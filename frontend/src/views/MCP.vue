@@ -1,0 +1,238 @@
+<template>
+  <div class="page">
+    <div class="page-header">
+      <div>
+        <h2>MCP 服务</h2>
+        <div class="sub">Model Context Protocol 工具服务，为 Agent 扩展外部工具能力</div>
+      </div>
+      <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
+    </div>
+
+    <el-row :gutter="16" v-loading="loading">
+      <el-col :span="8" v-for="m in mcps" :key="m.id">
+        <div class="card mcp-card">
+          <div class="mc-head">
+            <div class="mc-icon"><el-icon :size="20"><Connection /></el-icon></div>
+            <div class="mc-title">
+              <div class="mc-name">{{ m.name }}</div>
+              <el-tag size="small" type="info" effect="light">{{ m.transport }}</el-tag>
+            </div>
+            <el-switch :model-value="!!m.enabled" @change="(v:any)=>toggle(m, v)" style="margin-left:auto" />
+          </div>
+          <div class="muted mono mc-cmd">
+            {{ m.transport === 'stdio' ? `${m.command} ${(m.args||[]).join(' ')}` : m.url }}
+          </div>
+          <div class="mc-actions">
+            <el-button size="small" plain @click="test(m)" :loading="m._testing"><el-icon><Link /></el-icon> 测试</el-button>
+            <el-button size="small" type="primary" plain @click="showTools(m)"><el-icon><Tools /></el-icon> 工具</el-button>
+            <el-button size="small" text type="primary" @click="openEdit(m)"><el-icon><Edit /></el-icon> 编辑</el-button>
+            <el-button size="small" text type="danger" @click="remove(m)"><el-icon><Delete /></el-icon> 删除</el-button>
+          </div>
+        </div>
+      </el-col>
+    </el-row>
+    <div v-if="!loading && !mcps.length" class="empty-wrap">
+      <div class="empty-icon"><el-icon :size="28"><Connection /></el-icon></div>
+      <div>暂无 MCP 服务，点击右上角「新建 MCP」接入工具服务</div>
+      <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
+    </div>
+
+    <!-- 编辑对话框 -->
+    <el-dialog v-model="dlg" :title="form.id ? '编辑 MCP' : '新建 MCP'" width="600px">
+      <el-form :model="form" label-width="90px">
+        <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：文件系统、天气服务" /></el-form-item>
+        <el-form-item label="传输方式" required>
+          <el-radio-group v-model="form.transport">
+            <el-radio value="stdio">stdio</el-radio>
+            <el-radio value="sse">sse</el-radio>
+            <el-radio value="streamable_http">streamable_http</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <template v-if="form.transport === 'stdio'">
+          <el-form-item label="命令" required><el-input v-model="form.command" placeholder="如：npx 或 python" /></el-form-item>
+          <el-form-item label="参数">
+            <el-input v-model="argsText" placeholder="空格分隔，如：-m mcp-server-filesystem /data" />
+          </el-form-item>
+        </template>
+        <template v-else>
+          <el-form-item label="URL" required><el-input v-model="form.url" placeholder="http://host:port/sse" /></el-form-item>
+        </template>
+        <el-form-item label="环境变量">
+          <el-input v-model="envText" type="textarea" :rows="2" class="mono" placeholder="每行 KEY=VALUE" />
+        </el-form-item>
+        <el-form-item label="启用"><el-switch v-model="form.enabled" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dlg=false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 工具列表 -->
+    <el-dialog v-model="toolsDlg" :title="'MCP 工具：' + (curMcp?.name || '')" width="640px" top="6vh">
+      <el-table :data="tools" size="small" v-loading="loadingTools">
+        <el-table-column prop="name" label="工具名" min-width="160">
+          <template #default="{ row }"><span class="mono">{{ row.name }}</span></template>
+        </el-table-column>
+        <el-table-column prop="description" label="描述" min-width="240" show-overflow-tooltip />
+      </el-table>
+      <el-empty v-if="!loadingTools && !tools.length" description="未获取到工具" :image-size="60" />
+    </el-dialog>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { api } from '@/api'
+import type { MCPConfig, MCPTool } from '@/types'
+
+const mcps = ref<(MCPConfig & { _testing?: boolean })[]>([])
+const dlg = ref(false)
+const saving = ref(false)
+const loading = ref(false)
+const form = ref<Partial<MCPConfig>>({ transport: 'stdio', enabled: true })
+const argsText = ref('')
+const envText = ref('')
+
+const toolsDlg = ref(false)
+const curMcp = ref<MCPConfig | null>(null)
+const tools = ref<MCPTool[]>([])
+const loadingTools = ref(false)
+
+async function load() {
+  loading.value = true
+  try {
+    mcps.value = await api.listMCP()
+  } catch (e: any) {
+    ElMessage.error('加载失败：' + e.message)
+  } finally {
+    loading.value = false
+  }
+}
+function openCreate() {
+  form.value = { name: '', transport: 'stdio', command: '', args: [], enabled: true }
+  argsText.value = ''
+  envText.value = ''
+  dlg.value = true
+}
+function openEdit(m: MCPConfig) {
+  form.value = { ...m, args: [...(m.args || [])], env: { ...(m.env || {}) } }
+  argsText.value = (m.args || []).join(' ')
+  envText.value = Object.entries(m.env || {}).map(([k, v]) => `${k}=${v}`).join('\n')
+  dlg.value = true
+}
+function parseEnv(t: string) {
+  const out: Record<string, string> = {}
+  for (const line of t.split('\n')) {
+    const i = line.indexOf('=')
+    if (i > 0) out[line.slice(0, i).trim()] = line.slice(i + 1).trim()
+  }
+  return out
+}
+async function save() {
+  if (!form.value.name) return ElMessage.warning('请填写名称')
+  const payload: any = { ...form.value }
+  if (form.value.transport === 'stdio') {
+    payload.args = argsText.value.trim() ? argsText.value.trim().split(/\s+/) : []
+  } else {
+    payload.args = []
+  }
+  payload.env = parseEnv(envText.value)
+  saving.value = true
+  try {
+    if (form.value.id) await api.updateMCP(form.value.id, payload)
+    else await api.createMCP(payload)
+    ElMessage.success('已保存')
+    dlg.value = false
+    load()
+  } catch (e: any) {
+    ElMessage.error(e.message)
+  } finally {
+    saving.value = false
+  }
+}
+async function toggle(m: MCPConfig, v: boolean) {
+  try {
+    await api.updateMCP(m.id!, { ...m, enabled: v })
+    m.enabled = v
+  } catch (e: any) {
+    ElMessage.error(e.message)
+  }
+}
+async function test(m: MCPConfig & { _testing?: boolean }) {
+  m._testing = true
+  try {
+    const r: any = await api.testMCP(m.id!)
+    ElMessage.success(r.message || '连接成功')
+  } catch (e: any) {
+    ElMessage.error('连接失败：' + e.message)
+  } finally {
+    m._testing = false
+  }
+}
+async function showTools(m: MCPConfig) {
+  curMcp.value = m
+  tools.value = []
+  toolsDlg.value = true
+  loadingTools.value = true
+  try {
+    tools.value = await api.mcpTools(m.id!)
+  } catch (e: any) {
+    ElMessage.error(e.message)
+  } finally {
+    loadingTools.value = false
+  }
+}
+async function remove(m: MCPConfig) {
+  await ElMessageBox.confirm(`删除 MCP「${m.name}」？`, '确认', { type: 'warning' })
+  await api.deleteMCP(m.id!)
+  ElMessage.success('已删除')
+  load()
+}
+onMounted(load)
+</script>
+
+<style scoped>
+.mcp-card {
+  margin-bottom: 16px;
+  transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.mcp-card:hover {
+  transform: translateY(-3px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--border-strong);
+}
+.mc-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.mc-icon {
+  width: 40px; height: 40px;
+  border-radius: 11px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.mc-title { flex: 1; min-width: 0; }
+.mc-name {
+  font-weight: 700; font-size: 15px; margin-bottom: 3px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mc-cmd {
+  margin: 8px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mc-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+</style>

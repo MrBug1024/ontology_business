@@ -1,0 +1,1311 @@
+<template>
+  <div class="sd-page">
+    <div class="page-header">
+      <div class="ph-left">
+        <el-button class="back-btn" @click="goBack"><el-icon><ArrowLeft /></el-icon> 返回</el-button>
+        <div class="ph-title">
+          <b>{{ detail.name || '场景详情' }}</b>
+          <span class="ph-sub">{{ detail.description }}</span>
+        </div>
+      </div>
+      <div class="ph-right">
+        <el-button class="ai-btn" @click="runGenerate"><el-icon><MagicStick /></el-icon> AI 生成本体</el-button>
+      </div>
+    </div>
+
+    <el-tabs v-model="tab" class="sd-tabs">
+      <!-- ═══════════ 本体 ═══════════ -->
+      <el-tab-pane label="本体" name="ontology">
+        <div class="tab-toolbar">
+          <div class="tab-stats">
+            <span class="stat">实体 <b>{{ detail.entities.length }}</b></span>
+            <span class="stat">关系 <b>{{ detail.relations.length }}</b></span>
+          </div>
+          <div class="tab-actions">
+            <el-button size="small" @click="openEntity()"><el-icon><Plus /></el-icon> 实体</el-button>
+            <el-button size="small" @click="openRelation()"><el-icon><Plus /></el-icon> 关系</el-button>
+          </div>
+        </div>
+        <div class="graph-stage">
+          <GraphCanvas
+            :data="schemaGraph"
+            mode="schema"
+            :legend="legend"
+            empty-text="暂无本体，点击「实体」创建，或用 AI 生成"
+            @select="onNodeSelect"
+            @edge-click="onEdgeClick"
+            @add-relation="onAddRelation"
+            @canvas-click="clearSelection"
+          />
+          <EditorPanel
+            v-if="editor"
+            :editor="editor"
+            :entities="detail.entities"
+            :saving="saving"
+            @save="saveEditor"
+            @delete="deleteEditor"
+            @close="closeEditor"
+          />
+        </div>
+      </el-tab-pane>
+
+      <!-- ═══════════ 实例 ═══════════ -->
+      <el-tab-pane label="实例" name="instances">
+        <div class="tab-toolbar">
+          <div class="tab-stats">
+            <span class="stat">实例 <b>{{ detail.instances.length }}</b></span>
+            <span class="stat">关系实例 <b>{{ detail.relation_instances.length }}</b></span>
+          </div>
+          <div class="tab-actions">
+            <el-select v-model="instFilter" placeholder="全部实体" clearable size="small" class="inst-filter">
+              <el-option v-for="e in detail.entities" :key="e.id" :label="e.name" :value="e.id" />
+            </el-select>
+            <el-button size="small" type="primary" @click="openInstance()"><el-icon><Plus /></el-icon> 添加实例</el-button>
+          </div>
+        </div>
+        <div class="graph-stage">
+          <GraphCanvas
+            :data="instanceGraph"
+            mode="instance"
+            :legend="legend"
+            empty-text="暂无实例，点击「添加实例」创建"
+            @select="onInstSelect"
+            @canvas-click="clearSelection"
+          />
+          <EditorPanel
+            v-if="editor"
+            :editor="editor"
+            :entities="detail.entities"
+            :saving="saving"
+            @save="saveEditor"
+            @delete="deleteEditor"
+            @close="closeEditor"
+          />
+        </div>
+      </el-tab-pane>
+
+      <!-- ═══════════ 数据映射 ═══════════ -->
+      <el-tab-pane label="数据映射" name="mappings">
+        <div class="tab-toolbar">
+          <div class="tab-stats"><span class="stat">映射 <b>{{ detail.mappings.length }}</b></span></div>
+          <div class="tab-actions">
+            <el-button size="small" type="primary" @click="openMapping()"><el-icon><Plus /></el-icon> 添加映射</el-button>
+          </div>
+        </div>
+        <div class="card map-card">
+          <el-table :data="detail.mappings" class="map-table" empty-text="暂无数据映射">
+            <el-table-column label="实体" min-width="120">
+              <template #default="{ row }">
+                <span class="ent-chip" :style="{ color: entColor(row.entity_id) }">
+                  <i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column label="数据源 / 表" min-width="180">
+              <template #default="{ row }">
+                <div class="map-dst">
+                  <span class="mono">{{ row.table_name }}</span>
+                  <span class="muted">{{ dsName(row.data_source_id) }}</span>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="列映射" min-width="220">
+              <template #default="{ row }">
+                <div class="col-maps">
+                  <span class="col-map" v-for="(v, k) in row.column_map" :key="k">{{ k }} ← {{ v }}</span>
+                  <span class="muted" v-if="!Object.keys(row.column_map || {}).length">未配置</span>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="210" fixed="right">
+              <template #default="{ row }">
+                <el-button size="small" text @click="openMapping(row.id)">编辑</el-button>
+                <el-button size="small" text type="primary" :loading="row._importing" @click="doImport(row)">导入实例</el-button>
+                <el-button size="small" text type="danger" @click="removeMapping(row.id)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
+
+      <!-- ═══════════ 操作（Actions）═══════════ -->
+      <el-tab-pane label="操作" name="actions">
+        <div class="tab-toolbar">
+          <div class="tab-stats"><span class="stat">操作 <b>{{ detail.actions.length }}</b></span></div>
+          <div class="tab-actions">
+            <el-button size="small" type="primary" @click="openAction()"><el-icon><Plus /></el-icon> 添加操作</el-button>
+          </div>
+        </div>
+        <div class="card map-card">
+          <el-table :data="detail.actions" class="map-table" empty-text="暂无操作，点击「添加操作」创建">
+            <el-table-column label="名称" min-width="140">
+              <template #default="{ row }"><b>{{ row.name }}</b></template>
+            </el-table-column>
+            <el-table-column label="所属实体" min-width="120">
+              <template #default="{ row }">
+                <span class="ent-chip" :style="{ color: entColor(row.entity_id) }">
+                  <i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column label="执行方式" width="110">
+              <template #default="{ row }">
+                <el-tag size="small" effect="plain">{{ row.executor_type || '—' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="描述" min-width="200">
+              <template #default="{ row }"><span class="muted">{{ row.description || '—' }}</span></template>
+            </el-table-column>
+            <el-table-column label="启用" width="70">
+              <template #default="{ row }">
+                <el-tag size="small" :type="row.enabled === false ? 'info' : 'success'">{{ row.enabled === false ? '否' : '是' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="200" fixed="right">
+              <template #default="{ row }">
+                <el-button size="small" text @click="openAction(row.id)">编辑</el-button>
+                <el-button size="small" text type="primary" :loading="row._executing" @click="doExecuteAction(row)">执行</el-button>
+                <el-button size="small" text type="danger" @click="removeAction(row.id)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
+
+      <!-- ═══════════ 规则（Rules）═══════════ -->
+      <el-tab-pane label="规则" name="rules">
+        <div class="tab-toolbar">
+          <div class="tab-stats"><span class="stat">规则 <b>{{ detail.rules.length }}</b></span></div>
+          <div class="tab-actions">
+            <el-button size="small" type="primary" @click="openRule()"><el-icon><Plus /></el-icon> 添加规则</el-button>
+          </div>
+        </div>
+        <div class="card map-card">
+          <el-table :data="detail.rules" class="map-table" empty-text="暂无规则，点击「添加规则」创建">
+            <el-table-column label="名称" min-width="140">
+              <template #default="{ row }"><b>{{ row.name }}</b></template>
+            </el-table-column>
+            <el-table-column label="关联实体" min-width="120">
+              <template #default="{ row }">
+                <span v-if="row.entity_id" class="ent-chip" :style="{ color: entColor(row.entity_id) }">
+                  <i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}
+                </span>
+                <span v-else class="muted">全局</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="严重级别" width="100">
+              <template #default="{ row }">
+                <el-tag size="small" :type="row.severity === 'critical' ? 'danger' : row.severity === 'warning' ? 'warning' : 'info'">{{ row.severity || 'info' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="条件" min-width="220">
+              <template #default="{ row }"><span class="mono cond-text">{{ condSummary(row.condition) }}</span></template>
+            </el-table-column>
+            <el-table-column label="操作" width="200" fixed="right">
+              <template #default="{ row }">
+                <el-button size="small" text @click="openRule(row.id)">编辑</el-button>
+                <el-button size="small" text type="primary" @click="doEvalRule(row)">评估</el-button>
+                <el-button size="small" text type="danger" @click="removeRule(row.id)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
+
+      <!-- ═══════════ 事件（Events）═══════════ -->
+      <el-tab-pane label="事件" name="events">
+        <div class="tab-toolbar">
+          <div class="tab-stats"><span class="stat">事件 <b>{{ detail.events.length }}</b></span></div>
+          <div class="tab-actions">
+            <el-button size="small" type="primary" @click="openEvent()"><el-icon><Plus /></el-icon> 添加事件</el-button>
+          </div>
+        </div>
+        <div class="card map-card">
+          <el-table :data="detail.events" class="map-table" empty-text="暂无事件，点击「添加事件」创建">
+            <el-table-column label="名称" min-width="140">
+              <template #default="{ row }"><b>{{ row.name }}</b></template>
+            </el-table-column>
+            <el-table-column label="触发来源" width="140">
+              <template #default="{ row }"><el-tag size="small" effect="plain">{{ row.trigger_source || '—' }}</el-tag></template>
+            </el-table-column>
+            <el-table-column label="描述" min-width="220">
+              <template #default="{ row }"><span class="muted">{{ row.description || '—' }}</span></template>
+            </el-table-column>
+            <el-table-column label="启用" width="70">
+              <template #default="{ row }">
+                <el-tag size="small" :type="row.enabled === false ? 'info' : 'success'">{{ row.enabled === false ? '否' : '是' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="140" fixed="right">
+              <template #default="{ row }">
+                <el-button size="small" text @click="openEvent(row.id)">编辑</el-button>
+                <el-button size="small" text type="danger" @click="removeEvent(row.id)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
+
+      <!-- ═══════════ 工作流（Workflows）═══════════ -->
+      <el-tab-pane label="工作流" name="workflows">
+        <!-- 可视化编排画布 -->
+        <div v-if="wfEditor" class="wf-editor-stage">
+          <WorkflowEditor
+            :model-value="wfEditor"
+            :scenario-id="sid"
+            :actions="detail.actions"
+            :rules="detail.rules"
+            :events="detail.events"
+            :llm-configs="llmConfigs"
+            @update:model-value="wfEditor = $event"
+            @close="wfEditor = null"
+            @save="saveWorkflow"
+          />
+        </div>
+        <!-- 工作流列表 -->
+        <template v-else>
+          <div class="tab-toolbar">
+            <div class="tab-stats"><span class="stat">工作流 <b>{{ detail.workflows.length }}</b></span></div>
+            <div class="tab-actions">
+              <el-button size="small" type="primary" @click="openWorkflow()"><el-icon><Plus /></el-icon> 新建工作流</el-button>
+            </div>
+          </div>
+          <div class="card map-card">
+            <el-table :data="detail.workflows" class="map-table" empty-text="暂无工作流，点击「新建工作流」开始可视化编排">
+              <el-table-column label="名称" min-width="140">
+                <template #default="{ row }"><b>{{ row.name }}</b></template>
+              </el-table-column>
+              <el-table-column label="触发方式" width="110">
+                <template #default="{ row }"><el-tag size="small" effect="plain">{{ row.trigger_type || 'manual' }}</el-tag></template>
+              </el-table-column>
+              <el-table-column label="流程" min-width="280">
+                <template #default="{ row }">
+                  <div class="wf-steps">
+                    <span class="wf-step" v-for="(s, i) in wfSummary(row)" :key="i">{{ s }}</span>
+                    <span class="muted" v-if="!wfSummary(row).length">未配置</span>
+                  </div>
+                </template>
+              </el-table-column>
+              <el-table-column label="描述" min-width="160">
+                <template #default="{ row }"><span class="muted">{{ row.description || '—' }}</span></template>
+              </el-table-column>
+              <el-table-column label="操作" width="200" fixed="right">
+                <template #default="{ row }">
+                  <el-button size="small" text @click="openWorkflow(row.id)">编排</el-button>
+                  <el-button size="small" text type="primary" :loading="row._executing" @click="doExecuteWorkflow(row)">执行</el-button>
+                  <el-button size="small" text type="danger" @click="removeWorkflow(row.id)">删除</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+        </template>
+      </el-tab-pane>
+    </el-tabs>
+
+    <!-- ═══════════ 数据映射对话框 ═══════════ -->
+    <el-dialog v-model="mappingDlg" title="数据映射" width="600px" class="glass-dialog">
+      <el-form label-position="top">
+        <el-form-item label="目标实体">
+          <el-select v-model="mappingForm.entity_id" style="width:100%">
+            <el-option v-for="e in detail.entities" :key="e.id" :label="e.name" :value="e.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="数据源">
+          <el-select v-model="mappingForm.data_source_id" style="width:100%" @change="onMapDsChange">
+            <el-option v-for="d in dataSources" :key="d.id" :label="d.name" :value="d.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="表名">
+          <el-select v-model="mappingForm.table_name" style="width:100%" filterable allow-create placeholder="选择或输入表名">
+            <el-option v-for="t in mapTables" :key="t" :label="t" :value="t" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="列映射（实体属性 ← 数据列）">
+          <div class="colmap-list">
+            <div class="colmap-row" v-for="p in (detail.entities.find((e) => e.id === mappingForm.entity_id)?.properties || [])" :key="p.name">
+              <span class="colmap-attr">{{ p.name }}</span>
+              <el-select v-model="mappingForm.column_map[p.name]" size="small" clearable placeholder="—">
+                <el-option v-for="c in mapCols" :key="c" :label="c" :value="c" />
+              </el-select>
+            </div>
+            <div class="muted" v-if="!mapCols.length">选择表后自动加载列</div>
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="mappingDlg = false">取消</el-button>
+        <el-button type="primary" @click="saveMapping">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ═══════════ 操作对话框 ═══════════ -->
+    <el-dialog v-model="actionDlg" :title="actionForm.id ? '编辑操作' : '添加操作'" width="640px" class="glass-dialog">
+      <el-form label-position="top">
+        <div class="form-row">
+          <el-form-item label="名称" class="form-col">
+            <el-input v-model="actionForm.name" placeholder="如：标记违规、生成报告" />
+          </el-form-item>
+          <el-form-item label="所属实体" class="form-col">
+            <el-select v-model="actionForm.entity_id" style="width:100%">
+              <el-option v-for="e in detail.entities" :key="e.id" :label="e.name" :value="e.id" />
+            </el-select>
+          </el-form-item>
+        </div>
+        <el-form-item label="描述">
+          <el-input v-model="actionForm.description" type="textarea" :rows="2" placeholder="这个操作做什么" />
+        </el-form-item>
+        <div class="form-row">
+          <el-form-item label="执行方式" class="form-col">
+            <el-select v-model="actionForm.executor_type" style="width:100%">
+              <el-option label="SQL 查询" value="sql" />
+              <el-option label="技能 (Skill)" value="skill" />
+              <el-option label="MCP 工具" value="mcp" />
+              <el-option label="HTTP 请求" value="http" />
+              <el-option label="Python 脚本" value="script" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="启用" class="form-col">
+            <el-switch v-model="actionForm.enabled" />
+          </el-form-item>
+        </div>
+        <el-form-item label="执行配置（JSON，按执行方式不同而不同）">
+          <el-input v-model="actionForm.executor_config_text" type="textarea" :rows="5" class="mono" placeholder='{"data_source_id": "...", "sql": "SELECT ..."}' />
+        </el-form-item>
+        <el-form-item label="输入参数 Schema（JSON，可选）">
+          <el-input v-model="actionForm.input_schema_text" type="textarea" :rows="3" class="mono" placeholder='{"drug_name": {"type": "string"}}' />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="actionDlg = false">取消</el-button>
+        <el-button type="primary" @click="saveAction">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ═══════════ 规则对话框 ═══════════ -->
+    <el-dialog v-model="ruleDlg" :title="ruleForm.id ? '编辑规则' : '添加规则'" width="640px" class="glass-dialog">
+      <el-form label-position="top">
+        <div class="form-row">
+          <el-form-item label="名称" class="form-col">
+            <el-input v-model="ruleForm.name" placeholder="如：单张发票药品数量超限" />
+          </el-form-item>
+          <el-form-item label="严重级别" class="form-col">
+            <el-select v-model="ruleForm.severity" style="width:100%">
+              <el-option label="提示 (info)" value="info" />
+              <el-option label="警告 (warning)" value="warning" />
+              <el-option label="严重 (critical)" value="critical" />
+            </el-select>
+          </el-form-item>
+        </div>
+        <div class="form-row">
+          <el-form-item label="关联实体（可选，留空为全局规则）" class="form-col">
+            <el-select v-model="ruleForm.entity_id" clearable style="width:100%">
+              <el-option v-for="e in detail.entities" :key="e.id" :label="e.name" :value="e.id" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="启用" class="form-col">
+            <el-switch v-model="ruleForm.enabled" />
+          </el-form-item>
+        </div>
+        <el-form-item label="描述">
+          <el-input v-model="ruleForm.description" type="textarea" :rows="2" placeholder="这条规则检查什么" />
+        </el-form-item>
+        <el-form-item label="条件表达式（JSON，支持 and/or/not 组合）">
+          <el-input v-model="ruleForm.condition_text" type="textarea" :rows="6" class="mono" placeholder='{"op": "and", "conditions": [{"field": "数量", "op": ">", "value": 2}]}' />
+        </el-form-item>
+        <el-form-item label="命中后动作（文本说明）">
+          <el-input v-model="ruleForm.action_on_match" placeholder="如：标记为疑似违规并通知审核员" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="ruleDlg = false">取消</el-button>
+        <el-button type="primary" @click="saveRule">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ═══════════ 事件对话框 ═══════════ -->
+    <el-dialog v-model="eventDlg" :title="eventForm.id ? '编辑事件' : '添加事件'" width="560px" class="glass-dialog">
+      <el-form label-position="top">
+        <div class="form-row">
+          <el-form-item label="名称" class="form-col">
+            <el-input v-model="eventForm.name" placeholder="如：新发票录入" />
+          </el-form-item>
+          <el-form-item label="触发来源" class="form-col">
+            <el-input v-model="eventForm.trigger_source" placeholder="如：数据源同步 / 手动 / 定时" />
+          </el-form-item>
+        </div>
+        <el-form-item label="描述">
+          <el-input v-model="eventForm.description" type="textarea" :rows="2" placeholder="这个事件代表什么业务含义" />
+        </el-form-item>
+        <el-form-item label="载荷 Schema（JSON，可选）">
+          <el-input v-model="eventForm.payload_schema_text" type="textarea" :rows="4" class="mono" placeholder='{"invoice_id": {"type": "string"}}' />
+        </el-form-item>
+        <el-form-item label="启用">
+          <el-switch v-model="eventForm.enabled" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="eventDlg = false">取消</el-button>
+        <el-button type="primary" @click="saveEvent">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ═══════════ 执行结果对话框 ═══════════ -->
+    <el-dialog v-model="execResultDlg" title="执行结果" width="640px" class="glass-dialog">
+      <pre class="exec-result mono">{{ execResultText }}</pre>
+      <template #footer>
+        <el-button type="primary" @click="execResultDlg = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ═══════════ AI 生成对话框 ═══════════ -->
+    <el-dialog v-model="aiDlg" title="AI 生成本体" width="640px" class="glass-dialog">
+      <el-input v-model="aiDesc" type="textarea" :rows="3" placeholder="描述你的业务场景，AI 将自动设计实体、属性与关系…" />
+      <div class="ai-preview" v-if="aiResult">
+        <div class="ai-sec">
+          <span>实体（{{ aiResult.entities.length }}）</span>
+          <el-button size="small" text type="primary" @click="applyAI">应用到场景</el-button>
+        </div>
+        <div class="ai-ent-grid">
+          <div class="ai-ent" v-for="e in aiResult.entities" :key="e.name">
+            <div class="ai-ent-head"><i :style="{ background: e.color }"></i>{{ e.name }}</div>
+            <div class="ai-props">
+              <span class="ai-prop" v-for="p in e.properties" :key="p.name">{{ p.name }}<em>{{ p.data_type }}</em></span>
+            </div>
+          </div>
+        </div>
+        <div class="ai-sec" v-if="aiResult.relations.length">关系（{{ aiResult.relations.length }}）</div>
+        <div class="ai-rels">
+          <span class="ai-rel" v-for="(r, i) in aiResult.relations" :key="i">{{ r.source }} —{{ r.name }}→ {{ r.target }}</span>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="aiDlg = false">关闭</el-button>
+        <el-button type="primary" :loading="aiLoading" @click="runGenerate">生成</el-button>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, watch, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { api } from '@/api'
+import GraphCanvas from '@/components/GraphCanvas.vue'
+import EditorPanel from '@/components/EditorPanel.vue'
+import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
+import type { ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, DataMapping } from '@/types'
+
+const route = useRoute()
+const router = useRouter()
+const sid = route.params.id as string
+
+const detail = ref<ScenarioDetail>({
+  id: sid, name: '', description: '',
+  entities: [], relations: [], data_sources: [],
+  instances: [], relation_instances: [], mappings: [],
+  actions: [], rules: [], events: [], workflows: [],
+})
+const dataSources = ref<any[]>([])
+const llmConfigs = ref<any[]>([])
+const tab = ref('ontology')
+const instFilter = ref('')
+const saving = ref(false)
+
+// ── 悬浮编辑面板状态 ──
+const editor = ref<{ kind: 'entity' | 'relation' | 'instance'; id?: string; form: any } | null>(null)
+// 切换 tab 时关闭悬浮编辑器，避免跨 tab 状态残留
+watch(tab, () => { editor.value = null })
+
+// ── 图谱数据 ──
+const schemaGraph = computed<GraphData>(() => {
+  const nodes: GraphNode[] = detail.value.entities
+    .filter((e) => e.id)
+    .map((e) => ({
+      id: e.id!, label: e.name, type: 'entity', color: e.color || '#6366f1',
+      meta: { count: e.properties.length, abstract: e.is_abstract, description: e.description },
+    }))
+  const edges: GraphEdge[] = detail.value.relations
+    .filter((r) => r.id)
+    .map((r) => ({
+      id: r.id!, source: r.source_entity_id, target: r.target_entity_id,
+      label: r.name, type: r.relation_type,
+    }))
+  return { nodes, edges }
+})
+const instanceGraph = computed<GraphData>(() => {
+  const ents = (instFilter.value ? detail.value.entities.filter((e) => e.id === instFilter.value) : detail.value.entities).filter((e) => e.id)
+  const entIds = new Set(ents.map((e) => e.id as string))
+  const nodes: GraphNode[] = []
+  const entNode = new Map<string, string>()
+  for (const e of ents) {
+    const id = `ent:${e.id}`
+    entNode.set(e.id as string, id)
+    nodes.push({ id, label: e.name, type: 'entity', color: e.color || '#6366f1', meta: { count: detail.value.instances.filter((i) => i.entity_id === e.id).length } })
+  }
+  for (const i of detail.value.instances) {
+    if (!i.id || !entIds.has(i.entity_id)) continue
+    nodes.push({ id: i.id, label: i.name, type: 'instance', color: detail.value.entities.find((e) => e.id === i.entity_id)?.color || '#06b6d4', meta: { entity: i.entity_id } })
+  }
+  const edges: GraphEdge[] = []
+  for (const i of detail.value.instances) {
+    if (!i.id || !entIds.has(i.entity_id)) continue
+    edges.push({ id: `ie:${i.id}`, source: entNode.get(i.entity_id)!, target: i.id, type: 'belongs' })
+  }
+  const nodeIds = new Set(nodes.map((n) => n.id))
+  for (const ri of detail.value.relation_instances) {
+    if (ri.id && nodeIds.has(ri.source_instance_id) && nodeIds.has(ri.target_instance_id)) {
+      edges.push({ id: ri.id, source: ri.source_instance_id, target: ri.target_instance_id, label: ri.relation_name || detail.value.relations.find((r) => r.id === ri.relation_id)?.name || '', type: 'rel' })
+    }
+  }
+  return { nodes, edges }
+})
+const legend = computed(() => detail.value.entities.map((e) => ({ label: e.name, color: e.color || '#6366f1' })))
+
+function entName(id: string) { return detail.value.entities.find((e) => e.id === id)?.name || '—' }
+function entColor(id: string) { return detail.value.entities.find((e) => e.id === id)?.color || '#6366f1' }
+function dsName(id: string) { return dataSources.value.find((d) => d.id === id)?.name || '—' }
+
+// ── 选择 → 打开悬浮编辑器 ──
+function onNodeSelect(node: any) {
+  if (tab.value === 'instances') openInstance(node.id)
+  else openEntity(node.id)
+}
+function onInstSelect(node: any) { openInstance(node.id) }
+function onEdgeClick(edge: any) {
+  if (tab.value !== 'instances') openRelation(edge.id)
+}
+function onAddRelation(sourceId: string, targetId: string) {
+  openRelation()
+  if (editor.value) {
+    editor.value.form.source_entity_id = sourceId
+    editor.value.form.target_entity_id = targetId
+  }
+}
+function clearSelection() { editor.value = null }
+function closeEditor() { editor.value = null }
+
+// ── 打开编辑器 ──
+function openEntity(id?: string) {
+  const e = id ? detail.value.entities.find((x) => x.id === id) : null
+  editor.value = {
+    kind: 'entity',
+    id: e?.id,
+    form: e
+      ? { name: e.name, color: e.color, description: e.description, is_abstract: e.is_abstract, properties: e.properties.map((p) => ({ ...p })) }
+      : { name: '', color: '#6366f1', description: '', is_abstract: false, properties: [] },
+  }
+}
+function openRelation(id?: string) {
+  const r = id ? detail.value.relations.find((x) => x.id === id) : null
+  editor.value = {
+    kind: 'relation',
+    id: r?.id,
+    form: r
+      ? { name: r.name, source_entity_id: r.source_entity_id, target_entity_id: r.target_entity_id, relation_type: r.relation_type, description: r.description }
+      : { name: '', source_entity_id: detail.value.entities[0]?.id || '', target_entity_id: detail.value.entities[1]?.id || '', relation_type: '1:N', description: '' },
+  }
+}
+function openInstance(id?: string) {
+  const i = id ? detail.value.instances.find((x) => x.id === id) : null
+  editor.value = {
+    kind: 'instance',
+    id: i?.id,
+    form: i
+      ? { entity_id: i.entity_id, name: i.name, attributes: { ...i.attributes } }
+      : { entity_id: instFilter.value || detail.value.entities[0]?.id || '', name: '', attributes: {} },
+  }
+}
+
+// ── 保存 / 删除 ──
+async function saveEditor() {
+  if (!editor.value) return
+  const { kind, id, form } = editor.value
+  saving.value = true
+  try {
+    if (kind === 'entity') {
+      if (id) await api.updateEntity(id, form)
+      else await api.createEntity(sid, form)
+    } else if (kind === 'relation') {
+      if (id) await api.updateRelation(id, form)
+      else await api.createRelation(sid, form)
+    } else {
+      if (id) await api.updateInstance(id, form)
+      else await api.createInstance(sid, form)
+    }
+    await load()
+    if (id) {
+      if (kind === 'entity') openEntity(id)
+      else if (kind === 'relation') openRelation(id)
+      else openInstance(id)
+    } else {
+      editor.value = null
+    }
+    ElMessage.success('已保存')
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '保存失败')
+  } finally {
+    saving.value = false
+  }
+}
+async function deleteEditor() {
+  if (!editor.value) return
+  const { kind, id } = editor.value
+  if (!id) { editor.value = null; return }
+  const names = { entity: '实体', relation: '关系', instance: '实例' }
+  try {
+    await ElMessageBox.confirm(`确定删除该${names[kind]}？`, '提示', { type: 'warning' })
+  } catch { return }
+  if (kind === 'entity') await api.deleteEntity(id)
+  else if (kind === 'relation') await api.deleteRelation(id)
+  else await api.deleteInstance(id)
+  editor.value = null
+  await load()
+  ElMessage.success('已删除')
+}
+
+// ── 数据映射 ──
+const mappingDlg = ref(false)
+const mappingForm = ref<Partial<DataMapping> & { column_map: Record<string, string> }>({ column_map: {} })
+const mapTables = ref<string[]>([])
+const mapCols = ref<string[]>([])
+function openMapping(id?: string) {
+  const m = id ? detail.value.mappings.find((x) => x.id === id) : null
+  mappingForm.value = m
+    ? { ...m, column_map: { ...(m.column_map || {}) } }
+    : { entity_id: detail.value.entities[0]?.id, data_source_id: dataSources.value[0]?.id, table_name: '', column_map: {} }
+  mappingDlg.value = true
+  loadTables()
+}
+async function loadTables() {
+  mapTables.value = []; mapCols.value = []
+  if (!mappingForm.value.data_source_id) return
+  try {
+    const tables = await api.listTables(mappingForm.value.data_source_id)
+    mapTables.value = tables.map((t) => t.name)
+    const cur = tables.find((t) => t.name === mappingForm.value.table_name)
+    if (cur) mapCols.value = cur.columns.map((c) => c.name)
+  } catch { /* ignore */ }
+}
+function onMapDsChange() { mappingForm.value.table_name = ''; mapTables.value = []; mapCols.value = [] }
+watch(() => mappingForm.value.table_name, () => {
+  if (mappingForm.value.data_source_id) loadTables()
+})
+async function saveMapping() {
+  try {
+    // 后端无独立更新接口：create 会替换同实体的旧映射
+    await api.createMapping(sid, mappingForm.value)
+    mappingDlg.value = false
+    await load()
+    ElMessage.success('已保存')
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '保存失败') }
+}
+async function removeMapping(id: string) {
+  try {
+    await ElMessageBox.confirm('确定删除该映射？', '提示', { type: 'warning' })
+    await api.deleteMapping(id)
+    await load()
+  } catch { /* ignore */ }
+}
+async function doImport(row: any) {
+  row._importing = true
+  try {
+    const res = await api.importMapping(row.id)
+    ElMessage.success(`导入 ${res.imported} 条实例`)
+    await load()
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '导入失败') }
+  finally { row._importing = false }
+}
+
+// ── 操作（Actions）──
+const actionDlg = ref(false)
+const actionForm = ref<any>({ executor_config_text: '', input_schema_text: '' })
+function openAction(id?: string) {
+  const a = id ? detail.value.actions.find((x) => x.id === id) : null
+  actionForm.value = a
+    ? { ...a, executor_config_text: JSON.stringify(a.executor_config || {}, null, 2), input_schema_text: JSON.stringify(a.input_schema || {}, null, 2) }
+    : { entity_id: detail.value.entities[0]?.id || '', name: '', description: '', executor_type: 'sql', executor_config_text: '', input_schema_text: '', enabled: true }
+  actionDlg.value = true
+}
+async function saveAction() {
+  const f = { ...actionForm.value }
+  try {
+    f.executor_config = f.executor_config_text ? JSON.parse(f.executor_config_text) : {}
+    f.input_schema = f.input_schema_text ? JSON.parse(f.input_schema_text) : {}
+  } catch { ElMessage.error('JSON 格式错误'); return }
+  delete f.executor_config_text; delete f.input_schema_text
+  try {
+    if (f.id) await api.updateAction(f.id, f)
+    else await api.createAction(sid, f)
+    actionDlg.value = false
+    await load()
+    ElMessage.success('已保存')
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
+}
+async function removeAction(id: string) {
+  try {
+    await ElMessageBox.confirm('确定删除该操作？', '提示', { type: 'warning' })
+    await api.deleteAction(id)
+    await load()
+  } catch { /* ignore */ }
+}
+async function doExecuteAction(row: any) {
+  row._executing = true
+  try {
+    const params = await promptParams(row.input_schema)
+    const res = await api.executeAction(row.id!, params)
+    showExecResult(res)
+  } catch (e: any) {
+    if (e !== 'cancel') ElMessage.error(e?.response?.data?.detail || e?.message || '执行失败')
+  } finally { row._executing = false }
+}
+
+// ── 规则（Rules）──
+const ruleDlg = ref(false)
+const ruleForm = ref<any>({ condition_text: '' })
+function openRule(id?: string) {
+  const r = id ? detail.value.rules.find((x) => x.id === id) : null
+  ruleForm.value = r
+    ? { ...r, condition_text: JSON.stringify(r.condition || {}, null, 2) }
+    : { name: '', description: '', entity_id: '', severity: 'warning', condition_text: '', action_on_match: '', enabled: true }
+  ruleDlg.value = true
+}
+async function saveRule() {
+  const f = { ...ruleForm.value }
+  try {
+    f.condition = f.condition_text ? JSON.parse(f.condition_text) : {}
+  } catch { ElMessage.error('条件 JSON 格式错误'); return }
+  delete f.condition_text
+  try {
+    if (f.id) await api.updateRule(f.id, f)
+    else await api.createRule(sid, f)
+    ruleDlg.value = false
+    await load()
+    ElMessage.success('已保存')
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
+}
+async function removeRule(id: string) {
+  try {
+    await ElMessageBox.confirm('确定删除该规则？', '提示', { type: 'warning' })
+    await api.deleteRule(id)
+    await load()
+  } catch { /* ignore */ }
+}
+async function doEvalRule(row: any) {
+  try {
+    const record = await promptParams(row.condition, '输入待评估的数据记录（JSON）')
+    const res = await api.evaluateRule(row.id!, record)
+    showExecResult(res)
+  } catch (e: any) {
+    if (e !== 'cancel') ElMessage.error(e?.response?.data?.detail || e?.message || '评估失败')
+  }
+}
+function condSummary(c: any): string {
+  if (!c) return '—'
+  if (c.op === 'and' || c.op === 'or') {
+    return (c.conditions || []).map((x: any) => condSummary(x)).join(` ${c.op.toUpperCase()} `)
+  }
+  if (c.op === 'not') return `NOT(${condSummary(c.conditions?.[0])})`
+  return `${c.field || '?'} ${c.op || ''} ${JSON.stringify(c.value ?? '')}`
+}
+
+// ── 事件（Events）──
+const eventDlg = ref(false)
+const eventForm = ref<any>({ payload_schema_text: '' })
+function openEvent(id?: string) {
+  const e = id ? detail.value.events.find((x) => x.id === id) : null
+  eventForm.value = e
+    ? { ...e, payload_schema_text: JSON.stringify(e.payload_schema || {}, null, 2) }
+    : { name: '', description: '', trigger_source: '', payload_schema_text: '', enabled: true }
+  eventDlg.value = true
+}
+async function saveEvent() {
+  const f = { ...eventForm.value }
+  try {
+    f.payload_schema = f.payload_schema_text ? JSON.parse(f.payload_schema_text) : {}
+  } catch { ElMessage.error('JSON 格式错误'); return }
+  delete f.payload_schema_text
+  try {
+    if (f.id) await api.updateEvent(f.id, f)
+    else await api.createEvent(sid, f)
+    eventDlg.value = false
+    await load()
+    ElMessage.success('已保存')
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
+}
+async function removeEvent(id: string) {
+  try {
+    await ElMessageBox.confirm('确定删除该事件？', '提示', { type: 'warning' })
+    await api.deleteEvent(id)
+    await load()
+  } catch { /* ignore */ }
+}
+
+// ── 工作流（Workflows）：可视化编排 ──
+const wfEditor = ref<any>(null)
+function openWorkflow(id?: string) {
+  const w = id ? detail.value.workflows.find((x) => x.id === id) : null
+  wfEditor.value = w
+    ? {
+        ...w,
+        steps: (w.steps || []).map((s: any) => ({ ...s })),
+        nodes: (w.nodes || []).map((n: any) => ({ ...n, data: { ...(n.data || {}) } })),
+        edges: (w.edges || []).map((e: any) => ({ ...e })),
+      }
+    : { name: '', description: '', trigger_type: 'manual', steps: [], nodes: [], edges: [], enabled: true }
+}
+async function saveWorkflow(w: any) {
+  try {
+    if (w.id) await api.updateWorkflow(w.id, w)
+    else await api.createWorkflow(sid, w)
+    wfEditor.value = null
+    await load()
+    ElMessage.success('工作流已保存')
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
+}
+async function removeWorkflow(id: string) {
+  try {
+    await ElMessageBox.confirm('确定删除该工作流？', '提示', { type: 'warning' })
+    await api.deleteWorkflow(id)
+    await load()
+  } catch { /* ignore */ }
+}
+async function doExecuteWorkflow(row: any) {
+  row._executing = true
+  try {
+    const params = await promptParams(null, '输入工作流参数（JSON，可为空 {}）')
+    const res = await api.executeWorkflow(row.id!, params)
+    showExecResult(res)
+  } catch (e: any) {
+    if (e !== 'cancel') ElMessage.error(e?.response?.data?.detail || e?.message || '执行失败')
+  } finally { row._executing = false }
+}
+/** 列表页流程摘要：DAG 节点链（或旧版 steps） */
+function wfSummary(w: any): string[] {
+  const ns = w.nodes || []
+  if (ns.length) {
+    return ns
+      .filter((n: any) => n.type !== 'start' && n.type !== 'end')
+      .map((n: any) => {
+        const d = n.data || {}
+        if (n.type === 'action') return `⚡${d.action_id ? detail.value.actions.find((a) => a.id === d.action_id)?.name || n.name || '操作' : n.name || '操作'}`
+        if (n.type === 'rule') return `⑂${d.rule_id ? detail.value.rules.find((r) => r.id === d.rule_id)?.name || n.name || '规则' : n.name || '规则'}`
+        if (n.type === 'llm') return `✦${n.name || '大模型'}`
+        if (n.type === 'event') return `🔔${d.event_id ? detail.value.events.find((e) => e.id === d.event_id)?.name || n.name || '事件' : n.name || '事件'}`
+        if (n.type === 'http') return `⇄${n.name || 'HTTP'}`
+        if (n.type === 'script') return `Py${n.name || '脚本'}`
+        return n.name || n.type
+      })
+  }
+  return (w.steps || []).map((s: any, i: number) => `${i + 1}.${stepLabel(s)}`)
+}
+function stepLabel(s: any): string {
+  if (s.type === 'action') return `操作:${detail.value.actions.find((a) => a.id === s.action_id)?.name || '?'}`
+  if (s.type === 'rule') return `规则:${detail.value.rules.find((r) => r.id === s.rule_id)?.name || '?'}`
+  if (s.type === 'event') return `事件:${detail.value.events.find((e) => e.id === s.event_id)?.name || '?'}`
+  return s.type || '?'
+}
+
+// ── 执行结果 ──
+const execResultDlg = ref(false)
+const execResultText = ref('')
+function showExecResult(res: any) {
+  execResultText.value = JSON.stringify(res, null, 2)
+  execResultDlg.value = true
+}
+async function promptParams(schema: any, title = '输入参数（JSON）'): Promise<Record<string, any>> {
+  const keys = schema ? Object.keys(schema) : []
+  const template = keys.length
+    ? JSON.stringify(Object.fromEntries(keys.map((k) => [k, ''])), null, 2)
+    : '{}'
+  const { value } = await ElMessageBox.prompt(title, '参数输入', {
+    inputValue: template,
+    inputPattern: /\S/,
+    confirmButtonText: '确定',
+    cancelButtonText: '取消',
+  })
+  const parsed = JSON.parse(value || '{}')
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('参数必须是 JSON 对象')
+  return parsed
+}
+
+// ── AI 生成 ──
+const aiDlg = ref(false)
+const aiDesc = ref('')
+const aiLoading = ref(false)
+const aiResult = ref<any>(null)
+async function runGenerate() {
+  aiDlg.value = true
+  if (aiResult.value) return
+  aiLoading.value = true
+  try {
+    aiResult.value = await api.generateOntology(sid, aiDesc.value || detail.value.description || '')
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '生成失败') }
+  finally { aiLoading.value = false }
+}
+async function applyAI() {
+  if (!aiResult.value) return
+  try {
+    await api.applyOntology(sid, aiResult.value)
+    aiDlg.value = false
+    aiResult.value = null
+    await load()
+    ElMessage.success('已应用 AI 本体')
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '应用失败') }
+}
+
+// ── 加载 ──
+async function load() {
+  try {
+    detail.value = await api.getScenario(sid)
+    dataSources.value = await api.listDataSources()
+    llmConfigs.value = await api.listLLM()
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '加载失败')
+  }
+}
+function goBack() { router.push('/scenarios') }
+onMounted(load)
+</script>
+
+<style scoped>
+.sd-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.ph-left {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+.back-btn {
+  flex-shrink: 0;
+}
+.ph-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.ph-title b {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ph-sub {
+  font-size: 12.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ph-right {
+  flex-shrink: 0;
+}
+.ai-btn {
+  background: var(--grad);
+  border: none;
+  color: #fff;
+  font-weight: 600;
+  box-shadow: var(--shadow-primary);
+  transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.ai-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md), var(--shadow-primary);
+  color: #fff;
+}
+
+/* ── Tabs ── */
+.sd-tabs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.sd-tabs :deep(.el-tabs__header) {
+  margin-bottom: 12px;
+}
+.sd-tabs :deep(.el-tabs__nav-wrap::after) {
+  height: 1px;
+  background: var(--border);
+}
+.sd-tabs :deep(.el-tabs__item) {
+  font-size: 14px;
+  font-weight: 600;
+}
+.sd-tabs :deep(.el-tabs__content) {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.sd-tabs :deep(.el-tab-pane) {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── 工具栏 ── */
+.tab-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.tab-stats {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.stat {
+  font-size: 12.5px;
+  color: var(--text-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  padding: 5px 12px;
+  border-radius: 999px;
+}
+.stat b {
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+}
+.tab-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.inst-filter {
+  width: 150px;
+}
+
+/* ── 图谱舞台（自适应高度，悬浮编辑器覆盖其上）── */
+.graph-stage {
+  position: relative;
+  flex: 1;
+  min-height: 440px;
+}
+.graph-stage :deep(.graph-wrap) {
+  height: 100%;
+}
+
+/* ── 工作流可视化编排舞台 ── */
+.wf-editor-stage {
+  position: relative;
+  flex: 1;
+  min-height: 480px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── 数据映射 ── */
+.map-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.map-table {
+  flex: 1;
+}
+.ent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 600;
+  font-size: 13px;
+}
+.ent-chip i {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+.map-dst {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12.5px;
+  color: var(--text);
+}
+.muted {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.col-maps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.col-map {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11.5px;
+  background: var(--primary-soft);
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  border-radius: 6px;
+  color: var(--text-2);
+}
+
+/* ── 映射对话框 ── */
+.colmap-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.colmap-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.colmap-attr {
+  width: 110px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+.colmap-row .el-select {
+  flex: 1;
+}
+
+/* ── AI 预览 ── */
+.ai-preview {
+  margin-top: 14px;
+  padding: 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.ai-sec {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+.ai-ent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.ai-ent {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  box-shadow: var(--shadow-xs);
+}
+.ai-ent-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 700;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.ai-ent-head i {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+.ai-props {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.ai-prop {
+  font-size: 11px;
+  background: var(--primary-soft);
+  padding: 2px 7px;
+  border-radius: 5px;
+  color: var(--text-2);
+}
+.ai-prop em {
+  font-style: normal;
+  color: var(--text-3);
+  margin-left: 4px;
+}
+.ai-rels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ai-rel {
+  font-size: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  border-radius: 8px;
+  color: var(--text-2);
+}
+
+/* ── 操作/规则/事件/工作流 ── */
+.form-row {
+  display: flex;
+  gap: 16px;
+}
+.form-col {
+  flex: 1;
+  min-width: 0;
+}
+.mono {
+  font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+}
+.cond-text {
+  word-break: break-all;
+  color: var(--text-2);
+}
+.wf-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.wf-step {
+  font-size: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+  border-radius: 6px;
+  color: var(--text-2);
+}
+.exec-result {
+  background: #14102e;
+  color: #e2e8f0;
+  padding: 14px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ── 响应式 ── */
+@media (max-width: 900px) {
+  .ph-title b { font-size: 17px; }
+  .graph-stage { min-height: 380px; }
+}
+@media (max-width: 640px) {
+  .tab-toolbar { flex-direction: column; align-items: stretch; }
+  .tab-actions { justify-content: flex-end; }
+  .inst-filter { width: 100%; }
+}
+</style>

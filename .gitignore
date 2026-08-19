@@ -1,0 +1,33 @@
+# 环境与密钥
+.env
+
+# 运行期数据（业务场景、上传文件、技能库、对话记录）
+/backend/data/
+
+# 前端构建产物与依赖
+/frontend/node_modules/
+/frontend/dist/
+/frontend/vite-runtime*.log
+/frontend/vite.config.ts.timestamp-*.mjs
+/backend/tests
+# Python
+__pycache__
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.tmp/
+# IDE
+.idea/
+.vscode/
+.cache/
+.claude/
+.agents/
+.test/
+.codex-tmp/
+.pytest_tmp_progressive_relations
+.trae/
+*.log
+.tmp-medical-audit-template
+.pytest-basetemp-audit
+.pytest_cache

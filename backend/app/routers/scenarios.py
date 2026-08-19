@@ -1,0 +1,760 @@
+"""业务场景 & 本体建模路由。"""
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+from ..models import (
+    ActionExecutionLog,
+    BusinessScenario,
+    DataMapping,
+    DataSource,
+    OntologyAction,
+    OntologyEntity,
+    OntologyEvent,
+    OntologyInstance,
+    OntologyProperty,
+    OntologyRelation,
+    OntologyRule,
+    OntologyWorkflow,
+    RelationInstance,
+)
+from ..schemas import (
+    ActionExecuteRequest,
+    ActionIn,
+    ActionOut,
+    ActionExecutionLogOut,
+    DataMappingIn,
+    DataMappingOut,
+    EntityIn,
+    EntityOut,
+    EventIn,
+    EventOut,
+    InstanceIn,
+    InstanceOut,
+    Msg,
+    PropertyIn,
+    RelationIn,
+    RelationInstanceIn,
+    RelationInstanceOut,
+    RelationOut,
+    RuleIn,
+    RuleOut,
+    ScenarioDetail,
+    ScenarioIn,
+    ScenarioOut,
+    WorkflowExecuteRequest,
+    WorkflowGenerateRequest,
+    WorkflowIn,
+    WorkflowOut,
+)
+from ..services import ontology_service, workflow_service
+
+router = APIRouter(prefix="/scenarios", tags=["scenarios"])
+
+
+def _scenario_out(s: BusinessScenario) -> ScenarioOut:
+    return ScenarioOut(
+        id=s.id,
+        name=s.name,
+        description=s.description,
+        industry=s.industry,
+        status=s.status,
+        created_at=s.created_at,
+        updated_at=s.updated_at,
+        entity_count=len(s.entities),
+        relation_count=len(s.relations),
+        data_source_count=len(s.data_sources),
+        action_count=len(s.actions),
+        rule_count=len(s.rules),
+        event_count=len(s.events),
+        workflow_count=len(s.workflows),
+    )
+
+
+def _action_out(a: OntologyAction) -> ActionOut:
+    return ActionOut(
+        id=a.id,
+        scenario_id=a.scenario_id,
+        entity_id=a.entity_id,
+        name=a.name,
+        description=a.description,
+        input_schema=a.input_schema or {},
+        executor_type=a.executor_type,
+        executor_config=a.executor_config or {},
+        precondition=a.precondition,
+        postcondition=a.postcondition,
+        enabled=a.enabled,
+        entity_name=a.entity.name if a.entity else "",
+        created_at=a.created_at,
+    )
+
+
+def _rule_out(r: OntologyRule) -> RuleOut:
+    return RuleOut(
+        id=r.id,
+        scenario_id=r.scenario_id,
+        entity_id=r.entity_id,
+        name=r.name,
+        description=r.description,
+        condition=r.condition or {},
+        action_on_match=r.action_on_match,
+        trigger_action_ids=r.trigger_action_ids or [],
+        severity=r.severity,
+        enabled=r.enabled,
+        entity_name=r.entity.name if r.entity else "",
+        created_at=r.created_at,
+    )
+
+
+def _event_out(e: OntologyEvent) -> EventOut:
+    return EventOut(
+        id=e.id,
+        scenario_id=e.scenario_id,
+        name=e.name,
+        description=e.description,
+        payload_schema=e.payload_schema or {},
+        trigger_source=e.trigger_source,
+        enabled=e.enabled,
+        created_at=e.created_at,
+    )
+
+
+def _workflow_out(w: OntologyWorkflow) -> WorkflowOut:
+    return WorkflowOut(
+        id=w.id,
+        scenario_id=w.scenario_id,
+        name=w.name,
+        description=w.description,
+        trigger_type=w.trigger_type,
+        trigger_config=w.trigger_config or {},
+        steps=w.steps or [],
+        nodes=w.nodes or [],
+        edges=w.edges or [],
+        enabled=w.enabled,
+        created_at=w.created_at,
+    )
+
+
+def _entity_out(e: OntologyEntity) -> EntityOut:
+    return EntityOut(
+        id=e.id,
+        scenario_id=e.scenario_id,
+        name=e.name,
+        description=e.description,
+        icon=e.icon,
+        color=e.color,
+        is_abstract=e.is_abstract,
+        created_at=e.created_at,
+        properties=[
+            PropertyIn(
+                name=p.name,
+                data_type=p.data_type,
+                description=p.description,
+                is_key=p.is_key,
+                is_required=p.is_required,
+                is_enum=p.is_enum,
+                enum_values=p.enum_values or [],
+                default_value=p.default_value,
+            )
+            for p in e.properties
+        ],
+    )
+
+
+def _relation_out(r: OntologyRelation, entities: list[OntologyEntity]) -> RelationOut:
+    name_map = {e.id: e.name for e in entities}
+    return RelationOut(
+        id=r.id,
+        scenario_id=r.scenario_id,
+        name=r.name,
+        source_entity_id=r.source_entity_id,
+        target_entity_id=r.target_entity_id,
+        relation_type=r.relation_type,
+        description=r.description,
+        source_entity_name=name_map.get(r.source_entity_id, ""),
+        target_entity_name=name_map.get(r.target_entity_id, ""),
+    )
+
+
+@router.get("", response_model=list[ScenarioOut])
+def list_scenarios(db: Session = Depends(get_db)):
+    return [_scenario_out(s) for s in db.execute(select(BusinessScenario)).scalars().all()]
+
+
+@router.post("", response_model=ScenarioOut)
+def create_scenario(payload: ScenarioIn, db: Session = Depends(get_db)):
+    s = BusinessScenario(**payload.model_dump())
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return _scenario_out(s)
+
+
+def _instance_out(i: OntologyInstance) -> InstanceOut:
+    ent = i.entity
+    return InstanceOut(
+        id=i.id,
+        scenario_id=i.scenario_id,
+        entity_id=i.entity_id,
+        name=i.name,
+        attributes=i.attributes or {},
+        source=i.source,
+        source_ref=i.source_ref,
+        entity_name=ent.name if ent else "",
+        entity_color=ent.color if ent else "",
+        created_at=i.created_at,
+    )
+
+
+def _rel_instance_out(ri: RelationInstance) -> RelationInstanceOut:
+    rel = ri.relation
+    return RelationInstanceOut(
+        id=ri.id,
+        scenario_id=ri.scenario_id,
+        relation_id=ri.relation_id,
+        source_instance_id=ri.source_instance_id,
+        target_instance_id=ri.target_instance_id,
+        attributes=ri.attributes or {},
+        relation_name=rel.name if rel else "",
+        source_instance_name=ri.source_instance.name if ri.source_instance else "",
+        target_instance_name=ri.target_instance.name if ri.target_instance else "",
+        created_at=ri.created_at,
+    )
+
+
+def _mapping_out(m: DataMapping) -> DataMappingOut:
+    ent = m.entity
+    ds = m.data_source
+    return DataMappingOut(
+        id=m.id,
+        scenario_id=m.scenario_id,
+        entity_id=m.entity_id,
+        data_source_id=m.data_source_id,
+        table_name=m.table_name,
+        column_map=m.column_map or {},
+        entity_name=ent.name if ent else "",
+        data_source_name=ds.name if ds else "",
+        data_source_type=ds.type if ds else "",
+        created_at=m.created_at,
+    )
+
+
+@router.get("/{scenario_id}", response_model=ScenarioDetail)
+def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    base = _scenario_out(s)
+    entities = [_entity_out(e) for e in s.entities]
+    relations = [_relation_out(r, s.entities) for r in s.relations]
+    from ..schemas import DataSourceOut
+
+    ds_out = [
+        DataSourceOut(
+            id=d.id,
+            scenario_id=d.scenario_id,
+            name=d.name,
+            type=d.type,
+            config=d.config or {},
+            status=d.status,
+            last_error=d.last_error,
+            created_at=d.created_at,
+            file_count=len(d.files),
+        )
+        for d in s.data_sources
+    ]
+    instances = [_instance_out(i) for i in s.instances]
+    rel_instances = [_rel_instance_out(ri) for ri in s.relation_instances]
+    mappings = [_mapping_out(m) for m in s.data_mappings]
+    actions = [_action_out(a) for a in s.actions]
+    rules = [_rule_out(r) for r in s.rules]
+    events = [_event_out(e) for e in s.events]
+    workflows = [_workflow_out(w) for w in s.workflows]
+    return ScenarioDetail(
+        **base.model_dump(),
+        entities=entities,
+        relations=relations,
+        data_sources=ds_out,
+        instances=instances,
+        relation_instances=rel_instances,
+        mappings=mappings,
+        actions=actions,
+        rules=rules,
+        events=events,
+        workflows=workflows,
+    )
+
+
+@router.get("/{scenario_id}/graph")
+def scenario_graph(scenario_id: str, mode: str = "schema", db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    return ontology_service.build_graph(s, mode=mode)
+
+
+@router.put("/{scenario_id}", response_model=ScenarioOut)
+def update_scenario(scenario_id: str, payload: ScenarioIn, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    for k, v in payload.model_dump().items():
+        setattr(s, k, v)
+    db.commit()
+    db.refresh(s)
+    return _scenario_out(s)
+
+
+@router.delete("/{scenario_id}", response_model=Msg)
+def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    db.delete(s)
+    db.commit()
+    return Msg(message="已删除")
+
+
+# ── 实体 ──────────────────────────────────────
+@router.post("/{scenario_id}/entities", response_model=EntityOut)
+def create_entity(scenario_id: str, payload: EntityIn, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    e = OntologyEntity(scenario_id=scenario_id, **{k: v for k, v in payload.model_dump().items() if k != "properties"})
+    db.add(e)
+    db.flush()
+    for p in payload.properties:
+        db.add(OntologyProperty(entity_id=e.id, **p.model_dump()))
+    db.commit()
+    db.refresh(e)
+    return _entity_out(e)
+
+
+@router.put("/entities/{entity_id}", response_model=EntityOut)
+def update_entity(entity_id: str, payload: EntityIn, db: Session = Depends(get_db)):
+    e = db.get(OntologyEntity, entity_id)
+    if not e:
+        raise HTTPException(404, "实体不存在")
+    for k in ("name", "description", "icon", "color", "is_abstract"):
+        setattr(e, k, getattr(payload, k))
+    # 重建属性
+    for p in list(e.properties):
+        db.delete(p)
+    db.flush()
+    for p in payload.properties:
+        db.add(OntologyProperty(entity_id=e.id, **p.model_dump()))
+    db.commit()
+    db.refresh(e)
+    return _entity_out(e)
+
+
+@router.delete("/entities/{entity_id}", response_model=Msg)
+def delete_entity(entity_id: str, db: Session = Depends(get_db)):
+    e = db.get(OntologyEntity, entity_id)
+    if not e:
+        raise HTTPException(404, "实体不存在")
+    # 删除关联关系（含关系实例）
+    for r in list(e.scenario.relations):
+        if r.source_entity_id == entity_id or r.target_entity_id == entity_id:
+            for ri in list(r.relation_instances):
+                db.delete(ri)
+            db.delete(r)
+    # 删除实例（含其关系实例）与数据映射
+    for i in list(e.instances):
+        for ri in list(i.source_instances) + list(i.target_instances):
+            db.delete(ri)
+        db.delete(i)
+    for m in list(e.data_mappings):
+        db.delete(m)
+    db.delete(e)
+    db.commit()
+    return Msg(message="已删除")
+
+
+# ── 关系 ──────────────────────────────────────
+@router.post("/{scenario_id}/relations", response_model=RelationOut)
+def create_relation(scenario_id: str, payload: RelationIn, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    r = OntologyRelation(scenario_id=scenario_id, **payload.model_dump())
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    return _relation_out(r, s.entities)
+
+
+@router.put("/relations/{relation_id}", response_model=RelationOut)
+def update_relation(relation_id: str, payload: RelationIn, db: Session = Depends(get_db)):
+    r = db.get(OntologyRelation, relation_id)
+    if not r:
+        raise HTTPException(404, "关系不存在")
+    for k, v in payload.model_dump().items():
+        setattr(r, k, v)
+    db.commit()
+    db.refresh(r)
+    s = db.get(BusinessScenario, r.scenario_id)
+    return _relation_out(r, s.entities if s else [])
+
+
+@router.delete("/relations/{relation_id}", response_model=Msg)
+def delete_relation(relation_id: str, db: Session = Depends(get_db)):
+    r = db.get(OntologyRelation, relation_id)
+    if not r:
+        raise HTTPException(404, "关系不存在")
+    # 级联删除关系实例
+    for ri in list(r.relation_instances):
+        db.delete(ri)
+    db.delete(r)
+    db.commit()
+    return Msg(message="已删除")
+
+
+# ── AI 生成本体 ───────────────────────────────
+@router.post("/{scenario_id}/generate-ontology")
+def generate_ontology(scenario_id: str, payload: dict, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    description = (payload.get("description") or "").strip() or s.description or s.name
+    try:
+        return ontology_service.generate_ontology(db, s, description)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"AI 生成失败: {exc}")
+
+
+@router.post("/{scenario_id}/apply-ontology", response_model=Msg)
+def apply_ontology(scenario_id: str, payload: dict, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    ontology_service.apply_generated_ontology(db, s, payload)
+    return Msg(message="已应用")
+
+
+# ── 实例 ──────────────────────────────────────
+@router.post("/{scenario_id}/instances", response_model=InstanceOut)
+def create_instance(scenario_id: str, payload: InstanceIn, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    if not db.get(OntologyEntity, payload.entity_id):
+        raise HTTPException(404, "实体不存在")
+    i = OntologyInstance(scenario_id=scenario_id, **payload.model_dump())
+    db.add(i)
+    db.commit()
+    db.refresh(i)
+    return _instance_out(i)
+
+
+@router.put("/instances/{instance_id}", response_model=InstanceOut)
+def update_instance(instance_id: str, payload: InstanceIn, db: Session = Depends(get_db)):
+    i = db.get(OntologyInstance, instance_id)
+    if not i:
+        raise HTTPException(404, "实例不存在")
+    for k in ("entity_id", "name", "attributes", "source", "source_ref"):
+        setattr(i, k, getattr(payload, k))
+    db.commit()
+    db.refresh(i)
+    return _instance_out(i)
+
+
+@router.delete("/instances/{instance_id}", response_model=Msg)
+def delete_instance(instance_id: str, db: Session = Depends(get_db)):
+    i = db.get(OntologyInstance, instance_id)
+    if not i:
+        raise HTTPException(404, "实例不存在")
+    for ri in list(i.source_instances) + list(i.target_instances):
+        db.delete(ri)
+    db.delete(i)
+    db.commit()
+    return Msg(message="已删除")
+
+
+# ── 关系实例 ──────────────────────────────────
+@router.post("/{scenario_id}/relation-instances", response_model=RelationInstanceOut)
+def create_relation_instance(scenario_id: str, payload: RelationInstanceIn, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    ri = RelationInstance(scenario_id=scenario_id, **payload.model_dump())
+    db.add(ri)
+    db.commit()
+    db.refresh(ri)
+    return _rel_instance_out(ri)
+
+
+@router.delete("/relation-instances/{ri_id}", response_model=Msg)
+def delete_relation_instance(ri_id: str, db: Session = Depends(get_db)):
+    ri = db.get(RelationInstance, ri_id)
+    if not ri:
+        raise HTTPException(404, "关系实例不存在")
+    db.delete(ri)
+    db.commit()
+    return Msg(message="已删除")
+
+
+# ── 数据映射 ──────────────────────────────────
+@router.post("/{scenario_id}/mappings", response_model=DataMappingOut)
+def create_mapping(scenario_id: str, payload: DataMappingIn, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    # 同一实体只保留一条映射
+    old = db.execute(
+        select(DataMapping).where(
+            DataMapping.scenario_id == scenario_id, DataMapping.entity_id == payload.entity_id
+        )
+    ).scalars().all()
+    for o in old:
+        db.delete(o)
+    m = DataMapping(scenario_id=scenario_id, **payload.model_dump())
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return _mapping_out(m)
+
+
+@router.delete("/mappings/{mapping_id}", response_model=Msg)
+def delete_mapping(mapping_id: str, db: Session = Depends(get_db)):
+    m = db.get(DataMapping, mapping_id)
+    if not m:
+        raise HTTPException(404, "映射不存在")
+    db.delete(m)
+    db.commit()
+    return Msg(message="已删除")
+
+
+@router.post("/mappings/{mapping_id}/import")
+def import_mapping(mapping_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
+    m = db.get(DataMapping, mapping_id)
+    if not m:
+        raise HTTPException(404, "映射不存在")
+    s = db.get(BusinessScenario, m.scenario_id)
+    limit = int((payload or {}).get("limit", 50))
+    try:
+        return ontology_service.import_instances_from_mapping(db, s, m, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"导入失败: {exc}")
+
+
+# ── 操作（Actions）────────────────────────────
+@router.post("/{scenario_id}/actions", response_model=ActionOut)
+def create_action(scenario_id: str, payload: ActionIn, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    if not db.get(OntologyEntity, payload.entity_id):
+        raise HTTPException(404, "实体不存在")
+    a = OntologyAction(scenario_id=scenario_id, **payload.model_dump())
+    db.add(a)
+    db.commit()
+    db.refresh(a)
+    return _action_out(a)
+
+
+@router.put("/actions/{action_id}", response_model=ActionOut)
+def update_action(action_id: str, payload: ActionIn, db: Session = Depends(get_db)):
+    a = db.get(OntologyAction, action_id)
+    if not a:
+        raise HTTPException(404, "操作不存在")
+    for k, v in payload.model_dump().items():
+        setattr(a, k, v)
+    db.commit()
+    db.refresh(a)
+    return _action_out(a)
+
+
+@router.delete("/actions/{action_id}", response_model=Msg)
+def delete_action(action_id: str, db: Session = Depends(get_db)):
+    a = db.get(OntologyAction, action_id)
+    if not a:
+        raise HTTPException(404, "操作不存在")
+    db.delete(a)
+    db.commit()
+    return Msg(message="已删除")
+
+
+@router.post("/actions/{action_id}/execute")
+def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = Depends(get_db)):
+    a = db.get(OntologyAction, action_id)
+    if not a:
+        raise HTTPException(404, "操作不存在")
+    try:
+        return workflow_service.execute_action(db, a, payload.params)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"执行失败: {exc}")
+
+
+# ── 规则（Rules）──────────────────────────────
+@router.post("/{scenario_id}/rules", response_model=RuleOut)
+def create_rule(scenario_id: str, payload: RuleIn, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    if payload.entity_id and not db.get(OntologyEntity, payload.entity_id):
+        raise HTTPException(404, "实体不存在")
+    r = OntologyRule(scenario_id=scenario_id, **payload.model_dump())
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    return _rule_out(r)
+
+
+@router.put("/rules/{rule_id}", response_model=RuleOut)
+def update_rule(rule_id: str, payload: RuleIn, db: Session = Depends(get_db)):
+    r = db.get(OntologyRule, rule_id)
+    if not r:
+        raise HTTPException(404, "规则不存在")
+    for k, v in payload.model_dump().items():
+        setattr(r, k, v)
+    db.commit()
+    db.refresh(r)
+    return _rule_out(r)
+
+
+@router.delete("/rules/{rule_id}", response_model=Msg)
+def delete_rule(rule_id: str, db: Session = Depends(get_db)):
+    r = db.get(OntologyRule, rule_id)
+    if not r:
+        raise HTTPException(404, "规则不存在")
+    db.delete(r)
+    db.commit()
+    return Msg(message="已删除")
+
+
+@router.post("/rules/{rule_id}/evaluate")
+def evaluate_rule(rule_id: str, payload: dict, db: Session = Depends(get_db)):
+    """对给定数据记录评估规则是否命中。payload: {record: {...}}"""
+    r = db.get(OntologyRule, rule_id)
+    if not r:
+        raise HTTPException(404, "规则不存在")
+    record = (payload or {}).get("record", {})
+    return workflow_service.evaluate_rule(r, record)
+
+
+# ── 事件（Events）─────────────────────────────
+@router.post("/{scenario_id}/events", response_model=EventOut)
+def create_event(scenario_id: str, payload: EventIn, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    e = OntologyEvent(scenario_id=scenario_id, **payload.model_dump())
+    db.add(e)
+    db.commit()
+    db.refresh(e)
+    return _event_out(e)
+
+
+@router.put("/events/{event_id}", response_model=EventOut)
+def update_event(event_id: str, payload: EventIn, db: Session = Depends(get_db)):
+    e = db.get(OntologyEvent, event_id)
+    if not e:
+        raise HTTPException(404, "事件不存在")
+    for k, v in payload.model_dump().items():
+        setattr(e, k, v)
+    db.commit()
+    db.refresh(e)
+    return _event_out(e)
+
+
+@router.delete("/events/{event_id}", response_model=Msg)
+def delete_event(event_id: str, db: Session = Depends(get_db)):
+    e = db.get(OntologyEvent, event_id)
+    if not e:
+        raise HTTPException(404, "事件不存在")
+    db.delete(e)
+    db.commit()
+    return Msg(message="已删除")
+
+
+# ── 工作流（Workflows）────────────────────────
+@router.post("/{scenario_id}/workflows", response_model=WorkflowOut)
+def create_workflow(scenario_id: str, payload: WorkflowIn, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    w = OntologyWorkflow(scenario_id=scenario_id, **payload.model_dump())
+    db.add(w)
+    db.commit()
+    db.refresh(w)
+    return _workflow_out(w)
+
+
+@router.put("/workflows/{workflow_id}", response_model=WorkflowOut)
+def update_workflow(workflow_id: str, payload: WorkflowIn, db: Session = Depends(get_db)):
+    w = db.get(OntologyWorkflow, workflow_id)
+    if not w:
+        raise HTTPException(404, "工作流不存在")
+    for k, v in payload.model_dump().items():
+        setattr(w, k, v)
+    db.commit()
+    db.refresh(w)
+    return _workflow_out(w)
+
+
+@router.delete("/workflows/{workflow_id}", response_model=Msg)
+def delete_workflow(workflow_id: str, db: Session = Depends(get_db)):
+    w = db.get(OntologyWorkflow, workflow_id)
+    if not w:
+        raise HTTPException(404, "工作流不存在")
+    db.delete(w)
+    db.commit()
+    return Msg(message="已删除")
+
+
+@router.post("/workflows/{workflow_id}/execute")
+def execute_workflow(workflow_id: str, payload: WorkflowExecuteRequest, db: Session = Depends(get_db)):
+    w = db.get(OntologyWorkflow, workflow_id)
+    if not w:
+        raise HTTPException(404, "工作流不存在")
+    try:
+        return workflow_service.execute_workflow(db, w, payload.params)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"执行失败: {exc}")
+
+
+@router.post("/{scenario_id}/workflows/generate")
+def generate_workflow(scenario_id: str, payload: WorkflowGenerateRequest, db: Session = Depends(get_db)):
+    """AI 生成可视化工作流草稿（DAG 节点+连线，不落库）。"""
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    try:
+        return workflow_service.generate_workflow(db, s, payload.description)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"生成失败: {exc}")
+
+
+# ── 执行日志 ──────────────────────────────────
+@router.get("/{scenario_id}/execution-logs", response_model=list[ActionExecutionLogOut])
+def list_execution_logs(scenario_id: str, limit: int = 50, db: Session = Depends(get_db)):
+    s = db.get(BusinessScenario, scenario_id)
+    if not s:
+        raise HTTPException(404, "场景不存在")
+    logs = db.execute(
+        select(ActionExecutionLog)
+        .where(ActionExecutionLog.scenario_id == scenario_id)
+        .order_by(ActionExecutionLog.created_at.desc())
+        .limit(limit)
+    ).scalars().all()
+    return [
+        ActionExecutionLogOut(
+            id=l.id,
+            scenario_id=l.scenario_id,
+            target_type=l.target_type,
+            target_id=l.target_id,
+            target_name=l.target_name,
+            input_params=l.input_params or {},
+            status=l.status,
+            result=l.result or {},
+            error=l.error,
+            duration_ms=l.duration_ms,
+            created_at=l.created_at,
+        )
+        for l in logs
+    ]

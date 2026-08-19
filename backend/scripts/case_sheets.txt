@@ -1,0 +1,10 @@
+﻿python : D:\miniconda3\envs\ontology_platform_env\python.exe: can't open file '
+E:\\work\\test\\backend\\scripts\\explore_case.py': [Errno 2] No such file or d
+irectory
+所在位置 行:1 字符: 1
++ python scripts\explore_case.py list 2>&1 | Out-File -Encoding utf8 sc ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (D:\miniconda3\e...le or directory 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
