@@ -279,12 +279,22 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
     return {"entities": entities, "relations": clean_rels}
 
 
-def apply_generated_ontology(db: Session, scenario: BusinessScenario, data: dict[str, Any]) -> None:
+def apply_generated_ontology(
+    db: Session,
+    scenario: BusinessScenario,
+    data: dict[str, Any],
+    *,
+    commit: bool = True,
+) -> dict[str, int]:
     """把 AI 生成的本体草稿写入场景（追加，不覆盖已有）。"""
     name_map = {e.name: e for e in scenario.entities}
-    created: dict[str, OntologyEntity] = {}
+    relation_keys = {(r.name, r.source_entity_id, r.target_entity_id) for r in scenario.relations}
+    relation_names = {r.name for r in scenario.relations}
+    entities_added = 0
+    entities_skipped = 0
     for e in data.get("entities", []):
         if e["name"] in name_map:
+            entities_skipped += 1
             continue
         ent = OntologyEntity(
             scenario_id=scenario.id,
@@ -307,11 +317,18 @@ def apply_generated_ontology(db: Session, scenario: BusinessScenario, data: dict
                     is_required=bool(p.get("is_required", False)),
                 )
             )
-        created[e["name"]] = ent
         name_map[e["name"]] = ent
+        entities_added += 1
+    relations_added = 0
+    relations_skipped = 0
     for r in data.get("relations", []):
         src, tgt = name_map.get(r["source"]), name_map.get(r["target"])
         if not src or not tgt:
+            relations_skipped += 1
+            continue
+        relation_key = (r["name"], src.id, tgt.id)
+        if r["name"] in relation_names or relation_key in relation_keys:
+            relations_skipped += 1
             continue
         db.add(
             OntologyRelation(
@@ -323,7 +340,17 @@ def apply_generated_ontology(db: Session, scenario: BusinessScenario, data: dict
                 description=r.get("description", ""),
             )
         )
-    db.commit()
+        relation_keys.add(relation_key)
+        relation_names.add(r["name"])
+        relations_added += 1
+    if commit:
+        db.commit()
+    return {
+        "entities_added": entities_added,
+        "entities_skipped": entities_skipped,
+        "relations_added": relations_added,
+        "relations_skipped": relations_skipped,
+    }
 
 
 # ──────────────────────────────────────────────

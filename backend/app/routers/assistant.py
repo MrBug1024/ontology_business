@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ from ..schemas import (
 )
 from ..services import doc_parser, llm_service, ontology_service, tenant_service, workflow_service
 from ..services.auth_service import get_tenant_db
-from ..services.policies import PolicyViolation, validate_workflow_graph
+from ..services.policies import PolicyViolation
 
 router = APIRouter(prefix="/assistant", tags=["assistant"])
 
@@ -103,6 +104,107 @@ def _scenario_context(scenario: BusinessScenario | None) -> str:
         for relation in scenario.relations[:30]:
             lines.append(f"- {relation.name}（{relation.relation_type}）")
     return "\n".join(lines)
+
+
+def _scenario_snapshot(scenario: BusinessScenario) -> dict[str, Any]:
+    """生成提案的轻量基线，防止用户确认前场景已被其他操作改写。"""
+    return {
+        "entity_names": sorted(str(entity.name) for entity in scenario.entities),
+        "relation_names": sorted(str(relation.name) for relation in scenario.relations),
+        "workflow_names": sorted(str(workflow.name) for workflow in scenario.workflows),
+    }
+
+
+def _build_proposal(kind: str, data: dict[str, Any], scenario: BusinessScenario) -> dict[str, Any]:
+    """将生成结果包装成可审计、可确认的 Change Set。"""
+    snapshot = _scenario_snapshot(scenario)
+    changes: list[dict[str, Any]] = []
+    if kind == "ontology":
+        existing_entities = set(snapshot["entity_names"])
+        existing_relations = set(snapshot["relation_names"])
+        for entity in data.get("entities") or []:
+            name = str(entity.get("name") or "未命名实体").strip()
+            exists = name in existing_entities
+            changes.append(
+                {
+                    "operation": "skip" if exists else "add",
+                    "resource": "entity",
+                    "name": name,
+                    "summary": "实体已存在，应用时跳过" if exists else f"新增实体，包含 {len(entity.get('properties') or [])} 个属性",
+                }
+            )
+            existing_entities.add(name)
+        for relation in data.get("relations") or []:
+            name = str(relation.get("name") or "未命名关系").strip()
+            exists = name in existing_relations
+            changes.append(
+                {
+                    "operation": "skip" if exists else "add",
+                    "resource": "relation",
+                    "name": name,
+                    "summary": "关系已存在，应用时跳过" if exists else f"新增关系：{relation.get('source', '')} → {relation.get('target', '')}",
+                }
+            )
+            existing_relations.add(name)
+        title = "本体建模变更草稿"
+        summary = f"建议新增 {sum(1 for item in changes if item['operation'] == 'add' and item['resource'] == 'entity')} 个实体和 {sum(1 for item in changes if item['operation'] == 'add' and item['resource'] == 'relation')} 条关系。"
+    else:
+        workflow_name = str(data.get("name") or "AI 生成工作流").strip()
+        changes.append(
+            {
+                "operation": "add",
+                "resource": "workflow",
+                "name": workflow_name,
+                "summary": "新增一个草稿状态的工作流，不会立即执行",
+            }
+        )
+        for node in data.get("nodes") or []:
+            node_name = str(node.get("name") or node.get("label") or node.get("id") or "未命名节点")
+            changes.append(
+                {
+                    "operation": "add",
+                    "resource": "workflow_node",
+                    "name": node_name,
+                    "summary": f"新增 {node.get('type') or '业务'} 节点",
+                }
+            )
+        for edge in data.get("edges") or []:
+            changes.append(
+                {
+                    "operation": "add",
+                    "resource": "workflow_edge",
+                    "name": f"{edge.get('source', '')} → {edge.get('target', '')}",
+                    "summary": edge.get("label") or "新增流程连线",
+                }
+            )
+        title = "工作流编排变更草稿"
+        summary = f"建议生成 {len(data.get('nodes') or [])} 个节点和 {len(data.get('edges') or [])} 条连线。"
+    return {
+        "proposal_id": uuid.uuid4().hex,
+        "kind": kind,
+        "title": title,
+        "summary": summary,
+        "payload": data,
+        "changes": changes,
+        "base_snapshot": snapshot,
+        "requires_confirmation": True,
+        "status": "pending",
+    }
+
+
+def _find_saved_proposal(db: Session, thread_id: str, proposal_id: str) -> tuple[AssistantThread, AssistantMessage, dict[str, Any]]:
+    thread = _thread(db, thread_id)
+    messages = db.execute(
+        select(AssistantMessage).where(
+            AssistantMessage.thread_id == thread.id,
+            AssistantMessage.role == "assistant",
+        ).order_by(AssistantMessage.created_at.desc())
+    ).scalars().all()
+    for message in messages:
+        proposal = message.proposal if isinstance(message.proposal, dict) else {}
+        if proposal.get("proposal_id") == proposal_id:
+            return thread, message, proposal
+    raise HTTPException(404, "变更草稿不存在或已过期，请重新生成")
 
 
 def _attachment_context(attachments: list[AssistantAttachment]) -> tuple[str, list[dict[str, Any]]]:
@@ -432,13 +534,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield progress({"id": "ontology", "title": "生成本体草稿", "detail": "正在整理实体、属性和关系建议。", "status": "running"})
                 description = payload.message + (f"\n\n参考附件内容：\n{attachment_text}" if attachment_text else "")
                 data = ontology_service.generate_ontology(db, scenario, description)
-                proposal = {
-                    "kind": "ontology",
-                    "title": "本体建模变更草稿",
-                    "summary": f"建议新增 {len(data.get('entities', []))} 个实体和 {len(data.get('relations', []))} 条关系。",
-                    "payload": data,
-                    "requires_confirmation": True,
-                }
+                proposal = _build_proposal("ontology", data, scenario)
                 reply = "我已经根据当前场景和附件生成了本体草稿。请检查变更内容，确认后再应用到场景。"
                 yield progress({"id": "ontology", "title": "生成本体草稿", "detail": "实体和关系建议已整理完成。", "status": "done"})
                 yield _sse("proposal", proposal)
@@ -447,13 +543,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield progress({"id": "workflow", "title": "编排工作流草稿", "detail": "正在识别触发条件、节点和分支关系。", "status": "running"})
                 description = payload.message + (f"\n\n参考附件内容：\n{attachment_text}" if attachment_text else "")
                 data = workflow_service.generate_workflow(db, scenario, description)
-                proposal = {
-                    "kind": "workflow",
-                    "title": "工作流编排变更草稿",
-                    "summary": f"建议生成 {len(data.get('nodes', []))} 个节点和 {len(data.get('edges', []))} 条连线。",
-                    "payload": data,
-                    "requires_confirmation": True,
-                }
+                proposal = _build_proposal("workflow", data, scenario)
                 reply = "我已经生成了工作流草稿。请先检查节点、分支和动作引用，确认后再保存。"
                 yield progress({"id": "workflow", "title": "编排工作流草稿", "detail": "节点和连线建议已整理完成。", "status": "done"})
                 yield _sse("proposal", proposal)
@@ -560,26 +650,14 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             if attachment_text:
                 description += f"\n\n参考附件内容：\n{attachment_text}"
             data = ontology_service.generate_ontology(db, scenario, description)
-            proposal = {
-                "kind": "ontology",
-                "title": "本体建模变更草稿",
-                "summary": f"建议新增 {len(data.get('entities', []))} 个实体和 {len(data.get('relations', []))} 条关系。",
-                "payload": data,
-                "requires_confirmation": True,
-            }
+            proposal = _build_proposal("ontology", data, scenario)
             reply = "我已经根据当前场景和附件生成了本体草稿。请检查变更内容，确认后再应用到场景。"
         elif intent == "workflow" and scenario:
             description = payload.message
             if attachment_text:
                 description += f"\n\n参考附件内容：\n{attachment_text}"
             data = workflow_service.generate_workflow(db, scenario, description)
-            proposal = {
-                "kind": "workflow",
-                "title": "工作流编排变更草稿",
-                "summary": f"建议生成 {len(data.get('nodes', []))} 个节点和 {len(data.get('edges', []))} 条连线。",
-                "payload": data,
-                "requires_confirmation": True,
-            }
+            proposal = _build_proposal("workflow", data, scenario)
             reply = "我已经生成了工作流草稿。请先检查节点、分支和动作引用，确认后再保存。"
         else:
             llm = _llm(db)
@@ -649,10 +727,27 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
 
 @router.post("/proposals/apply")
 def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends(get_tenant_db)):
+    if not payload.confirm:
+        raise HTTPException(409, "应用变更必须显式确认")
     scenario = _scenario(db, payload.scenario_id, writable=True)
-    thread = _thread(db, payload.thread_id) if payload.thread_id else None
+    thread, proposal_message, saved_proposal = _find_saved_proposal(db, payload.thread_id, payload.proposal_id)
+    if thread.scenario_id != scenario.id:
+        raise HTTPException(409, "变更草稿与当前业务场景不一致")
+    if saved_proposal.get("kind") != payload.kind:
+        raise HTTPException(409, "变更草稿类型与请求不一致")
+    if saved_proposal.get("status") == "applied":
+        return {
+            "ok": True,
+            "status": "replayed",
+            "message": "该变更草稿已经应用过，已返回原应用结果",
+            "data": saved_proposal.get("apply_result") or {},
+        }
+    expected_snapshot = saved_proposal.get("base_snapshot") or {}
+    if expected_snapshot and expected_snapshot != _scenario_snapshot(scenario):
+        raise HTTPException(409, "场景在确认前已发生变化，请重新生成变更草稿")
+
     kind = payload.kind
-    data = payload.payload or {}
+    data = saved_proposal.get("payload") or {}
     result: dict[str, Any]
 
     try:
@@ -661,12 +756,17 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             relations = data.get("relations") or []
             if not entities:
                 raise PolicyViolation("本体草稿没有实体，不能应用")
-            ontology_service.apply_generated_ontology(db, scenario, {"entities": entities, "relations": relations})
-            result = {"kind": kind, "entities": len(entities), "relations": len(relations)}
+            applied = ontology_service.apply_generated_ontology(
+                db,
+                scenario,
+                {"entities": entities, "relations": relations},
+                commit=False,
+            )
+            result = {"kind": kind, **applied}
         else:
             nodes = data.get("nodes") or []
             edges = data.get("edges") or []
-            validate_workflow_graph(nodes, edges)
+            workflow_service.validate_workflow_definition(nodes, edges)
             workflow = OntologyWorkflow(
                 scenario_id=scenario.id,
                 name=str(data.get("name") or "AI 生成工作流"),
@@ -675,6 +775,7 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
                 steps=[],
                 nodes=nodes,
                 edges=edges,
+                status="draft",
                 enabled=False,
             )
             db.add(workflow)
@@ -684,6 +785,11 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
         db.rollback()
         raise
 
+    updated_proposal = dict(saved_proposal)
+    updated_proposal["status"] = "applied"
+    updated_proposal["applied_at"] = datetime.now(timezone.utc).isoformat()
+    updated_proposal["apply_result"] = result
+    proposal_message.proposal = updated_proposal
     db.add(
         AssistantAuditLog(
             tenant_id=_tenant(db),
@@ -692,7 +798,7 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             thread_id=thread.id if thread else None,
             operation="apply_proposal",
             status="success",
-            context={"kind": kind},
+            context={"kind": kind, "proposal_id": payload.proposal_id, "confirmed": True},
             result=result,
         )
     )

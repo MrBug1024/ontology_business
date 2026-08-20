@@ -695,6 +695,8 @@ class OntologyWorkflow(Base):
     # edges: [{"id":"e1","source":"start","target":"n1","label":"true|false|""}]
     nodes: Mapped[list] = mapped_column(JSON, default=list)
     edges: Mapped[list] = mapped_column(JSON, default=list)
+    # 生命周期：draft 草稿 / active 启用 / disabled 停用。
+    status: Mapped[str] = mapped_column(String(20), default="draft")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 

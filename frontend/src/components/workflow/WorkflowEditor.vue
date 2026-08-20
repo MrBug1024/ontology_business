@@ -474,6 +474,11 @@ const wf = computed({
       <el-button size="small" text @click="emit('close')"><el-icon><ArrowLeft /></el-icon> 返回</el-button>
       <el-input v-model="wf.name" size="small" class="wfe-name" placeholder="工作流名称，如：数据检查与通知流程" />
       <el-input v-model="wf.description" size="small" class="wfe-desc" placeholder="描述（可选）" />
+      <el-select v-model="wf.status" size="small" class="wfe-status" aria-label="工作流状态">
+        <el-option label="草稿" value="draft" />
+        <el-option label="启用" value="active" />
+        <el-option label="停用" value="disabled" />
+      </el-select>
     </div>
 
     <div class="wfe-body">
@@ -680,6 +685,10 @@ const wf = computed({
 .wfe-desc {
   flex: 1;
   min-width: 120px;
+}
+.wfe-status {
+  width: 92px;
+  flex-shrink: 0;
 }
 .wfe-body {
   flex: 1;
@@ -888,6 +897,17 @@ const wf = computed({
   }
 }
 @media (max-width: 860px) {
+  .wfe-topbar {
+    flex-wrap: wrap;
+  }
+  .wfe-name,
+  .wfe-desc {
+    width: 100%;
+    flex-basis: 100%;
+  }
+  .wfe-status {
+    width: 110px;
+  }
   .wfe-body {
     flex-direction: column;
   }

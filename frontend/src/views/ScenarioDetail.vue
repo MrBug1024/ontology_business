@@ -395,6 +395,11 @@
               <el-table-column label="触发方式" width="110">
                 <template #default="{ row }"><el-tag size="small" effect="plain">{{ row.trigger_type || 'manual' }}</el-tag></template>
               </el-table-column>
+              <el-table-column label="状态" width="90">
+                <template #default="{ row }">
+                  <el-tag size="small" :type="workflowStatusType(row.status)">{{ workflowStatusLabel(row.status) }}</el-tag>
+                </template>
+              </el-table-column>
               <el-table-column label="流程" min-width="280">
                 <template #default="{ row }">
                   <div class="wf-steps">
@@ -409,7 +414,7 @@
               <el-table-column label="操作" width="200" fixed="right">
                 <template #default="{ row }">
                   <el-button size="small" text @click="openWorkflow(row.id)">编排</el-button>
-                  <el-button size="small" text type="primary" :loading="row._executing" @click="doExecuteWorkflow(row)">执行</el-button>
+                  <el-button size="small" text type="primary" :disabled="row.status !== 'active'" :loading="row._executing" @click="doExecuteWorkflow(row)">执行</el-button>
                   <el-button size="small" text type="danger" @click="removeWorkflow(row.id)">删除</el-button>
                 </template>
               </el-table-column>
@@ -1350,7 +1355,7 @@ function openWorkflow(id?: string) {
         nodes: (w.nodes || []).map((n: any) => ({ ...n, data: { ...(n.data || {}) } })),
         edges: (w.edges || []).map((e: any) => ({ ...e })),
       }
-    : { name: '', description: '', trigger_type: 'manual', steps: [], nodes: [], edges: [], enabled: true }
+    : { name: '', description: '', trigger_type: 'manual', steps: [], nodes: [], edges: [], status: 'draft', enabled: true }
 }
 async function saveWorkflow(w: any) {
   try {
@@ -1369,6 +1374,10 @@ async function removeWorkflow(id: string) {
   } catch { /* ignore */ }
 }
 async function doExecuteWorkflow(row: any) {
+  if (row.status !== 'active') {
+    ElMessage.warning('请先将工作流状态设为「启用」')
+    return
+  }
   row._executing = true
   try {
     const params = await promptParams(null, '输入工作流参数（JSON，可为空 {}）')
@@ -1467,6 +1476,12 @@ function goBack() { router.push('/scenarios') }
 function onAssistantApplied(event: Event) {
   const detail = (event as CustomEvent<{ scenario_id?: string }>).detail || {}
   if (!detail.scenario_id || detail.scenario_id === sid) load()
+}
+function workflowStatusLabel(status?: string) {
+  return status === 'active' ? '启用' : status === 'disabled' ? '停用' : '草稿'
+}
+function workflowStatusType(status?: string) {
+  return status === 'active' ? 'success' : status === 'disabled' ? 'info' : 'warning'
 }
 onMounted(() => {
   load()

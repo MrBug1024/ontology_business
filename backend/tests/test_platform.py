@@ -5,14 +5,16 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
 from app.main import app
 from app.models import DataSource, OntologyEntity
-from app.schemas import ObjectProvenanceOut, ObjectSearchItemOut, ObjectSearchOut
+from app.schemas import AssistantProposalApplyRequest, ObjectProvenanceOut, ObjectSearchItemOut, ObjectSearchOut, WorkflowIn
 from app.services.policies import PolicyViolation, validate_action_params, validate_read_only_sql, validate_workflow_graph
 from app.services.auth_service import hash_password, verify_password
 from app.services.ontology_service import _quoted_mapping_table, preview_mapping
-from app.services.workflow_service import evaluate_condition
-from app.routers.assistant import _context_scope, _intent, _sse
+from app.services.workflow_service import evaluate_condition, execute_workflow, validate_workflow_definition
+from app.routers.assistant import _build_proposal, _context_scope, _intent, _sse, apply_proposal
 
 
 class SQLPolicyTests(unittest.TestCase):
@@ -58,6 +60,27 @@ class ActionPolicyTests(unittest.TestCase):
 
 
 class WorkflowPolicyTests(unittest.TestCase):
+    def test_workflow_definition_policy_is_authoritative_and_defaults_to_draft(self) -> None:
+        workflow = WorkflowIn(name="审批流程")
+        self.assertEqual(workflow.status, "draft")
+        validate_workflow_definition(
+            [
+                {"id": "start", "type": "start"},
+                {"id": "end", "type": "end"},
+            ],
+            [{"source": "start", "target": "end"}],
+        )
+        with self.assertRaises(PolicyViolation):
+            validate_workflow_definition(
+                [{"id": "start", "type": "start"}, {"id": "end", "type": "end"}],
+                [{"source": "start", "target": "missing"}],
+            )
+
+    def test_draft_workflow_cannot_execute(self) -> None:
+        workflow = SimpleNamespace(status="draft", enabled=True)
+        with self.assertRaises(PolicyViolation):
+            execute_workflow(None, workflow, {})
+
     def test_accepts_valid_dag(self) -> None:
         nodes = [
             {"id": "start", "type": "start"},
@@ -125,6 +148,107 @@ class AssistantIntentTests(unittest.TestCase):
         self.assertTrue(event.startswith("data: "))
         self.assertTrue(event.endswith("\n\n"))
         self.assertIn('"type": "token"', event)
+
+    def test_change_set_has_identity_diff_and_baseline(self) -> None:
+        scenario = SimpleNamespace(
+            entities=[SimpleNamespace(name="客户")],
+            relations=[SimpleNamespace(name="客户拥有订单")],
+            workflows=[SimpleNamespace(name="历史流程")],
+        )
+        proposal = _build_proposal(
+            "ontology",
+            {
+                "entities": [
+                    {"name": "客户", "properties": []},
+                    {"name": "订单", "properties": [{"name": "订单号"}]},
+                ],
+                "relations": [{"name": "客户拥有订单", "source": "客户", "target": "订单"}],
+            },
+            scenario,
+        )
+        self.assertEqual(len(proposal["proposal_id"]), 32)
+        self.assertEqual(proposal["status"], "pending")
+        self.assertEqual(proposal["base_snapshot"]["entity_names"], ["客户"])
+        self.assertEqual([item["operation"] for item in proposal["changes"]], ["skip", "add", "skip"])
+
+    def test_apply_request_requires_confirmation_and_saved_proposal_identity(self) -> None:
+        request = AssistantProposalApplyRequest(
+            kind="workflow",
+            scenario_id="scenario-1",
+            thread_id="thread-1",
+            proposal_id="proposal-1",
+            confirm=True,
+        )
+        self.assertTrue(request.confirm)
+        self.assertEqual(request.payload, {})
+
+    def test_apply_proposal_rejects_without_explicit_confirmation(self) -> None:
+        request = AssistantProposalApplyRequest(
+            kind="workflow",
+            scenario_id="scenario-1",
+            thread_id="thread-1",
+            proposal_id="proposal-1",
+        )
+        with self.assertRaises(HTTPException) as error:
+            apply_proposal(request, None)
+        self.assertEqual(error.exception.status_code, 409)
+
+    def test_apply_proposal_uses_saved_payload_and_marks_message_applied(self) -> None:
+        scenario = SimpleNamespace(id="scenario-1", entities=[], relations=[], workflows=[])
+        thread = SimpleNamespace(id="thread-1", scenario_id="scenario-1")
+        proposal_message = SimpleNamespace(proposal={})
+        saved_proposal = {
+            "proposal_id": "proposal-1",
+            "kind": "workflow",
+            "status": "pending",
+            "base_snapshot": {"entity_names": [], "relation_names": [], "workflow_names": []},
+            "payload": {
+                "name": "审批草稿",
+                "nodes": [{"id": "start", "type": "start"}, {"id": "end", "type": "end"}],
+                "edges": [{"source": "start", "target": "end"}],
+            },
+        }
+
+        class FakeDb:
+            info = {"tenant_id": "tenant-1", "user_id": "user-1"}
+
+            def __init__(self) -> None:
+                self.added = []
+                self.committed = False
+
+            def add(self, value) -> None:
+                self.added.append(value)
+
+            def commit(self) -> None:
+                self.committed = True
+
+            def flush(self) -> None:
+                return None
+
+            def rollback(self) -> None:
+                return None
+
+        db = FakeDb()
+        request = AssistantProposalApplyRequest(
+            kind="workflow",
+            scenario_id="scenario-1",
+            thread_id="thread-1",
+            proposal_id="proposal-1",
+            confirm=True,
+            payload={"name": "客户端篡改的工作流", "nodes": [], "edges": []},
+        )
+        fake_workflow = SimpleNamespace(id="workflow-1")
+        with patch("app.routers.assistant._scenario", return_value=scenario), patch(
+            "app.routers.assistant._find_saved_proposal",
+            return_value=(thread, proposal_message, saved_proposal),
+        ), patch("app.routers.assistant.OntologyWorkflow", return_value=fake_workflow):
+            result = apply_proposal(request, db)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["workflow_id"], "workflow-1")
+        self.assertEqual(proposal_message.proposal["status"], "applied")
+        self.assertEqual(proposal_message.proposal["payload"]["name"], "审批草稿")
+        self.assertTrue(db.committed)
 
 
 class ObjectRuntimeTests(unittest.TestCase):

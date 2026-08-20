@@ -107,7 +107,7 @@ export const api = {
     attachment_ids?: string[]
     mode?: 'ask' | 'draft' | 'execute'
   }) => http.post<AssistantReply>('/assistant/chat', d),
-  applyAssistantProposal: (d: { kind: 'ontology' | 'workflow'; scenario_id: string; thread_id?: string; payload: any }) =>
+  applyAssistantProposal: (d: { kind: 'ontology' | 'workflow'; scenario_id: string; thread_id: string; proposal_id: string; confirm: boolean }) =>
     http.post('/assistant/proposals/apply', d),
 
   // 场景

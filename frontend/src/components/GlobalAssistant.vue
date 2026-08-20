@@ -126,7 +126,9 @@
                   <div class="proposal-title"><el-icon aria-hidden="true"><DocumentChecked /></el-icon>{{ proposalOf(message)?.title }}</div>
                   <div class="proposal-summary">{{ proposalOf(message)?.summary }}</div>
                 </div>
-                <el-tag size="small" type="warning" effect="plain">待确认</el-tag>
+                <el-tag size="small" :type="proposalOf(message)?.status === 'applied' ? 'success' : 'warning'" effect="plain">
+                  {{ proposalOf(message)?.status === 'applied' ? '已应用' : '待确认' }}
+                </el-tag>
               </div>
               <div class="proposal-preview">
                 <template v-if="proposalOf(message)?.kind === 'ontology'">
@@ -137,14 +139,25 @@
                   <span>节点 {{ proposalOf(message)?.payload?.nodes?.length || 0 }}</span>
                   <span>连线 {{ proposalOf(message)?.payload?.edges?.length || 0 }}</span>
                 </template>
+                <span v-if="proposalOf(message)?.changes?.length">差异 {{ proposalOf(message)?.changes?.length }}</span>
                 <button type="button" class="preview-toggle" @click="toggleProposal(index)">{{ expandedProposal[index] ? '收起详情' : '查看详情' }}</button>
+              </div>
+              <div v-if="expandedProposal[index] && proposalOf(message)?.changes?.length" class="proposal-changes" aria-label="Change Set 差异">
+                <div v-for="(change, changeIndex) in proposalOf(message)?.changes" :key="`${change.resource}-${change.name}-${changeIndex}`" class="proposal-change">
+                  <el-tag size="small" effect="plain" :type="proposalOperationType(change.operation)">{{ proposalOperationLabel(change.operation) }}</el-tag>
+                  <div class="proposal-change-copy">
+                    <strong>{{ proposalResourceLabel(change.resource) }} · {{ change.name }}</strong>
+                    <span>{{ change.summary }}</span>
+                  </div>
+                </div>
               </div>
               <pre v-if="expandedProposal[index]" class="proposal-code">{{ proposalText(proposalOf(message)) }}</pre>
               <div class="proposal-actions">
-                <el-button size="small" type="primary" :loading="applyingIndex === index" :disabled="!context.scenario_id" @click="applyProposal(message, index)">
-                  <el-icon aria-hidden="true"><Check /></el-icon> 应用到场景草稿
+                <el-button size="small" type="primary" :loading="applyingIndex === index" :disabled="!context.scenario_id || proposalOf(message)?.status === 'applied' || !proposalOf(message)?.proposal_id" @click="applyProposal(message, index)">
+                  <el-icon aria-hidden="true"><Check /></el-icon>{{ proposalOf(message)?.status === 'applied' ? '已应用到场景草稿' : '确认并应用变更' }}
                 </el-button>
                 <span v-if="!context.scenario_id" class="proposal-hint">请先打开业务场景</span>
+                <span v-else-if="!proposalOf(message)?.proposal_id" class="proposal-hint">此草稿缺少安全标识，请重新生成</span>
               </div>
             </div>
 
@@ -267,6 +280,18 @@ function proposalOf(message: AssistantMessage): AssistantProposal | null {
 function proposalText(proposal: AssistantProposal | null) {
   if (!proposal) return ''
   return JSON.stringify(proposal.payload, null, 2)
+}
+
+function proposalOperationLabel(operation: string) {
+  return ({ add: '新增', update: '修改', delete: '删除', skip: '跳过' } as Record<string, string>)[operation] || operation
+}
+
+function proposalOperationType(operation: string) {
+  return ({ add: 'success', update: 'warning', delete: 'danger', skip: 'info' } as Record<string, string>)[operation] || 'info'
+}
+
+function proposalResourceLabel(resource: string) {
+  return ({ entity: '实体', relation: '关系', workflow: '工作流', workflow_node: '工作流节点', workflow_edge: '工作流连线' } as Record<string, string>)[resource] || resource
 }
 
 function sourcesOf(message: AssistantMessage) {
@@ -565,19 +590,34 @@ function send(text?: string) {
 
 async function applyProposal(message: AssistantMessage, index: number) {
   const proposal = proposalOf(message)
-  if (!proposal || !context.value.scenario_id || applyingIndex.value !== null) return
+  if (!proposal || proposal.status === 'applied' || !context.value.scenario_id || !threadId.value || !proposal.proposal_id || applyingIndex.value !== null) return
+  try {
+    await ElMessageBox.confirm(
+      `将把 ${proposal.changes?.filter((change) => change.operation !== 'skip').length || 0} 项变更写入当前场景草稿。草稿状态的工作流不会立即执行。`,
+      '确认应用 Change Set',
+      {
+        type: 'warning',
+        confirmButtonText: '确认应用',
+        cancelButtonText: '取消',
+        distinguishCancelAndClose: true,
+      },
+    )
+  } catch {
+    return
+  }
   applyingIndex.value = index
   try {
-    await api.applyAssistantProposal({
+    const result = await api.applyAssistantProposal({
       kind: proposal.kind,
       scenario_id: context.value.scenario_id,
-      thread_id: threadId.value || undefined,
-      payload: proposal.payload,
+      thread_id: threadId.value,
+      proposal_id: proposal.proposal_id,
+      confirm: true,
     })
     message.content += '\n\n变更已应用到当前场景草稿。'
-    message.proposal = {}
+    message.proposal = { ...proposal, status: 'applied', apply_result: result?.data || {} }
     window.dispatchEvent(new CustomEvent('assistant-proposal-applied', { detail: { scenario_id: context.value.scenario_id, kind: proposal.kind } }))
-    ElMessage.success('变更已应用到场景草稿')
+    ElMessage.success(result?.status === 'replayed' ? '该变更已应用过，已恢复应用结果' : '变更已应用到场景草稿')
   } catch (error: any) {
     ElMessage.error(error.message || '应用变更失败')
   } finally {
@@ -724,6 +764,11 @@ onBeforeUnmount(() => {
 .proposal-summary { margin-top: 4px; color: var(--text-2); font-size: 11.5px; line-height: 1.5; }
 .proposal-preview { display: flex; align-items: center; gap: 10px; padding: 9px 12px; color: var(--text-2); font-size: 11.5px; }
 .preview-toggle { margin-left: auto; padding: 0; border: 0; color: var(--primary-600); background: transparent; cursor: pointer; font: inherit; }
+.proposal-changes { display: flex; flex-direction: column; gap: 7px; max-height: 190px; padding: 0 12px 10px; overflow: auto; }
+.proposal-change { display: flex; align-items: flex-start; gap: 7px; padding: 7px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.proposal-change-copy { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+.proposal-change-copy strong { color: var(--text); font-size: 11px; font-weight: 750; line-height: 1.4; }
+.proposal-change-copy span { color: var(--text-3); font-size: 10.5px; line-height: 1.45; }
 .proposal-code { max-height: 180px; margin: 0 12px 10px; padding: 10px; overflow: auto; border-radius: 8px; color: #e2e8f0; background: #1d2930; font-size: 10px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 .proposal-actions { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-top: 1px solid var(--border); }
 .proposal-hint { color: var(--text-3); font-size: 10.5px; }

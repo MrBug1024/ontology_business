@@ -309,6 +309,7 @@ export interface OntologyWorkflow {
   steps?: WorkflowStep[] // 旧版线性步骤（兼容）
   nodes?: WorkflowNode[] // 可视化 DAG 节点
   edges?: WorkflowEdge[] // 可视化 DAG 连线
+  status?: 'draft' | 'active' | 'disabled' | string
   enabled?: boolean
   created_at?: string
 }
@@ -472,10 +473,21 @@ export interface AssistantAttachment {
 
 export interface AssistantProposal {
   kind: 'ontology' | 'workflow'
+  proposal_id: string
   title: string
   summary?: string
   payload: Record<string, any>
+  changes?: {
+    operation: 'add' | 'update' | 'delete' | 'skip' | string
+    resource: string
+    name: string
+    summary?: string
+  }[]
+  base_snapshot?: Record<string, any>
   requires_confirmation?: boolean
+  status?: 'pending' | 'applied' | string
+  applied_at?: string
+  apply_result?: Record<string, any>
 }
 
 export interface AssistantThought {

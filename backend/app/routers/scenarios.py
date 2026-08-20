@@ -229,6 +229,7 @@ def _workflow_out(w: OntologyWorkflow) -> WorkflowOut:
         steps=w.steps or [],
         nodes=w.nodes or [],
         edges=w.edges or [],
+        status=w.status or ("active" if w.enabled else "disabled"),
         enabled=w.enabled,
         created_at=w.created_at,
     )
@@ -1058,6 +1059,11 @@ def delete_event(event_id: str, db: Session = Depends(get_db)):
 def create_workflow(scenario_id: str, payload: WorkflowIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
     _validate_workflow_refs(db, scenario_id, payload.steps, payload.nodes)
+    if payload.nodes:
+        try:
+            workflow_service.validate_workflow_definition(payload.nodes, payload.edges)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, f"工作流校验失败: {exc}") from exc
     w = OntologyWorkflow(scenario_id=scenario_id, **payload.model_dump())
     db.add(w)
     db.commit()
@@ -1072,6 +1078,11 @@ def update_workflow(workflow_id: str, payload: WorkflowIn, db: Session = Depends
         raise HTTPException(404, "工作流不存在")
     _scenario_for_request(db, w.scenario_id, writable=True)
     _validate_workflow_refs(db, w.scenario_id, payload.steps, payload.nodes)
+    if payload.nodes:
+        try:
+            workflow_service.validate_workflow_definition(payload.nodes, payload.edges)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, f"工作流校验失败: {exc}") from exc
     for k, v in payload.model_dump().items():
         setattr(w, k, v)
     db.commit()
@@ -1096,6 +1107,8 @@ def execute_workflow(workflow_id: str, payload: WorkflowExecuteRequest, db: Sess
     if not w:
         raise HTTPException(404, "工作流不存在")
     _scenario_for_request(db, w.scenario_id, writable=True)
+    if (w.status or ("active" if w.enabled else "disabled")) != "active" or not w.enabled:
+        raise HTTPException(409, "工作流当前未启用，请先将状态设为 active")
     try:
         return workflow_service.execute_workflow(db, w, payload.params)
     except Exception as exc:  # noqa: BLE001

@@ -154,6 +154,23 @@ def _migrate_action_safety() -> None:
             )
 
 
+def _migrate_workflow_lifecycle() -> None:
+    """为已有工作流补充草稿/启用/停用生命周期状态。"""
+    if not _settings.database_url.startswith("sqlite"):
+        return
+    with engine.begin() as conn:
+        existing = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info('ontology_workflows')").fetchall()
+        }
+        if not existing or "status" in existing:
+            return
+        # 旧版本只有 enabled 字段，迁移为可执行的 active，避免升级后已有流程突然无法运行。
+        conn.exec_driver_sql(
+            "ALTER TABLE ontology_workflows ADD COLUMN status VARCHAR(20) DEFAULT 'active'"
+        )
+
+
 def _migrate_tenancy() -> None:
     """为已有平台表补充租户列；旧数据在首个用户注册时认领。"""
     if not _settings.database_url.startswith("sqlite"):
@@ -245,5 +262,6 @@ def init_db() -> None:
     _migrate_workflows_dag()
     _migrate_data_mapping_status()
     _migrate_action_safety()
+    _migrate_workflow_lifecycle()
     _migrate_tenancy()
     _migrate_assistant_scopes()

@@ -33,6 +33,11 @@ from . import datasource_service, skill_service, mcp_service, llm_service, tenan
 from .policies import PolicyViolation, validate_action_params, validate_workflow_graph
 
 
+def validate_workflow_definition(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:
+    """后端统一校验工作流 DAG；前端校验只是交互提示，不能作为安全边界。"""
+    validate_workflow_graph(nodes, edges)
+
+
 # ──────────────────────────────────────────────
 # 规则引擎：JSON 条件表达式解析
 # ──────────────────────────────────────────────
@@ -533,6 +538,9 @@ def render_template(value: Any, ctx: dict[str, Any]) -> Any:
 # ──────────────────────────────────────────────
 def execute_workflow(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]) -> dict[str, Any]:
     """执行工作流：优先可视化 DAG（nodes/edges），回退旧版线性 steps。"""
+    status = workflow.status or ("active" if workflow.enabled else "disabled")
+    if status != "active" or not workflow.enabled:
+        raise PolicyViolation("工作流当前未启用")
     start = time.time()
     log = ActionExecutionLog(
         scenario_id=workflow.scenario_id,
@@ -611,6 +619,7 @@ def _execute_steps(
                     enforce_policy=True,
                 )
                 step_result["status"] = r["status"]
+                step_result["log_id"] = r.get("log_id")
                 step_result["result"] = r.get("result", {})
                 context[f"step_{step_num}"] = r.get("result", {})
 
@@ -711,6 +720,7 @@ def _execute_dag(
                     enforce_policy=True,
                 )
                 res["status"] = r["status"]
+                res["log_id"] = r.get("log_id")
                 res["result"] = _wrap_out(r.get("result", {}))
                 res["error"] = r.get("error")
                 ctx[node_id] = res["result"]

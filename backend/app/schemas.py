@@ -522,7 +522,10 @@ class AssistantChatRequest(BaseModel):
 class AssistantProposalApplyRequest(BaseModel):
     kind: Literal["ontology", "workflow"]
     scenario_id: str
-    thread_id: str | None = None
+    thread_id: str = Field(min_length=1)
+    proposal_id: str = Field(min_length=1, max_length=64)
+    confirm: bool = False
+    # 兼容旧客户端字段；服务端应用时始终以已保存消息中的 payload 为准。
     payload: dict = Field(default_factory=dict)
 
 
@@ -606,6 +609,7 @@ class WorkflowIn(BaseModel):
     steps: list = Field(default_factory=list)  # 旧版线性步骤（兼容）
     nodes: list = Field(default_factory=list)  # 可视化 DAG 节点
     edges: list = Field(default_factory=list)  # 可视化 DAG 连线
+    status: Literal["draft", "active", "disabled"] = "draft"
     enabled: bool = True
 
 
