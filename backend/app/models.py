@@ -476,6 +476,87 @@ class Message(Base):
 
 
 # ──────────────────────────────────────────────
+# 全局 AI 助手：上下文会话、临时附件与变更审计
+# ──────────────────────────────────────────────
+class AssistantThread(Base):
+    """带业务上下文范围的助手会话。助手只在当前租户和上下文范围内可见。"""
+
+    __tablename__ = "assistant_threads"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    scenario_id: Mapped[str | None] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    # 由场景 ID + 页面路径组成，防止同一场景不同工作区串用会话。
+    scope_key: Mapped[str] = mapped_column(String(700), default="global", index=True)
+    title: Mapped[str] = mapped_column(String(300), default="新的助手任务")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    messages: Mapped[list["AssistantMessage"]] = relationship(
+        back_populates="thread", cascade="all, delete-orphan", order_by="AssistantMessage.created_at"
+    )
+
+
+class AssistantMessage(Base):
+    """助手会话消息，同时保存上下文和 AI 生成的待确认变更。"""
+
+    __tablename__ = "assistant_messages"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    thread_id: Mapped[str] = mapped_column(
+        ForeignKey("assistant_threads.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # user / assistant / system
+    content: Mapped[str] = mapped_column(Text, default="")
+    context: Mapped[dict] = mapped_column(JSON, default=dict)
+    attachments: Mapped[list] = mapped_column(JSON, default=list)
+    proposal: Mapped[dict] = mapped_column(JSON, default=dict)
+    thinking: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    thread: Mapped[AssistantThread] = relationship(back_populates="messages")
+
+
+class AssistantAttachment(Base):
+    """助手临时附件：只保存解析后的文本，用户确认后再提升为正式数据源。"""
+
+    __tablename__ = "assistant_attachments"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    mime: Mapped[str] = mapped_column(String(200), default="")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / parsed / error
+    parsed_text: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class AssistantAuditLog(Base):
+    """记录助手生成或应用变更时的用户、上下文和结果。"""
+
+    __tablename__ = "assistant_audit_logs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    scenario_id: Mapped[str | None] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    thread_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assistant_threads.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    operation: Mapped[str] = mapped_column(String(50), default="chat")
+    status: Mapped[str] = mapped_column(String(20), default="success")
+    context: Mapped[dict] = mapped_column(JSON, default=dict)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+# ──────────────────────────────────────────────
 # 本体扩展：操作 / 规则 / 事件 / 工作流
 # （元模型层：平台只提供框架，业务语义由用户定义）
 # ──────────────────────────────────────────────

@@ -487,7 +487,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
@@ -581,14 +581,23 @@ function dsName(id: string) { return dataSources.value.find((d) => d.id === id)?
 
 // ── 选择 → 打开悬浮编辑器 ──
 function onNodeSelect(node: any) {
+  window.dispatchEvent(new CustomEvent('ontology-selection-change', {
+    detail: { id: node.id, kind: tab.value === 'instances' ? 'instance' : 'entity', label: node.label || node.name || node.id },
+  }))
   if (tab.value === 'instances') openInstance(node.id)
   else openEntity(node.id)
 }
 function onInstSelect(node: any) {
+  window.dispatchEvent(new CustomEvent('ontology-selection-change', {
+    detail: { id: node.id, kind: node.id.startsWith('ent:') ? 'entity' : 'instance', label: node.label || node.name || node.id },
+  }))
   if (node.id.startsWith('ent:')) openEntity(node.id.slice(4))
   else openInstance(node.id)
 }
 function onEdgeClick(edge: any) {
+  window.dispatchEvent(new CustomEvent('ontology-selection-change', {
+    detail: { id: edge.id, kind: tab.value === 'instances' ? 'relation-instance' : 'relation', label: edge.label || edge.id },
+  }))
   if (tab.value !== 'instances') openRelation(edge.id)
 }
 function onAddRelation(sourceId: string, targetId: string) {
@@ -598,7 +607,10 @@ function onAddRelation(sourceId: string, targetId: string) {
     editor.value.form.target_entity_id = targetId
   }
 }
-function clearSelection() { editor.value = null }
+function clearSelection() {
+  editor.value = null
+  window.dispatchEvent(new CustomEvent('ontology-selection-change', { detail: {} }))
+}
 function closeEditor() { editor.value = null }
 
 // ── 打开编辑器 ──
@@ -981,7 +993,18 @@ async function load() {
   }
 }
 function goBack() { router.push('/scenarios') }
-onMounted(load)
+function onAssistantApplied(event: Event) {
+  const detail = (event as CustomEvent<{ scenario_id?: string }>).detail || {}
+  if (!detail.scenario_id || detail.scenario_id === sid) load()
+}
+onMounted(() => {
+  load()
+  window.addEventListener('assistant-proposal-applied', onAssistantApplied)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('assistant-proposal-applied', onAssistantApplied)
+  window.dispatchEvent(new CustomEvent('ontology-selection-change', { detail: {} }))
+})
 </script>
 
 <style scoped>

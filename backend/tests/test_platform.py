@@ -5,6 +5,7 @@ import unittest
 from app.services.policies import PolicyViolation, validate_read_only_sql, validate_workflow_graph
 from app.services.auth_service import hash_password, verify_password
 from app.services.workflow_service import evaluate_condition
+from app.routers.assistant import _context_scope, _intent, _sse
 
 
 class SQLPolicyTests(unittest.TestCase):
@@ -68,6 +69,24 @@ class AuthPolicyTests(unittest.TestCase):
         self.assertNotEqual(encoded, "Password123")
         self.assertTrue(verify_password("Password123", encoded))
         self.assertFalse(verify_password("wrong-password", encoded))
+
+
+class AssistantIntentTests(unittest.TestCase):
+    def test_routes_business_requests_to_safe_draft_intents(self) -> None:
+        self.assertEqual(_intent("请根据资料建立供应商实体和关系", "ask"), "ontology")
+        self.assertEqual(_intent("把异常处理编排成审批工作流", "ask"), "workflow")
+        self.assertEqual(_intent("帮我看看当前页面", "ask"), "chat")
+        self.assertEqual(_intent("继续分析", "draft"), "ontology")
+
+    def test_session_scope_includes_current_route_and_scenario(self) -> None:
+        self.assertEqual(_context_scope("scenario-1", "/scenarios/scenario-1?tab=ontology"), "scenario:scenario-1|path:/scenarios/scenario-1")
+        self.assertEqual(_context_scope(None, "/dashboard"), "scenario:global|path:/dashboard")
+
+    def test_sse_event_is_framed_as_json_data(self) -> None:
+        event = _sse("token", "你好")
+        self.assertTrue(event.startswith("data: "))
+        self.assertTrue(event.endswith("\n\n"))
+        self.assertIn('"type": "token"', event)
 
 
 if __name__ == "__main__":

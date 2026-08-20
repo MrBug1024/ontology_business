@@ -364,6 +364,73 @@ class ChatEvent(BaseModel):
 
 
 # ──────────────────────────────────────────────
+# 全局 AI 助手
+# ──────────────────────────────────────────────
+class AssistantThreadOut(BaseModel):
+    id: str
+    scenario_id: str | None = None
+    scope_key: str = "global"
+    title: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AssistantMessageOut(BaseModel):
+    id: str
+    thread_id: str
+    role: str
+    content: str
+    context: dict = Field(default_factory=dict)
+    attachments: list = Field(default_factory=list)
+    proposal: dict = Field(default_factory=dict)
+    thinking: list = Field(default_factory=list)
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AssistantAttachmentOut(BaseModel):
+    id: str
+    filename: str
+    mime: str = ""
+    size: int = 0
+    status: str = "pending"
+    error: str = ""
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AssistantChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=12000)
+    thread_id: str | None = None
+    scenario_id: str | None = None
+    page: str = ""
+    path: str = ""
+    selection: dict = Field(default_factory=dict)
+    attachment_ids: list[str] = Field(default_factory=list)
+    mode: Literal["ask", "draft", "execute"] = "ask"
+
+
+class AssistantProposalApplyRequest(BaseModel):
+    kind: Literal["ontology", "workflow"]
+    scenario_id: str
+    thread_id: str | None = None
+    payload: dict = Field(default_factory=dict)
+
+
+class AssistantReplyOut(BaseModel):
+    thread_id: str
+    reply: str
+    proposal: dict = Field(default_factory=dict)
+    questions: list[dict] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
+    sources: list[dict] = Field(default_factory=list)
+
+
+# ──────────────────────────────────────────────
 # 本体扩展：操作 / 规则 / 事件 / 工作流
 # ──────────────────────────────────────────────
 class ActionIn(BaseModel):

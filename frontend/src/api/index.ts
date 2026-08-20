@@ -1,6 +1,10 @@
 import axios from 'axios'
 import type {
   Agent,
+  AssistantAttachment,
+  AssistantMessage,
+  AssistantReply,
+  AssistantThread,
   AuthMessage,
   BucketFile,
   Conversation,
@@ -55,6 +59,52 @@ export const api = {
   forgotPassword: (email: string) => http.post<AuthMessage>('/auth/forgot-password', { email }),
   resetPassword: (d: { email: string; code: string; password: string; password_confirm: string }) =>
     http.post<AuthMessage>('/auth/reset-password', d),
+
+  // 全局 AI 助手
+  listAssistantThreads: (context: { scenario_id?: string; page?: string; path?: string } = {}) =>
+    http.get<AssistantThread[]>('/assistant/threads', { params: {
+      scenario_id: context.scenario_id || undefined,
+      page: context.page || undefined,
+      path: context.path || undefined,
+    } }),
+  createAssistantThread: (context: { scenario_id?: string; page?: string; path?: string } = {}) =>
+    http.post<AssistantThread>('/assistant/threads', undefined, { params: {
+      scenario_id: context.scenario_id || undefined,
+      page: context.page || undefined,
+      path: context.path || undefined,
+    } }),
+  listAssistantMessages: (threadId: string, context: { scenario_id?: string; page?: string; path?: string } = {}) =>
+    http.get<AssistantMessage[]>(`/assistant/threads/${threadId}/messages`, { params: {
+      scenario_id: context.scenario_id || undefined,
+      page: context.page || undefined,
+      path: context.path || undefined,
+    } }),
+  deleteAssistantThread: (threadId: string, context: { scenario_id?: string; page?: string; path?: string } = {}) =>
+    http.delete(`/assistant/threads/${threadId}`, { params: {
+      scenario_id: context.scenario_id || undefined,
+      page: context.page || undefined,
+      path: context.path || undefined,
+    } }),
+  uploadAssistantAttachment: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return http.post<AssistantAttachment>('/assistant/attachments', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+  },
+  deleteAssistantAttachment: (id: string) => http.delete(`/assistant/attachments/${id}`),
+  assistantChat: (d: {
+    message: string
+    thread_id?: string
+    scenario_id?: string
+    page?: string
+    path?: string
+    selection?: Record<string, any>
+    attachment_ids?: string[]
+    mode?: 'ask' | 'draft' | 'execute'
+  }) => http.post<AssistantReply>('/assistant/chat', d),
+  applyAssistantProposal: (d: { kind: 'ontology' | 'workflow'; scenario_id: string; thread_id?: string; payload: any }) =>
+    http.post('/assistant/proposals/apply', d),
 
   // 场景
   listScenarios: () => http.get<Scenario[]>('/scenarios'),
@@ -229,6 +279,71 @@ export function streamChat(
     })
     .catch((e) => {
       if (e.name !== 'AbortError') onError(e)
+    })
+  return ctrl
+}
+
+// 全局助手 SSE：token 流 + 安全处理摘要 + 草稿元数据
+export function streamAssistantChat(
+  payload: {
+    message: string
+    thread_id?: string
+    scenario_id?: string
+    page?: string
+    path?: string
+    selection?: Record<string, any>
+    attachment_ids?: string[]
+    mode?: 'ask' | 'draft' | 'execute'
+  },
+  onEvent: (ev: { type: string; data: any }) => void,
+  onDone: () => void,
+  onError: (e: Error) => void,
+) {
+  const ctrl = new AbortController()
+  let finished = false
+  const finish = () => {
+    if (finished) return
+    finished = true
+    onDone()
+  }
+  fetch('/api/assistant/chat/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    credentials: 'include',
+    cache: 'no-store',
+    body: JSON.stringify(payload),
+    signal: ctrl.signal,
+  })
+    .then(async (res) => {
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop() || ''
+        for (const line of lines) {
+          const text = line.trim()
+          if (!text.startsWith('data:')) continue
+          const data = text.slice(5).trim()
+          if (data === '[DONE]') {
+            finish()
+            return
+          }
+          try {
+            onEvent(JSON.parse(data))
+          } catch {
+            /* 忽略不完整或非 JSON SSE 行 */
+          }
+        }
+      }
+      finish()
+    })
+    .catch((error) => {
+      if (error.name !== 'AbortError') onError(error)
     })
   return ctrl
 }

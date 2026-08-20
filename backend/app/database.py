@@ -129,6 +129,46 @@ def _migrate_tenancy() -> None:
                     conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
+def _migrate_assistant_scopes() -> None:
+    """为已有助手会话补充上下文范围；旧消息可用最近一条消息的路径回填。"""
+    if not _settings.database_url.startswith("sqlite"):
+        return
+    with engine.begin() as conn:
+        existing = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info('assistant_threads')").fetchall()
+        }
+        if not existing:
+            return
+        if "scope_key" not in existing:
+            conn.exec_driver_sql("ALTER TABLE assistant_threads ADD COLUMN scope_key VARCHAR(700) DEFAULT 'global'")
+        # 仅回填旧版本的 global 值；新会话会在创建时写入准确范围。
+        conn.exec_driver_sql(
+            """
+            UPDATE assistant_threads
+            SET scope_key = CASE
+                WHEN scenario_id IS NOT NULL THEN 'scenario:' || scenario_id || '|path:' || COALESCE(
+                    (SELECT json_extract(m.context, '$.path')
+                     FROM assistant_messages m
+                     WHERE m.thread_id = assistant_threads.id
+                     ORDER BY m.created_at DESC LIMIT 1), '/')
+                ELSE 'global|path:' || COALESCE(
+                    (SELECT json_extract(m.context, '$.path')
+                     FROM assistant_messages m
+                     WHERE m.thread_id = assistant_threads.id
+                     ORDER BY m.created_at DESC LIMIT 1), '/')
+            END
+            WHERE scope_key IS NULL OR scope_key = 'global'
+            """
+        )
+        message_columns = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info('assistant_messages')").fetchall()
+        }
+        if message_columns and "thinking" not in message_columns:
+            conn.exec_driver_sql("ALTER TABLE assistant_messages ADD COLUMN thinking JSON DEFAULT '[]'")
+
+
 def init_db() -> None:
     # Import models so they register on the metadata before create_all.
     from . import models  # noqa: F401
@@ -137,3 +177,4 @@ def init_db() -> None:
     _migrate_data_sources_nullable_scenario()
     _migrate_workflows_dag()
     _migrate_tenancy()
+    _migrate_assistant_scopes()

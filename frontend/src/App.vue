@@ -62,6 +62,7 @@
         </div>
       </header>
       <router-view />
+      <GlobalAssistant :context="assistantContext" />
     </el-main>
   </el-container>
 </template>
@@ -70,6 +71,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import GlobalAssistant from '@/components/GlobalAssistant.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -82,6 +84,11 @@ const activeRoute = computed(() => {
   return p
 })
 const pageTitle = computed(() => String(route.meta.title || '工作台'))
+const assistantContext = computed(() => ({
+  page: pageTitle.value,
+  path: route.fullPath,
+  scenario_id: route.path.startsWith('/scenarios/') && typeof route.params.id === 'string' ? route.params.id : '',
+}))
 const initials = computed(() => (auth.user?.display_name || auth.user?.email || 'U').slice(0, 1).toUpperCase())
 function applyTheme() {
   document.documentElement.dataset.theme = theme.value

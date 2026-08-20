@@ -352,6 +352,64 @@ export interface ChatMessage {
   created_at?: string
 }
 
+export interface AssistantThread {
+  id: string
+  scenario_id?: string | null
+  scope_key?: string
+  title: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface AssistantAttachment {
+  id: string
+  filename: string
+  mime?: string
+  size: number
+  status: string
+  error?: string
+  created_at?: string
+}
+
+export interface AssistantProposal {
+  kind: 'ontology' | 'workflow'
+  title: string
+  summary?: string
+  payload: Record<string, any>
+  requires_confirmation?: boolean
+}
+
+export interface AssistantThought {
+  id: string
+  title: string
+  detail?: string
+  status?: 'running' | 'done' | 'error'
+}
+
+export interface AssistantMessage {
+  id?: string
+  thread_id?: string
+  role: 'user' | 'assistant' | 'system'
+  content: string
+  context?: Record<string, any>
+  attachments?: AssistantAttachment[] | Record<string, any>[]
+  proposal?: AssistantProposal | Record<string, any>
+  questions?: { id: string; title: string; message: string }[]
+  sources?: { id: string; filename: string; status?: string }[]
+  thinking?: AssistantThought[]
+  streaming?: boolean
+  created_at?: string
+}
+
+export interface AssistantReply {
+  thread_id: string
+  reply: string
+  proposal?: AssistantProposal | Record<string, any>
+  questions?: { id: string; title: string; message: string }[]
+  suggestions?: string[]
+  sources?: { id: string; filename: string; status?: string }[]
+}
+
 export interface ChatEvent {
   type: string
   data: any
