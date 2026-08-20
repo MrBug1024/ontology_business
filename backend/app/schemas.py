@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -14,6 +14,50 @@ class Msg(BaseModel):
     ok: bool = True
     message: str = ""
     data: Any = None
+
+
+class RegisterIn(BaseModel):
+    email: str
+    password: str = Field(min_length=8, max_length=128)
+    password_confirm: str
+    display_name: str = Field(default="", max_length=120)
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class VerifyEmailIn(BaseModel):
+    email: str
+    code: str = Field(min_length=6, max_length=6)
+
+
+class ResendCodeIn(BaseModel):
+    email: str
+
+
+class ForgotPasswordIn(BaseModel):
+    email: str
+
+
+class ResetPasswordIn(BaseModel):
+    email: str
+    code: str = Field(min_length=6, max_length=6)
+    password: str = Field(min_length=8, max_length=128)
+    password_confirm: str
+
+
+class UserOut(BaseModel):
+    id: str
+    email: str
+    display_name: str = ""
+    tenant_id: str
+    email_verified: bool = True
+
+
+class AuthMessage(Msg):
+    email: str = ""
 
 
 # ──────────────────────────────────────────────
@@ -152,7 +196,7 @@ class ScenarioDetail(ScenarioOut):
 # ──────────────────────────────────────────────
 class DataSourceIn(BaseModel):
     name: str
-    type: str = "mysql"  # mysql / postgres / sqlite / file_bucket
+    type: Literal["mysql", "postgres", "sqlite", "file_bucket"] = "mysql"
     scenario_id: str | None = None
     config: dict = Field(default_factory=dict)
 
@@ -271,8 +315,8 @@ class AgentIn(BaseModel):
     skill_ids: list[str] = []
     mcp_ids: list[str] = []
     data_source_ids: list[str] = []
-    temperature: float = 0.2
-    max_tokens: int = 4096
+    temperature: float = Field(default=0.2, ge=0, le=2)
+    max_tokens: int = Field(default=4096, ge=256, le=32768)
 
 
 class AgentOut(AgentIn):
@@ -327,7 +371,7 @@ class ActionIn(BaseModel):
     name: str
     description: str = ""
     input_schema: dict = Field(default_factory=dict)
-    executor_type: str = "sql"  # sql / skill / mcp / http / script
+    executor_type: Literal["sql", "skill", "mcp", "http", "script"] = "sql"
     executor_config: dict = Field(default_factory=dict)
     precondition: str = ""
     postcondition: str = ""
@@ -350,7 +394,7 @@ class RuleIn(BaseModel):
     condition: dict = Field(default_factory=dict)
     action_on_match: str = ""
     trigger_action_ids: list[str] = []
-    severity: str = "info"  # info / warning / critical
+    severity: Literal["info", "warning", "critical"] = "info"
     enabled: bool = True
 
 
@@ -382,7 +426,7 @@ class EventOut(EventIn):
 class WorkflowIn(BaseModel):
     name: str
     description: str = ""
-    trigger_type: str = "manual"  # manual / scheduled / event
+    trigger_type: Literal["manual", "scheduled", "event"] = "manual"
     trigger_config: dict = Field(default_factory=dict)
     steps: list = Field(default_factory=list)  # 旧版线性步骤（兼容）
     nodes: list = Field(default_factory=list)  # 可视化 DAG 节点

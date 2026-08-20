@@ -12,6 +12,7 @@ from sqlalchemy.engine import Engine
 
 from ..config import BUCKETS_DIR, get_settings
 from ..models import BucketFile, DataSource
+from .policies import validate_read_only_sql
 
 _engine_cache: dict[str, Engine] = {}
 
@@ -43,6 +44,15 @@ def get_engine(ds: DataSource) -> Engine:
     if key not in _engine_cache:
         _engine_cache[key] = create_engine(_db_url(ds), pool_pre_ping=True)
     return _engine_cache[key]
+
+
+def invalidate_engine(ds: DataSource) -> None:
+    """数据源配置变化后释放旧连接池，避免继续使用旧凭据或旧地址。"""
+    prefix = f"{ds.id}:"
+    for key, cached in list(_engine_cache.items()):
+        if key.startswith(prefix):
+            cached.dispose()
+            _engine_cache.pop(key, None)
 
 
 def test_connection(ds: DataSource) -> tuple[bool, str]:
@@ -98,8 +108,13 @@ def list_tables(ds: DataSource) -> list[dict[str, Any]]:
     return tables
 
 
-def run_query(ds: DataSource, sql: str, limit: int = 200) -> dict[str, Any]:
-    """执行只读 SQL 查询，返回列名与行数据。"""
+def run_query(ds: DataSource, sql: str, limit: int | None = None) -> dict[str, Any]:
+    """执行单条只读 SQL 查询，返回列名与行数据。"""
+    if ds.type == "file_bucket":
+        raise ValueError("文件桶数据源不支持 SQL 查询")
+    sql = validate_read_only_sql(sql)
+    max_rows = get_settings().max_query_rows
+    limit = max(1, min(int(limit or max_rows), max_rows))
     engine = get_engine(ds)
     with engine.connect() as conn:
         result = conn.execute(text(sql))

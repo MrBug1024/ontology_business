@@ -9,7 +9,7 @@
     </div>
 
     <el-row :gutter="16" v-loading="loading">
-      <el-col :span="8" v-for="m in mcps" :key="m.id">
+      <el-col :xs="24" :sm="12" :lg="8" v-for="m in mcps" :key="m.id">
         <div class="card mcp-card">
           <div class="mc-head">
             <div class="mc-icon"><el-icon :size="20"><Connection /></el-icon></div>
@@ -185,10 +185,14 @@ async function showTools(m: MCPConfig) {
   }
 }
 async function remove(m: MCPConfig) {
-  await ElMessageBox.confirm(`删除 MCP「${m.name}」？`, '确认', { type: 'warning' })
-  await api.deleteMCP(m.id!)
-  ElMessage.success('已删除')
-  load()
+  try {
+    await ElMessageBox.confirm(`删除 MCP「${m.name}」？`, '确认', { type: 'warning' })
+    await api.deleteMCP(m.id!)
+    ElMessage.success('已删除')
+    await load()
+  } catch (e: any) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
+  }
 }
 onMounted(load)
 </script>

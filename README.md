@@ -24,7 +24,7 @@
 - **MCP 服务**：接入 Model Context Protocol 工具服务（stdio / SSE / streamable_http），自动发现工具并暴露给 Agent。
 - **LLM 配置**：OpenAI 兼容协议（OpenAI / DeepSeek / 通义 / Ollama / vLLM…），多配置、可设默认、可测试连通性。
 - **Agent 管理**：绑定场景、LLM、技能、MCP、数据源与系统提示词，一键创建智能体。
-- **AI 对话**：ReAct 工具调用循环（最多 12 轮），SSE 流式输出，工具调用卡片实时展示参数与结果，Markdown 渲染。
+- **AI 对话**：可配置轮数的 ReAct 工具调用循环（默认最多 20 轮），SSE 流式输出，工具调用卡片实时展示参数与结果，Markdown 渲染。
 
 ## 技术栈
 
@@ -37,7 +37,7 @@
 ## 目录结构
 
 ```
-f:\test
+project-root
 ├── backend/
 │   ├── app/
 │   │   ├── main.py            # FastAPI 入口
@@ -45,12 +45,17 @@ f:\test
 │   │   ├── database.py        # SQLAlchemy 引擎/会话
 │   │   ├── models.py          # ORM 模型
 │   │   ├── schemas.py         # Pydantic 模型
-│   │   ├── seed.py            # 演示数据种子（python -m app.seed）
+│   │   ├── ...                # 平台运行时代码，不包含具体行业种子
 │   │   ├── routers/           # scenarios / data_sources / llm_configs / skills / mcp / agents
 │   │   └── services/          # datasource / doc_parser / llm / rag / skill / mcp / agent_engine
+│   ├── examples/              # 可选演示场景与样例文档（不参与平台运行时）
+│   │   ├── seed_retail.py
+│   │   ├── seed_bookkeeping.py
+│   │   └── bookkeeping_docs/
 │   ├── skills/
 │   │   ├── ocr-parser/        # OCR 文档解析技能（已内置）
 │   │   └── data-analyzer/     # 数据分析技能
+│   ├── tests/                 # 平台策略与核心行为回归测试
 │   ├── data/                  # platform.db + buckets/（文件桶存储）
 │   ├── .env                   # OCR / 调试配置
 │   └── requirements.txt
@@ -75,33 +80,32 @@ f:\test
 conda activate ontology_platform_env
 
 # 安装依赖（首次）
-pip install -r f:\test\backend\requirements.txt
+pip install -r <project-root>\backend\requirements.txt
 
-# 生成演示数据（可选，创建「零售销售分析」示例场景）
-$env:PYTHONPATH="f:\test\backend"
-python -m app.seed
+# 生成演示数据（可选；演示种子不属于平台运行时代码）
+$env:PYTHONPATH="<project-root>\backend"
+python <project-root>\backend\examples\seed_retail.py
+python <project-root>\backend\examples\seed_bookkeeping.py
 
 # 启动后端（端口 8001，8000 被占用）
-$env:PYTHONPATH="f:\test\backend"
+$env:PYTHONPATH="<project-root>\backend"
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 ```
 
-> 也可直接运行 `f:\test\start_backend.ps1`。
 > 后端 API 文档：http://127.0.0.1:8001/docs
 
 ### 2. 前端（Node.js）
 
 ```powershell
 # 安装依赖（首次）
-npm --prefix f:\test\frontend install
+npm --prefix <project-root>\frontend install
 # 若 npm 11 拦截了 postinstall 脚本：
-npm --prefix f:\test\frontend approve-scripts esbuild vue-demi
+npm --prefix <project-root>\frontend approve-scripts esbuild vue-demi
 
 # 启动开发服务器（端口 5173，/api 自动代理到 8001）
-npm --prefix f:\test\frontend run dev
+npm --prefix <project-root>\frontend run dev
 ```
 
-> 也可直接运行 `f:\test\start_frontend.ps1`。
 > 打开浏览器访问：http://127.0.0.1:5173
 
 ## 配置说明
@@ -124,6 +128,27 @@ OCR_API_KEY=你的密钥
 请在 **LLM 配置** 页面编辑或新建，填入真实的 `Base URL` / `API Key` / `模型`，
 并勾选「设为默认」。支持任意 OpenAI 兼容服务（DeepSeek、通义、Ollama、vLLM 等）。
 
+### 邮箱认证（`backend/.env`）
+
+平台支持邮箱注册、邮箱验证码验证、登录、退出登录和密码重置。邮件服务只从后端环境变量读取，
+不会写入平台代码；`backend/.env` 已按当前 SMTP 服务配置完成，部署到其他环境时请替换为对应环境变量。
+
+```ini
+MAIL_USERNAME=你的邮箱账号
+MAIL_PASSWORD=你的邮箱授权码
+MAIL_FROM=发件邮箱
+MAIL_PORT=994
+MAIL_SERVER=smtp.example.com
+MAIL_STARTTLS=false
+MAIL_SSL_TLS=true
+MAIL_USE_CREDENTIALS=true
+MAIL_TIMEOUT_SECONDS=20
+```
+
+认证使用 HttpOnly 会话 Cookie。每个注册用户默认创建独立工作区，只能访问本租户资源；标记为公共的场景、
+数据源、LLM、MCP 和技能可被登录用户读取/使用，但公共资源不允许被其他租户修改。首次注册时，旧版本未带租户
+信息的私有演示数据会认领到首个用户的工作区。
+
 ## 使用流程（5 步）
 
 1. **业务场景**：创建场景，在本体画布中定义实体、属性、关系。
@@ -144,9 +169,25 @@ OCR_API_KEY=你的密钥
 | `execute_skill` | 以子进程执行已安装技能 |
 | `mcp_{name}_{tool}` | 调用已接入 MCP 服务的工具 |
 
+## 平台边界与安全策略
+
+- `backend/app` 只实现通用平台能力；零售、医疗、财务等具体业务数据和提示词只放在 `backend/examples` 或由用户在界面中配置。
+- 数据源、Agent、本体扩展和工作流引用都会校验资源是否存在以及是否属于当前业务场景，避免跨场景串用。
+- Agent 与工作流中的 SQL 仅允许单条只读查询，并受最大返回行数限制；脚本节点默认关闭，只有受控部署显式开启后才可执行。
+- LLM API Key、数据源密码等凭据不会通过 API 回显；编辑时留空表示保留原凭据。
+- 工作流 DAG 保存/执行前会校验开始结束节点、可达性、环路和规则分支完整性。
+
+## 回归验证
+
+```powershell
+$env:PYTHONPATH="<project-root>\backend"
+python -m unittest discover -s <project-root>\backend\tests -v
+npm --prefix <project-root>\frontend run build
+```
+
 ## 常见问题
 
 - **端口 8000 被占用**：本项目后端固定使用 **8001**，前端代理已指向 8001。
 - **npm 11 拦截 postinstall**：执行 `npm approve-scripts esbuild vue-demi`。
-- **PowerShell 终端 cwd 重置**：使用 `npm --prefix f:\test\frontend ...` 与 `$env:PYTHONPATH="f:\test\backend"` 前缀，避免 `Set-Location` 被剥离。
+- **PowerShell 终端 cwd 重置**：使用 `npm --prefix <project-root>\frontend ...` 与 `$env:PYTHONPATH="<project-root>\backend"` 前缀，避免 `Set-Location` 被剥离。
 - **LLM 调用失败**：检查 LLM 配置的 API Key 是否真实有效，可在 LLM 配置页点「测试」。

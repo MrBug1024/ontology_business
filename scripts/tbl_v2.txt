@@ -1,1 +1,0 @@
-accounts | 13 | account_code,account_name,account_type,opening_balance,debit_amount,credit_amount,closing_balance

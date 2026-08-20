@@ -11,6 +11,7 @@ from ..models import (
     BusinessScenario,
     DataMapping,
     DataSource,
+    MCPConfig,
     OntologyAction,
     OntologyEntity,
     OntologyEvent,
@@ -50,9 +51,62 @@ from ..schemas import (
     WorkflowIn,
     WorkflowOut,
 )
-from ..services import ontology_service, workflow_service
+from ..services import ontology_service, tenant_service, workflow_service
+from ..services.auth_service import get_current_user
 
-router = APIRouter(prefix="/scenarios", tags=["scenarios"])
+router = APIRouter(
+    prefix="/scenarios",
+    tags=["scenarios"],
+    dependencies=[Depends(get_current_user)],
+)
+
+
+def _entity_in_scenario(db: Session, scenario_id: str, entity_id: str | None) -> OntologyEntity | None:
+    if not entity_id:
+        return None
+    entity = db.get(OntologyEntity, entity_id)
+    if not entity or entity.scenario_id != scenario_id:
+        raise HTTPException(400, "实体不属于当前业务场景")
+    return entity
+
+
+def _source_in_scenario(db: Session, scenario_id: str, source_id: str) -> DataSource:
+    source = tenant_service.require_visible(db, DataSource, source_id, "数据源不存在")
+    if not source or source.scenario_id not in (None, scenario_id):
+        raise HTTPException(400, "数据源不属于当前业务场景")
+    return source
+
+
+def _validate_action_executor(db: Session, scenario_id: str, payload: ActionIn) -> None:
+    """校验操作执行器引用的资源边界，保持操作配置可移植且不跨场景。"""
+    config = payload.executor_config or {}
+    if payload.executor_type == "sql" and config.get("data_source_id"):
+        _source_in_scenario(db, scenario_id, config["data_source_id"])
+    if payload.executor_type == "mcp" and config.get("mcp_id"):
+        tenant_service.require_visible(db, MCPConfig, config["mcp_id"], "操作引用的 MCP 服务不存在")
+
+
+def _validate_trigger_actions(db: Session, scenario_id: str, action_ids: list[str] | None) -> None:
+    for action_id in action_ids or []:
+        action = db.get(OntologyAction, action_id)
+        if not action or action.scenario_id != scenario_id:
+            raise HTTPException(400, "规则触发的操作不属于当前业务场景")
+
+
+def _validate_workflow_refs(db: Session, scenario_id: str, steps: list, nodes: list) -> None:
+    """校验工作流引用的 Action/Rule/Event，防止跨场景拼接执行图。"""
+    refs = [(s.get("type"), s) for s in (steps or [])] + [(n.get("type"), n.get("data") or n) for n in (nodes or [])]
+    for kind, data in refs:
+        model, key = {
+            "action": (OntologyAction, "action_id"),
+            "rule": (OntologyRule, "rule_id"),
+            "event": (OntologyEvent, "event_id"),
+        }.get(kind, (None, ""))
+        if not model or not data.get(key):
+            continue
+        item = db.get(model, data[key])
+        if not item or item.scenario_id != scenario_id:
+            raise HTTPException(400, f"工作流引用的 {kind} 不属于当前业务场景")
 
 
 def _scenario_out(s: BusinessScenario) -> ScenarioOut:
@@ -72,6 +126,18 @@ def _scenario_out(s: BusinessScenario) -> ScenarioOut:
         event_count=len(s.events),
         workflow_count=len(s.workflows),
     )
+
+
+def _scenario_for_request(db: Session, scenario_id: str, writable: bool = False) -> BusinessScenario:
+    return tenant_service.require_scenario(db, scenario_id, writable=writable)
+
+
+def _safe_source_config(config: dict) -> dict:
+    safe = dict(config or {})
+    for key in ("password", "api_key", "token", "secret", "access_token"):
+        if key in safe:
+            safe[key] = ""
+    return safe
 
 
 def _action_out(a: OntologyAction) -> ActionOut:
@@ -181,12 +247,17 @@ def _relation_out(r: OntologyRelation, entities: list[OntologyEntity]) -> Relati
 
 @router.get("", response_model=list[ScenarioOut])
 def list_scenarios(db: Session = Depends(get_db)):
-    return [_scenario_out(s) for s in db.execute(select(BusinessScenario)).scalars().all()]
+    return [_scenario_out(s) for s in db.execute(
+        select(BusinessScenario).where(tenant_service.visible_clause(BusinessScenario, db))
+    ).scalars().all()]
 
 
 @router.post("", response_model=ScenarioOut)
 def create_scenario(payload: ScenarioIn, db: Session = Depends(get_db)):
-    s = BusinessScenario(**payload.model_dump())
+    s = BusinessScenario(
+        tenant_id=tenant_service.current_tenant_id(db),
+        **payload.model_dump(),
+    )
     db.add(s)
     db.commit()
     db.refresh(s)
@@ -244,9 +315,7 @@ def _mapping_out(m: DataMapping) -> DataMappingOut:
 
 @router.get("/{scenario_id}", response_model=ScenarioDetail)
 def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id)
     base = _scenario_out(s)
     entities = [_entity_out(e) for e in s.entities]
     relations = [_relation_out(r, s.entities) for r in s.relations]
@@ -258,13 +327,14 @@ def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
             scenario_id=d.scenario_id,
             name=d.name,
             type=d.type,
-            config=d.config or {},
+            config=_safe_source_config(d.config or {}),
             status=d.status,
             last_error=d.last_error,
             created_at=d.created_at,
             file_count=len(d.files),
         )
         for d in s.data_sources
+        if d.tenant_id == tenant_service.current_tenant_id(db) or d.is_public
     ]
     instances = [_instance_out(i) for i in s.instances]
     rel_instances = [_rel_instance_out(ri) for ri in s.relation_instances]
@@ -290,17 +360,13 @@ def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
 
 @router.get("/{scenario_id}/graph")
 def scenario_graph(scenario_id: str, mode: str = "schema", db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id)
     return ontology_service.build_graph(s, mode=mode)
 
 
 @router.put("/{scenario_id}", response_model=ScenarioOut)
 def update_scenario(scenario_id: str, payload: ScenarioIn, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
     for k, v in payload.model_dump().items():
         setattr(s, k, v)
     db.commit()
@@ -310,9 +376,7 @@ def update_scenario(scenario_id: str, payload: ScenarioIn, db: Session = Depends
 
 @router.delete("/{scenario_id}", response_model=Msg)
 def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
     db.delete(s)
     db.commit()
     return Msg(message="已删除")
@@ -321,9 +385,7 @@ def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
 # ── 实体 ──────────────────────────────────────
 @router.post("/{scenario_id}/entities", response_model=EntityOut)
 def create_entity(scenario_id: str, payload: EntityIn, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
     e = OntologyEntity(scenario_id=scenario_id, **{k: v for k, v in payload.model_dump().items() if k != "properties"})
     db.add(e)
     db.flush()
@@ -339,6 +401,7 @@ def update_entity(entity_id: str, payload: EntityIn, db: Session = Depends(get_d
     e = db.get(OntologyEntity, entity_id)
     if not e:
         raise HTTPException(404, "实体不存在")
+    _scenario_for_request(db, e.scenario_id, writable=True)
     for k in ("name", "description", "icon", "color", "is_abstract"):
         setattr(e, k, getattr(payload, k))
     # 重建属性
@@ -357,6 +420,7 @@ def delete_entity(entity_id: str, db: Session = Depends(get_db)):
     e = db.get(OntologyEntity, entity_id)
     if not e:
         raise HTTPException(404, "实体不存在")
+    _scenario_for_request(db, e.scenario_id, writable=True)
     # 删除关联关系（含关系实例）
     for r in list(e.scenario.relations):
         if r.source_entity_id == entity_id or r.target_entity_id == entity_id:
@@ -378,9 +442,9 @@ def delete_entity(entity_id: str, db: Session = Depends(get_db)):
 # ── 关系 ──────────────────────────────────────
 @router.post("/{scenario_id}/relations", response_model=RelationOut)
 def create_relation(scenario_id: str, payload: RelationIn, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
+    _entity_in_scenario(db, scenario_id, payload.source_entity_id)
+    _entity_in_scenario(db, scenario_id, payload.target_entity_id)
     r = OntologyRelation(scenario_id=scenario_id, **payload.model_dump())
     db.add(r)
     db.commit()
@@ -393,6 +457,9 @@ def update_relation(relation_id: str, payload: RelationIn, db: Session = Depends
     r = db.get(OntologyRelation, relation_id)
     if not r:
         raise HTTPException(404, "关系不存在")
+    _scenario_for_request(db, r.scenario_id, writable=True)
+    _entity_in_scenario(db, r.scenario_id, payload.source_entity_id)
+    _entity_in_scenario(db, r.scenario_id, payload.target_entity_id)
     for k, v in payload.model_dump().items():
         setattr(r, k, v)
     db.commit()
@@ -406,6 +473,7 @@ def delete_relation(relation_id: str, db: Session = Depends(get_db)):
     r = db.get(OntologyRelation, relation_id)
     if not r:
         raise HTTPException(404, "关系不存在")
+    _scenario_for_request(db, r.scenario_id, writable=True)
     # 级联删除关系实例
     for ri in list(r.relation_instances):
         db.delete(ri)
@@ -417,9 +485,7 @@ def delete_relation(relation_id: str, db: Session = Depends(get_db)):
 # ── AI 生成本体 ───────────────────────────────
 @router.post("/{scenario_id}/generate-ontology")
 def generate_ontology(scenario_id: str, payload: dict, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
     description = (payload.get("description") or "").strip() or s.description or s.name
     try:
         return ontology_service.generate_ontology(db, s, description)
@@ -429,9 +495,7 @@ def generate_ontology(scenario_id: str, payload: dict, db: Session = Depends(get
 
 @router.post("/{scenario_id}/apply-ontology", response_model=Msg)
 def apply_ontology(scenario_id: str, payload: dict, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
     ontology_service.apply_generated_ontology(db, s, payload)
     return Msg(message="已应用")
 
@@ -439,11 +503,8 @@ def apply_ontology(scenario_id: str, payload: dict, db: Session = Depends(get_db
 # ── 实例 ──────────────────────────────────────
 @router.post("/{scenario_id}/instances", response_model=InstanceOut)
 def create_instance(scenario_id: str, payload: InstanceIn, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
-    if not db.get(OntologyEntity, payload.entity_id):
-        raise HTTPException(404, "实体不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
+    _entity_in_scenario(db, scenario_id, payload.entity_id)
     i = OntologyInstance(scenario_id=scenario_id, **payload.model_dump())
     db.add(i)
     db.commit()
@@ -456,6 +517,8 @@ def update_instance(instance_id: str, payload: InstanceIn, db: Session = Depends
     i = db.get(OntologyInstance, instance_id)
     if not i:
         raise HTTPException(404, "实例不存在")
+    _scenario_for_request(db, i.scenario_id, writable=True)
+    _entity_in_scenario(db, i.scenario_id, payload.entity_id)
     for k in ("entity_id", "name", "attributes", "source", "source_ref"):
         setattr(i, k, getattr(payload, k))
     db.commit()
@@ -468,6 +531,7 @@ def delete_instance(instance_id: str, db: Session = Depends(get_db)):
     i = db.get(OntologyInstance, instance_id)
     if not i:
         raise HTTPException(404, "实例不存在")
+    _scenario_for_request(db, i.scenario_id, writable=True)
     for ri in list(i.source_instances) + list(i.target_instances):
         db.delete(ri)
     db.delete(i)
@@ -478,9 +542,16 @@ def delete_instance(instance_id: str, db: Session = Depends(get_db)):
 # ── 关系实例 ──────────────────────────────────
 @router.post("/{scenario_id}/relation-instances", response_model=RelationInstanceOut)
 def create_relation_instance(scenario_id: str, payload: RelationInstanceIn, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
+    relation = db.get(OntologyRelation, payload.relation_id)
+    source = db.get(OntologyInstance, payload.source_instance_id)
+    target = db.get(OntologyInstance, payload.target_instance_id)
+    if not relation or relation.scenario_id != scenario_id:
+        raise HTTPException(400, "关系不属于当前业务场景")
+    if not source or not target or source.scenario_id != scenario_id or target.scenario_id != scenario_id:
+        raise HTTPException(400, "关系两端实例不属于当前业务场景")
+    if source.entity_id != relation.source_entity_id or target.entity_id != relation.target_entity_id:
+        raise HTTPException(400, "关系实例两端实体与关系定义不匹配")
     ri = RelationInstance(scenario_id=scenario_id, **payload.model_dump())
     db.add(ri)
     db.commit()
@@ -493,6 +564,7 @@ def delete_relation_instance(ri_id: str, db: Session = Depends(get_db)):
     ri = db.get(RelationInstance, ri_id)
     if not ri:
         raise HTTPException(404, "关系实例不存在")
+    _scenario_for_request(db, ri.scenario_id, writable=True)
     db.delete(ri)
     db.commit()
     return Msg(message="已删除")
@@ -501,9 +573,9 @@ def delete_relation_instance(ri_id: str, db: Session = Depends(get_db)):
 # ── 数据映射 ──────────────────────────────────
 @router.post("/{scenario_id}/mappings", response_model=DataMappingOut)
 def create_mapping(scenario_id: str, payload: DataMappingIn, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
+    _entity_in_scenario(db, scenario_id, payload.entity_id)
+    _source_in_scenario(db, scenario_id, payload.data_source_id)
     # 同一实体只保留一条映射
     old = db.execute(
         select(DataMapping).where(
@@ -524,6 +596,7 @@ def delete_mapping(mapping_id: str, db: Session = Depends(get_db)):
     m = db.get(DataMapping, mapping_id)
     if not m:
         raise HTTPException(404, "映射不存在")
+    _scenario_for_request(db, m.scenario_id, writable=True)
     db.delete(m)
     db.commit()
     return Msg(message="已删除")
@@ -534,7 +607,7 @@ def import_mapping(mapping_id: str, payload: dict | None = None, db: Session = D
     m = db.get(DataMapping, mapping_id)
     if not m:
         raise HTTPException(404, "映射不存在")
-    s = db.get(BusinessScenario, m.scenario_id)
+    s = _scenario_for_request(db, m.scenario_id, writable=True)
     limit = int((payload or {}).get("limit", 50))
     try:
         return ontology_service.import_instances_from_mapping(db, s, m, limit=limit)
@@ -545,11 +618,9 @@ def import_mapping(mapping_id: str, payload: dict | None = None, db: Session = D
 # ── 操作（Actions）────────────────────────────
 @router.post("/{scenario_id}/actions", response_model=ActionOut)
 def create_action(scenario_id: str, payload: ActionIn, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
-    if not db.get(OntologyEntity, payload.entity_id):
-        raise HTTPException(404, "实体不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
+    _entity_in_scenario(db, scenario_id, payload.entity_id)
+    _validate_action_executor(db, scenario_id, payload)
     a = OntologyAction(scenario_id=scenario_id, **payload.model_dump())
     db.add(a)
     db.commit()
@@ -562,6 +633,9 @@ def update_action(action_id: str, payload: ActionIn, db: Session = Depends(get_d
     a = db.get(OntologyAction, action_id)
     if not a:
         raise HTTPException(404, "操作不存在")
+    _scenario_for_request(db, a.scenario_id, writable=True)
+    _entity_in_scenario(db, a.scenario_id, payload.entity_id)
+    _validate_action_executor(db, a.scenario_id, payload)
     for k, v in payload.model_dump().items():
         setattr(a, k, v)
     db.commit()
@@ -574,6 +648,7 @@ def delete_action(action_id: str, db: Session = Depends(get_db)):
     a = db.get(OntologyAction, action_id)
     if not a:
         raise HTTPException(404, "操作不存在")
+    _scenario_for_request(db, a.scenario_id, writable=True)
     db.delete(a)
     db.commit()
     return Msg(message="已删除")
@@ -584,6 +659,7 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
     a = db.get(OntologyAction, action_id)
     if not a:
         raise HTTPException(404, "操作不存在")
+    _scenario_for_request(db, a.scenario_id)
     try:
         return workflow_service.execute_action(db, a, payload.params)
     except Exception as exc:  # noqa: BLE001
@@ -593,11 +669,10 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
 # ── 规则（Rules）──────────────────────────────
 @router.post("/{scenario_id}/rules", response_model=RuleOut)
 def create_rule(scenario_id: str, payload: RuleIn, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
-    if payload.entity_id and not db.get(OntologyEntity, payload.entity_id):
-        raise HTTPException(404, "实体不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
+    if payload.entity_id:
+        _entity_in_scenario(db, scenario_id, payload.entity_id)
+    _validate_trigger_actions(db, scenario_id, payload.trigger_action_ids)
     r = OntologyRule(scenario_id=scenario_id, **payload.model_dump())
     db.add(r)
     db.commit()
@@ -610,6 +685,10 @@ def update_rule(rule_id: str, payload: RuleIn, db: Session = Depends(get_db)):
     r = db.get(OntologyRule, rule_id)
     if not r:
         raise HTTPException(404, "规则不存在")
+    _scenario_for_request(db, r.scenario_id, writable=True)
+    if payload.entity_id:
+        _entity_in_scenario(db, r.scenario_id, payload.entity_id)
+    _validate_trigger_actions(db, r.scenario_id, payload.trigger_action_ids)
     for k, v in payload.model_dump().items():
         setattr(r, k, v)
     db.commit()
@@ -622,6 +701,7 @@ def delete_rule(rule_id: str, db: Session = Depends(get_db)):
     r = db.get(OntologyRule, rule_id)
     if not r:
         raise HTTPException(404, "规则不存在")
+    _scenario_for_request(db, r.scenario_id, writable=True)
     db.delete(r)
     db.commit()
     return Msg(message="已删除")
@@ -633,6 +713,7 @@ def evaluate_rule(rule_id: str, payload: dict, db: Session = Depends(get_db)):
     r = db.get(OntologyRule, rule_id)
     if not r:
         raise HTTPException(404, "规则不存在")
+    _scenario_for_request(db, r.scenario_id)
     record = (payload or {}).get("record", {})
     return workflow_service.evaluate_rule(r, record)
 
@@ -640,9 +721,7 @@ def evaluate_rule(rule_id: str, payload: dict, db: Session = Depends(get_db)):
 # ── 事件（Events）─────────────────────────────
 @router.post("/{scenario_id}/events", response_model=EventOut)
 def create_event(scenario_id: str, payload: EventIn, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
     e = OntologyEvent(scenario_id=scenario_id, **payload.model_dump())
     db.add(e)
     db.commit()
@@ -655,6 +734,7 @@ def update_event(event_id: str, payload: EventIn, db: Session = Depends(get_db))
     e = db.get(OntologyEvent, event_id)
     if not e:
         raise HTTPException(404, "事件不存在")
+    _scenario_for_request(db, e.scenario_id, writable=True)
     for k, v in payload.model_dump().items():
         setattr(e, k, v)
     db.commit()
@@ -667,6 +747,7 @@ def delete_event(event_id: str, db: Session = Depends(get_db)):
     e = db.get(OntologyEvent, event_id)
     if not e:
         raise HTTPException(404, "事件不存在")
+    _scenario_for_request(db, e.scenario_id, writable=True)
     db.delete(e)
     db.commit()
     return Msg(message="已删除")
@@ -675,9 +756,8 @@ def delete_event(event_id: str, db: Session = Depends(get_db)):
 # ── 工作流（Workflows）────────────────────────
 @router.post("/{scenario_id}/workflows", response_model=WorkflowOut)
 def create_workflow(scenario_id: str, payload: WorkflowIn, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id, writable=True)
+    _validate_workflow_refs(db, scenario_id, payload.steps, payload.nodes)
     w = OntologyWorkflow(scenario_id=scenario_id, **payload.model_dump())
     db.add(w)
     db.commit()
@@ -690,6 +770,8 @@ def update_workflow(workflow_id: str, payload: WorkflowIn, db: Session = Depends
     w = db.get(OntologyWorkflow, workflow_id)
     if not w:
         raise HTTPException(404, "工作流不存在")
+    _scenario_for_request(db, w.scenario_id, writable=True)
+    _validate_workflow_refs(db, w.scenario_id, payload.steps, payload.nodes)
     for k, v in payload.model_dump().items():
         setattr(w, k, v)
     db.commit()
@@ -702,6 +784,7 @@ def delete_workflow(workflow_id: str, db: Session = Depends(get_db)):
     w = db.get(OntologyWorkflow, workflow_id)
     if not w:
         raise HTTPException(404, "工作流不存在")
+    _scenario_for_request(db, w.scenario_id, writable=True)
     db.delete(w)
     db.commit()
     return Msg(message="已删除")
@@ -712,6 +795,7 @@ def execute_workflow(workflow_id: str, payload: WorkflowExecuteRequest, db: Sess
     w = db.get(OntologyWorkflow, workflow_id)
     if not w:
         raise HTTPException(404, "工作流不存在")
+    _scenario_for_request(db, w.scenario_id)
     try:
         return workflow_service.execute_workflow(db, w, payload.params)
     except Exception as exc:  # noqa: BLE001
@@ -721,9 +805,7 @@ def execute_workflow(workflow_id: str, payload: WorkflowExecuteRequest, db: Sess
 @router.post("/{scenario_id}/workflows/generate")
 def generate_workflow(scenario_id: str, payload: WorkflowGenerateRequest, db: Session = Depends(get_db)):
     """AI 生成可视化工作流草稿（DAG 节点+连线，不落库）。"""
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    s = _scenario_for_request(db, scenario_id)
     try:
         return workflow_service.generate_workflow(db, s, payload.description)
     except Exception as exc:  # noqa: BLE001
@@ -733,9 +815,7 @@ def generate_workflow(scenario_id: str, payload: WorkflowGenerateRequest, db: Se
 # ── 执行日志 ──────────────────────────────────
 @router.get("/{scenario_id}/execution-logs", response_model=list[ActionExecutionLogOut])
 def list_execution_logs(scenario_id: str, limit: int = 50, db: Session = Depends(get_db)):
-    s = db.get(BusinessScenario, scenario_id)
-    if not s:
-        raise HTTPException(404, "场景不存在")
+    _scenario_for_request(db, scenario_id)
     logs = db.execute(
         select(ActionExecutionLog)
         .where(ActionExecutionLog.scenario_id == scenario_id)

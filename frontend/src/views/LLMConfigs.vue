@@ -9,7 +9,7 @@
     </div>
 
     <el-row :gutter="16" v-loading="loading">
-      <el-col :span="8" v-for="l in llms" :key="l.id">
+      <el-col :xs="24" :sm="12" :lg="8" v-for="l in llms" :key="l.id">
         <div class="card llm-card">
           <div class="ll-head">
             <div class="ll-icon"><el-icon :size="20"><ChatDotRound /></el-icon></div>
@@ -48,7 +48,7 @@
           </el-select>
         </el-form-item>
         <el-form-item label="Base URL" required><el-input v-model="form.base_url" class="mono" placeholder="https://api.deepseek.com/v1" /></el-form-item>
-        <el-form-item label="API Key" required><el-input v-model="form.api_key" type="password" show-password class="mono" placeholder="sk-..." /></el-form-item>
+        <el-form-item label="API Key" required><el-input v-model="form.api_key" type="password" show-password class="mono" placeholder="新建时填写；编辑时留空保持原密钥" /></el-form-item>
         <el-form-item label="模型" required><el-input v-model="form.model" class="mono" placeholder="deepseek-chat" /></el-form-item>
         <el-row :gutter="12">
           <el-col :span="12">
@@ -138,10 +138,14 @@ async function setDefault(l: LLMConfig) {
   load()
 }
 async function remove(l: LLMConfig) {
-  await ElMessageBox.confirm(`删除 LLM 配置「${l.name}」？`, '确认', { type: 'warning' })
-  await api.deleteLLM(l.id!)
-  ElMessage.success('已删除')
-  load()
+  try {
+    await ElMessageBox.confirm(`删除 LLM 配置「${l.name}」？`, '确认', { type: 'warning' })
+    await api.deleteLLM(l.id!)
+    ElMessage.success('已删除')
+    await load()
+  } catch (e: any) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
+  }
 }
 onMounted(load)
 </script>

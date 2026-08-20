@@ -55,13 +55,13 @@ const nodeTypes: any = {
 }
 
 const PALETTE = [
-  { type: 'action', label: '执行操作', icon: '⚡', color: '#7c3aed', desc: '调用已定义操作（SQL/技能/MCP…）' },
-  { type: 'rule', label: '规则判断', icon: '⑂', color: '#d97706', desc: '评估规则，命中/未命中分支' },
-  { type: 'llm', label: '大模型', icon: '✦', color: '#0891b2', desc: 'LLM 分析/生成，支持变量引用' },
-  { type: 'event', label: '发布事件', icon: '🔔', color: '#db2777', desc: '发布业务事件' },
-  { type: 'http', label: 'HTTP 请求', icon: '⇄', color: '#6d28d9', desc: '调用外部 API' },
-  { type: 'script', label: 'Python 脚本', icon: 'Py', color: '#65a30d', desc: '自定义 Python 片段' },
-  { type: 'end', label: '结束', icon: '■', color: '#94919f', desc: '流程结束' },
+  { type: 'action', label: '执行操作', icon: 'Operation', color: 'var(--graph-blue)', desc: '调用已定义操作（SQL/技能/MCP…）' },
+  { type: 'rule', label: '规则判断', icon: 'SetUp', color: 'var(--warning)', desc: '评估规则，命中/未命中分支' },
+  { type: 'llm', label: '大模型', icon: 'Cpu', color: 'var(--primary)', desc: 'LLM 分析/生成，支持变量引用' },
+  { type: 'event', label: '发布事件', icon: 'Bell', color: 'var(--accent)', desc: '发布业务事件' },
+  { type: 'http', label: 'HTTP 请求', icon: 'Link', color: 'var(--graph-teal)', desc: '调用外部 API' },
+  { type: 'script', label: 'Python 脚本', icon: 'Document', color: 'var(--info)', desc: '自定义 Python 片段' },
+  { type: 'end', label: '结束', icon: 'CircleCheck', color: 'var(--text-3)', desc: '流程结束' },
 ]
 
 // ── 画布状态 ──
@@ -92,11 +92,11 @@ function toFlowEdge(e: any): Edge {
     label: label || undefined,
     animated: !e.label,
     style: {
-      stroke: e.label === 'true' ? '#059669' : e.label === 'false' ? '#dc2626' : '#a78bfa',
+      stroke: e.label === 'true' ? 'var(--success)' : e.label === 'false' ? 'var(--danger)' : 'var(--graph-edge)',
       strokeWidth: 1.8,
     },
-    labelStyle: { fill: '#5b5878', fontSize: '10px', fontWeight: 600 },
-    labelBgStyle: { fill: '#ffffff', fillOpacity: 0.95 },
+    labelStyle: { fill: 'var(--text-2)', fontSize: '10px', fontWeight: 600 },
+    labelBgStyle: { fill: 'var(--surface)', fillOpacity: 0.95 },
     labelBgPadding: [6, 3] as [number, number],
     labelBgBorderRadius: 6,
     markerEnd: MarkerType.ArrowClosed,
@@ -192,11 +192,11 @@ onConnect((c: Connection) => {
     label: label === 'true' ? '命中' : label === 'false' ? '未命中' : undefined,
     animated: !label,
     style: {
-      stroke: label === 'true' ? '#059669' : label === 'false' ? '#dc2626' : '#a78bfa',
+      stroke: label === 'true' ? 'var(--success)' : label === 'false' ? 'var(--danger)' : 'var(--graph-edge)',
       strokeWidth: 1.8,
     },
-    labelStyle: { fill: '#5b5878', fontSize: '10px', fontWeight: 600 },
-    labelBgStyle: { fill: '#ffffff', fillOpacity: 0.95 },
+    labelStyle: { fill: 'var(--text-2)', fontSize: '10px', fontWeight: 600 },
+    labelBgStyle: { fill: 'var(--surface)', fillOpacity: 0.95 },
     labelBgPadding: [6, 3] as [number, number],
     labelBgBorderRadius: 6,
     markerEnd: MarkerType.ArrowClosed,
@@ -472,7 +472,7 @@ const wf = computed({
     <!-- 顶栏：返回 + 名称/描述 -->
     <div class="wfe-topbar">
       <el-button size="small" text @click="emit('close')"><el-icon><ArrowLeft /></el-icon> 返回</el-button>
-      <el-input v-model="wf.name" size="small" class="wfe-name" placeholder="工作流名称，如：发票违规审计流程" />
+      <el-input v-model="wf.name" size="small" class="wfe-name" placeholder="工作流名称，如：数据检查与通知流程" />
       <el-input v-model="wf.description" size="small" class="wfe-desc" placeholder="描述（可选）" />
     </div>
 
@@ -482,14 +482,19 @@ const wf = computed({
         <div class="wfe-pal-title">节点库</div>
         <div
           class="wfe-pal-item"
+          role="button"
+          tabindex="0"
+          :aria-label="`添加节点：${p.label}`"
           v-for="p in PALETTE"
           :key="p.type"
           draggable="true"
           @dragstart="onDragStart($event, p.type)"
           @click="addNode(p.type)"
+          @keydown.enter.prevent="addNode(p.type)"
+          @keydown.space.prevent="addNode(p.type)"
           :style="{ '--pc': p.color }"
         >
-          <span class="wfe-pal-ico">{{ p.icon }}</span>
+          <span class="wfe-pal-ico" aria-hidden="true"><el-icon :size="15"><component :is="p.icon" /></el-icon></span>
           <div class="wfe-pal-tt">
             <b>{{ p.label }}</b>
             <small>{{ p.desc }}</small>
@@ -511,7 +516,7 @@ const wf = computed({
           fit-view-on-init
           class="wfe-flow"
         >
-          <Background :gap="22" :size="1.5" color="rgba(99,102,241,0.13)" />
+          <Background :gap="22" :size="1.5" color="#8ab9dc" />
           <Controls position="bottom-left" :show-interactions="false" />
         </VueFlow>
 
@@ -535,7 +540,7 @@ const wf = computed({
       <div class="wfe-panel" v-if="selNode">
         <div class="wfe-panel-head">
           <b>{{ selNode.data.name || selNode.id }}</b>
-          <el-button size="small" text @click="selectedId = ''"><el-icon><Close /></el-icon></el-button>
+          <el-button size="small" text @click="selectedId = ''" aria-label="关闭节点配置" title="关闭节点配置"><el-icon aria-hidden="true"><Close /></el-icon></el-button>
         </div>
         <div class="wfe-panel-body">
           <div class="wfe-field">
@@ -573,11 +578,11 @@ const wf = computed({
           <template v-if="selNode.type === 'llm'">
             <div class="wfe-field">
               <label>提示词（支持 {{ '{params.x}' }} / {{ '{n1.result}' }} 变量）</label>
-              <el-input v-model="selNode.data.prompt" type="textarea" :rows="7" class="mono" placeholder="如：分析以下审计结果并给出结论：{{n1.result}}" />
+          <el-input v-model="selNode.data.prompt" type="textarea" :rows="7" class="mono" placeholder="如：分析以下业务数据并给出结论：{{n1.result}}" />
             </div>
             <div class="wfe-field">
               <label>系统提示（可选）</label>
-              <el-input v-model="selNode.data.system" type="textarea" :rows="2" placeholder="你是一个严谨的业务审计助手" />
+          <el-input v-model="selNode.data.system" type="textarea" :rows="2" placeholder="你是一个严谨的业务助手" />
             </div>
           </template>
 
@@ -621,7 +626,7 @@ const wf = computed({
           <template v-if="selNode.type === 'end'">
             <div class="wfe-field">
               <label>结束摘要（支持变量）</label>
-              <el-input v-model="selNode.data.summary" type="textarea" :rows="3" placeholder="如：审计完成，共发现 {{n2.result.matched}} 条命中" />
+          <el-input v-model="selNode.data.summary" type="textarea" :rows="3" placeholder="如：流程完成，共处理 {{n2.result.matched}} 条记录" />
             </div>
           </template>
 
@@ -638,7 +643,7 @@ const wf = computed({
         v-model="aiDesc"
         type="textarea"
         :rows="4"
-        placeholder="描述业务流程，AI 将自动编排节点与连线。例如：查询违规数据，判断是否命中规则，命中则调用大模型生成审计报告，最后结束"
+        placeholder="描述业务流程，AI 将自动编排节点与连线。例如：查询业务数据，判断是否命中规则，命中后生成结果，最后结束"
       />
       <template #footer>
         <el-button @click="aiDlg = false">取消</el-button>
@@ -712,6 +717,9 @@ const wf = computed({
   border: 1px solid var(--border);
   background: var(--surface);
   cursor: grab;
+  font: inherit;
+  color: inherit;
+  text-align: left;
   transition: all var(--dur) var(--ease);
 }
 .wfe-pal-item:hover {
@@ -722,6 +730,7 @@ const wf = computed({
 .wfe-pal-item:active {
   cursor: grabbing;
 }
+.wfe-pal-item:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: 2px; }
 .wfe-pal-ico {
   width: 28px;
   height: 28px;
@@ -767,9 +776,9 @@ const wf = computed({
   border-radius: 14px;
   overflow: hidden;
   background:
-    radial-gradient(ellipse at 30% 20%, rgba(124, 58, 237, 0.06), transparent 55%),
-    radial-gradient(ellipse at 75% 80%, rgba(8, 145, 178, 0.06), transparent 55%),
-    #fbfaff;
+    radial-gradient(ellipse at 30% 20%, color-mix(in srgb, var(--primary) 7%, transparent), transparent 55%),
+    radial-gradient(ellipse at 75% 80%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 55%),
+    var(--graph-bg-start);
 }
 .wfe-flow {
   width: 100%;
@@ -858,7 +867,7 @@ const wf = computed({
   font-size: 11.5px;
 }
 .exec-result {
-  background: #14102e;
+  background: #1d2930;
   color: #e2e8f0;
   padding: 14px;
   border-radius: 10px;

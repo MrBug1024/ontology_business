@@ -1,9 +1,11 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { api } from '@/api'
 
 const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', redirect: '/dashboard' },
+    { path: '/login', name: 'login', component: () => import('@/views/Login.vue'), meta: { title: '登录', public: true } },
     { path: '/dashboard', name: 'dashboard', component: () => import('@/views/Dashboard.vue'), meta: { title: '仪表盘' } },
     { path: '/scenarios', name: 'scenarios', component: () => import('@/views/Scenarios.vue'), meta: { title: '业务场景' } },
     { path: '/scenarios/:id', name: 'scenario-detail', component: () => import('@/views/ScenarioDetail.vue'), meta: { title: '场景详情' } },
@@ -18,6 +20,17 @@ const router = createRouter({
 
 router.afterEach((to) => {
   document.title = `${to.meta.title || ''} · 业务场景本体智能平台`
+  requestAnimationFrame(() => document.getElementById('main-content')?.focus())
+})
+
+router.beforeEach(async (to) => {
+  if (to.meta.public) return true
+  try {
+    await api.me()
+    return true
+  } catch {
+    return { name: 'login', query: { redirect: to.fullPath } }
+  }
 })
 
 export default router

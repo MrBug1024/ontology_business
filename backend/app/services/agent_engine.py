@@ -14,14 +14,15 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..models import (
     Agent,
+    BusinessScenario,
     BucketFile,
     DataSource,
     LLMConfig,
@@ -32,10 +33,7 @@ from ..models import (
     OntologyWorkflow,
     Skill,
 )
-from . import datasource_service, doc_parser, llm_service, mcp_service, rag_service, skill_service, workflow_service
-
-ToolFn = Callable[[dict[str, Any]], str]
-
+from . import datasource_service, doc_parser, llm_service, mcp_service, ontology_service, rag_service, skill_service, tenant_service, workflow_service
 
 class AgentContext:
     """一次 Agent 会话的运行时上下文。"""
@@ -44,6 +42,10 @@ class AgentContext:
         self.db = db
         self.agent = agent
         self.llm = llm
+        if agent.scenario_id and db.info.get("tenant_id"):
+            self.scenario = tenant_service.get_visible(db, BusinessScenario, agent.scenario_id)
+        else:
+            self.scenario = db.get(BusinessScenario, agent.scenario_id) if agent.scenario_id else None
         self.data_sources: list[DataSource] = []
         self.skills: list[Skill] = []
         self.mcps: list[MCPConfig] = []
@@ -52,18 +54,27 @@ class AgentContext:
     def _load_bindings(self) -> None:
         ds_ids = self.agent.data_source_ids or []
         if ds_ids:
+            ds_scope = tenant_service.visible_clause(DataSource, self.db) if self.db.info.get("tenant_id") else True
             self.data_sources = list(
-                self.db.execute(select(DataSource).where(DataSource.id.in_(ds_ids))).scalars().all()
+                self.db.execute(
+                    select(DataSource).where(
+                        DataSource.id.in_(ds_ids),
+                        ds_scope,
+                        or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == self.agent.scenario_id),
+                    )
+                ).scalars().all()
             )
         sk_ids = self.agent.skill_ids or []
         if sk_ids:
+            skill_scope = tenant_service.visible_clause(Skill, self.db) if self.db.info.get("tenant_id") else True
             self.skills = list(
-                self.db.execute(select(Skill).where(Skill.id.in_(sk_ids), Skill.enabled == True)).scalars().all()  # noqa: E712
+                self.db.execute(select(Skill).where(Skill.id.in_(sk_ids), Skill.enabled == True, skill_scope)).scalars().all()  # noqa: E712
             )
         mcp_ids = self.agent.mcp_ids or []
         if mcp_ids:
+            mcp_scope = tenant_service.visible_clause(MCPConfig, self.db) if self.db.info.get("tenant_id") else True
             self.mcps = list(
-                self.db.execute(select(MCPConfig).where(MCPConfig.id.in_(mcp_ids), MCPConfig.enabled == True)).scalars().all()  # noqa: E712
+                self.db.execute(select(MCPConfig).where(MCPConfig.id.in_(mcp_ids), MCPConfig.enabled == True, mcp_scope)).scalars().all()  # noqa: E712
             )
         # 本体扩展：操作 / 规则 / 事件 / 工作流（按场景加载）
         self.actions: list[OntologyAction] = []
@@ -88,6 +99,18 @@ class AgentContext:
     # ── 工具定义 ──────────────────────────────
     def build_tools(self) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
+        if self.scenario and self.scenario.entities:
+            tools.append(
+                _tool(
+                    "search_ontology",
+                    "按实体类型和关键词检索当前业务场景中的本体实例及属性。"
+                    "用于先确认业务对象，再决定是否需要查询外部数据源。",
+                    {
+                        "entity": {"type": "string", "description": "实体名称，可留空查看所有实体"},
+                        "query": {"type": "string", "description": "实例名称或属性关键词，可留空"},
+                    },
+                )
+            )
         if self.data_sources:
             tools += [
                 _tool(
@@ -120,11 +143,11 @@ class AgentContext:
                 ),
                 _tool(
                     "save_deliverable",
-                    "把业务产出物（审计报告、财务报表、附注、月度报告、函证、分析结果等）保存为可下载附件，"
+                    "把正式业务产出物（报告、清单、分析结果或其他交付文件）保存为可下载附件，"
                     "返回附件的预览/下载链接。参数 filename 为文件名（建议 .md 或 .txt 结尾），content 为附件全文内容。"
-                    "凡是生成正式业务文档/报表/报告时都应调用本工具，并在回答中附上返回的链接。",
+                    "生成正式交付文件时应调用本工具，并在回答中附上返回的链接。",
                     {
-                        "filename": {"type": "string", "description": "附件文件名，如 审计报告-AP001.md"},
+                        "filename": {"type": "string", "description": "附件文件名，如 业务分析报告.md"},
                         "content": {"type": "string", "description": "附件全文内容（Markdown 或纯文本）"},
                     },
                 ),
@@ -213,6 +236,16 @@ class AgentContext:
     # ── 工具执行 ──────────────────────────────
     def execute_tool(self, name: str, args: dict[str, Any]) -> str:
         try:
+            if name == "search_ontology":
+                return _dump(
+                    ontology_service.search_instances(
+                        self.db,
+                        self.scenario,
+                        entity_name=args.get("entity", ""),
+                        query=args.get("query", ""),
+                        limit=get_settings().max_query_rows,
+                    )
+                )
             if name == "list_data_sources":
                 return _dump(
                     [
@@ -374,7 +407,7 @@ class AgentContext:
                 "size": bf.size,
                 "preview_url": f"/api/data-sources/files/{bf.id}/text",
                 "download_url": f"/api/data-sources/files/{bf.id}/download",
-                "提示": "请在回答中以 Markdown 链接形式附上该附件，例如 [📎 审计报告-AP001.md](/api/data-sources/files/" + bf.id + "/download)",
+                "提示": "请在回答中以 Markdown 链接形式附上该附件，例如 [📎 业务交付物.md](/api/data-sources/files/" + bf.id + "/download)",
             }
         )
 
@@ -456,9 +489,8 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
         parts.append("\n【可用数据源】\n" + "\n".join(ds_lines))
         parts.append("你可以用 list_tables 查看表结构，用 run_sql 查询数据库，用 search_documents 检索文件桶中的文档。")
         parts.append(
-            "当你生成正式业务产出物（审计报告、财务报表、报表附注、管理建议书、月度报告、函证、分析报告等）时，"
-            "务必调用 save_deliverable 工具把它保存为附件，并在最终回答中以 Markdown 链接形式附上返回的 download_url，"
-            "例如 [📎 审计报告-AP001.md](/api/data-sources/files/<file_id>/download)，让用户可以点击下载或预览。"
+            "当你生成正式业务交付物时，务必调用 save_deliverable 工具把它保存为附件，"
+            "并在最终回答中以 Markdown 链接形式附上返回的 download_url。"
         )
         table_map = _table_map(ctx)
         if table_map:
@@ -487,9 +519,9 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
             + "\n你可以用 list_workflows 查看工作流列表，用 execute_workflow 执行工作流（workflow_id 必须用上面的 id，不要用中文名）。"
         )
     parts.append(
-        "\n【工作方式】请根据用户问题，自主调用合适的工具获取数据，然后给出准确、结构化的中文回答。"
-        "涉及数据时务必基于工具返回的真实数据，不要编造。"
-        "如果场景定义了操作/规则/工作流，优先使用这些业务抽象来完成任务，而非直接写 SQL。"
+        "\n【工作方式】请根据用户问题，自主调用合适的工具获取数据，然后给出准确、结构化的回答。"
+        "涉及数据时务必基于工具返回的真实数据，不要编造；无法确认时明确说明数据缺口。"
+        "如果场景定义了本体、操作、规则或工作流，优先使用这些业务抽象来完成任务。"
     )
     return "\n".join(parts)
 
@@ -560,7 +592,13 @@ def run_agent(
         # 流式获取本轮 LLM 输出
         content_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
-        for ev in llm_service.chat_stream(llm, messages, tools=tools or None):
+        for ev in llm_service.chat_stream(
+            llm,
+            messages,
+            tools=tools or None,
+            temperature=agent.temperature,
+            max_tokens=agent.max_tokens,
+        ):
             if ev["type"] == "token":
                 content_parts.append(ev["content"])
                 yield {"type": "token", "data": ev["content"]}
@@ -594,9 +632,9 @@ def run_agent(
         for tc in tool_calls:
             fname = tc["function"]["name"]
             fargs = tc["function"]["arguments"] or {}
-            yield {"type": "tool_call", "data": {"name": fname, "arguments": fargs}}
+            yield {"type": "tool_call", "data": {"id": tc["id"], "name": fname, "arguments": fargs}}
             result = ctx.execute_tool(fname, fargs)
-            yield {"type": "tool_result", "data": {"name": fname, "result": result[:8000]}}
+            yield {"type": "tool_result", "data": {"id": tc["id"], "name": fname, "result": result[:8000]}}
             messages.append(
                 {"role": "tool", "tool_call_id": tc["id"], "name": fname, "content": result[:8000]}
             )

@@ -5,10 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..database import get_db
 from ..models import Skill
 from ..schemas import Msg, SkillOut, SkillToggle
-from ..services import skill_service
+from ..services import skill_service, tenant_service
+from ..services.auth_service import get_tenant_db
 
 router = APIRouter(prefix="/skills", tags=["skills"])
 
@@ -27,22 +27,22 @@ def _out(s: Skill) -> SkillOut:
 
 
 @router.get("", response_model=list[SkillOut])
-def list_skills(db: Session = Depends(get_db)):
+def list_skills(db: Session = Depends(get_tenant_db)):
     skill_service.sync_skills_to_db(db)
-    return [_out(s) for s in db.execute(select(Skill).order_by(Skill.name)).scalars().all()]
+    return [_out(s) for s in db.execute(
+        select(Skill).where(tenant_service.visible_clause(Skill, db)).order_by(Skill.name)
+    ).scalars().all()]
 
 
 @router.post("/rescan", response_model=Msg)
-def rescan(db: Session = Depends(get_db)):
+def rescan(db: Session = Depends(get_tenant_db)):
     skill_service.sync_skills_to_db(db)
     return Msg(message="技能扫描完成")
 
 
 @router.put("/{skill_id}", response_model=SkillOut)
-def update_skill(skill_id: str, payload: SkillToggle, db: Session = Depends(get_db)):
-    s = db.get(Skill, skill_id)
-    if not s:
-        raise HTTPException(404, "技能不存在")
+def update_skill(skill_id: str, payload: SkillToggle, db: Session = Depends(get_tenant_db)):
+    s = tenant_service.require_owned(db, Skill, skill_id, "技能不存在")
     s.enabled = payload.enabled
     db.commit()
     db.refresh(s)
@@ -50,9 +50,7 @@ def update_skill(skill_id: str, payload: SkillToggle, db: Session = Depends(get_
 
 
 @router.post("/{skill_id}/execute")
-def execute_skill(skill_id: str, payload: dict, db: Session = Depends(get_db)):
-    s = db.get(Skill, skill_id)
-    if not s:
-        raise HTTPException(404, "技能不存在")
+def execute_skill(skill_id: str, payload: dict, db: Session = Depends(get_tenant_db)):
+    s = tenant_service.require_visible(db, Skill, skill_id, "技能不存在")
     args = payload.get("args", [])
     return skill_service.execute_skill(s, args)

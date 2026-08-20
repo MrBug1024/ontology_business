@@ -18,7 +18,7 @@ class Settings(BaseSettings):
 
     app_name: str = "Ontology Business Agent Platform"
     app_version: str = "1.0.0"
-    debug: bool = True
+    debug: bool = False
 
     # API
     api_prefix: str = "/api"
@@ -35,6 +35,23 @@ class Settings(BaseSettings):
     max_tool_rounds: int = 20
     max_query_rows: int = 200
     llm_timeout: float = 120.0
+    max_upload_bytes: int = 50 * 1024 * 1024
+    allow_unsafe_workflow_nodes: bool = False
+
+    # Authentication / mail
+    auth_cookie_name: str = "ontology_session"
+    auth_cookie_secure: bool = False
+    auth_session_days: int = 7
+    verification_code_minutes: int = 10
+    mail_username: str = ""
+    mail_password: str = ""
+    mail_from: str = ""
+    mail_port: int = 465
+    mail_server: str = ""
+    mail_starttls: bool = False
+    mail_ssl_tls: bool = True
+    mail_use_credentials: bool = True
+    mail_timeout_seconds: int = 20
 
 
 @lru_cache

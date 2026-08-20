@@ -1,5 +1,19 @@
 // 领域类型定义
 
+export interface User {
+  id: string
+  email: string
+  display_name?: string
+  tenant_id: string
+  email_verified?: boolean
+}
+
+export interface AuthMessage {
+  ok: boolean
+  message: string
+  email?: string
+}
+
 export interface Property {
   name: string
   data_type: string

@@ -9,12 +9,34 @@ from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..database import get_db
 from ..models import BucketFile, DataSource
 from ..schemas import BucketFileOut, DataSourceIn, DataSourceOut, Msg, QueryResult, TableInfo
-from ..services import datasource_service, doc_parser
+from ..services import datasource_service, doc_parser, tenant_service
+from ..config import get_settings
+from ..services.auth_service import get_tenant_db
 
 router = APIRouter(prefix="/data-sources", tags=["data-sources"])
+
+_SECRET_KEYS = {"password", "api_key", "token", "secret", "access_token"}
+
+
+def _public_config(config: dict) -> dict:
+    """返回可给前端展示的配置，凭据字段永不回显。"""
+    safe = dict(config or {})
+    for key in _SECRET_KEYS:
+        if key in safe:
+            safe[key] = ""
+    return safe
+
+
+def _merge_config(old: dict, new: dict) -> dict:
+    """编辑数据源时，空凭据表示保持原值，避免前端必须读取密钥。"""
+    merged = dict(new or {})
+    for key in _SECRET_KEYS:
+        if not merged.get(key):
+            if key in old:
+                merged[key] = old[key]
+    return merged
 
 
 def _out(ds: DataSource) -> DataSourceOut:
@@ -23,7 +45,7 @@ def _out(ds: DataSource) -> DataSourceOut:
         scenario_id=ds.scenario_id,
         name=ds.name,
         type=ds.type,
-        config=ds.config or {},
+        config=_public_config(ds.config or {}),
         status=ds.status,
         last_error=ds.last_error,
         created_at=ds.created_at,
@@ -31,17 +53,25 @@ def _out(ds: DataSource) -> DataSourceOut:
     )
 
 
+def _data_source(db: Session, ds_id: str, writable: bool = False) -> DataSource:
+    if writable:
+        return tenant_service.require_owned(db, DataSource, ds_id, "数据源不存在")
+    return tenant_service.require_visible(db, DataSource, ds_id, "数据源不存在")
+
+
 @router.get("", response_model=list[DataSourceOut])
-def list_data_sources(scenario_id: str | None = None, db: Session = Depends(get_db)):
-    stmt = select(DataSource)
+def list_data_sources(scenario_id: str | None = None, db: Session = Depends(get_tenant_db)):
+    stmt = select(DataSource).where(tenant_service.visible_clause(DataSource, db))
     if scenario_id:
         stmt = stmt.where(DataSource.scenario_id == scenario_id)
     return [_out(d) for d in db.execute(stmt).scalars().all()]
 
 
 @router.post("", response_model=DataSourceOut)
-def create_data_source(payload: DataSourceIn, db: Session = Depends(get_db)):
-    ds = DataSource(**payload.model_dump())
+def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_db)):
+    if payload.scenario_id:
+        tenant_service.require_scenario(db, payload.scenario_id, writable=True)
+    ds = DataSource(tenant_id=tenant_service.current_tenant_id(db), **payload.model_dump())
     db.add(ds)
     db.commit()
     db.refresh(ds)
@@ -49,12 +79,15 @@ def create_data_source(payload: DataSourceIn, db: Session = Depends(get_db)):
 
 
 @router.put("/{ds_id}", response_model=DataSourceOut)
-def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(get_db)):
-    ds = db.get(DataSource, ds_id)
-    if not ds:
-        raise HTTPException(404, "数据源不存在")
-    for k, v in payload.model_dump().items():
+def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(get_tenant_db)):
+    ds = _data_source(db, ds_id, writable=True)
+    if payload.scenario_id:
+        tenant_service.require_scenario(db, payload.scenario_id, writable=True)
+    values = payload.model_dump()
+    values["config"] = _merge_config(ds.config or {}, values.get("config", {}))
+    for k, v in values.items():
         setattr(ds, k, v)
+    datasource_service.invalidate_engine(ds)
     ds.status = "unknown"
     db.commit()
     db.refresh(ds)
@@ -62,22 +95,19 @@ def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(
 
 
 @router.delete("/{ds_id}", response_model=Msg)
-def delete_data_source(ds_id: str, db: Session = Depends(get_db)):
-    ds = db.get(DataSource, ds_id)
-    if not ds:
-        raise HTTPException(404, "数据源不存在")
+def delete_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
+    ds = _data_source(db, ds_id, writable=True)
     for f in list(ds.files):
         datasource_service.delete_bucket_file(f)
+    datasource_service.invalidate_engine(ds)
     db.delete(ds)
     db.commit()
     return Msg(message="已删除")
 
 
 @router.post("/{ds_id}/test", response_model=Msg)
-def test_data_source(ds_id: str, db: Session = Depends(get_db)):
-    ds = db.get(DataSource, ds_id)
-    if not ds:
-        raise HTTPException(404, "数据源不存在")
+def test_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
+    ds = _data_source(db, ds_id, writable=True)
     if ds.type == "file_bucket":
         ds.status = "ok"
         ds.last_error = ""
@@ -91,10 +121,8 @@ def test_data_source(ds_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/{ds_id}/tables", response_model=list[TableInfo])
-def list_tables(ds_id: str, db: Session = Depends(get_db)):
-    ds = db.get(DataSource, ds_id)
-    if not ds:
-        raise HTTPException(404, "数据源不存在")
+def list_tables(ds_id: str, db: Session = Depends(get_tenant_db)):
+    ds = _data_source(db, ds_id)
     if ds.type == "file_bucket":
         return []
     try:
@@ -104,10 +132,8 @@ def list_tables(ds_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{ds_id}/query", response_model=QueryResult)
-def query(ds_id: str, payload: dict, db: Session = Depends(get_db)):
-    ds = db.get(DataSource, ds_id)
-    if not ds:
-        raise HTTPException(404, "数据源不存在")
+def query(ds_id: str, payload: dict, db: Session = Depends(get_tenant_db)):
+    ds = _data_source(db, ds_id)
     sql = payload.get("sql", "")
     if not sql.strip():
         raise HTTPException(400, "SQL 不能为空")
@@ -119,25 +145,24 @@ def query(ds_id: str, payload: dict, db: Session = Depends(get_db)):
 
 # ── 文件桶 ────────────────────────────────────
 @router.get("/{ds_id}/files", response_model=list[BucketFileOut])
-def list_files(ds_id: str, db: Session = Depends(get_db)):
-    ds = db.get(DataSource, ds_id)
-    if not ds:
-        raise HTTPException(404, "数据源不存在")
+def list_files(ds_id: str, db: Session = Depends(get_tenant_db)):
+    ds = _data_source(db, ds_id)
     if ds.type != "file_bucket":
         return []
     return list(ds.files)
 
 
 @router.post("/{ds_id}/files", response_model=list[BucketFileOut])
-async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Session = Depends(get_db)):
-    ds = db.get(DataSource, ds_id)
-    if not ds:
-        raise HTTPException(404, "数据源不存在")
+async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Session = Depends(get_tenant_db)):
+    ds = _data_source(db, ds_id, writable=True)
     if ds.type != "file_bucket":
         raise HTTPException(400, "该数据源不是文件桶")
     created: list[BucketFile] = []
+    max_upload_bytes = get_settings().max_upload_bytes
     for uf in files:
-        content = await uf.read()
+        content = await uf.read(max_upload_bytes + 1)
+        if len(content) > max_upload_bytes:
+            raise HTTPException(413, f"文件超过大小限制（{max_upload_bytes // (1024 * 1024)} MB）")
         bf = datasource_service.save_bucket_file(ds, uf.filename or "file", content)
         db.add(bf)
         db.commit()
@@ -154,10 +179,11 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
 
 
 @router.post("/files/{file_id}/reparse", response_model=BucketFileOut)
-def reparse_file(file_id: str, db: Session = Depends(get_db)):
+def reparse_file(file_id: str, db: Session = Depends(get_tenant_db)):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
+    tenant_service.require_owned(db, DataSource, bf.data_source_id, "文件不存在")
     r = doc_parser.parse_file(bf.stored_path, bf.filename)
     bf.status = "parsed" if r["status"] == "success" else "error"
     bf.parsed_text = r.get("text", "")
@@ -168,19 +194,21 @@ def reparse_file(file_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/files/{file_id}/text")
-def file_text(file_id: str, db: Session = Depends(get_db)):
+def file_text(file_id: str, db: Session = Depends(get_tenant_db)):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
+    tenant_service.require_visible(db, DataSource, bf.data_source_id, "文件不存在")
     return {"filename": bf.filename, "text": bf.parsed_text}
 
 
 @router.get("/files/{file_id}/download")
-def file_download(file_id: str, db: Session = Depends(get_db)):
+def file_download(file_id: str, db: Session = Depends(get_tenant_db)):
     """下载文件桶中的文件（附件）。"""
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
+    tenant_service.require_visible(db, DataSource, bf.data_source_id, "文件不存在")
     p = Path(bf.stored_path)
     if not p.exists():
         raise HTTPException(404, "文件已丢失")
@@ -193,10 +221,11 @@ def file_download(file_id: str, db: Session = Depends(get_db)):
 
 
 @router.delete("/files/{file_id}", response_model=Msg)
-def delete_file(file_id: str, db: Session = Depends(get_db)):
+def delete_file(file_id: str, db: Session = Depends(get_tenant_db)):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
+    tenant_service.require_owned(db, DataSource, bf.data_source_id, "文件不存在")
     datasource_service.delete_bucket_file(bf)
     db.delete(bf)
     db.commit()

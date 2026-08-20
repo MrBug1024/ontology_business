@@ -6,7 +6,7 @@
         <b>{{ title }}</b>
         <span class="ep-sub">{{ subtitle }}</span>
       </div>
-      <el-button class="ep-close" size="small" text @click="emit('close')"><el-icon><Close /></el-icon></el-button>
+      <el-button class="ep-close" size="small" text @click="emit('close')" aria-label="关闭编辑面板" title="关闭编辑面板"><el-icon aria-hidden="true"><Close /></el-icon></el-button>
     </div>
 
     <div class="ep-body">
@@ -14,7 +14,7 @@
       <template v-if="editor.kind === 'entity'">
         <div class="ep-field">
           <label>名称</label>
-          <el-input v-model="editor.form.name" placeholder="如：客户、订单" />
+          <el-input v-model="editor.form.name" placeholder="如：业务对象、资源、事项" />
         </div>
         <div class="ep-row2">
           <div class="ep-field">
@@ -44,7 +44,7 @@
             <div class="prop-flags">
               <el-checkbox v-model="p.is_key" label="主键" />
               <el-checkbox v-model="p.is_required" label="必填" />
-              <el-button size="small" text type="danger" @click="editor.form.properties.splice(i, 1)"><el-icon><Delete /></el-icon></el-button>
+          <el-button size="small" text type="danger" @click="editor.form.properties.splice(i, 1)" :aria-label="`删除属性：${p.name || i + 1}`" title="删除属性"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
             </div>
           </div>
           <div class="muted" v-if="!editor.form.properties.length" style="padding:6px 2px">暂无属性，点击「添加」</div>
@@ -91,7 +91,7 @@
         </div>
         <div class="ep-field">
           <label>名称</label>
-          <el-input v-model="editor.form.name" placeholder="实例名称，如：张三、订单#1001" />
+          <el-input v-model="editor.form.name" placeholder="实例名称，如：对象A、记录#1001" />
         </div>
         <div class="ep-sec"><span>属性值</span></div>
         <div class="ep-props">
@@ -147,12 +147,12 @@ const subtitle = computed(() => {
   return ent?.name || ''
 })
 const accent = computed(() => {
-  if (props.editor.kind === 'entity') return props.editor.form.color || '#6366f1'
+  if (props.editor.kind === 'entity') return props.editor.form.color || '#27b9b0'
   if (props.editor.kind === 'instance') {
     const ent = props.entities.find((e) => e.id === props.editor.form.entity_id)
-    return ent?.color || '#06b6d4'
+    return ent?.color || '#438be5'
   }
-  return '#8b5cf6'
+  return '#438be5'
 })
 
 function addProp() {

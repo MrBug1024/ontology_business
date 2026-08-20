@@ -9,7 +9,6 @@
 /frontend/dist/
 /frontend/vite-runtime*.log
 /frontend/vite.config.ts.timestamp-*.mjs
-/backend/tests
 # Python
 __pycache__
 *.py[cod]

@@ -9,8 +9,8 @@
     </div>
 
     <el-row :gutter="16" v-loading="loading">
-      <el-col :span="8" v-for="a in agents" :key="a.id">
-        <div class="card agent-card" @click="$router.push('/agents/' + a.id + '/chat')">
+      <el-col :xs="24" :sm="12" :lg="8" v-for="a in agents" :key="a.id">
+        <div class="card agent-card" role="button" tabindex="0" :aria-label="`打开 Agent 对话：${a.name}`" @click="$router.push('/agents/' + a.id + '/chat')" @keydown.enter.prevent="$router.push('/agents/' + a.id + '/chat')" @keydown.space.prevent="$router.push('/agents/' + a.id + '/chat')">
           <div class="ag-head">
             <div class="ag-avatar"><el-icon :size="20"><Cpu /></el-icon></div>
             <div class="ag-title">
@@ -20,10 +20,10 @@
           </div>
           <div class="ag-desc">{{ a.description || '暂无描述' }}</div>
           <div class="ag-tags">
-            <el-tag v-if="a.llm_name" size="small" type="primary" effect="light">✦ {{ a.llm_name }}</el-tag>
-            <el-tag v-for="n in a.skill_names || []" :key="n" size="small" type="success" effect="light">⚡ {{ n }}</el-tag>
-            <el-tag v-for="n in a.mcp_names || []" :key="n" size="small" type="warning" effect="light">🔌 {{ n }}</el-tag>
-            <el-tag v-for="n in a.data_source_names || []" :key="n" size="small" type="info" effect="light">🗄 {{ n }}</el-tag>
+            <el-tag v-if="a.llm_name" size="small" type="primary" effect="light"><el-icon aria-hidden="true"><ChatDotRound /></el-icon>{{ a.llm_name }}</el-tag>
+            <el-tag v-for="n in a.skill_names || []" :key="n" size="small" type="success" effect="light"><el-icon aria-hidden="true"><MagicStick /></el-icon>{{ n }}</el-tag>
+            <el-tag v-for="n in a.mcp_names || []" :key="n" size="small" type="warning" effect="light"><el-icon aria-hidden="true"><Connection /></el-icon>{{ n }}</el-tag>
+            <el-tag v-for="n in a.data_source_names || []" :key="n" size="small" type="info" effect="light"><el-icon aria-hidden="true"><Coin /></el-icon>{{ n }}</el-tag>
             <span class="muted" v-if="!(a.llm_name || a.skill_names?.length || a.mcp_names?.length || a.data_source_names?.length)">未配置能力</span>
           </div>
           <div class="ag-actions" @click.stop>
@@ -45,7 +45,7 @@
       <el-form :model="form" label-width="100px">
         <el-row :gutter="12">
           <el-col :span="12">
-            <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：销售分析助手" /></el-form-item>
+            <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：业务分析助手" /></el-form-item>
           </el-col>
           <el-col :span="12">
             <el-form-item label="描述"><el-input v-model="form.description" placeholder="Agent 用途说明" /></el-form-item>
@@ -167,10 +167,14 @@ async function save() {
   }
 }
 async function remove(a: Agent) {
-  await ElMessageBox.confirm(`删除 Agent「${a.name}」？`, '确认', { type: 'warning' })
-  await api.deleteAgent(a.id!)
-  ElMessage.success('已删除')
-  load()
+  try {
+    await ElMessageBox.confirm(`删除 Agent「${a.name}」？`, '确认', { type: 'warning' })
+    await api.deleteAgent(a.id!)
+    ElMessage.success('已删除')
+    await load()
+  } catch (e: any) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
+  }
 }
 onMounted(load)
 </script>
@@ -198,6 +202,7 @@ onMounted(load)
   border-color: var(--border-strong);
 }
 .agent-card:hover::before { opacity: 1; }
+.agent-card:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: 3px; }
 .ag-head {
   display: flex;
   align-items: center;

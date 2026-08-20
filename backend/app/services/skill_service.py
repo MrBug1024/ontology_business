@@ -87,6 +87,9 @@ def sync_skills_to_db(db) -> None:
             s.description = info["description"]
             s.path = info["path"]
             s.meta = info["metadata"]
+            s.source = "builtin"
+            s.tenant_id = None
+            s.is_public = True
         else:
             db.add(
                 Skill(
@@ -94,6 +97,7 @@ def sync_skills_to_db(db) -> None:
                     description=info["description"],
                     path=info["path"],
                     source="builtin",
+                    is_public=True,
                     enabled=True,
                     meta=info["metadata"],
                 )

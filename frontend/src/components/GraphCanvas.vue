@@ -9,14 +9,18 @@
     >
       <defs>
         <marker id="gc-arrow" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto">
-          <path d="M0,0 L8,3.5 L0,7 Z" fill="#a78bfa" />
+          <path d="M0,0 L8,3.5 L0,7 Z" fill="var(--graph-edge)" />
         </marker>
         <marker id="gc-arrow-sel" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto">
-          <path d="M0,0 L8,3.5 L0,7 Z" fill="#7c3aed" />
+          <path d="M0,0 L8,3.5 L0,7 Z" fill="var(--primary)" />
         </marker>
+        <linearGradient id="gc-node-bar" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="var(--graph-teal)" />
+          <stop offset="100%" stop-color="var(--graph-blue)" />
+        </linearGradient>
         <radialGradient id="gc-glow" cx="50%" cy="50%" r="50%">
-          <stop offset="0%" stop-color="rgba(124,58,237,0.22)" />
-          <stop offset="100%" stop-color="rgba(124,58,237,0)" />
+          <stop offset="0%" stop-color="rgba(44,190,194,0.22)" />
+          <stop offset="100%" stop-color="rgba(44,190,194,0)" />
         </radialGradient>
       </defs>
 
@@ -26,7 +30,7 @@
           <path
             :d="e.path"
             fill="none"
-            :stroke="e.selected ? '#7c3aed' : '#c4b5fd'"
+            :stroke="e.selected ? 'var(--primary)' : 'var(--border-strong)'"
             :stroke-width="e.selected ? 2.6 : 1.6"
             :stroke-dasharray="e.dashed ? '6 5' : 'none'"
             :marker-end="e.selected ? 'url(#gc-arrow-sel)' : 'url(#gc-arrow)'"
@@ -36,15 +40,15 @@
           <path :d="e.path" fill="none" stroke="transparent" stroke-width="14" class="edge-hit" @mousedown.stop @click.stop="onEdgeClick(e)" />
           <g v-if="e.label" class="edge-label" @mousedown.stop @click.stop="onEdgeClick(e)">
             <rect :x="e.mx - e.labelW / 2" :y="e.my - 10" :width="e.labelW" height="18" rx="9"
-              :fill="e.selected ? '#7c3aed' : 'rgba(255,255,255,0.95)'" />
+              :fill="e.selected ? 'var(--primary)' : 'var(--surface)'" />
             <text :x="e.mx" :y="e.my + 3.5" text-anchor="middle" font-size="10.5"
-              :fill="e.selected ? '#fff' : '#6d28d9'" font-weight="600">{{ e.label }}</text>
+              :fill="e.selected ? '#fff' : 'var(--primary-600)'" font-weight="600">{{ e.label }}</text>
           </g>
         </g>
 
         <!-- 连线拖拽中的临时线 -->
         <line v-if="linking" :x1="linking.x1" :y1="linking.y1" :x2="linking.x2" :y2="linking.y2"
-          stroke="#0891b2" stroke-width="2" stroke-dasharray="5 4" />
+          stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 4" />
 
         <!-- 节点 -->
         <g v-for="n in nodes" :key="n.id" :transform="`translate(${n.x},${n.y})`"
@@ -54,23 +58,27 @@
           <circle v-if="mode === 'instance'" :r="(n.size || 16) + 12" fill="url(#gc-glow)" />
           <!-- 实体节点：圆角矩形 -->
           <template v-if="mode === 'schema'">
-            <rect :x="-n.w / 2" :y="-26" :width="n.w" height="52" rx="14"
-              :fill="'rgba(255,255,255,0.96)'" :stroke="n.color" :stroke-width="selectedId === n.id ? 2.4 : 1.4" />
-            <rect :x="-n.w / 2" :y="-26" :width="n.w" height="7" rx="3.5" :fill="n.color" />
-            <text :y="-2" text-anchor="middle" font-size="13" font-weight="700" fill="#1e1b4b">{{ n.label }}</text>
-            <text :y="14" text-anchor="middle" font-size="10" fill="#94919f">
+            <rect :x="-n.w / 2" :y="-n.h / 2" :width="n.w" :height="n.h" rx="16"
+              :fill="'var(--surface)'" :stroke="n.color" :stroke-width="selectedId === n.id ? 2.4 : 1.3" />
+            <rect :x="-n.w / 2" :y="-n.h / 2" :width="n.w" height="6" rx="3" fill="url(#gc-node-bar)" />
+            <circle :cx="-n.w / 2 + 18" cy="-4" r="5" :fill="n.color" />
+            <text :x="-n.w / 2 + 32" y="0" text-anchor="start" font-size="13" font-weight="700" fill="var(--text)">{{ shortLabel(n.label, 17) }}</text>
+            <text :x="-n.w / 2 + 16" y="20" text-anchor="start" font-size="10" fill="var(--text-3)">
               {{ n.meta?.abstract ? '抽象 · ' : '' }}{{ n.meta?.count ?? 0 }} 属性
             </text>
           </template>
-          <!-- 实例节点：圆形 -->
+          <!-- 实例节点：信息卡片，标签不再悬浮在圆形下方互相覆盖 -->
           <template v-else>
-            <circle :r="n.size || 16" :fill="n.color" fill-opacity="0.16" :stroke="n.color" :stroke-width="selectedId === n.id ? 3 : 2" />
-            <circle :r="Math.max(4, (n.size || 16) * 0.42)" :fill="n.color" />
-            <text :y="(n.size || 16) + 14" text-anchor="middle" font-size="11" font-weight="600" fill="#5b5878">{{ n.label }}</text>
+            <rect :x="-n.w / 2" :y="-n.h / 2" :width="n.w" :height="n.h" rx="15"
+              :fill="'var(--surface)'" :stroke="n.color" :stroke-width="selectedId === n.id ? 2.4 : 1.2" />
+            <circle :cx="-n.w / 2 + 18" cy="0" r="7" :fill="n.color" fill-opacity="0.18" :stroke="n.color" />
+            <circle :cx="-n.w / 2 + 18" cy="0" r="3" :fill="n.color" />
+            <text :x="-n.w / 2 + 34" y="-2" text-anchor="start" font-size="11.5" font-weight="700" fill="var(--text)">{{ shortLabel(n.label, 18) }}</text>
+            <text :x="-n.w / 2 + 34" y="15" text-anchor="start" font-size="9.5" fill="var(--text-3)">{{ shortLabel(n.meta?.entity_name || '实例节点', 14) }}</text>
           </template>
           <!-- 连线手柄（schema 模式，hover 显示） -->
           <circle v-if="mode === 'schema'" :cx="n.w / 2" cy="0" r="7" class="link-handle"
-            :fill="'#0891b2'" @mousedown.stop="onLinkStart($event, n)" />
+            :fill="'var(--accent)'" @mousedown.stop="onLinkStart($event, n)" />
         </g>
       </g>
     </svg>
@@ -81,12 +89,18 @@
       <div>{{ emptyText }}</div>
     </div>
 
+    <div class="graph-caption">
+      <span class="caption-mark"></span>
+      <span>{{ mode === 'schema' ? '本体结构' : '实例关系' }}</span>
+      <i>{{ nodes.length }} 个节点</i>
+    </div>
+
     <!-- 工具栏 -->
     <div class="graph-tools">
-      <button title="放大" @click="zoomBy(1.2)"><el-icon><ZoomIn /></el-icon></button>
-      <button title="缩小" @click="zoomBy(0.8)"><el-icon><ZoomOut /></el-icon></button>
-      <button title="适应画布" @click="fitView"><el-icon><FullScreen /></el-icon></button>
-      <button title="重新布局" @click="relayout"><el-icon><Refresh /></el-icon></button>
+      <button title="放大" aria-label="放大画布" @click="zoomBy(1.2)"><el-icon aria-hidden="true"><ZoomIn /></el-icon></button>
+      <button title="缩小" aria-label="缩小画布" @click="zoomBy(0.8)"><el-icon aria-hidden="true"><ZoomOut /></el-icon></button>
+      <button title="适应画布" aria-label="适应画布" @click="fitView"><el-icon aria-hidden="true"><FullScreen /></el-icon></button>
+      <button title="重新布局" aria-label="重新布局" @click="relayout"><el-icon aria-hidden="true"><Refresh /></el-icon></button>
     </div>
 
     <!-- 图例 -->
@@ -150,14 +164,28 @@ function toGraph(clientX: number, clientY: number) {
 }
 
 function relayout() {
-  const layout = forceLayout(props.data, { width: W(), height: H() })
-  nodes.value = layout.nodes.map((n) => ({ ...n, w: nodeWidth(n) }))
+  const layout = forceLayout(props.data, {
+    width: W(),
+    height: H(),
+    nodePadding: props.mode === 'schema' ? 44 : 30,
+    nodeSize: (n) => ({ width: nodeWidth(n), height: nodeHeight(n) }),
+  })
+  nodes.value = layout.nodes.map((n) => ({ ...n, w: nodeWidth(n), h: nodeHeight(n) }))
   fitView()
 }
 
-function nodeWidth(n: LayoutNode) {
-  if (props.mode === 'instance') return 0
-  return Math.max(128, (n.label || '').length * 14 + 44)
+function nodeWidth(n: GraphNode) {
+  if (props.mode === 'instance') return Math.max(144, Math.min(228, (n.label || '').length * 11 + 68))
+  return Math.max(158, Math.min(236, (n.label || '').length * 14 + 78))
+}
+
+function nodeHeight(_n: GraphNode) {
+  return props.mode === 'instance' ? 52 : 72
+}
+
+function shortLabel(value: unknown, max: number) {
+  const text = String(value || '')
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }
 
 function fitView() {
@@ -165,15 +193,13 @@ function fitView() {
     view.x = 0; view.y = 0; view.k = 1
     return
   }
-  const xs = nodes.value.map((n) => n.x)
-  const ys = nodes.value.map((n) => n.y)
-  const minX = Math.min(...xs) - 60
-  const maxX = Math.max(...xs) + 60
-  const minY = Math.min(...ys) - 60
-  const maxY = Math.max(...ys) + 60
+  const minX = Math.min(...nodes.value.map((n) => n.x - n.w / 2)) - 56
+  const maxX = Math.max(...nodes.value.map((n) => n.x + n.w / 2)) + 56
+  const minY = Math.min(...nodes.value.map((n) => n.y - n.h / 2)) - 56
+  const maxY = Math.max(...nodes.value.map((n) => n.y + n.h / 2)) + 56
   const w = maxX - minX
   const h = maxY - minY
-  const k = Math.min(1.6, Math.min(W() / w, H() / h))
+  const k = Math.min(1.55, Math.min(W() / w, H() / h))
   view.k = k
   view.x = W() / 2 - ((minX + maxX) / 2) * k
   view.y = H() / 2 - ((minY + maxY) / 2) * k
@@ -233,9 +259,9 @@ function nodeAt(clientX: number, clientY: number): LayoutNode | null {
   let best: LayoutNode | null = null
   let bestD = Infinity
   for (const n of nodes.value) {
-    const r = props.mode === 'instance' ? (n.size || 16) : Math.max(n.w / 2, 26)
+    const hit = Math.abs(n.x - g.x) <= n.w / 2 + 8 && Math.abs(n.y - g.y) <= n.h / 2 + 8
     const d = Math.hypot(n.x - g.x, n.y - g.y)
-    if (d < r + 8 && d < bestD) {
+    if (hit && d < bestD) {
       best = n
       bestD = d
     }
@@ -295,16 +321,16 @@ const edgeViews = computed(() => {
     .map((e) => {
       const a = byId.get(e.source)!
       const b = byId.get(e.target)!
-      // 从节点边缘出发
+      // 从矩形节点边缘出发，避免连线穿透卡片。
       const dx = b.x - a.x
       const dy = b.y - a.y
       const dist = Math.hypot(dx, dy) || 1
-      const ra = props.mode === 'instance' ? (a.size || 16) : Math.max(a.w / 2, 26)
-      const rb = props.mode === 'instance' ? (b.size || 16) : Math.max(b.w / 2, 26)
-      const x1 = a.x + (dx / dist) * ra
-      const y1 = a.y + (dy / dist) * ra
-      const x2 = b.x - (dx / dist) * (rb + 6)
-      const y2 = b.y - (dy / dist) * (rb + 6)
+      const sourceScale = Math.min(a.w / 2 / Math.max(Math.abs(dx / dist), 0.0001), a.h / 2 / Math.max(Math.abs(dy / dist), 0.0001))
+      const targetScale = Math.min(b.w / 2 / Math.max(Math.abs(dx / dist), 0.0001), b.h / 2 / Math.max(Math.abs(dy / dist), 0.0001))
+      const x1 = a.x + (dx / dist) * sourceScale
+      const y1 = a.y + (dy / dist) * sourceScale
+      const x2 = b.x - (dx / dist) * (targetScale + 6)
+      const y2 = b.y - (dy / dist) * (targetScale + 6)
       const { path, mx, my } = edgePath(x1, y1, x2, y2, 0.16)
       const label = e.label || ''
       return {
@@ -368,18 +394,21 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   min-height: 320px;
-  border-radius: var(--radius);
+  border-radius: 20px;
   overflow: hidden;
   background:
-    radial-gradient(circle at 20% 20%, rgba(124, 58, 237, 0.06), transparent 40%),
-    radial-gradient(circle at 80% 70%, rgba(8, 145, 178, 0.06), transparent 40%),
-    linear-gradient(180deg, #fbfaff, #f5f3fc);
-  border: 1px solid var(--border);
+    radial-gradient(circle at 12% 12%, rgba(62, 180, 217, .14), transparent 34%),
+    radial-gradient(circle at 86% 78%, rgba(47, 194, 177, .11), transparent 34%),
+    linear-gradient(145deg, var(--graph-bg-start), var(--graph-bg-end));
+  border: 1px solid var(--graph-border);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.88), var(--shadow-sm);
 }
 .graph-svg {
   display: block;
   cursor: grab;
   touch-action: none;
+  background-image: radial-gradient(circle, rgba(75, 151, 210, .16) 1px, transparent 1px);
+  background-size: 24px 24px;
 }
 .graph-svg:active {
   cursor: grabbing;
@@ -389,7 +418,7 @@ onBeforeUnmount(() => {
 }
 .gnode.selected rect,
 .gnode.selected circle {
-  filter: drop-shadow(0 0 10px rgba(124, 58, 237, 0.5));
+  filter: drop-shadow(0 7px 12px rgba(38, 147, 196, .24));
 }
 .link-handle {
   opacity: 0;
@@ -403,7 +432,7 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 .edge-label rect {
-  stroke: var(--border);
+  stroke: var(--graph-border);
 }
 .graph-empty {
   position: absolute;
@@ -424,11 +453,12 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  border: 1px solid var(--graph-border);
+  border-radius: 14px;
   padding: 6px;
-  box-shadow: var(--shadow-sm);
+  box-shadow: 0 8px 24px rgba(44, 113, 164, .12);
+  backdrop-filter: blur(12px);
 }
 .graph-tools button {
   width: 32px;
@@ -440,11 +470,43 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--primary-600);
+  color: var(--graph-blue-deep);
   transition: background var(--dur) var(--ease);
 }
 .graph-tools button:hover {
-  background: var(--grad-soft);
+  background: var(--graph-soft);
+}
+.graph-caption {
+  position: absolute;
+  left: 16px;
+  top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  color: var(--graph-blue-deep);
+  background: color-mix(in srgb, var(--surface) 84%, transparent);
+  border: 1px solid var(--graph-border);
+  border-radius: 12px;
+  box-shadow: 0 6px 18px rgba(44, 113, 164, .08);
+  backdrop-filter: blur(10px);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: .04em;
+  pointer-events: none;
+}
+.graph-caption i {
+  color: var(--text-3);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 550;
+}
+.caption-mark {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--graph-teal);
+  box-shadow: 0 0 0 4px rgba(44, 190, 194, .12);
 }
 .graph-legend {
   position: absolute;
@@ -453,12 +515,13 @@ onBeforeUnmount(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 8px 14px;
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  border: 1px solid var(--graph-border);
   border-radius: 12px;
   padding: 8px 12px;
   max-width: 70%;
-  box-shadow: var(--shadow-xs);
+  box-shadow: 0 6px 18px rgba(44, 113, 164, .08);
+  backdrop-filter: blur(10px);
 }
 .legend-item {
   display: flex;
@@ -471,5 +534,8 @@ onBeforeUnmount(() => {
   width: 10px;
   height: 10px;
   border-radius: 50%;
+}
+@media (max-width: 768px) {
+  .graph-tools button { width: 44px; height: 44px; }
 }
 </style>

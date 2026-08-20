@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .database import init_db
-from .routers import agents, data_sources, llm_configs, mcp, scenarios, skills
+from .routers import agents, auth, data_sources, llm_configs, mcp, scenarios, skills
 from .services import skill_service
 
 
@@ -38,6 +38,7 @@ app.add_middleware(
 )
 
 app.include_router(scenarios.router, prefix=settings.api_prefix)
+app.include_router(auth.router, prefix=settings.api_prefix)
 app.include_router(data_sources.router, prefix=settings.api_prefix)
 app.include_router(llm_configs.router, prefix=settings.api_prefix)
 app.include_router(skills.router, prefix=settings.api_prefix)

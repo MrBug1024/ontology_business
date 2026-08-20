@@ -9,7 +9,7 @@
     </div>
 
     <el-row :gutter="16" v-loading="loading">
-      <el-col :span="8" v-for="s in skills" :key="s.id">
+      <el-col :xs="24" :sm="12" :lg="8" v-for="s in skills" :key="s.id">
         <div class="card skill-card">
           <div class="sk-head">
             <div class="sk-icon"><el-icon :size="20"><MagicStick /></el-icon></div>

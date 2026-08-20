@@ -1,5 +1,5 @@
 <template>
-  <div class="page">
+  <div class="page data-sources-page">
     <div class="page-header">
       <div>
         <h2>数据源</h2>
@@ -9,46 +9,48 @@
     </div>
 
     <el-row :gutter="16">
-      <el-col :span="9">
-        <div class="card" v-loading="loading">
+      <el-col class="data-sources-list-col" :xs="24" :md="9">
+        <div class="card data-sources-list-card" v-loading="loading">
           <div class="card-title"><el-icon><Coin /></el-icon> 数据源列表</div>
-          <div v-for="ds in dataSources" :key="ds.id" class="ds-item" :class="{ active: selected?.id === ds.id }" @click="select(ds)">
-            <div class="ds-icon" :class="ds.type">
-              <el-icon :size="18"><component :is="ds.type === 'file_bucket' ? 'FolderOpened' : 'Coin'" /></el-icon>
+          <div class="ds-list">
+            <div v-for="ds in dataSources" :key="ds.id" class="ds-item" :class="{ active: selected?.id === ds.id }" role="button" tabindex="0" :aria-current="selected?.id === ds.id ? 'true' : undefined" :aria-label="`选择数据源：${ds.name}`" @click="select(ds)" @keydown.enter.prevent="select(ds)" @keydown.space.prevent="select(ds)">
+              <div class="ds-icon" :class="ds.type">
+                <el-icon :size="18"><component :is="ds.type === 'file_bucket' ? 'FolderOpened' : 'Coin'" /></el-icon>
+              </div>
+              <div class="ds-info">
+                <div class="ds-name">{{ ds.name }}</div>
+                <div class="muted">{{ typeLabel(ds.type) }} · {{ ds.config.host || ds.config.path || '本地' }}</div>
+              </div>
+              <el-tag v-if="ds.status === 'ok'" size="small" type="success">正常</el-tag>
+              <el-tag v-else-if="ds.status === 'error'" size="small" type="danger">异常</el-tag>
+              <el-tag v-else size="small" type="info">未测试</el-tag>
             </div>
-            <div class="ds-info">
-              <div class="ds-name">{{ ds.name }}</div>
-              <div class="muted">{{ typeLabel(ds.type) }} · {{ ds.config.host || ds.config.path || '本地' }}</div>
+            <div v-if="!loading && !dataSources.length" class="empty-wrap">
+              <div class="empty-icon"><el-icon :size="26"><Coin /></el-icon></div>
+              <div>暂无数据源</div>
+              <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新建数据源</el-button>
             </div>
-            <el-tag v-if="ds.status === 'ok'" size="small" type="success">正常</el-tag>
-            <el-tag v-else-if="ds.status === 'error'" size="small" type="danger">异常</el-tag>
-            <el-tag v-else size="small" type="info">未测试</el-tag>
-          </div>
-          <div v-if="!loading && !dataSources.length" class="empty-wrap">
-            <div class="empty-icon"><el-icon :size="26"><Coin /></el-icon></div>
-            <div>暂无数据源</div>
-            <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新建数据源</el-button>
           </div>
         </div>
       </el-col>
 
-      <el-col :span="15">
-        <div v-if="selected" class="card">
+      <el-col class="data-source-detail-col" :xs="24" :md="15">
+        <div v-if="selected" class="card data-source-detail-card">
           <div class="card-title">
             <el-icon><Setting /></el-icon> {{ selected.name }}
             <el-tag size="small" type="info">{{ typeLabel(selected.type) }}</el-tag>
             <div style="margin-left:auto;display:flex;gap:6px">
               <el-button size="small" @click="testConn" :loading="testing"><el-icon><Link /></el-icon> 测试连接</el-button>
               <el-button size="small" @click="openEdit(selected)"><el-icon><Edit /></el-icon> 编辑</el-button>
-              <el-button size="small" type="danger" @click="remove(selected)"><el-icon><Delete /></el-icon></el-button>
+              <el-button size="small" type="danger" @click="remove(selected)" aria-label="删除数据源" title="删除数据源"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
             </div>
           </div>
 
           <!-- 数据库：表 + SQL -->
           <template v-if="selected.type !== 'file_bucket'">
             <el-tabs v-model="dbTab">
-              <el-tab-pane label="数据表" name="tables">
-                <el-table :data="tables" size="small" @row-click="(r:any)=>openTable(r)" style="cursor:pointer">
+              <el-tab-pane label="数据表" name="tables" style="height:calc(100vh - 360px)">
+                <el-table :data="tables" size="small" height="calc(100% - 36px)" @row-click="(r:any)=>openTable(r)"  style="cursor:pointer">
                   <el-table-column prop="name" label="表名" min-width="160">
                     <template #default="{ row }"><span class="mono">{{ row.name }}</span></template>
                   </el-table-column>
@@ -56,7 +58,7 @@
                   <el-table-column label="字段" min-width="220">
                     <template #default="{ row }">
                       <el-tag v-for="c in row.columns.slice(0, 5)" :key="c.name" size="small" effect="plain" style="margin:2px">
-                        {{ c.name }}<span v-if="c.pk" style="color:#f59e0b">🔑</span>
+                        {{ c.name }}<el-icon v-if="c.pk" class="pk-icon" aria-label="主键" title="主键"><Key /></el-icon>
                       </el-tag>
                       <span class="muted" v-if="row.columns.length > 5">+{{ row.columns.length - 5 }}</span>
                     </template>
@@ -84,41 +86,43 @@
 
           <!-- 文件桶 -->
           <template v-else>
-            <el-upload drag :auto-upload="false" :file-list="uploadList" :on-change="onFilePick" :on-remove="() => {}" multiple>
-              <el-icon class="el-icon--upload" :size="40"><UploadFilled /></el-icon>
-              <div class="el-upload__text">拖拽文件到此处，或 <em>点击选择</em></div>
-              <template #tip>
-                <div class="el-upload__tip">支持 Excel / Word / PPT / PDF / 图片 / TXT / MD / CSV / JSON，上传后自动解析为可检索文本</div>
-              </template>
-            </el-upload>
-            <div style="display:flex;gap:8px;margin:12px 0">
-              <el-button type="primary" :loading="uploading" :disabled="!uploadList.length" @click="doUpload">
-                <el-icon><Upload /></el-icon> 上传并解析（{{ uploadList.length }}）
-              </el-button>
-              <el-button @click="loadFiles" :loading="loadingFiles"><el-icon><Refresh /></el-icon> 刷新</el-button>
+            <div class="bucket-detail">
+              <el-upload drag :auto-upload="false" :file-list="uploadList" :on-change="onFilePick" :on-remove="() => {}" multiple>
+                <el-icon class="el-icon--upload" :size="40"><UploadFilled /></el-icon>
+                <div class="el-upload__text">拖拽文件到此处，或 <em>点击选择</em></div>
+                <template #tip>
+                  <div class="el-upload__tip">支持 Excel / Word / PPT / PDF / 图片 / TXT / MD / CSV / JSON，上传后自动解析为可检索文本</div>
+                </template>
+              </el-upload>
+              <div class="bucket-actions">
+                <el-button type="primary" :loading="uploading" :disabled="!uploadList.length" @click="doUpload">
+                  <el-icon><Upload /></el-icon> 上传并解析（{{ uploadList.length }}）
+                </el-button>
+                <el-button @click="loadFiles" :loading="loadingFiles"><el-icon><Refresh /></el-icon> 刷新</el-button>
+              </div>
+              <el-table :data="files" size="small" height="calc(100vh -  520px)">
+                <el-table-column prop="filename" label="文件名" min-width="180">
+                  <template #default="{ row }"><span class="mono">{{ row.filename }}</span></template>
+                </el-table-column>
+                <el-table-column label="大小" width="90" align="right">
+                  <template #default="{ row }">{{ fmtSize(row.size) }}</template>
+                </el-table-column>
+                <el-table-column label="状态" width="90" align="center">
+                  <template #default="{ row }">
+                    <el-tag v-if="row.status === 'parsed'" size="small" type="success">已解析</el-tag>
+                    <el-tag v-else-if="row.status === 'error'" size="small" type="danger">失败</el-tag>
+                    <el-tag v-else size="small" type="warning">{{ row.status }}</el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="" width="170" align="center">
+                  <template #default="{ row }">
+                    <el-button size="small" text type="primary" @click="viewText(row)">查看文本</el-button>
+                    <el-button size="small" text @click="reparse(row)" :loading="row._loading">重解析</el-button>
+                    <el-button size="small" text type="danger" @click="removeFile(row)">删除</el-button>
+                  </template>
+                </el-table-column>
+              </el-table>
             </div>
-            <el-table :data="files" size="small">
-              <el-table-column prop="filename" label="文件名" min-width="180">
-                <template #default="{ row }"><span class="mono">{{ row.filename }}</span></template>
-              </el-table-column>
-              <el-table-column label="大小" width="90" align="right">
-                <template #default="{ row }">{{ fmtSize(row.size) }}</template>
-              </el-table-column>
-              <el-table-column label="状态" width="90" align="center">
-                <template #default="{ row }">
-                  <el-tag v-if="row.status === 'parsed'" size="small" type="success">已解析</el-tag>
-                  <el-tag v-else-if="row.status === 'error'" size="small" type="danger">失败</el-tag>
-                  <el-tag v-else size="small" type="warning">{{ row.status }}</el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="" width="170" align="center">
-                <template #default="{ row }">
-                  <el-button size="small" text type="primary" @click="viewText(row)">查看文本</el-button>
-                  <el-button size="small" text @click="reparse(row)" :loading="row._loading">重解析</el-button>
-                  <el-button size="small" text type="danger" @click="removeFile(row)">删除</el-button>
-                </template>
-              </el-table-column>
-            </el-table>
           </template>
         </div>
         <el-empty v-else description="选择左侧数据源查看详情" />
@@ -128,7 +132,7 @@
     <!-- 新建/编辑对话框 -->
     <el-dialog v-model="dlg" :title="form.id ? '编辑数据源' : '新建数据源'" width="560px">
       <el-form :model="form" label-width="90px">
-        <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：销售数据库、业务文档桶" /></el-form-item>
+        <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：业务数据库、业务文档桶" /></el-form-item>
         <el-form-item label="所属场景">
           <el-select v-model="form.scenario_id" clearable placeholder="可选" style="width:100%">
             <el-option v-for="s in scenarios" :key="s.id" :label="s.name" :value="s.id" />
@@ -357,10 +361,14 @@ async function reparse(f: BucketFile & { _loading?: boolean }) {
   }
 }
 async function removeFile(f: BucketFile) {
-  await ElMessageBox.confirm(`删除文件「${f.filename}」？`, '确认', { type: 'warning' })
-  await api.deleteFile(f.id)
-  ElMessage.success('已删除')
-  loadFiles()
+  try {
+    await ElMessageBox.confirm(`删除文件「${f.filename}」？`, '确认', { type: 'warning' })
+    await api.deleteFile(f.id)
+    ElMessage.success('已删除')
+    await loadFiles()
+  } catch (e: any) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
+  }
 }
 
 // ── 新建/编辑 ──
@@ -395,11 +403,15 @@ async function save() {
   }
 }
 async function remove(ds: DataSource) {
-  await ElMessageBox.confirm(`删除数据源「${ds.name}」？`, '确认', { type: 'warning' })
-  await api.deleteDataSource(ds.id!)
-  selected.value = null
-  ElMessage.success('已删除')
-  load()
+  try {
+    await ElMessageBox.confirm(`删除数据源「${ds.name}」？`, '确认', { type: 'warning' })
+    await api.deleteDataSource(ds.id!)
+    selected.value = null
+    ElMessage.success('已删除')
+    await load()
+  } catch (e: any) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
+  }
 }
 
 onMounted(load)
@@ -422,6 +434,8 @@ onMounted(load)
   background: var(--primary-soft);
   border-color: var(--border-strong);
 }
+.ds-item:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: 2px; }
+.pk-icon { margin-left: 3px; color: var(--warning); vertical-align: -2px; }
 .ds-icon {
   width: 38px; height: 38px;
   border-radius: 10px;
@@ -437,5 +451,121 @@ onMounted(load)
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* ── 数据源工作区：列表与详情各自滚动，避免撑开主页面 ── */
+.data-sources-page {
+  height: calc(100dvh - 68px);
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+.data-sources-page > .page-header {
+  flex: 0 0 auto;
+}
+.data-sources-page > .el-row {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  align-items: stretch;
+}
+.data-sources-page > .el-row > .el-col {
+  min-height: 0;
+  display: flex;
+}
+.data-sources-list-col > .card,
+.data-source-detail-col > .card,
+.data-source-detail-col > .el-empty {
+  width: 100%;
+  min-height: 0;
+}
+.data-sources-list-card,
+.data-source-detail-card {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.data-sources-list-card .card-title,
+.data-source-detail-card > .card-title {
+  flex: 0 0 auto;
+}
+.ds-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+  scrollbar-gutter: stable;
+}
+.data-source-detail-card > .card-title {
+  flex-wrap: wrap;
+}
+.data-source-detail-card > :deep(.el-tabs) {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.data-source-detail-card :deep(.el-tabs__header) {
+  flex: 0 0 auto;
+}
+.data-source-detail-card :deep(.el-tabs__content) {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+.data-source-detail-card :deep(.el-tab-pane) {
+  min-height: 100%;
+}
+.bucket-detail {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.bucket-detail :deep(.el-upload) {
+  flex: 0 0 auto;
+}
+.bucket-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.bucket-detail > :deep(.el-table) {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+@media (max-width: 767px) {
+  .data-sources-page {
+    height: calc(100dvh - 68px);
+    padding: 14px;
+  }
+  .data-sources-page > .el-row {
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .data-sources-page > .el-row > .data-sources-list-col {
+    flex: 0 0 190px;
+    width: 100%;
+    max-width: none;
+  }
+  .data-sources-page > .el-row > .data-source-detail-col {
+    flex: 1 1 auto;
+    width: 100%;
+    max-width: none;
+  }
+  .data-sources-list-card { padding: 14px; }
+  .data-source-detail-card { padding: 14px; }
+  .data-source-detail-card > .card-title > div:last-child {
+    width: 100%;
+    margin-left: 0 !important;
+    justify-content: flex-end;
+  }
 }
 </style>

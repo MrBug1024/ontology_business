@@ -17,7 +17,7 @@ from ..models import (
     OntologyRelation,
     RelationInstance,
 )
-from . import datasource_service, llm_service
+from . import datasource_service, llm_service, tenant_service
 
 
 # ──────────────────────────────────────────────
@@ -95,6 +95,57 @@ def build_graph(scenario: BusinessScenario, mode: str = "schema") -> dict[str, A
     return {"nodes": nodes, "edges": edges}
 
 
+def search_instances(
+    db: Session,
+    scenario: BusinessScenario | None,
+    entity_name: str = "",
+    query: str = "",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """按通用本体语义检索实例，不依赖任何行业字段或表名。"""
+    if not scenario:
+        return []
+    entity_name = (entity_name or "").strip().lower()
+    query = (query or "").strip().lower()
+    entities = {e.id: e for e in scenario.entities}
+    allowed_ids = {
+        eid for eid, entity in entities.items()
+        if not entity_name or entity_name in entity.name.lower()
+    }
+    if entity_name and not allowed_ids:
+        return []
+    rows = db.execute(
+        select(OntologyInstance)
+        .where(
+            OntologyInstance.scenario_id == scenario.id,
+            OntologyInstance.entity_id.in_(allowed_ids) if allowed_ids else False,
+        )
+        .order_by(OntologyInstance.created_at.desc())
+        .limit(max(1, min(int(limit), 200)))
+    ).scalars().all()
+    results: list[dict[str, Any]] = []
+    for instance in rows:
+        attrs = instance.attributes or {}
+        haystack = f"{instance.name} {json.dumps(attrs, ensure_ascii=False, default=str)}".lower()
+        if query and query not in haystack:
+            continue
+        entity = entities.get(instance.entity_id)
+        results.append(
+            {
+                "id": instance.id,
+                "name": instance.name,
+                "entity": entity.name if entity else "",
+                "entity_id": instance.entity_id,
+                "attributes": attrs,
+                "source": instance.source,
+                "source_ref": instance.source_ref,
+            }
+        )
+        if len(results) >= max(1, min(int(limit), 200)):
+            break
+    return results
+
+
 # ──────────────────────────────────────────────
 # AI 生成本体
 # ──────────────────────────────────────────────
@@ -102,7 +153,7 @@ _GEN_PROMPT = """你是资深业务架构师，擅长为任意行业构建本体
 请根据下面的业务描述，设计一套简洁、通用、可扩展的本体模型。
 
 要求：
-1. 实体（entities）：3~8 个核心业务对象，命名用中文业务名词（如 客户、订单、设备、合同）。
+1. 实体（entities）：3~8 个核心业务对象，命名使用业务领域中的稳定名词。
 2. 每个实体给出 3~8 个属性（properties），属性名用中文，data_type 只能是：string / integer / float / boolean / date / datetime / json / text。
 3. 每个实体必须恰好有 1 个 is_key=true 的主键属性。
 4. 关系（relations）：2~8 条，relation_type 只能是 1:1 / 1:N / N:M。
@@ -111,11 +162,11 @@ _GEN_PROMPT = """你是资深业务架构师，擅长为任意行业构建本体
 输出格式（严格 JSON）：
 {
   "entities": [
-    {"name": "客户", "description": "购买商品的客户", "is_abstract": false,
-     "properties": [{"name": "客户ID", "data_type": "string", "is_key": true, "is_required": true}, ...]}
+    {"name": "业务对象", "description": "业务领域中的核心对象", "is_abstract": false,
+     "properties": [{"name": "对象ID", "data_type": "string", "is_key": true, "is_required": true}, ...]}
   ],
   "relations": [
-    {"name": "下单", "source": "客户", "target": "订单", "relation_type": "1:N", "description": ""}
+    {"name": "关联", "source": "业务对象", "target": "相关对象", "relation_type": "1:N", "description": ""}
   ]
 }
 
@@ -147,9 +198,12 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
     """调用 LLM 生成本体草稿（不落库），返回 {entities, relations}。"""
     from ..models import LLMConfig
 
-    llm = db.get(LLMConfig, scenario.llm_config_id) if getattr(scenario, "llm_config_id", None) else None
+    llm = tenant_service.get_visible(db, LLMConfig, scenario.llm_config_id) if getattr(scenario, "llm_config_id", None) and db.info.get("tenant_id") else None
     if not llm:
-        llm = db.execute(select(LLMConfig).where(LLMConfig.is_default == True).limit(1)).scalars().first()  # noqa: E712
+        llm_stmt = select(LLMConfig).where(LLMConfig.is_default == True)  # noqa: E712
+        if db.info.get("tenant_id"):
+            llm_stmt = llm_stmt.where(tenant_service.visible_clause(LLMConfig, db))
+        llm = db.execute(llm_stmt.limit(1)).scalars().first()
     if not llm:
         raise ValueError("请先在「LLM 配置」中配置并启用一个默认模型")
 

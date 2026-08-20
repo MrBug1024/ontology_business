@@ -9,8 +9,8 @@
     </div>
 
     <el-row :gutter="16" v-loading="loading">
-      <el-col :span="8" v-for="s in scenarios" :key="s.id">
-        <div class="card scenario-card" @click="$router.push('/scenarios/' + s.id)">
+      <el-col :xs="24" :sm="12" :lg="8" v-for="s in scenarios" :key="s.id">
+        <div class="card scenario-card" role="button" tabindex="0" :aria-label="`打开场景：${s.name}`" @click="$router.push('/scenarios/' + s.id)" @keydown.enter.prevent="$router.push('/scenarios/' + s.id)" @keydown.space.prevent="$router.push('/scenarios/' + s.id)">
           <div class="sc-head">
             <div class="sc-icon"><el-icon :size="22"><OfficeBuilding /></el-icon></div>
             <div class="sc-title">
@@ -43,10 +43,10 @@
     <el-dialog v-model="dlg" :title="form.id ? '编辑场景' : '新建场景'" width="480px">
       <el-form :model="form" label-width="80px">
         <el-form-item label="名称" required>
-          <el-input v-model="form.name" placeholder="如：零售销售分析、供应链、人力资源…" />
+          <el-input v-model="form.name" placeholder="如：运营分析、供应链、人力资源…" />
         </el-form-item>
         <el-form-item label="行业">
-          <el-input v-model="form.industry" placeholder="可选，如：零售、制造、金融" />
+          <el-input v-model="form.industry" placeholder="可选，填写所属行业或业务领域" />
         </el-form-item>
         <el-form-item label="描述">
           <el-input v-model="form.description" type="textarea" :rows="3" placeholder="业务场景说明" />
@@ -106,10 +106,14 @@ async function save() {
   }
 }
 async function remove(s: Scenario) {
-  await ElMessageBox.confirm(`删除场景「${s.name}」？其本体与数据源绑定将一并移除。`, '确认', { type: 'warning' })
-  await api.deleteScenario(s.id)
-  ElMessage.success('已删除')
-  load()
+  try {
+    await ElMessageBox.confirm(`删除场景「${s.name}」？其本体与数据源绑定将一并移除。`, '确认', { type: 'warning' })
+    await api.deleteScenario(s.id)
+    ElMessage.success('已删除')
+    await load()
+  } catch (e: any) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
+  }
 }
 onMounted(load)
 </script>
@@ -137,6 +141,7 @@ onMounted(load)
   border-color: var(--border-strong);
 }
 .scenario-card:hover::before { opacity: 1; }
+.scenario-card:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: 3px; }
 .sc-head {
   display: flex;
   align-items: center;

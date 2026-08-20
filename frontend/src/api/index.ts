@@ -1,6 +1,7 @@
 import axios from 'axios'
 import type {
   Agent,
+  AuthMessage,
   BucketFile,
   Conversation,
   DataMapping,
@@ -15,6 +16,7 @@ import type {
   ScenarioDetail,
   Skill,
   TableInfo,
+  User,
 } from '@/types'
 
 // 响应拦截器已把 r.data 解包，因此客户端方法在类型上直接返回 Promise<T>
@@ -25,11 +27,14 @@ interface ApiClient {
   delete<T = any>(url: string, config?: any): Promise<T>
 }
 
-const instance = axios.create({ baseURL: '/api', timeout: 120000 })
+const instance = axios.create({ baseURL: '/api', timeout: 120000, withCredentials: true })
 
 instance.interceptors.response.use(
   (r) => r.data,
   (err) => {
+    if (err.response?.status === 401 && !String(err.config?.url || '').startsWith('/auth') && window.location.pathname !== '/login') {
+      window.location.assign('/login')
+    }
     const msg = err.response?.data?.detail || err.message || '请求失败'
     return Promise.reject(new Error(typeof msg === 'string' ? msg : JSON.stringify(msg)))
   },
@@ -39,6 +44,18 @@ const http = instance as unknown as ApiClient
 
 // ── 场景 & 本体 ──────────────────────────────
 export const api = {
+  // 认证
+  me: () => http.get<User>('/auth/me'),
+  register: (d: { email: string; password: string; password_confirm: string; display_name?: string }) =>
+    http.post<AuthMessage>('/auth/register', d),
+  verifyEmail: (d: { email: string; code: string }) => http.post<AuthMessage>('/auth/verify-email', d),
+  resendCode: (email: string) => http.post<AuthMessage>('/auth/resend-code', { email }),
+  login: (d: { email: string; password: string }) => http.post<User>('/auth/login', d),
+  logout: () => http.post<AuthMessage>('/auth/logout'),
+  forgotPassword: (email: string) => http.post<AuthMessage>('/auth/forgot-password', { email }),
+  resetPassword: (d: { email: string; code: string; password: string; password_confirm: string }) =>
+    http.post<AuthMessage>('/auth/reset-password', d),
+
   // 场景
   listScenarios: () => http.get<Scenario[]>('/scenarios'),
   getScenario: (id: string) => http.get<ScenarioDetail>(`/scenarios/${id}`),
@@ -178,6 +195,7 @@ export function streamChat(
   fetch(`/api/agents/${agentId}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
     body: JSON.stringify(payload),
     signal: ctrl.signal,
   })

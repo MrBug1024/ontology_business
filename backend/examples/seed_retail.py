@@ -1,6 +1,6 @@
 """演示数据种子脚本：创建一个示例业务场景（零售销售分析），含本体、SQLite 数据源、文件桶。
 
-运行：python -m app.seed
+运行：python backend/examples/seed_retail.py
 """
 from __future__ import annotations
 

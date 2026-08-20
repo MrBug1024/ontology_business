@@ -18,6 +18,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..config import get_settings
 from ..models import (
     ActionExecutionLog,
     BusinessScenario,
@@ -27,7 +28,8 @@ from ..models import (
     OntologyRule,
     OntologyWorkflow,
 )
-from . import datasource_service, skill_service, mcp_service, llm_service
+from . import datasource_service, skill_service, mcp_service, llm_service, tenant_service
+from .policies import PolicyViolation, validate_workflow_graph
 
 
 # ──────────────────────────────────────────────
@@ -154,7 +156,7 @@ def _dispatch_executor(db: Session, action: OntologyAction, params: dict[str, An
     cfg = action.executor_config or {}
 
     if etype == "sql":
-        return _exec_sql(db, cfg, params)
+        return _exec_sql(db, {**cfg, "scenario_id": action.scenario_id}, params)
     if etype == "skill":
         return _exec_skill(db, cfg, params)
     if etype == "mcp":
@@ -182,7 +184,9 @@ def _exec_sql(db: Session, cfg: dict, params: dict) -> Any:
     ds = db.get(DataSource, ds_id)
     if not ds:
         raise ValueError(f"数据源不存在: {ds_id}")
-    return datasource_service.run_query(ds, sql, limit=200)
+    if ds.scenario_id not in (None, cfg.get("scenario_id")) and cfg.get("scenario_id"):
+        raise PolicyViolation("操作不能访问其他业务场景的数据源")
+    return datasource_service.run_query(ds, sql, limit=get_settings().max_query_rows)
 
 
 def _exec_skill(db: Session, cfg: dict, params: dict) -> Any:
@@ -265,6 +269,8 @@ def _exec_script(cfg: dict, params: dict) -> Any:
     script = cfg.get("script", "")
     if not script:
         raise ValueError("脚本执行器需要 script 配置")
+    if not get_settings().allow_unsafe_workflow_nodes:
+        raise PolicyViolation("脚本节点默认被禁用，请在受控环境中显式开启")
     namespace: dict[str, Any] = {"params": params, "json": json}
     exec(script, namespace)  # noqa: S102
     return namespace.get("result", namespace.get("output", ""))
@@ -368,11 +374,18 @@ def execute_workflow(db: Session, workflow: OntologyWorkflow, params: dict[str, 
 
     try:
         if workflow.nodes:
+            validate_workflow_graph(workflow.nodes, workflow.edges or [])
+        if workflow.nodes:
             step_results = _execute_dag(db, workflow, params)
         else:
             step_results = _execute_steps(db, workflow, params)
-        log.status = "success"
         log.result = {"steps": step_results}
+        failed = next((step for step in step_results if step.get("status") == "failed"), None)
+        if failed:
+            log.status = "failed"
+            log.error = failed.get("error") or "工作流节点执行失败"
+        else:
+            log.status = "success"
     except Exception as exc:  # noqa: BLE001
         log.status = "failed"
         log.error = str(exc)
@@ -403,6 +416,8 @@ def _execute_steps(db: Session, workflow: OntologyWorkflow, params: dict[str, An
         if step_type == "action":
             action_id = step.get("action_id", "")
             action = db.get(OntologyAction, action_id)
+            if action and action.scenario_id != workflow.scenario_id:
+                action = None
             if not action:
                 step_result["status"] = "skipped"
                 step_result["error"] = f"操作不存在: {action_id}"
@@ -416,6 +431,8 @@ def _execute_steps(db: Session, workflow: OntologyWorkflow, params: dict[str, An
         elif step_type == "rule":
             rule_id = step.get("rule_id", "")
             rule = db.get(OntologyRule, rule_id)
+            if rule and rule.scenario_id != workflow.scenario_id:
+                rule = None
             if not rule:
                 step_result["status"] = "skipped"
                 step_result["error"] = f"规则不存在: {rule_id}"
@@ -428,9 +445,14 @@ def _execute_steps(db: Session, workflow: OntologyWorkflow, params: dict[str, An
 
         elif step_type == "event":
             event_id = step.get("event_id", "")
-            step_result["status"] = "published"
-            step_result["result"] = {"event_id": event_id, "payload": step.get("payload", {})}
-            context[f"step_{step_num}"] = step_result["result"]
+            event = db.get(OntologyEvent, event_id)
+            if not event or event.scenario_id != workflow.scenario_id:
+                step_result["status"] = "failed"
+                step_result["error"] = f"事件不存在或不属于当前业务场景: {event_id}"
+            else:
+                step_result["status"] = "published"
+                step_result["result"] = {"event_id": event_id, "payload": step.get("payload", {})}
+                context[f"step_{step_num}"] = step_result["result"]
 
         else:
             step_result["status"] = "skipped"
@@ -481,6 +503,8 @@ def _execute_dag(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]
 
         elif ntype == "action":
             action = db.get(OntologyAction, data.get("action_id", ""))
+            if action and action.scenario_id != workflow.scenario_id:
+                action = None
             if not action:
                 res["status"] = "failed"
                 res["error"] = f"操作不存在: {data.get('action_id', '')}"
@@ -494,9 +518,11 @@ def _execute_dag(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]
 
         elif ntype == "rule":
             rule = db.get(OntologyRule, data.get("rule_id", ""))
+            if rule and rule.scenario_id != workflow.scenario_id:
+                rule = None
             if not rule:
                 res["status"] = "failed"
-                res["error"] = f"规则不存在: {data.get('rule_id', '')}"
+                res["error"] = f"规则不存在或不属于当前业务场景: {data.get('rule_id', '')}"
             else:
                 record = render_template(data.get("record", {}) or {}, ctx)
                 if not isinstance(record, dict):
@@ -505,6 +531,7 @@ def _execute_dag(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]
                 res["status"] = "matched" if r["matched"] else "not_matched"
                 res["result"] = r
                 ctx[node_id] = _wrap_out(r)
+                results.append(res)
                 # 分支：命中走 true 边，未命中走 false 边
                 branch = "true" if r["matched"] else "false"
                 for t in outs(node_id, branch):
@@ -537,10 +564,16 @@ def _execute_dag(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]
                     res["error"] = str(exc)
 
         elif ntype == "event":
-            payload = render_template(data.get("payload", {}) or {}, ctx)
-            res["status"] = "published"
-            res["result"] = {"result": payload, "event_id": data.get("event_id", "")}
-            ctx[node_id] = res["result"]
+            event_id = data.get("event_id", "")
+            event = db.get(OntologyEvent, event_id)
+            if not event or event.scenario_id != workflow.scenario_id:
+                res["status"] = "failed"
+                res["error"] = f"事件不存在或不属于当前业务场景: {event_id}"
+            else:
+                payload = render_template(data.get("payload", {}) or {}, ctx)
+                res["status"] = "published"
+                res["result"] = {"result": payload, "event_id": event_id}
+                ctx[node_id] = res["result"]
 
         elif ntype == "http":
             cfg = {
@@ -560,6 +593,8 @@ def _execute_dag(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]
         elif ntype == "script":
             script = render_template(data.get("script", ""), ctx)
             try:
+                if not get_settings().allow_unsafe_workflow_nodes:
+                    raise PolicyViolation("脚本节点默认被禁用，请在受控环境中显式开启")
                 namespace: dict[str, Any] = {
                     "params": params,
                     "ctx": ctx,
@@ -605,8 +640,13 @@ def _execute_dag(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]
 
 def _resolve_llm(db: Session, llm_config_id: str | None) -> LLMConfig | None:
     if llm_config_id:
+        if db.info.get("tenant_id"):
+            return tenant_service.get_visible(db, LLMConfig, llm_config_id)
         return db.get(LLMConfig, llm_config_id)
-    return db.execute(select(LLMConfig).where(LLMConfig.is_default == True).limit(1)).scalars().first()  # noqa: E712
+    stmt = select(LLMConfig).where(LLMConfig.is_default == True)  # noqa: E712
+    if db.info.get("tenant_id"):
+        stmt = stmt.where(tenant_service.visible_clause(LLMConfig, db))
+    return db.execute(stmt.limit(1)).scalars().first()
 
 
 def _try_parse_json(text: str) -> Any:
@@ -665,7 +705,7 @@ _WF_GEN_PROMPT = """你是资深业务流程架构师，擅长把业务描述编
     {"id":"start","type":"start","name":"开始","data":{}},
     {"id":"n1","type":"action","name":"查询违规数据","data":{"action_id":"...","params":{}}},
     {"id":"n2","type":"rule","name":"是否命中规则","data":{"rule_id":"...","record":{"数量":"{{n1.result.rows.0.数量}}"}}},
-    {"id":"end","type":"end","name":"结束","data":{"summary":"审计完成"}}
+    {"id":"end","type":"end","name":"结束","data":{"summary":"流程完成"}}
   ],
   "edges": [
     {"id":"e1","source":"start","target":"n1","label":""},
@@ -693,9 +733,12 @@ def generate_workflow(db: Session, scenario: BusinessScenario, description: str)
     """调用 LLM 生成可视化工作流草稿（DAG 节点+连线，不落库）。"""
     from ..models import OntologyEvent
 
-    llm = db.get(LLMConfig, scenario.llm_config_id) if getattr(scenario, "llm_config_id", None) else None
+    llm = tenant_service.get_visible(db, LLMConfig, scenario.llm_config_id) if getattr(scenario, "llm_config_id", None) and db.info.get("tenant_id") else None
     if not llm:
-        llm = db.execute(select(LLMConfig).where(LLMConfig.is_default == True).limit(1)).scalars().first()  # noqa: E712
+        llm_stmt = select(LLMConfig).where(LLMConfig.is_default == True)  # noqa: E712
+        if db.info.get("tenant_id"):
+            llm_stmt = llm_stmt.where(tenant_service.visible_clause(LLMConfig, db))
+        llm = db.execute(llm_stmt.limit(1)).scalars().first()
     if not llm:
         raise ValueError("请先在「LLM 配置」中配置并启用一个默认模型")
 

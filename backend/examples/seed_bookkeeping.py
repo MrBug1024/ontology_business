@@ -10,7 +10,7 @@
 - 工作流（Workflows）
 - Agent（AI 代理记账助手）
 
-运行：python -m app.seed_bookkeeping
+运行：python backend/examples/seed_bookkeeping.py
 """
 from __future__ import annotations
 
@@ -1319,7 +1319,7 @@ def main() -> None:
         print(f"\n✅ 代理记账业务场景已就绪！")
         print(f"   场景 ID: {scenario.id}")
         print(f"   数据源: {ds_sqlite.name} + {ds_bucket.name}")
-        print(f"   运行: python -m app.seed_bookkeeping")
+        print(f"   运行: python backend/examples/seed_bookkeeping.py")
     finally:
         db.close()
 

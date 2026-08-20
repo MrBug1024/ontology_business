@@ -24,14 +24,14 @@ const refName = computed(() => {
 })
 
 const META: Record<string, { icon: string; color: string; label: string }> = {
-  start: { icon: '▶', color: '#059669', label: '开始' },
-  end: { icon: '■', color: '#94919f', label: '结束' },
-  action: { icon: '⚡', color: '#7c3aed', label: '操作' },
-  rule: { icon: '⑂', color: '#d97706', label: '规则' },
-  llm: { icon: '✦', color: '#0891b2', label: '大模型' },
-  event: { icon: '🔔', color: '#db2777', label: '事件' },
-  http: { icon: '⇄', color: '#6d28d9', label: 'HTTP' },
-  script: { icon: 'Py', color: '#65a30d', label: '脚本' },
+  start: { icon: 'VideoPlay', color: 'var(--success)', label: '开始' },
+  end: { icon: 'CircleCheck', color: 'var(--text-3)', label: '结束' },
+  action: { icon: 'Operation', color: 'var(--graph-blue)', label: '操作' },
+  rule: { icon: 'SetUp', color: 'var(--warning)', label: '规则' },
+  llm: { icon: 'Cpu', color: 'var(--primary)', label: '大模型' },
+  event: { icon: 'Bell', color: 'var(--accent)', label: '事件' },
+  http: { icon: 'Link', color: 'var(--graph-teal)', label: 'HTTP' },
+  script: { icon: 'Document', color: 'var(--info)', label: '脚本' },
 }
 const meta = computed(() => META[props.type] || META.action)
 
@@ -64,7 +64,7 @@ const sub = computed(() => {
   <div class="wf-node" :class="[`wf-node--${type}`, { 'wf-node--sel': selected }]">
     <Handle v-if="type !== 'start'" type="target" :position="Position.Left" class="wf-h" />
     <div class="wf-node-head">
-      <span class="wf-node-ico" :style="{ background: meta.color + '1c', color: meta.color }">{{ meta.icon }}</span>
+      <span class="wf-node-ico" aria-hidden="true" :style="{ background: `color-mix(in srgb, ${meta.color} 12%, transparent)`, color: meta.color }"><el-icon :size="15"><component :is="meta.icon" /></el-icon></span>
       <div class="wf-node-tt">
         <b>{{ data.name || meta.label }}</b>
         <small>{{ sub }}</small>
@@ -137,7 +137,7 @@ const sub = computed(() => {
 .wf-h {
   width: 9px !important;
   height: 9px !important;
-  background: #fff;
+  background: var(--surface);
   border: 2px solid var(--border-strong);
 }
 .wf-h--true {

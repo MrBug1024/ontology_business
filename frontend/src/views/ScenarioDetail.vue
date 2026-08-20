@@ -1,6 +1,6 @@
 <template>
   <div class="sd-page">
-    <div class="page-header">
+    <div class="page-header sd-header">
       <div class="ph-left">
         <el-button class="back-btn" @click="goBack"><el-icon><ArrowLeft /></el-icon> 返回</el-button>
         <div class="ph-title">
@@ -386,7 +386,7 @@
       <el-form label-position="top">
         <div class="form-row">
           <el-form-item label="名称" class="form-col">
-            <el-input v-model="ruleForm.name" placeholder="如：单张发票药品数量超限" />
+            <el-input v-model="ruleForm.name" placeholder="如：数量超过允许范围" />
           </el-form-item>
           <el-form-item label="严重级别" class="form-col">
             <el-select v-model="ruleForm.severity" style="width:100%">
@@ -427,7 +427,7 @@
       <el-form label-position="top">
         <div class="form-row">
           <el-form-item label="名称" class="form-col">
-            <el-input v-model="eventForm.name" placeholder="如：新发票录入" />
+            <el-input v-model="eventForm.name" placeholder="如：新业务记录录入" />
           </el-form-item>
           <el-form-item label="触发来源" class="form-col">
             <el-input v-model="eventForm.trigger_source" placeholder="如：数据源同步 / 手动 / 定时" />
@@ -512,6 +512,14 @@ const tab = ref('ontology')
 const instFilter = ref('')
 const saving = ref(false)
 
+const graphPalette = ['#27b9b0', '#438be5', '#65a9df', '#4aa9c1', '#52c3a1', '#6f93d7']
+function visualColor(color: string | undefined, index: number) {
+  if (!color || ['#6366f1', '#4f46e5', '#06b6d4'].includes(color.toLowerCase())) {
+    return graphPalette[index % graphPalette.length]
+  }
+  return color
+}
+
 // ── 悬浮编辑面板状态 ──
 const editor = ref<{ kind: 'entity' | 'relation' | 'instance'; id?: string; form: any } | null>(null)
 // 切换 tab 时关闭悬浮编辑器，避免跨 tab 状态残留
@@ -521,8 +529,8 @@ watch(tab, () => { editor.value = null })
 const schemaGraph = computed<GraphData>(() => {
   const nodes: GraphNode[] = detail.value.entities
     .filter((e) => e.id)
-    .map((e) => ({
-      id: e.id!, label: e.name, type: 'entity', color: e.color || '#6366f1',
+    .map((e, index) => ({
+      id: e.id!, label: e.name, type: 'entity', color: visualColor(e.color, index),
       meta: { count: e.properties.length, abstract: e.is_abstract, description: e.description },
     }))
   const edges: GraphEdge[] = detail.value.relations
@@ -538,14 +546,16 @@ const instanceGraph = computed<GraphData>(() => {
   const entIds = new Set(ents.map((e) => e.id as string))
   const nodes: GraphNode[] = []
   const entNode = new Map<string, string>()
-  for (const e of ents) {
+  for (const [index, e] of ents.entries()) {
     const id = `ent:${e.id}`
     entNode.set(e.id as string, id)
-    nodes.push({ id, label: e.name, type: 'entity', color: e.color || '#6366f1', meta: { count: detail.value.instances.filter((i) => i.entity_id === e.id).length } })
+    nodes.push({ id, label: e.name, type: 'entity', color: visualColor(e.color, index), meta: { count: detail.value.instances.filter((i) => i.entity_id === e.id).length, entity_name: e.name } })
   }
   for (const i of detail.value.instances) {
     if (!i.id || !entIds.has(i.entity_id)) continue
-    nodes.push({ id: i.id, label: i.name, type: 'instance', color: detail.value.entities.find((e) => e.id === i.entity_id)?.color || '#06b6d4', meta: { entity: i.entity_id } })
+    const entityIndex = detail.value.entities.findIndex((e) => e.id === i.entity_id)
+    const entity = detail.value.entities.find((e) => e.id === i.entity_id)
+    nodes.push({ id: i.id, label: i.name, type: 'instance', color: visualColor(entity?.color, Math.max(0, entityIndex)), meta: { entity: i.entity_id, entity_name: entity?.name || '未分类' } })
   }
   const edges: GraphEdge[] = []
   for (const i of detail.value.instances) {
@@ -560,10 +570,13 @@ const instanceGraph = computed<GraphData>(() => {
   }
   return { nodes, edges }
 })
-const legend = computed(() => detail.value.entities.map((e) => ({ label: e.name, color: e.color || '#6366f1' })))
+const legend = computed(() => detail.value.entities.map((e, index) => ({ label: e.name, color: visualColor(e.color, index) })))
 
 function entName(id: string) { return detail.value.entities.find((e) => e.id === id)?.name || '—' }
-function entColor(id: string) { return detail.value.entities.find((e) => e.id === id)?.color || '#6366f1' }
+function entColor(id: string) {
+  const index = detail.value.entities.findIndex((e) => e.id === id)
+  return visualColor(detail.value.entities[index]?.color, Math.max(0, index))
+}
 function dsName(id: string) { return dataSources.value.find((d) => d.id === id)?.name || '—' }
 
 // ── 选择 → 打开悬浮编辑器 ──
@@ -571,7 +584,10 @@ function onNodeSelect(node: any) {
   if (tab.value === 'instances') openInstance(node.id)
   else openEntity(node.id)
 }
-function onInstSelect(node: any) { openInstance(node.id) }
+function onInstSelect(node: any) {
+  if (node.id.startsWith('ent:')) openEntity(node.id.slice(4))
+  else openInstance(node.id)
+}
 function onEdgeClick(edge: any) {
   if (tab.value !== 'instances') openRelation(edge.id)
 }
@@ -593,7 +609,7 @@ function openEntity(id?: string) {
     id: e?.id,
     form: e
       ? { name: e.name, color: e.color, description: e.description, is_abstract: e.is_abstract, properties: e.properties.map((p) => ({ ...p })) }
-      : { name: '', color: '#6366f1', description: '', is_abstract: false, properties: [] },
+      : { name: '', color: graphPalette[0], description: '', is_abstract: false, properties: [] },
   }
 }
 function openRelation(id?: string) {
@@ -888,12 +904,12 @@ function wfSummary(w: any): string[] {
       .filter((n: any) => n.type !== 'start' && n.type !== 'end')
       .map((n: any) => {
         const d = n.data || {}
-        if (n.type === 'action') return `⚡${d.action_id ? detail.value.actions.find((a) => a.id === d.action_id)?.name || n.name || '操作' : n.name || '操作'}`
-        if (n.type === 'rule') return `⑂${d.rule_id ? detail.value.rules.find((r) => r.id === d.rule_id)?.name || n.name || '规则' : n.name || '规则'}`
-        if (n.type === 'llm') return `✦${n.name || '大模型'}`
-        if (n.type === 'event') return `🔔${d.event_id ? detail.value.events.find((e) => e.id === d.event_id)?.name || n.name || '事件' : n.name || '事件'}`
-        if (n.type === 'http') return `⇄${n.name || 'HTTP'}`
-        if (n.type === 'script') return `Py${n.name || '脚本'}`
+        if (n.type === 'action') return `操作 · ${d.action_id ? detail.value.actions.find((a) => a.id === d.action_id)?.name || n.name || '未命名' : n.name || '未命名'}`
+        if (n.type === 'rule') return `规则 · ${d.rule_id ? detail.value.rules.find((r) => r.id === d.rule_id)?.name || n.name || '未命名' : n.name || '未命名'}`
+        if (n.type === 'llm') return `大模型 · ${n.name || '未命名'}`
+        if (n.type === 'event') return `事件 · ${d.event_id ? detail.value.events.find((e) => e.id === d.event_id)?.name || n.name || '未命名' : n.name || '未命名'}`
+        if (n.type === 'http') return `HTTP · ${n.name || '未命名'}`
+        if (n.type === 'script') return `脚本 · ${n.name || '未命名'}`
         return n.name || n.type
       })
   }
@@ -974,6 +990,8 @@ onMounted(load)
   flex-direction: column;
   height: 100%;
   min-height: 0;
+  padding: 20px 24px 24px;
+  animation: pageIn 0.32s var(--ease);
 }
 .ph-left {
   display: flex;
@@ -1286,7 +1304,7 @@ onMounted(load)
   color: var(--text-2);
 }
 .exec-result {
-  background: #14102e;
+  background: #1d2930;
   color: #e2e8f0;
   padding: 14px;
   border-radius: 10px;
@@ -1307,5 +1325,152 @@ onMounted(load)
   .tab-toolbar { flex-direction: column; align-items: stretch; }
   .tab-actions { justify-content: flex-end; }
   .inst-filter { width: 100%; }
+}
+
+/* ── 科技白场景工作区：轻玻璃、蓝青高光、明确的操作层级 ── */
+.sd-page {
+  position: relative;
+  padding: 24px 28px 30px;
+  background:
+    radial-gradient(620px 280px at 92% 0%, rgba(71, 157, 229, .10), transparent 68%),
+    radial-gradient(560px 260px at 2% 42%, rgba(41, 190, 177, .07), transparent 70%);
+}
+.sd-page::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 28px;
+  width: 34%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(57, 157, 221, .45), transparent);
+  pointer-events: none;
+}
+.ph-left { gap: 16px; }
+.back-btn {
+  border-color: var(--border);
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  color: var(--text-2);
+  box-shadow: var(--shadow-xs);
+}
+.back-btn:hover {
+  border-color: var(--border-strong);
+  color: var(--primary-600);
+  background: var(--primary-soft);
+}
+.ph-title b { color: var(--text); letter-spacing: -.04em; }
+.ph-sub { max-width: 620px; margin-top: 3px; }
+.ai-btn {
+  border-radius: 11px;
+  background: var(--grad);
+  box-shadow: var(--shadow-primary);
+}
+.sd-tabs :deep(.el-tabs__header) {
+  margin: 4px 0 16px;
+  padding: 4px 8px 0;
+  background: color-mix(in srgb, var(--surface) 76%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-xs);
+}
+.sd-tabs :deep(.el-tabs__nav-wrap::after) { background: transparent; }
+.sd-tabs :deep(.el-tabs__item) {
+  height: 40px;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+}
+.sd-tabs :deep(.el-tabs__item.is-active) { color: var(--primary-600); }
+.sd-tabs :deep(.el-tabs__active-bar) {
+  height: 3px;
+  border-radius: 3px;
+  background: var(--grad);
+}
+.tab-toolbar {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  box-shadow: var(--shadow-xs);
+}
+.stat {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--text-2);
+}
+.stat b { color: var(--primary-600); }
+.graph-stage {
+  min-height: 500px;
+  height: clamp(500px, 62vh, 700px);
+  flex: 0 0 auto;
+}
+.map-card {
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  box-shadow: var(--shadow-sm);
+}
+.inst-filter :deep(.el-input__wrapper) { background: var(--surface); }
+
+@media (max-width: 900px) {
+  .sd-page { padding: 18px 16px 22px; }
+  .graph-stage { min-height: 440px; height: 58vh; }
+}
+
+/* ── 工作区高度约束：头部固定，画布/表格只在内容区内伸缩 ── */
+.sd-page {
+  height: calc(100dvh - 68px);
+  min-height: 0;
+  overflow: hidden;
+  box-sizing: border-box;
+  padding: 14px 20px 16px;
+}
+.sd-header {
+  flex: 0 0 auto;
+  min-height: 48px;
+  margin-bottom: 6px;
+  align-items: center;
+}
+.sd-header .ph-title b { font-size: 18px; }
+.sd-tabs {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+.sd-tabs :deep(.el-tabs__header) {
+  flex: 0 0 auto;
+  margin: 0 0 8px;
+  padding-top: 2px;
+}
+.sd-tabs :deep(.el-tabs__nav-wrap) { min-width: 0; }
+.sd-tabs :deep(.el-tabs__content) { overflow: hidden; }
+.sd-tabs :deep(.el-tab-pane) { overflow: hidden; }
+.tab-toolbar {
+  flex: 0 0 auto;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+}
+.graph-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+  overflow: hidden;
+}
+.wf-editor-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+.map-card {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+@media (max-width: 900px) {
+  .sd-page { padding: 12px 14px 14px; }
+  .sd-header { min-height: 44px; }
+  .sd-header .ph-title b { font-size: 17px; }
+  .graph-stage { min-height: 0; height: auto; }
+  .wf-editor-stage { min-height: 0; }
 }
 </style>

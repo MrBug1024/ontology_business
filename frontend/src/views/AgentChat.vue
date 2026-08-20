@@ -3,7 +3,7 @@
     <!-- 左侧：会话列表 -->
     <div class="chat-side">
       <div class="side-head">
-        <el-button text @click="$router.push('/agents')"><el-icon><ArrowLeft /></el-icon></el-button>
+        <el-button text @click="$router.push('/agents')" aria-label="返回 Agent 列表" title="返回 Agent 列表"><el-icon aria-hidden="true"><ArrowLeft /></el-icon></el-button>
         <div class="agent-title">
           <div class="agent-name">{{ agent?.name }}</div>
           <div class="muted">{{ agent?.scenario_name || '未绑定场景' }}</div>
@@ -13,18 +13,18 @@
         <el-button type="primary" size="small" style="width:100%;margin:10px" @click="newConv">
           <el-icon><Plus /></el-icon> 新对话
         </el-button>
-        <div v-for="c in conversations" :key="c.id" class="conv-item" :class="{ active: curConv?.id === c.id }" @click="openConv(c)">
-          <el-icon><ChatLineRound /></el-icon>
+        <div v-for="c in conversations" :key="c.id" class="conv-item" :class="{ active: curConv?.id === c.id }" role="button" tabindex="0" :aria-current="curConv?.id === c.id ? 'true' : undefined" :aria-label="`打开对话：${c.title || '新对话'}`" @click="openConv(c)" @keydown.enter.prevent="openConv(c)" @keydown.space.prevent="openConv(c)">
+          <el-icon aria-hidden="true"><ChatLineRound /></el-icon>
           <span class="conv-title">{{ c.title || '新对话' }}</span>
-          <el-icon class="conv-del" @click.stop="delConv(c)"><Delete /></el-icon>
+          <button class="conv-del" type="button" :aria-label="`删除对话：${c.title || '新对话'}`" title="删除对话" @click.stop="delConv(c)"><el-icon aria-hidden="true"><Delete /></el-icon></button>
         </div>
         <el-empty v-if="!conversations.length" description="暂无对话" :image-size="50" />
       </div>
       <div class="side-foot" v-if="agent">
         <div class="muted">已配置能力</div>
-        <el-tag v-for="n in agent.skill_names || []" :key="n" size="small" type="success" effect="plain" style="margin:2px">⚡ {{ n }}</el-tag>
-        <el-tag v-for="n in agent.mcp_names || []" :key="n" size="small" type="warning" effect="plain" style="margin:2px">🔌 {{ n }}</el-tag>
-        <el-tag v-for="n in agent.data_source_names || []" :key="n" size="small" type="info" effect="plain" style="margin:2px">🗄 {{ n }}</el-tag>
+        <el-tag v-for="n in agent.skill_names || []" :key="n" size="small" type="success" effect="plain" style="margin:2px"><el-icon aria-hidden="true"><MagicStick /></el-icon>{{ n }}</el-tag>
+        <el-tag v-for="n in agent.mcp_names || []" :key="n" size="small" type="warning" effect="plain" style="margin:2px"><el-icon aria-hidden="true"><Connection /></el-icon>{{ n }}</el-tag>
+        <el-tag v-for="n in agent.data_source_names || []" :key="n" size="small" type="info" effect="plain" style="margin:2px"><el-icon aria-hidden="true"><Coin /></el-icon>{{ n }}</el-tag>
       </div>
     </div>
 
@@ -36,7 +36,7 @@
           <div class="empty-title">{{ agent?.name }} 已就绪</div>
           <div class="muted">基于「{{ agent?.scenario_name || '通用' }}」场景本体，可查询数据、检索文档、调用技能</div>
           <div class="suggestions">
-            <div class="sug" v-for="q in suggestions" :key="q" @click="send(q)">{{ q }}</div>
+            <button class="sug" type="button" v-for="q in suggestions" :key="q" @click="send(q)">{{ q }}</button>
           </div>
         </div>
 
@@ -48,14 +48,14 @@
             <!-- 工具调用卡片 -->
             <template v-for="(tc, ti) in m.tool_calls || []" :key="'tc' + ti">
               <div class="tool-card" :class="{ open: tc._open }">
-                <div class="head" @click="tc._open = !tc._open">
-                  <el-icon><component :is="tc.status === 'error' ? 'CircleClose' : tc.status === 'done' ? 'CircleCheck' : 'Loading'" /></el-icon>
+                <button class="head" type="button" :aria-expanded="tc._open" @click="tc._open = !tc._open">
+                  <el-icon aria-hidden="true"><component :is="tc.status === 'error' ? 'CircleClose' : tc.status === 'done' ? 'CircleCheck' : 'Loading'" /></el-icon>
                   <span>{{ tc.name }}</span>
                   <el-tag v-if="tc.status === 'done'" size="small" type="success">完成</el-tag>
                   <el-tag v-else-if="tc.status === 'error'" size="small" type="danger">失败</el-tag>
                   <el-tag v-else size="small" type="warning">执行中</el-tag>
-                  <el-icon style="margin-left:auto"><component :is="tc._open ? 'ArrowUp' : 'ArrowDown'" /></el-icon>
-                </div>
+                  <el-icon style="margin-left:auto" aria-hidden="true"><component :is="tc._open ? 'ArrowUp' : 'ArrowDown'" /></el-icon>
+                </button>
                 <div class="body">
                   <div class="muted" style="margin-bottom:4px">参数</div>
                   <pre class="code" style="max-height:160px">{{ JSON.stringify(tc.args, null, 2) }}</pre>
@@ -73,7 +73,7 @@
               <div class="attach-card" v-for="a in extractAttachments(m.content)" :key="a.id">
                 <div class="attach-icon"><el-icon :size="22"><Document /></el-icon></div>
                 <div class="attach-info">
-                  <div class="attach-name" @click="preview(a)">{{ a.filename }}</div>
+                  <button class="attach-name" type="button" :aria-label="`预览附件：${a.filename}`" @click="preview(a)">{{ a.filename }}</button>
                   <div class="muted attach-sub">点击预览</div>
                 </div>
                 <div class="attach-actions">
@@ -103,7 +103,7 @@
 
       <div class="chat-input-area">
         <el-input v-model="input" type="textarea" :rows="2" resize="none"
-          placeholder="输入业务问题，如：各门店本月销售额排名？"
+          placeholder="输入业务问题，例如查询数据、检索文档或执行已配置的业务操作"
           @keydown.enter.exact.prevent="send()" />
         <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
           <span class="muted">Enter 发送 · Shift+Enter 换行</span>
@@ -138,10 +138,10 @@ const msgRef = ref<HTMLElement>()
 let ctrl: AbortController | null = null
 
 const suggestions = [
-  '各门店本月销售额排名如何？',
-  '哪些商品销量最高？',
-  '帮我分析客户分布情况',
-  '业务文档里关于退货政策是怎么规定的？',
+  '请介绍当前业务场景和可用能力',
+  '查询当前场景中可用的业务对象',
+  '根据已配置规则检查一组业务数据',
+  '检索业务文档并给出要点总结',
 ]
 
 function renderMd(s: string) {
@@ -248,10 +248,14 @@ async function openConv(c: Conversation) {
   scrollBottom()
 }
 async function delConv(c: Conversation) {
-  await ElMessageBox.confirm('删除该对话？', '确认', { type: 'warning' })
-  await api.deleteConversation(c.id)
-  if (curConv.value?.id === c.id) newConv()
-  loadConvs()
+  try {
+    await ElMessageBox.confirm('删除该对话？', '确认', { type: 'warning' })
+    await api.deleteConversation(c.id)
+    if (curConv.value?.id === c.id) newConv()
+    await loadConvs()
+  } catch (e: any) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
+  }
 }
 
 function send(text?: string) {
@@ -304,7 +308,7 @@ function handleEvent(ev: { type: string; data: any }, ai: any) {
       break
     case 'error':
       ai.status = ''
-      ai.content += `\n\n⚠️ ${ev.data}`
+      ai.content += `\n\n[错误] ${ev.data}`
       break
   }
   scrollBottom()
@@ -338,6 +342,7 @@ onMounted(loadAgent)
   padding: 14px 14px 10px;
   border-bottom: 1px solid var(--border);
 }
+.chat-layout { height: calc(100dvh - 68px); min-height: 0; overflow: hidden; }
 .agent-title { flex: 1; min-width: 0; }
 .agent-name {
   font-weight: 700;
@@ -359,6 +364,7 @@ onMounted(loadAgent)
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 .conv-item:hover { background: var(--surface-2); }
+.conv-item:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: -2px; }
 .conv-item.active {
   background: var(--primary-soft);
   color: var(--primary-600);
@@ -366,8 +372,9 @@ onMounted(loadAgent)
   border-left-color: var(--primary);
 }
 .conv-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conv-del { opacity: 0; transition: opacity var(--dur); }
+.conv-del { opacity: 0; transition: opacity var(--dur); width: 28px; height: 28px; border: 0; border-radius: 7px; background: transparent; color: var(--text-3); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .conv-item:hover .conv-del { opacity: 1; }
+.conv-del:hover, .conv-del:focus-visible { opacity: 1; color: var(--danger); background: var(--danger-soft); }
 .side-foot {
   padding: 10px 14px;
   border-top: 1px solid var(--border);
@@ -406,12 +413,15 @@ onMounted(loadAgent)
   max-width: 560px;
 }
 .sug {
+  font: inherit;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 20px;
   padding: 7px 14px;
   font-size: 13px;
   cursor: pointer;
+  min-height: 44px;
+  line-height: 1.4;
   transition: border-color var(--dur) var(--ease), color var(--dur) var(--ease), background var(--dur) var(--ease), transform var(--dur) var(--ease);
 }
 .sug:hover {
@@ -469,6 +479,11 @@ onMounted(loadAgent)
   min-width: 0;
 }
 .attach-name {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
@@ -492,5 +507,17 @@ onMounted(loadAgent)
   max-height: 68vh;
   overflow-y: auto;
   padding: 4px 2px;
+}
+
+@media (max-width: 720px) {
+  .chat-layout { height: auto; min-height: calc(100dvh - 68px); flex-direction: column; }
+  .chat-side { width: 100%; height: 220px; flex: 0 0 220px; }
+  .conv-list { min-height: 0; }
+  .chat-main { min-height: 440px; height: calc(100dvh - 288px); }
+  .chat-messages { padding: 18px 14px; }
+  .chat-input-area { padding: 12px 14px 16px; }
+  .attach-card { align-items: flex-start; flex-wrap: wrap; }
+  .attach-info { min-width: calc(100% - 52px); }
+  .attach-actions { width: 100%; justify-content: flex-end; }
 }
 </style>

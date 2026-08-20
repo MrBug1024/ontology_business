@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
+from fastapi import Request
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -19,8 +20,14 @@ engine = create_engine(_settings.database_url, connect_args=connect_args, pool_p
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
-def get_db() -> Generator[Session, None, None]:
+def get_db(request: Request) -> Generator[Session, None, None]:
     db = SessionLocal()
+    tenant_id = getattr(request.state, "tenant_id", None)
+    user_id = getattr(request.state, "user_id", None)
+    if tenant_id:
+        db.info["tenant_id"] = tenant_id
+    if user_id:
+        db.info["user_id"] = user_id
     try:
         yield db
     finally:
@@ -80,6 +87,48 @@ def _migrate_workflows_dag() -> None:
             conn.exec_driver_sql("ALTER TABLE ontology_workflows ADD COLUMN edges JSON DEFAULT '[]'")
 
 
+def _migrate_tenancy() -> None:
+    """为已有平台表补充租户列；旧数据在首个用户注册时认领。"""
+    if not _settings.database_url.startswith("sqlite"):
+        return
+    columns_by_table = {
+        "business_scenarios": {
+            "tenant_id": "VARCHAR(32)",
+            "is_public": "BOOLEAN DEFAULT 0",
+        },
+        "data_sources": {
+            "tenant_id": "VARCHAR(32)",
+            "is_public": "BOOLEAN DEFAULT 0",
+        },
+        "llm_configs": {
+            "tenant_id": "VARCHAR(32)",
+            "is_public": "BOOLEAN DEFAULT 0",
+        },
+        "skills": {
+            "tenant_id": "VARCHAR(32)",
+            "is_public": "BOOLEAN DEFAULT 0",
+        },
+        "mcp_configs": {
+            "tenant_id": "VARCHAR(32)",
+            "is_public": "BOOLEAN DEFAULT 0",
+        },
+        "agents": {
+            "tenant_id": "VARCHAR(32)",
+        },
+    }
+    with engine.begin() as conn:
+        for table, columns in columns_by_table.items():
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(f"PRAGMA table_info('{table}')").fetchall()
+            }
+            if not existing:
+                continue
+            for name, definition in columns.items():
+                if name not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
 def init_db() -> None:
     # Import models so they register on the metadata before create_all.
     from . import models  # noqa: F401
@@ -87,3 +136,4 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_data_sources_nullable_scenario()
     _migrate_workflows_dag()
+    _migrate_tenancy()

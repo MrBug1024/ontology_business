@@ -19,12 +19,72 @@ def _now() -> datetime:
 
 
 # ──────────────────────────────────────────────
+# 租户、用户与认证
+# ──────────────────────────────────────────────
+class Tenant(Base):
+    __tablename__ = "tenants"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    users: Mapped[list["User"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(120), default="")
+    password_hash: Mapped[str] = mapped_column(String(300), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / active / disabled
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    tenant: Mapped[Tenant] = relationship(back_populates="users")
+    sessions: Mapped[list["AuthSession"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    user: Mapped[User] = relationship(back_populates="sessions")
+
+
+class EmailVerificationCode(Base):
+    __tablename__ = "email_verification_codes"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    email: Mapped[str] = mapped_column(String(320), index=True)
+    purpose: Mapped[str] = mapped_column(String(30), default="register")  # register / password_reset
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+# ──────────────────────────────────────────────
 # 业务场景 & 本体
 # ──────────────────────────────────────────────
 class BusinessScenario(Base):
     __tablename__ = "business_scenarios"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     industry: Mapped[str] = mapped_column(String(100), default="")
@@ -65,10 +125,11 @@ class BusinessScenario(Base):
     execution_logs: Mapped[list["ActionExecutionLog"]] = relationship(
         back_populates="scenario", cascade="all, delete-orphan"
     )
+    tenant: Mapped[Tenant | None] = relationship()
 
 
 class OntologyEntity(Base):
-    """本体中的实体类型（Object Type），如 客户、订单、设备、合同……"""
+    """本体中的实体类型（Object Type），例如对象、事项、资源等领域概念。"""
 
     __tablename__ = "ontology_entities"
 
@@ -241,6 +302,10 @@ class DataSource(Base):
     __tablename__ = "data_sources"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     scenario_id: Mapped[str | None] = mapped_column(
         ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True, nullable=True
     )
@@ -255,6 +320,7 @@ class DataSource(Base):
     files: Mapped[list[BucketFile]] = relationship(
         back_populates="data_source", cascade="all, delete-orphan"
     )
+    tenant: Mapped[Tenant | None] = relationship()
 
 
 class BucketFile(Base):
@@ -285,6 +351,10 @@ class LLMConfig(Base):
     __tablename__ = "llm_configs"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     provider: Mapped[str] = mapped_column(String(50), default="openai")  # openai 兼容协议
     base_url: Mapped[str] = mapped_column(String(500), default="")
@@ -294,6 +364,7 @@ class LLMConfig(Base):
     max_tokens: Mapped[int] = mapped_column(Integer, default=4096)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    tenant: Mapped[Tenant | None] = relationship()
 
 
 # ──────────────────────────────────────────────
@@ -303,6 +374,10 @@ class Skill(Base):
     __tablename__ = "skills"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
     description: Mapped[str] = mapped_column(Text, default="")
     path: Mapped[str] = mapped_column(String(1000), nullable=False)
@@ -310,12 +385,17 @@ class Skill(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     meta: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    tenant: Mapped[Tenant | None] = relationship()
 
 
 class MCPConfig(Base):
     __tablename__ = "mcp_configs"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     transport: Mapped[str] = mapped_column(String(20), default="stdio")  # stdio / sse / streamable_http
     command: Mapped[str] = mapped_column(String(500), default="")
@@ -325,6 +405,7 @@ class MCPConfig(Base):
     headers: Mapped[dict] = mapped_column(JSON, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    tenant: Mapped[Tenant | None] = relationship()
 
 
 # ──────────────────────────────────────────────
@@ -334,6 +415,9 @@ class Agent(Base):
     __tablename__ = "agents"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=True
+    )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     scenario_id: Mapped[str | None] = mapped_column(
@@ -356,6 +440,7 @@ class Agent(Base):
     conversations: Mapped[list[Conversation]] = relationship(
         back_populates="agent", cascade="all, delete-orphan"
     )
+    tenant: Mapped[Tenant | None] = relationship()
 
 
 class Conversation(Base):

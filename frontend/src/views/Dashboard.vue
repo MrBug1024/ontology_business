@@ -13,8 +13,8 @@
     <!-- 统计卡片 -->
     <el-row :gutter="16">
       <el-col :xs="12" :sm="12" :md="6" v-for="s in stats" :key="s.label">
-        <div class="stat-card" @click="s.to && $router.push(s.to)">
-          <div class="stat-icon" :style="{ background: s.bg, color: s.fg }">
+        <div class="stat-card" role="link" tabindex="0" :aria-label="`查看${s.label}`" @click="s.to && $router.push(s.to)" @keydown.enter.prevent="s.to && $router.push(s.to)" @keydown.space.prevent="s.to && $router.push(s.to)">
+          <div class="stat-icon" :style="{ background: s.bg, color: s.fg }" aria-hidden="true">
             <el-icon :size="22"><component :is="s.icon" /></el-icon>
           </div>
           <div class="stat-body">
@@ -213,6 +213,7 @@ onMounted(load)
   transform: translateX(3px);
   color: var(--primary);
 }
+.stat-card:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: 3px; }
 
 @media (max-width: 768px) {
   .stat-card { padding: 14px 14px; gap: 10px; }
