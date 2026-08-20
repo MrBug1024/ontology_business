@@ -377,6 +377,7 @@
             @update:model-value="wfEditor = $event"
             @close="wfEditor = null"
             @save="saveWorkflow"
+            @run-created="openWorkflowRun"
           />
         </div>
         <!-- 工作流列表 -->
@@ -393,7 +394,12 @@
                 <template #default="{ row }"><b>{{ row.name }}</b></template>
               </el-table-column>
               <el-table-column label="触发方式" width="110">
-                <template #default="{ row }"><el-tag size="small" effect="plain">{{ row.trigger_type || 'manual' }}</el-tag></template>
+                <template #default="{ row }">
+                  <div class="workflow-trigger">
+                    <el-tag size="small" effect="plain">{{ workflowTriggerLabel(row.trigger_type) }}</el-tag>
+                    <small v-if="workflowTriggerDetail(row)">{{ workflowTriggerDetail(row) }}</small>
+                  </div>
+                </template>
               </el-table-column>
               <el-table-column label="状态" width="90">
                 <template #default="{ row }">
@@ -411,10 +417,11 @@
               <el-table-column label="描述" min-width="160">
                 <template #default="{ row }"><span class="muted">{{ row.description || '—' }}</span></template>
               </el-table-column>
-              <el-table-column label="操作" width="200" fixed="right">
+              <el-table-column label="操作" width="258" fixed="right">
                 <template #default="{ row }">
                   <el-button size="small" text @click="openWorkflow(row.id)">编排</el-button>
                   <el-button size="small" text type="primary" :disabled="row.status !== 'active'" :loading="row._executing" @click="doExecuteWorkflow(row)">执行</el-button>
+                  <el-button size="small" text @click="goToWorkflowTasks(row)">任务</el-button>
                   <el-button size="small" text type="danger" @click="removeWorkflow(row.id)">删除</el-button>
                 </template>
               </el-table-column>
@@ -754,7 +761,7 @@ import { api } from '@/api'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import EditorPanel from '@/components/EditorPanel.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
-import type { ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, DataMapping, DataMappingPreview, ObjectDetail, ObjectSearchItem } from '@/types'
+import type { ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, DataMapping, DataMappingPreview, ObjectDetail, ObjectSearchItem, WorkflowRun } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -1351,11 +1358,16 @@ function openWorkflow(id?: string) {
   wfEditor.value = w
     ? {
         ...w,
+        trigger_config: { interval_seconds: 300, max_attempts: 3, retry_backoff_seconds: 5, timeout_seconds: 300, event_id: '', ...(w.trigger_config || {}) },
         steps: (w.steps || []).map((s: any) => ({ ...s })),
         nodes: (w.nodes || []).map((n: any) => ({ ...n, data: { ...(n.data || {}) } })),
         edges: (w.edges || []).map((e: any) => ({ ...e })),
       }
-    : { name: '', description: '', trigger_type: 'manual', steps: [], nodes: [], edges: [], status: 'draft', enabled: true }
+    : {
+        name: '', description: '', trigger_type: 'manual',
+        trigger_config: { interval_seconds: 300, max_attempts: 3, retry_backoff_seconds: 5, timeout_seconds: 300, event_id: '' },
+        steps: [], nodes: [], edges: [], status: 'draft', enabled: true,
+      }
 }
 async function saveWorkflow(w: any) {
   try {
@@ -1381,11 +1393,30 @@ async function doExecuteWorkflow(row: any) {
   row._executing = true
   try {
     const params = await promptParams(null, '输入工作流参数（JSON，可为空 {}）')
-    const res = await api.executeWorkflow(row.id!, params)
-    showExecResult(res)
+    const run = await api.submitWorkflowRun(row.id!, params)
+    ElMessage.success(run.status === 'awaiting_approval' ? '任务已提交，正在等待审批' : '工作流任务已提交到队列')
+    openWorkflowRun(run)
   } catch (e: any) {
     if (e !== 'cancel') ElMessage.error(e?.response?.data?.detail || e?.message || '执行失败')
   } finally { row._executing = false }
+}
+function openWorkflowRun(run: WorkflowRun) {
+  router.push({
+    name: 'tasks',
+    query: { scenario_id: sid, workflow_id: run.workflow_id, task: run.id },
+  })
+}
+function goToWorkflowTasks(row: any) {
+  router.push({ name: 'tasks', query: { scenario_id: sid, workflow_id: row.id } })
+}
+function workflowTriggerLabel(triggerType?: string) {
+  return ({ manual: '手动', scheduled: '定时', event: '事件' } as Record<string, string>)[triggerType || 'manual'] || '手动'
+}
+function workflowTriggerDetail(workflow: any) {
+  const config = workflow.trigger_config || {}
+  if (workflow.trigger_type === 'scheduled' && config.interval_seconds) return `每 ${config.interval_seconds} 秒`
+  if (workflow.trigger_type === 'event' && config.event_id) return detail.value.events.find((event) => event.id === config.event_id)?.name || '已配置事件'
+  return ''
 }
 /** 列表页流程摘要：DAG 节点链（或旧版 steps） */
 function wfSummary(w: any): string[] {
@@ -1399,6 +1430,7 @@ function wfSummary(w: any): string[] {
         if (n.type === 'rule') return `规则 · ${d.rule_id ? detail.value.rules.find((r) => r.id === d.rule_id)?.name || n.name || '未命名' : n.name || '未命名'}`
         if (n.type === 'llm') return `大模型 · ${n.name || '未命名'}`
         if (n.type === 'event') return `事件 · ${d.event_id ? detail.value.events.find((e) => e.id === d.event_id)?.name || n.name || '未命名' : n.name || '未命名'}`
+        if (n.type === 'approval') return `审批 · ${n.name || '等待人工决定'}`
         if (n.type === 'http') return `HTTP · ${n.name || '未命名'}`
         if (n.type === 'script') return `脚本 · ${n.name || '未命名'}`
         return n.name || n.type
@@ -1850,6 +1882,13 @@ onBeforeUnmount(() => {
 .map-table {
   flex: 1;
 }
+.workflow-trigger {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+.workflow-trigger small { color: var(--text-3); font-size: 10px; white-space: nowrap; }
 .ent-chip {
   display: inline-flex;
   align-items: center;

@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
+from app.database import Base
+from app.models import LLMEvaluationRecord, LLMConfig, LLMInvocationTrace, Tenant
+from app.routers.llm_configs import (
+    _out,
+    create_evaluation,
+    evaluation_summary,
+    resolve_llm,
+    usage_summary,
+)
+from app.schemas import LLMEvaluationIn, LLMConfigIn
+from app.services import llm_service
+
+
+class _CompletionClient:
+    def __init__(self, response=None, error: Exception | None = None):
+        self.response = response
+        self.error = error
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    def create(self, **_kwargs):
+        if self.error:
+            raise self.error
+        return self.response
+
+
+class _StreamClient:
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    def create(self, **_kwargs):
+        return iter(self.chunks)
+
+
+def _response(content: str = "ok", *, prompt_tokens: int = 11, completion_tokens: int = 7):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=content, tool_calls=None),
+                finish_reason="stop",
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+    )
+
+
+class LLMManagementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.db = Session(self.engine)
+        self.tenant = Tenant(id="tenant-llm", name="模型租户")
+        self.db.add(self.tenant)
+        self.db.commit()
+        self.db.info["tenant_id"] = self.tenant.id
+        self.config = LLMConfig(
+            id="cfg-primary",
+            tenant_id=self.tenant.id,
+            name="主模型",
+            provider="openai-compatible",
+            api_key="sk-secret-value-should-not-leak",
+            model="example-chat",
+            capabilities=["chat", "tool"],
+            enabled=True,
+            routing_priority=20,
+            input_cost_per_million=2.0,
+            output_cost_per_million=4.0,
+            budget_limit=10.0,
+        )
+        self.db.add(self.config)
+        self.db.commit()
+
+    def tearDown(self) -> None:
+        self.db.close()
+        self.engine.dispose()
+
+    def _trace_session(self):
+        return Session(self.engine)
+
+    def test_config_contract_hides_key_and_routes_enabled_capabilities(self) -> None:
+        disabled = LLMConfig(
+            id="cfg-disabled",
+            tenant_id=self.tenant.id,
+            name="已停用",
+            model="disabled",
+            capabilities=["chat"],
+            enabled=False,
+            routing_priority=1,
+        )
+        vision = LLMConfig(
+            id="cfg-vision",
+            tenant_id=self.tenant.id,
+            name="视觉模型",
+            model="vision",
+            capabilities=["vision"],
+            enabled=True,
+            routing_priority=1,
+        )
+        secondary = LLMConfig(
+            id="cfg-secondary",
+            tenant_id=self.tenant.id,
+            name="备用模型",
+            model="backup",
+            capabilities=["chat"],
+            enabled=True,
+            routing_priority=30,
+        )
+        self.db.add_all([disabled, vision, secondary])
+        self.db.commit()
+
+        payload = LLMConfigIn(name="验证", capabilities=["CHAT", "tool", "chat"])
+        self.assertEqual(payload.capabilities, ["chat", "tool"])
+        with self.assertRaises(ValueError):
+            LLMConfigIn(name="非法工具模型", capabilities=["tool"])
+        self.assertEqual(_out(self.config).api_key, "")
+        self.assertNotIn("sk-secret", _out(self.config).model_dump_json())
+
+        route = resolve_llm("chat", db=self.db)
+        self.assertEqual(route.selected.id, self.config.id)
+        self.assertEqual([item.id for item in route.candidates], [self.config.id, secondary.id])
+        self.assertEqual(resolve_llm("vision", db=self.db).selected.id, vision.id)
+
+    def test_sync_call_persists_costed_trace_without_prompt_or_key(self) -> None:
+        with (
+            patch("app.services.llm_service._client", return_value=_CompletionClient(_response("业务回复"))),
+            patch("app.database.SessionLocal", side_effect=self._trace_session),
+        ):
+            result = llm_service.chat(
+                self.config,
+                [{"role": "user", "content": "包含敏感业务内容的提示词"}],
+                db=self.db,
+            )
+        self.assertEqual(result["content"], "业务回复")
+        trace = Session(self.engine).execute(select(LLMInvocationTrace)).scalars().one()
+        self.assertEqual(trace.status, "succeeded")
+        self.assertEqual(trace.operation, "chat")
+        self.assertEqual(trace.provider, "openai-compatible")
+        self.assertEqual(trace.model, "example-chat")
+        self.assertEqual(trace.input_tokens, 11)
+        self.assertEqual(trace.output_tokens, 7)
+        self.assertAlmostEqual(trace.estimated_cost, 0.00005)
+        self.assertFalse(hasattr(trace, "prompt"))
+        self.assertNotIn("secret", trace.error)
+
+    def test_stream_completion_and_failure_record_sanitized_traces(self) -> None:
+        token_chunk = SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content="流式", tool_calls=None))],
+            usage=None,
+        )
+        final_chunk = SimpleNamespace(
+            choices=[],
+            usage=SimpleNamespace(prompt_tokens=8, completion_tokens=3, total_tokens=11),
+        )
+        with (
+            patch("app.services.llm_service._client", return_value=_StreamClient([token_chunk, final_chunk])),
+            patch("app.database.SessionLocal", side_effect=self._trace_session),
+        ):
+            events = list(llm_service.chat_stream(self.config, [{"role": "user", "content": "stream"}], db=self.db))
+        self.assertEqual(events, [{"type": "token", "content": "流式"}])
+
+        with (
+            patch(
+                "app.services.llm_service._client",
+                return_value=_CompletionClient(error=RuntimeError("api_key=sk-secret-value-should-not-leak")),
+            ),
+            patch("app.database.SessionLocal", side_effect=self._trace_session),
+        ):
+            with self.assertRaises(RuntimeError):
+                llm_service.chat(self.config, [{"role": "user", "content": "will fail"}], db=self.db)
+
+        traces = Session(self.engine).execute(
+            select(LLMInvocationTrace).order_by(LLMInvocationTrace.created_at)
+        ).scalars().all()
+        self.assertEqual([trace.status for trace in traces], ["succeeded", "failed"])
+        self.assertEqual(traces[0].operation, "chat_stream")
+        self.assertEqual((traces[0].input_tokens, traces[0].output_tokens), (8, 3))
+        self.assertEqual(traces[1].error, "RuntimeError: provider 调用失败")
+        self.assertNotIn("sk-secret", traces[1].error)
+
+    def test_usage_and_evaluation_summaries_are_owner_scoped(self) -> None:
+        self.db.add_all(
+            [
+                LLMInvocationTrace(
+                    tenant_id=self.tenant.id,
+                    llm_config_id=self.config.id,
+                    provider=self.config.provider,
+                    model=self.config.model,
+                    capability="chat",
+                    operation="chat",
+                    status="succeeded",
+                    latency_ms=120,
+                    input_tokens=100,
+                    output_tokens=20,
+                    total_tokens=120,
+                    estimated_cost=0.005,
+                    currency="USD",
+                ),
+                LLMInvocationTrace(
+                    tenant_id=self.tenant.id,
+                    llm_config_id=self.config.id,
+                    provider=self.config.provider,
+                    model=self.config.model,
+                    capability="tool",
+                    operation="chat_stream",
+                    status="failed",
+                    latency_ms=50,
+                    input_tokens=30,
+                    output_tokens=0,
+                    total_tokens=30,
+                    estimated_cost=0.001,
+                    currency="USD",
+                ),
+            ]
+        )
+        self.db.commit()
+        usage = usage_summary(self.config.id, days=30, db=self.db)
+        self.assertEqual(usage.invocation_count, 2)
+        self.assertEqual(usage.failed_count, 1)
+        self.assertEqual(usage.input_tokens, 130)
+        self.assertAlmostEqual(usage.budget_remaining or 0, 9.994)
+        self.assertEqual(usage.by_capability["chat"]["invocation_count"], 1)
+
+        evaluation = create_evaluation(
+            self.config.id,
+            LLMEvaluationIn(
+                name="工具准确率",
+                passed=True,
+                score=0.9,
+                notes="authorization=Bearer sk-secret-value-should-not-leak",
+                metrics={"api_key": "sk-secret-value-should-not-leak", "accuracy": 0.9},
+            ),
+            db=self.db,
+        )
+        self.assertNotIn("sk-secret", evaluation.notes)
+        record = self.db.get(LLMEvaluationRecord, evaluation.id)
+        self.assertEqual(record.metrics["api_key"], "[REDACTED]")
+        summary = evaluation_summary(self.config.id, db=self.db)
+        self.assertEqual((summary.total, summary.passed, summary.failed), (1, 1, 0))
+        self.assertAlmostEqual(summary.average_score, 0.9)
+
+
+if __name__ == "__main__":
+    unittest.main()

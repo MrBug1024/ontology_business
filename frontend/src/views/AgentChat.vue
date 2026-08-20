@@ -68,6 +68,32 @@
             <div v-if="m.status" class="status-line"><el-icon class="is-loading"><Loading /></el-icon> {{ m.status }}</div>
             <!-- 正文（markdown） -->
             <div class="md-body" v-if="m.content" v-html="renderMd(m.content)"></div>
+            <!-- 检索资料来源：由服务端按当前租户和 Agent 已绑定资料库过滤后返回。 -->
+            <section v-if="m.citations?.length" class="citation-sources" :aria-labelledby="`citation-title-${i}`">
+              <div class="citation-sources-head">
+                <div>
+                  <h4 :id="`citation-title-${i}`"><el-icon aria-hidden="true"><Document /></el-icon>资料来源 <span>{{ m.citations.length }}</span></h4>
+                  <p role="status">本回答检索到 {{ m.citations.length }} 条可追溯资料。</p>
+                </div>
+              </div>
+              <article v-for="citation in m.citations" :key="citation.chunk_id" class="citation-card">
+                <div class="citation-card-head">
+                  <span class="citation-id">{{ citation.citation_id }}</span>
+                  <div class="citation-info">
+                    <strong>{{ citation.filename }}</strong>
+                    <small>{{ citation.data_source_name }} · 字符 {{ citation.char_start }}–{{ citation.char_end }} · 片段 {{ citation.chunk_ordinal + 1 }}</small>
+                  </div>
+                  <el-button
+                    size="small"
+                    text
+                    type="primary"
+                    :aria-label="`查看引用原文：${citation.filename}，字符 ${citation.char_start} 到 ${citation.char_end}`"
+                    @click="previewCitation(citation)"
+                  ><el-icon aria-hidden="true"><View /></el-icon>查看原文</el-button>
+                </div>
+                <p class="citation-excerpt">{{ citation.text }}</p>
+              </article>
+            </section>
             <!-- 附件卡片 -->
             <div class="attach-list" v-if="extractAttachments(m.content).length">
               <div class="attach-card" v-for="a in extractAttachments(m.content)" :key="a.id">
@@ -88,9 +114,13 @@
       </div>
 
       <!-- 附件预览弹窗 -->
-      <el-dialog v-model="previewVisible" :title="previewFile.filename" width="720px" top="6vh" destroy-on-close>
+      <el-dialog v-model="previewVisible" :title="citationPreview ? `引用原文：${previewFile.filename}` : previewFile.filename" width="720px" top="6vh" destroy-on-close>
         <div v-loading="previewLoading" class="preview-box">
-          <div class="md-body" v-if="previewText" v-html="renderMd(previewText)"></div>
+          <template v-if="citationPreview">
+            <p class="citation-range">引用位置：字符 {{ citationPreview.charStart }}–{{ citationPreview.charEnd }}</p>
+            <pre class="citation-original"><span>{{ citationPreview.prefix }}</span><mark>{{ citationPreview.highlighted }}</mark><span>{{ citationPreview.suffix }}</span></pre>
+          </template>
+          <div class="md-body" v-else-if="previewText" v-html="renderMd(previewText)"></div>
           <el-empty v-else-if="!previewLoading" description="暂无可预览内容" />
         </div>
         <template #footer>
@@ -125,13 +155,22 @@ import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
 import { api, streamChat } from '@/api'
-import type { Agent, Conversation } from '@/types'
+import type { Agent, ChatMessage, Conversation, RagCitation } from '@/types'
 
 const route = useRoute()
 const agent = ref<Agent | null>(null)
 const conversations = ref<Conversation[]>([])
 const curConv = ref<Conversation | null>(null)
-const messages = ref<any[]>([])
+type ChatViewMessage = ChatMessage & { streaming?: boolean; status?: string }
+type CitationPreview = {
+  charStart: number
+  charEnd: number
+  prefix: string
+  highlighted: string
+  suffix: string
+}
+
+const messages = ref<ChatViewMessage[]>([])
 const input = ref('')
 const streaming = ref(false)
 const msgRef = ref<HTMLElement>()
@@ -177,15 +216,68 @@ const previewVisible = ref(false)
 const previewLoading = ref(false)
 const previewText = ref('')
 const previewFile = ref<{ id: string; filename: string; url: string }>({ id: '', filename: '', url: '' })
+const citationPreview = ref<CitationPreview | null>(null)
 
 async function preview(a: { id: string; filename: string; url: string }) {
   previewFile.value = a
   previewVisible.value = true
   previewLoading.value = true
   previewText.value = ''
+  citationPreview.value = null
   try {
     const r: any = await api.fileText(a.id)
     previewText.value = r.text || ''
+  } catch (e: any) {
+    previewText.value = `预览失败：${e.message}`
+  } finally {
+    previewLoading.value = false
+  }
+}
+
+/** 后端偏移按 Python Unicode code point 计算；JS substring 需要 UTF-16 下标。 */
+function codePointOffsetToUtf16(text: string, offset: number) {
+  const safeOffset = Math.max(0, offset || 0)
+  let codePoints = 0
+  let utf16Offset = 0
+  for (const character of text) {
+    if (codePoints >= safeOffset) break
+    utf16Offset += character.length
+    codePoints += 1
+  }
+  return utf16Offset
+}
+
+function citationPreviewFor(text: string, citation: RagCitation): CitationPreview {
+  const charStart = Math.max(0, citation.char_start || 0)
+  const charEnd = Math.max(charStart, citation.char_end || charStart)
+  const start = codePointOffsetToUtf16(text, charStart)
+  const end = codePointOffsetToUtf16(text, charEnd)
+  const context = 280
+  const prefixStart = Math.max(0, start - context)
+  const suffixEnd = Math.min(text.length, Math.max(end, start) + context)
+  return {
+    charStart,
+    charEnd,
+    prefix: `${prefixStart ? '…' : ''}${text.slice(prefixStart, start)}`,
+    highlighted: text.slice(start, end) || citation.text || '（引用片段当前不可用）',
+    suffix: `${text.slice(end, suffixEnd)}${suffixEnd < text.length ? '…' : ''}`,
+  }
+}
+
+async function previewCitation(citation: RagCitation) {
+  previewFile.value = {
+    id: citation.file_id,
+    filename: citation.filename,
+    url: `/api/data-sources/files/${citation.file_id}/download`,
+  }
+  previewVisible.value = true
+  previewLoading.value = true
+  previewText.value = ''
+  citationPreview.value = null
+  try {
+    const r: any = await api.fileText(citation.file_id)
+    previewText.value = r.text || ''
+    citationPreview.value = citationPreviewFor(previewText.value, citation)
   } catch (e: any) {
     previewText.value = `预览失败：${e.message}`
   } finally {
@@ -216,6 +308,19 @@ function formatResult(r: any) {
   if (typeof r === 'string') return r.length > 2000 ? r.slice(0, 2000) + '…' : r
   return JSON.stringify(r, null, 2)?.slice(0, 2000)
 }
+
+function citationsOf(value: unknown): RagCitation[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((citation): citation is RagCitation => Boolean(
+    citation
+      && typeof citation === 'object'
+      && typeof (citation as RagCitation).chunk_id === 'string'
+      && typeof (citation as RagCitation).file_id === 'string'
+      && typeof (citation as RagCitation).char_start === 'number'
+      && typeof (citation as RagCitation).char_end === 'number',
+  ))
+}
+
 function scrollBottom() {
   nextTick(() => {
     if (msgRef.value) msgRef.value.scrollTop = msgRef.value.scrollHeight
@@ -237,12 +342,21 @@ async function newConv() {
 async function openConv(c: Conversation) {
   curConv.value = c
   messages.value = []
-  const msgs: any[] = await api.listMessages(c.id)
+  const msgs = await api.listMessages(c.id)
   for (const m of msgs) {
+    const resultById = new Map((m.tool_results || []).map((result: any) => [result.id, result]))
     messages.value.push({
+      id: m.id,
       role: m.role,
       content: m.content,
-      tool_calls: (m.tool_calls || []).map((t: any) => ({ ...t, _open: false, status: 'done' })),
+      citations: citationsOf(m.citations),
+      tool_calls: (m.tool_calls || []).map((t: any) => ({
+        ...t,
+        args: t.args ?? t.arguments ?? {},
+        result: resultById.get(t.id)?.result,
+        _open: false,
+        status: 'done',
+      })),
     })
   }
   scrollBottom()
@@ -264,7 +378,7 @@ function send(text?: string) {
   input.value = ''
   messages.value.push({ role: 'user', content: msg })
   messages.value.push({ role: 'assistant', content: '', tool_calls: [], streaming: true, status: '正在思考…' })
-  const ai = messages.value[messages.value.length - 1]
+  const ai = messages.value[messages.value.length - 1]!
   streaming.value = true
   const isNewConv = !curConv.value
   scrollBottom()
@@ -283,23 +397,28 @@ function send(text?: string) {
   )
 }
 
-function handleEvent(ev: { type: string; data: any }, ai: any) {
+function handleEvent(ev: { type: string; data: any }, ai: ChatViewMessage) {
   switch (ev.type) {
     case 'status':
       ai.status = ev.data
       break
     case 'tool_call':
       ai.status = ''
-      ai.tool_calls.push({ name: ev.data.name, args: ev.data.arguments, status: 'running', _open: true })
+      ai.tool_calls = ai.tool_calls || []
+      ai.tool_calls.push({ id: ev.data.id, name: ev.data.name, args: ev.data.arguments, status: 'running', _open: true })
       break
     case 'tool_result': {
-      const tc = [...ai.tool_calls].reverse().find((t: any) => t.status === 'running')
+      const tc = (ai.tool_calls || []).find((t: any) => t.id === ev.data.id)
+        || [...(ai.tool_calls || [])].reverse().find((t: any) => t.status === 'running')
       if (tc) {
         tc.status = 'done'
         tc.result = ev.data.result
       }
       break
     }
+    case 'citations':
+      ai.citations = citationsOf(ev.data)
+      break
     case 'token':
       ai.status = ''
       ai.content += ev.data
@@ -314,7 +433,7 @@ function handleEvent(ev: { type: string; data: any }, ai: any) {
   scrollBottom()
 }
 
-async function finish(ai: any, isNewConv = false) {
+async function finish(ai: ChatViewMessage, isNewConv = false) {
   ai.streaming = false
   ai.status = ''
   streaming.value = false
@@ -443,6 +562,86 @@ onMounted(loadAgent)
   gap: 6px;
   margin-bottom: 4px;
 }
+.citation-sources {
+  margin-top: 12px;
+  padding: 11px;
+  border: 1px solid color-mix(in srgb, var(--primary) 25%, var(--border));
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+.citation-sources-head { display: flex; align-items: flex-start; margin-bottom: 8px; }
+.citation-sources-head h4 {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+.citation-sources-head h4 span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 10px;
+  background: var(--primary-soft);
+  color: var(--primary-600);
+  font-size: 11px;
+}
+.citation-sources-head p { margin: 3px 0 0; color: var(--text-3); font-size: 12px; }
+.citation-sources article + article { margin-top: 8px; }
+.citation-card {
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+.citation-card-head { display: flex; align-items: flex-start; gap: 8px; }
+.citation-id {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  min-height: 24px;
+  padding: 0 5px;
+  border-radius: 6px;
+  background: var(--primary-soft);
+  color: var(--primary-600);
+  font-size: 12px;
+  font-weight: 700;
+}
+.citation-info { flex: 1; min-width: 0; }
+.citation-info strong, .citation-info small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.citation-info strong { color: var(--text); font-size: 13px; }
+.citation-info small { margin-top: 2px; color: var(--text-3); font-size: 11px; }
+.citation-excerpt {
+  max-height: 10.4em;
+  margin: 8px 0 0;
+  overflow: auto;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.citation-range { margin: 0 0 8px; color: var(--text-3); font-size: 13px; }
+.citation-original {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-2);
+  background: var(--surface-2);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.citation-original mark { padding: 1px 2px; border-radius: 2px; color: inherit; background: var(--warning-soft); }
 .attach-list {
   display: flex;
   flex-direction: column;
@@ -519,5 +718,7 @@ onMounted(loadAgent)
   .attach-card { align-items: flex-start; flex-wrap: wrap; }
   .attach-info { min-width: calc(100% - 52px); }
   .attach-actions { width: 100%; justify-content: flex-end; }
+  .citation-card-head { flex-wrap: wrap; }
+  .citation-info { min-width: calc(100% - 42px); }
 }
 </style>

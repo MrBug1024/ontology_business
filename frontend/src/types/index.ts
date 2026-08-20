@@ -304,7 +304,7 @@ export interface OntologyWorkflow {
   scenario_id?: string
   name: string
   description?: string
-  trigger_type?: string // manual / scheduled / event
+  trigger_type?: 'manual' | 'scheduled' | 'event' | string
   trigger_config?: Record<string, any>
   steps?: WorkflowStep[] // 旧版线性步骤（兼容）
   nodes?: WorkflowNode[] // 可视化 DAG 节点
@@ -353,6 +353,7 @@ export interface DataSource {
   last_error?: string
   created_at?: string
   file_count?: number
+  can_write?: boolean
 }
 
 export interface BucketFile {
@@ -363,6 +364,11 @@ export interface BucketFile {
   mime: string
   status: string
   error?: string
+  index_status?: 'pending' | 'indexed' | 'partial' | 'error' | string
+  index_error?: string
+  index_version?: string
+  indexed_at?: string | null
+  chunk_count?: number
   created_at?: string
 }
 
@@ -382,7 +388,110 @@ export interface LLMConfig {
   temperature: number
   max_tokens: number
   is_default?: boolean
+  capabilities?: Array<'chat' | 'embedding' | 'vision' | 'tool' | string>
+  enabled?: boolean
+  routing_priority?: number
+  input_cost_per_million?: number
+  output_cost_per_million?: number
+  budget_limit?: number
+  cost_currency?: string
   created_at?: string
+  updated_at?: string
+}
+
+export interface LLMTrace {
+  id: string
+  llm_config_id?: string | null
+  provider: string
+  model: string
+  capability: string
+  operation: string
+  status: 'succeeded' | 'failed' | 'cancelled' | string
+  latency_ms: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  estimated_cost: number
+  currency: string
+  tool_count: number
+  error?: string
+  created_at?: string
+}
+
+export interface LLMUsageSummary {
+  llm_config_id: string
+  invocation_count: number
+  succeeded_count: number
+  failed_count: number
+  cancelled_count: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  estimated_cost: number
+  budget_limit: number
+  budget_remaining?: number | null
+  currency: string
+  average_latency_ms: number
+  by_capability: Record<string, { invocation_count: number; input_tokens: number; output_tokens: number; estimated_cost: number }>
+}
+
+export interface LLMEvaluation {
+  id?: string
+  llm_config_id?: string | null
+  name: string
+  capability: 'chat' | 'embedding' | 'vision' | 'tool' | string
+  passed: boolean
+  score: number
+  latency_ms: number
+  input_tokens: number
+  output_tokens: number
+  estimated_cost: number
+  currency?: string
+  notes?: string
+  metrics?: Record<string, unknown>
+  created_at?: string
+}
+
+export interface LLMEvaluationSummary {
+  llm_config_id: string
+  total: number
+  passed: number
+  failed: number
+  average_score: number
+  average_latency_ms: number
+  input_tokens: number
+  output_tokens: number
+  estimated_cost: number
+  latest_at?: string | null
+}
+
+export interface LineageNode {
+  id: string
+  kind: 'data_source' | 'mapping' | 'object' | 'document' | 'document_chunk' | 'ai_answer' | 'action' | 'action_execution' | 'external_result' | 'workflow_run' | string
+  label: string
+  meta?: Record<string, unknown>
+}
+
+export interface LineageEdge {
+  id: string
+  source: string
+  target: string
+  kind: string
+  label?: string
+  meta?: Record<string, unknown>
+}
+
+export interface LineageGraph {
+  scenario_id: string
+  nodes: LineageNode[]
+  edges: LineageEdge[]
+  truncated: boolean
+  summary: {
+    data_sources: number
+    objects: number
+    ai_answers: number
+    action_executions: number
+  }
 }
 
 export interface Skill {
@@ -449,7 +558,59 @@ export interface ChatMessage {
   content: string
   tool_calls?: any[]
   tool_results?: any[]
+  citations?: RagCitation[]
   created_at?: string
+}
+
+/** P1 运行时任务状态：由队列、重试、超时与审批共同驱动。 */
+export type WorkflowRunStatus =
+  | 'queued'
+  | 'running'
+  | 'awaiting_approval'
+  | 'retry_waiting'
+  | 'succeeded'
+  | 'failed'
+  | 'timed_out'
+  | 'rejected'
+  | 'cancelled'
+
+export interface WorkflowApproval {
+  id: string
+  workflow_run_id: string
+  scenario_id: string
+  workflow_id: string
+  workflow_name: string
+  node_id: string
+  node_name: string
+  instructions?: string
+  status: string
+  requested_at?: string
+  expires_at?: string | null
+  resolved_at?: string | null
+  comment?: string
+}
+
+export interface WorkflowRun {
+  id: string
+  scenario_id: string
+  workflow_id: string
+  workflow_name: string
+  trigger_source: string
+  status: WorkflowRunStatus | string
+  input_params: Record<string, any>
+  attempt: number
+  max_attempts: number
+  timeout_seconds: number
+  available_at?: string | null
+  scheduled_for?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+  next_retry_at?: string | null
+  error?: string
+  result?: Record<string, any>
+  pending_approval?: WorkflowApproval | boolean | null
+  created_at?: string
+  updated_at?: string
 }
 
 export interface AssistantThread {
@@ -469,6 +630,45 @@ export interface AssistantAttachment {
   status: string
   error?: string
   created_at?: string
+}
+
+/** P1 检索命中：可直接跳转至原文的稳定引用。 */
+export interface RagCitation {
+  citation_id: string
+  chunk_id: string
+  file_id: string
+  filename: string
+  data_source_id: string
+  data_source_name: string
+  char_start: number
+  char_end: number
+  chunk_ordinal: number
+  content_hash: string
+  embedding_model: string
+  index_version: string
+  score: number
+  vector_score: number
+  keyword_score: number
+  text: string
+}
+
+export interface DocumentSearchResult {
+  query: string
+  results: RagCitation[]
+  searched_data_source_ids: string[]
+  excluded_data_source_ids: string[]
+  permission_message: string
+  retrieval_mode: string
+}
+
+export interface DocumentReindexResult {
+  data_source_id: string
+  files_total: number
+  files_indexed: number
+  chunks_total: number
+  jobs_queued: number
+  jobs_existing: number
+  items: Array<{ file_id: string; status: string; indexed: boolean; chunk_count: number; error?: string }>
 }
 
 export interface AssistantProposal {

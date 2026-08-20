@@ -1,6 +1,7 @@
 """本体服务：图谱构建（schema / instance 两种模式）+ AI 生成本体。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -17,25 +18,38 @@ from ..models import (
     OntologyRelation,
     RelationInstance,
 )
-from . import datasource_service, llm_service, tenant_service
+from . import datasource_service, llm_service, permission_service, tenant_service
 
 
 # ──────────────────────────────────────────────
 # 图谱构建
 # ──────────────────────────────────────────────
-def build_graph(scenario: BusinessScenario, mode: str = "schema") -> dict[str, Any]:
+def build_graph(
+    scenario: BusinessScenario,
+    mode: str = "schema",
+    *,
+    db: Session | None = None,
+) -> dict[str, Any]:
     """构建图谱数据。
 
     mode=schema:   节点=实体类型，边=关系类型（本体层）
     mode=instance: 节点=实例，边=关系实例（数据层，按实体着色）
     """
+    # 图谱也是对象读取入口；没有可验证主体时不能退化为返回完整实例图。
+    if db is None:
+        return {"nodes": [], "edges": []}
+
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
 
     if mode == "instance":
-        inst_map = {i.id: i for i in scenario.instances}
+        inst_map = {
+            instance.id: instance
+            for instance in scenario.instances
+            if permission_service.check_object(db, instance, "read").allowed
+        }
         ent_map = {e.id: e for e in scenario.entities}
-        for i in scenario.instances:
+        for i in inst_map.values():
             ent = ent_map.get(i.entity_id)
             nodes.append(
                 {
@@ -46,7 +60,7 @@ def build_graph(scenario: BusinessScenario, mode: str = "schema") -> dict[str, A
                     "entity_name": ent.name if ent else "",
                     "color": (ent.color if ent else "#64748b"),
                     "size": 14 + min(10, len(i.attributes or {}) * 2),
-                    "attrs": i.attributes or {},
+                    "attrs": permission_service.filter_instance_attributes(db, i),
                 }
             )
         rel_map = {r.id: r for r in scenario.relations}
@@ -65,7 +79,10 @@ def build_graph(scenario: BusinessScenario, mode: str = "schema") -> dict[str, A
             )
     else:
         for e in scenario.entities:
-            prop_count = len(e.properties)
+            visible_properties = [
+                prop for prop in e.properties if permission_service.can_read_property(db, prop)
+            ]
+            prop_count = len(visible_properties)
             nodes.append(
                 {
                     "id": e.id,
@@ -76,7 +93,7 @@ def build_graph(scenario: BusinessScenario, mode: str = "schema") -> dict[str, A
                     "size": 26 + min(26, prop_count * 3),
                     "props": [
                         {"name": p.name, "type": p.data_type, "key": bool(p.is_key)}
-                        for p in e.properties
+                        for p in visible_properties
                     ][:12],
                     "description": e.description or "",
                 }
@@ -125,7 +142,9 @@ def search_instances(
     ).scalars().all()
     results: list[dict[str, Any]] = []
     for instance in rows:
-        attrs = instance.attributes or {}
+        if not permission_service.check_object(db, instance, "read").allowed:
+            continue
+        attrs = permission_service.filter_instance_attributes(db, instance)
         haystack = f"{instance.name} {json.dumps(attrs, ensure_ascii=False, default=str)}".lower()
         if query and query not in haystack:
             continue
@@ -200,10 +219,13 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
 
     llm = tenant_service.get_visible(db, LLMConfig, scenario.llm_config_id) if getattr(scenario, "llm_config_id", None) and db.info.get("tenant_id") else None
     if not llm:
-        llm_stmt = select(LLMConfig).where(LLMConfig.is_default == True)  # noqa: E712
         if db.info.get("tenant_id"):
-            llm_stmt = llm_stmt.where(tenant_service.visible_clause(LLMConfig, db))
-        llm = db.execute(llm_stmt.limit(1)).scalars().first()
+            candidates = llm_service.routable_configs(db, "chat")
+            llm = candidates[0] if candidates else None
+        else:
+            llm = db.execute(
+                select(LLMConfig).where(LLMConfig.is_default == True, LLMConfig.enabled == True)  # noqa: E712
+            ).scalars().first()
     if not llm:
         raise ValueError("请先在「LLM 配置」中配置并启用一个默认模型")
 
@@ -220,6 +242,7 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
             ],
             temperature=0.3,
             max_tokens=4096,
+            db=db,
         )
         try:
             data = _extract_json(resp.get("content", ""))
@@ -467,7 +490,12 @@ def preview_mapping(
 
 
 def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mapping: DataMapping, limit: int = 50) -> dict[str, Any]:
-    """按数据映射从数据库表导入实例，并按外键列自动推断关系实例。"""
+    """按数据映射增量同步实例，并写入可审计的来源快照。
+
+    ``source_ref`` 保留短小可读的引用；精确且不会串源的映射标识、数据源、表和
+    记录键写在 ``source_metadata``。这样同一个实体由多个数据源/映射同步时也不
+    会互相覆盖，未变记录则可安全复用既有实例。
+    """
     ds, ent = _mapping_context(db, scenario, mapping)
     col_map = mapping.column_map or {}
 
@@ -486,15 +514,23 @@ def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mappi
     key_col = col_map.get(key_prop) if key_prop else None
 
     created_instances: list[OntologyInstance] = []
-    existing = {
-        i.source_ref: i
-        for i in db.execute(
-            select(OntologyInstance).where(
-                OntologyInstance.entity_id == ent.id,
-                OntologyInstance.source == "imported",
-            )
-        ).scalars().all()
-    }
+    updated_instances = 0
+    imported_instances = db.execute(
+        select(OntologyInstance).where(
+            OntologyInstance.entity_id == ent.id,
+            OntologyInstance.source == "imported",
+        )
+    ).scalars().all()
+    # 新版使用 (mapping_id, record_key) 做稳定身份；旧版用 table:key 作为一次性
+    # 回退，升级后第一次刷新会补齐元数据，随后完全按新版键去重。
+    existing_by_identity: dict[tuple[str, str], OntologyInstance] = {}
+    legacy_by_ref: dict[str, OntologyInstance] = {}
+    for instance in imported_instances:
+        metadata = instance.source_metadata or {}
+        if isinstance(metadata, dict) and metadata.get("mapping_id") and metadata.get("record_key") is not None:
+            existing_by_identity[(str(metadata["mapping_id"]), str(metadata["record_key"]))] = instance
+        if instance.source_ref:
+            legacy_by_ref[instance.source_ref] = instance
 
     row_instances: list[OntologyInstance] = []
     for row in rows:
@@ -503,10 +539,27 @@ def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mappi
         for prop_name, col in col_map.items():
             if col in rec:
                 attrs[prop_name] = rec[col]
-        ref = f"{mapping.table_name}:{rec.get(key_col)}" if key_col and key_col in rec else f"{mapping.table_name}:{len(existing) + len(created_instances)}"
-        inst = existing.get(ref)
+        if key_col and key_col in rec and rec.get(key_col) is not None:
+            record_key = str(rec[key_col])
+        else:
+            # 没有映射主键时，用规范化整行哈希代替递增序号。该键对相同源记录稳定，
+            # 不会在每次 refresh 时生成重复对象；预览/校验会继续提示应配置主键。
+            canonical = json.dumps(rec, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+            record_key = f"row:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:20]}"
+        legacy_ref = f"{mapping.table_name}:{record_key}"
+        ref = f"{ds.id}:{mapping.table_name}:{record_key}"[:500]
+        identity = (mapping.id, record_key)
+        inst = existing_by_identity.get(identity) or legacy_by_ref.get(legacy_ref)
+        display = str(rec.get(key_col) or attrs.get(key_prop) or f"{ent.name}-{len(created_instances) + 1}")
+        metadata = {
+            "mapping_id": mapping.id,
+            "data_source_id": ds.id,
+            "table_name": mapping.table_name,
+            "key_column": key_col or "",
+            "record_key": record_key,
+            "version": "mapping-v1",
+        }
         if not inst:
-            display = str(rec.get(key_col) or attrs.get(key_prop) or f"{ent.name}-{len(created_instances) + 1}")
             inst = OntologyInstance(
                 scenario_id=scenario.id,
                 entity_id=ent.id,
@@ -514,11 +567,27 @@ def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mappi
                 attributes=attrs,
                 source="imported",
                 source_ref=ref,
+                source_metadata=metadata,
             )
             db.add(inst)
             db.flush()
-            existing[ref] = inst
+            existing_by_identity[identity] = inst
+            legacy_by_ref[legacy_ref] = inst
             created_instances.append(inst)
+        else:
+            # 源记录发生变化时更新运行时对象，避免 P0 仅新增不更新导致血缘与对象
+            # 值脱节。由于当前 API 的 limit 是安全上限，未出现在本批中的对象不删除。
+            if (
+                inst.name != display
+                or (inst.attributes or {}) != attrs
+                or inst.source_ref != ref
+                or (inst.source_metadata or {}) != metadata
+            ):
+                inst.name = display
+                inst.attributes = attrs
+                inst.source_ref = ref
+                inst.source_metadata = metadata
+                updated_instances += 1
         row_instances.append(inst)
 
     # 自动推断关系实例：本表若存在指向其他实体主键列的列，则建立关系
@@ -558,19 +627,24 @@ def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mappi
         if not fk_col:
             continue
         # 其他实体的已导入实例：key 值 → 实例
-        oexisting = {
-            i.source_ref: i
-            for i in db.execute(
-                select(OntologyInstance).where(
-                    OntologyInstance.entity_id == oent.id,
-                    OntologyInstance.source == "imported",
-                )
-            ).scalars().all()
-        }
+        oexisting = db.execute(
+            select(OntologyInstance).where(
+                OntologyInstance.entity_id == oent.id,
+                OntologyInstance.source == "imported",
+            )
+        ).scalars().all()
         okey_by_value: dict[str, OntologyInstance] = {}
-        for ref, inst in oexisting.items():
-            if f"{om.table_name}:" in ref:
-                okey_by_value[ref.split(":", 1)[1]] = inst
+        for inst in oexisting:
+            metadata = inst.source_metadata or {}
+            if isinstance(metadata, dict) and metadata.get("mapping_id") == om.id:
+                value = metadata.get("record_key")
+                if value is not None:
+                    okey_by_value[str(value)] = inst
+                    continue
+            # 兼容尚未刷新过的旧对象来源标识。
+            legacy_prefix = f"{om.table_name}:"
+            if (inst.source_ref or "").startswith(legacy_prefix):
+                okey_by_value[inst.source_ref[len(legacy_prefix):]] = inst
 
         for row, ent_inst in zip(rows, row_instances):
             rec = dict(zip(columns, row))
@@ -602,4 +676,9 @@ def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mappi
                 )
                 rels_created += 1
     db.commit()
-    return {"instances_created": len(created_instances), "relations_created": rels_created, "rows_scanned": len(rows)}
+    return {
+        "instances_created": len(created_instances),
+        "instances_updated": updated_instances,
+        "relations_created": rels_created,
+        "rows_scanned": len(rows),
+    }

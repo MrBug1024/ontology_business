@@ -1,5 +1,6 @@
 import axios from 'axios'
 import type {
+  ActionExecutionLog,
   Agent,
   AssistantAttachment,
   AssistantMessage,
@@ -7,13 +8,21 @@ import type {
   AssistantThread,
   AuthMessage,
   BucketFile,
+  ChatMessage,
   Conversation,
   DataMapping,
   DataMappingPreview,
   DataMappingRefresh,
+  DocumentReindexResult,
+  DocumentSearchResult,
   DataSource,
   GraphData,
+  LineageGraph,
   LLMConfig,
+  LLMEvaluation,
+  LLMEvaluationSummary,
+  LLMTrace,
+  LLMUsageSummary,
   MCPConfig,
   MCPTool,
   OntologyInstance,
@@ -25,6 +34,8 @@ import type {
   Skill,
   TableInfo,
   User,
+  WorkflowApproval,
+  WorkflowRun,
 } from '@/types'
 
 // 响应拦截器已把 r.data 解包，因此客户端方法在类型上直接返回 Promise<T>
@@ -130,6 +141,8 @@ export const api = {
   // 图谱
   getGraph: (sid: string, mode: 'schema' | 'instance' = 'schema') =>
     http.get<GraphData>(`/scenarios/${sid}/graph`, { params: { mode } }),
+  getScenarioLineage: (sid: string, limit = 300) =>
+    http.get<LineageGraph>(`/lineage/scenarios/${sid}`, { params: { limit } }),
 
   // AI 生成本体
   generateOntology: (sid: string, description: string) =>
@@ -184,14 +197,26 @@ export const api = {
   updateWorkflow: (id: string, d: any) => http.put(`/scenarios/workflows/${id}`, d),
   deleteWorkflow: (id: string) => http.delete(`/scenarios/workflows/${id}`),
   executeWorkflow: (id: string, params: any) => http.post(`/scenarios/workflows/${id}/execute`, { params }),
+  submitWorkflowRun: (id: string, params: Record<string, any> = {}) =>
+    http.post<WorkflowRun>(`/scenarios/workflows/${id}/runs`, { params }),
   generateWorkflow: (sid: string, description: string) =>
     http.post<{ name: string; description: string; nodes: any[]; edges: any[] }>(
       `/scenarios/${sid}/workflows/generate`,
       { description },
     ),
 
-  // 执行日志
-  listExecutionLogs: (sid: string) => http.get(`/scenarios/${sid}/execution-logs`),
+  // P1 任务运行与审批
+  listTasks: (params: { scenario_id?: string; status?: string; limit?: number } = {}) =>
+    http.get<WorkflowRun[]>('/tasks', { params }),
+  getTask: (id: string) => http.get<WorkflowRun>(`/tasks/${id}`),
+  listTaskApprovals: (params: { scenario_id?: string } = {}) =>
+    http.get<WorkflowApproval[]>('/tasks/approvals', { params }),
+  approveTask: (id: string, comment = '') => http.post<WorkflowRun>(`/tasks/${id}/approve`, { comment }),
+  rejectTask: (id: string, comment = '') => http.post<WorkflowRun>(`/tasks/${id}/reject`, { comment }),
+  retryTask: (id: string) => http.post<WorkflowRun>(`/tasks/${id}/retry`),
+
+  // 执行日志（P0 兼容）
+  listExecutionLogs: (sid: string) => http.get<ActionExecutionLog[]>(`/scenarios/${sid}/execution-logs`),
 
   // 数据源
   listDataSources: (sid?: string) =>
@@ -203,6 +228,9 @@ export const api = {
   listTables: (id: string) => http.get<TableInfo[]>(`/data-sources/${id}/tables`),
   query: (id: string, sql: string) => http.post(`/data-sources/${id}/query`, { sql }),
   listFiles: (id: string) => http.get<BucketFile[]>(`/data-sources/${id}/files`),
+  searchDocuments: (d: { query: string; data_source_ids?: string[]; scenario_id?: string; top_k?: number }) =>
+    http.post<DocumentSearchResult>('/data-sources/search', d),
+  reindexFiles: (id: string) => http.post<DocumentReindexResult>(`/data-sources/${id}/reindex`),
   uploadFiles: (id: string, files: File[]) => {
     const fd = new FormData()
     files.forEach((f) => fd.append('files', f))
@@ -220,6 +248,13 @@ export const api = {
   updateLLM: (id: string, d: Partial<LLMConfig>) => http.put<LLMConfig>(`/llm-configs/${id}`, d),
   deleteLLM: (id: string) => http.delete(`/llm-configs/${id}`),
   testLLM: (id: string) => http.post(`/llm-configs/${id}/test`),
+  resolveLLM: (capability: 'chat' | 'embedding' | 'vision' | 'tool' = 'chat') =>
+    http.get<{ capability: string; selected: LLMConfig; candidates: LLMConfig[] }>('/llm-configs/resolve', { params: { capability } }),
+  listLLMTraces: (id: string, limit = 100) => http.get<LLMTrace[]>(`/llm-configs/${id}/traces`, { params: { limit } }),
+  getLLMUsageSummary: (id: string, days = 30) => http.get<LLMUsageSummary>(`/llm-configs/${id}/usage-summary`, { params: { days } }),
+  listLLMEvaluations: (id: string, limit = 100) => http.get<LLMEvaluation[]>(`/llm-configs/${id}/evaluations`, { params: { limit } }),
+  createLLMEvaluation: (id: string, data: Partial<LLMEvaluation>) => http.post<LLMEvaluation>(`/llm-configs/${id}/evaluations`, data),
+  getLLMEvaluationSummary: (id: string) => http.get<LLMEvaluationSummary>(`/llm-configs/${id}/evaluation-summary`),
 
   // Skill
   listSkills: () => http.get<Skill[]>('/skills'),
@@ -244,7 +279,7 @@ export const api = {
   listConversations: (agentId: string) => http.get<Conversation[]>(`/agents/${agentId}/conversations`),
   createConversation: (agentId: string) => http.post<Conversation>(`/agents/${agentId}/conversations`),
   deleteConversation: (cid: string) => http.delete(`/agents/conversations/${cid}`),
-  listMessages: (cid: string) => http.get(`/agents/conversations/${cid}/messages`),
+  listMessages: (cid: string) => http.get<ChatMessage[]>(`/agents/conversations/${cid}/messages`),
 }
 
 // SSE 流式对话

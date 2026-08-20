@@ -39,10 +39,13 @@
           <div class="card-title">
             <el-icon><Setting /></el-icon> {{ selected.name }}
             <el-tag size="small" type="info">{{ typeLabel(selected.type) }}</el-tag>
+            <el-tag v-if="!selected.can_write" size="small" type="warning" effect="plain">只读公开资源</el-tag>
             <div style="margin-left:auto;display:flex;gap:6px">
-              <el-button size="small" @click="testConn" :loading="testing"><el-icon><Link /></el-icon> 测试连接</el-button>
-              <el-button size="small" @click="openEdit(selected)"><el-icon><Edit /></el-icon> 编辑</el-button>
-              <el-button size="small" type="danger" @click="remove(selected)" aria-label="删除数据源" title="删除数据源"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
+              <template v-if="selected.can_write">
+                <el-button size="small" @click="testConn" :loading="testing"><el-icon><Link /></el-icon> 测试连接</el-button>
+                <el-button size="small" @click="openEdit(selected)"><el-icon><Edit /></el-icon> 编辑</el-button>
+                <el-button size="small" type="danger" @click="remove(selected)" aria-label="删除数据源" title="删除数据源"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
+              </template>
             </div>
           </div>
 
@@ -87,7 +90,15 @@
           <!-- 文件桶 -->
           <template v-else>
             <div class="bucket-detail">
-              <el-upload drag :auto-upload="false" :file-list="uploadList" :on-change="onFilePick" :on-remove="() => {}" multiple>
+              <el-alert
+                v-if="!selected.can_write"
+                title="这是可检索的公开资料库；当前账号只有读取权限，不能上传、重新解析、重建索引或删除文件。"
+                type="info"
+                :closable="false"
+                show-icon
+                class="readonly-note"
+              />
+              <el-upload v-if="selected.can_write" drag :auto-upload="false" :file-list="uploadList" :on-change="onFilePick" :on-remove="() => {}" multiple>
                 <el-icon class="el-icon--upload" :size="40"><UploadFilled /></el-icon>
                 <div class="el-upload__text">拖拽文件到此处，或 <em>点击选择</em></div>
                 <template #tip>
@@ -95,12 +106,50 @@
                 </template>
               </el-upload>
               <div class="bucket-actions">
-                <el-button type="primary" :loading="uploading" :disabled="!uploadList.length" @click="doUpload">
+                <el-button type="primary" :loading="uploading" :disabled="!selected.can_write || !uploadList.length" @click="doUpload">
                   <el-icon><Upload /></el-icon> 上传并解析（{{ uploadList.length }}）
+                </el-button>
+                <el-button :loading="reindexing" :disabled="!selected.can_write" @click="reindexFiles">
+                  <el-icon><Refresh /></el-icon> 重建索引
                 </el-button>
                 <el-button @click="loadFiles" :loading="loadingFiles"><el-icon><Refresh /></el-icon> 刷新</el-button>
               </div>
-              <el-table :data="files" size="small" height="calc(100vh -  520px)">
+              <section class="retrieval-panel" aria-labelledby="retrieval-title">
+                <div class="retrieval-head">
+                  <div>
+                    <span class="eyebrow">RETRIEVAL PREVIEW</span>
+                    <h3 id="retrieval-title">检索预览</h3>
+                    <p>只检索当前有权访问的资料库；每条结果都保留原文定位与引用编号。</p>
+                  </div>
+                  <el-tag type="info" effect="plain">向量 + 关键词</el-tag>
+                </div>
+                <div class="retrieval-query">
+                  <el-input v-model="retrievalQuery" clearable aria-label="资料库检索词" placeholder="输入要验证的业务问题或关键词" @keyup.enter="searchDocuments" />
+                  <el-button type="primary" :loading="searching" :disabled="!retrievalQuery.trim()" @click="searchDocuments">
+                    检索
+                  </el-button>
+                </div>
+                <p v-if="searchError" class="retrieval-error" role="alert">{{ searchError }}</p>
+                <p v-if="searchNotice" class="retrieval-notice" aria-live="polite">{{ searchNotice }}</p>
+                <p v-if="searched && !searchError" class="retrieval-summary" aria-live="polite">
+                  {{ searchResults.length ? `找到 ${searchResults.length} 条可引用资料` : '没有找到匹配资料；请更换关键词、确认文件已解析并检查索引状态。' }}
+                </p>
+                <div v-if="searchResults.length" class="citation-list" aria-label="检索引用结果">
+                  <article v-for="citation in searchResults" :key="citation.chunk_id" class="citation-card">
+                    <div class="citation-meta">
+                      <span class="citation-id">{{ citation.citation_id }}</span>
+                      <div>
+                        <strong>{{ citation.filename }}</strong>
+                        <small>{{ citation.data_source_name }} · 字符 {{ citation.char_start }}–{{ citation.char_end }} · 相似度 {{ Math.round(citation.score * 100) }}%</small>
+                      </div>
+                      <el-button size="small" text type="primary" :aria-label="`查看 ${citation.filename} 原文`" @click="viewCitation(citation)">查看原文</el-button>
+                    </div>
+                    <p>{{ citation.text }}</p>
+                  </article>
+                </div>
+              </section>
+              <el-empty v-if="!loadingFiles && !files.length" description="资料库暂无文件；上传资料后即可建立检索索引。" class="bucket-empty" />
+              <el-table v-else :data="files" size="small" height="calc(100vh -  520px)">
                 <el-table-column prop="filename" label="文件名" min-width="180">
                   <template #default="{ row }"><span class="mono">{{ row.filename }}</span></template>
                 </el-table-column>
@@ -114,11 +163,18 @@
                     <el-tag v-else size="small" type="warning">{{ row.status }}</el-tag>
                   </template>
                 </el-table-column>
+                <el-table-column label="检索索引" width="142" align="center">
+                  <template #default="{ row }">
+                    <el-tag :type="indexTagType(row.index_status)" size="small">{{ indexLabel(row.index_status) }}</el-tag>
+                    <small v-if="row.chunk_count" class="index-count">{{ row.chunk_count }} 段</small>
+                    <small v-if="row.index_error" class="index-error" :title="row.index_error">{{ row.index_error }}</small>
+                  </template>
+                </el-table-column>
                 <el-table-column label="" width="170" align="center">
                   <template #default="{ row }">
                     <el-button size="small" text type="primary" @click="viewText(row)">查看文本</el-button>
-                    <el-button size="small" text @click="reparse(row)" :loading="row._loading">重解析</el-button>
-                    <el-button size="small" text type="danger" @click="removeFile(row)">删除</el-button>
+                    <el-button v-if="selected?.can_write" size="small" text @click="reparse(row)" :loading="row._loading">重解析</el-button>
+                    <el-button v-if="selected?.can_write" size="small" text type="danger" @click="removeFile(row)">删除</el-button>
                   </template>
                 </el-table-column>
               </el-table>
@@ -195,11 +251,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onBeforeUnmount, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { api } from '@/api'
-import type { DataSource, Scenario, TableInfo, BucketFile } from '@/types'
+import type { DataSource, Scenario, TableInfo, BucketFile, RagCitation } from '@/types'
 
 const dataSources = ref<DataSource[]>([])
 const scenarios = ref<Scenario[]>([])
@@ -225,9 +281,17 @@ const files = ref<(BucketFile & { _loading?: boolean })[]>([])
 const loadingFiles = ref(false)
 const uploadList = ref<UploadFile[]>([])
 const uploading = ref(false)
+const reindexing = ref(false)
 const textDlg = ref(false)
 const textFile = ref('')
 const textContent = ref('')
+const retrievalQuery = ref('')
+const searchResults = ref<RagCitation[]>([])
+const searching = ref(false)
+const searched = ref(false)
+const searchError = ref('')
+const searchNotice = ref('')
+let indexPollTimer: number | undefined
 
 const TYPE_LABELS: Record<string, string> = {
   mysql: 'MySQL', postgres: 'PostgreSQL', sqlite: 'SQLite', file_bucket: '文件桶',
@@ -237,6 +301,15 @@ function fmtSize(n: number) {
   if (n < 1024) return n + ' B'
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
   return (n / 1024 / 1024).toFixed(1) + ' MB'
+}
+function indexLabel(status?: string) {
+  return ({ indexed: '已建立', partial: '部分建立', queued: '排队中', pending: '待建立', error: '索引失败' } as Record<string, string>)[status || 'pending'] || '待建立'
+}
+function indexTagType(status?: string): 'success' | 'warning' | 'danger' | 'info' {
+  if (status === 'indexed') return 'success'
+  if (status === 'partial') return 'warning'
+  if (status === 'error') return 'danger'
+  return 'info'
 }
 
 async function load() {
@@ -259,6 +332,10 @@ function select(ds: DataSource) {
   selected.value = ds
   sqlResult.value = null
   sqlError.value = ''
+  searchResults.value = []
+  searched.value = false
+  searchError.value = ''
+  searchNotice.value = ''
   if (ds.type !== 'file_bucket') loadTables()
   else loadFiles()
 }
@@ -320,9 +397,9 @@ async function doUpload() {
   uploading.value = true
   try {
     await api.uploadFiles(selected.value!.id!, raws)
-    ElMessage.success('上传完成，正在解析…')
+    ElMessage.success('资料已提交，正在后台解析并建立检索索引')
     uploadList.value = []
-    setTimeout(loadFiles, 1500)
+    await loadFiles()
   } catch (e: any) {
     ElMessage.error(e.message)
   } finally {
@@ -331,9 +408,16 @@ async function doUpload() {
 }
 async function loadFiles() {
   if (!selected.value) return
+  const sourceId = selected.value.id
   loadingFiles.value = true
   try {
     files.value = await api.listFiles(selected.value.id!)
+    if (indexPollTimer) window.clearTimeout(indexPollTimer)
+    if (files.value.some((file) => ['pending', 'queued'].includes(file.index_status || 'pending'))) {
+      indexPollTimer = window.setTimeout(() => {
+        if (selected.value?.id === sourceId) void loadFiles()
+      }, 1000)
+    }
   } finally {
     loadingFiles.value = false
   }
@@ -352,13 +436,64 @@ async function reparse(f: BucketFile & { _loading?: boolean }) {
   f._loading = true
   try {
     await api.reparseFile(f.id)
-    ElMessage.success('已重新解析')
-    setTimeout(loadFiles, 1200)
+    ElMessage.success('已提交重新解析，正在后台更新检索索引')
+    await loadFiles()
   } catch (e: any) {
     ElMessage.error(e.message)
   } finally {
     f._loading = false
   }
+}
+async function reindexFiles() {
+  if (!selected.value) return
+  reindexing.value = true
+  try {
+    const result = await api.reindexFiles(selected.value.id!)
+    ElMessage.success(
+      result.jobs_queued
+        ? `已排队重建 ${result.jobs_queued}/${result.files_total} 个文件的检索索引`
+        : result.jobs_existing
+          ? `${result.jobs_existing} 个文件已在检索队列中`
+          : '没有需要重建的已解析文件',
+    )
+    await loadFiles()
+  } catch (e: any) {
+    ElMessage.error(e.message || '重建索引失败')
+  } finally {
+    reindexing.value = false
+  }
+}
+async function searchDocuments() {
+  if (!selected.value || !retrievalQuery.value.trim()) return
+  searching.value = true
+  searched.value = false
+  searchError.value = ''
+  searchNotice.value = ''
+  searchResults.value = []
+  try {
+    const result = await api.searchDocuments({
+      query: retrievalQuery.value.trim(),
+      data_source_ids: [selected.value.id!],
+      scenario_id: selected.value.scenario_id,
+      top_k: 5,
+    })
+    searchResults.value = result.results || []
+    searchNotice.value = result.permission_message || (
+      selected.value?.can_write ? '' : '当前为只读公开资料库，结果仅来自已建立的公开索引。'
+    )
+    if (!searchResults.value.length && files.value.some((file) => ['pending', 'queued'].includes(file.index_status || 'pending'))) {
+      searchNotice.value = '资料仍在后台解析或建立索引，请稍候自动刷新后再次检索。'
+    }
+    searched.value = true
+  } catch (e: any) {
+    searchError.value = e.message || '检索失败，请稍后重试。'
+    searched.value = true
+  } finally {
+    searching.value = false
+  }
+}
+function viewCitation(citation: RagCitation) {
+  void viewText({ id: citation.file_id, filename: citation.filename } as BucketFile)
 }
 async function removeFile(f: BucketFile) {
   try {
@@ -415,6 +550,9 @@ async function remove(ds: DataSource) {
 }
 
 onMounted(load)
+onBeforeUnmount(() => {
+  if (indexPollTimer) window.clearTimeout(indexPollTimer)
+})
 </script>
 
 <style scoped>
@@ -524,7 +662,8 @@ onMounted(load)
   min-height: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 .bucket-detail :deep(.el-upload) {
   flex: 0 0 auto;
@@ -540,6 +679,37 @@ onMounted(load)
   flex: 1 1 auto;
   min-height: 0;
 }
+.retrieval-panel {
+  flex: 0 0 auto;
+  margin: 2px 0 14px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border));
+  border-radius: 14px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--primary-soft) 72%, var(--surface)), var(--surface));
+}
+.retrieval-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.eyebrow { display: block; color: var(--primary-600); font-size: 10px; font-weight: 750; letter-spacing: .1em; }
+.retrieval-head h3 { margin: 3px 0; color: var(--text); font-size: 16px; }
+.retrieval-head p { max-width: 620px; margin: 0; color: var(--text-2); font-size: 13px; line-height: 1.55; }
+.retrieval-query { display: flex; gap: 8px; margin-top: 12px; }
+.retrieval-query :deep(.el-input) { flex: 1; min-width: 0; }
+.retrieval-query :deep(.el-button) { min-width: 76px; }
+.retrieval-summary { margin: 10px 0 0; color: var(--text-2); font-size: 13px; }
+.retrieval-notice { margin: 10px 0 0; color: var(--primary-600); font-size: 13px; line-height: 1.5; }
+.retrieval-error { margin: 10px 0 0; color: var(--danger); font-size: 13px; line-height: 1.5; }
+.citation-list { display: grid; gap: 8px; margin-top: 12px; }
+.citation-card { padding: 10px 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.citation-meta { display: flex; align-items: flex-start; gap: 9px; }
+.citation-meta > div { min-width: 0; flex: 1; }
+.citation-meta strong { display: block; color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+.citation-meta small { display: block; margin-top: 2px; color: var(--text-3); font-size: 11px; overflow-wrap: anywhere; }
+.citation-id { flex: 0 0 auto; padding: 3px 6px; border-radius: 6px; background: var(--primary-soft); color: var(--primary-600); font: 700 11px/1.2 var(--font-mono, monospace); }
+.citation-card p { margin: 8px 0 0; color: var(--text-2); font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.index-count { display: block; margin-top: 3px; color: var(--text-3); font-size: 10px; }
+.index-error { display: block; max-width: 120px; margin-top: 3px; color: var(--danger); font-size: 10px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.readonly-note { margin-bottom: 12px; }
+.bucket-empty { padding: 18px 0 24px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 @media (max-width: 767px) {
   .data-sources-page {
@@ -567,5 +737,8 @@ onMounted(load)
     margin-left: 0 !important;
     justify-content: flex-end;
   }
+  .retrieval-head, .retrieval-query { align-items: stretch; flex-direction: column; }
+  .retrieval-head > :deep(.el-tag) { align-self: flex-start; }
+  .retrieval-query :deep(.el-button) { min-height: 44px; }
 }
 </style>

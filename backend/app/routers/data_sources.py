@@ -6,12 +6,22 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..models import BucketFile, DataSource
-from ..schemas import BucketFileOut, DataSourceIn, DataSourceOut, Msg, QueryResult, TableInfo
-from ..services import datasource_service, doc_parser, tenant_service
+from ..schemas import (
+    BucketFileOut,
+    DataSourceIn,
+    DataSourceOut,
+    DocumentReindexOut,
+    DocumentSearchIn,
+    DocumentSearchOut,
+    Msg,
+    QueryResult,
+    TableInfo,
+)
+from ..services import datasource_service, rag_service, tenant_service
 from ..config import get_settings
 from ..services.auth_service import get_tenant_db
 
@@ -39,7 +49,7 @@ def _merge_config(old: dict, new: dict) -> dict:
     return merged
 
 
-def _out(ds: DataSource) -> DataSourceOut:
+def _out(ds: DataSource, db: Session) -> DataSourceOut:
     return DataSourceOut(
         id=ds.id,
         scenario_id=ds.scenario_id,
@@ -50,6 +60,7 @@ def _out(ds: DataSource) -> DataSourceOut:
         last_error=ds.last_error,
         created_at=ds.created_at,
         file_count=len(ds.files),
+        can_write=ds.tenant_id == tenant_service.current_tenant_id(db),
     )
 
 
@@ -64,7 +75,7 @@ def list_data_sources(scenario_id: str | None = None, db: Session = Depends(get_
     stmt = select(DataSource).where(tenant_service.visible_clause(DataSource, db))
     if scenario_id:
         stmt = stmt.where(DataSource.scenario_id == scenario_id)
-    return [_out(d) for d in db.execute(stmt).scalars().all()]
+    return [_out(d, db) for d in db.execute(stmt).scalars().all()]
 
 
 @router.post("", response_model=DataSourceOut)
@@ -75,7 +86,7 @@ def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_d
     db.add(ds)
     db.commit()
     db.refresh(ds)
-    return _out(ds)
+    return _out(ds, db)
 
 
 @router.put("/{ds_id}", response_model=DataSourceOut)
@@ -91,7 +102,7 @@ def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(
     ds.status = "unknown"
     db.commit()
     db.refresh(ds)
-    return _out(ds)
+    return _out(ds, db)
 
 
 @router.delete("/{ds_id}", response_model=Msg)
@@ -143,7 +154,59 @@ def query(ds_id: str, payload: dict, db: Session = Depends(get_tenant_db)):
         raise HTTPException(400, f"查询失败: {exc}")
 
 
+@router.post("/search", response_model=DocumentSearchOut)
+def search_documents(payload: DocumentSearchIn, db: Session = Depends(get_tenant_db)):
+    """在当前租户可见的文件桶中执行混合向量检索。
+
+    资料库可见性在此和 ``rag_service`` 中双重执行，确保 Agent、页面和
+    未来外部 API 进入同一个检索边界。
+    """
+    if payload.scenario_id:
+        tenant_service.require_scenario(db, payload.scenario_id)
+    stmt = select(DataSource).where(
+        DataSource.type == "file_bucket",
+        tenant_service.visible_clause(DataSource, db),
+    )
+    if payload.data_source_ids:
+        stmt = stmt.where(DataSource.id.in_(payload.data_source_ids))
+    if payload.scenario_id:
+        stmt = stmt.where(
+            or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == payload.scenario_id)
+        )
+    sources = db.execute(stmt).scalars().all()
+    source_ids = [source.id for source in sources]
+    requested_ids = set(payload.data_source_ids or [])
+    excluded_ids = sorted(requested_ids - set(source_ids))
+    try:
+        results = rag_service.search(db, source_ids, payload.query, top_k=payload.top_k)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        raise HTTPException(500, f"资料检索失败: {exc}") from exc
+    return DocumentSearchOut(
+        query=payload.query,
+        results=results,
+        searched_data_source_ids=source_ids,
+        excluded_data_source_ids=excluded_ids,
+        permission_message=(
+            "部分指定资料库不在当前访问范围，已自动排除。" if excluded_ids else ""
+        ),
+    )
+
+
 # ── 文件桶 ────────────────────────────────────
+@router.post("/{ds_id}/reindex", response_model=DocumentReindexOut)
+def reindex_files(ds_id: str, db: Session = Depends(get_tenant_db)):
+    """显式排队重建资料库索引，适用于历史文件或模型版本升级后。"""
+    ds = _data_source(db, ds_id, writable=True)
+    try:
+        result = rag_service.enqueue_data_source_reindex(db, ds, force=True)
+        db.commit()
+        return result
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        raise HTTPException(400, f"重建检索索引失败: {exc}") from exc
+
+
 @router.get("/{ds_id}/files", response_model=list[BucketFileOut])
 def list_files(ds_id: str, db: Session = Depends(get_tenant_db)):
     ds = _data_source(db, ds_id)
@@ -165,13 +228,9 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
             raise HTTPException(413, f"文件超过大小限制（{max_upload_bytes // (1024 * 1024)} MB）")
         bf = datasource_service.save_bucket_file(ds, uf.filename or "file", content)
         db.add(bf)
-        db.commit()
-        db.refresh(bf)
-        # 解析
-        r = doc_parser.parse_file(bf.stored_path, bf.filename)
-        bf.status = "parsed" if r["status"] == "success" else "error"
-        bf.parsed_text = r.get("text", "")
-        bf.error = "" if r["status"] == "success" else r.get("message", "")
+        db.flush()
+        # 文件已可靠落盘；解析与 embedding 由可恢复的后台任务处理，避免阻塞请求。
+        rag_service.enqueue_document_index(db, bf, parse_document=True)
         db.commit()
         db.refresh(bf)
         created.append(bf)
@@ -184,10 +243,10 @@ def reparse_file(file_id: str, db: Session = Depends(get_tenant_db)):
     if not bf:
         raise HTTPException(404, "文件不存在")
     tenant_service.require_owned(db, DataSource, bf.data_source_id, "文件不存在")
-    r = doc_parser.parse_file(bf.stored_path, bf.filename)
-    bf.status = "parsed" if r["status"] == "success" else "error"
-    bf.parsed_text = r.get("text", "")
-    bf.error = "" if r["status"] == "success" else r.get("message", "")
+    bf.status = "pending"
+    bf.error = ""
+    bf.parsed_text = ""
+    rag_service.enqueue_document_index(db, bf, parse_document=True, force=True)
     db.commit()
     db.refresh(bf)
     return bf

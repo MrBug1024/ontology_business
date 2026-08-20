@@ -30,6 +30,7 @@ const META: Record<string, { icon: string; color: string; label: string }> = {
   rule: { icon: 'SetUp', color: 'var(--warning)', label: '规则' },
   llm: { icon: 'Cpu', color: 'var(--primary)', label: '大模型' },
   event: { icon: 'Bell', color: 'var(--accent)', label: '事件' },
+  approval: { icon: 'UserFilled', color: 'var(--warning)', label: '人工审批' },
   http: { icon: 'Link', color: 'var(--graph-teal)', label: 'HTTP' },
   script: { icon: 'Document', color: 'var(--info)', label: '脚本' },
 }
@@ -50,6 +51,10 @@ const sub = computed(() => {
       return (d.prompt || '未填写提示词').slice(0, 26)
     case 'event':
       return d.ref_name || '未选择事件'
+    case 'approval': {
+      const timeout = Number(d.timeout_seconds || 0)
+      return timeout > 0 ? `等待人工决定 · ${Math.ceil(timeout / 60)} 分钟` : '等待人工决定'
+    }
     case 'http':
       return `${d.method || 'GET'} ${d.url || '未填写 URL'}`.slice(0, 30)
     case 'script':

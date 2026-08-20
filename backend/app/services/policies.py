@@ -18,7 +18,7 @@ _WRITE_RE = re.compile(
     r"\b(insert|update|delete|replace|merge|upsert|alter|drop|create|truncate|attach|detach|vacuum|reindex|grant|revoke)\b",
     re.IGNORECASE,
 )
-_WORKFLOW_NODE_TYPES = {"start", "end", "action", "rule", "llm", "event", "http", "script"}
+_WORKFLOW_NODE_TYPES = {"start", "end", "action", "rule", "llm", "event", "http", "script", "approval"}
 
 
 def _strip_sql_literals(sql: str) -> str:

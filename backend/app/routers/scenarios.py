@@ -4,12 +4,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from ..database import get_db
 from ..models import (
     ActionExecutionLog,
+    AuthorizationGrant,
     BusinessScenario,
     DataMapping,
     DataSource,
@@ -23,6 +24,8 @@ from ..models import (
     OntologyRule,
     OntologyWorkflow,
     RelationInstance,
+    WorkflowApprovalRequest,
+    WorkflowRun,
 )
 from ..schemas import (
     ActionExecuteRequest,
@@ -37,6 +40,8 @@ from ..schemas import (
     EntityIn,
     EntityOut,
     EventIn,
+    EventEnvelopeOut,
+    EventPublishIn,
     EventOut,
     InstanceIn,
     InstanceOut,
@@ -60,8 +65,16 @@ from ..schemas import (
     WorkflowGenerateRequest,
     WorkflowIn,
     WorkflowOut,
+    WorkflowRunCreateRequest,
+    WorkflowRunOut,
 )
-from ..services import ontology_service, tenant_service, workflow_service
+from ..services import (
+    ontology_service,
+    operations_service,
+    permission_service,
+    tenant_service,
+    workflow_service,
+)
 from ..services.auth_service import get_current_user
 
 router = APIRouter(
@@ -136,6 +149,18 @@ def _validate_workflow_refs(db: Session, scenario_id: str, steps: list, nodes: l
             raise HTTPException(400, f"工作流引用的 {kind} 不属于当前业务场景")
 
 
+def _validate_workflow_trigger(db: Session, scenario_id: str, trigger_type: str, trigger_config: dict) -> None:
+    """把 P1 调度配置校验放在服务端，避免保存无法运行的工作流。"""
+    try:
+        operations_service.validate_trigger_config(trigger_type, trigger_config)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"工作流触发配置无效: {exc}") from exc
+    if trigger_type == "event" and (event_id := (trigger_config or {}).get("event_id")):
+        event = db.get(OntologyEvent, event_id)
+        if not event or event.scenario_id != scenario_id:
+            raise HTTPException(400, "事件触发工作流引用的事件不属于当前业务场景")
+
+
 def _scenario_out(s: BusinessScenario) -> ScenarioOut:
     return ScenarioOut(
         id=s.id,
@@ -156,7 +181,24 @@ def _scenario_out(s: BusinessScenario) -> ScenarioOut:
 
 
 def _scenario_for_request(db: Session, scenario_id: str, writable: bool = False) -> BusinessScenario:
-    return tenant_service.require_scenario(db, scenario_id, writable=writable)
+    scenario = tenant_service.require_scenario(db, scenario_id, writable=writable)
+    permission_service.require_scenario_permission(
+        db,
+        scenario,
+        "write" if writable else "read",
+    )
+    return scenario
+
+
+def _require_restricted_scope_management(db: Session, access_scope: str) -> None:
+    """受限资源会改变 ACL 语义，只允许组织管理者创建或调整该标记。"""
+    if access_scope != "tenant":
+        permission_service.require_tenant_permission(db, "manage")
+
+
+def _require_sensitive_property_management(db: Session, properties: list[PropertyIn]) -> None:
+    if any(property_payload.is_sensitive for property_payload in properties):
+        permission_service.require_tenant_permission(db, "manage")
 
 
 def _safe_source_config(config: dict) -> dict:
@@ -183,6 +225,7 @@ def _action_out(a: OntologyAction) -> ActionOut:
         requires_confirmation=a.requires_confirmation,
         idempotency_required=a.idempotency_required,
         permission_scope=a.permission_scope or "scenario",
+        access_scope=a.access_scope or "tenant",
         entity_name=a.entity.name if a.entity else "",
         created_at=a.created_at,
     )
@@ -231,11 +274,43 @@ def _workflow_out(w: OntologyWorkflow) -> WorkflowOut:
         edges=w.edges or [],
         status=w.status or ("active" if w.enabled else "disabled"),
         enabled=w.enabled,
+        access_scope=w.access_scope or "tenant",
         created_at=w.created_at,
     )
 
 
-def _entity_out(e: OntologyEntity) -> EntityOut:
+def _workflow_run_out(db: Session, run: WorkflowRun) -> WorkflowRunOut:
+    pending = db.execute(
+        select(WorkflowApprovalRequest.id).where(
+            WorkflowApprovalRequest.workflow_run_id == run.id,
+            WorkflowApprovalRequest.status == "pending",
+        ).limit(1)
+    ).scalar_one_or_none()
+    return WorkflowRunOut(
+        id=run.id,
+        scenario_id=run.scenario_id,
+        workflow_id=run.workflow_id,
+        workflow_name=run.workflow.name if run.workflow else "",
+        trigger_source=run.trigger_source,
+        status=run.status,
+        input_params=run.input_params or {},
+        attempt=run.attempt,
+        max_attempts=run.max_attempts,
+        timeout_seconds=run.timeout_seconds,
+        available_at=run.available_at,
+        scheduled_for=run.scheduled_for,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
+        next_retry_at=run.next_retry_at,
+        error=run.error or "",
+        result=run.result or {},
+        pending_approval=bool(pending),
+        created_at=run.created_at,
+        updated_at=run.updated_at,
+    )
+
+
+def _entity_out(db: Session, e: OntologyEntity) -> EntityOut:
     return EntityOut(
         id=e.id,
         scenario_id=e.scenario_id,
@@ -255,8 +330,10 @@ def _entity_out(e: OntologyEntity) -> EntityOut:
                 is_enum=p.is_enum,
                 enum_values=p.enum_values or [],
                 default_value=p.default_value,
+                is_sensitive=bool(p.is_sensitive),
             )
             for p in e.properties
+            if permission_service.can_read_property(db, p)
         ],
     )
 
@@ -285,6 +362,7 @@ def list_scenarios(db: Session = Depends(get_db)):
 
 @router.post("", response_model=ScenarioOut)
 def create_scenario(payload: ScenarioIn, db: Session = Depends(get_db)):
+    permission_service.require_tenant_permission(db, "write")
     s = BusinessScenario(
         tenant_id=tenant_service.current_tenant_id(db),
         **payload.model_dump(),
@@ -295,16 +373,18 @@ def create_scenario(payload: ScenarioIn, db: Session = Depends(get_db)):
     return _scenario_out(s)
 
 
-def _instance_out(i: OntologyInstance) -> InstanceOut:
+def _instance_out(db: Session, i: OntologyInstance) -> InstanceOut:
     ent = i.entity
+    can_read = permission_service.check_object(db, i, "read").allowed
     return InstanceOut(
         id=i.id,
         scenario_id=i.scenario_id,
         entity_id=i.entity_id,
         name=i.name,
-        attributes=i.attributes or {},
+        attributes=permission_service.filter_instance_attributes(db, i) if can_read else {},
         source=i.source,
         source_ref=i.source_ref,
+        access_scope=i.access_scope or "tenant",
         entity_name=ent.name if ent else "",
         entity_color=ent.color if ent else "",
         created_at=i.created_at,
@@ -395,9 +475,10 @@ def _object_item_out(
         entity_name=entity.name if entity else "",
         entity_color=entity.color if entity else "",
         name=instance.name,
-        attributes=instance.attributes or {},
+        attributes=permission_service.filter_instance_attributes(db, instance),
         source=instance.source or "manual",
         source_ref=instance.source_ref or "",
+        access_scope=instance.access_scope or "tenant",
         provenance=_object_provenance(db, instance, mapping),
         relation_count=relation_count,
         created_at=instance.created_at,
@@ -415,7 +496,7 @@ def _object_detail_out(db: Session, instance: OntologyInstance) -> ObjectDetailO
         outgoing = relation_instance.source_instance_id == instance.id
         related = relation_instance.target_instance if outgoing else relation_instance.source_instance
         relation = relation_instance.relation
-        if not related:
+        if not related or not permission_service.check_object(db, related, "read").allowed:
             continue
         related_entity = related.entity
         relations.append(
@@ -441,7 +522,7 @@ def _object_detail_out(db: Session, instance: OntologyInstance) -> ObjectDetailO
 def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id)
     base = _scenario_out(s)
-    entities = [_entity_out(e) for e in s.entities]
+    entities = [_entity_out(db, e) for e in s.entities]
     relations = [_relation_out(r, s.entities) for r in s.relations]
     from ..schemas import DataSourceOut
 
@@ -460,13 +541,32 @@ def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
         for d in s.data_sources
         if d.tenant_id == tenant_service.current_tenant_id(db) or d.is_public
     ]
-    instances = [_instance_out(i) for i in s.instances]
-    rel_instances = [_rel_instance_out(ri) for ri in s.relation_instances]
+    visible_instances = [
+        instance
+        for instance in s.instances
+        if permission_service.check_object(db, instance, "read").allowed
+    ]
+    visible_instance_ids = {instance.id for instance in visible_instances}
+    instances = [_instance_out(db, instance) for instance in visible_instances]
+    rel_instances = [
+        _rel_instance_out(ri)
+        for ri in s.relation_instances
+        if ri.source_instance_id in visible_instance_ids
+        and ri.target_instance_id in visible_instance_ids
+    ]
     mappings = [_mapping_out(m) for m in s.data_mappings]
-    actions = [_action_out(a) for a in s.actions]
+    actions = [
+        _action_out(action)
+        for action in s.actions
+        if permission_service.check_action(db, action, "read").allowed
+    ]
     rules = [_rule_out(r) for r in s.rules]
     events = [_event_out(e) for e in s.events]
-    workflows = [_workflow_out(w) for w in s.workflows]
+    workflows = [
+        _workflow_out(workflow)
+        for workflow in s.workflows
+        if permission_service.check_workflow(db, workflow, "read").allowed
+    ]
     return ScenarioDetail(
         **base.model_dump(),
         entities=entities,
@@ -485,7 +585,7 @@ def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
 @router.get("/{scenario_id}/graph")
 def scenario_graph(scenario_id: str, mode: str = "schema", db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id)
-    return ontology_service.build_graph(s, mode=mode)
+    return ontology_service.build_graph(s, mode=mode, db=db)
 
 
 @router.get("/{scenario_id}/objects", response_model=ObjectSearchOut)
@@ -503,25 +603,31 @@ def search_objects(
     if entity_id:
         _entity_in_scenario(db, scenario_id, entity_id)
         filters.append(OntologyInstance.entity_id == entity_id)
-    query = q.strip()
-    if query:
-        pattern = f"%{query}%"
-        filters.append(
-            or_(
-                OntologyInstance.name.ilike(pattern),
-                cast(OntologyInstance.attributes, String).ilike(pattern),
-            )
-        )
-    total = int(db.scalar(select(func.count()).select_from(OntologyInstance).where(*filters)) or 0)
-    instances = db.execute(
+    query = q.strip().lower()
+    candidates = db.execute(
         select(OntologyInstance)
         .options(joinedload(OntologyInstance.entity))
         .where(*filters)
         .order_by(OntologyInstance.created_at.desc(), OntologyInstance.name.asc())
-        .offset(offset)
-        .limit(limit)
     ).scalars().all()
+    # 先做对象 ACL 与属性脱敏，再用安全的字段做查询；否则敏感值即使不返回也会被
+    # 搜索命中侧信道泄露。对象查询的分页也必须在 ACL 过滤之后计算总数。
+    visible_candidates = [
+        instance
+        for instance in candidates
+        if permission_service.check_object(db, instance, "read").allowed
+    ]
+    if query:
+        visible_candidates = [
+            instance
+            for instance in visible_candidates
+            if query in instance.name.lower()
+            or query in str(permission_service.filter_instance_attributes(db, instance)).lower()
+        ]
+    total = len(visible_candidates)
+    instances = visible_candidates[offset : offset + limit]
     instance_ids = [instance.id for instance in instances]
+    visible_instance_ids = {instance.id for instance in visible_candidates}
     mappings_by_entity: dict[str, DataMapping] = {}
     if instances:
         mappings_by_entity = {
@@ -549,9 +655,15 @@ def search_objects(
             )
         ).all()
         for relation_id, source_instance_id, target_instance_id in relation_rows:
-            if source_instance_id in relation_ids_by_instance:
+            if (
+                source_instance_id in relation_ids_by_instance
+                and target_instance_id in visible_instance_ids
+            ):
                 relation_ids_by_instance[source_instance_id].add(relation_id)
-            if target_instance_id in relation_ids_by_instance:
+            if (
+                target_instance_id in relation_ids_by_instance
+                and source_instance_id in visible_instance_ids
+            ):
                 relation_ids_by_instance[target_instance_id].add(relation_id)
     return ObjectSearchOut(
         items=[
@@ -578,6 +690,7 @@ def get_object(scenario_id: str, object_id: str, db: Session = Depends(get_db)):
     instance = db.get(OntologyInstance, object_id)
     if not instance or instance.scenario_id != scenario_id:
         raise HTTPException(404, "对象不存在")
+    permission_service.require_object_permission(db, instance, "read")
     return _object_detail_out(db, instance)
 
 
@@ -603,6 +716,7 @@ def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
 @router.post("/{scenario_id}/entities", response_model=EntityOut)
 def create_entity(scenario_id: str, payload: EntityIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
+    _require_sensitive_property_management(db, payload.properties)
     e = OntologyEntity(scenario_id=scenario_id, **{k: v for k, v in payload.model_dump().items() if k != "properties"})
     db.add(e)
     db.flush()
@@ -610,7 +724,7 @@ def create_entity(scenario_id: str, payload: EntityIn, db: Session = Depends(get
         db.add(OntologyProperty(entity_id=e.id, **p.model_dump()))
     db.commit()
     db.refresh(e)
-    return _entity_out(e)
+    return _entity_out(db, e)
 
 
 @router.put("/entities/{entity_id}", response_model=EntityOut)
@@ -619,17 +733,33 @@ def update_entity(entity_id: str, payload: EntityIn, db: Session = Depends(get_d
     if not e:
         raise HTTPException(404, "实体不存在")
     _scenario_for_request(db, e.scenario_id, writable=True)
+    _require_sensitive_property_management(db, payload.properties)
     for k in ("name", "description", "icon", "color", "is_abstract"):
         setattr(e, k, getattr(payload, k))
-    # 重建属性
-    for p in list(e.properties):
-        db.delete(p)
-    db.flush()
-    for p in payload.properties:
-        db.add(OntologyProperty(entity_id=e.id, **p.model_dump()))
+    # 按名称原位更新属性，避免属性级 ACL 因编辑实体描述而丢失稳定 resource_id。
+    remaining_by_name: dict[str, list[OntologyProperty]] = {}
+    for prop in e.properties:
+        remaining_by_name.setdefault(prop.name, []).append(prop)
+    for property_payload in payload.properties:
+        candidates = remaining_by_name.get(property_payload.name, [])
+        existing = candidates.pop(0) if candidates else None
+        if existing:
+            for key, value in property_payload.model_dump().items():
+                setattr(existing, key, value)
+        else:
+            db.add(OntologyProperty(entity_id=e.id, **property_payload.model_dump()))
+    for obsolete in [prop for items in remaining_by_name.values() for prop in items]:
+        for grant in db.execute(
+            select(AuthorizationGrant).where(
+                AuthorizationGrant.resource_type == "property",
+                AuthorizationGrant.resource_id == obsolete.id,
+            )
+        ).scalars().all():
+            db.delete(grant)
+        db.delete(obsolete)
     db.commit()
     db.refresh(e)
-    return _entity_out(e)
+    return _entity_out(db, e)
 
 
 @router.delete("/entities/{entity_id}", response_model=Msg)
@@ -721,12 +851,13 @@ def apply_ontology(scenario_id: str, payload: dict, db: Session = Depends(get_db
 @router.post("/{scenario_id}/instances", response_model=InstanceOut)
 def create_instance(scenario_id: str, payload: InstanceIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
+    _require_restricted_scope_management(db, payload.access_scope)
     _entity_in_scenario(db, scenario_id, payload.entity_id)
     i = OntologyInstance(scenario_id=scenario_id, **payload.model_dump())
     db.add(i)
     db.commit()
     db.refresh(i)
-    return _instance_out(i)
+    return _instance_out(db, i)
 
 
 @router.put("/instances/{instance_id}", response_model=InstanceOut)
@@ -735,12 +866,14 @@ def update_instance(instance_id: str, payload: InstanceIn, db: Session = Depends
     if not i:
         raise HTTPException(404, "实例不存在")
     _scenario_for_request(db, i.scenario_id, writable=True)
+    permission_service.require_object_permission(db, i, "write")
+    _require_restricted_scope_management(db, payload.access_scope)
     _entity_in_scenario(db, i.scenario_id, payload.entity_id)
-    for k in ("entity_id", "name", "attributes", "source", "source_ref"):
+    for k in ("entity_id", "name", "attributes", "source", "source_ref", "access_scope"):
         setattr(i, k, getattr(payload, k))
     db.commit()
     db.refresh(i)
-    return _instance_out(i)
+    return _instance_out(db, i)
 
 
 @router.delete("/instances/{instance_id}", response_model=Msg)
@@ -749,6 +882,7 @@ def delete_instance(instance_id: str, db: Session = Depends(get_db)):
     if not i:
         raise HTTPException(404, "实例不存在")
     _scenario_for_request(db, i.scenario_id, writable=True)
+    permission_service.require_object_permission(db, i, "write")
     for ri in list(i.source_instances) + list(i.target_instances):
         db.delete(ri)
     db.delete(i)
@@ -767,6 +901,8 @@ def create_relation_instance(scenario_id: str, payload: RelationInstanceIn, db: 
         raise HTTPException(400, "关系不属于当前业务场景")
     if not source or not target or source.scenario_id != scenario_id or target.scenario_id != scenario_id:
         raise HTTPException(400, "关系两端实例不属于当前业务场景")
+    permission_service.require_object_permission(db, source, "write")
+    permission_service.require_object_permission(db, target, "write")
     if source.entity_id != relation.source_entity_id or target.entity_id != relation.target_entity_id:
         raise HTTPException(400, "关系实例两端实体与关系定义不匹配")
     ri = RelationInstance(scenario_id=scenario_id, **payload.model_dump())
@@ -782,6 +918,12 @@ def delete_relation_instance(ri_id: str, db: Session = Depends(get_db)):
     if not ri:
         raise HTTPException(404, "关系实例不存在")
     _scenario_for_request(db, ri.scenario_id, writable=True)
+    source = ri.source_instance
+    target = ri.target_instance
+    if source:
+        permission_service.require_object_permission(db, source, "write")
+    if target:
+        permission_service.require_object_permission(db, target, "write")
     db.delete(ri)
     db.commit()
     return Msg(message="已删除")
@@ -912,6 +1054,7 @@ def import_mapping(mapping_id: str, payload: dict | None = None, db: Session = D
 @router.post("/{scenario_id}/actions", response_model=ActionOut)
 def create_action(scenario_id: str, payload: ActionIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
+    _require_restricted_scope_management(db, payload.access_scope)
     _entity_in_scenario(db, scenario_id, payload.entity_id)
     _validate_action_executor(db, scenario_id, payload)
     a = OntologyAction(scenario_id=scenario_id, **payload.model_dump())
@@ -927,6 +1070,7 @@ def update_action(action_id: str, payload: ActionIn, db: Session = Depends(get_d
     if not a:
         raise HTTPException(404, "操作不存在")
     _scenario_for_request(db, a.scenario_id, writable=True)
+    _require_restricted_scope_management(db, payload.access_scope)
     _entity_in_scenario(db, a.scenario_id, payload.entity_id)
     _validate_action_executor(db, a.scenario_id, payload)
     for k, v in payload.model_dump().items():
@@ -954,6 +1098,11 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
         raise HTTPException(404, "操作不存在")
     # 执行属于写入边界：公共场景可以查看/预演，但只有场景所属租户可确认执行。
     _scenario_for_request(db, a.scenario_id, writable=not payload.dry_run)
+    permission_service.require_action_permission(
+        db,
+        a,
+        "read" if payload.dry_run else "execute",
+    )
     try:
         return workflow_service.execute_action(
             db,
@@ -1054,11 +1203,47 @@ def delete_event(event_id: str, db: Session = Depends(get_db)):
     return Msg(message="已删除")
 
 
+@router.post("/events/{event_id}/publish", response_model=EventEnvelopeOut)
+def publish_event(event_id: str, payload: EventPublishIn, db: Session = Depends(get_db)):
+    """发布持久化业务事件，并把订阅该事件的启用工作流异步入队。"""
+    event = db.get(OntologyEvent, event_id)
+    if not event:
+        raise HTTPException(404, "事件不存在")
+    _scenario_for_request(db, event.scenario_id, writable=True)
+    try:
+        envelope, queued_runs = operations_service.publish_event(
+            db,
+            event,
+            payload.payload,
+            source="manual",
+            dedupe_key=payload.dedupe_key,
+            created_by_user_id=str(db.info.get("user_id") or "") or None,
+        )
+        db.commit()
+        db.refresh(envelope)
+        return EventEnvelopeOut(
+            id=envelope.id,
+            scenario_id=envelope.scenario_id,
+            event_id=envelope.event_id,
+            name=envelope.name,
+            payload=envelope.payload or {},
+            source=envelope.source,
+            source_run_id=envelope.source_run_id,
+            created_at=envelope.created_at,
+            queued_workflow_run_ids=[run.id for run in queued_runs],
+        )
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        raise HTTPException(400, f"发布事件失败: {exc}") from exc
+
+
 # ── 工作流（Workflows）────────────────────────
 @router.post("/{scenario_id}/workflows", response_model=WorkflowOut)
 def create_workflow(scenario_id: str, payload: WorkflowIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
+    _require_restricted_scope_management(db, payload.access_scope)
     _validate_workflow_refs(db, scenario_id, payload.steps, payload.nodes)
+    _validate_workflow_trigger(db, scenario_id, payload.trigger_type, payload.trigger_config)
     if payload.nodes:
         try:
             workflow_service.validate_workflow_definition(payload.nodes, payload.edges)
@@ -1077,7 +1262,9 @@ def update_workflow(workflow_id: str, payload: WorkflowIn, db: Session = Depends
     if not w:
         raise HTTPException(404, "工作流不存在")
     _scenario_for_request(db, w.scenario_id, writable=True)
+    _require_restricted_scope_management(db, payload.access_scope)
     _validate_workflow_refs(db, w.scenario_id, payload.steps, payload.nodes)
+    _validate_workflow_trigger(db, w.scenario_id, payload.trigger_type, payload.trigger_config)
     if payload.nodes:
         try:
             workflow_service.validate_workflow_definition(payload.nodes, payload.edges)
@@ -1101,12 +1288,41 @@ def delete_workflow(workflow_id: str, db: Session = Depends(get_db)):
     return Msg(message="已删除")
 
 
+@router.post("/workflows/{workflow_id}/runs", response_model=WorkflowRunOut, status_code=202)
+def create_workflow_run(
+    workflow_id: str,
+    payload: WorkflowRunCreateRequest,
+    db: Session = Depends(get_db),
+):
+    """P1 异步入口：只提交任务，不在 HTTP 请求中等待工作流完成。"""
+    workflow = db.get(OntologyWorkflow, workflow_id)
+    if not workflow:
+        raise HTTPException(404, "工作流不存在")
+    _scenario_for_request(db, workflow.scenario_id, writable=True)
+    permission_service.require_workflow_permission(db, workflow, "execute")
+    try:
+        run, _ = operations_service.enqueue_workflow_run(
+            db,
+            workflow,
+            payload.params,
+            trigger_source="manual",
+            created_by_user_id=str(db.info.get("user_id") or "") or None,
+        )
+        db.commit()
+        db.refresh(run)
+        return _workflow_run_out(db, run)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        raise HTTPException(409, f"提交任务失败: {exc}") from exc
+
+
 @router.post("/workflows/{workflow_id}/execute")
 def execute_workflow(workflow_id: str, payload: WorkflowExecuteRequest, db: Session = Depends(get_db)):
     w = db.get(OntologyWorkflow, workflow_id)
     if not w:
         raise HTTPException(404, "工作流不存在")
     _scenario_for_request(db, w.scenario_id, writable=True)
+    permission_service.require_workflow_permission(db, w, "execute")
     if (w.status or ("active" if w.enabled else "disabled")) != "active" or not w.enabled:
         raise HTTPException(409, "工作流当前未启用，请先将状态设为 active")
     try:

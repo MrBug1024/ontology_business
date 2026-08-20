@@ -7,6 +7,8 @@ const router = createRouter({
     { path: '/', redirect: '/dashboard' },
     { path: '/login', name: 'login', component: () => import('@/views/Login.vue'), meta: { title: '登录', public: true } },
     { path: '/dashboard', name: 'dashboard', component: () => import('@/views/Dashboard.vue'), meta: { title: '仪表盘' } },
+    { path: '/tasks', name: 'tasks', component: () => import('@/views/Tasks.vue'), meta: { title: '任务中心' } },
+    { path: '/lineage', name: 'lineage', component: () => import('@/views/Lineage.vue'), meta: { title: '端到端血缘' } },
     { path: '/scenarios', name: 'scenarios', component: () => import('@/views/Scenarios.vue'), meta: { title: '业务场景' } },
     { path: '/scenarios/:id', name: 'scenario-detail', component: () => import('@/views/ScenarioDetail.vue'), meta: { title: '场景详情' } },
     { path: '/data-sources', name: 'data-sources', component: () => import('@/views/DataSources.vue'), meta: { title: '数据源' } },

@@ -4,7 +4,18 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -29,6 +40,9 @@ class Tenant(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     users: Mapped[list["User"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    organization: Mapped["Organization | None"] = relationship(
+        back_populates="tenant", uselist=False, cascade="all, delete-orphan"
+    )
 
 
 class User(Base):
@@ -46,6 +60,140 @@ class User(Base):
 
     tenant: Mapped[Tenant] = relationship(back_populates="users")
     sessions: Mapped[list["AuthSession"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    organization_memberships: Mapped[list["OrganizationMember"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    authorization_grants: Mapped[list["AuthorizationGrant"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="AuthorizationGrant.user_id",
+    )
+
+
+class Organization(Base):
+    """租户内的权限主体容器。
+
+    现有 ``Tenant`` 仍是数据隔离边界；一对一的 Organization 只承载成员、角色和
+    授权规则，避免把 RBAC 状态散落在各业务对象上。
+    """
+
+    __tablename__ = "organizations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    tenant: Mapped[Tenant] = relationship(back_populates="organization")
+    roles: Mapped[list["OrganizationRole"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
+    members: Mapped[list["OrganizationMember"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
+    grants: Mapped[list["AuthorizationGrant"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
+
+
+class OrganizationRole(Base):
+    """组织内可持久化角色；系统角色以稳定 key 驱动默认授权矩阵。"""
+
+    __tablename__ = "organization_roles"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "key", name="uq_organization_role_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), index=True
+    )
+    key: Mapped[str] = mapped_column(String(40), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    is_system: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    organization: Mapped[Organization] = relationship(back_populates="roles")
+    members: Mapped[list["OrganizationMember"]] = relationship(back_populates="role")
+    grants: Mapped[list["AuthorizationGrant"]] = relationship(back_populates="role")
+
+
+class OrganizationMember(Base):
+    """用户在当前租户组织中的唯一成员身份。"""
+
+    __tablename__ = "organization_members"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "user_id", name="uq_organization_member_user"),
+        Index("ix_organization_members_org_role", "organization_id", "role_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    role_id: Mapped[str] = mapped_column(
+        ForeignKey("organization_roles.id", ondelete="RESTRICT"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    organization: Mapped[Organization] = relationship(back_populates="members")
+    user: Mapped[User] = relationship(back_populates="organization_memberships")
+    role: Mapped[OrganizationRole] = relationship(back_populates="members")
+
+
+class AuthorizationGrant(Base):
+    """对象、属性、Action 与工作流的精确 allow/deny 授权。
+
+    每条规则只指向一个角色或一个用户（由服务层校验）；``deny`` 比默认角色权限和
+    ``allow`` 优先，保证敏感字段或受限对象可以可靠收窄访问面。
+    """
+
+    __tablename__ = "authorization_grants"
+    __table_args__ = (
+        Index(
+            "ix_authorization_grants_lookup",
+            "organization_id",
+            "resource_type",
+            "resource_id",
+            "verb",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), index=True
+    )
+    role_id: Mapped[str | None] = mapped_column(
+        ForeignKey("organization_roles.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    resource_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    verb: Mapped[str] = mapped_column(String(30), nullable=False)
+    effect: Mapped[str] = mapped_column(String(10), default="allow")
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    organization: Mapped[Organization] = relationship(back_populates="grants")
+    role: Mapped[OrganizationRole | None] = relationship(back_populates="grants")
+    user: Mapped[User | None] = relationship(
+        back_populates="authorization_grants", foreign_keys=[user_id]
+    )
 
 
 class AuthSession(Base):
@@ -125,6 +273,12 @@ class BusinessScenario(Base):
     execution_logs: Mapped[list["ActionExecutionLog"]] = relationship(
         back_populates="scenario", cascade="all, delete-orphan"
     )
+    workflow_runs: Mapped[list["WorkflowRun"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
+    event_envelopes: Mapped[list["EventEnvelope"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
     tenant: Mapped[Tenant | None] = relationship()
 
 
@@ -179,6 +333,8 @@ class OntologyProperty(Base):
     is_enum: Mapped[bool] = mapped_column(Boolean, default=False)
     enum_values: Mapped[list] = mapped_column(JSON, default=list)
     default_value: Mapped[str] = mapped_column(String(500), default="")
+    # 敏感属性默认仅 owner/admin 可见；其他成员需通过 AuthorizationGrant 显式授权。
+    is_sensitive: Mapped[bool] = mapped_column(Boolean, default=False)
 
     entity: Mapped[OntologyEntity] = relationship(back_populates="properties")
 
@@ -226,6 +382,10 @@ class OntologyInstance(Base):
     attributes: Mapped[dict] = mapped_column(JSON, default=dict)  # 属性值
     source: Mapped[str] = mapped_column(String(20), default="manual")  # manual / imported
     source_ref: Mapped[str] = mapped_column(String(500), default="")  # 来源引用（表.行 等）
+    # 内部血缘快照（mapping_id/data_source_id/table/key 等）；对外 DTO 保持兼容。
+    source_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    # tenant: 遵循场景角色矩阵；restricted: 非 owner/admin 必须获得对象级显式授权。
+    access_scope: Mapped[str] = mapped_column(String(20), default="tenant")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship(overlaps="instances")
@@ -330,7 +490,7 @@ class DataSource(Base):
 
 
 class BucketFile(Base):
-    """文件桶中的业务文件及其解析结果。"""
+    """文件桶中的业务文件、解析结果和可追溯检索索引状态。"""
 
     __tablename__ = "bucket_files"
 
@@ -345,15 +505,114 @@ class BucketFile(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / parsed / error
     error: Mapped[str] = mapped_column(Text, default="")
     parsed_text: Mapped[str] = mapped_column(Text, default="")
+    # P1 RAG 索引：解析文本变化后按内容哈希增量重建分块向量。
+    index_status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / queued / indexed / partial / error
+    index_error: Mapped[str] = mapped_column(Text, default="")
+    index_version: Mapped[str] = mapped_column(String(80), default="")
+    indexed_content_hash: Mapped[str] = mapped_column(String(64), default="")
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     data_source: Mapped[DataSource] = relationship(back_populates="files")
+    document_chunks: Mapped[list["DocumentChunk"]] = relationship(
+        back_populates="bucket_file", cascade="all, delete-orphan"
+    )
+
+
+class DocumentChunk(Base):
+    """已解析文档的可引用分块与向量表示。
+
+    原始文本仍保留在 ``BucketFile``；这里保存稳定的字符偏移，令 AI 回答、
+    搜索预览与审计记录能引用到同一份资料的精确片段。
+    """
+
+    __tablename__ = "document_chunks"
+    __table_args__ = (
+        Index("ix_document_chunks_source_file", "data_source_id", "bucket_file_id"),
+        Index("uq_document_chunks_file_ordinal", "bucket_file_id", "ordinal", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    bucket_file_id: Mapped[str] = mapped_column(
+        ForeignKey("bucket_files.id", ondelete="CASCADE"), index=True
+    )
+    data_source_id: Mapped[str] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    char_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    char_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, default="")
+    content_hash: Mapped[str] = mapped_column(String(64), default="")
+    # JSON 保证 SQLite / Postgres 均可用；服务层统一按余弦相似度检索。
+    embedding: Mapped[list] = mapped_column(JSON, default=list)
+    embedding_model: Mapped[str] = mapped_column(String(120), default="local-semantic-hash-192-v1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    bucket_file: Mapped[BucketFile] = relationship(back_populates="document_chunks")
+    data_source: Mapped[DataSource] = relationship()
+
+
+class DocumentIndexJob(Base):
+    """持久化的文档解析/索引任务。
+
+    文件上传 API 只负责可靠落盘和入队；实际解析、分块与向量生成由 P1 worker
+    执行，使重启、重试和超时对文档处理与工作流运行同样生效。
+    """
+
+    __tablename__ = "document_index_jobs"
+    __table_args__ = (
+        Index("ix_document_index_jobs_dispatch", "status", "available_at"),
+        Index("ix_document_index_jobs_file_created", "bucket_file_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    data_source_id: Mapped[str] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    bucket_file_id: Mapped[str] = mapped_column(
+        ForeignKey("bucket_files.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    # True: 从存储文件重新解析后索引；False: 使用当前 parsed_text 重建索引。
+    parse_document: Mapped[bool] = mapped_column(Boolean, default=True)
+    force: Mapped[bool] = mapped_column(Boolean, default=False)
+    # queued / running / retry_waiting / succeeded / failed / timed_out
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=300)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    tenant: Mapped[Tenant] = relationship()
+    data_source: Mapped[DataSource] = relationship()
+    bucket_file: Mapped[BucketFile] = relationship()
 
 
 # ──────────────────────────────────────────────
 # LLM 配置
 # ──────────────────────────────────────────────
 class LLMConfig(Base):
+    """可路由的模型部署配置。
+
+    ``api_key`` 仅保存在服务端；运行指标通过 ``LLMInvocationTrace`` 保存，
+    但绝不保存完整提示词、回复或凭据。
+    """
+
     __tablename__ = "llm_configs"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -369,7 +628,98 @@ class LLMConfig(Base):
     temperature: Mapped[float] = mapped_column(Float, default=0.2)
     max_tokens: Mapped[int] = mapped_column(Integer, default=4096)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    # chat / embedding / vision / tool。旧配置默认保留 chat + tool，避免升级后
+    # 已绑定 Agent 的工具调用被意外禁用。
+    capabilities: Mapped[list] = mapped_column(JSON, default=lambda: ["chat", "tool"])
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    # 数字越小路由优先级越高；同优先级时优先默认模型。
+    routing_priority: Mapped[int] = mapped_column(Integer, default=100, index=True)
+    # 以每百万 token 计价，0 表示尚未配置计费。预算为 0 时表示不设上限。
+    input_cost_per_million: Mapped[float] = mapped_column(Float, default=0.0)
+    output_cost_per_million: Mapped[float] = mapped_column(Float, default=0.0)
+    budget_limit: Mapped[float] = mapped_column(Float, default=0.0)
+    cost_currency: Mapped[str] = mapped_column(String(12), default="USD")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+    tenant: Mapped[Tenant | None] = relationship()
+    traces: Mapped[list["LLMInvocationTrace"]] = relationship(back_populates="llm_config")
+    evaluations: Mapped[list["LLMEvaluationRecord"]] = relationship(back_populates="llm_config")
+
+
+class LLMInvocationTrace(Base):
+    """一次真实模型调用的最小可审计元数据。
+
+    不持久化 prompt、completion、工具参数或 API key，防止把业务敏感内容复制到
+    运营日志中。provider/model 为调用时快照，避免配置后来修改影响历史报表。
+    """
+
+    __tablename__ = "llm_invocation_traces"
+    __table_args__ = (
+        Index("ix_llm_traces_config_created", "llm_config_id", "created_at"),
+        Index("ix_llm_traces_tenant_created", "tenant_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    # 调用者租户；公共模型由其他租户调用时也可按调用租户归集成本。
+    tenant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    llm_config_id: Mapped[str | None] = mapped_column(
+        ForeignKey("llm_configs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    provider: Mapped[str] = mapped_column(String(50), default="")
+    model: Mapped[str] = mapped_column(String(200), default="")
+    capability: Mapped[str] = mapped_column(String(20), default="chat")
+    operation: Mapped[str] = mapped_column(String(30), default="chat")  # chat / chat_stream / test
+    status: Mapped[str] = mapped_column(String(20), default="succeeded")  # succeeded / failed / cancelled
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    currency: Mapped[str] = mapped_column(String(12), default="USD")
+    tool_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 错误已在服务层去敏与截断，不能写入完整 provider 响应。
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    llm_config: Mapped[LLMConfig | None] = relationship(back_populates="traces")
+    tenant: Mapped[Tenant | None] = relationship()
+
+
+class LLMEvaluationRecord(Base):
+    """人工或外部评测导入的基础指标记录，不保存评测原始提示词。"""
+
+    __tablename__ = "llm_evaluation_records"
+    __table_args__ = (
+        Index("ix_llm_evaluations_config_created", "llm_config_id", "created_at"),
+        Index("ix_llm_evaluations_tenant_created", "tenant_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    llm_config_id: Mapped[str | None] = mapped_column(
+        ForeignKey("llm_configs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(200), default="基础评测")
+    capability: Mapped[str] = mapped_column(String(20), default="chat")
+    passed: Mapped[bool] = mapped_column(Boolean, default=True)
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    currency: Mapped[str] = mapped_column(String(12), default="USD")
+    # 仅保存非敏感评价摘要/标签；API 会限制长度。
+    notes: Mapped[str] = mapped_column(Text, default="")
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    llm_config: Mapped[LLMConfig | None] = relationship(back_populates="evaluations")
     tenant: Mapped[Tenant | None] = relationship()
 
 
@@ -476,6 +826,8 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, default="")
     tool_calls: Mapped[list] = mapped_column(JSON, default=list)
     tool_results: Mapped[list] = mapped_column(JSON, default=list)
+    # Agent 检索到的稳定资料引用。保留 file/chunk/字符偏移，令历史消息仍可追溯原文。
+    citations: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
@@ -602,6 +954,8 @@ class OntologyAction(Base):
     requires_confirmation: Mapped[bool] = mapped_column(Boolean, default=True)
     idempotency_required: Mapped[bool] = mapped_column(Boolean, default=True)
     permission_scope: Mapped[str] = mapped_column(String(30), default="scenario")
+    # Action 级 ACL 的开关。受限操作只能由 owner/admin 或显式 grant 执行。
+    access_scope: Mapped[str] = mapped_column(String(20), default="tenant")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship()
@@ -698,9 +1052,134 @@ class OntologyWorkflow(Base):
     # 生命周期：draft 草稿 / active 启用 / disabled 停用。
     status: Mapped[str] = mapped_column(String(20), default="draft")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 工作流可独立于场景角色矩阵收窄执行权。
+    access_scope: Mapped[str] = mapped_column(String(20), default="tenant")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship()
+    runs: Mapped[list["WorkflowRun"]] = relationship(
+        back_populates="workflow", cascade="all, delete-orphan"
+    )
+
+
+class WorkflowRun(Base):
+    """持久化的工作流运行实例，也是 P1 异步任务队列的业务记录。
+
+    队列状态和业务运行状态合并在同一记录中，重启后仍可恢复等待审批、
+    重试或尚未调度的任务。执行器的细粒度审计仍由 ActionExecutionLog 保存。
+    """
+
+    __tablename__ = "workflow_runs"
+    __table_args__ = (
+        Index("ix_workflow_runs_dispatch", "status", "available_at"),
+        Index("ix_workflow_runs_scenario_created", "scenario_id", "created_at"),
+        Index("uq_workflow_runs_dedupe", "workflow_id", "dedupe_key", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    workflow_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_workflows.id", ondelete="CASCADE"), index=True
+    )
+    # manual / scheduled / event / approval / retry
+    trigger_source: Mapped[str] = mapped_column(String(30), default="manual")
+    event_envelope_id: Mapped[str | None] = mapped_column(
+        ForeignKey("event_envelopes.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # 事件和调度投递以此键去重；手动运行不填写，允许重复提交。
+    dedupe_key: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    input_params: Mapped[dict] = mapped_column(JSON, default=dict)
+    # queued / running / awaiting_approval / retry_waiting / succeeded / failed /
+    # timed_out / rejected / cancelled
+    status: Mapped[str] = mapped_column(String(30), default="queued")
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=300)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 已批准的审批节点 ID。恢复时前序 Action 通过运行 ID 保持幂等。
+    approved_node_ids: Mapped[list] = mapped_column(JSON, default=list)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="workflow_runs")
+    workflow: Mapped[OntologyWorkflow] = relationship(back_populates="runs")
+    approvals: Mapped[list["WorkflowApprovalRequest"]] = relationship(
+        back_populates="workflow_run", cascade="all, delete-orphan"
+    )
+
+
+class WorkflowApprovalRequest(Base):
+    """工作流审批节点生成的可恢复人工决策请求。"""
+
+    __tablename__ = "workflow_approval_requests"
+    __table_args__ = (
+        Index("ix_workflow_approvals_pending", "status", "requested_at"),
+        Index("uq_workflow_approvals_node", "workflow_run_id", "node_id", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    workflow_run_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    node_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    node_name: Mapped[str] = mapped_column(String(200), default="")
+    instructions: Mapped[str] = mapped_column(Text, default="")
+    # pending / approved / rejected / expired
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    comment: Mapped[str] = mapped_column(Text, default="")
+
+    workflow_run: Mapped[WorkflowRun] = relationship(back_populates="approvals")
+
+
+class EventEnvelope(Base):
+    """事件总线的持久化信封；订阅工作流据此生成去重的运行任务。"""
+
+    __tablename__ = "event_envelopes"
+    __table_args__ = (
+        Index("ix_event_envelopes_scenario_created", "scenario_id", "created_at"),
+        Index("uq_event_envelopes_dedupe", "event_id", "dedupe_key", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_events.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), default="")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    source: Mapped[str] = mapped_column(String(60), default="manual")
+    source_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    dedupe_key: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="event_envelopes")
+    event: Mapped[OntologyEvent] = relationship()
 
 
 class ActionExecutionLog(Base):

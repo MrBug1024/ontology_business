@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ──────────────────────────────────────────────
@@ -56,6 +56,82 @@ class UserOut(BaseModel):
     email_verified: bool = True
 
 
+class OrganizationOut(BaseModel):
+    id: str
+    tenant_id: str
+    name: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class OrganizationRoleOut(BaseModel):
+    id: str
+    key: str
+    name: str
+    description: str = ""
+    is_system: bool = True
+
+    model_config = {"from_attributes": True}
+
+
+class OrganizationMemberOut(BaseModel):
+    id: str
+    user_id: str
+    email: str = ""
+    display_name: str = ""
+    role_id: str
+    role_key: str
+    role_name: str = ""
+    status: str = "active"
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class OrganizationMemberIn(BaseModel):
+    user_id: str = Field(min_length=1, max_length=32)
+    role_key: Literal["owner", "admin", "operator", "viewer"]
+
+
+class PermissionGrantIn(BaseModel):
+    """角色或单个成员对一个受控资源的精确 allow/deny 规则。"""
+
+    role_key: Literal["owner", "admin", "operator", "viewer"] | None = None
+    user_id: str | None = Field(default=None, min_length=1, max_length=32)
+    resource_type: Literal["scenario", "object", "property", "action", "workflow"]
+    resource_id: str = Field(min_length=1, max_length=64)
+    verb: Literal["read", "write", "execute", "approve", "manage"]
+    effect: Literal["allow", "deny"] = "allow"
+
+
+class PermissionGrantOut(BaseModel):
+    id: str
+    organization_id: str
+    role_id: str | None = None
+    role_key: str = ""
+    user_id: str | None = None
+    resource_type: str
+    resource_id: str
+    verb: str
+    effect: str
+    created_by_user_id: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class PermissionResourceOut(BaseModel):
+    resource_type: str
+    id: str
+    name: str
+    scenario_id: str
+    entity_id: str | None = None
+    is_sensitive: bool = False
+    access_scope: str = "tenant"
+
+
 class AuthMessage(Msg):
     email: str = ""
 
@@ -72,6 +148,7 @@ class PropertyIn(BaseModel):
     is_enum: bool = False
     enum_values: list[str] = []
     default_value: str = ""
+    is_sensitive: bool = False
 
 
 class EntityIn(BaseModel):
@@ -136,6 +213,7 @@ class InstanceIn(BaseModel):
     attributes: dict = Field(default_factory=dict)
     source: str = "manual"
     source_ref: str = ""
+    access_scope: Literal["tenant", "restricted"] = "tenant"
 
 
 class InstanceOut(InstanceIn):
@@ -198,6 +276,7 @@ class ObjectSearchItemOut(BaseModel):
     attributes: dict = Field(default_factory=dict)
     source: str = "manual"
     source_ref: str = ""
+    access_scope: Literal["tenant", "restricted"] = "tenant"
     provenance: ObjectProvenanceOut
     relation_count: int = 0
     created_at: datetime
@@ -313,6 +392,8 @@ class DataSourceOut(DataSourceIn):
     last_error: str = ""
     created_at: datetime
     file_count: int = 0
+    # 前端据此区分“可检索的公开资源”和“可修改的自有资源”。
+    can_write: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -325,6 +406,11 @@ class BucketFileOut(BaseModel):
     mime: str
     status: str
     error: str = ""
+    index_status: str = "pending"
+    index_error: str = ""
+    index_version: str = ""
+    indexed_at: datetime | None = None
+    chunk_count: int = 0
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -346,22 +432,139 @@ class QueryResult(BaseModel):
 # ──────────────────────────────────────────────
 # LLM
 # ──────────────────────────────────────────────
+LLM_CAPABILITIES = {"chat", "embedding", "vision", "tool"}
+
+
 class LLMConfigIn(BaseModel):
-    name: str
-    provider: str = "openai"
-    base_url: str = ""
-    api_key: str = ""
-    model: str = ""
-    temperature: float = 0.2
-    max_tokens: int = 4096
+    name: str = Field(min_length=1, max_length=200)
+    provider: str = Field(default="openai", max_length=50)
+    base_url: str = Field(default="", max_length=500)
+    # 只允许通过写入请求传递；所有响应模型都会强制回写为空字符串。
+    api_key: str = Field(default="", max_length=500, repr=False)
+    model: str = Field(default="", max_length=200)
+    temperature: float = Field(default=0.2, ge=0, le=2)
+    max_tokens: int = Field(default=4096, ge=1, le=131_072)
     is_default: bool = False
+    capabilities: list[str] = Field(default_factory=lambda: ["chat", "tool"], max_length=4)
+    enabled: bool = True
+    # 数字越小越优先；同优先级时默认模型优先。
+    routing_priority: int = Field(default=100, ge=0, le=10_000)
+    input_cost_per_million: float = Field(default=0.0, ge=0)
+    output_cost_per_million: float = Field(default=0.0, ge=0)
+    budget_limit: float = Field(default=0.0, ge=0)
+    cost_currency: str = Field(default="USD", min_length=1, max_length=12)
+
+    @field_validator("capabilities")
+    @classmethod
+    def normalize_capabilities(cls, values: list[str]) -> list[str]:
+        normalized = []
+        for value in values or []:
+            capability = str(value).strip().lower()
+            if capability not in LLM_CAPABILITIES:
+                raise ValueError(f"不支持的模型能力: {value}")
+            if capability not in normalized:
+                normalized.append(capability)
+        if not normalized:
+            raise ValueError("至少需要配置一种模型能力")
+        if "tool" in normalized and "chat" not in normalized:
+            raise ValueError("tool 能力必须与 chat 能力一起配置")
+        return normalized
+
+    @field_validator("cost_currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        return value.strip().upper()
 
 
 class LLMConfigOut(LLMConfigIn):
     id: str
+    # 禁止 ORM 直接序列化时意外暴露服务端密钥。
+    api_key: str = Field(default="", repr=False)
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class LLMRouteOut(BaseModel):
+    capability: Literal["chat", "embedding", "vision", "tool"]
+    selected: LLMConfigOut
+    candidates: list[LLMConfigOut] = Field(default_factory=list)
+
+
+class LLMTraceOut(BaseModel):
+    id: str
+    llm_config_id: str | None = None
+    provider: str
+    model: str
+    capability: str
+    operation: str
+    status: str
+    latency_ms: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    estimated_cost: float
+    currency: str
+    tool_count: int
+    error: str = ""
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class LLMUsageSummaryOut(BaseModel):
+    llm_config_id: str
+    since: datetime
+    until: datetime
+    invocation_count: int = 0
+    succeeded_count: int = 0
+    failed_count: int = 0
+    cancelled_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost: float = 0.0
+    budget_limit: float = 0.0
+    budget_remaining: float | None = None
+    currency: str = "USD"
+    average_latency_ms: float = 0.0
+    by_capability: dict[str, dict[str, float | int]] = Field(default_factory=dict)
+
+
+class LLMEvaluationIn(BaseModel):
+    name: str = Field(default="基础评测", min_length=1, max_length=200)
+    capability: Literal["chat", "embedding", "vision", "tool"] = "chat"
+    passed: bool = True
+    score: float = Field(default=0.0, ge=0, le=1)
+    latency_ms: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    estimated_cost: float = Field(default=0.0, ge=0)
+    notes: str = Field(default="", max_length=2_000)
+    metrics: dict = Field(default_factory=dict)
+
+
+class LLMEvaluationOut(LLMEvaluationIn):
+    id: str
+    llm_config_id: str | None = None
+    currency: str = "USD"
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class LLMEvaluationSummaryOut(BaseModel):
+    llm_config_id: str
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    average_score: float = 0.0
+    average_latency_ms: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost: float = 0.0
+    latest_at: datetime | None = None
 
 
 # ──────────────────────────────────────────────
@@ -453,6 +656,7 @@ class MessageOut(BaseModel):
     content: str
     tool_calls: list = []
     tool_results: list = []
+    citations: list = []
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -480,6 +684,53 @@ class AssistantThreadOut(BaseModel):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class DocumentSearchIn(BaseModel):
+    """资料库检索请求；服务端会再次按租户可见性收窄候选数据源。"""
+
+    query: str = Field(min_length=1, max_length=2_000)
+    data_source_ids: list[str] = Field(default_factory=list, max_length=100)
+    scenario_id: str | None = None
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class RagCitationOut(BaseModel):
+    citation_id: str
+    chunk_id: str
+    file_id: str
+    filename: str
+    data_source_id: str
+    data_source_name: str = ""
+    char_start: int
+    char_end: int
+    chunk_ordinal: int
+    content_hash: str
+    embedding_model: str
+    index_version: str
+    score: float
+    vector_score: float
+    keyword_score: float
+    text: str
+
+
+class DocumentSearchOut(BaseModel):
+    query: str
+    results: list[RagCitationOut] = Field(default_factory=list)
+    searched_data_source_ids: list[str] = Field(default_factory=list)
+    excluded_data_source_ids: list[str] = Field(default_factory=list)
+    permission_message: str = ""
+    retrieval_mode: str = "hybrid-vector-keyword"
+
+
+class DocumentReindexOut(BaseModel):
+    data_source_id: str
+    files_total: int = 0
+    files_indexed: int = 0
+    chunks_total: int = 0
+    jobs_queued: int = 0
+    jobs_existing: int = 0
+    items: list[dict] = Field(default_factory=list)
 
 
 class AssistantMessageOut(BaseModel):
@@ -554,6 +805,7 @@ class ActionIn(BaseModel):
     requires_confirmation: bool = True
     idempotency_required: bool = True
     permission_scope: Literal["scenario"] = "scenario"
+    access_scope: Literal["tenant", "restricted"] = "tenant"
 
 
 class ActionOut(ActionIn):
@@ -611,6 +863,7 @@ class WorkflowIn(BaseModel):
     edges: list = Field(default_factory=list)  # 可视化 DAG 连线
     status: Literal["draft", "active", "disabled"] = "draft"
     enabled: bool = True
+    access_scope: Literal["tenant", "restricted"] = "tenant"
 
 
 class WorkflowOut(WorkflowIn):
@@ -652,3 +905,75 @@ class ActionExecuteRequest(BaseModel):
 
 class WorkflowExecuteRequest(BaseModel):
     params: dict = Field(default_factory=dict)
+
+
+class WorkflowRunCreateRequest(BaseModel):
+    """提交一次人工运行；可靠性策略由工作流 trigger_config 统一控制。"""
+
+    params: dict = Field(default_factory=dict)
+
+
+class WorkflowRunOut(BaseModel):
+    id: str
+    scenario_id: str
+    workflow_id: str
+    workflow_name: str = ""
+    trigger_source: str
+    status: str
+    input_params: dict = Field(default_factory=dict)
+    attempt: int = 0
+    max_attempts: int = 1
+    timeout_seconds: int = 300
+    available_at: datetime | None = None
+    scheduled_for: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    next_retry_at: datetime | None = None
+    error: str = ""
+    result: dict = Field(default_factory=dict)
+    pending_approval: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class WorkflowApprovalOut(BaseModel):
+    id: str
+    workflow_run_id: str
+    scenario_id: str
+    workflow_id: str
+    workflow_name: str = ""
+    node_id: str
+    node_name: str = ""
+    instructions: str = ""
+    status: str
+    requested_at: datetime
+    expires_at: datetime | None = None
+    resolved_at: datetime | None = None
+    comment: str = ""
+
+    model_config = {"from_attributes": True}
+
+
+class ApprovalDecisionIn(BaseModel):
+    comment: str = Field(default="", max_length=1000)
+
+
+class EventPublishIn(BaseModel):
+    payload: dict = Field(default_factory=dict)
+    dedupe_key: str | None = Field(default=None, min_length=1, max_length=180)
+
+
+class EventEnvelopeOut(BaseModel):
+    id: str
+    scenario_id: str
+    event_id: str
+    name: str = ""
+    payload: dict = Field(default_factory=dict)
+    source: str = "manual"
+    source_run_id: str | None = None
+    created_at: datetime
+    queued_workflow_run_ids: list[str] = Field(default_factory=list)
+
+    model_config = {"from_attributes": True}

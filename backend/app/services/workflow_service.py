@@ -26,10 +26,18 @@ from ..models import (
     DataSource,
     LLMConfig,
     OntologyAction,
+    OntologyEvent,
     OntologyRule,
     OntologyWorkflow,
 )
-from . import datasource_service, skill_service, mcp_service, llm_service, tenant_service
+from . import (
+    datasource_service,
+    skill_service,
+    mcp_service,
+    llm_service,
+    permission_service,
+    tenant_service,
+)
 from .policies import PolicyViolation, validate_action_params, validate_workflow_graph
 
 
@@ -121,15 +129,23 @@ def evaluate_rule(rule: OntologyRule, record: dict[str, Any]) -> dict[str, Any]:
 # ──────────────────────────────────────────────
 # 操作执行器
 # ──────────────────────────────────────────────
-def _permission_summary(action: OntologyAction, confirmed: bool) -> dict[str, Any]:
-    """返回给 UI/审计日志的统一权限判定，不把权限判断留给前端。"""
-    scope = action.permission_scope or "scenario"
+def _permission_summary(
+    db: Session,
+    action: OntologyAction,
+    confirmed: bool,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """返回经集中 ACL 判定的 Action 权限摘要，而不是相信前端字段。"""
+    decision = permission_service.check_action(db, action, "read" if dry_run else "execute")
     return {
-        "allowed": scope == "scenario",
-        "scope": scope,
+        "allowed": decision.allowed,
+        "scope": "action",
+        "configured_scope": action.permission_scope or "scenario",
         "requires_confirmation": bool(action.requires_confirmation),
         "confirmed": confirmed,
-        "reason": "当前用户拥有业务场景的写入权限" if scope == "scenario" else "不支持的权限范围",
+        "reason": decision.reason,
+        "role": decision.role_key,
     }
 
 
@@ -202,9 +218,9 @@ def preview_action(db: Session, action: OntologyAction, params: dict[str, Any]) 
         raise PolicyViolation("操作已禁用")
     normalized = validate_action_params(action.input_schema or {}, params)
     plan = _action_plan(action, normalized)
-    permission = _permission_summary(action, confirmed=False)
+    permission = _permission_summary(db, action, confirmed=False, dry_run=True)
     if not permission["allowed"]:
-        raise PolicyViolation("操作权限范围不受支持")
+        raise PolicyViolation("没有预演该操作的权限")
     start = time.time()
     log = ActionExecutionLog(
         scenario_id=action.scenario_id,
@@ -248,9 +264,9 @@ def execute_action(
     if not action.enabled:
         raise PolicyViolation("操作已禁用")
     normalized = validate_action_params(action.input_schema or {}, params)
-    permission = _permission_summary(action, confirmed=confirm)
+    permission = _permission_summary(db, action, confirmed=confirm)
     if not permission["allowed"]:
-        raise PolicyViolation("操作权限范围不受支持")
+        raise PolicyViolation("没有执行该操作的权限")
 
     if enforce_policy and action.requires_confirmation and not confirm:
         log = ActionExecutionLog(
@@ -536,11 +552,27 @@ def render_template(value: Any, ctx: dict[str, Any]) -> Any:
 # ──────────────────────────────────────────────
 # 工作流执行
 # ──────────────────────────────────────────────
-def execute_workflow(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]) -> dict[str, Any]:
-    """执行工作流：优先可视化 DAG（nodes/edges），回退旧版线性 steps。"""
+def execute_workflow(
+    db: Session,
+    workflow: OntologyWorkflow,
+    params: dict[str, Any],
+    *,
+    execution_id: str | None = None,
+    approved_node_ids: set[str] | None = None,
+    attempt: int = 1,
+    source_run_id: str | None = None,
+) -> dict[str, Any]:
+    """执行工作流：优先可视化 DAG（nodes/edges），回退旧版线性 steps。
+
+    ``execution_id`` 和 ``attempt`` 由 P1 任务队列传入，用于让审批恢复时的
+    已执行 Action 幂等回放、失败重试时重新获得独立的执行键。
+    """
     status = workflow.status or ("active" if workflow.enabled else "disabled")
     if status != "active" or not workflow.enabled:
         raise PolicyViolation("工作流当前未启用")
+    workflow_permission = permission_service.check_workflow(db, workflow, "execute")
+    if not workflow_permission.allowed:
+        raise PolicyViolation("没有执行该工作流的权限")
     start = time.time()
     log = ActionExecutionLog(
         scenario_id=workflow.scenario_id,
@@ -552,19 +584,40 @@ def execute_workflow(db: Session, workflow: OntologyWorkflow, params: dict[str, 
     )
     db.add(log)
     db.flush()
+    execution_key = execution_id or log.id
+    approved_nodes = approved_node_ids or set()
 
     try:
         if workflow.nodes:
             validate_workflow_graph(workflow.nodes, workflow.edges or [])
         if workflow.nodes:
-            step_results = _execute_dag(db, workflow, params, execution_id=log.id)
+            step_results = _execute_dag(
+                db,
+                workflow,
+                params,
+                execution_id=execution_key,
+                approved_node_ids=approved_nodes,
+                attempt=attempt,
+                source_run_id=source_run_id,
+            )
         else:
-            step_results = _execute_steps(db, workflow, params, execution_id=log.id)
+            step_results = _execute_steps(
+                db,
+                workflow,
+                params,
+                execution_id=execution_key,
+                approved_node_ids=approved_nodes,
+                attempt=attempt,
+                source_run_id=source_run_id,
+            )
         log.result = {"steps": step_results}
         failed = next((step for step in step_results if step.get("status") == "failed"), None)
+        waiting = next((step for step in step_results if step.get("status") == "awaiting_approval"), None)
         if failed:
             log.status = "failed"
             log.error = failed.get("error") or "工作流节点执行失败"
+        elif waiting:
+            log.status = "awaiting_approval"
         else:
             log.status = "success"
     except Exception as exc:  # noqa: BLE001
@@ -591,6 +644,9 @@ def _execute_steps(
     params: dict[str, Any],
     *,
     execution_id: str,
+    approved_node_ids: set[str],
+    attempt: int,
+    source_run_id: str | None,
 ) -> list[dict[str, Any]]:
     step_results: list[dict[str, Any]] = []
     context: dict[str, Any] = {"params": params}
@@ -615,7 +671,7 @@ def _execute_steps(
                     action,
                     step_params,
                     confirm=True,
-                    idempotency_key=f"workflow:{execution_id}:step:{step_num}",
+                    idempotency_key=f"workflow:{execution_id}:attempt:{attempt}:step:{step_num}",
                     enforce_policy=True,
                 )
                 step_result["status"] = r["status"]
@@ -645,15 +701,50 @@ def _execute_steps(
                 step_result["status"] = "failed"
                 step_result["error"] = f"事件不存在或不属于当前业务场景: {event_id}"
             else:
+                from .operations_service import publish_event
+
+                payload = render_template(step.get("payload", {}) or {}, context)
+                envelope, queued_runs = publish_event(
+                    db,
+                    event,
+                    payload if isinstance(payload, dict) else {"value": payload},
+                    source="workflow",
+                    source_run_id=source_run_id,
+                    dedupe_key=f"workflow:{execution_id}:attempt:{attempt}:step:{step_num}",
+                    created_by_user_id=str(db.info.get("user_id") or "") or None,
+                )
                 step_result["status"] = "published"
-                step_result["result"] = {"event_id": event_id, "payload": step.get("payload", {})}
+                step_result["result"] = {
+                    "event_id": event_id,
+                    "payload": payload,
+                    "envelope_id": envelope.id,
+                    "queued_workflow_run_ids": [run.id for run in queued_runs],
+                }
                 context[f"step_{step_num}"] = step_result["result"]
+
+        elif step_type == "approval":
+            node_id = str(step.get("id") or f"step-{step_num}")
+            if node_id in approved_node_ids:
+                step_result["status"] = "approved"
+                step_result["result"] = {"node_id": node_id}
+            else:
+                step_result["status"] = "awaiting_approval"
+                step_result["result"] = {
+                    "node_id": node_id,
+                    "instructions": step.get("instructions", "请核对影响范围后决定是否批准。"),
+                    "timeout_seconds": step.get("timeout_seconds"),
+                }
+                step_results.append(step_result)
+                break
 
         else:
             step_result["status"] = "skipped"
             step_result["error"] = f"未知步骤类型: {step_type}"
 
         step_results.append(step_result)
+        # 失败后不应继续产生后续副作用；审批节点在上方已显式暂停。
+        if step_result.get("status") == "failed":
+            break
     return step_results
 
 
@@ -664,10 +755,13 @@ def _execute_dag(
     params: dict[str, Any],
     *,
     execution_id: str,
+    approved_node_ids: set[str],
+    attempt: int,
+    source_run_id: str | None,
 ) -> list[dict[str, Any]]:
     """按 DAG 拓扑执行：start → 各节点 → end。
 
-    节点类型: start / end / action / rule / llm / event / http / script
+    节点类型: start / end / action / rule / llm / event / approval / http / script
     边 label: true / false（规则分支），空 = 顺序
     上下文: ctx["params"] = 入参；ctx[node_id] = 节点输出（result/output/matched）
     """
@@ -683,9 +777,11 @@ def _execute_dag(
     ctx: dict[str, Any] = {"params": params}
     results: list[dict[str, Any]] = []
     visited: set[str] = set()
+    halted = False
 
     def run(node_id: str) -> None:
-        if node_id in visited:
+        nonlocal halted
+        if halted or node_id in visited:
             return
         visited.add(node_id)
         node = nodes[node_id]
@@ -716,7 +812,7 @@ def _execute_dag(
                     action,
                     step_params,
                     confirm=True,
-                    idempotency_key=f"workflow:{execution_id}:node:{node_id}",
+                    idempotency_key=f"workflow:{execution_id}:attempt:{attempt}:node:{node_id}",
                     enforce_policy=True,
                 )
                 res["status"] = r["status"]
@@ -745,6 +841,8 @@ def _execute_dag(
                 branch = "true" if r["matched"] else "false"
                 for t in outs(node_id, branch):
                     run(t)
+                    if halted:
+                        break
                 return
 
         elif ntype == "llm":
@@ -763,6 +861,7 @@ def _execute_dag(
                             {"role": "user", "content": str(prompt)},
                         ],
                         temperature=0.3,
+                        db=db,
                     )
                     content = resp.get("content", "")
                     res["status"] = "success"
@@ -780,9 +879,42 @@ def _execute_dag(
                 res["error"] = f"事件不存在或不属于当前业务场景: {event_id}"
             else:
                 payload = render_template(data.get("payload", {}) or {}, ctx)
+                from .operations_service import publish_event
+
+                envelope, queued_runs = publish_event(
+                    db,
+                    event,
+                    payload if isinstance(payload, dict) else {"value": payload},
+                    source="workflow",
+                    source_run_id=source_run_id,
+                    dedupe_key=f"workflow:{execution_id}:attempt:{attempt}:node:{node_id}",
+                    created_by_user_id=str(db.info.get("user_id") or "") or None,
+                )
                 res["status"] = "published"
-                res["result"] = {"result": payload, "event_id": event_id}
+                res["result"] = {
+                    "result": payload,
+                    "event_id": event_id,
+                    "envelope_id": envelope.id,
+                    "queued_workflow_run_ids": [run.id for run in queued_runs],
+                }
                 ctx[node_id] = res["result"]
+
+        elif ntype == "approval":
+            if node_id in approved_node_ids:
+                res["status"] = "approved"
+                res["result"] = {"node_id": node_id}
+                ctx[node_id] = res["result"]
+            else:
+                res["status"] = "awaiting_approval"
+                res["result"] = {
+                    "node_id": node_id,
+                    "instructions": data.get("instructions", "请核对影响范围后决定是否批准。"),
+                    "timeout_seconds": data.get("timeout_seconds"),
+                }
+                results.append(res)
+                # 审批是流程暂停点；不能让父节点或后续分支继续运行。
+                halted = True
+                return
 
         elif ntype == "http":
             cfg = {
@@ -828,9 +960,15 @@ def _execute_dag(
             res["error"] = f"未知节点类型: {ntype}"
 
         results.append(res)
+        # 对失败和审批都采用 fail/stop-fast 语义，避免错误路径继续执行副作用节点。
+        if res.get("status") in {"failed", "awaiting_approval"}:
+            halted = True
+            return
         # 顺序边（label 为空）
         for t in outs(node_id, ""):
             run(t)
+            if halted:
+                break
 
     # 从 start 出发
     start_ids = [nid for nid, n in nodes.items() if n.get("type") == "start"]
@@ -838,11 +976,6 @@ def _execute_dag(
         raise ValueError("工作流缺少开始节点")
     for sid_ in start_ids:
         run(sid_)
-
-    # 未连通的孤立节点也执行，便于调试
-    for nid in nodes:
-        if nid not in visited:
-            run(nid)
 
     return results
 
@@ -852,10 +985,12 @@ def _resolve_llm(db: Session, llm_config_id: str | None) -> LLMConfig | None:
         if db.info.get("tenant_id"):
             return tenant_service.get_visible(db, LLMConfig, llm_config_id)
         return db.get(LLMConfig, llm_config_id)
-    stmt = select(LLMConfig).where(LLMConfig.is_default == True)  # noqa: E712
     if db.info.get("tenant_id"):
-        stmt = stmt.where(tenant_service.visible_clause(LLMConfig, db))
-    return db.execute(stmt.limit(1)).scalars().first()
+        candidates = llm_service.routable_configs(db, "chat")
+        return candidates[0] if candidates else None
+    return db.execute(
+        select(LLMConfig).where(LLMConfig.is_default == True, LLMConfig.enabled == True)  # noqa: E712
+    ).scalars().first()
 
 
 def _try_parse_json(text: str) -> Any:
@@ -944,10 +1079,13 @@ def generate_workflow(db: Session, scenario: BusinessScenario, description: str)
 
     llm = tenant_service.get_visible(db, LLMConfig, scenario.llm_config_id) if getattr(scenario, "llm_config_id", None) and db.info.get("tenant_id") else None
     if not llm:
-        llm_stmt = select(LLMConfig).where(LLMConfig.is_default == True)  # noqa: E712
         if db.info.get("tenant_id"):
-            llm_stmt = llm_stmt.where(tenant_service.visible_clause(LLMConfig, db))
-        llm = db.execute(llm_stmt.limit(1)).scalars().first()
+            candidates = llm_service.routable_configs(db, "chat")
+            llm = candidates[0] if candidates else None
+        else:
+            llm = db.execute(
+                select(LLMConfig).where(LLMConfig.is_default == True, LLMConfig.enabled == True)  # noqa: E712
+            ).scalars().first()
     if not llm:
         raise ValueError("请先在「LLM 配置」中配置并启用一个默认模型")
 
@@ -980,6 +1118,7 @@ def generate_workflow(db: Session, scenario: BusinessScenario, description: str)
             ],
             temperature=0.3,
             max_tokens=4096,
+            db=db,
         )
         try:
             data = _extract_json(resp.get("content", ""))

@@ -1,6 +1,9 @@
 """FastAPI 应用入口。"""
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -8,8 +11,21 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .database import init_db
-from .routers import agents, assistant, auth, data_sources, llm_configs, mcp, scenarios, skills
-from .services import skill_service
+from .routers import agents, assistant, auth, data_sources, lineage, llm_configs, mcp, operations, permissions, scenarios, skills
+from .services import operations_service, permission_service, skill_service
+
+
+logger = logging.getLogger(__name__)
+
+
+async def _operations_worker() -> None:
+    """数据库驱动的 P1 worker；即使 API 重启，待处理任务仍会在下一次启动后继续。"""
+    while True:
+        try:
+            await asyncio.to_thread(operations_service.worker_tick)
+        except Exception:  # noqa: BLE001
+            logger.exception("运营任务 worker 轮询失败")
+        await asyncio.sleep(1)
 
 
 @asynccontextmanager
@@ -20,10 +36,18 @@ async def lifespan(_: FastAPI):
 
     db = SessionLocal()
     try:
+        permission_service.bootstrap_authorization(db)
+        db.commit()
         skill_service.sync_skills_to_db(db)
     finally:
         db.close()
-    yield
+    worker = asyncio.create_task(_operations_worker(), name="ontology-operations-worker")
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
 
 
 settings = get_settings()
@@ -45,6 +69,9 @@ app.include_router(skills.router, prefix=settings.api_prefix)
 app.include_router(mcp.router, prefix=settings.api_prefix)
 app.include_router(agents.router, prefix=settings.api_prefix)
 app.include_router(assistant.router, prefix=settings.api_prefix)
+app.include_router(operations.router, prefix=settings.api_prefix)
+app.include_router(permissions.router, prefix=settings.api_prefix)
+app.include_router(lineage.router, prefix=settings.api_prefix)
 
 
 @app.get("/")

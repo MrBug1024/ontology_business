@@ -29,6 +29,7 @@ from ..models import (
     MCPConfig,
     User,
 )
+from . import permission_service
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _PBKDF2_ITERATIONS = 310_000
@@ -212,6 +213,10 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     request.state.tenant_id = session.user.tenant_id
     db.info["user_id"] = session.user.id
     db.info["tenant_id"] = session.user.tenant_id
+    # 升级前账号没有成员表记录时，在真实、已验证的登录主体下回填默认 owner/admin。
+    # 后续权限服务不会为缺失上下文自动放行，因而这里是兼容旧用户的唯一兜底入口。
+    permission_service.ensure_organization(db, session.user.tenant_id)
+    db.commit()
     return session.user
 
 

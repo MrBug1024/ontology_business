@@ -19,7 +19,7 @@ from ..schemas import (
     MessageOut,
     Msg,
 )
-from ..services import agent_engine, tenant_service
+from ..services import agent_engine, llm_service, tenant_service
 from ..services.auth_service import get_tenant_db
 
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -180,12 +180,8 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
     a = tenant_service.require_owned(db, Agent, agent_id, "Agent 不存在")
     llm = tenant_service.get_visible(db, LLMConfig, a.llm_config_id) if a.llm_config_id else None
     if not llm:
-        llm = db.execute(
-            select(LLMConfig).where(
-                LLMConfig.is_default == True,  # noqa: E712
-                tenant_service.visible_clause(LLMConfig, db),
-            ).limit(1)
-        ).scalars().first()
+        candidates = llm_service.routable_configs(db, "chat")
+        llm = candidates[0] if candidates else None
     if not llm:
         raise HTTPException(400, "请先为 Agent 配置 LLM（或设置默认 LLM）")
 
@@ -266,6 +262,7 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
         assistant_content = ""
         tool_calls_log: list[dict[str, Any]] = []
         tool_results_log: list[dict[str, Any]] = []
+        citations_log: list[dict[str, Any]] = []
         try:
             for ev in agent_engine.run_agent(
                 db, a, llm, history, payload.message, scenario_name, ontology_summary
@@ -277,6 +274,10 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
                     tool_calls_log.append(ev["data"])
                 elif etype == "tool_result":
                     tool_results_log.append(ev["data"])
+                elif etype == "citations":
+                    # 引用由 AgentContext 在当前租户、绑定数据源范围内生成；作为
+                    # 独立字段持久化，历史消息无需再从工具文本中反向解析。
+                    citations_log = ev["data"] if isinstance(ev["data"], list) else []
                 yield f"data: {json.dumps({'type': etype, 'data': ev['data']}, ensure_ascii=False)}\n\n"
             # 保存助手消息（用独立会话，避免请求作用域 db 在流式期间被关闭）
             save_db = SessionLocal()
@@ -288,6 +289,7 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
                         content=assistant_content,
                         tool_calls=tool_calls_log,
                         tool_results=tool_results_log,
+                        citations=citations_log,
                     )
                 )
                 save_db.commit()

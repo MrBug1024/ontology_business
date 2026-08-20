@@ -11,6 +11,7 @@ import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import WFNode from './WFNode.vue'
 import { api } from '@/api'
+import type { WorkflowRun } from '@/types'
 import '@vue-flow/core/dist/style.css'
 import '@vue-flow/core/dist/theme-default.css'
 import '@vue-flow/controls/dist/style.css'
@@ -27,6 +28,7 @@ const emit = defineEmits<{
   (e: 'update:modelValue', v: any): void
   (e: 'close'): void
   (e: 'save', w: any): void
+  (e: 'run-created', run: WorkflowRun): void
 }>()
 
 // 注入场景资源给节点卡片（显示引用的操作/规则/事件名称）
@@ -50,15 +52,18 @@ const nodeTypes: any = {
   rule: _WFNode,
   llm: _WFNode,
   event: _WFNode,
+  approval: _WFNode,
   http: _WFNode,
   script: _WFNode,
 }
 
 const PALETTE = [
+  { type: 'start', label: '开始', icon: 'VideoPlay', color: 'var(--success)', desc: '工作流的唯一入口' },
   { type: 'action', label: '执行操作', icon: 'Operation', color: 'var(--graph-blue)', desc: '调用已定义操作（SQL/技能/MCP…）' },
   { type: 'rule', label: '规则判断', icon: 'SetUp', color: 'var(--warning)', desc: '评估规则，命中/未命中分支' },
   { type: 'llm', label: '大模型', icon: 'Cpu', color: 'var(--primary)', desc: 'LLM 分析/生成，支持变量引用' },
   { type: 'event', label: '发布事件', icon: 'Bell', color: 'var(--accent)', desc: '发布业务事件' },
+  { type: 'approval', label: '人工审批', icon: 'UserFilled', color: 'var(--warning)', desc: '暂停执行，等待人工决定' },
   { type: 'http', label: 'HTTP 请求', icon: 'Link', color: 'var(--graph-teal)', desc: '调用外部 API' },
   { type: 'script', label: 'Python 脚本', icon: 'Document', color: 'var(--info)', desc: '自定义 Python 片段' },
   { type: 'end', label: '结束', icon: 'CircleCheck', color: 'var(--text-3)', desc: '流程结束' },
@@ -229,12 +234,17 @@ function defaultData(type: string) {
     case 'rule': return { name: '规则判断', rule_id: '', record: {} }
     case 'llm': return { name: '大模型分析', prompt: '', system: '' }
     case 'event': return { name: '发布事件', event_id: '', payload: {} }
+    case 'approval': return { name: '等待人工审批', instructions: '请核对业务影响后批准或驳回。', timeout_seconds: 86400, on_timeout: 'reject' }
     case 'http': return { name: 'HTTP 请求', method: 'GET', url: '', body: {} }
     case 'script': return { name: 'Python 脚本', script: 'result = {"ok": True}' }
     default: return { name: type }
   }
 }
 function addNode(type: string, pos?: { x: number; y: number }) {
+  if ((type === 'start' || type === 'end') && nodes.value.some((node) => node.type === type)) {
+    ElMessage.warning(`工作流只能有一个「${type === 'start' ? '开始' : '结束'}」节点`)
+    return
+  }
   const id = genId(type)
   const p = pos || { x: 60 + Math.random() * 240, y: 60 + Math.random() * 240 }
   nodes.value = [...nodes.value, { id, type, position: p, data: defaultData(type) }]
@@ -322,6 +332,7 @@ function validate(): string[] {
     if (n.type === 'action' && !d.action_id) errs.push(`节点「${nm}」未选择操作`)
     if (n.type === 'rule' && !d.rule_id) errs.push(`节点「${nm}」未选择规则`)
     if (n.type === 'event' && !d.event_id) errs.push(`节点「${nm}」未选择事件`)
+    if (n.type === 'approval' && !(d.instructions || '').trim()) errs.push(`审批节点「${nm}」未填写审批说明`)
     if (n.type === 'llm' && !(d.prompt || '').trim()) errs.push(`节点「${nm}」未填写提示词`)
     if (n.type === 'http' && !(d.url || '').trim()) errs.push(`节点「${nm}」未填写 URL`)
   }
@@ -372,8 +383,6 @@ function save() {
 }
 
 const executing = ref(false)
-const execDlg = ref(false)
-const execText = ref('')
 async function doExecute() {
   if (!props.modelValue.id) {
     ElMessage.warning('请先保存工作流，再执行')
@@ -388,25 +397,14 @@ async function doExecute() {
       cancelButtonText: '取消',
     })
     const params = JSON.parse(value || '{}')
-    const res = await api.executeWorkflow(props.modelValue.id, params)
-    execText.value = formatExec(res)
-    execDlg.value = true
+    const run = await api.submitWorkflowRun(props.modelValue.id, params)
+    emit('run-created', run)
+    ElMessage.success(run.status === 'awaiting_approval' ? '任务已提交，正在等待审批' : '任务已提交到运行队列')
   } catch (e: any) {
     if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(e?.message || '执行失败')
   } finally {
     executing.value = false
   }
-}
-function formatExec(res: any) {
-  const lines: string[] = [`状态: ${res.status}    耗时: ${res.duration_ms}ms`, '─'.repeat(46)]
-  for (const s of res.steps || []) {
-    const ok = ['success', 'matched', 'published'].includes(s.status)
-    const icon = ok ? '✓' : s.status === 'not_matched' ? '∅' : s.status === 'failed' ? '✗' : '·'
-    lines.push(`${icon} [${s.type}] ${s.name || s.node || ''} → ${s.status}${s.error ? `  (${s.error})` : ''}`)
-    if (s.result) lines.push(`    ${JSON.stringify(s.result).slice(0, 260)}`)
-  }
-  if (res.error) lines.push('', '错误: ' + res.error)
-  return lines.join('\n')
 }
 
 // ── AI 生成 ──
@@ -462,7 +460,17 @@ function onJsonInput() {
 }
 
 const wf = computed({
-  get: () => props.modelValue,
+  get: () => {
+    const workflow = props.modelValue || {}
+    if (!workflow.trigger_config || typeof workflow.trigger_config !== 'object') workflow.trigger_config = {}
+    const config = workflow.trigger_config
+    if (config.interval_seconds === undefined) config.interval_seconds = 300
+    if (config.max_attempts === undefined) config.max_attempts = 3
+    if (config.timeout_seconds === undefined) config.timeout_seconds = 300
+    if (config.retry_backoff_seconds === undefined) config.retry_backoff_seconds = 5
+    if (config.event_id === undefined) config.event_id = ''
+    return workflow
+  },
   set: (v) => emit('update:modelValue', v),
 })
 </script>
@@ -479,6 +487,40 @@ const wf = computed({
         <el-option label="启用" value="active" />
         <el-option label="停用" value="disabled" />
       </el-select>
+    </div>
+
+    <div class="wfe-run-config" aria-label="触发与执行策略">
+      <div class="wfe-config-field">
+        <label>触发方式</label>
+        <el-select v-model="wf.trigger_type" size="small" aria-label="工作流触发方式">
+          <el-option label="手动" value="manual" />
+          <el-option label="定时" value="scheduled" />
+          <el-option label="事件" value="event" />
+        </el-select>
+      </div>
+      <div v-if="wf.trigger_type === 'scheduled'" class="wfe-config-field">
+        <label>执行间隔（秒）</label>
+        <el-input-number v-model.number="wf.trigger_config.interval_seconds" size="small" :min="5" :max="31536000" controls-position="right" aria-label="定时执行间隔秒数" />
+      </div>
+      <div v-else-if="wf.trigger_type === 'event'" class="wfe-config-field wfe-config-field--event">
+        <label>触发事件</label>
+        <el-select v-model="wf.trigger_config.event_id" size="small" filterable aria-label="触发事件">
+          <el-option v-for="event in events" :key="event.id" :label="event.name" :value="event.id" />
+        </el-select>
+      </div>
+      <div class="wfe-config-field">
+        <label>最大尝试次数</label>
+        <el-input-number v-model.number="wf.trigger_config.max_attempts" size="small" :min="1" :max="10" controls-position="right" aria-label="最大执行尝试次数" />
+      </div>
+      <div class="wfe-config-field">
+        <label>重试间隔（秒）</label>
+        <el-input-number v-model.number="wf.trigger_config.retry_backoff_seconds" size="small" :min="1" :max="3600" controls-position="right" aria-label="首次重试间隔秒数" />
+      </div>
+      <div class="wfe-config-field">
+        <label>超时（秒）</label>
+        <el-input-number v-model.number="wf.trigger_config.timeout_seconds" size="small" :min="5" :max="86400" controls-position="right" aria-label="工作流超时秒数" />
+      </div>
+      <span class="wfe-config-help">队列按此策略安排重试和超时；保存后生效。</span>
     </div>
 
     <div class="wfe-body">
@@ -604,6 +646,25 @@ const wf = computed({
             </div>
           </template>
 
+          <template v-if="selNode.type === 'approval'">
+            <div class="wfe-field">
+              <label>审批说明</label>
+              <el-input v-model="selNode.data.instructions" type="textarea" :rows="4" placeholder="说明审批人需要核对的影响、条件和执行范围" />
+            </div>
+            <div class="wfe-field">
+              <label>审批超时（秒）</label>
+              <el-input-number v-model.number="selNode.data.timeout_seconds" :min="60" :max="604800" controls-position="right" style="width:100%" />
+            </div>
+            <div class="wfe-field">
+              <label>审批超时后</label>
+              <el-select v-model="selNode.data.on_timeout" size="small" style="width:100%">
+                <el-option label="驳回任务" value="reject" />
+                <el-option label="标记超时" value="timeout" />
+              </el-select>
+            </div>
+            <div class="wfe-hint">流程将在此节点暂停；审批人从任务中心批准或驳回后，系统才会继续。</div>
+          </template>
+
           <template v-if="selNode.type === 'http'">
             <div class="wfe-field">
               <label>请求方法</label>
@@ -656,13 +717,6 @@ const wf = computed({
       </template>
     </el-dialog>
 
-    <!-- 执行结果对话框 -->
-    <el-dialog v-model="execDlg" title="执行结果" width="680px" class="glass-dialog">
-      <pre class="exec-result mono">{{ execText }}</pre>
-      <template #footer>
-        <el-button type="primary" @click="execDlg = false">关闭</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
@@ -690,6 +744,21 @@ const wf = computed({
   width: 92px;
   flex-shrink: 0;
 }
+.wfe-run-config {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  margin: -2px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+.wfe-config-field { display: flex; flex-direction: column; gap: 4px; min-width: 116px; }
+.wfe-config-field--event { min-width: 180px; }
+.wfe-config-field label { color: var(--text-3); font-size: 10px; font-weight: 750; }
+.wfe-config-help { align-self: center; max-width: 220px; color: var(--text-3); font-size: 10.5px; line-height: 1.45; }
 .wfe-body {
   flex: 1;
   min-height: 0;
@@ -908,6 +977,9 @@ const wf = computed({
   .wfe-status {
     width: 110px;
   }
+  .wfe-run-config { align-items: stretch; }
+  .wfe-config-field, .wfe-config-field--event { flex: 1 1 160px; }
+  .wfe-config-help { max-width: none; }
   .wfe-body {
     flex-direction: column;
   }

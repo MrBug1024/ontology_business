@@ -80,12 +80,8 @@ def _scenario(db: Session, scenario_id: str | None, writable: bool = False) -> B
 
 
 def _llm(db: Session) -> LLMConfig | None:
-    return db.execute(
-        select(LLMConfig).where(
-            LLMConfig.is_default == True,  # noqa: E712
-            tenant_service.visible_clause(LLMConfig, db),
-        ).limit(1)
-    ).scalars().first()
+    candidates = llm_service.routable_configs(db, "chat")
+    return candidates[0] if candidates else None
 
 
 def _scenario_context(scenario: BusinessScenario | None) -> str:
@@ -550,7 +546,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield _sse("token", reply)
             elif llm:
                 yield progress({"id": "response", "title": "生成回答", "detail": "正在根据当前上下文组织答案。", "status": "running"})
-                for event in llm_service.chat_stream(llm, llm_messages):
+                for event in llm_service.chat_stream(llm, llm_messages, db=db):
                     if event["type"] == "token":
                         reply += event["content"]
                         yield _sse("token", event["content"])
@@ -688,7 +684,11 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 for item in reversed(history):
                     if item.role in ("user", "assistant") and item.content:
                         messages.append({"role": item.role, "content": item.content[:8000]})
-                answer = llm_service.chat(llm, messages + [{"role": "user", "content": payload.message}])
+                answer = llm_service.chat(
+                    llm,
+                    messages + [{"role": "user", "content": payload.message}],
+                    db=db,
+                )
                 reply = answer.get("content", "").strip() or _fallback_reply(intent, scenario)
             else:
                 reply = _fallback_reply(intent, scenario)

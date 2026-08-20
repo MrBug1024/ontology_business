@@ -21,7 +21,7 @@ from ..schemas import (
     UserOut,
     VerifyEmailIn,
 )
-from ..services import auth_service
+from ..services import auth_service, permission_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
@@ -66,10 +66,12 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
         raise HTTPException(409, "该邮箱已注册，请直接登录")
 
     first_user = db.execute(select(User.id)).first() is None
+    created_tenant = False
     if not user:
         tenant = Tenant(name=f"{payload.display_name.strip() or email.split('@')[0]} 的工作区")
         db.add(tenant)
         db.flush()
+        created_tenant = True
         user = User(
             tenant_id=tenant.id,
             email=email,
@@ -86,6 +88,13 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
         user.display_name = payload.display_name.strip() or user.display_name
         user.status = "pending"
         user.email_verified_at = None
+
+    # 新租户创建者立即成为 owner；升级前已有同租户用户由服务统一回填为 owner/admin。
+    permission_service.ensure_organization(
+        db,
+        user.tenant_id,
+        owner_user_id=user.id if created_tenant else None,
+    )
 
     code = auth_service.issue_email_code(db, user, "register")
     db.commit()

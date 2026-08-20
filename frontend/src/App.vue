@@ -28,6 +28,8 @@
         <div class="nav-label">工作台</div>
         <el-menu :default-active="activeRoute" router class="side-menu" background-color="transparent" text-color="var(--sidebar-text)" active-text-color="var(--sidebar-title)">
           <el-menu-item index="/dashboard" title="仪表盘"><el-icon aria-hidden="true"><Odometer /></el-icon><span>仪表盘</span></el-menu-item>
+          <el-menu-item index="/tasks" title="任务中心"><el-icon aria-hidden="true"><List /></el-icon><span>任务中心</span></el-menu-item>
+          <el-menu-item index="/lineage" title="端到端血缘"><el-icon aria-hidden="true"><Share /></el-icon><span>端到端血缘</span></el-menu-item>
           <el-menu-item index="/scenarios" title="业务场景"><el-icon aria-hidden="true"><OfficeBuilding /></el-icon><span>业务场景</span></el-menu-item>
           <el-menu-item index="/data-sources" title="数据源"><el-icon aria-hidden="true"><Coin /></el-icon><span>数据源</span></el-menu-item>
         </el-menu>

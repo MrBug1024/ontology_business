@@ -33,7 +33,7 @@ from ..models import (
     OntologyWorkflow,
     Skill,
 )
-from . import datasource_service, doc_parser, llm_service, mcp_service, ontology_service, rag_service, skill_service, tenant_service, workflow_service
+from . import datasource_service, llm_service, mcp_service, ontology_service, rag_service, skill_service, tenant_service, workflow_service
 
 class AgentContext:
     """一次 Agent 会话的运行时上下文。"""
@@ -42,11 +42,16 @@ class AgentContext:
         self.db = db
         self.agent = agent
         self.llm = llm
-        if agent.scenario_id and db.info.get("tenant_id"):
-            self.scenario = tenant_service.get_visible(db, BusinessScenario, agent.scenario_id)
-        else:
-            self.scenario = db.get(BusinessScenario, agent.scenario_id) if agent.scenario_id else None
+        # Agent 工具始终以当前租户运行；缺少上下文时拒绝，而不是隐式获得全库访问。
+        self.tenant_id = tenant_service.current_tenant_id(db)
+        self.scenario = (
+            tenant_service.get_visible(db, BusinessScenario, agent.scenario_id)
+            if agent.scenario_id else None
+        )
         self.data_sources: list[DataSource] = []
+        # 一次回答内的引用编号必须稳定、全局唯一；不能把每次检索各自的 C1 混在一起。
+        self.citations: list[dict[str, Any]] = []
+        self._citations_by_key: dict[tuple[str, str, int, int], dict[str, Any]] = {}
         self.skills: list[Skill] = []
         self.mcps: list[MCPConfig] = []
         self._load_bindings()
@@ -54,7 +59,7 @@ class AgentContext:
     def _load_bindings(self) -> None:
         ds_ids = self.agent.data_source_ids or []
         if ds_ids:
-            ds_scope = tenant_service.visible_clause(DataSource, self.db) if self.db.info.get("tenant_id") else True
+            ds_scope = tenant_service.visible_clause(DataSource, self.db)
             self.data_sources = list(
                 self.db.execute(
                     select(DataSource).where(
@@ -66,13 +71,13 @@ class AgentContext:
             )
         sk_ids = self.agent.skill_ids or []
         if sk_ids:
-            skill_scope = tenant_service.visible_clause(Skill, self.db) if self.db.info.get("tenant_id") else True
+            skill_scope = tenant_service.visible_clause(Skill, self.db)
             self.skills = list(
                 self.db.execute(select(Skill).where(Skill.id.in_(sk_ids), Skill.enabled == True, skill_scope)).scalars().all()  # noqa: E712
             )
         mcp_ids = self.agent.mcp_ids or []
         if mcp_ids:
-            mcp_scope = tenant_service.visible_clause(MCPConfig, self.db) if self.db.info.get("tenant_id") else True
+            mcp_scope = tenant_service.visible_clause(MCPConfig, self.db)
             self.mcps = list(
                 self.db.execute(select(MCPConfig).where(MCPConfig.id.in_(mcp_ids), MCPConfig.enabled == True, mcp_scope)).scalars().all()  # noqa: E712
             )
@@ -95,6 +100,66 @@ class AgentContext:
             self.workflows = list(
                 self.db.execute(select(OntologyWorkflow).where(OntologyWorkflow.scenario_id == sid, OntologyWorkflow.enabled == True)).scalars().all()  # noqa: E712
             )
+
+    def _writable_file_buckets(self) -> list[DataSource]:
+        """公开绑定资源可读不可写；交付物只允许保存到当前租户自有桶。"""
+        return [
+            source for source in self.data_sources
+            if source.type == "file_bucket" and source.tenant_id == self.tenant_id
+        ]
+
+    def _record_citations(self, raw_citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """登记 RAG 命中并生成本轮对话唯一的引用编号。
+
+        ``rag_service`` 已按租户可见性过滤，这里再限制为 Agent 当前绑定的数据源，
+        防止未来工具实现误把未绑定或未授权资料写入消息审计记录。
+        """
+        allowed_source_ids = {source.id for source in self.data_sources if source.type == "file_bucket"}
+        normalized: list[dict[str, Any]] = []
+        for raw in raw_citations:
+            if not isinstance(raw, dict):
+                continue
+            source_id = str(raw.get("data_source_id") or "")
+            file_id = str(raw.get("file_id") or "")
+            chunk_id = str(raw.get("chunk_id") or "")
+            if not source_id or source_id not in allowed_source_ids or not file_id or not chunk_id:
+                continue
+            try:
+                char_start = int(raw.get("char_start"))
+                char_end = int(raw.get("char_end"))
+            except (TypeError, ValueError):
+                continue
+            if char_start < 0 or char_end <= char_start:
+                continue
+            key = (file_id, chunk_id, char_start, char_end)
+            citation = self._citations_by_key.get(key)
+            if citation is None:
+                citation = {
+                    "citation_id": f"C{len(self.citations) + 1}",
+                    "chunk_id": chunk_id,
+                    "file_id": file_id,
+                    "filename": str(raw.get("filename") or "资料文件"),
+                    "data_source_id": source_id,
+                    "data_source_name": str(raw.get("data_source_name") or "资料库"),
+                    "char_start": char_start,
+                    "char_end": char_end,
+                    "chunk_ordinal": int(raw.get("chunk_ordinal") or 0),
+                    "content_hash": str(raw.get("content_hash") or ""),
+                    "embedding_model": str(raw.get("embedding_model") or ""),
+                    "index_version": str(raw.get("index_version") or ""),
+                    "score": float(raw.get("score") or 0),
+                    "vector_score": float(raw.get("vector_score") or 0),
+                    "keyword_score": float(raw.get("keyword_score") or 0),
+                    "text": str(raw.get("text") or ""),
+                }
+                self.citations.append(citation)
+                self._citations_by_key[key] = citation
+            normalized.append(dict(citation))
+        return normalized
+
+    def citation_snapshot(self) -> list[dict[str, Any]]:
+        """返回可安全发送到 SSE / 持久化消息的独立副本。"""
+        return [dict(citation) for citation in self.citations]
 
     # ── 工具定义 ──────────────────────────────
     def build_tools(self) -> list[dict[str, Any]]:
@@ -133,25 +198,36 @@ class AgentContext:
                 ),
                 _tool(
                     "search_documents",
-                    "在文件桶数据源中按关键词检索相关文档片段（RAG）。参数 query 为检索词。",
-                    {"query": {"type": "string", "description": "检索关键词"}},
+                    "在已绑定且有权限的文件桶中执行混合向量检索，返回可引用的资料片段。"
+                    "回答引用事实时必须使用结果的 citation_id（如【C1】）。",
+                    {
+                        "query": {"type": "string", "description": "检索问题或关键词"},
+                        "top_k": {"type": "integer", "description": "返回片段数，默认 5，最大 10"},
+                    },
                 ),
                 _tool(
                     "read_document",
-                    "读取某个已解析文档的全文。参数 filename 为文件名。",
-                    {"filename": {"type": "string", "description": "文件名"}},
-                ),
-                _tool(
-                    "save_deliverable",
-                    "把正式业务产出物（报告、清单、分析结果或其他交付文件）保存为可下载附件，"
-                    "返回附件的预览/下载链接。参数 filename 为文件名（建议 .md 或 .txt 结尾），content 为附件全文内容。"
-                    "生成正式交付文件时应调用本工具，并在回答中附上返回的链接。",
+                    "读取已绑定且有权限的已解析文档。优先使用 search_documents 返回的 file_id，"
+                    "避免仅按文件名读取同名资料。",
                     {
-                        "filename": {"type": "string", "description": "附件文件名，如 业务分析报告.md"},
-                        "content": {"type": "string", "description": "附件全文内容（Markdown 或纯文本）"},
+                        "file_id": {"type": "string", "description": "检索结果中的文件 id"},
+                        "filename": {"type": "string", "description": "兼容旧会话的文件名，重名时会拒绝"},
                     },
                 ),
             ]
+            if self._writable_file_buckets():
+                tools.append(
+                    _tool(
+                        "save_deliverable",
+                        "把正式业务产出物（报告、清单、分析结果或其他交付文件）保存为可下载附件，"
+                        "返回附件的预览/下载链接。参数 filename 为文件名（建议 .md 或 .txt 结尾），content 为附件全文内容。"
+                        "生成正式交付文件时应调用本工具，并在回答中附上返回的链接。",
+                        {
+                            "filename": {"type": "string", "description": "附件文件名，如 业务分析报告.md"},
+                            "content": {"type": "string", "description": "附件全文内容（Markdown 或纯文本）"},
+                        },
+                    )
+                )
         if self.skills:
             tools.append(
                 _tool(
@@ -275,10 +351,24 @@ class AgentContext:
                             pass
                     return f"SQL 执行出错: {msg}"
             if name == "search_documents":
-                results = rag_service.search(self.db, [d.id for d in self.data_sources if d.type == "file_bucket"], args.get("query", ""))
-                return _dump(results) if results else "未检索到相关文档内容"
+                results = rag_service.search(
+                    self.db,
+                    [d.id for d in self.data_sources if d.type == "file_bucket"],
+                    args.get("query", ""),
+                    top_k=max(1, min(int(args.get("top_k") or 5), 10)),
+                )
+                citations = self._record_citations(results)
+                if not citations:
+                    return "未检索到可引用的文档内容；请检查资料库绑定、文档解析和检索词。"
+                return _dump(
+                    {
+                        "retrieval_mode": "hybrid-vector-keyword",
+                        "citations": citations,
+                        "instruction": "最终回答涉及资料事实时，请标注对应的 citation_id，例如【C1】；不要编造引用。",
+                    }
+                )
             if name == "read_document":
-                return self._read_doc(args.get("filename", ""))
+                return self._read_doc(args.get("file_id", ""), args.get("filename", ""))
             if name == "save_deliverable":
                 return self._save_deliverable(args.get("filename", ""), args.get("content", ""))
             if name == "execute_skill":
@@ -363,20 +453,37 @@ class AgentContext:
                 return d
         return None
 
-    def _read_doc(self, filename: str) -> str:
+    def _read_doc(self, file_id: str = "", filename: str = "") -> str:
+        """读取资料库全文时复用绑定范围与租户可见性，避免绕过检索边界。"""
+        bound_ids = [d.id for d in self.data_sources if d.type == "file_bucket"]
+        if not bound_ids:
+            return "当前 Agent 未绑定可检索资料库"
         stmt = select(BucketFile).where(
-            BucketFile.data_source_id.in_([d.id for d in self.data_sources]),
-            BucketFile.filename == filename,
+            BucketFile.data_source_id.in_(bound_ids),
         )
-        f = self.db.execute(stmt).scalars().first()
+        if file_id:
+            stmt = stmt.where(BucketFile.id == file_id)
+        elif filename:
+            stmt = stmt.where(BucketFile.filename == filename)
+        else:
+            return "请提供 search_documents 返回的 file_id"
+        stmt = stmt.join(DataSource, DataSource.id == BucketFile.data_source_id).where(
+            tenant_service.visible_clause(DataSource, self.db)
+        )
+        matches = self.db.execute(stmt).scalars().all()
+        if filename and len(matches) > 1:
+            return "存在同名资料，请先使用 search_documents 返回的 file_id 精确读取"
+        f = matches[0] if matches else None
         if not f:
-            return f"未找到文件: {filename}"
-        return f.parsed_text or f"文件 {filename} 暂无解析内容"
+            return f"未找到或无权读取文件: {file_id}"
+        return (f.parsed_text or f"文件 {f.filename} 暂无解析内容")[:24_000]
 
     def _save_deliverable(self, filename: str, content: str) -> str:
         """把产出物保存为文件桶附件，返回预览/下载链接。"""
-        bucket = next((d for d in self.data_sources if d.type == "file_bucket"), None)
+        bucket = next(iter(self._writable_file_buckets()), None)
         if not bucket:
+            if any(d.type == "file_bucket" for d in self.data_sources):
+                return "绑定的文件桶均为只读公开资源，无法保存附件；请绑定当前租户自有文件桶"
             return "未绑定文件桶数据源，无法保存附件"
         if not content or not content.strip():
             return "附件内容为空，未保存"
@@ -395,15 +502,8 @@ class AgentContext:
         data = content.encode("utf-8")
         bf = datasource_service.save_bucket_file(bucket, safe, data)
         self.db.add(bf)
-        # 解析（md/txt 直接取原文，便于预览）
-        try:
-            r = doc_parser.parse_file(bf.stored_path, bf.filename)
-            bf.status = "parsed" if r["status"] == "success" else "error"
-            bf.parsed_text = r.get("text", "") or content
-            bf.error = "" if r["status"] == "success" else r.get("message", "")
-        except Exception:  # noqa: BLE001
-            bf.status = "parsed"
-            bf.parsed_text = content
+        self.db.flush()
+        rag_service.enqueue_document_index(self.db, bf, parse_document=True)
         self.db.commit()
         self.db.refresh(bf)
         return _dump(
@@ -412,9 +512,10 @@ class AgentContext:
                 "file_id": bf.id,
                 "filename": bf.filename,
                 "size": bf.size,
+                "index_status": bf.index_status,
                 "preview_url": f"/api/data-sources/files/{bf.id}/text",
                 "download_url": f"/api/data-sources/files/{bf.id}/download",
-                "提示": "请在回答中以 Markdown 链接形式附上该附件，例如 [📎 业务交付物.md](/api/data-sources/files/" + bf.id + "/download)",
+                "提示": "附件已排队解析和建立检索索引；请在回答中以 Markdown 链接形式附上下载地址，例如 [📎 业务交付物.md](/api/data-sources/files/" + bf.id + "/download)",
             }
         )
 
@@ -494,11 +595,15 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
     if ctx.data_sources:
         ds_lines = [f"- {d.name}（{d.type}，id={d.id}）" for d in ctx.data_sources]
         parts.append("\n【可用数据源】\n" + "\n".join(ds_lines))
-        parts.append("你可以用 list_tables 查看表结构，用 run_sql 查询数据库，用 search_documents 检索文件桶中的文档。")
         parts.append(
-            "当你生成正式业务交付物时，务必调用 save_deliverable 工具把它保存为附件，"
-            "并在最终回答中以 Markdown 链接形式附上返回的 download_url。"
+            "你可以用 list_tables 查看表结构，用 run_sql 查询数据库，用 search_documents 检索文件桶中的文档。"
+            "凡引用检索到的事实，必须在答案中标出工具结果提供的【C#】；未检索到依据时明确说明。"
         )
+        if ctx._writable_file_buckets():
+            parts.append(
+                "当你生成正式业务交付物时，务必调用 save_deliverable 工具把它保存为附件，"
+                "并在最终回答中以 Markdown 链接形式附上返回的 download_url。"
+            )
         table_map = _table_map(ctx)
         if table_map:
             parts.append("\n【实体 → 数据库表名映射】（run_sql 时请使用下列真实表名，不要臆造）\n" + table_map)
@@ -584,7 +689,7 @@ def run_agent(
 ) -> Iterator[dict[str, Any]]:
     """执行 Agent 工具循环，逐事件 yield。
 
-    事件类型: status / tool_call / tool_result / token / done / error
+    事件类型: status / tool_call / tool_result / token / citations / done / error
     """
     ctx = AgentContext(db, agent, llm)
     system_prompt = build_system_prompt(ctx, scenario_name, ontology_summary)
@@ -605,6 +710,7 @@ def run_agent(
             tools=tools or None,
             temperature=agent.temperature,
             max_tokens=agent.max_tokens,
+            db=db,
         ):
             if ev["type"] == "token":
                 content_parts.append(ev["content"])
@@ -616,6 +722,8 @@ def run_agent(
 
         if not tool_calls:
             # 最终回答
+            if ctx.citations:
+                yield {"type": "citations", "data": ctx.citation_snapshot()}
             yield {"type": "done", "data": content}
             return
 
@@ -646,4 +754,6 @@ def run_agent(
                 {"role": "tool", "tool_call_id": tc["id"], "name": fname, "content": result[:8000]}
             )
 
+    if ctx.citations:
+        yield {"type": "citations", "data": ctx.citation_snapshot()}
     yield {"type": "done", "data": "（已达到最大工具调用轮数，回答可能不完整）"}
