@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -286,6 +286,12 @@ class DataMapping(Base):
     )
     table_name: Mapped[str] = mapped_column(String(300), default="")
     column_map: Mapped[dict] = mapped_column(JSON, default=dict)  # {本体属性名: 表列名}
+    status: Mapped[str] = mapped_column(String(20), default="unknown")  # unknown / ready / ok / error
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_row_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_imported_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship(back_populates="data_mappings")
@@ -592,6 +598,10 @@ class OntologyAction(Base):
     # 后置效果（描述性文本）
     postcondition: Mapped[str] = mapped_column(Text, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 执行安全策略：当前权限边界以场景所有权为准，确认和幂等由服务端强制执行。
+    requires_confirmation: Mapped[bool] = mapped_column(Boolean, default=True)
+    idempotency_required: Mapped[bool] = mapped_column(Boolean, default=True)
+    permission_scope: Mapped[str] = mapped_column(String(30), default="scenario")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship()
@@ -695,6 +705,16 @@ class ActionExecutionLog(Base):
     """操作执行日志：记录每次 Action/Workflow 的执行轨迹（可追溯）。"""
 
     __tablename__ = "action_execution_logs"
+    __table_args__ = (
+        Index(
+            "uq_action_execution_logs_idempotency",
+            "scenario_id",
+            "target_type",
+            "target_id",
+            "idempotency_key",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     scenario_id: Mapped[str] = mapped_column(
@@ -706,8 +726,12 @@ class ActionExecutionLog(Base):
     target_name: Mapped[str] = mapped_column(String(200), default="")
     # 输入参数
     input_params: Mapped[dict] = mapped_column(JSON, default=dict)
-    # 执行状态: running / success / failed
+    # 执行状态: running / success / failed / confirmation_required / dry_run
     status: Mapped[str] = mapped_column(String(20), default="running")
+    # execute / dry_run / confirmation
+    mode: Mapped[str] = mapped_column(String(20), default="execute")
+    # 同一个业务请求的幂等键；预演和确认提醒不要求填写。
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), index=True, nullable=True)
     # 执行结果
     result: Mapped[dict] = mapped_column(JSON, default=dict)
     # 错误信息

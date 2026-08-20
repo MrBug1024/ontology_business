@@ -219,10 +219,25 @@
                 </div>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="210" fixed="right">
+            <el-table-column label="运行状态" min-width="150">
+              <template #default="{ row }">
+                <div class="mapping-status-cell">
+                  <el-tag size="small" effect="plain" :type="mappingStatusType(row.status)">
+                    {{ mappingStatusLabel(row.status) }}
+                  </el-tag>
+                  <el-tooltip v-if="row.last_error" :content="row.last_error" placement="top">
+                    <el-icon class="mapping-error-icon" aria-label="查看映射错误"><WarningFilled /></el-icon>
+                  </el-tooltip>
+                  <small v-if="row.last_refreshed_at" class="muted">{{ formatDate(row.last_refreshed_at) }}</small>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" min-width="340" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" text @click="openMapping(row.id)">编辑</el-button>
-                <el-button size="small" text type="primary" :loading="row._importing" @click="doImport(row)">导入实例</el-button>
+                <el-button size="small" text @click="doPreviewMapping(row)">预览</el-button>
+                <el-button size="small" text :loading="row._testing" @click="doTestMapping(row)">测试</el-button>
+                <el-button size="small" text type="primary" :loading="row._refreshing" @click="doRefreshMapping(row)">刷新实例</el-button>
                 <el-button size="small" text type="danger" @click="removeMapping(row.id)">删除</el-button>
               </template>
             </el-table-column>
@@ -263,10 +278,10 @@
                 <el-tag size="small" :type="row.enabled === false ? 'info' : 'success'">{{ row.enabled === false ? '否' : '是' }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="200" fixed="right">
+            <el-table-column label="操作" width="245" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" text @click="openAction(row.id)">编辑</el-button>
-                <el-button size="small" text type="primary" :loading="row._executing" @click="doExecuteAction(row)">执行</el-button>
+                <el-button size="small" text type="primary" :loading="row._executing" @click="doExecuteAction(row)">参数与执行</el-button>
                 <el-button size="small" text type="danger" @click="removeAction(row.id)">删除</el-button>
               </template>
             </el-table-column>
@@ -440,6 +455,80 @@
       </template>
     </el-dialog>
 
+    <!-- ═══════════ 数据映射预览/校验 ═══════════ -->
+    <el-dialog v-model="mappingPreviewDlg" title="映射预览与校验" width="920px" class="glass-dialog">
+      <div v-if="mappingPreview" v-loading="mappingPreviewLoading" class="mapping-preview" aria-live="polite">
+        <div class="mapping-preview-head">
+          <div>
+            <span class="eyebrow">MAPPING VALIDATION</span>
+            <h3>{{ mappingPreview.entity_name }} <span>←</span> {{ mappingPreview.table_name }}</h3>
+            <p>{{ mappingPreview.data_source_name || '未命名数据源' }} · {{ mappingPreview.row_count }} 行样本{{ mappingPreview.truncated ? '（已截断）' : '' }}</p>
+          </div>
+          <el-tag :type="mappingPreview.ok ? 'success' : 'danger'" effect="plain">
+            {{ mappingPreview.ok ? '映射可用' : '需要修正' }}
+          </el-tag>
+        </div>
+        <el-alert
+          v-if="mappingPreview.errors.length"
+          type="error"
+          :closable="false"
+          title="阻塞问题"
+          class="mapping-alert"
+          role="alert"
+        >
+          <ul class="mapping-issue-list">
+            <li v-for="error in mappingPreview.errors" :key="error">{{ error }}</li>
+          </ul>
+        </el-alert>
+        <el-alert
+          v-if="mappingPreview.warnings.length"
+          type="warning"
+          :closable="false"
+          title="提醒"
+          class="mapping-alert"
+        >
+          <ul class="mapping-issue-list">
+            <li v-for="warning in mappingPreview.warnings" :key="warning">{{ warning }}</li>
+          </ul>
+        </el-alert>
+        <div class="mapping-preview-grid">
+          <section class="mapping-coverage">
+            <div class="preview-section-title">属性覆盖</div>
+            <el-table :data="mappingPreview.fields" size="small" empty-text="实体暂无属性">
+              <el-table-column label="实体属性" min-width="150">
+                <template #default="{ row }">
+                  <span>{{ row.property_name }}</span>
+                  <el-tag v-if="row.is_key" size="small" effect="plain" class="field-flag">主键</el-tag>
+                  <el-tag v-else-if="row.is_required" size="small" effect="plain" type="warning" class="field-flag">必填</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="源列" min-width="150">
+                <template #default="{ row }"><span class="mono">{{ row.source_column || '未配置' }}</span></template>
+              </el-table-column>
+              <el-table-column label="状态" width="100">
+                <template #default="{ row }">
+                  <el-tag size="small" effect="plain" :type="mappingFieldType(row.status)">{{ mappingFieldLabel(row.status) }}</el-tag>
+                </template>
+              </el-table-column>
+            </el-table>
+          </section>
+          <section class="mapping-samples">
+            <div class="preview-section-title">源表样本</div>
+            <el-table :data="mappingPreviewRows" size="small" max-height="300" empty-text="暂无数据">
+              <el-table-column v-for="column in mappingPreview.columns" :key="column" :prop="column" :label="column" min-width="130" show-overflow-tooltip />
+            </el-table>
+          </section>
+        </div>
+        <div v-if="mappingPreview.unmapped_columns.length" class="unmapped-columns">
+          未映射源列：<span v-for="column in mappingPreview.unmapped_columns" :key="column" class="col-map">{{ column }}</span>
+        </div>
+      </div>
+      <el-empty v-else description="暂无预览数据" />
+      <template #footer>
+        <el-button @click="mappingPreviewDlg = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
     <!-- ═══════════ 操作对话框 ═══════════ -->
     <el-dialog v-model="actionDlg" :title="actionForm.id ? '编辑操作' : '添加操作'" width="640px" class="glass-dialog">
       <el-form label-position="top">
@@ -470,6 +559,16 @@
             <el-switch v-model="actionForm.enabled" />
           </el-form-item>
         </div>
+        <div class="form-row">
+          <el-form-item label="执行前需要确认" class="form-col">
+            <el-switch v-model="actionForm.requires_confirmation" />
+            <div class="form-help">确认前只允许预演，不会调用执行器</div>
+          </el-form-item>
+          <el-form-item label="要求幂等键" class="form-col">
+            <el-switch v-model="actionForm.idempotency_required" />
+            <div class="form-help">防止同一请求重复执行</div>
+          </el-form-item>
+        </div>
         <el-form-item label="执行配置（JSON，按执行方式不同而不同）">
           <el-input v-model="actionForm.executor_config_text" type="textarea" :rows="5" class="mono" placeholder='{"data_source_id": "...", "sql": "SELECT ..."}' />
         </el-form-item>
@@ -480,6 +579,60 @@
       <template #footer>
         <el-button @click="actionDlg = false">取消</el-button>
         <el-button type="primary" @click="saveAction">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ═══════════ 操作参数与安全执行对话框 ═══════════ -->
+    <el-dialog v-model="actionExecuteDlg" :title="`执行操作：${actionExecuteRow?.name || ''}`" width="640px" class="glass-dialog">
+      <el-alert
+        :title="`权限范围：${actionExecuteRow?.permission_scope || 'scenario'} · ${actionExecuteRow?.requires_confirmation === false ? '可直接执行' : '需要确认后执行'}`"
+        type="info"
+        :closable="false"
+        show-icon
+      />
+      <el-form label-position="top" class="action-params-form">
+        <el-form-item
+          v-for="field in actionParameterFields"
+          :key="field.name"
+          :label="`${field.name}${field.required ? ' *' : ''}`"
+        >
+          <div v-if="field.description" class="action-param-hint">{{ field.description }}</div>
+          <el-select v-if="field.schema.enum" v-model="actionParamsForm[field.name]" style="width:100%">
+            <el-option v-for="option in field.schema.enum" :key="String(option)" :label="String(option)" :value="option" />
+          </el-select>
+          <el-input-number
+            v-else-if="field.schema.type === 'number' || field.schema.type === 'integer'"
+            v-model="actionParamsForm[field.name]"
+            :precision="field.schema.type === 'integer' ? 0 : undefined"
+            controls-position="right"
+            style="width:100%"
+          />
+          <el-switch v-else-if="field.schema.type === 'boolean'" v-model="actionParamsForm[field.name]" />
+          <el-input
+            v-else-if="field.schema.type === 'array' || field.schema.type === 'object'"
+            v-model="actionParamsText[field.name]"
+            type="textarea"
+            :rows="3"
+            class="mono"
+            :placeholder="field.schema.type === 'array' ? '请输入 JSON 数组' : '请输入 JSON 对象'"
+          />
+          <el-input v-else v-model="actionParamsForm[field.name]" :placeholder="field.schema.default !== undefined ? `默认值：${field.schema.default}` : '请输入参数'" />
+        </el-form-item>
+        <el-empty v-if="!actionParameterFields.length" :image-size="56" description="此操作无需输入参数" />
+      </el-form>
+      <div class="action-execution-meta">
+        <span>幂等键</span>
+        <code class="mono">{{ actionIdempotencyKey }}</code>
+        <span class="muted">本次确认执行保持不变</span>
+      </div>
+      <el-alert v-if="actionPreviewResult" class="action-preview-alert" type="success" :closable="false" show-icon>
+        <template #title>预演完成：未调用执行器，可确认执行</template>
+        <pre class="action-preview-text mono">{{ JSON.stringify(actionPreviewResult.result?.plan || actionPreviewResult.result, null, 2) }}</pre>
+      </el-alert>
+      <template #footer>
+        <el-button @click="actionExecuteDlg = false">取消</el-button>
+        <el-button :loading="actionPreviewing" @click="previewActionExecution">预演</el-button>
+        <el-button type="primary" :loading="actionExecuting" :disabled="!actionPreviewResult" @click="confirmActionExecution">确认执行</el-button>
       </template>
     </el-dialog>
 
@@ -596,7 +749,7 @@ import { api } from '@/api'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import EditorPanel from '@/components/EditorPanel.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
-import type { ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, DataMapping, ObjectDetail, ObjectSearchItem } from '@/types'
+import type { ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, DataMapping, DataMappingPreview, ObjectDetail, ObjectSearchItem } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -854,6 +1007,40 @@ const mappingDlg = ref(false)
 const mappingForm = ref<Partial<DataMapping> & { column_map: Record<string, string> }>({ column_map: {} })
 const mapTables = ref<string[]>([])
 const mapCols = ref<string[]>([])
+const mappingPreviewDlg = ref(false)
+const mappingPreviewLoading = ref(false)
+const mappingPreview = ref<DataMappingPreview | null>(null)
+const mappingPreviewRows = computed(() => {
+  const preview = mappingPreview.value
+  if (!preview) return []
+  return preview.sample_rows.map((row) => Object.fromEntries(
+    preview.columns.map((column, index) => [column, formatMappingValue(row[index])]),
+  ))
+})
+
+function mappingStatusLabel(status?: string) {
+  return ({ unknown: '未检查', ready: '已通过', ok: '已刷新', error: '有错误' } as Record<string, string>)[status || 'unknown'] || '未检查'
+}
+function mappingStatusType(status?: string) {
+  return ({ unknown: 'info', ready: 'success', ok: 'success', error: 'danger' } as Record<string, string>)[status || 'unknown'] || 'info'
+}
+function mappingFieldLabel(status: string) {
+  return ({ mapped: '已映射', missing: '未配置', invalid: '源列不存在' } as Record<string, string>)[status] || status
+}
+function mappingFieldType(status: string) {
+  return ({ mapped: 'success', missing: 'warning', invalid: 'danger' } as Record<string, string>)[status] || 'info'
+}
+function formatMappingValue(value: any): string {
+  if (value === null || value === undefined || value === '') return '—'
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
+function formatDate(value?: string) {
+  if (!value) return ''
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
+
 function openMapping(id?: string) {
   const m = id ? detail.value.mappings.find((x) => x.id === id) : null
   mappingForm.value = m
@@ -885,6 +1072,49 @@ async function saveMapping() {
     ElMessage.success('已保存')
   } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '保存失败') }
 }
+async function doPreviewMapping(row: DataMapping) {
+  if (!row.id) return
+  mappingPreview.value = null
+  mappingPreviewDlg.value = true
+  mappingPreviewLoading.value = true
+  try {
+    mappingPreview.value = await api.previewMapping(row.id)
+  } catch (e: any) {
+    mappingPreviewDlg.value = false
+    ElMessage.error(e?.response?.data?.detail || e?.message || '映射预览失败')
+  } finally {
+    mappingPreviewLoading.value = false
+  }
+}
+async function doTestMapping(row: any) {
+  if (!row.id) return
+  row._testing = true
+  try {
+    const result = await api.testMapping(row.id)
+    mappingPreview.value = result
+    mappingPreviewDlg.value = true
+    if (result.ok) ElMessage.success('映射测试通过')
+    else ElMessage.warning('映射存在需要修正的问题')
+    await load()
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '映射测试失败')
+  } finally { row._testing = false }
+}
+async function doRefreshMapping(row: any) {
+  if (!row.id) return
+  row._refreshing = true
+  try {
+    const result = await api.refreshMapping(row.id)
+    if (!result.ok) {
+      ElMessage.error(result.message || result.last_error || '映射刷新失败')
+      await load()
+      return
+    }
+    ElMessage.success(`刷新完成：扫描 ${result.rows_scanned} 行，新增 ${result.instances_created} 个对象`)
+    await load()
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '映射刷新失败') }
+  finally { row._refreshing = false }
+}
 async function removeMapping(id: string) {
   try {
     await ElMessageBox.confirm('确定删除该映射？', '提示', { type: 'warning' })
@@ -892,24 +1122,49 @@ async function removeMapping(id: string) {
     await load()
   } catch { /* ignore */ }
 }
-async function doImport(row: any) {
-  row._importing = true
-  try {
-    const res = await api.importMapping(row.id)
-    ElMessage.success(`导入 ${res.imported} 条实例`)
-    await load()
-  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '导入失败') }
-  finally { row._importing = false }
-}
 
 // ── 操作（Actions）──
 const actionDlg = ref(false)
 const actionForm = ref<any>({ executor_config_text: '', input_schema_text: '' })
+const actionExecuteDlg = ref(false)
+const actionExecuteRow = ref<any>(null)
+const actionParamsForm = ref<Record<string, any>>({})
+const actionParamsText = ref<Record<string, string>>({})
+const actionPreviewResult = ref<any>(null)
+const actionPreviewing = ref(false)
+const actionExecuting = ref(false)
+const actionIdempotencyKey = ref('')
+
+function actionSchemaRoot(schema: any): { properties: Record<string, any>; required: string[] } {
+  if (!schema || typeof schema !== 'object') return { properties: {}, required: [] }
+  if (schema.properties && typeof schema.properties === 'object') {
+    return { properties: schema.properties, required: Array.isArray(schema.required) ? schema.required : [] }
+  }
+  return { properties: schema, required: [] }
+}
+const actionParameterFields = computed(() => {
+  const root = actionSchemaRoot(actionExecuteRow.value?.input_schema)
+  return Object.entries(root.properties).map(([name, schema]: [string, any]) => ({
+    name,
+    schema: schema && typeof schema === 'object' ? schema : { type: 'string' },
+    required: root.required.includes(name) || schema?.required === true,
+    description: schema?.description || '',
+  }))
+})
+function createIdempotencyKey() {
+  const cryptoApi = globalThis.crypto as Crypto | undefined
+  if (cryptoApi?.randomUUID) return cryptoApi.randomUUID()
+  return `action-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
 function openAction(id?: string) {
   const a = id ? detail.value.actions.find((x) => x.id === id) : null
   actionForm.value = a
     ? { ...a, executor_config_text: JSON.stringify(a.executor_config || {}, null, 2), input_schema_text: JSON.stringify(a.input_schema || {}, null, 2) }
-    : { entity_id: detail.value.entities[0]?.id || '', name: '', description: '', executor_type: 'sql', executor_config_text: '', input_schema_text: '', enabled: true }
+    : {
+        entity_id: detail.value.entities[0]?.id || '', name: '', description: '', executor_type: 'sql',
+        executor_config_text: '', input_schema_text: '', enabled: true,
+        requires_confirmation: true, idempotency_required: true, permission_scope: 'scenario',
+      }
   actionDlg.value = true
 }
 async function saveAction() {
@@ -935,14 +1190,72 @@ async function removeAction(id: string) {
   } catch { /* ignore */ }
 }
 async function doExecuteAction(row: any) {
-  row._executing = true
+  actionExecuteRow.value = row
+  actionParamsForm.value = {}
+  actionParamsText.value = {}
+  actionPreviewResult.value = null
+  actionIdempotencyKey.value = createIdempotencyKey()
+  for (const field of actionParameterFields.value) {
+    const schema = field.schema || {}
+    const defaultValue = schema.default !== undefined
+      ? schema.default
+      : schema.type === 'boolean' ? false
+        : schema.type === 'array' ? []
+          : schema.type === 'object' ? {} : ''
+    if (schema.type === 'array' || schema.type === 'object') actionParamsText.value[field.name] = JSON.stringify(defaultValue)
+    else actionParamsForm.value[field.name] = defaultValue
+  }
+  actionExecuteDlg.value = true
+}
+function buildActionParams(): Record<string, any> {
+  const params: Record<string, any> = {}
+  for (const field of actionParameterFields.value) {
+    const schema = field.schema || {}
+    if (schema.type === 'array' || schema.type === 'object') {
+      const text = actionParamsText.value[field.name]?.trim() || ''
+      if (!text && !field.required) continue
+      try { params[field.name] = JSON.parse(text) } catch { throw new Error(`参数 ${field.name} 必须是有效 JSON`) }
+      continue
+    }
+    const value = actionParamsForm.value[field.name]
+    if (value === '' || value === undefined || value === null) {
+      if (field.required) throw new Error(`请填写必填参数：${field.name}`)
+      continue
+    }
+    params[field.name] = value
+  }
+  return params
+}
+async function previewActionExecution() {
+  if (!actionExecuteRow.value?.id) return
+  actionPreviewing.value = true
   try {
-    const params = await promptParams(row.input_schema)
-    const res = await api.executeAction(row.id!, params)
+    const params = buildActionParams()
+    const res = await api.executeAction(actionExecuteRow.value.id, { params, dry_run: true, confirm: false })
+    actionPreviewResult.value = res
+    ElMessage.success('预演完成，未调用执行器')
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '预演失败')
+  } finally { actionPreviewing.value = false }
+}
+async function confirmActionExecution() {
+  if (!actionExecuteRow.value?.id) return
+  actionExecuting.value = true
+  try {
+    const params = buildActionParams()
+    const res = await api.executeAction(actionExecuteRow.value.id, {
+      params,
+      confirm: true,
+      idempotency_key: actionIdempotencyKey.value,
+    })
+    if (res.status === 'idempotent_replay') ElMessage.info('检测到相同幂等键，已返回原执行结果')
+    else if (res.status === 'success') ElMessage.success('操作执行成功')
+    else ElMessage.warning(res.error || '操作执行未成功')
+    actionExecuteDlg.value = false
     showExecResult(res)
   } catch (e: any) {
-    if (e !== 'cancel') ElMessage.error(e?.response?.data?.detail || e?.message || '执行失败')
-  } finally { row._executing = false }
+    ElMessage.error(e?.response?.data?.detail || e?.message || '执行失败')
+  } finally { actionExecuting.value = false }
 }
 
 // ── 规则（Rules）──
@@ -1564,6 +1877,77 @@ onBeforeUnmount(() => {
 }
 
 /* ── 映射对话框 ── */
+.mapping-status-cell {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.mapping-status-cell small { flex-basis: 100%; }
+.mapping-error-icon {
+  color: var(--danger);
+  cursor: help;
+  font-size: 15px;
+}
+.mapping-preview {
+  min-height: 220px;
+}
+.mapping-preview-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.mapping-preview-head h3 {
+  margin: 4px 0 5px;
+  color: var(--text);
+  font-size: 17px;
+  letter-spacing: -.02em;
+}
+.mapping-preview-head h3 span { color: var(--text-3); font-weight: 400; }
+.mapping-preview-head p { margin: 0; color: var(--text-3); font-size: 12px; }
+.mapping-alert { margin-bottom: 10px; }
+.mapping-issue-list {
+  margin: 0;
+  padding-left: 18px;
+  line-height: 1.65;
+}
+.mapping-preview-grid {
+  display: grid;
+  grid-template-columns: minmax(250px, .85fr) minmax(360px, 1.15fr);
+  gap: 14px;
+  margin-top: 14px;
+}
+.mapping-coverage,
+.mapping-samples {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+.preview-section-title {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 800;
+}
+.mapping-coverage :deep(.el-table),
+.mapping-samples :deep(.el-table) { background: transparent; }
+.mapping-coverage :deep(.el-table__inner-wrapper::before),
+.mapping-samples :deep(.el-table__inner-wrapper::before) { display: none; }
+.field-flag { margin-left: 5px; transform: scale(.86); transform-origin: left center; }
+.unmapped-columns {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+  color: var(--text-3);
+  font-size: 11px;
+}
 .colmap-list {
   display: flex;
   flex-direction: column;
@@ -1672,6 +2056,46 @@ onBeforeUnmount(() => {
 .mono {
   font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
   font-size: 12px;
+}
+.form-help,
+.action-param-hint {
+  margin-top: 4px;
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.action-params-form {
+  margin-top: 18px;
+  max-height: 360px;
+  overflow: auto;
+  padding-right: 4px;
+}
+.action-execution-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 9px 11px;
+  color: var(--text-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-size: 12px;
+}
+.action-execution-meta code {
+  color: var(--primary-600);
+  word-break: break-all;
+}
+.action-preview-alert {
+  margin-top: 14px;
+}
+.action-preview-text {
+  max-height: 150px;
+  overflow: auto;
+  margin: 7px 0 0;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 .cond-text {
   word-break: break-all;
@@ -1805,6 +2229,7 @@ onBeforeUnmount(() => {
   .instance-workspace { grid-template-columns: 1fr; overflow: auto; }
   .instance-workspace .graph-stage { min-height: 420px; height: 52vh; }
   .object-explorer { min-height: 540px; }
+  .mapping-preview-grid { grid-template-columns: 1fr; }
 }
 
 /* ── 工作区高度约束：头部固定，画布/表格只在内容区内伸缩 ── */

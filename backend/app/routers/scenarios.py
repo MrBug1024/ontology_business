@@ -1,6 +1,8 @@
 """业务场景 & 本体建模路由。"""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session, joinedload
@@ -29,6 +31,9 @@ from ..schemas import (
     ActionExecutionLogOut,
     DataMappingIn,
     DataMappingOut,
+    DataMappingPreviewOut,
+    DataMappingRefreshOut,
+    DataMappingTestOut,
     EntityIn,
     EntityOut,
     EventIn,
@@ -80,6 +85,23 @@ def _source_in_scenario(db: Session, scenario_id: str, source_id: str) -> DataSo
     if not source or source.scenario_id not in (None, scenario_id):
         raise HTTPException(400, "数据源不属于当前业务场景")
     return source
+
+
+def _mapping_for_request(db: Session, mapping_id: str, writable: bool = False) -> DataMapping:
+    mapping = db.get(DataMapping, mapping_id)
+    if not mapping:
+        raise HTTPException(404, "映射不存在")
+    _scenario_for_request(db, mapping.scenario_id, writable=writable)
+    _source_in_scenario(db, mapping.scenario_id, mapping.data_source_id)
+    return mapping
+
+
+def _mapping_limit(payload: dict | None, default: int, maximum: int) -> int:
+    try:
+        value = int((payload or {}).get("limit", default))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "limit 必须是整数") from exc
+    return max(1, min(value, maximum))
 
 
 def _validate_action_executor(db: Session, scenario_id: str, payload: ActionIn) -> None:
@@ -158,6 +180,9 @@ def _action_out(a: OntologyAction) -> ActionOut:
         precondition=a.precondition,
         postcondition=a.postcondition,
         enabled=a.enabled,
+        requires_confirmation=a.requires_confirmation,
+        idempotency_required=a.idempotency_required,
+        permission_scope=a.permission_scope or "scenario",
         entity_name=a.entity.name if a.entity else "",
         created_at=a.created_at,
     )
@@ -314,6 +339,12 @@ def _mapping_out(m: DataMapping) -> DataMappingOut:
         entity_name=ent.name if ent else "",
         data_source_name=ds.name if ds else "",
         data_source_type=ds.type if ds else "",
+        status=m.status or "unknown",
+        last_error=m.last_error or "",
+        last_checked_at=m.last_checked_at,
+        last_refreshed_at=m.last_refreshed_at,
+        last_row_count=m.last_row_count or 0,
+        last_imported_count=m.last_imported_count or 0,
         created_at=m.created_at,
     )
 
@@ -787,17 +818,93 @@ def delete_mapping(mapping_id: str, db: Session = Depends(get_db)):
     return Msg(message="已删除")
 
 
+@router.post("/mappings/{mapping_id}/preview", response_model=DataMappingPreviewOut)
+def preview_mapping(mapping_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
+    mapping = _mapping_for_request(db, mapping_id)
+    limit = _mapping_limit(payload, 20, 100)
+    try:
+        scenario = _scenario_for_request(db, mapping.scenario_id)
+        return ontology_service.preview_mapping(db, scenario, mapping, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"映射预览失败: {exc}")
+
+
+@router.post("/mappings/{mapping_id}/test", response_model=DataMappingTestOut)
+def test_mapping(mapping_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
+    mapping = _mapping_for_request(db, mapping_id)
+    checked_at = datetime.now(timezone.utc)
+    scenario = _scenario_for_request(db, mapping.scenario_id)
+    try:
+        preview = ontology_service.preview_mapping(db, scenario, mapping, limit=_mapping_limit(payload, 20, 100))
+        mapping.status = "ready" if preview["ok"] else "error"
+        mapping.last_error = "; ".join(preview.get("errors", []))
+        mapping.last_checked_at = checked_at
+        mapping.last_row_count = int(preview.get("row_count", 0))
+        db.commit()
+        return DataMappingTestOut(**preview, status=mapping.status, checked_at=checked_at)
+    except Exception as exc:  # noqa: BLE001
+        mapping.status = "error"
+        mapping.last_error = str(exc)
+        mapping.last_checked_at = checked_at
+        db.commit()
+        ds = mapping.data_source
+        ent = mapping.entity
+        return DataMappingTestOut(
+            mapping_id=mapping.id,
+            entity_name=ent.name if ent else "",
+            data_source_name=ds.name if ds else "",
+            table_name=mapping.table_name,
+            ok=False,
+            message=f"映射测试失败: {exc}",
+            errors=[str(exc)],
+            status="error",
+            checked_at=checked_at,
+        )
+
+
+@router.post("/mappings/{mapping_id}/refresh", response_model=DataMappingRefreshOut)
+def refresh_mapping(mapping_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
+    mapping = _mapping_for_request(db, mapping_id, writable=True)
+    refreshed_at = datetime.now(timezone.utc)
+    scenario = _scenario_for_request(db, mapping.scenario_id)
+    limit = _mapping_limit(payload, 50, 500)
+    try:
+        result = ontology_service.import_instances_from_mapping(db, scenario, mapping, limit=limit)
+        mapping.status = "ok"
+        mapping.last_error = ""
+        mapping.last_checked_at = refreshed_at
+        mapping.last_refreshed_at = refreshed_at
+        mapping.last_row_count = int(result.get("rows_scanned", 0))
+        mapping.last_imported_count = int(result.get("instances_created", 0))
+        db.commit()
+        return DataMappingRefreshOut(
+            mapping_id=mapping.id,
+            ok=True,
+            status=mapping.status,
+            message="映射刷新完成",
+            rows_scanned=int(result.get("rows_scanned", 0)),
+            instances_created=int(result.get("instances_created", 0)),
+            relations_created=int(result.get("relations_created", 0)),
+            last_refreshed_at=refreshed_at,
+        )
+    except Exception as exc:  # noqa: BLE001
+        mapping.status = "error"
+        mapping.last_error = str(exc)
+        mapping.last_checked_at = refreshed_at
+        db.commit()
+        return DataMappingRefreshOut(
+            mapping_id=mapping.id,
+            ok=False,
+            status="error",
+            message=f"映射刷新失败: {exc}",
+            last_error=str(exc),
+        )
+
+
 @router.post("/mappings/{mapping_id}/import")
 def import_mapping(mapping_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
-    m = db.get(DataMapping, mapping_id)
-    if not m:
-        raise HTTPException(404, "映射不存在")
-    s = _scenario_for_request(db, m.scenario_id, writable=True)
-    limit = int((payload or {}).get("limit", 50))
-    try:
-        return ontology_service.import_instances_from_mapping(db, s, m, limit=limit)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(400, f"导入失败: {exc}")
+    """兼容旧客户端：旧的“导入实例”接口复用新的刷新状态闭环。"""
+    return refresh_mapping(mapping_id, payload, db).model_dump()
 
 
 # ── 操作（Actions）────────────────────────────
@@ -844,9 +951,17 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
     a = db.get(OntologyAction, action_id)
     if not a:
         raise HTTPException(404, "操作不存在")
-    _scenario_for_request(db, a.scenario_id)
+    # 执行属于写入边界：公共场景可以查看/预演，但只有场景所属租户可确认执行。
+    _scenario_for_request(db, a.scenario_id, writable=not payload.dry_run)
     try:
-        return workflow_service.execute_action(db, a, payload.params)
+        return workflow_service.execute_action(
+            db,
+            a,
+            payload.params,
+            confirm=payload.confirm,
+            dry_run=payload.dry_run,
+            idempotency_key=payload.idempotency_key,
+        )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"执行失败: {exc}")
 
@@ -980,7 +1095,7 @@ def execute_workflow(workflow_id: str, payload: WorkflowExecuteRequest, db: Sess
     w = db.get(OntologyWorkflow, workflow_id)
     if not w:
         raise HTTPException(404, "工作流不存在")
-    _scenario_for_request(db, w.scenario_id)
+    _scenario_for_request(db, w.scenario_id, writable=True)
     try:
         return workflow_service.execute_workflow(db, w, payload.params)
     except Exception as exc:  # noqa: BLE001
@@ -1016,6 +1131,8 @@ def list_execution_logs(scenario_id: str, limit: int = 50, db: Session = Depends
             target_name=l.target_name,
             input_params=l.input_params or {},
             status=l.status,
+            mode=l.mode or "execute",
+            idempotency_key=l.idempotency_key,
             result=l.result or {},
             error=l.error,
             duration_ms=l.duration_ms,

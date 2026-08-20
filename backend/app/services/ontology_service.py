@@ -329,20 +329,126 @@ def apply_generated_ontology(db: Session, scenario: BusinessScenario, data: dict
 # ──────────────────────────────────────────────
 # 数据映射 → 实例导入
 # ──────────────────────────────────────────────
-def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mapping: DataMapping, limit: int = 50) -> dict[str, Any]:
-    """按数据映射从数据库表导入实例，并按外键列自动推断关系实例。"""
+def _mapping_context(
+    db: Session,
+    scenario: BusinessScenario,
+    mapping: DataMapping,
+) -> tuple[DataSource, OntologyEntity]:
+    if mapping.scenario_id != scenario.id:
+        raise ValueError("映射不属于当前业务场景")
     ds = db.get(DataSource, mapping.data_source_id)
-    if not ds or ds.type == "file_bucket":
+    if not ds or ds.scenario_id not in (None, scenario.id):
+        raise ValueError("映射对应的数据源不存在或不属于当前业务场景")
+    if ds.type == "file_bucket":
         raise ValueError("该映射的数据源不是数据库类型")
     ent = db.get(OntologyEntity, mapping.entity_id)
-    if not ent:
-        raise ValueError("映射对应的实体不存在")
-
-    col_map = mapping.column_map or {}
-    if not mapping.table_name:
+    if not ent or ent.scenario_id != scenario.id:
+        raise ValueError("映射对应的实体不存在或不属于当前业务场景")
+    if not mapping.table_name.strip():
         raise ValueError("请先选择映射的表")
+    return ds, ent
 
-    result = datasource_service.run_query(ds, f'SELECT * FROM "{mapping.table_name}"', limit=limit)
+
+def _quoted_mapping_table(table_name: str) -> str:
+    """只接受简单表名或 schema.table，避免映射表名拼接出多语句 SQL。"""
+    parts = [part.strip() for part in table_name.split(".")]
+    if not parts or len(parts) > 2 or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", part) for part in parts):
+        raise ValueError("表名格式不合法，请重新选择数据源中的表")
+    return ".".join(f'"{part}"' for part in parts)
+
+
+def preview_mapping(
+    db: Session,
+    scenario: BusinessScenario,
+    mapping: DataMapping,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """读取映射源表样本并检查属性覆盖，不创建或修改对象实例。"""
+    ds, ent = _mapping_context(db, scenario, mapping)
+    sample_limit = max(1, min(int(limit or 20), 100))
+    result = datasource_service.run_query(
+        ds,
+        f"SELECT * FROM {_quoted_mapping_table(mapping.table_name)}",
+        limit=sample_limit,
+    )
+    columns = [str(column) for column in result.get("columns", [])]
+    available_columns = set(columns)
+    col_map = {str(key): str(value) for key, value in (mapping.column_map or {}).items() if value}
+    known_properties = {prop.name for prop in ent.properties}
+    fields: list[dict[str, Any]] = []
+    missing_properties: list[str] = []
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    for prop in ent.properties:
+        source_column = col_map.get(prop.name, "")
+        source_exists = bool(source_column and source_column in available_columns)
+        status = "mapped" if source_exists else "missing" if not source_column else "invalid"
+        fields.append(
+            {
+                "property_name": prop.name,
+                "data_type": prop.data_type,
+                "is_key": prop.is_key,
+                "is_required": prop.is_required,
+                "source_column": source_column,
+                "source_exists": source_exists,
+                "status": status,
+            }
+        )
+        if not source_exists:
+            missing_properties.append(prop.name)
+            if not source_column:
+                message = f"属性“{prop.name}”尚未配置源列"
+            else:
+                message = f"属性“{prop.name}”引用的源列“{source_column}”不存在"
+            if prop.is_key or prop.is_required:
+                errors.append(message)
+            else:
+                warnings.append(message)
+
+    for property_name, source_column in col_map.items():
+        if property_name not in known_properties:
+            errors.append(f"映射引用了不存在的实体属性“{property_name}”")
+
+    mapped_source_columns = set(col_map.values())
+    unmapped_columns = [column for column in columns if column not in mapped_source_columns]
+    if unmapped_columns:
+        warnings.append(f"源表还有 {len(unmapped_columns)} 个列未映射")
+    if not result.get("rows"):
+        warnings.append("源表当前没有数据，刷新时不会创建对象")
+    if result.get("truncated"):
+        warnings.append(f"仅展示前 {sample_limit} 行样本")
+
+    ok = not errors
+    return {
+        "mapping_id": mapping.id,
+        "entity_name": ent.name,
+        "data_source_name": ds.name,
+        "table_name": mapping.table_name,
+        "ok": ok,
+        "message": "映射检查通过" if ok else "映射存在需要修正的问题",
+        "columns": columns,
+        "sample_rows": result.get("rows", []),
+        "row_count": int(result.get("row_count", 0)),
+        "truncated": bool(result.get("truncated", False)),
+        "fields": fields,
+        "missing_properties": missing_properties,
+        "unmapped_columns": unmapped_columns,
+        "warnings": warnings,
+        "errors": errors,
+    }
+
+
+def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mapping: DataMapping, limit: int = 50) -> dict[str, Any]:
+    """按数据映射从数据库表导入实例，并按外键列自动推断关系实例。"""
+    ds, ent = _mapping_context(db, scenario, mapping)
+    col_map = mapping.column_map or {}
+
+    result = datasource_service.run_query(
+        ds,
+        f"SELECT * FROM {_quoted_mapping_table(mapping.table_name)}",
+        limit=limit,
+    )
     rows = result.get("rows", [])
     columns = result.get("columns", [])
     if not rows:

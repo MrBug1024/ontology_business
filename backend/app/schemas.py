@@ -229,7 +229,58 @@ class DataMappingOut(DataMappingIn):
     entity_name: str = ""
     data_source_name: str = ""
     data_source_type: str = ""
+    status: str = "unknown"
+    last_error: str = ""
+    last_checked_at: datetime | None = None
+    last_refreshed_at: datetime | None = None
+    last_row_count: int = 0
+    last_imported_count: int = 0
     created_at: datetime
+
+
+class DataMappingFieldPreviewOut(BaseModel):
+    property_name: str
+    data_type: str = "string"
+    is_key: bool = False
+    is_required: bool = False
+    source_column: str = ""
+    source_exists: bool = False
+    status: Literal["mapped", "missing", "invalid"] = "missing"
+
+
+class DataMappingPreviewOut(BaseModel):
+    mapping_id: str
+    entity_name: str = ""
+    data_source_name: str = ""
+    table_name: str = ""
+    ok: bool = True
+    message: str = ""
+    columns: list[str] = []
+    sample_rows: list[list[Any]] = []
+    row_count: int = 0
+    truncated: bool = False
+    fields: list[DataMappingFieldPreviewOut] = []
+    missing_properties: list[str] = []
+    unmapped_columns: list[str] = []
+    warnings: list[str] = []
+    errors: list[str] = []
+
+
+class DataMappingTestOut(DataMappingPreviewOut):
+    status: str = "unknown"
+    checked_at: datetime
+
+
+class DataMappingRefreshOut(BaseModel):
+    mapping_id: str
+    ok: bool = True
+    status: str = "unknown"
+    message: str = ""
+    rows_scanned: int = 0
+    instances_created: int = 0
+    relations_created: int = 0
+    last_refreshed_at: datetime | None = None
+    last_error: str = ""
 
 
 class ScenarioDetail(ScenarioOut):
@@ -497,6 +548,9 @@ class ActionIn(BaseModel):
     precondition: str = ""
     postcondition: str = ""
     enabled: bool = True
+    requires_confirmation: bool = True
+    idempotency_required: bool = True
+    permission_scope: Literal["scenario"] = "scenario"
 
 
 class ActionOut(ActionIn):
@@ -575,6 +629,8 @@ class ActionExecutionLogOut(BaseModel):
     target_name: str
     input_params: dict = {}
     status: str
+    mode: str = "execute"
+    idempotency_key: str | None = None
     result: dict = {}
     error: str = ""
     duration_ms: int = 0
@@ -585,6 +641,9 @@ class ActionExecutionLogOut(BaseModel):
 
 class ActionExecuteRequest(BaseModel):
     params: dict = Field(default_factory=dict)
+    dry_run: bool = False
+    confirm: bool = False
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class WorkflowExecuteRequest(BaseModel):

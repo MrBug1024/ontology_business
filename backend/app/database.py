@@ -87,6 +87,73 @@ def _migrate_workflows_dag() -> None:
             conn.exec_driver_sql("ALTER TABLE ontology_workflows ADD COLUMN edges JSON DEFAULT '[]'")
 
 
+def _migrate_data_mapping_status() -> None:
+    """为已有数据映射补充检查、刷新和错误状态字段。"""
+    if not _settings.database_url.startswith("sqlite"):
+        return
+    with engine.begin() as conn:
+        existing = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info('data_mappings')").fetchall()
+        }
+        if not existing:
+            return
+        columns = {
+            "status": "VARCHAR(20) DEFAULT 'unknown'",
+            "last_error": "TEXT DEFAULT ''",
+            "last_checked_at": "DATETIME",
+            "last_refreshed_at": "DATETIME",
+            "last_row_count": "INTEGER DEFAULT 0",
+            "last_imported_count": "INTEGER DEFAULT 0",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.exec_driver_sql(f"ALTER TABLE data_mappings ADD COLUMN {name} {definition}")
+
+
+def _migrate_action_safety() -> None:
+    """为已有 Action 和执行日志补充确认、幂等和执行模式字段。"""
+    if not _settings.database_url.startswith("sqlite"):
+        return
+    with engine.begin() as conn:
+        action_columns = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info('ontology_actions')").fetchall()
+        }
+        if action_columns:
+            for name, definition in {
+                "requires_confirmation": "BOOLEAN DEFAULT 1",
+                "idempotency_required": "BOOLEAN DEFAULT 1",
+                "permission_scope": "VARCHAR(30) DEFAULT 'scenario'",
+            }.items():
+                if name not in action_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE ontology_actions ADD COLUMN {name} {definition}"
+                    )
+
+        log_columns = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info('action_execution_logs')").fetchall()
+        }
+        if log_columns:
+            for name, definition in {
+                "mode": "VARCHAR(20) DEFAULT 'execute'",
+                "idempotency_key": "VARCHAR(120)",
+            }.items():
+                if name not in log_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE action_execution_logs ADD COLUMN {name} {definition}"
+                    )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_action_execution_logs_idempotency_key "
+                "ON action_execution_logs (idempotency_key)"
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_action_execution_logs_idempotency "
+                "ON action_execution_logs (scenario_id, target_type, target_id, idempotency_key)"
+            )
+
+
 def _migrate_tenancy() -> None:
     """为已有平台表补充租户列；旧数据在首个用户注册时认领。"""
     if not _settings.database_url.startswith("sqlite"):
@@ -176,5 +243,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_data_sources_nullable_scenario()
     _migrate_workflows_dag()
+    _migrate_data_mapping_status()
+    _migrate_action_safety()
     _migrate_tenancy()
     _migrate_assistant_scopes()

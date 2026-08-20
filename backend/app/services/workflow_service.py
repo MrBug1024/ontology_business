@@ -16,6 +16,7 @@ import time
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
@@ -29,7 +30,7 @@ from ..models import (
     OntologyWorkflow,
 )
 from . import datasource_service, skill_service, mcp_service, llm_service, tenant_service
-from .policies import PolicyViolation, validate_workflow_graph
+from .policies import PolicyViolation, validate_action_params, validate_workflow_graph
 
 
 # ──────────────────────────────────────────────
@@ -115,39 +116,211 @@ def evaluate_rule(rule: OntologyRule, record: dict[str, Any]) -> dict[str, Any]:
 # ──────────────────────────────────────────────
 # 操作执行器
 # ──────────────────────────────────────────────
-def execute_action(db: Session, action: OntologyAction, params: dict[str, Any]) -> dict[str, Any]:
-    """执行单个操作，记录执行日志，返回结果。"""
+def _permission_summary(action: OntologyAction, confirmed: bool) -> dict[str, Any]:
+    """返回给 UI/审计日志的统一权限判定，不把权限判断留给前端。"""
+    scope = action.permission_scope or "scenario"
+    return {
+        "allowed": scope == "scenario",
+        "scope": scope,
+        "requires_confirmation": bool(action.requires_confirmation),
+        "confirmed": confirmed,
+        "reason": "当前用户拥有业务场景的写入权限" if scope == "scenario" else "不支持的权限范围",
+    }
+
+
+def _action_plan(action: OntologyAction, params: dict[str, Any]) -> dict[str, Any]:
+    """生成预演计划；只返回执行元数据和参数，不调用任何执行器。"""
+    config = action.executor_config or {}
+    plan = {
+        "action_id": action.id,
+        "action_name": action.name,
+        "executor_type": action.executor_type,
+        "parameter_count": len(params),
+        "parameters": params,
+        "side_effects_skipped": True,
+    }
+    if action.executor_type == "sql":
+        plan["data_source_id"] = config.get("data_source_id", "")
+        plan["sql_template"] = str(config.get("sql", ""))[:2000]
+    elif action.executor_type == "http":
+        plan["method"] = str(config.get("method", "GET")).upper()
+        plan["url"] = str(config.get("url", ""))[:500]
+    elif action.executor_type in {"skill", "mcp", "script"}:
+        plan["target"] = str(
+            config.get("tool_name") or config.get("skill_name") or config.get("script") or ""
+        )
+    return plan
+
+
+def _response_from_log(log: ActionExecutionLog, status: str | None = None) -> dict[str, Any]:
+    return {
+        "log_id": log.id,
+        "status": status or log.status,
+        "result": log.result or {},
+        "error": log.error or "",
+        "duration_ms": log.duration_ms or 0,
+        "idempotency_key": log.idempotency_key,
+        "permission": {"allowed": True, "scope": "scenario", "confirmed": True},
+    }
+
+
+def _find_idempotent_log(db: Session, action: OntologyAction, key: str) -> ActionExecutionLog | None:
+    return db.execute(
+        select(ActionExecutionLog)
+        .where(
+            ActionExecutionLog.scenario_id == action.scenario_id,
+            ActionExecutionLog.target_type == "action",
+            ActionExecutionLog.target_id == action.id,
+            ActionExecutionLog.idempotency_key == key,
+            ActionExecutionLog.mode == "execute",
+        )
+        .order_by(ActionExecutionLog.created_at.desc())
+    ).scalars().first()
+
+
+def _idempotent_replay(
+    existing: ActionExecutionLog,
+    normalized: dict[str, Any],
+    permission: dict[str, Any],
+) -> dict[str, Any]:
+    if (existing.input_params or {}) != normalized:
+        raise PolicyViolation("同一个 idempotency_key 不能复用不同的参数")
+    replay = _response_from_log(existing, status="idempotent_replay")
+    replay["original_status"] = existing.status
+    replay["permission"] = permission
+    return replay
+
+
+def preview_action(db: Session, action: OntologyAction, params: dict[str, Any]) -> dict[str, Any]:
+    """校验参数并生成 Action 预演，不触发 SQL/HTTP/脚本/MCP/Skill。"""
+    if not action.enabled:
+        raise PolicyViolation("操作已禁用")
+    normalized = validate_action_params(action.input_schema or {}, params)
+    plan = _action_plan(action, normalized)
+    permission = _permission_summary(action, confirmed=False)
+    if not permission["allowed"]:
+        raise PolicyViolation("操作权限范围不受支持")
     start = time.time()
     log = ActionExecutionLog(
         scenario_id=action.scenario_id,
         target_type="action",
         target_id=action.id,
         target_name=action.name,
-        input_params=params,
-        status="running",
+        input_params=normalized,
+        status="dry_run",
+        mode="dry_run",
+        result={"plan": plan, "permission": permission},
+        duration_ms=int((time.time() - start) * 1000),
     )
     db.add(log)
-    db.flush()
+    db.commit()
+    db.refresh(log)
+    return {
+        "log_id": log.id,
+        "status": "dry_run",
+        "result": log.result,
+        "error": "",
+        "duration_ms": log.duration_ms,
+        "requires_confirmation": bool(action.requires_confirmation),
+        "permission": permission,
+        "idempotency_key": None,
+    }
+
+
+def execute_action(
+    db: Session,
+    action: OntologyAction,
+    params: dict[str, Any],
+    *,
+    confirm: bool = True,
+    dry_run: bool = False,
+    idempotency_key: str | None = None,
+    enforce_policy: bool = True,
+) -> dict[str, Any]:
+    """执行单个操作，统一完成参数校验、权限确认和幂等日志。"""
+    if dry_run:
+        return preview_action(db, action, params)
+    if not action.enabled:
+        raise PolicyViolation("操作已禁用")
+    normalized = validate_action_params(action.input_schema or {}, params)
+    permission = _permission_summary(action, confirmed=confirm)
+    if not permission["allowed"]:
+        raise PolicyViolation("操作权限范围不受支持")
+
+    if enforce_policy and action.requires_confirmation and not confirm:
+        log = ActionExecutionLog(
+            scenario_id=action.scenario_id,
+            target_type="action",
+            target_id=action.id,
+            target_name=action.name,
+            input_params=normalized,
+            status="confirmation_required",
+            mode="confirmation",
+            # 确认提醒不占用幂等键；真正的 execute 记录才会保留并竞争该键。
+            idempotency_key=None,
+            result={"permission": permission},
+        )
+        db.add(log)
+        db.commit()
+        db.refresh(log)
+        response = _response_from_log(log)
+        response.update({
+            "status": "confirmation_required",
+            "requires_confirmation": True,
+            "permission": permission,
+            "idempotency_key": idempotency_key,
+        })
+        return response
+
+    if enforce_policy and action.idempotency_required and not idempotency_key:
+        raise PolicyViolation("执行操作必须提供 idempotency_key")
+
+    if enforce_policy and idempotency_key:
+        existing = _find_idempotent_log(db, action, idempotency_key)
+        if existing:
+            return _idempotent_replay(existing, normalized, permission)
+
+    start = time.time()
+    log = ActionExecutionLog(
+        scenario_id=action.scenario_id,
+        target_type="action",
+        target_id=action.id,
+        target_name=action.name,
+        input_params=normalized,
+        status="running",
+        mode="execute",
+        idempotency_key=idempotency_key,
+    )
+    db.add(log)
+    # 先提交 running 占位记录，再调用外部执行器；这样并发请求会在副作用前竞争同一幂等键。
+    if enforce_policy and idempotency_key:
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            existing = _find_idempotent_log(db, action, idempotency_key)
+            if existing:
+                return _idempotent_replay(existing, normalized, permission)
+            raise
+        db.refresh(log)
+    else:
+        db.flush()
 
     try:
-        result = _dispatch_executor(db, action, params)
+        result = _dispatch_executor(db, action, normalized)
         log.status = "success"
         log.result = result if isinstance(result, dict) else {"output": str(result)[:2000]}
     except Exception as exc:  # noqa: BLE001
         log.status = "failed"
         log.error = str(exc)
-        result = {"error": str(exc)}
+        log.result = {"error": str(exc)}
 
     log.duration_ms = int((time.time() - start) * 1000)
     db.commit()
     db.refresh(log)
-    return {
-        "log_id": log.id,
-        "status": log.status,
-        "result": log.result or {},
-        "error": log.error,
-        "duration_ms": log.duration_ms,
-    }
+    response = _response_from_log(log)
+    response.update({"requires_confirmation": bool(action.requires_confirmation), "permission": permission})
+    return response
 
 
 def _dispatch_executor(db: Session, action: OntologyAction, params: dict[str, Any]) -> Any:
@@ -376,9 +549,9 @@ def execute_workflow(db: Session, workflow: OntologyWorkflow, params: dict[str, 
         if workflow.nodes:
             validate_workflow_graph(workflow.nodes, workflow.edges or [])
         if workflow.nodes:
-            step_results = _execute_dag(db, workflow, params)
+            step_results = _execute_dag(db, workflow, params, execution_id=log.id)
         else:
-            step_results = _execute_steps(db, workflow, params)
+            step_results = _execute_steps(db, workflow, params, execution_id=log.id)
         log.result = {"steps": step_results}
         failed = next((step for step in step_results if step.get("status") == "failed"), None)
         if failed:
@@ -404,7 +577,13 @@ def execute_workflow(db: Session, workflow: OntologyWorkflow, params: dict[str, 
 
 
 # ── 旧版线性 steps（兼容）──
-def _execute_steps(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]) -> list[dict[str, Any]]:
+def _execute_steps(
+    db: Session,
+    workflow: OntologyWorkflow,
+    params: dict[str, Any],
+    *,
+    execution_id: str,
+) -> list[dict[str, Any]]:
     step_results: list[dict[str, Any]] = []
     context: dict[str, Any] = {"params": params}
 
@@ -423,7 +602,14 @@ def _execute_steps(db: Session, workflow: OntologyWorkflow, params: dict[str, An
                 step_result["error"] = f"操作不存在: {action_id}"
             else:
                 step_params = {**params, **step.get("params", {})}
-                r = execute_action(db, action, step_params)
+                r = execute_action(
+                    db,
+                    action,
+                    step_params,
+                    confirm=True,
+                    idempotency_key=f"workflow:{execution_id}:step:{step_num}",
+                    enforce_policy=True,
+                )
                 step_result["status"] = r["status"]
                 step_result["result"] = r.get("result", {})
                 context[f"step_{step_num}"] = r.get("result", {})
@@ -463,7 +649,13 @@ def _execute_steps(db: Session, workflow: OntologyWorkflow, params: dict[str, An
 
 
 # ── 可视化 DAG 执行 ──
-def _execute_dag(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]) -> list[dict[str, Any]]:
+def _execute_dag(
+    db: Session,
+    workflow: OntologyWorkflow,
+    params: dict[str, Any],
+    *,
+    execution_id: str,
+) -> list[dict[str, Any]]:
     """按 DAG 拓扑执行：start → 各节点 → end。
 
     节点类型: start / end / action / rule / llm / event / http / script
@@ -510,7 +702,14 @@ def _execute_dag(db: Session, workflow: OntologyWorkflow, params: dict[str, Any]
                 res["error"] = f"操作不存在: {data.get('action_id', '')}"
             else:
                 step_params = render_template(data.get("params", {}) or {}, ctx)
-                r = execute_action(db, action, step_params)
+                r = execute_action(
+                    db,
+                    action,
+                    step_params,
+                    confirm=True,
+                    idempotency_key=f"workflow:{execution_id}:node:{node_id}",
+                    enforce_policy=True,
+                )
                 res["status"] = r["status"]
                 res["result"] = _wrap_out(r.get("result", {}))
                 res["error"] = r.get("error")

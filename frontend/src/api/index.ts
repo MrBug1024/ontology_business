@@ -9,6 +9,8 @@ import type {
   BucketFile,
   Conversation,
   DataMapping,
+  DataMappingPreview,
+  DataMappingRefresh,
   DataSource,
   GraphData,
   LLMConfig,
@@ -154,13 +156,17 @@ export const api = {
   // 数据映射
   createMapping: (sid: string, d: Partial<DataMapping>) => http.post(`/scenarios/${sid}/mappings`, d),
   deleteMapping: (mid: string) => http.delete(`/scenarios/mappings/${mid}`),
+  previewMapping: (mid: string, limit = 20) => http.post<DataMappingPreview>(`/scenarios/mappings/${mid}/preview`, { limit }),
+  testMapping: (mid: string, limit = 20) => http.post<DataMappingPreview>(`/scenarios/mappings/${mid}/test`, { limit }),
+  refreshMapping: (mid: string, limit = 50) => http.post<DataMappingRefresh>(`/scenarios/mappings/${mid}/refresh`, { limit }),
   importMapping: (mid: string, limit = 50) => http.post(`/scenarios/mappings/${mid}/import`, { limit }),
 
   // 操作（Actions）
   createAction: (sid: string, d: any) => http.post(`/scenarios/${sid}/actions`, d),
   updateAction: (id: string, d: any) => http.put(`/scenarios/actions/${id}`, d),
   deleteAction: (id: string) => http.delete(`/scenarios/actions/${id}`),
-  executeAction: (id: string, params: any) => http.post(`/scenarios/actions/${id}/execute`, { params }),
+  executeAction: (id: string, payload: { params: any; dry_run?: boolean; confirm?: boolean; idempotency_key?: string }) =>
+    http.post(`/scenarios/actions/${id}/execute`, payload),
 
   // 规则（Rules）
   createRule: (sid: string, d: any) => http.post(`/scenarios/${sid}/rules`, d),

@@ -307,7 +307,14 @@ class AgentContext:
                 if not a:
                     names = "、".join(x.name for x in self.actions)
                     return f"未找到操作: {key}（可用操作: {names}，请用 list_actions 查看 id）"
-                r = workflow_service.execute_action(self.db, a, args.get("params", {}))
+                # 助手工具调用也必须经过显式确认；对话模型不能绕过页面的预演/幂等执行链路。
+                r = workflow_service.execute_action(
+                    self.db,
+                    a,
+                    args.get("params", {}),
+                    confirm=False,
+                    enforce_policy=True,
+                )
                 return _dump(r)
             if name == "list_rules":
                 return _dump(

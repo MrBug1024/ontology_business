@@ -68,6 +68,103 @@ def validate_read_only_sql(sql: str) -> str:
     return statement
 
 
+def _action_schema_root(schema: Any) -> dict[str, Any]:
+    """兼容完整 JSON Schema 和早期的扁平字段 Schema。"""
+    if schema in (None, {}):
+        return {"type": "object", "properties": {}, "additionalProperties": True}
+    if not isinstance(schema, dict):
+        raise PolicyViolation("Action 输入 Schema 必须是 JSON 对象")
+    if "properties" in schema or "required" in schema or schema.get("type") == "object":
+        root = dict(schema)
+    else:
+        root = {"type": "object", "properties": schema, "additionalProperties": False}
+    if root.get("type", "object") != "object":
+        raise PolicyViolation("Action 输入 Schema 顶层必须是 object")
+    if not isinstance(root.get("properties", {}), dict):
+        raise PolicyViolation("Action 输入 Schema 的 properties 必须是对象")
+    return root
+
+
+def _validate_action_value(path: str, value: Any, schema: dict[str, Any]) -> None:
+    if "enum" in schema and value not in schema["enum"]:
+        raise PolicyViolation(f"参数 {path} 必须是枚举值: {schema['enum']}")
+
+    expected = schema.get("type")
+    if isinstance(expected, list):
+        expected_types = expected
+    elif expected:
+        expected_types = [expected]
+    else:
+        expected_types = []
+    if expected_types and not any(
+        (kind == "string" and isinstance(value, str))
+        or (kind == "number" and isinstance(value, (int, float)) and not isinstance(value, bool))
+        or (kind == "integer" and isinstance(value, int) and not isinstance(value, bool))
+        or (kind == "boolean" and isinstance(value, bool))
+        or (kind == "array" and isinstance(value, list))
+        or (kind == "object" and isinstance(value, dict))
+        or (kind == "null" and value is None)
+        for kind in expected_types
+    ):
+        raise PolicyViolation(f"参数 {path} 类型错误，期望 {expected}")
+
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            raise PolicyViolation(f"参数 {path} 长度不能少于 {schema['minLength']}")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            raise PolicyViolation(f"参数 {path} 长度不能超过 {schema['maxLength']}")
+        if schema.get("pattern"):
+            try:
+                matched = re.search(str(schema["pattern"]), value)
+            except re.error as exc:
+                raise PolicyViolation(f"参数 {path} 的 pattern 无效") from exc
+            if not matched:
+                raise PolicyViolation(f"参数 {path} 不符合格式要求")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            raise PolicyViolation(f"参数 {path} 不能小于 {schema['minimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            raise PolicyViolation(f"参数 {path} 不能大于 {schema['maximum']}")
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            raise PolicyViolation(f"参数 {path} 至少需要 {schema['minItems']} 项")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            raise PolicyViolation(f"参数 {path} 最多允许 {schema['maxItems']} 项")
+        if isinstance(schema.get("items"), dict):
+            for index, item in enumerate(value):
+                _validate_action_value(f"{path}[{index}]", item, schema["items"])
+    if isinstance(value, dict) and schema.get("properties"):
+        properties = schema["properties"]
+        required = set(schema.get("required", []))
+        for key, child_schema in properties.items():
+            if not isinstance(child_schema, dict):
+                raise PolicyViolation(f"参数 {path}.{key} 的 Schema 无效")
+            if key not in value:
+                if key in required or child_schema.get("required") is True:
+                    if "default" not in child_schema:
+                        raise PolicyViolation(f"缺少必填参数: {path}.{key}")
+                continue
+            _validate_action_value(f"{path}.{key}", value[key], child_schema)
+        if schema.get("additionalProperties") is False:
+            unknown = set(value) - set(properties)
+            if unknown:
+                raise PolicyViolation(f"存在未声明参数: {path}.{sorted(unknown)[0]}")
+
+
+def validate_action_params(schema: Any, params: Any) -> dict[str, Any]:
+    """校验 Action 参数类型、必填项和约束，并返回可安全使用的参数副本。"""
+    if not isinstance(params, dict):
+        raise PolicyViolation("Action 参数必须是 JSON 对象")
+    root = _action_schema_root(schema)
+    normalized = dict(params)
+    properties = root.get("properties", {})
+    for key, child_schema in properties.items():
+        if key not in normalized and isinstance(child_schema, dict) and "default" in child_schema:
+            normalized[key] = child_schema["default"]
+    _validate_action_value("params", normalized, root)
+    return normalized
+
+
 def validate_workflow_graph(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:
     """校验工作流 DAG 的节点、连线、可达性和分支完整性。"""
     if not nodes:

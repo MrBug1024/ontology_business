@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.main import app
+from app.models import DataSource, OntologyEntity
 from app.schemas import ObjectProvenanceOut, ObjectSearchItemOut, ObjectSearchOut
-from app.services.policies import PolicyViolation, validate_read_only_sql, validate_workflow_graph
+from app.services.policies import PolicyViolation, validate_action_params, validate_read_only_sql, validate_workflow_graph
 from app.services.auth_service import hash_password, verify_password
+from app.services.ontology_service import _quoted_mapping_table, preview_mapping
 from app.services.workflow_service import evaluate_condition
 from app.routers.assistant import _context_scope, _intent, _sse
 
@@ -20,6 +24,37 @@ class SQLPolicyTests(unittest.TestCase):
         for sql in ("UPDATE records SET value = 1", "WITH x AS (DELETE FROM records) SELECT * FROM x", "SELECT 1; SELECT 2"):
             with self.assertRaises(PolicyViolation):
                 validate_read_only_sql(sql)
+
+
+class ActionPolicyTests(unittest.TestCase):
+    def test_validates_full_json_schema_and_defaults(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "minLength": 2},
+                "count": {"type": "integer", "minimum": 1, "default": 1},
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        }
+        self.assertEqual(
+            validate_action_params(schema, {"name": "ok", "enabled": True}),
+            {"name": "ok", "enabled": True, "count": 1},
+        )
+
+    def test_validates_legacy_flat_schema_and_rejects_wrong_values(self) -> None:
+        self.assertEqual(
+            validate_action_params({"priority": {"type": "integer"}}, {"priority": 2}),
+            {"priority": 2},
+        )
+        with self.assertRaises(PolicyViolation):
+            validate_action_params({"priority": {"type": "integer"}}, {"priority": "2"})
+        with self.assertRaises(PolicyViolation):
+            validate_action_params(
+                {"type": "object", "properties": {"kind": {"type": "string", "enum": ["A", "B"]}}, "required": ["kind"]},
+                {"kind": "C"},
+            )
 
 
 class WorkflowPolicyTests(unittest.TestCase):
@@ -122,6 +157,60 @@ class ObjectRuntimeTests(unittest.TestCase):
         result = ObjectSearchOut(items=[item], total=1, limit=50, offset=0)
         self.assertEqual(result.items[0].provenance.table_name, "supplier_master")
         self.assertEqual(result.items[0].relation_count, 2)
+
+
+class MappingRuntimeTests(unittest.TestCase):
+    def test_mapping_runtime_routes_are_registered(self) -> None:
+        paths = {route.path for route in app.routes}
+        self.assertIn("/api/scenarios/mappings/{mapping_id}/preview", paths)
+        self.assertIn("/api/scenarios/mappings/{mapping_id}/test", paths)
+        self.assertIn("/api/scenarios/mappings/{mapping_id}/refresh", paths)
+
+    def test_preview_reports_mapping_coverage_and_unmapped_columns(self) -> None:
+        scenario = SimpleNamespace(id="scenario-1")
+        data_source = SimpleNamespace(id="source-1", scenario_id=None, type="sqlite", name="业务库")
+        entity = SimpleNamespace(
+            id="entity-1",
+            scenario_id="scenario-1",
+            name="供应商",
+            properties=[
+                SimpleNamespace(name="编码", data_type="string", is_key=True, is_required=True),
+                SimpleNamespace(name="名称", data_type="string", is_key=False, is_required=True),
+            ],
+        )
+        mapping = SimpleNamespace(
+            id="mapping-1",
+            scenario_id="scenario-1",
+            data_source_id="source-1",
+            entity_id="entity-1",
+            table_name="supplier_master",
+            column_map={"编码": "supplier_id", "名称": "supplier_name"},
+        )
+
+        class FakeDb:
+            def get(self, model, _id):
+                return data_source if model is DataSource else entity if model is OntologyEntity else None
+
+        with patch(
+            "app.services.ontology_service.datasource_service.run_query",
+            return_value={
+                "columns": ["supplier_id", "supplier_name", "unused"],
+                "rows": [["SUP-001", "华东供应商", "x"]],
+                "row_count": 1,
+                "truncated": False,
+            },
+        ):
+            result = preview_mapping(FakeDb(), scenario, mapping)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["fields"][0]["status"], "mapped")
+        self.assertEqual(result["unmapped_columns"], ["unused"])
+        self.assertTrue(result["warnings"])
+
+    def test_mapping_table_name_is_restricted_to_identifiers(self) -> None:
+        self.assertEqual(_quoted_mapping_table("public.suppliers"), '"public"."suppliers"')
+        with self.assertRaises(ValueError):
+            _quoted_mapping_table('suppliers"; DROP TABLE users')
 
 
 if __name__ == "__main__":

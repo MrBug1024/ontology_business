@@ -148,7 +148,55 @@ export interface DataMapping {
   entity_name?: string
   data_source_name?: string
   data_source_type?: string
+  status?: 'unknown' | 'ready' | 'ok' | 'error' | string
+  last_error?: string
+  last_checked_at?: string
+  last_refreshed_at?: string
+  last_row_count?: number
+  last_imported_count?: number
   created_at?: string
+}
+
+export interface DataMappingFieldPreview {
+  property_name: string
+  data_type: string
+  is_key: boolean
+  is_required: boolean
+  source_column: string
+  source_exists: boolean
+  status: 'mapped' | 'missing' | 'invalid'
+}
+
+export interface DataMappingPreview {
+  mapping_id: string
+  entity_name: string
+  data_source_name: string
+  table_name: string
+  ok: boolean
+  message: string
+  columns: string[]
+  sample_rows: any[][]
+  row_count: number
+  truncated: boolean
+  fields: DataMappingFieldPreview[]
+  missing_properties: string[]
+  unmapped_columns: string[]
+  warnings: string[]
+  errors: string[]
+  status?: string
+  checked_at?: string
+}
+
+export interface DataMappingRefresh {
+  mapping_id: string
+  ok: boolean
+  status: string
+  message: string
+  rows_scanned: number
+  instances_created: number
+  relations_created: number
+  last_refreshed_at?: string
+  last_error?: string
 }
 
 export interface GraphNode {
@@ -190,6 +238,9 @@ export interface OntologyAction {
   precondition?: string
   postcondition?: string
   enabled?: boolean
+  requires_confirmation?: boolean
+  idempotency_required?: boolean
+  permission_scope?: 'scenario' | string
   entity_name?: string
   created_at?: string
 }
@@ -270,6 +321,8 @@ export interface ActionExecutionLog {
   target_name: string
   input_params?: Record<string, any>
   status: string
+  mode?: string
+  idempotency_key?: string
   result?: Record<string, any>
   error?: string
   duration_ms?: number
