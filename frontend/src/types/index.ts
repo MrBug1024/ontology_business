@@ -92,6 +92,52 @@ export interface RelationInstance {
   created_at?: string
 }
 
+export interface ObjectProvenance {
+  kind: string
+  reference: string
+  mapping_id?: string
+  data_source_id?: string
+  data_source_name?: string
+  table_name?: string
+  status?: string
+}
+
+export interface ObjectRelation {
+  id: string
+  direction: 'outgoing' | 'incoming'
+  relation_id: string
+  relation_name?: string
+  relation_type?: string
+  related_object_id: string
+  related_object_name: string
+  related_entity_id: string
+  related_entity_name?: string
+  attributes?: Record<string, any>
+  created_at?: string
+}
+
+export interface ObjectSearchItem extends OntologyInstance {
+  id: string
+  scenario_id: string
+  entity_name: string
+  entity_color: string
+  provenance: ObjectProvenance
+  relation_count: number
+}
+
+export interface ObjectSearchResult {
+  items: ObjectSearchItem[]
+  total: number
+  limit: number
+  offset: number
+  query: string
+  entity_id?: string
+}
+
+export interface ObjectDetail extends ObjectSearchItem {
+  relations: ObjectRelation[]
+}
+
 export interface DataMapping {
   id?: string
   scenario_id?: string

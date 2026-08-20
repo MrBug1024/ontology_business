@@ -16,6 +16,8 @@ import type {
   MCPTool,
   OntologyInstance,
   RelationInstance,
+  ObjectDetail,
+  ObjectSearchResult,
   Scenario,
   ScenarioDetail,
   Skill,
@@ -142,6 +144,12 @@ export const api = {
   createRelationInstance: (sid: string, d: Partial<RelationInstance>) =>
     http.post(`/scenarios/${sid}/relation-instances`, d),
   deleteRelationInstance: (rid: string) => http.delete(`/scenarios/relation-instances/${rid}`),
+
+  // 对象运行时
+  searchObjects: (sid: string, params: { q?: string; entity_id?: string; limit?: number; offset?: number } = {}) =>
+    http.get<ObjectSearchResult>(`/scenarios/${sid}/objects`, { params }),
+  getObject: (sid: string, objectId: string) =>
+    http.get<ObjectDetail>(`/scenarios/${sid}/objects/${objectId}`),
 
   // 数据映射
   createMapping: (sid: string, d: Partial<DataMapping>) => http.post(`/scenarios/${sid}/mappings`, d),

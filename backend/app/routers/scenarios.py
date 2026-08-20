@@ -1,9 +1,9 @@
 """业务场景 & 本体建模路由。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy.orm import Session, joinedload
 
 from ..database import get_db
 from ..models import (
@@ -36,6 +36,11 @@ from ..schemas import (
     InstanceIn,
     InstanceOut,
     Msg,
+    ObjectDetailOut,
+    ObjectProvenanceOut,
+    ObjectRelationOut,
+    ObjectSearchItemOut,
+    ObjectSearchOut,
     PropertyIn,
     RelationIn,
     RelationInstanceIn,
@@ -313,6 +318,93 @@ def _mapping_out(m: DataMapping) -> DataMappingOut:
     )
 
 
+def _object_provenance(
+    db: Session,
+    instance: OntologyInstance,
+    mapping: DataMapping | None = None,
+) -> ObjectProvenanceOut:
+    """把对象的导入来源解析成安全的、可展示的来源摘要。"""
+    if mapping is None:
+        mapping = db.execute(
+            select(DataMapping)
+            .where(
+                DataMapping.scenario_id == instance.scenario_id,
+                DataMapping.entity_id == instance.entity_id,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+    source = mapping.data_source if mapping else None
+    return ObjectProvenanceOut(
+        kind=instance.source or "manual",
+        reference=instance.source_ref or "",
+        mapping_id=mapping.id if mapping else None,
+        data_source_id=source.id if source else None,
+        data_source_name=source.name if source else "",
+        table_name=mapping.table_name if mapping else "",
+        status=source.status if source else "unknown",
+    )
+
+
+def _object_item_out(
+    db: Session,
+    instance: OntologyInstance,
+    *,
+    mapping: DataMapping | None = None,
+    relation_count: int | None = None,
+) -> ObjectSearchItemOut:
+    entity = instance.entity
+    if relation_count is None:
+        relation_ids = {r.id for r in [*instance.source_instances, *instance.target_instances]}
+        relation_count = len(relation_ids)
+    return ObjectSearchItemOut(
+        id=instance.id,
+        scenario_id=instance.scenario_id,
+        entity_id=instance.entity_id,
+        entity_name=entity.name if entity else "",
+        entity_color=entity.color if entity else "",
+        name=instance.name,
+        attributes=instance.attributes or {},
+        source=instance.source or "manual",
+        source_ref=instance.source_ref or "",
+        provenance=_object_provenance(db, instance, mapping),
+        relation_count=relation_count,
+        created_at=instance.created_at,
+    )
+
+
+def _object_detail_out(db: Session, instance: OntologyInstance) -> ObjectDetailOut:
+    item = _object_item_out(db, instance)
+    relations: list[ObjectRelationOut] = []
+    seen: set[str] = set()
+    for relation_instance in [*instance.source_instances, *instance.target_instances]:
+        if relation_instance.id in seen:
+            continue
+        seen.add(relation_instance.id)
+        outgoing = relation_instance.source_instance_id == instance.id
+        related = relation_instance.target_instance if outgoing else relation_instance.source_instance
+        relation = relation_instance.relation
+        if not related:
+            continue
+        related_entity = related.entity
+        relations.append(
+            ObjectRelationOut(
+                id=relation_instance.id,
+                direction="outgoing" if outgoing else "incoming",
+                relation_id=relation_instance.relation_id,
+                relation_name=relation.name if relation else "",
+                relation_type=(relation.relation_type if relation else ""),
+                related_object_id=related.id,
+                related_object_name=related.name,
+                related_entity_id=related.entity_id,
+                related_entity_name=related_entity.name if related_entity else "",
+                attributes=relation_instance.attributes or {},
+                created_at=relation_instance.created_at,
+            )
+        )
+    relations.sort(key=lambda r: (r.direction, r.relation_name, r.related_object_name))
+    return ObjectDetailOut(**item.model_dump(), relations=relations)
+
+
 @router.get("/{scenario_id}", response_model=ScenarioDetail)
 def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id)
@@ -362,6 +454,99 @@ def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
 def scenario_graph(scenario_id: str, mode: str = "schema", db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id)
     return ontology_service.build_graph(s, mode=mode)
+
+
+@router.get("/{scenario_id}/objects", response_model=ObjectSearchOut)
+def search_objects(
+    scenario_id: str,
+    q: str = Query(default="", max_length=200),
+    entity_id: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """对象运行时搜索：只返回当前场景可见对象及安全来源摘要。"""
+    _scenario_for_request(db, scenario_id)
+    filters = [OntologyInstance.scenario_id == scenario_id]
+    if entity_id:
+        _entity_in_scenario(db, scenario_id, entity_id)
+        filters.append(OntologyInstance.entity_id == entity_id)
+    query = q.strip()
+    if query:
+        pattern = f"%{query}%"
+        filters.append(
+            or_(
+                OntologyInstance.name.ilike(pattern),
+                cast(OntologyInstance.attributes, String).ilike(pattern),
+            )
+        )
+    total = int(db.scalar(select(func.count()).select_from(OntologyInstance).where(*filters)) or 0)
+    instances = db.execute(
+        select(OntologyInstance)
+        .options(joinedload(OntologyInstance.entity))
+        .where(*filters)
+        .order_by(OntologyInstance.created_at.desc(), OntologyInstance.name.asc())
+        .offset(offset)
+        .limit(limit)
+    ).scalars().all()
+    instance_ids = [instance.id for instance in instances]
+    mappings_by_entity: dict[str, DataMapping] = {}
+    if instances:
+        mappings_by_entity = {
+            mapping.entity_id: mapping
+            for mapping in db.execute(
+                select(DataMapping)
+                .where(
+                    DataMapping.scenario_id == scenario_id,
+                    DataMapping.entity_id.in_({instance.entity_id for instance in instances}),
+                )
+            ).scalars().all()
+        }
+    relation_ids_by_instance: dict[str, set[str]] = {instance_id: set() for instance_id in instance_ids}
+    if instance_ids:
+        relation_rows = db.execute(
+            select(
+                RelationInstance.id,
+                RelationInstance.source_instance_id,
+                RelationInstance.target_instance_id,
+            ).where(
+                or_(
+                    RelationInstance.source_instance_id.in_(instance_ids),
+                    RelationInstance.target_instance_id.in_(instance_ids),
+                )
+            )
+        ).all()
+        for relation_id, source_instance_id, target_instance_id in relation_rows:
+            if source_instance_id in relation_ids_by_instance:
+                relation_ids_by_instance[source_instance_id].add(relation_id)
+            if target_instance_id in relation_ids_by_instance:
+                relation_ids_by_instance[target_instance_id].add(relation_id)
+    return ObjectSearchOut(
+        items=[
+            _object_item_out(
+                db,
+                instance,
+                mapping=mappings_by_entity.get(instance.entity_id),
+                relation_count=len(relation_ids_by_instance.get(instance.id, set())),
+            )
+            for instance in instances
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+        query=query,
+        entity_id=entity_id,
+    )
+
+
+@router.get("/{scenario_id}/objects/{object_id}", response_model=ObjectDetailOut)
+def get_object(scenario_id: str, object_id: str, db: Session = Depends(get_db)):
+    """返回对象属性、邻接关系和来源追踪信息。"""
+    _scenario_for_request(db, scenario_id)
+    instance = db.get(OntologyInstance, object_id)
+    if not instance or instance.scenario_id != scenario_id:
+        raise HTTPException(404, "对象不存在")
+    return _object_detail_out(db, instance)
 
 
 @router.put("/{scenario_id}", response_model=ScenarioOut)

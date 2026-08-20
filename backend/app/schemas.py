@@ -162,6 +162,60 @@ class RelationInstanceOut(RelationInstanceIn):
     created_at: datetime
 
 
+class ObjectProvenanceOut(BaseModel):
+    """对象来源：保留可追溯信息，但不泄露数据源连接配置。"""
+
+    kind: str = "manual"
+    reference: str = ""
+    mapping_id: str | None = None
+    data_source_id: str | None = None
+    data_source_name: str = ""
+    table_name: str = ""
+    status: str = "unknown"
+
+
+class ObjectRelationOut(BaseModel):
+    id: str
+    direction: Literal["outgoing", "incoming"]
+    relation_id: str
+    relation_name: str = ""
+    relation_type: str = ""
+    related_object_id: str
+    related_object_name: str = ""
+    related_entity_id: str = ""
+    related_entity_name: str = ""
+    attributes: dict = Field(default_factory=dict)
+    created_at: datetime
+
+
+class ObjectSearchItemOut(BaseModel):
+    id: str
+    scenario_id: str
+    entity_id: str
+    entity_name: str = ""
+    entity_color: str = ""
+    name: str
+    attributes: dict = Field(default_factory=dict)
+    source: str = "manual"
+    source_ref: str = ""
+    provenance: ObjectProvenanceOut
+    relation_count: int = 0
+    created_at: datetime
+
+
+class ObjectSearchOut(BaseModel):
+    items: list[ObjectSearchItemOut] = []
+    total: int = 0
+    limit: int = 50
+    offset: int = 0
+    query: str = ""
+    entity_id: str | None = None
+
+
+class ObjectDetailOut(ObjectSearchItemOut):
+    relations: list[ObjectRelationOut] = []
+
+
 class DataMappingIn(BaseModel):
     entity_id: str
     data_source_id: str

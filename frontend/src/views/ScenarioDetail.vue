@@ -55,6 +55,7 @@
           <div class="tab-stats">
             <span class="stat">实例 <b>{{ detail.instances.length }}</b></span>
             <span class="stat">关系实例 <b>{{ detail.relation_instances.length }}</b></span>
+            <span class="stat stat-runtime">运行时对象 <b>{{ objectTotal }}</b></span>
           </div>
           <div class="tab-actions">
             <el-select v-model="instFilter" placeholder="全部实体" clearable size="small" class="inst-filter">
@@ -63,24 +64,125 @@
             <el-button size="small" type="primary" @click="openInstance()"><el-icon><Plus /></el-icon> 添加实例</el-button>
           </div>
         </div>
-        <div class="graph-stage">
-          <GraphCanvas
-            :data="instanceGraph"
-            mode="instance"
-            :legend="legend"
-            empty-text="暂无实例，点击「添加实例」创建"
-            @select="onInstSelect"
-            @canvas-click="clearSelection"
-          />
-          <EditorPanel
-            v-if="editor"
-            :editor="editor"
-            :entities="detail.entities"
-            :saving="saving"
-            @save="saveEditor"
-            @delete="deleteEditor"
-            @close="closeEditor"
-          />
+        <div class="instance-workspace">
+          <div class="graph-stage">
+            <GraphCanvas
+              :data="instanceGraph"
+              mode="instance"
+              :legend="legend"
+              empty-text="暂无实例，点击「添加实例」创建"
+              @select="onInstSelect"
+              @canvas-click="clearSelection"
+            />
+            <EditorPanel
+              v-if="editor"
+              :editor="editor"
+              :entities="detail.entities"
+              :saving="saving"
+              @save="saveEditor"
+              @delete="deleteEditor"
+              @close="closeEditor"
+            />
+          </div>
+          <aside class="object-explorer" aria-label="对象浏览器">
+            <div class="explorer-head">
+              <div>
+                <span class="eyebrow">OBJECT RUNTIME</span>
+                <h3>对象浏览</h3>
+              </div>
+              <el-button
+                text
+                circle
+                :loading="objectLoading"
+                aria-label="刷新对象列表"
+                title="刷新对象列表"
+                @click="searchObjects"
+              ><el-icon><Refresh /></el-icon></el-button>
+            </div>
+            <div class="explorer-tools">
+              <el-input
+                v-model="objectQuery"
+                clearable
+                placeholder="搜索对象名称或属性"
+                aria-label="搜索对象名称或属性"
+                @keyup.enter="searchObjects"
+                @clear="searchObjects"
+              >
+                <template #prefix><el-icon><Search /></el-icon></template>
+              </el-input>
+              <span class="explorer-hint">回车搜索 · {{ objectTotal }} 个结果</span>
+            </div>
+            <div class="object-list" v-loading="objectLoading">
+              <button
+                v-for="item in objectItems"
+                :key="item.id"
+                type="button"
+                class="object-row"
+                :class="{ active: selectedObjectId === item.id }"
+                @click="selectObject(item.id)"
+              >
+                <span class="object-dot" :style="{ background: item.entity_color || 'var(--primary)' }"></span>
+                <span class="object-row-main">
+                  <strong>{{ item.name }}</strong>
+                  <small>{{ item.entity_name || '未分类' }} · {{ item.relation_count }} 条关系</small>
+                </span>
+                <el-icon class="object-arrow"><ArrowRight /></el-icon>
+              </button>
+              <div v-if="!objectLoading && !objectItems.length" class="object-empty">
+                <el-icon><Search /></el-icon>
+                <span>{{ objectQuery ? '没有匹配对象，试试更短的关键词' : '暂无可浏览对象' }}</span>
+              </div>
+            </div>
+            <div v-if="objectDetail" class="object-detail" aria-live="polite">
+              <div class="object-detail-head">
+                <div class="object-title-wrap">
+                  <span class="object-detail-dot" :style="{ background: objectDetail.entity_color || 'var(--primary)' }"></span>
+                  <div>
+                    <strong>{{ objectDetail.name }}</strong>
+                    <small>{{ objectDetail.entity_name }}</small>
+                  </div>
+                </div>
+                <el-button size="small" text type="primary" @click="openInstance(objectDetail.id)">编辑</el-button>
+              </div>
+              <div class="object-meta-line">
+                <span class="runtime-badge" :class="`is-${objectDetail.provenance.kind}`">{{ objectDetail.provenance.kind === 'imported' ? '已导入' : '手动' }}</span>
+                <span v-if="objectDetail.provenance.reference" class="mono">{{ objectDetail.provenance.reference }}</span>
+              </div>
+              <div class="object-detail-section">
+                <div class="detail-section-title">属性 <span>{{ Object.keys(objectDetail.attributes || {}).length }}</span></div>
+                <div v-if="Object.keys(objectDetail.attributes || {}).length" class="attribute-grid">
+                  <div v-for="(value, key) in objectDetail.attributes" :key="key" class="attribute-item">
+                    <span>{{ key }}</span>
+                    <strong>{{ formatObjectValue(value) }}</strong>
+                  </div>
+                </div>
+                <span v-else class="muted">暂无属性值</span>
+              </div>
+              <div class="object-detail-section">
+                <div class="detail-section-title">来源追踪</div>
+                <div class="provenance-card">
+                  <span>{{ objectDetail.provenance.data_source_name || '手动创建' }}</span>
+                  <small v-if="objectDetail.provenance.table_name">{{ objectDetail.provenance.table_name }}</small>
+                  <small v-else>当前对象没有绑定数据映射</small>
+                </div>
+              </div>
+              <div class="object-detail-section">
+                <div class="detail-section-title">关系 <span>{{ objectDetail.relations.length }}</span></div>
+                <button
+                  v-for="relation in objectDetail.relations"
+                  :key="relation.id"
+                  type="button"
+                  class="relation-row"
+                  @click="selectObject(relation.related_object_id)"
+                >
+                  <span class="relation-direction">{{ relation.direction === 'outgoing' ? '出' : '入' }}</span>
+                  <span><strong>{{ relation.relation_name || '关联' }}</strong> · {{ relation.related_object_name }}</span>
+                  <el-icon><ArrowRight /></el-icon>
+                </button>
+                <span v-if="!objectDetail.relations.length" class="muted">暂无关系</span>
+              </div>
+            </div>
+          </aside>
         </div>
       </el-tab-pane>
 
@@ -494,7 +596,7 @@ import { api } from '@/api'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import EditorPanel from '@/components/EditorPanel.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
-import type { ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, DataMapping } from '@/types'
+import type { ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, DataMapping, ObjectDetail, ObjectSearchItem } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -511,6 +613,12 @@ const llmConfigs = ref<any[]>([])
 const tab = ref('ontology')
 const instFilter = ref('')
 const saving = ref(false)
+const objectQuery = ref('')
+const objectItems = ref<ObjectSearchItem[]>([])
+const objectTotal = ref(0)
+const objectLoading = ref(false)
+const selectedObjectId = ref<string | null>(null)
+const objectDetail = ref<ObjectDetail | null>(null)
 
 const graphPalette = ['#27b9b0', '#438be5', '#65a9df', '#4aa9c1', '#52c3a1', '#6f93d7']
 function visualColor(color: string | undefined, index: number) {
@@ -522,8 +630,14 @@ function visualColor(color: string | undefined, index: number) {
 
 // ── 悬浮编辑面板状态 ──
 const editor = ref<{ kind: 'entity' | 'relation' | 'instance'; id?: string; form: any } | null>(null)
-// 切换 tab 时关闭悬浮编辑器，避免跨 tab 状态残留
-watch(tab, () => { editor.value = null })
+// 切换 tab 时关闭悬浮编辑器，避免跨 tab 状态残留；进入实例页时刷新对象运行时列表。
+watch(tab, (value) => {
+  editor.value = null
+  if (value === 'instances') searchObjects()
+})
+watch(instFilter, () => {
+  if (tab.value === 'instances') searchObjects()
+})
 
 // ── 图谱数据 ──
 const schemaGraph = computed<GraphData>(() => {
@@ -579,6 +693,44 @@ function entColor(id: string) {
 }
 function dsName(id: string) { return dataSources.value.find((d) => d.id === id)?.name || '—' }
 
+// ── 对象运行时浏览 ──
+async function searchObjects() {
+  objectLoading.value = true
+  try {
+    const result = await api.searchObjects(sid, {
+      q: objectQuery.value.trim() || undefined,
+      entity_id: instFilter.value || undefined,
+      limit: 50,
+    })
+    objectItems.value = result.items
+    objectTotal.value = result.total
+    if (selectedObjectId.value && !result.items.some((item) => item.id === selectedObjectId.value)) {
+      selectedObjectId.value = null
+      objectDetail.value = null
+    }
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '对象列表加载失败')
+  } finally {
+    objectLoading.value = false
+  }
+}
+
+async function selectObject(id: string) {
+  selectedObjectId.value = id
+  try {
+    objectDetail.value = await api.getObject(sid, id)
+  } catch (e: any) {
+    objectDetail.value = null
+    ElMessage.error(e?.response?.data?.detail || e?.message || '对象详情加载失败')
+  }
+}
+
+function formatObjectValue(value: any): string {
+  if (value === null || value === undefined || value === '') return '—'
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
+
 // ── 选择 → 打开悬浮编辑器 ──
 function onNodeSelect(node: any) {
   window.dispatchEvent(new CustomEvent('ontology-selection-change', {
@@ -592,7 +744,10 @@ function onInstSelect(node: any) {
     detail: { id: node.id, kind: node.id.startsWith('ent:') ? 'entity' : 'instance', label: node.label || node.name || node.id },
   }))
   if (node.id.startsWith('ent:')) openEntity(node.id.slice(4))
-  else openInstance(node.id)
+  else {
+    openInstance(node.id)
+    selectObject(node.id)
+  }
 }
 function onEdgeClick(edge: any) {
   window.dispatchEvent(new CustomEvent('ontology-selection-change', {
@@ -609,6 +764,8 @@ function onAddRelation(sourceId: string, targetId: string) {
 }
 function clearSelection() {
   editor.value = null
+  selectedObjectId.value = null
+  objectDetail.value = null
   window.dispatchEvent(new CustomEvent('ontology-selection-change', { detail: {} }))
 }
 function closeEditor() { editor.value = null }
@@ -988,6 +1145,7 @@ async function load() {
     detail.value = await api.getScenario(sid)
     dataSources.value = await api.listDataSources()
     llmConfigs.value = await api.listLLM()
+    await searchObjects()
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.detail || '加载失败')
   }
@@ -1136,6 +1294,212 @@ onBeforeUnmount(() => {
 }
 .graph-stage :deep(.graph-wrap) {
   height: 100%;
+}
+
+/* ── 对象运行时浏览器 ── */
+.instance-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+}
+.instance-workspace .graph-stage {
+  min-width: 0;
+}
+.object-explorer {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  box-shadow: var(--shadow-sm);
+}
+.explorer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 14px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.explorer-head h3 {
+  margin: 3px 0 0;
+  color: var(--text);
+  font-size: 15px;
+  letter-spacing: -.02em;
+}
+.eyebrow {
+  color: var(--primary-600);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .13em;
+}
+.explorer-tools {
+  padding: 10px 12px 8px;
+}
+.explorer-hint {
+  display: block;
+  margin: 6px 2px 0;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.object-list {
+  flex: 1 1 42%;
+  min-height: 120px;
+  overflow: auto;
+  padding: 0 8px 8px;
+}
+.object-row,
+.relation-row {
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.object-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 54px;
+  padding: 8px 8px;
+}
+.object-row:hover,
+.relation-row:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+.object-row:focus-visible,
+.relation-row:focus-visible {
+  border-color: var(--primary);
+  background: var(--surface-2);
+  outline: 2px solid color-mix(in srgb, var(--primary) 55%, transparent);
+  outline-offset: 2px;
+}
+.object-row.active {
+  border-color: color-mix(in srgb, var(--primary) 38%, var(--border));
+  background: var(--primary-soft);
+}
+.object-dot,
+.object-detail-dot {
+  flex: 0 0 auto;
+  border-radius: 50%;
+}
+.object-dot {
+  width: 9px;
+  height: 9px;
+}
+.object-row-main {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+.object-row-main strong,
+.object-row-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.object-row-main strong { font-size: 12.5px; }
+.object-row-main small { color: var(--text-3); font-size: 11px; }
+.object-arrow { color: var(--text-3); font-size: 14px; }
+.object-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 90px;
+  padding: 12px;
+  color: var(--text-3);
+  font-size: 12px;
+  text-align: center;
+}
+.object-detail {
+  flex: 1 1 58%;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  padding: 13px 12px 16px;
+}
+.object-detail-head,
+.object-title-wrap,
+.object-meta-line {
+  display: flex;
+  align-items: center;
+}
+.object-detail-head { justify-content: space-between; gap: 8px; }
+.object-title-wrap { min-width: 0; gap: 9px; }
+.object-detail-dot { width: 11px; height: 11px; }
+.object-title-wrap div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.object-title-wrap strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.object-title-wrap small { color: var(--text-3); font-size: 11px; }
+.object-meta-line { flex-wrap: wrap; gap: 7px; margin: 10px 0 12px; }
+.runtime-badge {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: var(--text-2);
+  font-size: 10px;
+}
+.runtime-badge.is-imported { border-color: color-mix(in srgb, var(--success) 36%, var(--border)); color: var(--success); }
+.object-detail-section { margin-top: 14px; }
+.detail-section-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 7px;
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.detail-section-title span { color: var(--text-3); font-family: 'JetBrains Mono', monospace; font-weight: 500; }
+.attribute-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.attribute-item,
+.provenance-card {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  padding: 7px 8px;
+}
+.attribute-item span,
+.provenance-card small { color: var(--text-3); font-size: 10px; }
+.attribute-item strong,
+.provenance-card span { overflow: hidden; color: var(--text-2); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.provenance-card { gap: 5px; }
+.relation-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 6px 7px;
+  font-size: 11px;
+}
+.relation-row > span:nth-child(2) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.relation-row strong { color: var(--primary-600); }
+.relation-direction {
+  min-width: 18px;
+  border-radius: 4px;
+  background: var(--primary-soft);
+  color: var(--primary-600);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  text-align: center;
 }
 
 /* ── 工作流可视化编排舞台 ── */
@@ -1422,6 +1786,7 @@ onBeforeUnmount(() => {
   color: var(--text-2);
 }
 .stat b { color: var(--primary-600); }
+.stat-runtime { border-color: color-mix(in srgb, var(--primary) 28%, var(--border)); }
 .graph-stage {
   min-height: 500px;
   height: clamp(500px, 62vh, 700px);
@@ -1437,6 +1802,9 @@ onBeforeUnmount(() => {
 @media (max-width: 900px) {
   .sd-page { padding: 18px 16px 22px; }
   .graph-stage { min-height: 440px; height: 58vh; }
+  .instance-workspace { grid-template-columns: 1fr; overflow: auto; }
+  .instance-workspace .graph-stage { min-height: 420px; height: 52vh; }
+  .object-explorer { min-height: 540px; }
 }
 
 /* ── 工作区高度约束：头部固定，画布/表格只在内容区内伸缩 ── */

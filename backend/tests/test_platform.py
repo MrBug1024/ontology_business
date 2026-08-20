@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 
+from app.main import app
+from app.schemas import ObjectProvenanceOut, ObjectSearchItemOut, ObjectSearchOut
 from app.services.policies import PolicyViolation, validate_read_only_sql, validate_workflow_graph
 from app.services.auth_service import hash_password, verify_password
 from app.services.workflow_service import evaluate_condition
@@ -87,6 +90,38 @@ class AssistantIntentTests(unittest.TestCase):
         self.assertTrue(event.startswith("data: "))
         self.assertTrue(event.endswith("\n\n"))
         self.assertIn('"type": "token"', event)
+
+
+class ObjectRuntimeTests(unittest.TestCase):
+    def test_object_runtime_routes_are_registered(self) -> None:
+        paths = {route.path for route in app.routes}
+        self.assertIn("/api/scenarios/{scenario_id}/objects", paths)
+        self.assertIn("/api/scenarios/{scenario_id}/objects/{object_id}", paths)
+
+    def test_object_runtime_contract_keeps_provenance_and_relation_count(self) -> None:
+        item = ObjectSearchItemOut(
+            id="object-1",
+            scenario_id="scenario-1",
+            entity_id="entity-1",
+            entity_name="供应商",
+            entity_color="#27b9b0",
+            name="华东供应商",
+            attributes={"编码": "SUP-001"},
+            source="imported",
+            source_ref="supplier_master:SUP-001",
+            provenance=ObjectProvenanceOut(
+                kind="imported",
+                reference="supplier_master:SUP-001",
+                data_source_name="主数据源",
+                table_name="supplier_master",
+                status="ok",
+            ),
+            relation_count=2,
+            created_at=datetime.now(timezone.utc),
+        )
+        result = ObjectSearchOut(items=[item], total=1, limit=50, offset=0)
+        self.assertEqual(result.items[0].provenance.table_name, "supplier_master")
+        self.assertEqual(result.items[0].relation_count, 2)
 
 
 if __name__ == "__main__":
