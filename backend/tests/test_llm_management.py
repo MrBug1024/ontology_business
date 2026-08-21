@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.database import Base
-from app.models import LLMEvaluationRecord, LLMConfig, LLMInvocationTrace, Tenant
+from app.models import LLMEvaluationRecord, LLMConfig, LLMInvocationTrace, Tenant, User
 from app.routers.llm_configs import (
     _out,
     create_evaluation,
@@ -17,7 +17,7 @@ from app.routers.llm_configs import (
     usage_summary,
 )
 from app.schemas import LLMEvaluationIn, LLMConfigIn
-from app.services import llm_service
+from app.services import llm_service, permission_service
 
 
 class _CompletionClient:
@@ -39,6 +39,18 @@ class _StreamClient:
 
     def create(self, **_kwargs):
         return iter(self.chunks)
+
+
+class _EmbeddingClient:
+    def __init__(self, vectors):
+        self.vectors = vectors
+        self.embeddings = SimpleNamespace(create=self.create)
+
+    def create(self, **_kwargs):
+        return SimpleNamespace(
+            data=[SimpleNamespace(embedding=vector) for vector in self.vectors],
+            usage=SimpleNamespace(prompt_tokens=6, completion_tokens=0, total_tokens=6),
+        )
 
 
 def _response(content: str = "ok", *, prompt_tokens: int = 11, completion_tokens: int = 7):
@@ -63,9 +75,21 @@ class LLMManagementTests(unittest.TestCase):
         Base.metadata.create_all(self.engine)
         self.db = Session(self.engine)
         self.tenant = Tenant(id="tenant-llm", name="模型租户")
-        self.db.add(self.tenant)
+        self.owner = User(
+            id="user-llm-owner",
+            tenant_id=self.tenant.id,
+            email="owner-llm@example.test",
+            password_hash="test-only",
+            status="active",
+        )
+        self.db.add_all([self.tenant, self.owner])
         self.db.commit()
         self.db.info["tenant_id"] = self.tenant.id
+        self.db.info["user_id"] = self.owner.id
+        permission_service.ensure_organization(
+            self.db, self.tenant.id, owner_user_id=self.owner.id
+        )
+        self.db.commit()
         self.config = LLMConfig(
             id="cfg-primary",
             tenant_id=self.tenant.id,
@@ -250,6 +274,63 @@ class LLMManagementTests(unittest.TestCase):
         summary = evaluation_summary(self.config.id, db=self.db)
         self.assertEqual((summary.total, summary.passed, summary.failed), (1, 1, 0))
         self.assertAlmostEqual(summary.average_score, 0.9)
+
+    def test_embedding_runtime_and_trace_context_are_real_provider_calls(self) -> None:
+        embedding = LLMConfig(
+            id="cfg-embedding",
+            tenant_id=self.tenant.id,
+            name="Embedding",
+            model="example-embedding",
+            capabilities=["embedding"],
+            enabled=True,
+            input_cost_per_million=1.0,
+        )
+        self.db.add(embedding)
+        self.db.commit()
+        self.db.info["llm_trace_context"] = {
+            "correlation_id": "request-1",
+            "agent_id": "agent-1",
+            "conversation_id": "conversation-1",
+            "scenario_id": "scenario-1",
+        }
+        with (
+            patch("app.services.llm_service._client", return_value=_EmbeddingClient([[0.2, 0.8]])),
+            patch("app.database.SessionLocal", side_effect=self._trace_session),
+        ):
+            vectors = llm_service.embed(embedding, ["文本"], db=self.db)
+        self.assertEqual(vectors, [[0.2, 0.8]])
+        trace = Session(self.engine).execute(
+            select(LLMInvocationTrace).where(LLMInvocationTrace.llm_config_id == embedding.id)
+        ).scalars().one()
+        self.assertEqual(trace.capability, "embedding")
+        self.assertEqual(trace.correlation_id, "request-1")
+        self.assertEqual(trace.agent_id, "agent-1")
+        self.assertEqual(trace.conversation_id, "conversation-1")
+        self.assertEqual(trace.scenario_id, "scenario-1")
+
+    def test_budget_limit_blocks_provider_before_call(self) -> None:
+        self.config.budget_limit = 0.01
+        self.db.add(
+            LLMInvocationTrace(
+                tenant_id=self.tenant.id,
+                llm_config_id=self.config.id,
+                provider=self.config.provider,
+                model=self.config.model,
+                capability="chat",
+                operation="chat",
+                status="succeeded",
+                estimated_cost=0.01,
+            )
+        )
+        self.db.commit()
+        with patch("app.services.llm_service._client") as client:
+            with self.assertRaises(llm_service.LLMRuntimeError):
+                llm_service.chat(
+                    self.config,
+                    [{"role": "user", "content": "不应发送到 provider"}],
+                    db=self.db,
+                )
+        client.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -10,10 +10,15 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import ipaddress
+import hashlib
 import json
 import re
+import socket
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -29,6 +34,7 @@ from ..models import (
     OntologyEvent,
     OntologyRule,
     OntologyWorkflow,
+    Skill,
 )
 from . import (
     datasource_service,
@@ -36,14 +42,207 @@ from . import (
     mcp_service,
     llm_service,
     permission_service,
+    runtime_connector_service,
+    runtime_definition_service,
     tenant_service,
 )
 from .policies import PolicyViolation, validate_action_params, validate_workflow_graph
 
 
+class WorkflowDeadlineExceeded(PolicyViolation):
+    """Raised before a workflow starts another node after its run deadline."""
+
+
+def _check_deadline(deadline_at: datetime | None) -> None:
+    if deadline_at is None:
+        return
+    deadline = deadline_at if deadline_at.tzinfo else deadline_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) >= deadline:
+        raise WorkflowDeadlineExceeded("任务执行超过配置的超时限制，已停止后续节点")
+
+
+def _workflow_action_status(response: dict[str, Any]) -> tuple[str, str]:
+    """Map idempotent records into safe workflow execution semantics.
+
+    A completed Action is safely replayed as data.  A failed or indeterminate
+    Action is *not* invoked again automatically with a fresh key: doing so could
+    repeat an external side effect whose outcome was never confirmed.
+    """
+    status = str(response.get("status") or "failed")
+    if status != "idempotent_replay":
+        return status, str(response.get("error") or "")
+    original = str(response.get("original_status") or "")
+    if original == "success":
+        return status, ""
+    return "failed", str(response.get("error") or "此前同一幂等操作未成功完成，已阻止自动重放")
+
+
+def _runtime_provenance(
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None,
+    runtime_environment: str | None,
+) -> dict[str, str | None]:
+    """Return auditable, execution-local definition provenance.
+
+    A frozen definition is not optional metadata: its environment must match
+    the deployment assertion and every child action receives the same release
+    pin.  Legacy callers without a definition remain supported for dev-only
+    internal use, but no non-dev route may rely on that compatibility path.
+    """
+    environment = runtime_connector_service.runtime_environment(runtime_environment)
+    if runtime_definition is None:
+        return {
+            "environment": environment,
+            "definition_snapshot_id": None,
+            "release_id": None,
+            "definition_hash": "",
+            "definition_source": "live",
+        }
+    if runtime_definition.environment != environment:
+        raise PolicyViolation("运行定义环境与当前部署环境不一致，已阻止执行")
+    return {
+        "environment": environment,
+        "definition_snapshot_id": runtime_definition.snapshot_id,
+        "release_id": runtime_definition.release_id,
+        "definition_hash": runtime_definition.definition_hash,
+        "definition_source": runtime_definition.source,
+    }
+
+
+def _scoped_idempotency_key(key: str | None, environment: str) -> str | None:
+    """Make external idempotency keys environment-local without widening SQL keys."""
+    if not key:
+        return None
+    scoped = f"{environment}:{key}"
+    if len(scoped) <= 120:
+        return scoped
+    return f"{environment}:sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+
+
+def _definition_resource(
+    db: Session,
+    workflow: Any,
+    *,
+    kind: str,
+    resource_id: str,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None,
+) -> Any | None:
+    """Resolve child resources from the pinned map, never fall back to live."""
+    if runtime_definition is not None:
+        try:
+            return runtime_definition_service.resolve_resource(
+                runtime_definition, kind, resource_id
+            )
+        except runtime_definition_service.RuntimeDefinitionError:
+            return None
+    model = {
+        "action": OntologyAction,
+        "rule": OntologyRule,
+        "event": OntologyEvent,
+    }.get(kind)
+    if model is None:
+        return None
+    resource = db.get(model, resource_id)
+    if resource and resource.scenario_id != workflow.scenario_id:
+        return None
+    return resource
+
+
 def validate_workflow_definition(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:
     """后端统一校验工作流 DAG；前端校验只是交互提示，不能作为安全边界。"""
     validate_workflow_graph(nodes, edges)
+    unsafe_types = sorted(
+        {
+            str(node.get("type") or "")
+            for node in nodes
+            if str(node.get("type") or "") in {"http", "script"}
+        }
+    )
+    if unsafe_types and not get_settings().allow_unsafe_workflow_nodes:
+        labels = "、".join("原生 HTTP" if node_type == "http" else "Python 脚本" for node_type in unsafe_types)
+        raise PolicyViolation(
+            f"{labels} 节点默认停用；请改用经过权限、确认、幂等和审计约束的 Action"
+        )
+
+
+_HTTP_ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
+_HTTP_BLOCKED_HEADERS = {"host", "connection", "proxy-authorization", "proxy-connection"}
+_UNMANAGED_SKILL_CONFIG_FIELDS = {"skill_name", "skill_path", "script", "interpreter"}
+
+
+def _is_public_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except ValueError:
+        return False
+
+
+def validate_http_action_config(config: dict[str, Any]) -> None:
+    """Validate a declarative HTTP Action without performing network I/O."""
+    url = str((config or {}).get("url") or "").strip()
+    if not url:
+        raise PolicyViolation("HTTP Action 需要 url 配置")
+    parsed = urlparse(url)
+    settings = get_settings()
+    if parsed.scheme not in ({"https", "http"} if settings.allow_insecure_http_actions else {"https"}):
+        raise PolicyViolation("HTTP Action 仅允许 HTTPS 目标；受控开发环境需显式开启不安全 HTTP")
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise PolicyViolation("HTTP Action URL 必须包含合法主机，且不能包含用户凭据")
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise PolicyViolation("HTTP Action 不允许访问本机或内网主机")
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+    if literal is not None and not literal.is_global:
+        raise PolicyViolation("HTTP Action 不允许访问本机、私网或保留地址")
+    method = str((config or {}).get("method") or "GET").upper()
+    if method not in _HTTP_ALLOWED_METHODS:
+        raise PolicyViolation("HTTP Action 请求方法不受支持")
+    headers = (config or {}).get("headers") or {}
+    if not isinstance(headers, dict):
+        raise PolicyViolation("HTTP Action headers 必须是对象")
+    blocked = sorted(str(key) for key in headers if str(key).lower() in _HTTP_BLOCKED_HEADERS)
+    if blocked:
+        raise PolicyViolation(f"HTTP Action 不允许设置受控请求头: {', '.join(blocked)}")
+
+
+def validate_skill_action_config(db: Session, config: dict[str, Any]) -> Skill:
+    """Resolve a Skill Action through the governed catalog, never a caller path.
+
+    Action definitions are durable and may be imported or created outside the
+    normal editor. Keeping the lookup here makes execution fail closed for
+    legacy JSON that still contains an arbitrary interpreter, path, or script.
+    """
+    config = config or {}
+    unmanaged = sorted(
+        key for key in _UNMANAGED_SKILL_CONFIG_FIELDS if config.get(key) not in (None, "")
+    )
+    if unmanaged:
+        raise PolicyViolation("Skill Action 只能引用受管理 skill_id，不能包含本地路径或脚本配置")
+    skill_id = str(config.get("skill_id") or "").strip()
+    if not skill_id:
+        raise PolicyViolation("Skill Action 需要已登记的 skill_id")
+    skill = tenant_service.require_visible(db, Skill, skill_id, "操作引用的 Skill 不存在")
+    if not skill.enabled:
+        raise PolicyViolation("操作引用的 Skill 当前已停用")
+    return skill
+
+
+def _assert_public_http_target(url: str) -> None:
+    """Resolve once before connecting and reject private DNS answers/redirect bypasses."""
+    parsed = urlparse(url)
+    validate_http_action_config({"url": url, "method": "GET"})
+    hostname = parsed.hostname or ""
+    try:
+        addresses = {
+            item[4][0]
+            for item in socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+        }
+    except OSError as exc:
+        raise PolicyViolation("HTTP Action 目标主机无法安全解析") from exc
+    if not addresses or any(not _is_public_ip(address) for address in addresses):
+        raise PolicyViolation("HTTP Action 目标解析到本机、私网或保留地址")
 
 
 # ──────────────────────────────────────────────
@@ -149,7 +348,39 @@ def _permission_summary(
     }
 
 
-def _action_plan(action: OntologyAction, params: dict[str, Any]) -> dict[str, Any]:
+def _action_runtime_connector(
+    db: Session,
+    action: Any,
+    *,
+    kind: str,
+    config: dict[str, Any],
+    runtime_environment: str | None = None,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    scenario = db.get(BusinessScenario, action.scenario_id)
+    if not scenario:
+        raise PolicyViolation("操作所属业务场景不存在")
+    try:
+        return runtime_connector_service.resolve_connector(
+            db,
+            scenario,
+            kind=kind,
+            config=config,
+            environment=runtime_environment,
+            release_id=(runtime_definition.release_id if runtime_definition else None),
+        )
+    except runtime_connector_service.RuntimeConnectorError as exc:
+        raise PolicyViolation(str(exc)) from exc
+
+
+def _action_plan(
+    db: Session,
+    action: Any,
+    params: dict[str, Any],
+    *,
+    runtime_environment: str | None = None,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+) -> dict[str, Any]:
     """生成预演计划；只返回执行元数据和参数，不调用任何执行器。"""
     config = action.executor_config or {}
     plan = {
@@ -161,15 +392,42 @@ def _action_plan(action: OntologyAction, params: dict[str, Any]) -> dict[str, An
         "side_effects_skipped": True,
     }
     if action.executor_type == "sql":
-        plan["data_source_id"] = config.get("data_source_id", "")
+        if any(key in config for key in ("data_source_id", "data_source_binding_key", "data_source_binding_ref")):
+            connector, audit = _action_runtime_connector(
+                db,
+                action,
+                kind="data_source",
+                config=config,
+                runtime_environment=runtime_environment,
+                runtime_definition=runtime_definition,
+            )
+            plan["data_source_id"] = str(connector.id)
+            plan["connector_audit"] = [audit]
+        else:
+            plan["data_source_id"] = ""
         plan["sql_template"] = str(config.get("sql", ""))[:2000]
+    elif action.executor_type == "mcp":
+        if any(key in config for key in ("mcp_id", "mcp_binding_key", "mcp_binding_ref")):
+            connector, audit = _action_runtime_connector(
+                db,
+                action,
+                kind="mcp",
+                config=config,
+                runtime_environment=runtime_environment,
+                runtime_definition=runtime_definition,
+            )
+            plan["mcp_id"] = str(connector.id)
+            plan["connector_audit"] = [audit]
+        else:
+            plan["mcp_id"] = ""
+        plan["target"] = str(config.get("tool_name") or "")
     elif action.executor_type == "http":
         plan["method"] = str(config.get("method", "GET")).upper()
         plan["url"] = str(config.get("url", ""))[:500]
-    elif action.executor_type in {"skill", "mcp", "script"}:
-        plan["target"] = str(
-            config.get("tool_name") or config.get("skill_name") or config.get("script") or ""
-        )
+    elif action.executor_type == "skill":
+        plan["skill_id"] = str(config.get("skill_id") or "")
+    elif action.executor_type == "script":
+        plan["target"] = "受控脚本"
     return plan
 
 
@@ -178,14 +436,23 @@ def _response_from_log(log: ActionExecutionLog, status: str | None = None) -> di
         "log_id": log.id,
         "status": status or log.status,
         "result": log.result or {},
+        "connector_audit": log.connector_audit or [],
         "error": log.error or "",
         "duration_ms": log.duration_ms or 0,
         "idempotency_key": log.idempotency_key,
         "permission": {"allowed": True, "scope": "scenario", "confirmed": True},
+        # A direct Action response is the user's first audit surface.  Keep
+        # the immutable execution pin alongside the result (including replay
+        # and confirmation responses) rather than making callers query logs.
+        "environment": log.environment or "dev",
+        "definition_snapshot_id": log.definition_snapshot_id,
+        "release_id": log.release_id,
+        "definition_hash": log.definition_hash or "",
+        "definition_source": log.definition_source or "live",
     }
 
 
-def _find_idempotent_log(db: Session, action: OntologyAction, key: str) -> ActionExecutionLog | None:
+def _find_idempotent_log(db: Session, action: Any, key: str) -> ActionExecutionLog | None:
     return db.execute(
         select(ActionExecutionLog)
         .where(
@@ -212,12 +479,26 @@ def _idempotent_replay(
     return replay
 
 
-def preview_action(db: Session, action: OntologyAction, params: dict[str, Any]) -> dict[str, Any]:
+def preview_action(
+    db: Session,
+    action: Any,
+    params: dict[str, Any],
+    *,
+    runtime_environment: str | None = None,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+) -> dict[str, Any]:
     """校验参数并生成 Action 预演，不触发 SQL/HTTP/脚本/MCP/Skill。"""
     if not action.enabled:
         raise PolicyViolation("操作已禁用")
     normalized = validate_action_params(action.input_schema or {}, params)
-    plan = _action_plan(action, normalized)
+    provenance = _runtime_provenance(runtime_definition, runtime_environment)
+    plan = _action_plan(
+        db,
+        action,
+        normalized,
+        runtime_environment=runtime_environment,
+        runtime_definition=runtime_definition,
+    )
     permission = _permission_summary(db, action, confirmed=False, dry_run=True)
     if not permission["allowed"]:
         raise PolicyViolation("没有预演该操作的权限")
@@ -231,36 +512,49 @@ def preview_action(db: Session, action: OntologyAction, params: dict[str, Any]) 
         status="dry_run",
         mode="dry_run",
         result={"plan": plan, "permission": permission},
+        connector_audit=plan.get("connector_audit", []),
+        **provenance,
         duration_ms=int((time.time() - start) * 1000),
     )
     db.add(log)
     db.commit()
     db.refresh(log)
-    return {
-        "log_id": log.id,
-        "status": "dry_run",
-        "result": log.result,
-        "error": "",
-        "duration_ms": log.duration_ms,
-        "requires_confirmation": bool(action.requires_confirmation),
-        "permission": permission,
-        "idempotency_key": None,
-    }
+    response = _response_from_log(log, status="dry_run")
+    response.update(
+        {
+            "requires_confirmation": bool(action.requires_confirmation),
+            "permission": permission,
+            "idempotency_key": None,
+        }
+    )
+    return response
 
 
 def execute_action(
     db: Session,
-    action: OntologyAction,
+    action: Any,
     params: dict[str, Any],
     *,
     confirm: bool = True,
     dry_run: bool = False,
     idempotency_key: str | None = None,
     enforce_policy: bool = True,
+    runtime_environment: str | None = None,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
 ) -> dict[str, Any]:
     """执行单个操作，统一完成参数校验、权限确认和幂等日志。"""
     if dry_run:
-        return preview_action(db, action, params)
+        return preview_action(
+            db,
+            action,
+            params,
+            runtime_environment=runtime_environment,
+            runtime_definition=runtime_definition,
+        )
+    provenance = _runtime_provenance(runtime_definition, runtime_environment)
+    scoped_idempotency_key = _scoped_idempotency_key(
+        idempotency_key, str(provenance["environment"])
+    )
     if not action.enabled:
         raise PolicyViolation("操作已禁用")
     normalized = validate_action_params(action.input_schema or {}, params)
@@ -280,6 +574,7 @@ def execute_action(
             # 确认提醒不占用幂等键；真正的 execute 记录才会保留并竞争该键。
             idempotency_key=None,
             result={"permission": permission},
+            **provenance,
         )
         db.add(log)
         db.commit()
@@ -296,8 +591,8 @@ def execute_action(
     if enforce_policy and action.idempotency_required and not idempotency_key:
         raise PolicyViolation("执行操作必须提供 idempotency_key")
 
-    if enforce_policy and idempotency_key:
-        existing = _find_idempotent_log(db, action, idempotency_key)
+    if enforce_policy and scoped_idempotency_key:
+        existing = _find_idempotent_log(db, action, scoped_idempotency_key)
         if existing:
             return _idempotent_replay(existing, normalized, permission)
 
@@ -310,16 +605,17 @@ def execute_action(
         input_params=normalized,
         status="running",
         mode="execute",
-        idempotency_key=idempotency_key,
+        idempotency_key=scoped_idempotency_key,
+        **provenance,
     )
     db.add(log)
     # 先提交 running 占位记录，再调用外部执行器；这样并发请求会在副作用前竞争同一幂等键。
-    if enforce_policy and idempotency_key:
+    if enforce_policy and scoped_idempotency_key:
         try:
             db.commit()
         except IntegrityError:
             db.rollback()
-            existing = _find_idempotent_log(db, action, idempotency_key)
+            existing = _find_idempotent_log(db, action, scoped_idempotency_key)
             if existing:
                 return _idempotent_replay(existing, normalized, permission)
             raise
@@ -328,9 +624,16 @@ def execute_action(
         db.flush()
 
     try:
-        result = _dispatch_executor(db, action, normalized)
+        result, connector_audit = _dispatch_executor(
+            db,
+            action,
+            normalized,
+            runtime_environment=runtime_environment,
+            runtime_definition=runtime_definition,
+        )
         log.status = "success"
         log.result = result if isinstance(result, dict) else {"output": str(result)[:2000]}
+        log.connector_audit = connector_audit
     except Exception as exc:  # noqa: BLE001
         log.status = "failed"
         log.error = str(exc)
@@ -344,25 +647,66 @@ def execute_action(
     return response
 
 
-def _dispatch_executor(db: Session, action: OntologyAction, params: dict[str, Any]) -> Any:
+def _dispatch_executor(
+    db: Session,
+    action: Any,
+    params: dict[str, Any],
+    *,
+    runtime_environment: str | None = None,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+) -> tuple[Any, list[dict[str, Any]]]:
     """按 executor_type 分发到具体执行器。"""
     etype = action.executor_type
     cfg = action.executor_config or {}
 
+    # A release snapshot intentionally redacts arbitrary HTTP headers and
+    # Skill/Script execution may depend on mutable host state.  Those executor
+    # types are therefore not portable, frozen deployment semantics yet.  Keep
+    # the runtime guard even though publish-time validation rejects new ones.
+    if runtime_definition and runtime_definition.is_frozen and etype in {"http", "skill", "script"}:
+        raise PolicyViolation(f"{etype} Action 不能在已冻结的发布环境执行")
+
     if etype == "sql":
-        return _exec_sql(db, {**cfg, "scenario_id": action.scenario_id}, params)
+        source, audit = _action_runtime_connector(
+            db,
+            action,
+            kind="data_source",
+            config=cfg,
+            runtime_environment=runtime_environment,
+            runtime_definition=runtime_definition,
+        )
+        return _exec_sql(
+            db,
+            {**cfg, "scenario_id": action.scenario_id},
+            params,
+            data_source=source,
+        ), [audit]
     if etype == "skill":
-        return _exec_skill(db, cfg, params)
+        return _exec_skill(db, cfg, params), []
     if etype == "mcp":
-        return _exec_mcp(db, cfg, params)
+        mcp, audit = _action_runtime_connector(
+            db,
+            action,
+            kind="mcp",
+            config=cfg,
+            runtime_environment=runtime_environment,
+            runtime_definition=runtime_definition,
+        )
+        return _exec_mcp(db, cfg, params, mcp=mcp), [audit]
     if etype == "http":
-        return _exec_http(cfg, params)
+        return _exec_http(cfg, params), []
     if etype == "script":
-        return _exec_script(cfg, params)
+        return _exec_script(cfg, params), []
     raise ValueError(f"未知执行器类型: {etype}")
 
 
-def _exec_sql(db: Session, cfg: dict, params: dict) -> Any:
+def _exec_sql(
+    db: Session,
+    cfg: dict,
+    params: dict,
+    *,
+    data_source: DataSource | None = None,
+) -> Any:
     """SQL 执行器：在指定数据源上执行 SQL。
 
     cfg: {data_source_id, sql}
@@ -370,12 +714,12 @@ def _exec_sql(db: Session, cfg: dict, params: dict) -> Any:
     """
     ds_id = cfg.get("data_source_id", "")
     sql = cfg.get("sql", "")
-    if not ds_id or not sql:
+    if not sql or (not ds_id and data_source is None):
         raise ValueError("SQL 执行器需要 data_source_id 和 sql 配置")
     # 参数替换
     for k, v in params.items():
         sql = sql.replace("{%s}" % k, str(v))
-    ds = db.get(DataSource, ds_id)
+    ds = data_source or db.get(DataSource, ds_id)
     if not ds:
         raise ValueError(f"数据源不存在: {ds_id}")
     if ds.scenario_id not in (None, cfg.get("scenario_id")) and cfg.get("scenario_id"):
@@ -384,41 +728,34 @@ def _exec_sql(db: Session, cfg: dict, params: dict) -> Any:
 
 
 def _exec_skill(db: Session, cfg: dict, params: dict) -> Any:
-    """技能执行器：调用已安装技能。
-
-    cfg: {skill_name, skill_path, script, interpreter}
-    params: 命令行参数（list 或 dict）
-    """
-    import os
-    import subprocess
-
-    skill_name = cfg.get("skill_name", "")
-    skill_path = cfg.get("skill_path", "")
-    if not skill_name or not skill_path:
-        raise ValueError("技能执行器需要 skill_name 和 skill_path 配置")
+    """Execute a catalogued enabled Skill with a bounded argument shape."""
+    skill = validate_skill_action_config(db, cfg)
     args = params.get("args", [])
     if isinstance(args, dict):
         args = [str(v) for v in args.values()]
-    cmd = [
-        cfg.get("interpreter", "python"),
-        os.path.join(skill_path, cfg.get("script", "main.py")),
-    ] + [str(a) for a in args]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    return {"stdout": r.stdout[:3000], "stderr": r.stderr[:1000], "exit_code": r.returncode}
+    if not isinstance(args, list):
+        raise ValueError("Skill Action 的 args 必须是数组或对象")
+    result = skill_service.execute_skill(skill, [str(arg) for arg in args], timeout=60)
+    return {
+        "status": str(result.get("status") or "error"),
+        "stdout": str(result.get("stdout") or "")[:3000],
+        "stderr": str(result.get("stderr") or "")[:1000],
+        "exit_code": int(result.get("exit_code") or 0),
+    }
 
 
-def _exec_mcp(db: Session, cfg: dict, params: dict) -> Any:
+def _exec_mcp(db: Session, cfg: dict, params: dict, *, mcp: Any = None) -> Any:
     """MCP 执行器：调用 MCP 工具。
 
     cfg: {mcp_id, tool_name}
     """
     mcp_id = cfg.get("mcp_id", "")
     tool_name = cfg.get("tool_name", "")
-    if not mcp_id or not tool_name:
+    if not tool_name or (not mcp_id and mcp is None):
         raise ValueError("MCP 执行器需要 mcp_id 和 tool_name 配置")
     from ..models import MCPConfig
 
-    mcp = db.get(MCPConfig, mcp_id)
+    mcp = mcp or db.get(MCPConfig, mcp_id)
     if not mcp:
         raise ValueError(f"MCP 不存在: {mcp_id}")
     return mcp_service.call_tool(mcp, tool_name, params)
@@ -430,25 +767,40 @@ def _exec_http(cfg: dict, params: dict) -> Any:
     cfg: {method, url, headers}
     params: 请求体/查询参数
     """
+    import urllib.error
     import urllib.request
-    import urllib.parse
 
-    method = cfg.get("method", "GET").upper()
-    url = cfg.get("url", "")
-    headers = cfg.get("headers", {})
-    if not url:
-        raise ValueError("HTTP 执行器需要 url 配置")
+    method = str(cfg.get("method", "GET")).upper()
+    url = str(cfg.get("url", ""))
+    headers = dict(cfg.get("headers") or {})
+    validate_http_action_config({**cfg, "method": method, "url": url, "headers": headers})
     # 参数替换 URL
     for k, v in params.items():
         url = url.replace("{%s}" % k, str(v))
+    _assert_public_http_target(url)
     data = None
     if method in ("POST", "PUT", "PATCH"):
         body = params.get("body", params)
         data = json.dumps(body).encode("utf-8")
         headers.setdefault("Content-Type", "application/json")
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
+    req = urllib.request.Request(url, data=data, headers={str(k): str(v) for k, v in headers.items()}, method=method)
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect())
+    try:
+        response = opener.open(req, timeout=30)
+    except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise PolicyViolation("HTTP Action 不跟随重定向，请为目标配置经过审核的最终 HTTPS 地址") from exc
+        raise
+    with response as resp:
+        body = resp.read(1_048_577)
+        if len(body) > 1_048_576:
+            raise PolicyViolation("HTTP Action 响应超过 1MB 限制")
+        body = body.decode("utf-8", errors="replace")
         try:
             return json.loads(body)
         except json.JSONDecodeError:
@@ -554,18 +906,22 @@ def render_template(value: Any, ctx: dict[str, Any]) -> Any:
 # ──────────────────────────────────────────────
 def execute_workflow(
     db: Session,
-    workflow: OntologyWorkflow,
+    workflow: Any,
     params: dict[str, Any],
     *,
     execution_id: str | None = None,
     approved_node_ids: set[str] | None = None,
     attempt: int = 1,
     source_run_id: str | None = None,
+    runtime_environment: str | None = None,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+    deadline_at: datetime | None = None,
 ) -> dict[str, Any]:
     """执行工作流：优先可视化 DAG（nodes/edges），回退旧版线性 steps。
 
-    ``execution_id`` 和 ``attempt`` 由 P1 任务队列传入，用于让审批恢复时的
-    已执行 Action 幂等回放、失败重试时重新获得独立的执行键。
+    ``execution_id`` 由 P1 任务队列持久化：审批恢复和自动重试均复用同一
+    执行谱系，已成功的 Action 只回放其审计结果而不再次产生副作用。显式
+    人工重试会由队列生成新的 ``execution_id``。
     """
     status = workflow.status or ("active" if workflow.enabled else "disabled")
     if status != "active" or not workflow.enabled:
@@ -574,6 +930,7 @@ def execute_workflow(
     if not workflow_permission.allowed:
         raise PolicyViolation("没有执行该工作流的权限")
     start = time.time()
+    provenance = _runtime_provenance(runtime_definition, runtime_environment)
     log = ActionExecutionLog(
         scenario_id=workflow.scenario_id,
         target_type="workflow",
@@ -581,6 +938,7 @@ def execute_workflow(
         target_name=workflow.name,
         input_params=params,
         status="running",
+        **provenance,
     )
     db.add(log)
     db.flush()
@@ -588,8 +946,9 @@ def execute_workflow(
     approved_nodes = approved_node_ids or set()
 
     try:
+        _check_deadline(deadline_at)
         if workflow.nodes:
-            validate_workflow_graph(workflow.nodes, workflow.edges or [])
+            validate_workflow_definition(workflow.nodes, workflow.edges or [])
         if workflow.nodes:
             step_results = _execute_dag(
                 db,
@@ -599,6 +958,9 @@ def execute_workflow(
                 approved_node_ids=approved_nodes,
                 attempt=attempt,
                 source_run_id=source_run_id,
+                runtime_environment=runtime_environment,
+                runtime_definition=runtime_definition,
+                deadline_at=deadline_at,
             )
         else:
             step_results = _execute_steps(
@@ -609,8 +971,17 @@ def execute_workflow(
                 approved_node_ids=approved_nodes,
                 attempt=attempt,
                 source_run_id=source_run_id,
+                runtime_environment=runtime_environment,
+                runtime_definition=runtime_definition,
+                deadline_at=deadline_at,
             )
         log.result = {"steps": step_results}
+        log.connector_audit = [
+            audit
+            for step in step_results
+            for audit in (step.get("connector_audit") or [])
+            if isinstance(audit, dict)
+        ]
         failed = next((step for step in step_results if step.get("status") == "failed"), None)
         waiting = next((step for step in step_results if step.get("status") == "awaiting_approval"), None)
         if failed:
@@ -632,6 +1003,7 @@ def execute_workflow(
         "log_id": log.id,
         "status": log.status,
         "steps": log.result.get("steps", []),
+        "connector_audit": log.connector_audit or [],
         "error": log.error,
         "duration_ms": log.duration_ms,
     }
@@ -640,27 +1012,35 @@ def execute_workflow(
 # ── 旧版线性 steps（兼容）──
 def _execute_steps(
     db: Session,
-    workflow: OntologyWorkflow,
+    workflow: Any,
     params: dict[str, Any],
     *,
     execution_id: str,
     approved_node_ids: set[str],
     attempt: int,
     source_run_id: str | None,
+    runtime_environment: str | None,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None,
+    deadline_at: datetime | None,
 ) -> list[dict[str, Any]]:
     step_results: list[dict[str, Any]] = []
     context: dict[str, Any] = {"params": params}
 
     for i, step in enumerate(workflow.steps or []):
+        _check_deadline(deadline_at)
         step_type = step.get("type", "")
         step_num = step.get("step", i + 1)
         step_result: dict[str, Any] = {"step": step_num, "type": step_type}
 
         if step_type == "action":
             action_id = step.get("action_id", "")
-            action = db.get(OntologyAction, action_id)
-            if action and action.scenario_id != workflow.scenario_id:
-                action = None
+            action = _definition_resource(
+                db,
+                workflow,
+                kind="action",
+                resource_id=str(action_id),
+                runtime_definition=runtime_definition,
+            )
             if not action:
                 step_result["status"] = "skipped"
                 step_result["error"] = f"操作不存在: {action_id}"
@@ -671,19 +1051,28 @@ def _execute_steps(
                     action,
                     step_params,
                     confirm=True,
-                    idempotency_key=f"workflow:{execution_id}:attempt:{attempt}:step:{step_num}",
+                    idempotency_key=f"workflow:{execution_id}:step:{step_num}",
                     enforce_policy=True,
+                    runtime_environment=runtime_environment,
+                    runtime_definition=runtime_definition,
                 )
-                step_result["status"] = r["status"]
+                step_result["status"], step_error = _workflow_action_status(r)
                 step_result["log_id"] = r.get("log_id")
                 step_result["result"] = r.get("result", {})
+                step_result["connector_audit"] = r.get("connector_audit", [])
+                if step_error:
+                    step_result["error"] = step_error
                 context[f"step_{step_num}"] = r.get("result", {})
 
         elif step_type == "rule":
             rule_id = step.get("rule_id", "")
-            rule = db.get(OntologyRule, rule_id)
-            if rule and rule.scenario_id != workflow.scenario_id:
-                rule = None
+            rule = _definition_resource(
+                db,
+                workflow,
+                kind="rule",
+                resource_id=str(rule_id),
+                runtime_definition=runtime_definition,
+            )
             if not rule:
                 step_result["status"] = "skipped"
                 step_result["error"] = f"规则不存在: {rule_id}"
@@ -696,8 +1085,14 @@ def _execute_steps(
 
         elif step_type == "event":
             event_id = step.get("event_id", "")
-            event = db.get(OntologyEvent, event_id)
-            if not event or event.scenario_id != workflow.scenario_id:
+            event = _definition_resource(
+                db,
+                workflow,
+                kind="event",
+                resource_id=str(event_id),
+                runtime_definition=runtime_definition,
+            )
+            if not event:
                 step_result["status"] = "failed"
                 step_result["error"] = f"事件不存在或不属于当前业务场景: {event_id}"
             else:
@@ -710,8 +1105,9 @@ def _execute_steps(
                     payload if isinstance(payload, dict) else {"value": payload},
                     source="workflow",
                     source_run_id=source_run_id,
-                    dedupe_key=f"workflow:{execution_id}:attempt:{attempt}:step:{step_num}",
+                    dedupe_key=f"workflow:{execution_id}:step:{step_num}",
                     created_by_user_id=str(db.info.get("user_id") or "") or None,
+                    runtime_definition=runtime_definition,
                 )
                 step_result["status"] = "published"
                 step_result["result"] = {
@@ -733,6 +1129,7 @@ def _execute_steps(
                     "node_id": node_id,
                     "instructions": step.get("instructions", "请核对影响范围后决定是否批准。"),
                     "timeout_seconds": step.get("timeout_seconds"),
+                    "on_timeout": step.get("on_timeout", "reject"),
                 }
                 step_results.append(step_result)
                 break
@@ -751,17 +1148,21 @@ def _execute_steps(
 # ── 可视化 DAG 执行 ──
 def _execute_dag(
     db: Session,
-    workflow: OntologyWorkflow,
+    workflow: Any,
     params: dict[str, Any],
     *,
     execution_id: str,
     approved_node_ids: set[str],
     attempt: int,
     source_run_id: str | None,
+    runtime_environment: str | None,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None,
+    deadline_at: datetime | None,
 ) -> list[dict[str, Any]]:
     """按 DAG 拓扑执行：start → 各节点 → end。
 
-    节点类型: start / end / action / rule / llm / event / approval / http / script
+    节点类型: start / end / action / rule / llm / event / approval。
+    原生 HTTP/Python 节点仅能在受控部署显式启用，默认要求通过类型化 Action。
     边 label: true / false（规则分支），空 = 顺序
     上下文: ctx["params"] = 入参；ctx[node_id] = 节点输出（result/output/matched）
     """
@@ -783,6 +1184,7 @@ def _execute_dag(
         nonlocal halted
         if halted or node_id in visited:
             return
+        _check_deadline(deadline_at)
         visited.add(node_id)
         node = nodes[node_id]
         ntype = node.get("type", "")
@@ -799,9 +1201,13 @@ def _execute_dag(
             res["result"] = {"summary": render_template(data.get("summary", ""), ctx)}
 
         elif ntype == "action":
-            action = db.get(OntologyAction, data.get("action_id", ""))
-            if action and action.scenario_id != workflow.scenario_id:
-                action = None
+            action = _definition_resource(
+                db,
+                workflow,
+                kind="action",
+                resource_id=str(data.get("action_id", "")),
+                runtime_definition=runtime_definition,
+            )
             if not action:
                 res["status"] = "failed"
                 res["error"] = f"操作不存在: {data.get('action_id', '')}"
@@ -812,19 +1218,26 @@ def _execute_dag(
                     action,
                     step_params,
                     confirm=True,
-                    idempotency_key=f"workflow:{execution_id}:attempt:{attempt}:node:{node_id}",
+                    idempotency_key=f"workflow:{execution_id}:node:{node_id}",
                     enforce_policy=True,
+                    runtime_environment=runtime_environment,
+                    runtime_definition=runtime_definition,
                 )
-                res["status"] = r["status"]
+                res["status"], action_error = _workflow_action_status(r)
                 res["log_id"] = r.get("log_id")
                 res["result"] = _wrap_out(r.get("result", {}))
-                res["error"] = r.get("error")
+                res["error"] = action_error or r.get("error")
+                res["connector_audit"] = r.get("connector_audit", [])
                 ctx[node_id] = res["result"]
 
         elif ntype == "rule":
-            rule = db.get(OntologyRule, data.get("rule_id", ""))
-            if rule and rule.scenario_id != workflow.scenario_id:
-                rule = None
+            rule = _definition_resource(
+                db,
+                workflow,
+                kind="rule",
+                resource_id=str(data.get("rule_id", "")),
+                runtime_definition=runtime_definition,
+            )
             if not rule:
                 res["status"] = "failed"
                 res["error"] = f"规则不存在或不属于当前业务场景: {data.get('rule_id', '')}"
@@ -846,10 +1259,35 @@ def _execute_dag(
                 return
 
         elif ntype == "llm":
-            llm = _resolve_llm(db, data.get("llm_config_id"))
-            if not llm:
+            llm = None
+            try:
+                resolved_environment = runtime_connector_service.runtime_environment(runtime_environment)
+                has_runtime_config = any(
+                    key in data
+                    for key in ("llm_config_id", "llm_binding_key", "llm_binding_ref")
+                )
+                if has_runtime_config or resolved_environment != "dev":
+                    scenario = db.get(BusinessScenario, workflow.scenario_id)
+                    if not scenario:
+                        raise PolicyViolation("工作流所属业务场景不存在")
+                    llm, audit = runtime_connector_service.resolve_connector(
+                        db,
+                        scenario,
+                        kind="llm",
+                        config=data,
+                        environment=resolved_environment,
+                        release_id=(runtime_definition.release_id if runtime_definition else None),
+                    )
+                    res["connector_audit"] = [audit]
+                else:
+                    llm = _resolve_llm(db, data.get("llm_config_id"))
+            except runtime_connector_service.RuntimeConnectorError as exc:
                 res["status"] = "failed"
-                res["error"] = "未找到可用 LLM 配置（请先在 LLM 配置中设置默认模型）"
+                res["error"] = str(exc)
+            if not llm:
+                if res.get("status") != "failed":
+                    res["status"] = "failed"
+                    res["error"] = "未找到可用 LLM 配置（请先在 LLM 配置中设置默认模型）"
             else:
                 prompt = render_template(data.get("prompt", ""), ctx)
                 system = data.get("system", "你是一个严谨的业务助手。")
@@ -873,8 +1311,14 @@ def _execute_dag(
 
         elif ntype == "event":
             event_id = data.get("event_id", "")
-            event = db.get(OntologyEvent, event_id)
-            if not event or event.scenario_id != workflow.scenario_id:
+            event = _definition_resource(
+                db,
+                workflow,
+                kind="event",
+                resource_id=str(event_id),
+                runtime_definition=runtime_definition,
+            )
+            if not event:
                 res["status"] = "failed"
                 res["error"] = f"事件不存在或不属于当前业务场景: {event_id}"
             else:
@@ -887,8 +1331,9 @@ def _execute_dag(
                     payload if isinstance(payload, dict) else {"value": payload},
                     source="workflow",
                     source_run_id=source_run_id,
-                    dedupe_key=f"workflow:{execution_id}:attempt:{attempt}:node:{node_id}",
+                    dedupe_key=f"workflow:{execution_id}:node:{node_id}",
                     created_by_user_id=str(db.info.get("user_id") or "") or None,
+                    runtime_definition=runtime_definition,
                 )
                 res["status"] = "published"
                 res["result"] = {
@@ -910,6 +1355,7 @@ def _execute_dag(
                     "node_id": node_id,
                     "instructions": data.get("instructions", "请核对影响范围后决定是否批准。"),
                     "timeout_seconds": data.get("timeout_seconds"),
+                    "on_timeout": data.get("on_timeout", "reject"),
                 }
                 results.append(res)
                 # 审批是流程暂停点；不能让父节点或后续分支继续运行。
@@ -1030,13 +1476,11 @@ _WF_GEN_PROMPT = """你是资深业务流程架构师，擅长把业务描述编
   命中走 label="true" 的边，未命中走 label="false" 的边
 - llm：调用大模型，data: {"name":"节点名","prompt":"提示词，可用 {{params.x}} / {{n1.result}} 变量","system":"系统提示(可选)"}
 - event：发布事件，data: {"name":"节点名","event_id":"<事件ID>","payload":{}}
-- http：HTTP 请求，data: {"name":"节点名","method":"GET","url":"..."}
-- script：Python 脚本，data: {"name":"节点名","script":"result = ..."}
 
 要求：
 1. 节点 id 用 n1、n2、n3…（start 节点 id 固定为 "start"，end 节点 id 固定为 "end"）。
-2. 每个 action/rule/llm/event/http/script 节点必须配置 name（中文节点名）。
-3. 只能引用下面列出的操作/规则/事件 ID；若没有合适的操作，可用 llm/script/http 节点代替。
+2. 每个 action/rule/llm/event/approval 节点必须配置 name（中文节点名）。
+3. 只能引用下面列出的操作/规则/事件 ID；涉及外部副作用时必须使用类型化 Action。
 4. 连线 edges: [{"id":"e1","source":"start","target":"n1","label":""}]，分支节点必须同时给出 true 和 false 两条出边。
 5. 流程必须从 start 出发并最终到达 end。
 6. 只输出 JSON，不要输出任何解释文字。

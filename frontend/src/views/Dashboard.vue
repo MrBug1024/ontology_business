@@ -72,12 +72,25 @@
                 <div class="cell-sub">{{ row.scenario_name || '未绑定场景' }}</div>
               </template>
             </el-table-column>
-            <el-table-column label="能力" min-width="150">
+            <el-table-column label="已绑定资源" min-width="180">
               <template #default="{ row }">
                 <div class="cap-tags">
-                  <el-tag size="small" type="success" effect="light" v-for="n in (row.skill_names||[]).slice(0,2)" :key="n">{{ n }}</el-tag>
-                  <el-tag size="small" type="warning" effect="light" v-for="n in (row.mcp_names||[]).slice(0,2)" :key="n">{{ n }}</el-tag>
-                  <span class="muted" v-if="!(row.skill_names?.length || row.mcp_names?.length)">未配置</span>
+                  <el-tooltip
+                    v-for="tag in agentCapabilityTags(row)"
+                    :key="tag.key"
+                    :content="tag.detail"
+                    placement="top"
+                    :show-after="300"
+                  >
+                    <el-tag
+                      class="cap-tag"
+                      size="small"
+                      :type="tag.type"
+                      effect="light"
+                      :aria-label="tag.detail"
+                    ><span class="cap-tag-label">{{ tag.label }}</span></el-tag>
+                  </el-tooltip>
+                  <span class="muted" v-if="!agentCapabilityTags(row).length">未绑定模型或资源</span>
                 </div>
               </template>
             </el-table-column>
@@ -115,6 +128,63 @@ const agents = ref<Agent[]>([])
 const totalDS = ref(0)
 const skills = ref<any[]>([])
 const loading = ref(false)
+
+type AgentCapabilityTag = {
+  key: string
+  label: string
+  detail: string
+  type: 'primary' | 'success' | 'warning' | 'info'
+}
+
+function boundNames(names?: string[]) {
+  return (names || []).map(name => name.trim()).filter(Boolean)
+}
+
+function summarizedBinding(
+  key: string,
+  label: string,
+  names: string[] | undefined,
+  type: AgentCapabilityTag['type'],
+): AgentCapabilityTag | null {
+  const bound = boundNames(names)
+  if (!bound.length) return null
+  const remaining = bound.length - 1
+  return {
+    key,
+    label: `${label}·${bound[0]}${remaining ? ` +${remaining}` : ''}`,
+    detail: `已绑定${label}：${bound.join('、')}`,
+    type,
+  }
+}
+
+/**
+ * The dashboard is an inventory of bindings, not an authorization or action
+ * surface.  In particular, skill/MCP bindings are labelled as configurations:
+ * actual external operations still go through the permissioned Action/
+ * Workflow path and any required approval.
+ */
+function agentCapabilityTags(agent: Agent): AgentCapabilityTag[] {
+  const tags: AgentCapabilityTag[] = []
+  const llmName = agent.llm_name?.trim()
+  if (llmName) {
+    tags.push({
+      key: 'llm',
+      label: `模型·${llmName}`,
+      detail: `已绑定模型：${llmName}`,
+      type: 'primary',
+    })
+  }
+
+  const dataSource = summarizedBinding('data-source', '数据/资料源', agent.data_source_names, 'info')
+  if (dataSource) tags.push(dataSource)
+
+  const skills = summarizedBinding('skills', '技能配置', agent.skill_names, 'success')
+  if (skills) tags.push(skills)
+
+  const mcps = summarizedBinding('mcps', 'MCP 配置', agent.mcp_names, 'warning')
+  if (mcps) tags.push(mcps)
+  return tags
+}
 
 const stats = computed(() => [
   { label: '业务场景', value: scenarios.value.length, icon: 'OfficeBuilding', bg: 'var(--primary-soft)', fg: 'var(--primary-600)', to: '/scenarios' },
@@ -229,7 +299,9 @@ onMounted(load)
 .cell-main { font-weight: 700; color: var(--text); }
 .cell-sub { font-size: 12px; color: var(--text-3); margin-top: 1px; }
 .row-arrow { color: var(--text-3); }
-.cap-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.cap-tags { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.cap-tag { max-width: 100%; min-width: 0; }
+.cap-tag-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .flow-steps {
   padding: 12px 0 4px;

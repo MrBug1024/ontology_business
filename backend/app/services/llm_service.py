@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 
 from openai import OpenAI
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models import LLMConfig, LLMInvocationTrace
@@ -55,6 +55,11 @@ class TracePayload:
     estimated_cost: float
     currency: str
     tool_count: int
+    correlation_id: str = ""
+    agent_id: str | None = None
+    conversation_id: str | None = None
+    scenario_id: str | None = None
+    user_id: str | None = None
     error: str = ""
 
 
@@ -145,6 +150,30 @@ def _ensure_callable(cfg: LLMConfig, *, tools: bool = False) -> None:
         raise LLMRuntimeError("该模型未启用 tool 能力，不能执行工具调用")
 
 
+def _ensure_capability(cfg: LLMConfig, capability: str) -> None:
+    """在真正调用 provider 前统一校验模型生命周期与能力。"""
+    normalized = str(capability or "").strip().lower()
+    if normalized == "chat":
+        _ensure_callable(cfg)
+        return
+    if normalized == "tool":
+        _ensure_callable(cfg, tools=True)
+        return
+    if not bool(cfg.enabled):
+        raise LLMRuntimeError("该模型已停用")
+    if normalized not in capabilities_of(cfg):
+        raise LLMRuntimeError(f"该模型未启用 {normalized} 能力")
+
+
+def supports_capability(cfg: LLMConfig, capability: str) -> bool:
+    """供 Agent 绑定和管理界面使用的无副作用能力判定。"""
+    try:
+        _ensure_capability(cfg, capability)
+    except LLMRuntimeError:
+        return False
+    return True
+
+
 def _message_text(messages: list[dict[str, Any]]) -> str:
     """仅在内存中计算 token 估算，绝不落库。"""
     try:
@@ -197,6 +226,32 @@ def _estimated_cost(cfg: LLMConfig, input_tokens: int, output_tokens: int) -> fl
     )
 
 
+def _assert_budget_available(
+    cfg: LLMConfig,
+    *,
+    db: Session | None,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    """在调用前按最坏 token 估算守住配置级预算。
+
+    预算为 0 或模型未配置价格时保持无限制，避免把无法计算金额的旧配置误阻断；
+    有价格的调用则会以已经持久化的 trace 成本加本次上界做 fail-closed 检查。
+    """
+    limit = max(0.0, float(cfg.budget_limit or 0.0))
+    reserved = _estimated_cost(cfg, input_tokens, output_tokens)
+    if not limit or not reserved or db is None or not cfg.id:
+        return
+    spent = db.scalar(
+        select(func.coalesce(func.sum(LLMInvocationTrace.estimated_cost), 0.0)).where(
+            LLMInvocationTrace.llm_config_id == cfg.id,
+            LLMInvocationTrace.status == "succeeded",
+        )
+    )
+    if float(spent or 0.0) + reserved > limit + 1e-9:
+        raise LLMRuntimeError("该模型预算已耗尽，调用已被阻止")
+
+
 def _tenant_for_trace(cfg: LLMConfig, db: Session | None) -> str | None:
     if db is not None and db.info.get("tenant_id"):
         return str(db.info["tenant_id"])
@@ -219,6 +274,11 @@ def _trace_model(payload: TracePayload) -> LLMInvocationTrace:
         estimated_cost=max(0.0, payload.estimated_cost),
         currency=payload.currency or "USD",
         tool_count=max(0, payload.tool_count),
+        correlation_id=str(payload.correlation_id or "")[:64],
+        agent_id=str(payload.agent_id)[:32] if payload.agent_id else None,
+        conversation_id=str(payload.conversation_id)[:32] if payload.conversation_id else None,
+        scenario_id=str(payload.scenario_id)[:32] if payload.scenario_id else None,
+        user_id=str(payload.user_id)[:32] if payload.user_id else None,
         error=sanitize_trace_error(payload.error),
     )
 
@@ -257,8 +317,16 @@ def _record_trace(
     output_tokens: int,
     total_tokens: int,
     tool_count: int = 0,
+    trace_context: dict[str, Any] | None = None,
     error: Any = "",
 ) -> None:
+    context = dict(trace_context or {})
+    if db is not None:
+        context = {
+            "user_id": db.info.get("user_id"),
+            **dict(db.info.get("llm_trace_context") or {}),
+            **context,
+        }
     _persist_trace(
         TracePayload(
             tenant_id=_tenant_for_trace(cfg, db),
@@ -275,6 +343,11 @@ def _record_trace(
             estimated_cost=_estimated_cost(cfg, input_tokens, output_tokens),
             currency=cfg.cost_currency or "USD",
             tool_count=tool_count,
+            correlation_id=str(context.get("correlation_id") or ""),
+            agent_id=str(context.get("agent_id") or "") or None,
+            conversation_id=str(context.get("conversation_id") or "") or None,
+            scenario_id=str(context.get("scenario_id") or "") or None,
+            user_id=str(context.get("user_id") or "") or None,
             error=error,
         ),
         db=db,
@@ -292,27 +365,31 @@ def chat(
     operation: str = "chat",
 ) -> dict[str, Any]:
     """非流式对话，并为每次真实 provider 调用持久化脱敏 trace。"""
-    started_at = time.perf_counter()
     input_estimate = _estimate_tokens(_message_text(messages))
-    input_tokens = 0
-    output_tokens = 0
-    total_tokens = 0
-    tool_count = 0
     trace_capability = "tool" if tools else "chat"
-    try:
-        _ensure_callable(cfg, tools=bool(tools))
-        client = _client(cfg)
-        kwargs: dict[str, Any] = {
-            "model": cfg.model,
-            "messages": messages,
-            "temperature": cfg.temperature if temperature is None else temperature,
-            "max_tokens": cfg.max_tokens if max_tokens is None else max_tokens,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-        # 推理模型的思考过程会占用 max_tokens；若首轮仅长度截断则放大一次。
-        for attempt in range(2):
+    _ensure_callable(cfg, tools=bool(tools))
+    kwargs: dict[str, Any] = {
+        "model": cfg.model,
+        "messages": messages,
+        "temperature": cfg.temperature if temperature is None else temperature,
+        "max_tokens": cfg.max_tokens if max_tokens is None else max_tokens,
+    }
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+    # 推理模型的思考过程会占用 max_tokens；若首轮仅长度截断则放大一次。每一轮
+    # 都是独立的真实 provider 调用，必须各自计费、追踪和预算检查。
+    for attempt in range(2):
+        started_at = time.perf_counter()
+        reserved_output = max(1, int(kwargs.get("max_tokens") or cfg.max_tokens or 1))
+        _assert_budget_available(
+            cfg,
+            db=db,
+            input_tokens=input_estimate,
+            output_tokens=reserved_output,
+        )
+        try:
+            client = _client(cfg)
             resp = client.chat.completions.create(**kwargs)
             response_choice = resp.choices[0]
             choice = response_choice.message
@@ -341,10 +418,19 @@ def chat(
                 fallback_input=input_estimate,
                 fallback_output=fallback_output,
             )
-            input_tokens += attempt_input
-            output_tokens += attempt_output
-            total_tokens += attempt_total
             tool_count = len(tool_calls)
+            _record_trace(
+                cfg,
+                db=db,
+                capability=trace_capability,
+                operation=operation,
+                status="succeeded",
+                started_at=started_at,
+                input_tokens=attempt_input,
+                output_tokens=attempt_output,
+                total_tokens=attempt_total,
+                tool_count=tool_count,
+            )
             # OpenAI 将 finish_reason 放在 choice 层；兼容少数供应商仍放在 message
             # 层的实现。
             truncated = (
@@ -354,49 +440,22 @@ def chat(
             if attempt == 0 and truncated and not content.strip() and not tool_calls:
                 kwargs["max_tokens"] = (kwargs.get("max_tokens") or 4096) * 2
                 continue
+            return {"content": content, "tool_calls": tool_calls, "raw": resp}
+        except Exception as exc:
             _record_trace(
                 cfg,
                 db=db,
                 capability=trace_capability,
                 operation=operation,
-                status="succeeded",
+                status="failed",
                 started_at=started_at,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                total_tokens=total_tokens,
-                tool_count=tool_count,
+                input_tokens=input_estimate,
+                output_tokens=0,
+                total_tokens=input_estimate,
+                error=exc,
             )
-            return {"content": content, "tool_calls": tool_calls, "raw": resp}
-        # 防御性回退；循环正常应在前面 return。
-        _record_trace(
-            cfg,
-            db=db,
-            capability=trace_capability,
-            operation=operation,
-            status="succeeded",
-            started_at=started_at,
-            input_tokens=input_tokens or input_estimate,
-            output_tokens=output_tokens,
-            total_tokens=total_tokens or (input_tokens or input_estimate) + output_tokens,
-            tool_count=tool_count,
-        )
-        return {"content": content, "tool_calls": tool_calls, "raw": resp}
-    except Exception as exc:
-        failed_input = input_tokens or input_estimate
-        _record_trace(
-            cfg,
-            db=db,
-            capability=trace_capability,
-            operation=operation,
-            status="failed",
-            started_at=started_at,
-            input_tokens=failed_input,
-            output_tokens=output_tokens,
-            total_tokens=total_tokens or failed_input + output_tokens,
-            tool_count=tool_count,
-            error=exc,
-        )
-        raise
+            raise
+    raise RuntimeError("模型调用未返回结果")
 
 
 def chat_stream(
@@ -416,9 +475,16 @@ def chat_stream(
     usage: Any = None
     status = "succeeded"
     error: Any = ""
+    provider_started = False
     trace_capability = "tool" if tools else "chat"
     try:
         _ensure_callable(cfg, tools=bool(tools))
+        _assert_budget_available(
+            cfg,
+            db=db,
+            input_tokens=input_estimate,
+            output_tokens=max(1, int(max_tokens if max_tokens is not None else cfg.max_tokens or 1)),
+        )
         client = _client(cfg)
         kwargs: dict[str, Any] = {
             "model": cfg.model,
@@ -430,6 +496,7 @@ def chat_stream(
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        provider_started = True
         stream = client.chat.completions.create(**kwargs)
         for chunk in stream:
             if getattr(chunk, "usage", None) is not None:
@@ -485,19 +552,152 @@ def chat_stream(
             fallback_input=input_estimate,
             fallback_output=_estimate_tokens(output_text),
         )
+        if provider_started:
+            _record_trace(
+                cfg,
+                db=db,
+                capability=trace_capability,
+                operation="chat_stream",
+                status=status,
+                started_at=started_at,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                tool_count=len(tc_acc),
+                error=error,
+            )
+
+
+def embed(
+    cfg: LLMConfig,
+    inputs: list[str],
+    *,
+    db: Session | None = None,
+    operation: str = "embedding",
+) -> list[list[float]]:
+    """调用 OpenAI 兼容 Embeddings API，并记录真实模型调用。"""
+    values = [str(value or "") for value in inputs]
+    if not values:
+        return []
+    _ensure_capability(cfg, "embedding")
+    input_estimate = _estimate_tokens(values)
+    _assert_budget_available(
+        cfg,
+        db=db,
+        input_tokens=input_estimate,
+        output_tokens=0,
+    )
+    started_at = time.perf_counter()
+    try:
+        response = _client(cfg).embeddings.create(model=cfg.model, input=values)
+        raw_items = list(getattr(response, "data", None) or [])
+        vectors = [
+            [float(component) for component in (getattr(item, "embedding", None) or [])]
+            for item in raw_items
+        ]
+        if len(vectors) != len(values) or not all(vector for vector in vectors):
+            raise LLMRuntimeError("Embedding provider 返回了无效向量")
+        usage = getattr(response, "usage", None)
+        input_tokens, output_tokens, total_tokens = _usage_counts(
+            usage,
+            fallback_input=input_estimate,
+            fallback_output=0,
+        )
         _record_trace(
             cfg,
             db=db,
-            capability=trace_capability,
-            operation="chat_stream",
-            status=status,
+            capability="embedding",
+            operation=operation,
+            status="succeeded",
             started_at=started_at,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            tool_count=len(tc_acc),
-            error=error,
         )
+        return vectors
+    except Exception as exc:
+        _record_trace(
+            cfg,
+            db=db,
+            capability="embedding",
+            operation=operation,
+            status="failed",
+            started_at=started_at,
+            input_tokens=input_estimate,
+            output_tokens=0,
+            total_tokens=input_estimate,
+            error=exc,
+        )
+        raise
+
+
+def vision(
+    cfg: LLMConfig,
+    prompt: str,
+    image_url: str,
+    *,
+    db: Session | None = None,
+    operation: str = "vision",
+    max_tokens: int = 128,
+) -> str:
+    """调用视觉模型的兼容 chat-completions 接口。"""
+    _ensure_capability(cfg, "vision")
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": str(prompt or "请描述图片。")},
+            {"type": "image_url", "image_url": {"url": str(image_url or "")}},
+        ],
+    }
+    input_estimate = _estimate_tokens(_message_text([message]))
+    _assert_budget_available(
+        cfg,
+        db=db,
+        input_tokens=input_estimate,
+        output_tokens=max(1, int(max_tokens)),
+    )
+    started_at = time.perf_counter()
+    try:
+        response = _client(cfg).chat.completions.create(
+            model=cfg.model,
+            messages=[message],
+            temperature=0,
+            max_tokens=max(1, int(max_tokens)),
+        )
+        choice = response.choices[0].message
+        content = getattr(choice, "content", "") or ""
+        usage = getattr(response, "usage", None)
+        input_tokens, output_tokens, total_tokens = _usage_counts(
+            usage,
+            fallback_input=input_estimate,
+            fallback_output=_estimate_tokens(content),
+        )
+        _record_trace(
+            cfg,
+            db=db,
+            capability="vision",
+            operation=operation,
+            status="succeeded",
+            started_at=started_at,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+        )
+        return str(content)
+    except Exception as exc:
+        _record_trace(
+            cfg,
+            db=db,
+            capability="vision",
+            operation=operation,
+            status="failed",
+            started_at=started_at,
+            input_tokens=input_estimate,
+            output_tokens=0,
+            total_tokens=input_estimate,
+            error=exc,
+        )
+        raise
 
 
 def _loads(s: str) -> dict[str, Any]:
@@ -507,8 +707,34 @@ def _loads(s: str) -> dict[str, Any]:
     return json.loads(s)
 
 
-def test_connection(cfg: LLMConfig, *, db: Session | None = None) -> tuple[bool, str]:
+def test_connection(
+    cfg: LLMConfig,
+    *,
+    db: Session | None = None,
+    capability: str | None = None,
+) -> tuple[bool, str]:
+    """按模型实际能力测试连接，避免 embedding/vision 配置被错误地当作 chat 调用。"""
     try:
+        selected = str(capability or "").strip().lower()
+        available = capabilities_of(cfg)
+        if not selected:
+            selected = "chat" if "chat" in available else ("embedding" if "embedding" in available else "vision")
+        if selected == "embedding":
+            vector = embed(cfg, ["连接测试"], db=db, operation="test_embedding")[0]
+            return True, f"连接成功，已返回 {len(vector)} 维 Embedding"
+        if selected == "vision":
+            # 透明的 1px PNG，不会携带业务图片或用户数据。
+            content = vision(
+                cfg,
+                "请仅回复 ok。",
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9JZ8sAAAAASUVORK5CYII=",
+                db=db,
+                operation="test_vision",
+                max_tokens=16,
+            )
+            return True, f"连接成功，视觉模型响应: {sanitize_trace_text(content, max_length=50)}"
+        if selected not in {"chat", "tool"}:
+            raise LLMRuntimeError(f"不支持的测试能力: {selected}")
         result = chat(
             cfg,
             [{"role": "user", "content": "你好，请回复“ok”"}],

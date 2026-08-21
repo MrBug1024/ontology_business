@@ -79,11 +79,12 @@
             <span :class="{ 'task-error': row.error }">{{ row.error || (row.next_retry_at ? `下次重试：${formatDate(row.next_retry_at)}` : '—') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="205" fixed="right">
           <template #default="{ row }">
             <el-button size="small" text @click="showTask(row.id)">详情</el-button>
-            <el-button v-if="row.status === 'awaiting_approval'" size="small" text type="primary" @click="showTask(row.id)">审批</el-button>
+            <el-button v-if="canApprove(row)" size="small" text type="primary" @click="showTask(row.id)">审批</el-button>
             <el-button v-else-if="canRetry(row)" size="small" text type="warning" @click="retryTask(row)">重试</el-button>
+            <el-button v-if="canCancel(row)" size="small" text type="danger" :loading="cancellingTaskId === row.id" @click="cancelTask(row)">取消</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -118,14 +119,20 @@
             <div><dt>审批节点</dt><dd>{{ activeApproval.node_name || activeApproval.node_id }}</dd></div>
             <div><dt>发起时间</dt><dd>{{ formatDate(activeApproval.requested_at) }}</dd></div>
           </dl>
-          <div class="approval-actions">
+          <div v-if="canApprove(selectedTask)" class="approval-actions">
             <el-button type="danger" plain :loading="approvalSubmitting" @click="requestApproval('reject')">驳回</el-button>
             <el-button type="primary" :loading="approvalSubmitting" @click="requestApproval('approve')">批准并继续</el-button>
           </div>
+          <p v-else class="approval-readonly-hint" role="status">当前账号仅可查看审批上下文，没有审批权限。</p>
         </section>
 
         <section class="detail-grid" aria-label="任务信息">
           <div><span>触发来源</span><b>{{ selectedTask.trigger_source || 'manual' }}</b></div>
+          <div><span>运行环境</span><b>{{ selectedTask.environment || 'dev' }}</b></div>
+          <div><span>定义版本</span><b>{{ selectedTask.definition_source === 'release' ? '已冻结发布快照' : '实时开发定义' }}</b></div>
+          <div v-if="selectedTask.definition_snapshot_id"><span>发布快照 ID</span><b class="mono">{{ selectedTask.definition_snapshot_id }}</b></div>
+          <div v-if="selectedTask.release_id"><span>发布记录 ID</span><b class="mono">{{ selectedTask.release_id }}</b></div>
+          <div v-if="selectedTask.definition_hash"><span>定义校验哈希</span><b class="mono">{{ selectedTask.definition_hash }}</b></div>
           <div><span>执行尝试</span><b>{{ Math.max(selectedTask.attempt || 0, 1) }} / {{ Math.max(selectedTask.max_attempts || 0, 1) }}</b></div>
           <div><span>超时设置</span><b>{{ selectedTask.timeout_seconds || 0 }} 秒</b></div>
           <div><span>下次重试</span><b>{{ formatDate(selectedTask.next_retry_at) || '—' }}</b></div>
@@ -143,6 +150,7 @@
         </section>
 
         <footer class="task-detail-footer">
+          <el-button v-if="canCancel(selectedTask)" type="danger" plain :loading="cancellingTaskId === selectedTask.id" @click="cancelTask(selectedTask)">取消任务</el-button>
           <el-button v-if="canRetry(selectedTask)" type="warning" plain :loading="retrySubmitting" @click="retryTask(selectedTask)">重新提交</el-button>
           <el-button @click="taskDrawer = false">关闭</el-button>
         </footer>
@@ -170,6 +178,7 @@ const loading = ref(false)
 const detailLoading = ref(false)
 const approvalSubmitting = ref(false)
 const retrySubmitting = ref(false)
+const cancellingTaskId = ref<string | null>(null)
 const taskDrawer = ref(false)
 const selectedTask = ref<WorkflowRun | null>(null)
 const scenarioFilter = ref('')
@@ -225,8 +234,16 @@ function approvalFor(task: WorkflowRun | null): WorkflowApproval | null {
   if (task.pending_approval && typeof task.pending_approval === 'object') return task.pending_approval
   return approvals.value.find((approval) => approval.workflow_run_id === task.id && isWaitingApproval(approval)) || null
 }
+function canApprove(task: WorkflowRun | null) {
+  return Boolean(task?.can_approve) && task?.status === 'awaiting_approval'
+}
 function canRetry(task: WorkflowRun) {
-  return ['failed', 'timed_out', 'cancelled'].includes(task.status)
+  return task.can_execute === true && ['failed', 'timed_out', 'cancelled'].includes(task.status)
+}
+function canCancel(task: WorkflowRun) {
+  // A running task may have crossed an external boundary. The backend
+  // deliberately rejects it rather than reporting a misleading cancellation.
+  return task.can_execute === true && ['queued', 'retry_waiting', 'awaiting_approval'].includes(task.status)
 }
 function shortId(value: string) {
   return value.length > 10 ? `${value.slice(0, 8)}…` : value
@@ -317,7 +334,11 @@ async function showTask(id: string, syncRoute = true) {
   }
 }
 async function requestApproval(decision: 'approve' | 'reject') {
-  if (!selectedTask.value) return
+  const task = selectedTask.value
+  if (!task || !canApprove(task)) {
+    ElMessage.warning('当前账号没有审批此任务的权限')
+    return
+  }
   const isApprove = decision === 'approve'
   try {
     const { value } = await ElMessageBox.prompt(
@@ -333,10 +354,10 @@ async function requestApproval(decision: 'approve' | 'reject') {
       },
     )
     approvalSubmitting.value = true
-    const task = isApprove
-      ? await api.approveTask(selectedTask.value.id, value || '')
-      : await api.rejectTask(selectedTask.value.id, value || '')
-    updateTask(task)
+    const updatedTask = isApprove
+      ? await api.approveTask(task.id, value || '')
+      : await api.rejectTask(task.id, value || '')
+    updateTask(updatedTask)
     await loadApprovals()
     ElMessage.success(isApprove ? '任务已批准，正在继续执行' : '任务已驳回')
   } catch (error: any) {
@@ -346,6 +367,10 @@ async function requestApproval(decision: 'approve' | 'reject') {
   }
 }
 async function retryTask(task: WorkflowRun) {
+  if (!canRetry(task)) {
+    ElMessage.warning(task.can_execute ? '此任务当前不能重新提交' : '当前账号没有重新提交此任务的权限')
+    return
+  }
   try {
     await ElMessageBox.confirm('将按该工作流的重试策略重新排队。确定继续吗？', '重新提交任务', {
       type: 'warning', confirmButtonText: '重新提交', cancelButtonText: '取消',
@@ -358,6 +383,28 @@ async function retryTask(task: WorkflowRun) {
     if (!isCancelled(error)) ElMessage.error(error?.message || '重新提交失败')
   } finally {
     retrySubmitting.value = false
+  }
+}
+async function cancelTask(task: WorkflowRun) {
+  if (!canCancel(task)) {
+    ElMessage.warning(task.can_execute ? '此任务当前不能取消' : '当前账号没有取消此任务的权限')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      '这会停止排队、重试或等待审批中的任务，并保留完整审计记录。已开始执行的外部调用不会在这里被强制中断。确定取消吗？',
+      '取消任务',
+      { type: 'warning', confirmButtonText: '取消任务', cancelButtonText: '返回' },
+    )
+    cancellingTaskId.value = task.id
+    const updated = await api.cancelTask(task.id)
+    updateTask(updated)
+    await loadApprovals()
+    ElMessage.success('任务已取消，审计记录已保留')
+  } catch (error: any) {
+    if (!isCancelled(error)) ElMessage.error(error?.message || '取消任务失败')
+  } finally {
+    cancellingTaskId.value = null
   }
 }
 async function applyFilters() {
@@ -444,6 +491,7 @@ onBeforeUnmount(() => {
 .approval-meta dt { color: var(--text-3); font-size: 10px; }
 .approval-meta dd { margin: 3px 0 0; color: var(--text-2); font-size: 12px; overflow-wrap: anywhere; }
 .approval-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.approval-readonly-hint { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.55; }
 .detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-bottom: 18px; }
 .detail-grid div { min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
 .detail-grid span { display: block; color: var(--text-3); font-size: 10px; }

@@ -34,7 +34,7 @@
         <div v-if="!messages.length" class="empty-chat">
           <div class="empty-icon"><el-icon :size="40"><ChatDotRound /></el-icon></div>
           <div class="empty-title">{{ agent?.name }} 已就绪</div>
-          <div class="muted">基于「{{ agent?.scenario_name || '通用' }}」场景本体，可查询数据、检索文档、调用技能</div>
+          <div class="muted">基于「{{ agent?.scenario_name || '通用' }}」场景本体，可查询数据、检索文档并生成操作预演</div>
           <div class="suggestions">
             <button class="sug" type="button" v-for="q in suggestions" :key="q" @click="send(q)">{{ q }}</button>
           </div>
@@ -66,8 +66,8 @@
             </template>
             <!-- 状态提示 -->
             <div v-if="m.status" class="status-line"><el-icon class="is-loading"><Loading /></el-icon> {{ m.status }}</div>
-            <!-- 正文（markdown） -->
-            <div class="md-body" v-if="m.content" v-html="renderMd(m.content)"></div>
+            <!-- 正文（Markdown token 结构渲染；模型输出不会作为 HTML 注入） -->
+            <SafeMarkdown v-if="m.content" :content="m.content" />
             <!-- 检索资料来源：由服务端按当前租户和 Agent 已绑定资料库过滤后返回。 -->
             <section v-if="m.citations?.length" class="citation-sources" :aria-labelledby="`citation-title-${i}`">
               <div class="citation-sources-head">
@@ -114,26 +114,31 @@
       </div>
 
       <!-- 附件预览弹窗 -->
-      <el-dialog v-model="previewVisible" :title="citationPreview ? `引用原文：${previewFile.filename}` : previewFile.filename" width="720px" top="6vh" destroy-on-close>
+      <el-dialog v-model="previewVisible" :title="citationPreview ? `${citationPreview.source === 'snapshot' ? '历史引用快照' : '引用原文'}：${previewFile.filename}` : previewFile.filename" width="720px" top="6vh" destroy-on-close>
         <div v-loading="previewLoading" class="preview-box">
           <template v-if="citationPreview">
-            <p class="citation-range">引用位置：字符 {{ citationPreview.charStart }}–{{ citationPreview.charEnd }}</p>
+            <p v-if="citationPreview.source === 'snapshot'" class="citation-range">
+              历史引用快照：这是回答生成时保存的片段，不会按当前文件的旧偏移重新截取。
+            </p>
+            <p v-else class="citation-range">
+              当前文件位置：字符 {{ citationPreview.charStart }}–{{ citationPreview.charEnd }}（原始快照不可用，文件内容可能已变更）。
+            </p>
             <pre class="citation-original"><span>{{ citationPreview.prefix }}</span><mark>{{ citationPreview.highlighted }}</mark><span>{{ citationPreview.suffix }}</span></pre>
           </template>
-          <div class="md-body" v-else-if="previewText" v-html="renderMd(previewText)"></div>
+          <SafeMarkdown v-else-if="previewText" :content="previewText" />
           <el-empty v-else-if="!previewLoading" description="暂无可预览内容" />
         </div>
         <template #footer>
           <el-button @click="previewVisible = false">关闭</el-button>
           <el-button type="primary" :disabled="!previewFile.id" @click="download(previewFile)">
-            <el-icon><Download /></el-icon> 下载
+            <el-icon><Download /></el-icon>{{ citationPreview?.source === 'snapshot' ? '下载当前文件' : '下载' }}
           </el-button>
         </template>
       </el-dialog>
 
       <div class="chat-input-area">
         <el-input v-model="input" type="textarea" :rows="2" resize="none"
-          placeholder="输入业务问题，例如查询数据、检索文档或执行已配置的业务操作"
+          placeholder="输入业务问题，例如查询数据、检索文档或预演已配置的业务操作"
           @keydown.enter.exact.prevent="send()" />
         <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
           <span class="muted">Enter 发送 · Shift+Enter 换行</span>
@@ -153,9 +158,9 @@
 import { ref, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { marked } from 'marked'
 import { api, streamChat } from '@/api'
 import type { Agent, ChatMessage, Conversation, RagCitation } from '@/types'
+import SafeMarkdown from '@/components/SafeMarkdown.vue'
 
 const route = useRoute()
 const agent = ref<Agent | null>(null)
@@ -168,6 +173,7 @@ type CitationPreview = {
   prefix: string
   highlighted: string
   suffix: string
+  source: 'snapshot' | 'current'
 }
 
 const messages = ref<ChatViewMessage[]>([])
@@ -182,10 +188,6 @@ const suggestions = [
   '根据已配置规则检查一组业务数据',
   '检索业务文档并给出要点总结',
 ]
-
-function renderMd(s: string) {
-  return marked.parse(s, { breaks: true }) as string
-}
 
 // ── 附件：从消息内容中提取 save_deliverable 生成的下载链接 ──
 const ATTACH_RE = /\/api\/data-sources\/files\/([a-f0-9]{32})\/download/g
@@ -261,6 +263,7 @@ function citationPreviewFor(text: string, citation: RagCitation): CitationPrevie
     prefix: `${prefixStart ? '…' : ''}${text.slice(prefixStart, start)}`,
     highlighted: text.slice(start, end) || citation.text || '（引用片段当前不可用）',
     suffix: `${text.slice(end, suffixEnd)}${suffixEnd < text.length ? '…' : ''}`,
+    source: 'current',
   }
 }
 
@@ -271,9 +274,24 @@ async function previewCitation(citation: RagCitation) {
     url: `/api/data-sources/files/${citation.file_id}/download`,
   }
   previewVisible.value = true
-  previewLoading.value = true
+  previewLoading.value = false
   previewText.value = ''
+  // Citations persist their answer-time excerpt. Prefer it over a fresh
+  // offset lookup so a document reindex/update cannot silently display a
+  // different passage under the historical citation label.
+  if (citation.text) {
+    citationPreview.value = {
+      charStart: citation.char_start,
+      charEnd: citation.char_end,
+      prefix: '',
+      highlighted: citation.text,
+      suffix: '',
+      source: 'snapshot',
+    }
+    return
+  }
   citationPreview.value = null
+  previewLoading.value = true
   try {
     const r: any = await api.fileText(citation.file_id)
     previewText.value = r.text || ''

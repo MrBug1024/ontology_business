@@ -6,14 +6,13 @@
 - run_sql             在数据源上执行只读 SQL
 - search_documents    在文件桶中检索相关文档片段（RAG）
 - read_document       读取某个已解析文档的全文
-- execute_skill       执行已安装的技能（如 ocr-parser 解析文件）
-- mcp_*               调用已安装的 MCP 工具
+
+Agent 只承担读取、检索、解释和受控 Action 预演。任何外部副作用都必须由用户
+通过类型化 Action 或任务中心的显式确认入口触发，不能由模型工具调用直接执行。
 """
 from __future__ import annotations
 
 import json
-import uuid
-from pathlib import Path
 from typing import Any, Iterator
 
 from sqlalchemy import or_, select
@@ -33,7 +32,7 @@ from ..models import (
     OntologyWorkflow,
     Skill,
 )
-from . import datasource_service, llm_service, mcp_service, ontology_service, rag_service, skill_service, tenant_service, workflow_service
+from . import datasource_service, llm_service, mcp_service, ontology_service, permission_service, rag_service, skill_service, tenant_service, workflow_service
 
 class AgentContext:
     """一次 Agent 会话的运行时上下文。"""
@@ -48,6 +47,15 @@ class AgentContext:
             tenant_service.get_visible(db, BusinessScenario, agent.scenario_id)
             if agent.scenario_id else None
         )
+        if agent.scenario_id:
+            if not self.scenario:
+                raise PermissionError("Agent 绑定的业务场景不存在或不可见")
+            permission_service.require_scenario_permission(
+                db,
+                self.scenario,
+                "read",
+                message="没有使用该 Agent 业务场景的权限",
+            )
         self.data_sources: list[DataSource] = []
         # 一次回答内的引用编号必须稳定、全局唯一；不能把每次检索各自的 C1 混在一起。
         self.citations: list[dict[str, Any]] = []
@@ -88,18 +96,28 @@ class AgentContext:
         self.workflows: list[OntologyWorkflow] = []
         sid = self.agent.scenario_id
         if sid:
-            self.actions = list(
+            candidate_actions = list(
                 self.db.execute(select(OntologyAction).where(OntologyAction.scenario_id == sid, OntologyAction.enabled == True)).scalars().all()  # noqa: E712
             )
+            # 绑定 Agent 不能成为 Action 配置名称、说明或能力的旁路；展示与执行都
+            # 复用细粒度 ACL，执行时仍会再做一次强制检查。
+            self.actions = [
+                action for action in candidate_actions
+                if permission_service.check_action(self.db, action, "read").allowed
+            ]
             self.rules = list(
                 self.db.execute(select(OntologyRule).where(OntologyRule.scenario_id == sid, OntologyRule.enabled == True)).scalars().all()  # noqa: E712
             )
             self.events = list(
                 self.db.execute(select(OntologyEvent).where(OntologyEvent.scenario_id == sid, OntologyEvent.enabled == True)).scalars().all()  # noqa: E712
             )
-            self.workflows = list(
+            candidate_workflows = list(
                 self.db.execute(select(OntologyWorkflow).where(OntologyWorkflow.scenario_id == sid, OntologyWorkflow.enabled == True)).scalars().all()  # noqa: E712
             )
+            self.workflows = [
+                workflow for workflow in candidate_workflows
+                if permission_service.check_workflow(self.db, workflow, "read").allowed
+            ]
 
     def _writable_file_buckets(self) -> list[DataSource]:
         """公开绑定资源可读不可写；交付物只允许保存到当前租户自有桶。"""
@@ -122,7 +140,7 @@ class AgentContext:
             source_id = str(raw.get("data_source_id") or "")
             file_id = str(raw.get("file_id") or "")
             chunk_id = str(raw.get("chunk_id") or "")
-            if not source_id or source_id not in allowed_source_ids or not file_id or not chunk_id:
+            if not source_id or source_id not in allowed_source_ids or not file_id:
                 continue
             try:
                 char_start = int(raw.get("char_start"))
@@ -131,7 +149,7 @@ class AgentContext:
                 continue
             if char_start < 0 or char_end <= char_start:
                 continue
-            key = (file_id, chunk_id, char_start, char_end)
+            key = (file_id, chunk_id or "document", char_start, char_end)
             citation = self._citations_by_key.get(key)
             if citation is None:
                 citation = {
@@ -145,6 +163,7 @@ class AgentContext:
                     "char_end": char_end,
                     "chunk_ordinal": int(raw.get("chunk_ordinal") or 0),
                     "content_hash": str(raw.get("content_hash") or ""),
+                    "file_content_hash": str(raw.get("file_content_hash") or ""),
                     "embedding_model": str(raw.get("embedding_model") or ""),
                     "index_version": str(raw.get("index_version") or ""),
                     "score": float(raw.get("score") or 0),
@@ -215,43 +234,6 @@ class AgentContext:
                     },
                 ),
             ]
-            if self._writable_file_buckets():
-                tools.append(
-                    _tool(
-                        "save_deliverable",
-                        "把正式业务产出物（报告、清单、分析结果或其他交付文件）保存为可下载附件，"
-                        "返回附件的预览/下载链接。参数 filename 为文件名（建议 .md 或 .txt 结尾），content 为附件全文内容。"
-                        "生成正式交付文件时应调用本工具，并在回答中附上返回的链接。",
-                        {
-                            "filename": {"type": "string", "description": "附件文件名，如 业务分析报告.md"},
-                            "content": {"type": "string", "description": "附件全文内容（Markdown 或纯文本）"},
-                        },
-                    )
-                )
-        if self.skills:
-            tools.append(
-                _tool(
-                    "execute_skill",
-                    "执行已安装的技能。参数 skill_name 为技能名，args 为命令行参数数组。"
-                    "例如用 ocr-parser 解析文件：skill_name=ocr-parser, args=[\"--path\",\"/path/file.pdf\",\"--format\",\"json\"]。",
-                    {
-                        "skill_name": {"type": "string", "description": "技能名"},
-                        "args": {"type": "array", "items": {"type": "string"}, "description": "命令行参数"},
-                    },
-                )
-            )
-        for mcp in self.mcps:
-            try:
-                for t in mcp_service.list_tools(mcp):
-                    tools.append(
-                        _tool(
-                            f"mcp_{mcp.name}_{t['name']}",
-                            f"[MCP:{mcp.name}] {t['description'] or t['name']}",
-                            t.get("input_schema", {}).get("properties", {}),
-                        )
-                    )
-            except Exception:  # noqa: BLE001
-                continue
         # 本体扩展工具：操作 / 规则 / 工作流
         if self.actions:
             tools.append(
@@ -300,7 +282,7 @@ class AgentContext:
             tools.append(
                 _tool(
                     "execute_workflow",
-                    "执行场景中定义的某个工作流（按步骤顺序执行操作/规则/事件）。参数 workflow_id 为工作流 id，params 为输入参数。",
+                    "提交场景中定义的某个工作流到可靠运行队列。任务会在后台执行，人工审批、重试和结果请在任务中心跟踪。参数 workflow_id 为工作流 id，params 为输入参数。",
                     {
                         "workflow_id": {"type": "string", "description": "工作流 id"},
                         "params": {"type": "object", "description": "输入参数"},
@@ -369,12 +351,11 @@ class AgentContext:
                 )
             if name == "read_document":
                 return self._read_doc(args.get("file_id", ""), args.get("filename", ""))
-            if name == "save_deliverable":
-                return self._save_deliverable(args.get("filename", ""), args.get("content", ""))
-            if name == "execute_skill":
-                return self._exec_skill(args.get("skill_name", ""), args.get("args", []))
-            if name.startswith("mcp_"):
-                return self._exec_mcp(name, args)
+            if name == "save_deliverable" or name == "execute_skill" or name.startswith("mcp_"):
+                return (
+                    "Agent 不直接执行 Skill、MCP 或写入文件；请将该副作用配置为类型化 Action，"
+                    "由用户在操作页或任务中心完成预演和显式确认。"
+                )
             # 本体扩展工具
             if name == "list_actions":
                 return _dump(
@@ -397,14 +378,17 @@ class AgentContext:
                 if not a:
                     names = "、".join(x.name for x in self.actions)
                     return f"未找到操作: {key}（可用操作: {names}，请用 list_actions 查看 id）"
-                # 助手工具调用也必须经过显式确认；对话模型不能绕过页面的预演/幂等执行链路。
+                permission_service.require_action_permission(self.db, a, "read")
+                # 对话模型只可生成 Action 预演。实际执行必须由用户在 Action/任务
+                # 界面显式确认，确保模型不能把自然语言输入直接变成外部副作用。
                 r = workflow_service.execute_action(
                     self.db,
                     a,
                     args.get("params", {}),
-                    confirm=False,
+                    dry_run=True,
                     enforce_policy=True,
                 )
+                r["message"] = "这是预演结果；请在操作页或任务中心确认后执行。"
                 return _dump(r)
             if name == "list_rules":
                 return _dump(
@@ -441,8 +425,13 @@ class AgentContext:
                 w = next((x for x in self.workflows if x.id == args.get("workflow_id")), None)
                 if not w:
                     return f"未找到工作流: {args.get('workflow_id')}"
-                r = workflow_service.execute_workflow(self.db, w, args.get("params", {}))
-                return _dump(r)
+                return _dump(
+                    {
+                        "status": "confirmation_required",
+                        "workflow_id": w.id,
+                        "message": "Agent 不直接提交工作流；请在工作流页面或任务中心确认后运行。",
+                    }
+                )
             return f"未知工具: {name}"
         except Exception as exc:  # noqa: BLE001
             return f"工具执行出错: {exc}"
@@ -454,7 +443,7 @@ class AgentContext:
         return None
 
     def _read_doc(self, file_id: str = "", filename: str = "") -> str:
-        """读取资料库全文时复用绑定范围与租户可见性，避免绕过检索边界。"""
+        """读取资料库全文时附带可持久化引用，避免全文工具绕过引用审计。"""
         bound_ids = [d.id for d in self.data_sources if d.type == "file_bucket"]
         if not bound_ids:
             return "当前 Agent 未绑定可检索资料库"
@@ -476,70 +465,49 @@ class AgentContext:
         f = matches[0] if matches else None
         if not f:
             return f"未找到或无权读取文件: {file_id}"
-        return (f.parsed_text or f"文件 {f.filename} 暂无解析内容")[:24_000]
-
-    def _save_deliverable(self, filename: str, content: str) -> str:
-        """把产出物保存为文件桶附件，返回预览/下载链接。"""
-        bucket = next(iter(self._writable_file_buckets()), None)
-        if not bucket:
-            if any(d.type == "file_bucket" for d in self.data_sources):
-                return "绑定的文件桶均为只读公开资源，无法保存附件；请绑定当前租户自有文件桶"
-            return "未绑定文件桶数据源，无法保存附件"
-        if not content or not content.strip():
-            return "附件内容为空，未保存"
-        safe = Path(filename).name or f"deliverable_{uuid.uuid4().hex[:8]}.md"
-        if "." not in safe:
-            safe += ".md"
-        # 同名文件加时间戳避免覆盖
-        existing = self.db.execute(
-            select(BucketFile).where(
-                BucketFile.data_source_id == bucket.id, BucketFile.filename == safe
-            )
-        ).scalars().first()
-        if existing:
-            stem, dot, ext = safe.rpartition(".")
-            safe = f"{stem}_{uuid.uuid4().hex[:6]}.{ext}" if dot else f"{safe}_{uuid.uuid4().hex[:6]}"
-        data = content.encode("utf-8")
-        bf = datasource_service.save_bucket_file(bucket, safe, data)
-        self.db.add(bf)
-        self.db.flush()
-        rag_service.enqueue_document_index(self.db, bf, parse_document=True)
-        self.db.commit()
-        self.db.refresh(bf)
+        content = (f.parsed_text or f"文件 {f.filename} 暂无解析内容")[:24_000]
+        source = next((item for item in self.data_sources if item.id == f.data_source_id), None)
+        citation = self._record_citations(
+            [
+                {
+                    "file_id": f.id,
+                    "filename": f.filename,
+                    "data_source_id": f.data_source_id,
+                    "data_source_name": source.name if source else "资料库",
+                    "char_start": 0,
+                    "char_end": len(content),
+                    # 全文读取并不等于某个单独分块；保留文件版本哈希和快照，以便
+                    # 历史会话仍可审计且不会被重索引后的字符偏移误导。
+                    "content_hash": f.indexed_content_hash or "",
+                    "file_content_hash": f.indexed_content_hash or "",
+                    "index_version": f.index_version or "",
+                    "text": content,
+                }
+            ]
+        )
+        if not citation:
+            return "资料文件当前没有可审计的引用版本，请先完成解析和索引"
         return _dump(
             {
-                "saved": True,
-                "file_id": bf.id,
-                "filename": bf.filename,
-                "size": bf.size,
-                "index_status": bf.index_status,
-                "preview_url": f"/api/data-sources/files/{bf.id}/text",
-                "download_url": f"/api/data-sources/files/{bf.id}/download",
-                "提示": "附件已排队解析和建立检索索引；请在回答中以 Markdown 链接形式附上下载地址，例如 [📎 业务交付物.md](/api/data-sources/files/" + bf.id + "/download)",
+                "citation": citation[0],
+                "content": content,
+                "truncated": len(f.parsed_text or "") > len(content),
+                "instruction": "最终回答引用该资料事实时必须标注 citation_id。",
             }
         )
 
+    def _save_deliverable(self, filename: str, content: str) -> str:
+        """Legacy direct-write hook retained as a non-executing compatibility response."""
+        return (
+            "Agent 不直接写入文件桶；请通过类型化 Action 配置文件交付，"
+            "并由用户在操作页或任务中心完成确认。"
+        )
+
     def _exec_skill(self, skill_name: str, args: list[str]) -> str:
-        skill = next((s for s in self.skills if s.name == skill_name), None)
-        if not skill:
-            return f"未找到技能: {skill_name}（已安装: {[s.name for s in self.skills]}）"
-        r = skill_service.execute_skill(skill, args)
-        out = r.get("stdout", "")
-        if r.get("stderr"):
-            out += f"\n[stderr] {r['stderr']}"
-        return out or f"技能执行结束（exit={r.get('exit_code')}）"
+        return "Agent 不直接执行 Skill；请通过类型化 Action 配置技能并由用户确认。"
 
     def _exec_mcp(self, tool_name: str, args: dict[str, Any]) -> str:
-        # tool_name 形如 mcp_<mcpname>_<toolname>
-        parts = tool_name.split("_", 2)
-        if len(parts) < 3:
-            return "MCP 工具名格式错误"
-        mcp_name, mcp_tool = parts[1], parts[2]
-        mcp = next((m for m in self.mcps if m.name == mcp_name), None)
-        if not mcp:
-            return f"未找到 MCP: {mcp_name}"
-        r = mcp_service.call_tool(mcp, mcp_tool, args)
-        return r.get("text", "") or json.dumps(r, ensure_ascii=False)
+        return "Agent 不直接调用 MCP；请通过类型化 Action 配置 MCP 工具并由用户确认。"
 
 
 def _tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, Any]:
@@ -599,24 +567,20 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
             "你可以用 list_tables 查看表结构，用 run_sql 查询数据库，用 search_documents 检索文件桶中的文档。"
             "凡引用检索到的事实，必须在答案中标出工具结果提供的【C#】；未检索到依据时明确说明。"
         )
-        if ctx._writable_file_buckets():
-            parts.append(
-                "当你生成正式业务交付物时，务必调用 save_deliverable 工具把它保存为附件，"
-                "并在最终回答中以 Markdown 链接形式附上返回的 download_url。"
-            )
         table_map = _table_map(ctx)
         if table_map:
             parts.append("\n【实体 → 数据库表名映射】（run_sql 时请使用下列真实表名，不要臆造）\n" + table_map)
     if ctx.skills:
         parts.append("\n【已安装技能】\n" + "\n".join(f"- {s.name}: {s.description[:80]}" for s in ctx.skills))
-        parts.append("你可以用 execute_skill 调用技能（如用 ocr-parser 解析 PDF/图片）。")
+        parts.append("这些能力只能通过已经配置并获确认的 Action 使用，不能由对话直接执行。")
     if ctx.mcps:
         parts.append("\n【已安装 MCP 服务】\n" + "\n".join(f"- {m.name}（{m.transport}）" for m in ctx.mcps))
+        parts.append("这些能力只能通过已经配置并获确认的 Action 使用，不能由对话直接调用。")
     if ctx.actions:
         parts.append(
             "\n【可执行操作（Actions）】\n"
             + "\n".join(f"- {a.name}（id={a.id}，{a.entity.name if a.entity else '?'}，{a.executor_type}）: {a.description[:60]}" for a in ctx.actions)
-            + "\n你可以用 list_actions 查看操作列表，用 execute_action 执行操作（action_id 必须用上面的 id，不要用中文名）。"
+            + "\n你可以用 list_actions 查看操作列表，用 execute_action 生成预演；实际执行须由用户在操作页或任务中心确认。"
         )
     if ctx.rules:
         parts.append(
@@ -628,7 +592,7 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
         parts.append(
             "\n【工作流（Workflows）】\n"
             + "\n".join(f"- {w.name}（id={w.id}，{w.trigger_type}，{len(w.steps or [])}步）: {w.description[:60]}" for w in ctx.workflows)
-            + "\n你可以用 list_workflows 查看工作流列表，用 execute_workflow 执行工作流（workflow_id 必须用上面的 id，不要用中文名）。"
+            + "\n你可以用 list_workflows 查看工作流列表；实际运行须由用户在工作流页面或任务中心确认。"
         )
     parts.append(
         "\n【工作方式】请根据用户问题，自主调用合适的工具获取数据，然后给出准确、结构化的回答。"
@@ -678,7 +642,7 @@ def ontology_summary_for(scenario) -> str:
 # ──────────────────────────────────────────────
 # 主循环
 # ──────────────────────────────────────────────
-def run_agent(
+def _run_agent(
     db: Session,
     agent: Agent,
     llm: LLMConfig,
@@ -757,3 +721,38 @@ def run_agent(
     if ctx.citations:
         yield {"type": "citations", "data": ctx.citation_snapshot()}
     yield {"type": "done", "data": "（已达到最大工具调用轮数，回答可能不完整）"}
+
+
+def run_agent(
+    db: Session,
+    agent: Agent,
+    llm: LLMConfig,
+    history: list[dict[str, Any]],
+    user_message: str,
+    scenario_name: str,
+    ontology_summary: str,
+    *,
+    trace_context: dict[str, Any] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """执行 Agent 并在每个真实模型 trace 中保留最小可审计回链。"""
+    previous = db.info.get("llm_trace_context")
+    context = dict(trace_context or {})
+    context.setdefault("agent_id", agent.id)
+    context.setdefault("scenario_id", agent.scenario_id or "")
+    if context:
+        db.info["llm_trace_context"] = context
+    try:
+        yield from _run_agent(
+            db,
+            agent,
+            llm,
+            history,
+            user_message,
+            scenario_name,
+            ontology_summary,
+        )
+    finally:
+        if previous is None:
+            db.info.pop("llm_trace_context", None)
+        else:
+            db.info["llm_trace_context"] = previous

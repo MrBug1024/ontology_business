@@ -383,10 +383,14 @@ def _mapping_context(
     db: Session,
     scenario: BusinessScenario,
     mapping: DataMapping,
+    *,
+    data_source: DataSource | None = None,
 ) -> tuple[DataSource, OntologyEntity]:
     if mapping.scenario_id != scenario.id:
         raise ValueError("映射不属于当前业务场景")
-    ds = db.get(DataSource, mapping.data_source_id)
+    # 非开发环境可由运行时绑定解析为该环境的物理数据源；映射中的直接 ID
+    # 仅保留开发兼容与定义预览用途。
+    ds = data_source or db.get(DataSource, mapping.data_source_id)
     if not ds or ds.scenario_id not in (None, scenario.id):
         raise ValueError("映射对应的数据源不存在或不属于当前业务场景")
     if ds.type == "file_bucket":
@@ -412,9 +416,11 @@ def preview_mapping(
     scenario: BusinessScenario,
     mapping: DataMapping,
     limit: int = 20,
+    *,
+    data_source: DataSource | None = None,
 ) -> dict[str, Any]:
     """读取映射源表样本并检查属性覆盖，不创建或修改对象实例。"""
-    ds, ent = _mapping_context(db, scenario, mapping)
+    ds, ent = _mapping_context(db, scenario, mapping, data_source=data_source)
     sample_limit = max(1, min(int(limit or 20), 100))
     result = datasource_service.run_query(
         ds,
@@ -489,14 +495,24 @@ def preview_mapping(
     }
 
 
-def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mapping: DataMapping, limit: int = 50) -> dict[str, Any]:
+def import_instances_from_mapping(
+    db: Session,
+    scenario: BusinessScenario,
+    mapping: DataMapping,
+    limit: int = 50,
+    *,
+    data_source: DataSource | None = None,
+    commit: bool = True,
+    environment: str = "dev",
+) -> dict[str, Any]:
     """按数据映射增量同步实例，并写入可审计的来源快照。
 
-    ``source_ref`` 保留短小可读的引用；精确且不会串源的映射标识、数据源、表和
-    记录键写在 ``source_metadata``。这样同一个实体由多个数据源/映射同步时也不
-    会互相覆盖，未变记录则可安全复用既有实例。
+    ``source_ref`` 保留短小可读的引用；精确且不会串源的映射标识、运行环境、
+    数据源、表和记录键写在 ``source_metadata``。这样同一个实体由多个数据源/
+    映射/部署环境同步时也不会互相覆盖，未变记录则可安全复用既有实例。
     """
-    ds, ent = _mapping_context(db, scenario, mapping)
+    ds, ent = _mapping_context(db, scenario, mapping, data_source=data_source)
+    runtime_environment = str(environment or "dev").strip().lower() or "dev"
     col_map = mapping.column_map or {}
 
     result = datasource_service.run_query(
@@ -507,7 +523,14 @@ def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mappi
     rows = result.get("rows", [])
     columns = result.get("columns", [])
     if not rows:
-        raise ValueError(f"表 {mapping.table_name} 中没有数据")
+        # 空表是一次成功的无变更刷新，而不是需要重试的连接器失败。
+        # 这也与 preview_mapping 的“暂无数据”提示语义保持一致。
+        return {
+            "instances_created": 0,
+            "instances_updated": 0,
+            "relations_created": 0,
+            "rows_scanned": 0,
+        }
 
     # 主键属性
     key_prop = next((p.name for p in ent.properties if p.is_key), None)
@@ -521,15 +544,19 @@ def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mappi
             OntologyInstance.source == "imported",
         )
     ).scalars().all()
-    # 新版使用 (mapping_id, record_key) 做稳定身份；旧版用 table:key 作为一次性
-    # 回退，升级后第一次刷新会补齐元数据，随后完全按新版键去重。
-    existing_by_identity: dict[tuple[str, str], OntologyInstance] = {}
+    # 新版使用 (mapping_id, environment, record_key) 做稳定身份；旧版用
+    # table:key 作为开发环境的一次性回退，升级后第一次刷新会补齐元数据，随后
+    # 完全按新版键去重。这样共享数据库中的 staging/prod 写入不会覆盖 dev 对象。
+    existing_by_identity: dict[tuple[str, str, str], OntologyInstance] = {}
     legacy_by_ref: dict[str, OntologyInstance] = {}
     for instance in imported_instances:
         metadata = instance.source_metadata or {}
         if isinstance(metadata, dict) and metadata.get("mapping_id") and metadata.get("record_key") is not None:
-            existing_by_identity[(str(metadata["mapping_id"]), str(metadata["record_key"]))] = instance
-        if instance.source_ref:
+            metadata_environment = str(metadata.get("runtime_environment") or "dev").strip().lower() or "dev"
+            existing_by_identity[
+                (str(metadata["mapping_id"]), metadata_environment, str(metadata["record_key"]))
+            ] = instance
+        if runtime_environment == "dev" and instance.source_ref:
             legacy_by_ref[instance.source_ref] = instance
 
     row_instances: list[OntologyInstance] = []
@@ -548,11 +575,12 @@ def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mappi
             record_key = f"row:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:20]}"
         legacy_ref = f"{mapping.table_name}:{record_key}"
         ref = f"{ds.id}:{mapping.table_name}:{record_key}"[:500]
-        identity = (mapping.id, record_key)
+        identity = (mapping.id, runtime_environment, record_key)
         inst = existing_by_identity.get(identity) or legacy_by_ref.get(legacy_ref)
         display = str(rec.get(key_col) or attrs.get(key_prop) or f"{ent.name}-{len(created_instances) + 1}")
         metadata = {
             "mapping_id": mapping.id,
+            "runtime_environment": runtime_environment,
             "data_source_id": ds.id,
             "table_name": mapping.table_name,
             "key_column": key_col or "",
@@ -636,14 +664,23 @@ def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mappi
         okey_by_value: dict[str, OntologyInstance] = {}
         for inst in oexisting:
             metadata = inst.source_metadata or {}
-            if isinstance(metadata, dict) and metadata.get("mapping_id") == om.id:
+            metadata_environment = (
+                str(metadata.get("runtime_environment") or "dev").strip().lower()
+                if isinstance(metadata, dict)
+                else ""
+            )
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("mapping_id") == om.id
+                and metadata_environment == runtime_environment
+            ):
                 value = metadata.get("record_key")
                 if value is not None:
                     okey_by_value[str(value)] = inst
                     continue
             # 兼容尚未刷新过的旧对象来源标识。
             legacy_prefix = f"{om.table_name}:"
-            if (inst.source_ref or "").startswith(legacy_prefix):
+            if runtime_environment == "dev" and (inst.source_ref or "").startswith(legacy_prefix):
                 okey_by_value[inst.source_ref[len(legacy_prefix):]] = inst
 
         for row, ent_inst in zip(rows, row_instances):
@@ -675,7 +712,12 @@ def import_instances_from_mapping(db: Session, scenario: BusinessScenario, mappi
                     )
                 )
                 rels_created += 1
-    db.commit()
+    # 后台任务需要原子提交“实例/关系 + 映射状态 + 任务终态”，不能在此提前
+    # 提交出半完成同步；保留默认提交以兼容现有 seed/服务调用。
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return {
         "instances_created": len(created_instances),
         "instances_updated": updated_instances,

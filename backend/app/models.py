@@ -8,9 +8,11 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
+    event,
     Float,
     ForeignKey,
     Index,
+    inspect,
     Integer,
     String,
     Text,
@@ -18,6 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from .config import get_settings
 from .database import Base
 
 
@@ -27,6 +30,11 @@ def _uuid() -> str:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _runtime_environment_default() -> str:
+    """Keep direct ORM-created runs aligned with this server deployment."""
+    return get_settings().runtime_environment
 
 
 # ──────────────────────────────────────────────
@@ -42,6 +50,9 @@ class Tenant(Base):
     users: Mapped[list["User"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
     organization: Mapped["Organization | None"] = relationship(
         back_populates="tenant", uselist=False, cascade="all, delete-orphan"
+    )
+    mapping_refresh_jobs: Mapped[list["DataMappingRefreshJob"]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
     )
 
 
@@ -258,6 +269,9 @@ class BusinessScenario(Base):
     data_mappings: Mapped[list[DataMapping]] = relationship(
         back_populates="scenario", cascade="all, delete-orphan"
     )
+    function_definitions: Mapped[list["FunctionDefinition"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
     actions: Mapped[list["OntologyAction"]] = relationship(
         back_populates="scenario", cascade="all, delete-orphan"
     )
@@ -277,6 +291,27 @@ class BusinessScenario(Base):
         back_populates="scenario", cascade="all, delete-orphan"
     )
     event_envelopes: Mapped[list["EventEnvelope"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
+    ontology_branches: Mapped[list["OntologyBranch"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
+    ontology_snapshots: Mapped[list["OntologySnapshot"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
+    ontology_proposals: Mapped[list["OntologyProposal"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
+    ontology_releases: Mapped[list["OntologyRelease"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
+    ontology_rollbacks: Mapped[list["OntologyRollback"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
+    mapping_refresh_jobs: Mapped[list["DataMappingRefreshJob"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
+    incident_cases: Mapped[list["IncidentCase"]] = relationship(
         back_populates="scenario", cascade="all, delete-orphan"
     )
     tenant: Mapped[Tenant | None] = relationship()
@@ -444,6 +479,10 @@ class DataMapping(Base):
     data_source_id: Mapped[str] = mapped_column(
         ForeignKey("data_sources.id", ondelete="CASCADE"), index=True
     )
+    # 物理数据源仅用于开发环境兼容与定义预览。非开发环境刷新由逻辑绑定键
+    # 解析到该环境已发布、已验签的连接器，不能据此直接选中 dev 数据源。
+    data_source_binding_key: Mapped[str] = mapped_column(String(180), default="")
+    data_source_binding_ref: Mapped[dict] = mapped_column(JSON, default=dict)
     table_name: Mapped[str] = mapped_column(String(300), default="")
     column_map: Mapped[dict] = mapped_column(JSON, default=dict)  # {本体属性名: 表列名}
     status: Mapped[str] = mapped_column(String(20), default="unknown")  # unknown / ready / ok / error
@@ -452,6 +491,9 @@ class DataMapping(Base):
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_row_count: Mapped[int] = mapped_column(Integer, default=0)
     last_imported_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 按部署环境保存刷新状态；旧顶层字段继续承载 dev 的兼容视图，避免共享
+    # 数据库中的 staging/prod worker 覆盖开发环境的可见状态。
+    environment_status: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship(back_populates="data_mappings")
@@ -478,6 +520,10 @@ class DataSource(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     type: Mapped[str] = mapped_column(String(30), nullable=False)  # mysql / postgres / sqlite / file_bucket
     config: Mapped[dict] = mapped_column(JSON, default=dict)
+    # A durable, monotonic revision of all runtime-relevant configuration.
+    # Releases record this value instead of storing an unsafe configuration
+    # fingerprint that could reveal credentials.
+    connector_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[str] = mapped_column(String(20), default="unknown")  # unknown / ok / error
     last_error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -487,6 +533,14 @@ class DataSource(Base):
         back_populates="data_source", cascade="all, delete-orphan"
     )
     tenant: Mapped[Tenant | None] = relationship()
+
+    __mapper_args__ = {
+        # The revision is advanced by the listener below.  Keeping it as an
+        # optimistic version column prevents two concurrent configuration
+        # updates from silently producing the same revision.
+        "version_id_col": connector_revision,
+        "version_id_generator": False,
+    }
 
 
 class BucketFile(Base):
@@ -557,6 +611,75 @@ class DocumentChunk(Base):
     data_source: Mapped[DataSource] = relationship()
 
 
+class DataMappingRefreshJob(Base):
+    """持久化的数据映射单批刷新任务。
+
+    映射定义在 HTTP 请求中只负责入队；实际读取外部数据源、写入对象实例和关系
+    由 worker 执行。``mapping_id`` 不设外键，避免编辑映射（当前为删除旧映射再新建）
+    时丢失可追溯的已取消任务记录。
+    """
+
+    __tablename__ = "data_mapping_refresh_jobs"
+    __table_args__ = (
+        Index("ix_mapping_refresh_jobs_dispatch", "environment", "status", "available_at"),
+        Index("ix_mapping_refresh_jobs_mapping_created", "mapping_id", "created_at"),
+        UniqueConstraint("tenant_id", "active_key", name="uq_mapping_refresh_jobs_active_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    mapping_id: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    requested_by_user_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    environment: Mapped[str] = mapped_column(String(20), default=_runtime_environment_default, index=True)
+    # 同一映射同一环境只保留一个活跃任务；终态会清空，允许下一次刷新。
+    active_key: Mapped[str | None] = mapped_column(String(260), nullable=True)
+    # Immutable, credential-free mapping definition captured when the job is
+    # queued.  A staging/prod worker must never reread mutable live mapping
+    # fields after a release has been selected.
+    mapping_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    mapping_fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    # Release provenance for a frozen mapping job.  ``dev`` jobs explicitly
+    # retain ``live`` as their source while still carrying mapping_snapshot so
+    # queue/retry work cannot drift with later edits.
+    definition_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    release_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_releases.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    definition_hash: Mapped[str] = mapped_column(String(64), default="")
+    definition_source: Mapped[str] = mapped_column(String(20), default="live")
+    limit: Mapped[int] = mapped_column(Integer, default=50)
+    # queued / running / retry_waiting / succeeded / failed / timed_out / cancelled
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=300)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rows_scanned: Mapped[int] = mapped_column(Integer, default=0)
+    instances_created: Mapped[int] = mapped_column(Integer, default=0)
+    instances_updated: Mapped[int] = mapped_column(Integer, default=0)
+    relations_created: Mapped[int] = mapped_column(Integer, default=0)
+    # 仅存逻辑键、目标 ID、适配器等无密钥连接器审计事实。
+    connector_audit: Mapped[list] = mapped_column(JSON, default=list)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    tenant: Mapped[Tenant] = relationship(back_populates="mapping_refresh_jobs")
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="mapping_refresh_jobs")
+
+
 class DocumentIndexJob(Base):
     """持久化的文档解析/索引任务。
 
@@ -568,6 +691,9 @@ class DocumentIndexJob(Base):
     __table_args__ = (
         Index("ix_document_index_jobs_dispatch", "status", "available_at"),
         Index("ix_document_index_jobs_file_created", "bucket_file_id", "created_at"),
+        # 活跃任务使用同一个 logical key，终态任务清空该字段。这样在 SQLite
+        # 及其他支持唯一索引的数据库中都能防止同一文件重复入队。
+        UniqueConstraint("tenant_id", "active_key", name="uq_document_index_jobs_active_key"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -583,6 +709,9 @@ class DocumentIndexJob(Base):
     # True: 从存储文件重新解析后索引；False: 使用当前 parsed_text 重建索引。
     parse_document: Mapped[bool] = mapped_column(Boolean, default=True)
     force: Mapped[bool] = mapped_column(Boolean, default=False)
+    # queued / running / retry_waiting 时为 bucket_file_id；终态置为 NULL，借助
+    # SQL UNIQUE 对多个 NULL 的语义允许之后再次为同一文件建索引。
+    active_key: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # queued / running / retry_waiting / succeeded / failed / timed_out
     status: Mapped[str] = mapped_column(String(24), default="queued")
     attempt: Mapped[int] = mapped_column(Integer, default=0)
@@ -624,6 +753,9 @@ class LLMConfig(Base):
     provider: Mapped[str] = mapped_column(String(50), default="openai")  # openai 兼容协议
     base_url: Mapped[str] = mapped_column(String(500), default="")
     api_key: Mapped[str] = mapped_column(String(500), default="")
+    # See ``DataSource.connector_revision``.  API keys are deliberately not
+    # copied to a release audit; changing one still advances this revision.
+    connector_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     model: Mapped[str] = mapped_column(String(200), default="")
     temperature: Mapped[float] = mapped_column(Float, default=0.2)
     max_tokens: Mapped[int] = mapped_column(Integer, default=4096)
@@ -646,6 +778,11 @@ class LLMConfig(Base):
     tenant: Mapped[Tenant | None] = relationship()
     traces: Mapped[list["LLMInvocationTrace"]] = relationship(back_populates="llm_config")
     evaluations: Mapped[list["LLMEvaluationRecord"]] = relationship(back_populates="llm_config")
+
+    __mapper_args__ = {
+        "version_id_col": connector_revision,
+        "version_id_generator": False,
+    }
 
 
 class LLMInvocationTrace(Base):
@@ -681,6 +818,13 @@ class LLMInvocationTrace(Base):
     estimated_cost: Mapped[float] = mapped_column(Float, default=0.0)
     currency: Mapped[str] = mapped_column(String(12), default="USD")
     tool_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 仅保存稳定 ID，不保存 prompt/回复/参数；可把一次模型调用审计回链到具体
+    # Agent、会话、场景和请求，而不会复制业务敏感内容。
+    correlation_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    agent_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    conversation_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    scenario_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     # 错误已在服务层去敏与截断，不能写入完整 provider 响应。
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -760,8 +904,68 @@ class MCPConfig(Base):
     env: Mapped[dict] = mapped_column(JSON, default=dict)
     headers: Mapped[dict] = mapped_column(JSON, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    connector_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     tenant: Mapped[Tenant | None] = relationship()
+
+    __mapper_args__ = {
+        "version_id_col": connector_revision,
+        "version_id_generator": False,
+    }
+
+
+# Connector configurations are runtime authority.  A public-shape signature
+# intentionally does not contain credentials or endpoint values, so it cannot
+# alone identify a safe target after an edit.  The version below is the durable
+# opaque pin used by bindings and release audit records.  It is changed only by
+# actual connector configuration updates, never by health/status bookkeeping.
+_CONNECTOR_REVISION_FIELDS: dict[type, tuple[str, ...]] = {
+    DataSource: (
+        "tenant_id", "is_public", "scenario_id", "name", "type", "config",
+    ),
+    MCPConfig: (
+        "tenant_id", "is_public", "name", "transport", "command", "args",
+        "url", "env", "headers", "enabled",
+    ),
+    LLMConfig: (
+        "tenant_id", "is_public", "name", "provider", "base_url", "api_key",
+        "model", "temperature", "max_tokens", "is_default", "capabilities",
+        "enabled", "routing_priority", "input_cost_per_million",
+        "output_cost_per_million", "budget_limit", "cost_currency",
+    ),
+}
+
+
+def _positive_connector_revision(value: object) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _advance_connector_revision(_mapper, _connection, target) -> None:
+    """Advance an opaque runtime pin without trusting caller-supplied values."""
+    state = inspect(target)
+    revision = state.attrs.connector_revision
+    previous = _positive_connector_revision(
+        revision.history.deleted[0] if revision.history.deleted else getattr(target, "connector_revision", 1)
+    )
+    changed = any(
+        state.attrs[field].history.has_changes()
+        for field in _CONNECTOR_REVISION_FIELDS[type(target)]
+    )
+    if changed:
+        # Do not let an ORM caller manually roll the revision back (or skip a
+        # value) while changing a target configuration.
+        target.connector_revision = previous + 1
+    elif revision.history.has_changes():
+        # Revision is managed only here; a standalone assignment must not
+        # create a fake version or restore an old release-compatible number.
+        target.connector_revision = previous
+
+
+for _connector_model in _CONNECTOR_REVISION_FIELDS:
+    event.listen(_connector_model, "before_update", _advance_connector_revision)
 
 
 # ──────────────────────────────────────────────
@@ -806,6 +1010,12 @@ class Conversation(Base):
     agent_id: Mapped[str] = mapped_column(
         ForeignKey("agents.id", ondelete="CASCADE"), index=True
     )
+    # Agent definitions are collaborative tenant resources, while a chat
+    # transcript is a user's private working context.  Nullable supports a
+    # fail-closed migration for legacy rows whose creator cannot be proven.
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     title: Mapped[str] = mapped_column(String(300), default="新对话")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
@@ -843,6 +1053,11 @@ class AssistantThread(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    # 助手会话属于创建者，而不只是属于同一租户。否则同租户任意成员可枚举、
+    # 读取或删除其他人的上下文与提案。
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     scenario_id: Mapped[str | None] = mapped_column(
         ForeignKey("business_scenarios.id", ondelete="SET NULL"), index=True, nullable=True
     )
@@ -884,6 +1099,10 @@ class AssistantAttachment(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    # 临时附件也属于上传者，不能因为同租户而被其他会话任意引用或读取。
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
     mime: Mapped[str] = mapped_column(String(200), default="")
     size: Mapped[int] = mapped_column(Integer, default=0)
@@ -918,6 +1137,38 @@ class AssistantAuditLog(Base):
 # 本体扩展：操作 / 规则 / 事件 / 工作流
 # （元模型层：平台只提供框架，业务语义由用户定义）
 # ──────────────────────────────────────────────
+class FunctionDefinition(Base):
+    """A governed, declarative function contract without executable code.
+
+    The record expresses typed input/output and presentation metadata only.
+    It deliberately has no handler, URL, command, script, connector, or runtime
+    configuration field.  A future execution implementation must introduce a
+    separately reviewed capability rather than turning this declaration into an
+    arbitrary-code channel.
+    """
+
+    __tablename__ = "function_definitions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    input_schema: Mapped[dict] = mapped_column(JSON, default=dict)
+    output_schema: Mapped[dict] = mapped_column(JSON, default=dict)
+    tags: Mapped[list] = mapped_column(JSON, default=list)
+    # Presentation metadata only.  Authorization still comes from the owning
+    # scenario and is never inferred from this field.
+    visibility: Mapped[str] = mapped_column(String(20), default="scenario")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="function_definitions")
+
+
 class OntologyAction(Base):
     """实体操作（Action）：定义某个实体类型可执行业务行为。
 
@@ -1062,6 +1313,308 @@ class OntologyWorkflow(Base):
     )
 
 
+# ──────────────────────────────────────────────
+# P2 本体发布治理：分支 / 快照 / 提案 / 评审 / 发布 / 回滚
+# ──────────────────────────────────────────────
+class OntologyBranch(Base):
+    """业务场景的受治理本体分支。
+
+    分支并不直接保存可变草稿；所有候选状态都落为不可变 ``OntologySnapshot``，从而
+    保证提案、合并和回滚可审计且可复现。
+    """
+
+    __tablename__ = "ontology_branches"
+    __table_args__ = (
+        UniqueConstraint("scenario_id", "name", name="uq_ontology_branch_name"),
+        Index("ix_ontology_branches_tenant_scenario", "tenant_id", "scenario_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    # active / merged / archived
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    base_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    head_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="ontology_branches")
+    snapshots: Mapped[list["OntologySnapshot"]] = relationship(
+        back_populates="branch",
+        foreign_keys="OntologySnapshot.branch_id",
+    )
+    proposals: Mapped[list["OntologyProposal"]] = relationship(
+        back_populates="branch", cascade="all, delete-orphan"
+    )
+    releases: Mapped[list["OntologyRelease"]] = relationship(back_populates="branch")
+    rollbacks: Mapped[list["OntologyRollback"]] = relationship(back_populates="branch")
+
+
+class OntologySnapshot(Base):
+    """不可变的本体定义快照；不包含运行时对象实例或执行日志。"""
+
+    __tablename__ = "ontology_snapshots"
+    __table_args__ = (
+        Index("ix_ontology_snapshots_scenario_created", "scenario_id", "created_at"),
+        Index("ix_ontology_snapshots_branch_created", "branch_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    branch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_branches.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    parent_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # baseline / proposal / pre_merge / merge / pre_rollback / rollback
+    kind: Mapped[str] = mapped_column(String(30), default="baseline")
+    content: Mapped[dict] = mapped_column(JSON, default=dict)
+    content_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="ontology_snapshots")
+    branch: Mapped[OntologyBranch | None] = relationship(
+        back_populates="snapshots", foreign_keys=[branch_id]
+    )
+
+
+class OntologyProposal(Base):
+    """由分支快照构成的待评审本体变更提案。"""
+
+    __tablename__ = "ontology_proposals"
+    __table_args__ = (
+        Index("ix_ontology_proposals_scenario_status", "scenario_id", "status"),
+        Index("ix_ontology_proposals_branch_created", "branch_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    branch_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_branches.id", ondelete="CASCADE"), index=True
+    )
+    base_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="RESTRICT"), index=True
+    )
+    proposed_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="RESTRICT"), index=True
+    )
+    pre_merge_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    merged_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    # draft / submitted / approved / rejected / merged / withdrawn
+    status: Mapped[str] = mapped_column(String(20), default="submitted")
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    merged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    merged_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="ontology_proposals")
+    branch: Mapped[OntologyBranch] = relationship(back_populates="proposals")
+    reviews: Mapped[list["OntologyReview"]] = relationship(
+        back_populates="proposal", cascade="all, delete-orphan", order_by="OntologyReview.created_at"
+    )
+
+
+class OntologyReview(Base):
+    """一次不可变评审决定；提案状态由最新明确决定驱动。"""
+
+    __tablename__ = "ontology_reviews"
+    __table_args__ = (
+        Index("ix_ontology_reviews_proposal_created", "proposal_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    proposal_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_proposals.id", ondelete="CASCADE"), index=True
+    )
+    reviewer_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # approve / reject
+    decision: Mapped[str] = mapped_column(String(20), nullable=False)
+    comment: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    proposal: Mapped[OntologyProposal] = relationship(back_populates="reviews")
+
+
+class OntologyRelease(Base):
+    """向 dev/staging/prod 环境推广一个已治理快照的不可变发布记录。"""
+
+    __tablename__ = "ontology_releases"
+    __table_args__ = (
+        Index("ix_ontology_releases_scenario_environment", "scenario_id", "environment", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    branch_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_branches.id", ondelete="RESTRICT"), index=True
+    )
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="RESTRICT"), index=True
+    )
+    proposal_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_proposals.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # dev / staging / prod
+    environment: Mapped[str] = mapped_column(String(20), nullable=False)
+    # released / superseded / rolled_back
+    status: Mapped[str] = mapped_column(String(20), default="released")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    # Immutable, credential-free evidence of the bindings that passed the
+    # environment gate at release time.  Runtime connector config never enters
+    # this JSON document.
+    connector_audit: Mapped[list] = mapped_column(JSON, default=list)
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="ontology_releases")
+    branch: Mapped[OntologyBranch] = relationship(back_populates="releases")
+
+
+class OntologyRollback(Base):
+    """显式确认后的回滚审计：从当前状态恢复到一份已存在的治理快照。"""
+
+    __tablename__ = "ontology_rollbacks"
+    __table_args__ = (
+        Index("ix_ontology_rollbacks_scenario_created", "scenario_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    branch_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_branches.id", ondelete="RESTRICT"), index=True
+    )
+    from_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="RESTRICT"), index=True
+    )
+    target_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="RESTRICT"), index=True
+    )
+    result_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="RESTRICT"), index=True
+    )
+    environment: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    connector_audit: Mapped[list] = mapped_column(JSON, default=list)
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="ontology_rollbacks")
+    branch: Mapped[OntologyBranch] = relationship(back_populates="rollbacks")
+
+
+class ConnectorBinding(Base):
+    """A scenario/environment-specific reference to a reusable connector.
+
+    Connector credentials remain in ``DataSource``, ``MCPConfig`` or
+    ``LLMConfig``.  This table only stores the safe, auditable association that
+    lets an imported package resolve a portable external reference in a target
+    environment.  The connector id is intentionally polymorphic: the kind
+    controls which source table is resolved by the service layer.
+    """
+
+    __tablename__ = "connector_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "scenario_id", "environment", "binding_key",
+            name="uq_connector_bindings_scenario_environment_key",
+        ),
+        Index("ix_connector_bindings_connector", "connector_kind", "connector_id"),
+        Index("ix_connector_bindings_scenario_environment", "scenario_id", "environment"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    # dev / staging / prod; validated centrally in connector_service.
+    environment: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Stable portable-reference key.  It never contains a credential or source id.
+    binding_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    reference_label: Mapped[str] = mapped_column(String(300), default="")
+    # data_source / mcp / llm
+    connector_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    connector_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    # unknown / healthy / unhealthy.  A binding becomes stale when its connector
+    # is edited, disabled or removed, and must be explicitly checked again.
+    health_status: Mapped[str] = mapped_column(String(20), default="unknown")
+    health_message: Mapped[str] = mapped_column(Text, default="")
+    connector_signature: Mapped[str] = mapped_column(String(64), default="")
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship()
+    tenant: Mapped[Tenant] = relationship()
+
+
 class WorkflowRun(Base):
     """持久化的工作流运行实例，也是 P1 异步任务队列的业务记录。
 
@@ -1073,6 +1626,7 @@ class WorkflowRun(Base):
     __table_args__ = (
         Index("ix_workflow_runs_dispatch", "status", "available_at"),
         Index("ix_workflow_runs_scenario_created", "scenario_id", "created_at"),
+        Index("ix_workflow_runs_release", "release_id", "definition_snapshot_id"),
         Index("uq_workflow_runs_dedupe", "workflow_id", "dedupe_key", unique=True),
     )
 
@@ -1091,6 +1645,25 @@ class WorkflowRun(Base):
     # 事件和调度投递以此键去重；手动运行不填写，允许重复提交。
     dedupe_key: Mapped[str | None] = mapped_column(String(180), nullable=True)
     input_params: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Fixed when queued so approval/retry cannot silently switch environments.
+    environment: Mapped[str] = mapped_column(String(20), default=_runtime_environment_default)
+    # A staging/prod run pins the immutable released definition.  The live
+    # workflow FK above remains for lineage compatibility and referential safety;
+    # execution resolves these fields rather than reading mutable live columns.
+    definition_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    release_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_releases.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    definition_hash: Mapped[str] = mapped_column(String(64), default="")
+    # live / release.  The source makes historical execution provenance
+    # inspectable without exposing the snapshot payload in list APIs.
+    definition_source: Mapped[str] = mapped_column(String(20), default="live")
+    # Stable execution lineage.  Automatic retries deliberately retain this value so
+    # completed side-effecting nodes replay their durable idempotency record instead
+    # of being invoked again.  A user-requested retry starts a fresh lineage.
+    execution_key: Mapped[str] = mapped_column(String(64), default="", index=True)
     # queued / running / awaiting_approval / retry_waiting / succeeded / failed /
     # timed_out / rejected / cancelled
     status: Mapped[str] = mapped_column(String(30), default="queued")
@@ -1175,6 +1748,18 @@ class EventEnvelope(Base):
     source_run_id: Mapped[str | None] = mapped_column(
         ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Event delivery and its subscribers are resolved from one deployment
+    # definition; otherwise an event emitted by release A could enqueue a live
+    # workflow from release B after a dev merge.
+    environment: Mapped[str] = mapped_column(String(20), default=_runtime_environment_default)
+    definition_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    release_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_releases.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    definition_hash: Mapped[str] = mapped_column(String(64), default="")
+    definition_source: Mapped[str] = mapped_column(String(20), default="live")
     dedupe_key: Mapped[str | None] = mapped_column(String(180), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
@@ -1213,8 +1798,22 @@ class ActionExecutionLog(Base):
     mode: Mapped[str] = mapped_column(String(20), default="execute")
     # 同一个业务请求的幂等键；预演和确认提醒不要求填写。
     idempotency_key: Mapped[str | None] = mapped_column(String(120), index=True, nullable=True)
+    # Provenance for an execution that came from a frozen staging/prod release.
+    # ``environment`` also scopes idempotency so equal caller keys cannot replay
+    # a result produced in another deployment environment.
+    environment: Mapped[str] = mapped_column(String(20), default=_runtime_environment_default)
+    definition_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    release_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_releases.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    definition_hash: Mapped[str] = mapped_column(String(64), default="")
+    definition_source: Mapped[str] = mapped_column(String(20), default="live")
     # 执行结果
     result: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Credential-free runtime connector evidence (environment/key/target only).
+    connector_audit: Mapped[list] = mapped_column(JSON, default=list)
     # 错误信息
     error: Mapped[str] = mapped_column(Text, default="")
     # 执行耗时（毫秒）
@@ -1222,3 +1821,99 @@ class ActionExecutionLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship()
+
+
+# ──────────────────────────────────────────────
+# P1 运营闭环：事件 / Case（异常事项）及其不可变历史
+# ──────────────────────────────────────────────
+class IncidentCase(Base):
+    """场景范围内可分派、确认和闭环的运营异常事项。
+
+    事件、规则或人工发现的问题最终都应落到同一种 durable Case 记录；状态变化
+    只通过服务层写入 ``IncidentCaseHistory``，避免任务中心只展示一次性执行结果。
+    """
+
+    __tablename__ = "incident_cases"
+    __table_args__ = (
+        Index("ix_incident_cases_tenant_scenario_status", "tenant_id", "scenario_id", "status"),
+        Index("ix_incident_cases_scenario_updated", "scenario_id", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    # low / medium / high / critical
+    severity: Mapped[str] = mapped_column(String(20), default="medium", index=True)
+    # open / acknowledged / resolved
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    # manual / rule / workflow / agent / import 等可审计来源，不承载凭据。
+    source: Mapped[str] = mapped_column(String(60), default="manual")
+    source_ref: Mapped[str] = mapped_column(String(180), default="")
+    # 不设对象外键，确保对象生命周期不会抹掉已闭环 Case 的来源证据。
+    related_object_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    assignee_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    context: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    acknowledged_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolution: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="incident_cases")
+    histories: Mapped[list["IncidentCaseHistory"]] = relationship(
+        back_populates="incident_case",
+        cascade="all, delete-orphan",
+        order_by="IncidentCaseHistory.created_at",
+    )
+
+
+class IncidentCaseHistory(Base):
+    """Case 状态/内容变化的追加式审计记录。"""
+
+    __tablename__ = "incident_case_history"
+    __table_args__ = (
+        Index("ix_incident_case_history_case_created", "incident_case_id", "created_at"),
+        Index("ix_incident_case_history_tenant_scenario", "tenant_id", "scenario_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    incident_case_id: Mapped[str] = mapped_column(
+        ForeignKey("incident_cases.id", ondelete="CASCADE"), index=True
+    )
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    # created / updated / acknowledged / resolved
+    action: Mapped[str] = mapped_column(String(30), nullable=False)
+    actor_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    from_status: Mapped[str] = mapped_column(String(20), default="")
+    to_status: Mapped[str] = mapped_column(String(20), default="")
+    changes: Mapped[dict] = mapped_column(JSON, default=dict)
+    comment: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    incident_case: Mapped[IncidentCase] = relationship(back_populates="histories")

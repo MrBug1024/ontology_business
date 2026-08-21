@@ -239,6 +239,42 @@ class LineageRuntimeTests(unittest.TestCase):
         self.assertNotIn("action:action-1", node_ids)
         self.assertNotIn("action_execution:log-1", node_ids)
 
+    def test_records_object_to_ai_answer_lineage_without_exposing_answer_text(self) -> None:
+        self.message.tool_results = [
+            *(self.message.tool_results or []),
+            {
+                "id": "tool-object-search",
+                "name": "search_ontology",
+                "result": json.dumps([{"id": self.instance.id, "name": self.instance.name}]),
+            },
+        ]
+        self.db.commit()
+        graph = build_scenario_lineage(self.db, self.scenario.id)
+        self.assertTrue(
+            any(
+                edge["source"] == "object:object-1"
+                and edge["target"] == "ai_answer:message-1"
+                and edge["kind"] == "used_as_context"
+                for edge in graph["edges"]
+            )
+        )
+        answer = next(node for node in graph["nodes"] if node["id"] == "ai_answer:message-1")
+        self.assertEqual(answer["label"], "AI 回答")
+        self.assertNotIn("费用单应进入审批", answer["label"])
+
+    def test_marks_graph_truncated_when_per_source_limit_is_reached(self) -> None:
+        self.db.add(
+            Message(
+                id="message-2",
+                conversation_id=self.conversation.id,
+                role="assistant",
+                content="第二条回答",
+            )
+        )
+        self.db.commit()
+        graph = build_scenario_lineage(self.db, self.scenario.id, limit=1)
+        self.assertTrue(graph["truncated"])
+
 
 if __name__ == "__main__":
     unittest.main()

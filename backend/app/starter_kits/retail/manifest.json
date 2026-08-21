@@ -1,0 +1,20 @@
+{
+  "id": "retail",
+  "name": "零售经营 Starter Kit",
+  "industry": "retail",
+  "version": "1.0.0",
+  "description": "用于零售客户、门店、商品与订单经营建模的声明性本体起点。",
+  "package_file": "package.json",
+  "fingerprint": "sha256:717f6c22591bec79224970f2f07d515a8bdbadba8a375fb2d2a51f7e1aa62d81",
+  "resource_counts": {
+    "entities": 5,
+    "properties": 13,
+    "relations": 4,
+    "mappings": 0,
+    "functions": 0,
+    "actions": 0,
+    "rules": 1,
+    "events": 1,
+    "workflows": 1
+  }
+}

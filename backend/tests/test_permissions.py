@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.database import Base, get_db
 from app.models import (
+    ActionExecutionLog,
     BusinessScenario,
+    DataMapping,
+    DataMappingRefreshJob,
+    DataSource,
     OntologyAction,
     OntologyEntity,
     OntologyInstance,
@@ -19,8 +24,10 @@ from app.models import (
     OntologyWorkflow,
     Tenant,
     User,
+    WorkflowApprovalRequest,
+    WorkflowRun,
 )
-from app.routers import lineage, permissions, scenarios
+from app.routers import lineage, operations, permissions, scenarios
 from app.services import permission_service
 from app.services.auth_service import get_current_user, get_tenant_db
 
@@ -80,6 +87,22 @@ class PermissionIntegrationTests(unittest.TestCase):
             self.entity = OntologyEntity(
                 id="entity-private", scenario_id=self.scenario.id, name="客户"
             )
+            self.mapping_source = DataSource(
+                id="source-mapping-async",
+                tenant_id=self.tenant.id,
+                scenario_id=self.scenario.id,
+                name="不应在 HTTP 请求中连接的映射源",
+                type="sqlite",
+                config={"path": "/not-used-by-route.sqlite3"},
+            )
+            self.mapping = DataMapping(
+                id="mapping-async-only",
+                scenario_id=self.scenario.id,
+                entity_id=self.entity.id,
+                data_source_id=self.mapping_source.id,
+                table_name="orders",
+                column_map={"姓名": "customer_name"},
+            )
             self.public_entity = OntologyEntity(
                 id="entity-public", scenario_id=self.public_scenario.id, name="公开客户"
             )
@@ -138,6 +161,39 @@ class PermissionIntegrationTests(unittest.TestCase):
                 enabled=True,
                 access_scope="restricted",
             )
+            self.task_workflow = OntologyWorkflow(
+                id="workflow-task-standard",
+                scenario_id=self.scenario.id,
+                name="普通审批工作流",
+                status="active",
+                enabled=True,
+            )
+            self.task_run = WorkflowRun(
+                id="run-task-standard",
+                scenario_id=self.scenario.id,
+                workflow_id=self.task_workflow.id,
+                trigger_source="manual",
+                status="awaiting_approval",
+                created_by_user_id=self.owner.id,
+            )
+            self.task_approval = WorkflowApprovalRequest(
+                id="approval-task-standard",
+                workflow_run_id=self.task_run.id,
+                scenario_id=self.scenario.id,
+                node_id="approval-standard",
+                status="pending",
+            )
+            self.restricted_action_log = ActionExecutionLog(
+                id="log-restricted-action",
+                scenario_id=self.scenario.id,
+                target_type="action",
+                target_id=self.action.id,
+                target_name=self.action.name,
+                input_params={"secret": "不应通过日志泄露"},
+                result={"external": "不应通过日志泄露"},
+                status="success",
+                mode="execute",
+            )
             db.add_all(
                 [
                     self.tenant,
@@ -149,6 +205,8 @@ class PermissionIntegrationTests(unittest.TestCase):
                     self.scenario,
                     self.public_scenario,
                     self.entity,
+                    self.mapping_source,
+                    self.mapping,
                     self.public_entity,
                     self.public_property,
                     self.secret_property,
@@ -158,6 +216,10 @@ class PermissionIntegrationTests(unittest.TestCase):
                     self.public_instance,
                     self.action,
                     self.workflow,
+                    self.task_workflow,
+                    self.task_run,
+                    self.task_approval,
+                    self.restricted_action_log,
                 ]
             )
             db.commit()
@@ -181,6 +243,8 @@ class PermissionIntegrationTests(unittest.TestCase):
         self.current_tenant_id = self.tenant.id
         self.app = FastAPI()
         self.app.include_router(scenarios.router, prefix="/api")
+        self.app.include_router(operations.router, prefix="/api")
+        self.app.include_router(operations.operations_router, prefix="/api")
         self.app.include_router(permissions.router, prefix="/api")
         self.app.include_router(lineage.router, prefix="/api")
 
@@ -275,6 +339,126 @@ class PermissionIntegrationTests(unittest.TestCase):
         self.assertEqual(public_read.status_code, 200, public_read.text)
         self.assertEqual(public_read.json()["attributes"], {"姓名": "王五"})
 
+    def test_scenario_detail_exposes_server_evaluated_write_capability(self) -> None:
+        """详情页的编辑能力必须服从实时 ACL，而不是由客户端猜测角色。"""
+        owner_detail = self.client.get(f"/api/scenarios/{self.scenario.id}")
+        self.assertEqual(owner_detail.status_code, 200, owner_detail.text)
+        self.assertTrue(owner_detail.json()["can_write"])
+
+        self._as(self.viewer, self.tenant)
+        viewer_detail = self.client.get(f"/api/scenarios/{self.scenario.id}")
+        self.assertEqual(viewer_detail.status_code, 200, viewer_detail.text)
+        self.assertFalse(viewer_detail.json()["can_write"])
+
+        self._as(self.operator, self.tenant)
+        operator_detail = self.client.get(f"/api/scenarios/{self.scenario.id}")
+        self.assertEqual(operator_detail.status_code, 200, operator_detail.text)
+        self.assertTrue(operator_detail.json()["can_write"])
+
+        # Explicit deny wins over the operator's default write role.
+        self._as(self.owner, self.tenant)
+        denied = self.client.post(
+            "/api/permissions/grants",
+            json={
+                "role_key": "operator",
+                "resource_type": "scenario",
+                "resource_id": self.scenario.id,
+                "verb": "write",
+                "effect": "deny",
+            },
+        )
+        self.assertEqual(denied.status_code, 200, denied.text)
+        self._as(self.operator, self.tenant)
+        denied_detail = self.client.get(f"/api/scenarios/{self.scenario.id}")
+        self.assertEqual(denied_detail.status_code, 200, denied_detail.text)
+        self.assertFalse(denied_detail.json()["can_write"])
+
+        # Foreign-tenant public scenes are visible but cannot be modified.
+        self._as(self.outsider, self.other_tenant)
+        public_detail = self.client.get(f"/api/scenarios/{self.public_scenario.id}")
+        self.assertEqual(public_detail.status_code, 200, public_detail.text)
+        self.assertFalse(public_detail.json()["can_write"])
+
+    def test_task_rows_expose_server_evaluated_execution_and_approval_capabilities(self) -> None:
+        def task_for_current_user() -> dict:
+            response = self.client.get(f"/api/tasks?scenario_id={self.scenario.id}")
+            self.assertEqual(response.status_code, 200, response.text)
+            return next(item for item in response.json() if item["id"] == self.task_run.id)
+
+        owner_task = task_for_current_user()
+        self.assertTrue(owner_task["pending_approval"])
+        self.assertTrue(owner_task["can_execute"])
+        self.assertTrue(owner_task["can_approve"])
+
+        self._as(self.operator, self.tenant)
+        operator_task = task_for_current_user()
+        self.assertTrue(operator_task["can_execute"])
+        self.assertFalse(operator_task["can_approve"])
+
+        self._as(self.viewer, self.tenant)
+        viewer_task = task_for_current_user()
+        self.assertFalse(viewer_task["can_execute"])
+        self.assertFalse(viewer_task["can_approve"])
+
+    def test_attribute_writes_require_explicit_property_access_and_hide_legacy_fields(self) -> None:
+        db = self.Session()
+        try:
+            instance = db.get(OntologyInstance, self.instance.id)
+            instance.attributes = {
+                "姓名": "张三",
+                "身份证号": "110101199001011234",
+                "遗留未定义字段": "不可泄露",
+            }
+            db.commit()
+        finally:
+            db.close()
+
+        self._as(self.viewer, self.tenant)
+        detail = self.client.get(f"/api/scenarios/{self.scenario.id}/objects/{self.instance.id}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["attributes"], {"姓名": "张三"})
+
+        # Operators can write ordinary objects, but not individual fields until the
+        # field's write ACL is granted.
+        self._as(self.operator, self.tenant)
+        denied = self.client.put(
+            f"/api/scenarios/instances/{self.instance.id}",
+            json={"entity_id": self.entity.id, "name": "张三", "attributes": {"姓名": "修改"}},
+        )
+        self.assertEqual(denied.status_code, 403, denied.text)
+
+        self._as(self.owner, self.tenant)
+        undefined = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/instances",
+            json={
+                "entity_id": self.entity.id,
+                "name": "未知字段对象",
+                "attributes": {"未定义字段": "禁止写入"},
+            },
+        )
+        self.assertEqual(undefined.status_code, 422, undefined.text)
+
+        self._grant(resource_type="property", resource_id=self.public_property.id, verb="write")
+        self._as(self.operator, self.tenant)
+        allowed = self.client.put(
+            f"/api/scenarios/instances/{self.instance.id}",
+            json={"entity_id": self.entity.id, "name": "张三", "attributes": {"姓名": "已授权修改"}},
+        )
+        self.assertEqual(allowed.status_code, 200, allowed.text)
+        self.assertEqual(allowed.json()["attributes"], {"姓名": "已授权修改"})
+
+    def test_execution_logs_do_not_bypass_action_or_workflow_acl(self) -> None:
+        self._as(self.viewer, self.tenant)
+        denied_logs = self.client.get(f"/api/scenarios/{self.scenario.id}/execution-logs")
+        self.assertEqual(denied_logs.status_code, 200, denied_logs.text)
+        self.assertEqual(denied_logs.json(), [])
+
+        self._as(self.owner, self.tenant)
+        owner_logs = self.client.get(f"/api/scenarios/{self.scenario.id}/execution-logs")
+        self.assertEqual(owner_logs.status_code, 200, owner_logs.text)
+        self.assertEqual(owner_logs.json()[0]["id"], self.restricted_action_log.id)
+        self.assertEqual(owner_logs.json()[0]["input_params"], {"secret": "不应通过日志泄露"})
+
     def test_action_and_workflow_execute_only_after_explicit_restricted_grants(self) -> None:
         self._as(self.operator, self.tenant)
         action_denied = self.client.post(
@@ -304,8 +488,85 @@ class PermissionIntegrationTests(unittest.TestCase):
             f"/api/scenarios/workflows/{self.workflow.id}/execute",
             json={"params": {}},
         )
-        self.assertEqual(workflow.status_code, 200, workflow.text)
-        self.assertEqual(workflow.json()["status"], "success")
+        self.assertEqual(workflow.status_code, 202, workflow.text)
+        self.assertEqual(workflow.json()["status"], "queued")
+        self.assertEqual(workflow.json()["workflow_id"], self.workflow.id)
+        self.assertEqual(workflow.json()["input_params"], {})
+
+        # 旧 /execute 是 /runs 的兼容别名：两条 HTTP 入口都只能创建可恢复任务，
+        # 绝不能在请求内同步执行工作流。
+        canonical = self.client.post(
+            f"/api/scenarios/workflows/{self.workflow.id}/runs",
+            json={"params": {"source": "canonical"}},
+        )
+        self.assertEqual(canonical.status_code, 202, canonical.text)
+        self.assertEqual(canonical.json()["status"], "queued")
+        self.assertEqual(canonical.json()["input_params"], {"source": "canonical"})
+
+        db = self.Session()
+        try:
+            runs = db.query(WorkflowRun).filter_by(workflow_id=self.workflow.id).all()
+            self.assertEqual(len(runs), 2)
+            self.assertTrue(all(run.status == "queued" for run in runs))
+            self.assertTrue(all(run.created_by_user_id == self.operator.id for run in runs))
+        finally:
+            db.close()
+
+    def test_legacy_mapping_refresh_and_import_only_enqueue_jobs(self) -> None:
+        """Legacy aliases must never synchronously resolve a connector or import objects."""
+        db = self.Session()
+        try:
+            instance_count_before = len(
+                db.execute(
+                    select(OntologyInstance).where(
+                        OntologyInstance.scenario_id == self.scenario.id
+                    )
+                ).scalars().all()
+            )
+        finally:
+            db.close()
+
+        with patch(
+            "app.routers.scenarios.mapping_refresh_service.resolve_mapping_data_source"
+        ) as resolve_source, patch(
+            "app.routers.scenarios.ontology_service.import_instances_from_mapping"
+        ) as import_instances:
+            refresh = self.client.post(
+                f"/api/scenarios/mappings/{self.mapping.id}/refresh",
+                json={"limit": 17},
+            )
+            legacy_import = self.client.post(
+                f"/api/scenarios/mappings/{self.mapping.id}/import",
+                json={"limit": 99},
+            )
+
+        self.assertEqual(refresh.status_code, 202, refresh.text)
+        self.assertEqual(legacy_import.status_code, 202, legacy_import.text)
+        self.assertEqual(refresh.json()["status"], "queued")
+        self.assertEqual(refresh.json()["limit"], 17)
+        self.assertEqual(legacy_import.json()["id"], refresh.json()["id"])
+        resolve_source.assert_not_called()
+        import_instances.assert_not_called()
+
+        db = self.Session()
+        try:
+            jobs = db.execute(
+                select(DataMappingRefreshJob).where(
+                    DataMappingRefreshJob.mapping_id == self.mapping.id
+                )
+            ).scalars().all()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].status, "queued")
+            instance_count_after = len(
+                db.execute(
+                    select(OntologyInstance).where(
+                        OntologyInstance.scenario_id == self.scenario.id
+                    )
+                ).scalars().all()
+            )
+            self.assertEqual(instance_count_after, instance_count_before)
+        finally:
+            db.close()
 
     def test_missing_context_is_fail_closed(self) -> None:
         db = self.Session()

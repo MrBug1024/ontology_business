@@ -288,6 +288,8 @@ class MappingRuntimeTests(unittest.TestCase):
         paths = {route.path for route in app.routes}
         self.assertIn("/api/scenarios/mappings/{mapping_id}/preview", paths)
         self.assertIn("/api/scenarios/mappings/{mapping_id}/test", paths)
+        self.assertIn("/api/scenarios/mappings/{mapping_id}/refresh-jobs", paths)
+        self.assertIn("/api/scenarios/mappings/refresh-jobs/{job_id}", paths)
         self.assertIn("/api/scenarios/mappings/{mapping_id}/refresh", paths)
 
     def test_preview_reports_mapping_coverage_and_unmapped_columns(self) -> None:

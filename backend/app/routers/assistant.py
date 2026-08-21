@@ -21,6 +21,9 @@ from ..models import (
     AssistantMessage,
     AssistantThread,
     BusinessScenario,
+    BucketFile,
+    DataSource,
+    DocumentChunk,
     LLMConfig,
     OntologyWorkflow,
 )
@@ -33,7 +36,15 @@ from ..schemas import (
     AssistantThreadOut,
     Msg,
 )
-from ..services import doc_parser, llm_service, ontology_service, tenant_service, workflow_service
+from ..services import (
+    doc_parser,
+    llm_service,
+    ontology_service,
+    permission_service,
+    rag_service,
+    tenant_service,
+    workflow_service,
+)
 from ..services.auth_service import get_tenant_db
 from ..services.policies import PolicyViolation
 
@@ -44,15 +55,27 @@ def _tenant(db: Session) -> str:
     return tenant_service.current_tenant_id(db)
 
 
+def _current_user_id(db: Session) -> str:
+    """Require a real organization principal before handling assistant state."""
+    return permission_service.require_principal(db).user_id
+
+
 def _thread(db: Session, thread_id: str) -> AssistantThread:
     thread = db.execute(
         select(AssistantThread).where(
             AssistantThread.id == thread_id,
             AssistantThread.tenant_id == _tenant(db),
+            # Legacy NULL owner rows are intentionally inaccessible: guessing
+            # ownership from tenant scope would reintroduce cross-user leaks.
+            AssistantThread.created_by_user_id == _current_user_id(db),
         )
     ).scalars().first()
     if not thread:
         raise HTTPException(404, "助手会话不存在")
+    if thread.scenario_id:
+        _scenario(db, thread.scenario_id)
+    else:
+        permission_service.require_tenant_permission(db, "read")
     return thread
 
 
@@ -76,7 +99,14 @@ def _assert_thread_scope(
 def _scenario(db: Session, scenario_id: str | None, writable: bool = False) -> BusinessScenario | None:
     if not scenario_id:
         return None
-    return tenant_service.require_scenario(db, scenario_id, writable=writable)
+    scenario = tenant_service.require_scenario(db, scenario_id, writable=writable)
+    permission_service.require_scenario_permission(
+        db,
+        scenario,
+        "write" if writable else "read",
+        message="没有当前业务场景的权限",
+    )
+    return scenario
 
 
 def _llm(db: Session) -> LLMConfig | None:
@@ -199,6 +229,8 @@ def _find_saved_proposal(db: Session, thread_id: str, proposal_id: str) -> tuple
     for message in messages:
         proposal = message.proposal if isinstance(message.proposal, dict) else {}
         if proposal.get("proposal_id") == proposal_id:
+            if _has_invalid_historic_rag_source(db, thread, message):
+                raise HTTPException(409, "变更草稿引用的资料已不在当前访问范围，请重新生成")
             return thread, message, proposal
     raise HTTPException(404, "变更草稿不存在或已过期，请重新生成")
 
@@ -215,6 +247,175 @@ def _attachment_context(attachments: list[AssistantAttachment]) -> tuple[str, li
         elif item.error:
             parts.append(f"【附件：{item.filename}】解析失败：{item.error}")
     return "\n\n".join(parts), sources
+
+
+def _authorized_rag_context(
+    db: Session,
+    scenario: BusinessScenario | None,
+    query: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """为全局助手补入当前场景可访问资料库的引用上下文。
+
+    场景 ACL 已由 `_scenario` 强制校验；RAG 服务仍会重复校验资料库租户可见性，
+    所以不会因助手路径绕过资料库或场景边界。
+    """
+    if not scenario or not (query or "").strip():
+        return "", []
+    source_ids = list(
+        db.scalars(
+            select(DataSource.id).where(
+                DataSource.scenario_id == scenario.id,
+                DataSource.type == "file_bucket",
+            )
+        ).all()
+    )
+    if not source_ids:
+        return "", []
+    results = rag_service.search(db, source_ids, query, top_k=5, max_chars=4_000)
+    if not results:
+        return "", []
+    sources = [
+        {
+            # Keep a complete, versioned reference rather than only a display
+            # label.  Assistant messages are durable history, so this metadata
+            # is re-authorized before either showing the answer or feeding it
+            # back into a later model turn.
+            "id": f"rag:{item['citation_id']}:{item['chunk_id']}",
+            "kind": "rag",
+            "citation_id": item["citation_id"],
+            "filename": f"{item['citation_id']} · {item['filename']}",
+            "status": "cited",
+            "data_source_id": item["data_source_id"],
+            "file_id": item["file_id"],
+            "chunk_id": item["chunk_id"],
+            "content_hash": item.get("content_hash") or "",
+            "file_content_hash": item.get("file_content_hash") or "",
+            "index_version": item.get("index_version") or "",
+            "char_start": item.get("char_start"),
+            "char_end": item.get("char_end"),
+        }
+        for item in results
+    ]
+    return rag_service.build_context(results), sources
+
+
+_HISTORICAL_RAG_REDACTION = "该历史回答引用的资料已不在当前访问范围，内容已隐藏。"
+
+
+def _is_rag_source(source: object) -> bool:
+    """Identify persisted RAG sources without mistaking local attachments for them.
+
+    Older records did not carry ``kind``.  Treat their stable RAG-like fields as
+    RAG too, so a legacy incomplete citation fails closed instead of becoming a
+    permanent disclosure.
+    """
+    if not isinstance(source, dict):
+        return False
+    return bool(
+        source.get("kind") == "rag"
+        or str(source.get("id") or "").startswith("rag:")
+        or source.get("data_source_id")
+        or source.get("file_id")
+        or source.get("chunk_id")
+        or source.get("file_content_hash")
+    )
+
+
+def _current_rag_source(
+    db: Session,
+    thread: AssistantThread,
+    source_meta: object,
+) -> tuple[DataSource, BucketFile, DocumentChunk | None] | None:
+    """Re-authorize one persisted assistant RAG citation.
+
+    The source must still be visible to the request tenant, remain bound to the
+    thread's scenario, pass the scenario ACL, and point to exactly the same
+    indexed document version.  Any ambiguous/legacy reference is intentionally
+    invalid; showing an answer is less important than keeping revoked material
+    out of history and subsequent LLM prompts.
+    """
+    if not isinstance(source_meta, dict) or not thread.scenario_id:
+        return None
+    source_id = str(source_meta.get("data_source_id") or "")
+    file_id = str(source_meta.get("file_id") or "")
+    chunk_id = str(source_meta.get("chunk_id") or "")
+    expected_file_hash = str(source_meta.get("file_content_hash") or "")
+    if not source_id or not file_id or not expected_file_hash:
+        return None
+
+    source = tenant_service.get_visible(db, DataSource, source_id)
+    if (
+        not source
+        # A global-assistant thread is tenant-owned.  A foreign resource being
+        # temporarily public must not become durable private-thread context.
+        or source.tenant_id != _tenant(db)
+        or source.type != "file_bucket"
+        or source.scenario_id != thread.scenario_id
+    ):
+        return None
+    scenario = tenant_service.get_visible(db, BusinessScenario, thread.scenario_id)
+    if not scenario or not permission_service.check_scenario(db, scenario, "read").allowed:
+        return None
+
+    bucket_file = db.get(BucketFile, file_id)
+    if (
+        not bucket_file
+        or bucket_file.data_source_id != source.id
+        or bucket_file.status != "parsed"
+        # A stale parsed_text with an old index hash is also an altered file.
+        or not rag_service._index_is_current(bucket_file)
+        or bucket_file.indexed_content_hash != expected_file_hash
+    ):
+        return None
+
+    if not chunk_id:
+        return source, bucket_file, None
+    chunk = db.get(DocumentChunk, chunk_id)
+    if (
+        not chunk
+        or chunk.bucket_file_id != bucket_file.id
+        or chunk.data_source_id != source.id
+    ):
+        return None
+    expected_chunk_hash = str(source_meta.get("content_hash") or "")
+    if expected_chunk_hash and chunk.content_hash != expected_chunk_hash:
+        return None
+    return source, bucket_file, chunk
+
+
+def _has_invalid_historic_rag_source(
+    db: Session,
+    thread: AssistantThread,
+    message: AssistantMessage,
+) -> bool:
+    sources = message.attachments if isinstance(message.attachments, list) else []
+    rag_sources = [source for source in sources if _is_rag_source(source)]
+    return bool(rag_sources) and any(
+        _current_rag_source(db, thread, source) is None for source in rag_sources
+    )
+
+
+def _assistant_message_out(
+    db: Session,
+    thread: AssistantThread,
+    message: AssistantMessage,
+) -> AssistantMessageOut:
+    """Serialize assistant history without turning old citations into a bypass."""
+    if message.role == "assistant" and _has_invalid_historic_rag_source(db, thread, message):
+        # Proposal/thinking can contain the same facts as the final answer; all
+        # three need to disappear together with the cited source cards.
+        return AssistantMessageOut(
+            id=message.id,
+            thread_id=message.thread_id,
+            role=message.role,
+            content=_HISTORICAL_RAG_REDACTION,
+            context={},
+            attachments=[],
+            proposal={},
+            thinking=[],
+            created_at=message.created_at,
+        )
+    return AssistantMessageOut.model_validate(message)
 
 
 def _intent(message: str, mode: str) -> str:
@@ -244,6 +445,9 @@ def _safe_attachment_ids(db: Session, ids: list[str]) -> list[AssistantAttachmen
             select(AssistantAttachment).where(
                 AssistantAttachment.id.in_(ids),
                 AssistantAttachment.tenant_id == _tenant(db),
+                # Like threads, legacy attachment rows without a demonstrable
+                # owner are fail-closed rather than shared across a tenant.
+                AssistantAttachment.created_by_user_id == _current_user_id(db),
             )
         ).scalars().all()
     )
@@ -273,22 +477,32 @@ def _save_message(
     return message
 
 
-def _history_messages(db: Session, thread_id: str, user_message_id: str) -> list[dict[str, str]]:
+def _history_messages(
+    db: Session,
+    thread: AssistantThread,
+    user_message_id: str,
+) -> list[dict[str, str]]:
     """读取助手历史，排除本次刚保存的用户消息。"""
     history = db.execute(
         select(AssistantMessage)
         .where(
-            AssistantMessage.thread_id == thread_id,
+            AssistantMessage.thread_id == thread.id,
             AssistantMessage.id != user_message_id,
         )
         .order_by(AssistantMessage.created_at.desc())
         .limit(8)
     ).scalars().all()
-    return [
-        {"role": item.role, "content": item.content[:8000]}
-        for item in reversed(history)
-        if item.role in ("user", "assistant") and item.content
-    ]
+    result: list[dict[str, str]] = []
+    for item in reversed(history):
+        if item.role not in ("user", "assistant") or not item.content:
+            continue
+        content = (
+            _assistant_message_out(db, thread, item).content
+            if item.role == "assistant"
+            else item.content
+        )
+        result.append({"role": item.role, "content": content[:8000]})
+    return result
 
 
 def _sse(event_type: str, data: Any) -> str:
@@ -302,7 +516,13 @@ def list_threads(
     path: str = "",
     db: Session = Depends(get_tenant_db),
 ):
-    stmt = select(AssistantThread).where(AssistantThread.tenant_id == _tenant(db))
+    _scenario(db, scenario_id)
+    if not scenario_id:
+        permission_service.require_tenant_permission(db, "read")
+    stmt = select(AssistantThread).where(
+        AssistantThread.tenant_id == _tenant(db),
+        AssistantThread.created_by_user_id == _current_user_id(db),
+    )
     stmt = stmt.where(AssistantThread.scope_key == _context_scope(scenario_id, path))
     return list(db.execute(stmt.order_by(AssistantThread.updated_at.desc())).scalars().all())
 
@@ -315,8 +535,11 @@ def create_thread(
     db: Session = Depends(get_tenant_db),
 ):
     _scenario(db, scenario_id)
+    if not scenario_id:
+        permission_service.require_tenant_permission(db, "read")
     thread = AssistantThread(
         tenant_id=_tenant(db),
+        created_by_user_id=_current_user_id(db),
         scenario_id=scenario_id,
         scope_key=_context_scope(scenario_id, path),
         title="新的助手任务",
@@ -337,13 +560,12 @@ def list_thread_messages(
 ):
     thread = _thread(db, thread_id)
     _assert_thread_scope(thread, scenario_id, page, path)
-    return list(
-        db.execute(
-            select(AssistantMessage)
-            .where(AssistantMessage.thread_id == thread_id)
-            .order_by(AssistantMessage.created_at)
-        ).scalars().all()
-    )
+    messages = db.execute(
+        select(AssistantMessage)
+        .where(AssistantMessage.thread_id == thread_id)
+        .order_by(AssistantMessage.created_at)
+    ).scalars().all()
+    return [_assistant_message_out(db, thread, message) for message in messages]
 
 
 @router.delete("/threads/{thread_id}", response_model=Msg)
@@ -372,6 +594,7 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
     suffix = Path(filename).suffix or ".bin"
     attachment = AssistantAttachment(
         tenant_id=_tenant(db),
+        created_by_user_id=_current_user_id(db),
         filename=filename,
         mime=file.content_type or "application/octet-stream",
         size=len(content),
@@ -404,6 +627,7 @@ def delete_attachment(attachment_id: str, db: Session = Depends(get_tenant_db)):
         select(AssistantAttachment).where(
             AssistantAttachment.id == attachment_id,
             AssistantAttachment.tenant_id == _tenant(db),
+            AssistantAttachment.created_by_user_id == _current_user_id(db),
         )
     ).scalars().first()
     if not attachment:
@@ -424,6 +648,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
     if not thread:
         thread = AssistantThread(
             tenant_id=_tenant(db),
+            created_by_user_id=_current_user_id(db),
             scenario_id=payload.scenario_id,
             scope_key=scope_key,
             title=payload.message[:80] or "新的助手任务",
@@ -435,6 +660,8 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
 
     attachments = _safe_attachment_ids(db, payload.attachment_ids)
     attachment_text, sources = _attachment_context(attachments)
+    rag_context, rag_sources = _authorized_rag_context(db, scenario, payload.message)
+    sources = [*sources, *rag_sources]
     context = {
         "page": payload.page,
         "path": payload.path,
@@ -452,7 +679,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
 
     intent = _intent(payload.message, payload.mode)
     llm = _llm(db)
-    history = _history_messages(db, thread_id, user_message.id)
+    history = _history_messages(db, thread, user_message.id)
     llm_messages: list[dict[str, str]] = [
         {
             "role": "system",
@@ -464,6 +691,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 + (f"\n\n当前页面：{payload.page}（{payload.path}）" if payload.page else "")
                 + (f"\n当前选择：{payload.selection}" if payload.selection else "")
                 + (f"\n\n{attachment_text}" if attachment_text else "")
+                + (f"\n\n{rag_context}" if rag_context else "")
             ),
         },
         *history,
@@ -528,7 +756,11 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield _sse("token", reply)
             elif intent == "ontology" and scenario:
                 yield progress({"id": "ontology", "title": "生成本体草稿", "detail": "正在整理实体、属性和关系建议。", "status": "running"})
-                description = payload.message + (f"\n\n参考附件内容：\n{attachment_text}" if attachment_text else "")
+                description = (
+                    payload.message
+                    + (f"\n\n参考附件内容：\n{attachment_text}" if attachment_text else "")
+                    + (f"\n\n已授权资料依据：\n{rag_context}" if rag_context else "")
+                )
                 data = ontology_service.generate_ontology(db, scenario, description)
                 proposal = _build_proposal("ontology", data, scenario)
                 reply = "我已经根据当前场景和附件生成了本体草稿。请检查变更内容，确认后再应用到场景。"
@@ -537,7 +769,11 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield _sse("token", reply)
             elif intent == "workflow" and scenario:
                 yield progress({"id": "workflow", "title": "编排工作流草稿", "detail": "正在识别触发条件、节点和分支关系。", "status": "running"})
-                description = payload.message + (f"\n\n参考附件内容：\n{attachment_text}" if attachment_text else "")
+                description = (
+                    payload.message
+                    + (f"\n\n参考附件内容：\n{attachment_text}" if attachment_text else "")
+                    + (f"\n\n已授权资料依据：\n{rag_context}" if rag_context else "")
+                )
                 data = workflow_service.generate_workflow(db, scenario, description)
                 proposal = _build_proposal("workflow", data, scenario)
                 reply = "我已经生成了工作流草稿。请先检查节点、分支和动作引用，确认后再保存。"
@@ -605,6 +841,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     if not thread:
         thread = AssistantThread(
             tenant_id=_tenant(db),
+            created_by_user_id=_current_user_id(db),
             scenario_id=payload.scenario_id,
             scope_key=scope_key,
             title=payload.message[:80] or "新的助手任务",
@@ -616,6 +853,8 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
 
     attachments = _safe_attachment_ids(db, payload.attachment_ids)
     attachment_text, sources = _attachment_context(attachments)
+    rag_context, rag_sources = _authorized_rag_context(db, scenario, payload.message)
+    sources = [*sources, *rag_sources]
     context = {
         "page": payload.page,
         "path": payload.path,
@@ -645,6 +884,8 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             description = payload.message
             if attachment_text:
                 description += f"\n\n参考附件内容：\n{attachment_text}"
+            if rag_context:
+                description += f"\n\n已授权资料依据：\n{rag_context}"
             data = ontology_service.generate_ontology(db, scenario, description)
             proposal = _build_proposal("ontology", data, scenario)
             reply = "我已经根据当前场景和附件生成了本体草稿。请检查变更内容，确认后再应用到场景。"
@@ -652,21 +893,14 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             description = payload.message
             if attachment_text:
                 description += f"\n\n参考附件内容：\n{attachment_text}"
+            if rag_context:
+                description += f"\n\n已授权资料依据：\n{rag_context}"
             data = workflow_service.generate_workflow(db, scenario, description)
             proposal = _build_proposal("workflow", data, scenario)
             reply = "我已经生成了工作流草稿。请先检查节点、分支和动作引用，确认后再保存。"
         else:
             llm = _llm(db)
             if llm:
-                history = db.execute(
-                    select(AssistantMessage)
-                    .where(
-                        AssistantMessage.thread_id == thread.id,
-                        AssistantMessage.id != user_message.id,
-                    )
-                    .order_by(AssistantMessage.created_at.desc())
-                    .limit(8)
-                ).scalars().all()
                 messages: list[dict[str, str]] = [
                     {
                         "role": "system",
@@ -678,12 +912,11 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                             + (f"\n\n当前页面：{payload.page}（{payload.path}）" if payload.page else "")
                             + (f"\n当前选择：{payload.selection}" if payload.selection else "")
                             + (f"\n\n{attachment_text}" if attachment_text else "")
+                            + (f"\n\n{rag_context}" if rag_context else "")
                         ),
                     }
                 ]
-                for item in reversed(history):
-                    if item.role in ("user", "assistant") and item.content:
-                        messages.append({"role": item.role, "content": item.content[:8000]})
+                messages.extend(_history_messages(db, thread, user_message.id))
                 answer = llm_service.chat(
                     llm,
                     messages + [{"role": "user", "content": payload.message}],

@@ -29,7 +29,10 @@
         <el-menu :default-active="activeRoute" router class="side-menu" background-color="transparent" text-color="var(--sidebar-text)" active-text-color="var(--sidebar-title)">
           <el-menu-item index="/dashboard" title="仪表盘"><el-icon aria-hidden="true"><Odometer /></el-icon><span>仪表盘</span></el-menu-item>
           <el-menu-item index="/tasks" title="任务中心"><el-icon aria-hidden="true"><List /></el-icon><span>任务中心</span></el-menu-item>
+          <el-menu-item index="/incidents" title="事件中心"><el-icon aria-hidden="true"><Bell /></el-icon><span>事件中心</span></el-menu-item>
           <el-menu-item index="/lineage" title="端到端血缘"><el-icon aria-hidden="true"><Share /></el-icon><span>端到端血缘</span></el-menu-item>
+          <el-menu-item index="/releases" title="发布治理"><el-icon aria-hidden="true"><SetUp /></el-icon><span>发布治理</span></el-menu-item>
+          <el-menu-item index="/connectors" title="连接器与环境"><el-icon aria-hidden="true"><Connection /></el-icon><span>连接器与环境</span></el-menu-item>
           <el-menu-item index="/scenarios" title="业务场景"><el-icon aria-hidden="true"><OfficeBuilding /></el-icon><span>业务场景</span></el-menu-item>
           <el-menu-item index="/data-sources" title="数据源"><el-icon aria-hidden="true"><Coin /></el-icon><span>数据源</span></el-menu-item>
         </el-menu>
@@ -40,6 +43,11 @@
           <el-menu-item index="/skills" title="技能"><el-icon aria-hidden="true"><MagicStick /></el-icon><span>技能</span></el-menu-item>
           <el-menu-item index="/mcp" title="MCP 服务"><el-icon aria-hidden="true"><Connection /></el-icon><span>MCP 服务</span></el-menu-item>
           <el-menu-item index="/llm" title="LLM 配置"><el-icon aria-hidden="true"><ChatDotRound /></el-icon><span>LLM 配置</span></el-menu-item>
+        </el-menu>
+
+        <div class="nav-label">组织治理</div>
+        <el-menu :default-active="activeRoute" router class="side-menu" background-color="transparent" text-color="var(--sidebar-text)" active-text-color="var(--sidebar-title)">
+          <el-menu-item index="/permissions" title="权限与成员"><el-icon aria-hidden="true"><Lock /></el-icon><span>权限与成员</span></el-menu-item>
         </el-menu>
       </nav>
 

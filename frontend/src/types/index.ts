@@ -6,6 +6,140 @@ export interface User {
   display_name?: string
   tenant_id: string
   email_verified?: boolean
+  can_manage?: boolean
+}
+
+/** P1 组织与细粒度授权模型。租户仍是数据隔离边界，组织承载成员和 ACL。 */
+export interface Organization {
+  id: string
+  tenant_id: string
+  name: string
+  created_at?: string
+  updated_at?: string
+}
+
+export type OrganizationRoleKey = 'owner' | 'admin' | 'operator' | 'viewer'
+
+export interface OrganizationRole {
+  id: string
+  key: OrganizationRoleKey | string
+  name: string
+  description?: string
+  is_system?: boolean
+}
+
+export interface OrganizationMember {
+  id: string
+  user_id: string
+  email: string
+  display_name?: string
+  role_id: string
+  role_key: OrganizationRoleKey | string
+  role_name?: string
+  status: 'active' | 'removed' | string
+  created_at?: string
+}
+
+export type PermissionResourceType = 'scenario' | 'object' | 'property' | 'action' | 'workflow'
+export type PermissionVerb = 'read' | 'write' | 'execute' | 'approve' | 'manage'
+export type PermissionEffect = 'allow' | 'deny'
+
+export interface PermissionGrantInput {
+  role_key?: OrganizationRoleKey
+  user_id?: string
+  resource_type: PermissionResourceType
+  resource_id: string
+  verb: PermissionVerb
+  effect?: PermissionEffect
+}
+
+export interface PermissionGrant {
+  id: string
+  organization_id: string
+  role_id?: string | null
+  role_key?: string
+  user_id?: string | null
+  resource_type: PermissionResourceType | string
+  resource_id: string
+  verb: PermissionVerb | string
+  effect: PermissionEffect | string
+  created_by_user_id?: string | null
+  created_at?: string
+}
+
+export interface PermissionResource {
+  resource_type: PermissionResourceType | string
+  id: string
+  name: string
+  scenario_id: string
+  entity_id?: string | null
+  is_sensitive?: boolean
+  access_scope?: string
+}
+
+/** P1 运营闭环：场景范围内的事件 / Case 及其不可变历史。 */
+export type IncidentSeverity = 'low' | 'medium' | 'high' | 'critical'
+export type IncidentStatus = 'open' | 'acknowledged' | 'resolved'
+export type IncidentHistoryAction = 'created' | 'updated' | 'acknowledged' | 'resolved'
+
+export interface IncidentCase {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  title: string
+  description: string
+  severity: IncidentSeverity
+  status: IncidentStatus
+  source: string
+  source_ref: string
+  related_object_id?: string | null
+  assignee_user_id?: string | null
+  context: Record<string, unknown>
+  created_by_user_id?: string | null
+  acknowledged_by_user_id?: string | null
+  acknowledged_at?: string | null
+  resolved_by_user_id?: string | null
+  resolved_at?: string | null
+  resolution: string
+  created_at: string
+  updated_at: string
+  history_count: number
+}
+
+export interface IncidentCaseCreateInput {
+  title: string
+  description?: string
+  severity?: IncidentSeverity
+  source?: string
+  source_ref?: string
+  related_object_id?: string | null
+  assignee_user_id?: string | null
+  context?: Record<string, unknown>
+  comment?: string
+}
+
+export interface IncidentCaseUpdateInput {
+  title?: string
+  description?: string
+  severity?: IncidentSeverity
+  related_object_id?: string | null
+  assignee_user_id?: string | null
+  context?: Record<string, unknown>
+  comment?: string
+}
+
+export interface IncidentCaseHistory {
+  id: string
+  incident_case_id: string
+  tenant_id: string
+  scenario_id: string
+  action: IncidentHistoryAction
+  actor_user_id?: string | null
+  from_status: string
+  to_status: string
+  changes: Record<string, unknown>
+  comment: string
+  created_at: string
 }
 
 export interface AuthMessage {
@@ -55,6 +189,8 @@ export interface Scenario {
   description?: string
   industry?: string
   status?: string
+  /** Whether the current user may mutate resources in this scenario. */
+  can_write?: boolean
   created_at?: string
   updated_at?: string
   entity_count?: number
@@ -143,6 +279,8 @@ export interface DataMapping {
   scenario_id?: string
   entity_id: string
   data_source_id: string
+  data_source_binding_key?: string
+  data_source_binding_ref?: Record<string, any>
   table_name: string
   column_map: Record<string, string>
   entity_name?: string
@@ -199,6 +337,30 @@ export interface DataMappingRefresh {
   last_error?: string
 }
 
+export interface DataMappingRefreshJob {
+  id: string
+  mapping_id: string
+  scenario_id: string
+  environment: 'dev' | 'staging' | 'prod' | string
+  status: 'queued' | 'running' | 'retry_waiting' | 'succeeded' | 'failed' | 'timed_out' | 'cancelled' | string
+  limit: number
+  attempt: number
+  max_attempts: number
+  timeout_seconds: number
+  available_at?: string
+  started_at?: string
+  completed_at?: string
+  next_retry_at?: string
+  rows_scanned: number
+  instances_created: number
+  instances_updated: number
+  relations_created: number
+  connector_audit: Array<Record<string, any>>
+  error?: string
+  created_at?: string
+  updated_at?: string
+}
+
 export interface GraphNode {
   id: string
   label: string
@@ -224,6 +386,23 @@ export interface GraphEdge {
 export interface GraphData {
   nodes: GraphNode[]
   edges: GraphEdge[]
+}
+
+/**
+ * 受治理函数只描述输入/输出契约与展示元数据；它不是可执行器，也不承载代码。
+ * 实际访问权始终由所属场景的 ACL 决定，不能由 visibility 推断。
+ */
+export interface FunctionDefinition {
+  id?: string
+  scenario_id?: string
+  name: string
+  description?: string
+  input_schema?: Record<string, unknown>
+  output_schema?: Record<string, unknown>
+  tags?: string[]
+  visibility?: 'scenario' | 'tenant'
+  created_at?: string
+  updated_at?: string
 }
 
 export interface OntologyAction {
@@ -324,19 +503,36 @@ export interface ActionExecutionLog {
   status: string
   mode?: string
   idempotency_key?: string
+  environment?: 'dev' | 'staging' | 'prod' | string
+  definition_snapshot_id?: string | null
+  release_id?: string | null
+  definition_hash?: string
+  definition_source?: 'live' | 'release' | string
   result?: Record<string, any>
+  connector_audit?: Array<{
+    kind: string
+    environment: 'dev' | 'staging' | 'prod' | string
+    managed?: boolean
+    binding_key?: string | null
+    binding_id?: string | null
+    connector_id?: string
+    connector_name?: string
+    adapter_type?: string
+  }>
   error?: string
   duration_ms?: number
   created_at?: string
 }
 
 export interface ScenarioDetail extends Scenario {
+  can_write?: boolean
   entities: Entity[]
   relations: Relation[]
   data_sources: DataSource[]
   instances: OntologyInstance[]
   relation_instances: RelationInstance[]
   mappings: DataMapping[]
+  functions: FunctionDefinition[]
   actions: OntologyAction[]
   rules: OntologyRule[]
   events: OntologyEvent[]
@@ -418,6 +614,24 @@ export interface LLMTrace {
   created_at?: string
 }
 
+/** P1 持久化事件信封：发布后异步订阅工作流会进入任务队列。 */
+export interface EventEnvelope {
+  id: string
+  scenario_id: string
+  event_id: string
+  name: string
+  payload: Record<string, any>
+  source: string
+  source_run_id?: string | null
+  environment?: 'dev' | 'staging' | 'prod' | string
+  definition_snapshot_id?: string | null
+  release_id?: string | null
+  definition_hash?: string
+  definition_source?: 'live' | 'release' | string
+  created_at?: string
+  queued_workflow_run_ids: string[]
+}
+
 export interface LLMUsageSummary {
   llm_config_id: string
   invocation_count: number
@@ -492,6 +706,204 @@ export interface LineageGraph {
     ai_answers: number
     action_executions: number
   }
+}
+
+/** P2 本体发布治理：所有内容均为服务端已经脱敏的定义快照。 */
+export interface ReleaseBranch {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  name: string
+  description?: string
+  status: 'active' | 'merged' | 'archived' | string
+  base_snapshot_id?: string | null
+  head_snapshot_id?: string | null
+  created_by_user_id?: string | null
+  created_at?: string
+  updated_at?: string
+}
+
+export interface ReleaseSnapshot {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  branch_id?: string | null
+  parent_snapshot_id?: string | null
+  kind: string
+  content_hash: string
+  content: Record<string, any>
+  created_by_user_id?: string | null
+  created_at?: string
+}
+
+export interface ReleaseReview {
+  id: string
+  proposal_id: string
+  reviewer_user_id?: string | null
+  decision: 'approve' | 'reject' | string
+  comment?: string
+  created_at?: string
+}
+
+export interface ReleaseProposal {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  branch_id: string
+  base_snapshot_id: string
+  proposed_snapshot_id: string
+  pre_merge_snapshot_id?: string | null
+  merged_snapshot_id?: string | null
+  title: string
+  description?: string
+  status: 'draft' | 'submitted' | 'approved' | 'rejected' | 'merged' | 'withdrawn' | string
+  created_by_user_id?: string | null
+  submitted_at?: string | null
+  merged_at?: string | null
+  merged_by_user_id?: string | null
+  content: Record<string, any>
+  reviews?: ReleaseReview[]
+  created_at?: string
+  updated_at?: string
+}
+
+export interface ReleaseRecord {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  branch_id: string
+  snapshot_id: string
+  proposal_id?: string | null
+  environment: 'dev' | 'staging' | 'prod' | string
+  status: 'released' | 'superseded' | 'rolled_back' | string
+  notes?: string
+  connector_audit?: Array<Record<string, any>>
+  created_by_user_id?: string | null
+  created_at?: string
+}
+
+export interface ReleaseRollback {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  branch_id: string
+  from_snapshot_id: string
+  target_snapshot_id: string
+  result_snapshot_id: string
+  environment?: 'dev' | 'staging' | 'prod' | string | null
+  reason?: string
+  connector_audit?: Array<Record<string, any>>
+  created_by_user_id?: string | null
+  created_at?: string
+}
+
+/** P2 可移植资源包。定义资源会使用稳定 key；凭据与运行时对象不在包内。 */
+export interface OntologyResourcePackage {
+  format: 'ontology-resource-package' | string
+  version: string
+  manifest: {
+    name: string
+    description?: string
+    industry?: string
+    fingerprint?: string
+    resource_counts?: Record<string, number>
+  }
+  resources: Record<string, Array<Record<string, any>>>
+}
+
+export interface PackageIssue {
+  code: string
+  path: string
+  message: string
+}
+
+/** 导入只生成预检和差异；实际应用需转入受治理的发布提案。 */
+export interface PackageImportPreview {
+  valid: boolean
+  applicable: boolean
+  target_scenario_id: string
+  environment?: 'dev' | 'staging' | 'prod' | string
+  package_fingerprint: string
+  /** Present only when the server loaded a fixed, code-versioned Starter Kit. */
+  starter_kit?: StarterKit
+  errors: PackageIssue[]
+  warnings: PackageIssue[]
+  proposal: {
+    mode: 'preview' | string
+    mutates_target: false | boolean
+    ready_to_apply: boolean
+    target?: { id: string; name: string }
+    environment?: 'dev' | 'staging' | 'prod' | string
+    summary: Record<string, number>
+    changes: Array<Record<string, any>>
+    conflicts: Array<Record<string, any>>
+    required_bindings: Array<Record<string, any>>
+    resolved_bindings?: Array<Record<string, any>>
+  }
+}
+
+/** 资源包预检通过后，由服务端编译并创建的受治理提案摘要。 */
+export interface PackageImportProposal {
+  id: string
+  branch_id: string
+  base_snapshot_id: string
+  proposed_snapshot_id: string
+  status: 'draft' | 'submitted' | 'approved' | 'rejected' | 'merged' | 'withdrawn' | string
+  environment?: 'dev' | 'staging' | 'prod' | string
+  package_fingerprint: string
+  summary: Record<string, number>
+}
+
+/** Repository-owned, server-verified industry starter-kit catalog entry. */
+export interface StarterKit {
+  id: string
+  name: string
+  industry: string
+  version: string
+  description?: string
+  fingerprint: string
+  resource_counts: Record<string, number>
+}
+
+export interface StarterKitImportProposal extends PackageImportProposal {
+  starter_kit: StarterKit
+}
+
+export type ConnectorKind = 'data_source' | 'mcp' | 'llm'
+export type ConnectorHealth = 'unknown' | 'healthy' | 'unhealthy'
+
+/** Safe logical view of an existing DataSource, MCP or LLM deployment. */
+export interface ConnectorCatalogItem {
+  id: string
+  name: string
+  kind: ConnectorKind
+  adapter_type: string
+  scenario_id?: string | null
+  enabled: boolean
+  secret_state: 'configured' | 'missing' | 'not_required'
+  health: ConnectorHealth
+  checked_at?: string | null
+  message?: string
+  capabilities: string[]
+}
+
+/** A scenario/environment mapping; never contains connector config or secrets. */
+export interface ConnectorBinding extends ConnectorCatalogItem {
+  binding_id: string
+  binding_key: string
+  reference_label?: string
+  environment: 'dev' | 'staging' | 'prod'
+  ready: boolean
+  blocking_reason?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface ConnectorReadiness {
+  ready: boolean
+  environment: 'dev' | 'staging' | 'prod'
+  reasons: string[]
+  audit: Array<Record<string, any>>
 }
 
 export interface Skill {
@@ -596,6 +1008,11 @@ export interface WorkflowRun {
   workflow_id: string
   workflow_name: string
   trigger_source: string
+  environment?: 'dev' | 'staging' | 'prod' | string
+  definition_snapshot_id?: string | null
+  release_id?: string | null
+  definition_hash?: string
+  definition_source?: 'live' | 'release' | string
   status: WorkflowRunStatus | string
   input_params: Record<string, any>
   attempt: number
@@ -609,6 +1026,10 @@ export interface WorkflowRun {
   error?: string
   result?: Record<string, any>
   pending_approval?: WorkflowApproval | boolean | null
+  /** 由服务端根据当前账号与工作流 ACL 计算；缺失时前端按无权处理。 */
+  can_execute: boolean
+  /** 由服务端根据当前账号与工作流 ACL 计算；缺失时前端按无权处理。 */
+  can_approve: boolean
   created_at?: string
   updated_at?: string
 }

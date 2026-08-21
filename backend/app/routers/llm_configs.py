@@ -20,7 +20,7 @@ from ..schemas import (
     LLMUsageSummaryOut,
     Msg,
 )
-from ..services import llm_service, tenant_service
+from ..services import connector_service, llm_service, permission_service, tenant_service
 from ..services.auth_service import get_tenant_db
 
 router = APIRouter(prefix="/llm-configs", tags=["llm-configs"])
@@ -72,6 +72,11 @@ def _trace_out(trace: LLMInvocationTrace) -> LLMTraceOut:
         estimated_cost=trace.estimated_cost,
         currency=trace.currency,
         tool_count=trace.tool_count,
+        correlation_id=trace.correlation_id or "",
+        agent_id=trace.agent_id,
+        conversation_id=trace.conversation_id,
+        scenario_id=trace.scenario_id,
+        user_id=trace.user_id,
         error=trace.error,
         created_at=trace.created_at,
     )
@@ -134,6 +139,7 @@ def resolve_llm(
 
 @router.post("", response_model=LLMConfigOut)
 def create_llm(payload: LLMConfigIn, db: Session = Depends(get_tenant_db)):
+    permission_service.require_tenant_permission(db, "manage")
     _validate_default(payload)
     if payload.is_default:
         for c in db.execute(
@@ -149,6 +155,7 @@ def create_llm(payload: LLMConfigIn, db: Session = Depends(get_tenant_db)):
 
 @router.put("/{cfg_id}", response_model=LLMConfigOut)
 def update_llm(cfg_id: str, payload: LLMConfigIn, db: Session = Depends(get_tenant_db)):
+    permission_service.require_tenant_permission(db, "manage")
     _validate_default(payload)
     c = tenant_service.require_owned(db, LLMConfig, cfg_id, "配置不存在")
     if payload.is_default:
@@ -161,6 +168,7 @@ def update_llm(cfg_id: str, payload: LLMConfigIn, db: Session = Depends(get_tena
         values["api_key"] = c.api_key
     for key, value in values.items():
         setattr(c, key, value)
+    connector_service.invalidate_connector_bindings(db, "llm", c.id)
     db.commit()
     db.refresh(c)
     return _out(c)
@@ -258,6 +266,7 @@ def create_evaluation(
     payload: LLMEvaluationIn,
     db: Session = Depends(get_tenant_db),
 ):
+    permission_service.require_tenant_permission(db, "manage")
     config = tenant_service.require_owned(db, LLMConfig, cfg_id, "配置不存在")
     record = LLMEvaluationRecord(
         tenant_id=tenant_service.current_tenant_id(db),
@@ -305,15 +314,27 @@ def evaluation_summary(cfg_id: str, db: Session = Depends(get_tenant_db)):
 
 @router.delete("/{cfg_id}", response_model=Msg)
 def delete_llm(cfg_id: str, db: Session = Depends(get_tenant_db)):
+    permission_service.require_tenant_permission(db, "manage")
     c = tenant_service.require_owned(db, LLMConfig, cfg_id, "配置不存在")
+    try:
+        connector_service.assert_connector_not_bound(db, "llm", c.id)
+    except connector_service.ConnectorBindingConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.delete(c)
     db.commit()
     return Msg(message="已删除")
 
 
 @router.post("/{cfg_id}/test", response_model=Msg)
-def test_llm(cfg_id: str, db: Session = Depends(get_tenant_db)):
+def test_llm(
+    cfg_id: str,
+    capability: Capability | None = Query(default=None),
+    db: Session = Depends(get_tenant_db),
+):
     # 测试调用会产生费用和 trace，因此只允许所有者操作。
+    permission_service.require_tenant_permission(db, "manage")
     c = tenant_service.require_owned(db, LLMConfig, cfg_id, "配置不存在")
-    ok, msg = llm_service.test_connection(c, db=db)
+    if not c.enabled:
+        raise HTTPException(409, "模型配置当前已停用")
+    ok, msg = llm_service.test_connection(c, db=db, capability=capability)
     return Msg(ok=ok, message=msg)

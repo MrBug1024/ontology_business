@@ -337,8 +337,49 @@ def can_read_property(db: Session, prop: OntologyProperty) -> bool:
     return check_property(db, prop, "read").allowed
 
 
+def require_property_permission(
+    db: Session,
+    prop: OntologyProperty,
+    verb: str = "read",
+) -> None:
+    """Require a concrete property permission before exposing or mutating it."""
+    require_principal(db)
+    if not check_property(db, prop, verb).allowed:
+        raise HTTPException(status_code=403, detail="没有该属性的权限")
+
+
+def require_instance_attribute_write_permissions(
+    db: Session,
+    entity: OntologyEntity,
+    attributes: dict | None,
+) -> None:
+    """Reject undefined attributes and require write access for every persisted field.
+
+    Ontology instances store their values in JSON, so object-level write permission by
+    itself is insufficient: without this guard a caller could create a new hidden field
+    or overwrite a sensitive one.  Attribute names must correspond to the entity's
+    current ontology definition; legacy values remain readable only when a matching
+    property is still authorized.
+    """
+    values = dict(attributes or {})
+    if not values:
+        return
+    properties = db.execute(
+        select(OntologyProperty).where(OntologyProperty.entity_id == entity.id)
+    ).scalars().all()
+    by_name = {prop.name: prop for prop in properties}
+    unknown = sorted(str(name) for name in values if name not in by_name)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"属性未在实体定义中声明: {', '.join(unknown)}",
+        )
+    for name in values:
+        require_property_permission(db, by_name[name], "write")
+
+
 def filter_instance_attributes(db: Session, instance: OntologyInstance) -> dict:
-    """返回当前主体可序列化的对象属性；未知字段按非敏感兼容处理。"""
+    """返回当前主体可序列化的对象属性；未知字段一律不暴露。"""
     values = dict(instance.attributes or {})
     if not values:
         return values
@@ -349,7 +390,7 @@ def filter_instance_attributes(db: Session, instance: OntologyInstance) -> dict:
     return {
         name: value
         for name, value in values.items()
-        if not by_name.get(name) or can_read_property(db, by_name[name])
+        if by_name.get(name) and can_read_property(db, by_name[name])
     }
 
 
@@ -414,6 +455,7 @@ def ensure_organization(
     organization = db.execute(
         select(Organization).where(Organization.tenant_id == tenant_id)
     ).scalars().first()
+    created_organization = organization is None
     if not organization:
         organization = Organization(tenant_id=tenant_id, name=tenant.name)
         db.add(organization)
@@ -438,9 +480,15 @@ def ensure_organization(
             roles[key] = role
     db.flush()
 
+    # Membership bootstrapping is deliberately a one-time organization-creation
+    # migration.  Re-running it on every login/startup would silently restore a
+    # removed member as admin merely because their User row still exists.
     users = db.execute(
         select(User)
-        .where(User.tenant_id == tenant_id)
+        .where(
+            User.tenant_id == tenant_id,
+            or_(User.status == "active", User.id == owner_user_id),
+        )
         .order_by(User.created_at.asc(), User.id.asc())
     ).scalars().all()
     member_user_ids = set(
@@ -450,25 +498,26 @@ def ensure_organization(
             )
         ).scalars().all()
     )
-    valid_owner_id = next((user.id for user in users if user.id == owner_user_id), None)
-    default_owner_id = valid_owner_id or (users[0].id if users else None)
-    for user in users:
-        if user.id in member_user_ids:
-            continue
-        db.add(
-            OrganizationMember(
-                organization_id=organization.id,
-                user_id=user.id,
-                role_id=roles["owner" if user.id == default_owner_id else "admin"].id,
-                status="active",
+    if created_organization:
+        valid_owner_id = next((user.id for user in users if user.id == owner_user_id), None)
+        default_owner_id = valid_owner_id or (users[0].id if users else None)
+        for user in users:
+            if user.id in member_user_ids:
+                continue
+            db.add(
+                OrganizationMember(
+                    organization_id=organization.id,
+                    user_id=user.id,
+                    role_id=roles["owner" if user.id == default_owner_id else "admin"].id,
+                    status="active",
+                )
             )
-        )
     db.flush()
     return organization
 
 
 def ensure_user_membership(db: Session, user: User) -> bool:
-    """登录时兜底迁移旧用户；只对已验证的本租户用户赋予 admin/owner 默认角色。"""
+    """返回用户是否已有有效成员身份，不在登录时隐式恢复被移除成员。"""
     existing = db.execute(
         select(OrganizationMember)
         .join(OrganizationMember.organization)
@@ -479,32 +528,11 @@ def ensure_user_membership(db: Session, user: User) -> bool:
         .limit(1)
     ).scalars().first()
     if existing:
-        return False
-    organization = ensure_organization(db, user.tenant_id)
-    member = db.execute(
-        select(OrganizationMember).where(
-            OrganizationMember.organization_id == organization.id,
-            OrganizationMember.user_id == user.id,
-        )
-    ).scalars().first()
-    if member:
-        return True
-    admin = db.execute(
-        select(OrganizationRole).where(
-            OrganizationRole.organization_id == organization.id,
-            OrganizationRole.key == "admin",
-        )
-    ).scalars().one()
-    db.add(
-        OrganizationMember(
-            organization_id=organization.id,
-            user_id=user.id,
-            role_id=admin.id,
-            status="active",
-        )
-    )
-    db.flush()
-    return True
+        return existing.status == "active"
+    # Organization creation/backfill is handled by ensure_organization at
+    # startup/registration.  A missing row in an established organization is a
+    # deliberate removal until an administrator explicitly adds the user again.
+    return False
 
 
 def bootstrap_authorization(db: Session) -> None:
@@ -654,6 +682,12 @@ def execution_principal(
     if not organization:
         raise HTTPException(status_code=403, detail="工作流所属组织不存在")
     member = _eligible_member(db, organization.id, requested_user_id)
+    if requested_user_id and not member:
+        # A user-triggered durable task must never silently escalate to the
+        # owner after its requester was disabled or removed from the org.  Only
+        # scheduler/event work (which has no requester) may use the owner
+        # fallback below.
+        raise HTTPException(status_code=403, detail="任务发起人已失效或不再属于当前组织")
     if not member:
         member = db.execute(
             select(OrganizationMember)

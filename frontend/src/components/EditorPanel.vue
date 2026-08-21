@@ -119,7 +119,7 @@ import { computed } from 'vue'
 import type { Entity, Property } from '@/types'
 
 const DATA_TYPES = ['string', 'integer', 'float', 'boolean', 'date', 'datetime', 'json', 'text']
-const REL_TYPES = ['1:1', '1:N', 'N:M']
+const REL_TYPES = ['1:1', '1:N', 'N:1', 'N:M']
 
 const props = defineProps<{
   editor: { kind: 'entity' | 'relation' | 'instance'; id?: string; form: any }

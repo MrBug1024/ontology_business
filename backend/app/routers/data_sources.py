@@ -21,7 +21,13 @@ from ..schemas import (
     QueryResult,
     TableInfo,
 )
-from ..services import datasource_service, rag_service, tenant_service
+from ..services import (
+    connector_service,
+    datasource_service,
+    permission_service,
+    rag_service,
+    tenant_service,
+)
 from ..config import get_settings
 from ..services.auth_service import get_tenant_db
 
@@ -60,28 +66,78 @@ def _out(ds: DataSource, db: Session) -> DataSourceOut:
         last_error=ds.last_error,
         created_at=ds.created_at,
         file_count=len(ds.files),
-        can_write=ds.tenant_id == tenant_service.current_tenant_id(db),
+        can_write=(
+            ds.tenant_id == tenant_service.current_tenant_id(db)
+            and _can_access_data_source(db, ds, writable=True)
+        ),
     )
+
+
+def _require_data_source_access(
+    db: Session,
+    ds: DataSource,
+    *,
+    writable: bool = False,
+) -> DataSource:
+    """Apply the owning scenario's ACL to every data-source entry point.
+
+    ``tenant_service`` protects tenant/public ownership, but a source bound to a
+    scenario inherits that scenario's explicit allow/deny rules.  Keeping this
+    check next to the generic source lookup prevents file, SQL and RAG routes
+    from accidentally becoming alternate paths around the scenario workspace.
+    """
+    if ds.scenario_id:
+        scenario = tenant_service.require_scenario(db, ds.scenario_id, writable=writable)
+        permission_service.require_scenario_permission(
+            db,
+            scenario,
+            "write" if writable else "read",
+            message="没有该数据源所属业务场景的权限",
+        )
+    else:
+        permission_service.require_tenant_permission(db, "write" if writable else "read")
+    return ds
+
+
+def _can_access_data_source(db: Session, ds: DataSource, *, writable: bool = False) -> bool:
+    """List endpoints must hide inaccessible sources instead of leaking names."""
+    try:
+        _require_data_source_access(db, ds, writable=writable)
+    except HTTPException:
+        return False
+    return True
 
 
 def _data_source(db: Session, ds_id: str, writable: bool = False) -> DataSource:
     if writable:
-        return tenant_service.require_owned(db, DataSource, ds_id, "数据源不存在")
-    return tenant_service.require_visible(db, DataSource, ds_id, "数据源不存在")
+        ds = tenant_service.require_owned(db, DataSource, ds_id, "数据源不存在")
+    else:
+        ds = tenant_service.require_visible(db, DataSource, ds_id, "数据源不存在")
+    return _require_data_source_access(db, ds, writable=writable)
 
 
 @router.get("", response_model=list[DataSourceOut])
 def list_data_sources(scenario_id: str | None = None, db: Session = Depends(get_tenant_db)):
+    if scenario_id:
+        scenario = tenant_service.require_scenario(db, scenario_id)
+        permission_service.require_scenario_permission(db, scenario, "read")
     stmt = select(DataSource).where(tenant_service.visible_clause(DataSource, db))
     if scenario_id:
         stmt = stmt.where(DataSource.scenario_id == scenario_id)
-    return [_out(d, db) for d in db.execute(stmt).scalars().all()]
+    return [
+        _out(d, db)
+        for d in db.execute(stmt).scalars().all()
+        if _can_access_data_source(db, d)
+    ]
 
 
 @router.post("", response_model=DataSourceOut)
 def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_db)):
     if payload.scenario_id:
-        tenant_service.require_scenario(db, payload.scenario_id, writable=True)
+        scenario = tenant_service.require_scenario(db, payload.scenario_id, writable=True)
+        permission_service.require_scenario_permission(db, scenario, "write")
+    else:
+        permission_service.require_tenant_permission(db, "write")
     ds = DataSource(tenant_id=tenant_service.current_tenant_id(db), **payload.model_dump())
     db.add(ds)
     db.commit()
@@ -93,13 +149,17 @@ def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_d
 def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(get_tenant_db)):
     ds = _data_source(db, ds_id, writable=True)
     if payload.scenario_id:
-        tenant_service.require_scenario(db, payload.scenario_id, writable=True)
+        scenario = tenant_service.require_scenario(db, payload.scenario_id, writable=True)
+        permission_service.require_scenario_permission(db, scenario, "write")
+    else:
+        permission_service.require_tenant_permission(db, "write")
     values = payload.model_dump()
     values["config"] = _merge_config(ds.config or {}, values.get("config", {}))
     for k, v in values.items():
         setattr(ds, k, v)
     datasource_service.invalidate_engine(ds)
     ds.status = "unknown"
+    connector_service.invalidate_connector_bindings(db, "data_source", ds.id)
     db.commit()
     db.refresh(ds)
     return _out(ds, db)
@@ -108,6 +168,10 @@ def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(
 @router.delete("/{ds_id}", response_model=Msg)
 def delete_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
     ds = _data_source(db, ds_id, writable=True)
+    try:
+        connector_service.assert_connector_not_bound(db, "data_source", ds.id)
+    except connector_service.ConnectorBindingConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     for f in list(ds.files):
         datasource_service.delete_bucket_file(f)
     datasource_service.invalidate_engine(ds)
@@ -125,6 +189,10 @@ def test_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
         db.commit()
         return Msg(ok=True, message="文件桶就绪")
     ok, msg = datasource_service.test_connection(ds)
+    # Defense in depth: a future driver adapter or a mocked service must not
+    # cause a credential-bearing error to become an API response or persisted
+    # data-source status.
+    msg = msg if ok else datasource_service.CONNECTION_TEST_FAILURE_MESSAGE
     ds.status = "ok" if ok else "error"
     ds.last_error = "" if ok else msg
     db.commit()
@@ -162,7 +230,8 @@ def search_documents(payload: DocumentSearchIn, db: Session = Depends(get_tenant
     未来外部 API 进入同一个检索边界。
     """
     if payload.scenario_id:
-        tenant_service.require_scenario(db, payload.scenario_id)
+        scenario = tenant_service.require_scenario(db, payload.scenario_id)
+        permission_service.require_scenario_permission(db, scenario, "read")
     stmt = select(DataSource).where(
         DataSource.type == "file_bucket",
         tenant_service.visible_clause(DataSource, db),
@@ -173,7 +242,11 @@ def search_documents(payload: DocumentSearchIn, db: Session = Depends(get_tenant
         stmt = stmt.where(
             or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == payload.scenario_id)
         )
-    sources = db.execute(stmt).scalars().all()
+    sources = [
+        source
+        for source in db.execute(stmt).scalars().all()
+        if _can_access_data_source(db, source)
+    ]
     source_ids = [source.id for source in sources]
     requested_ids = set(payload.data_source_ids or [])
     excluded_ids = sorted(requested_ids - set(source_ids))
@@ -242,7 +315,7 @@ def reparse_file(file_id: str, db: Session = Depends(get_tenant_db)):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
-    tenant_service.require_owned(db, DataSource, bf.data_source_id, "文件不存在")
+    _data_source(db, bf.data_source_id, writable=True)
     bf.status = "pending"
     bf.error = ""
     bf.parsed_text = ""
@@ -257,7 +330,7 @@ def file_text(file_id: str, db: Session = Depends(get_tenant_db)):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
-    tenant_service.require_visible(db, DataSource, bf.data_source_id, "文件不存在")
+    _data_source(db, bf.data_source_id)
     return {"filename": bf.filename, "text": bf.parsed_text}
 
 
@@ -267,7 +340,7 @@ def file_download(file_id: str, db: Session = Depends(get_tenant_db)):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
-    tenant_service.require_visible(db, DataSource, bf.data_source_id, "文件不存在")
+    _data_source(db, bf.data_source_id)
     p = Path(bf.stored_path)
     if not p.exists():
         raise HTTPException(404, "文件已丢失")
@@ -284,7 +357,7 @@ def delete_file(file_id: str, db: Session = Depends(get_tenant_db)):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
-    tenant_service.require_owned(db, DataSource, bf.data_source_id, "文件不存在")
+    _data_source(db, bf.data_source_id, writable=True)
     datasource_service.delete_bucket_file(bf)
     db.delete(bf)
     db.commit()

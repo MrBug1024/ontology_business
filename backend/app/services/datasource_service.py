@@ -16,6 +16,11 @@ from .policies import validate_read_only_sql
 
 _engine_cache: dict[str, Engine] = {}
 
+# Database driver exceptions commonly include a full DSN (and can therefore
+# disclose a password, token, hostname or database name).  Connection-test
+# callers intentionally receive this stable, non-diagnostic public message.
+CONNECTION_TEST_FAILURE_MESSAGE = "连接测试失败，请检查数据源配置和网络可达性"
+
 
 def _db_url(ds: DataSource) -> str:
     cfg = ds.config or {}
@@ -62,8 +67,8 @@ def test_connection(ds: DataSource) -> tuple[bool, str]:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         return True, "连接成功"
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
+    except Exception:  # noqa: BLE001 - never expose driver diagnostics or DSNs.
+        return False, CONNECTION_TEST_FAILURE_MESSAGE
 
 
 def list_tables(ds: DataSource) -> list[dict[str, Any]]:

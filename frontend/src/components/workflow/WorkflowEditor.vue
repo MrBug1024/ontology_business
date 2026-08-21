@@ -53,6 +53,7 @@ const nodeTypes: any = {
   llm: _WFNode,
   event: _WFNode,
   approval: _WFNode,
+  // 保留旧流程的只读渲染能力；服务端默认拒绝保存/执行原生高风险节点。
   http: _WFNode,
   script: _WFNode,
 }
@@ -64,8 +65,6 @@ const PALETTE = [
   { type: 'llm', label: '大模型', icon: 'Cpu', color: 'var(--primary)', desc: 'LLM 分析/生成，支持变量引用' },
   { type: 'event', label: '发布事件', icon: 'Bell', color: 'var(--accent)', desc: '发布业务事件' },
   { type: 'approval', label: '人工审批', icon: 'UserFilled', color: 'var(--warning)', desc: '暂停执行，等待人工决定' },
-  { type: 'http', label: 'HTTP 请求', icon: 'Link', color: 'var(--graph-teal)', desc: '调用外部 API' },
-  { type: 'script', label: 'Python 脚本', icon: 'Document', color: 'var(--info)', desc: '自定义 Python 片段' },
   { type: 'end', label: '结束', icon: 'CircleCheck', color: 'var(--text-3)', desc: '流程结束' },
 ]
 
@@ -74,7 +73,7 @@ const nodes = ref<any[]>([])
 const edges = ref<any[]>([])
 const graph = ref<{ nodes: any[]; edges: any[] }>({ nodes: [], edges: [] })
 const selectedId = ref('')
-const { screenToFlowCoordinate, fitView, addEdges, onConnect, onNodeClick, onEdgeClick, onPaneClick } = useVueFlow()
+const { screenToFlowCoordinate, fitView, addEdges, onConnect } = useVueFlow()
 
 const selNode = computed(() => nodes.value.find((n) => n.id === selectedId.value) || null)
 
@@ -153,8 +152,11 @@ function loadFromModel() {
     ns = conv.nodes
     es = conv.edges
   }
+  // 父组件会回传 v-model 更新；保留仍存在的选中节点，避免编辑器刚添加或点击节点时
+  // 被回传同步清空，从而使右侧配置面板无法使用。
+  const retainedSelectedId = ns.some((n) => n.id === selectedId.value) ? selectedId.value : ''
   graph.value = { nodes: ns, edges: es }
-  selectedId.value = ''
+  selectedId.value = retainedSelectedId
   syncToFlow()
 }
 function stepsToNodes(steps: any[]) {
@@ -207,15 +209,12 @@ onConnect((c: Connection) => {
     markerEnd: MarkerType.ArrowClosed,
   })
 })
-onNodeClick(({ node }) => {
+function selectNode({ node }: { node: Node }) {
   selectedId.value = node.id
-})
-onEdgeClick(() => {
+}
+function clearNodeSelection() {
   selectedId.value = ''
-})
-onPaneClick(() => {
-  selectedId.value = ''
-})
+}
 
 // ── 添加 / 删除节点 ──
 function genId(type: string) {
@@ -334,7 +333,7 @@ function validate(): string[] {
     if (n.type === 'event' && !d.event_id) errs.push(`节点「${nm}」未选择事件`)
     if (n.type === 'approval' && !(d.instructions || '').trim()) errs.push(`审批节点「${nm}」未填写审批说明`)
     if (n.type === 'llm' && !(d.prompt || '').trim()) errs.push(`节点「${nm}」未填写提示词`)
-    if (n.type === 'http' && !(d.url || '').trim()) errs.push(`节点「${nm}」未填写 URL`)
+    if (n.type === 'http' || n.type === 'script') errs.push(`节点「${nm}」使用了已停用的原生高风险节点；请改为类型化 Action`)
   }
   for (const n of ns) {
     if (n.type !== 'rule') continue
@@ -562,6 +561,9 @@ const wf = computed({
           :max-zoom="2"
           fit-view-on-init
           class="wfe-flow"
+          @node-click="selectNode"
+          @edge-click="clearNodeSelection"
+          @pane-click="clearNodeSelection"
         >
           <Background :gap="22" :size="1.5" color="#8ab9dc" />
           <Controls position="bottom-left" :show-interactions="false" />
@@ -631,6 +633,19 @@ const wf = computed({
               <label>系统提示（可选）</label>
           <el-input v-model="selNode.data.system" type="textarea" :rows="2" placeholder="你是一个严谨的业务助手" />
             </div>
+            <div class="wfe-field">
+              <label for="workflow-llm-binding-key">运行时绑定键（非开发环境必填）</label>
+              <el-input
+                id="workflow-llm-binding-key"
+                v-model.trim="selNode.data.llm_binding_key"
+                class="mono"
+                aria-describedby="workflow-llm-binding-help"
+                placeholder="例如 llm:operations:chat"
+              />
+              <div id="workflow-llm-binding-help" class="wfe-hint">
+                在“连接器与环境”中为同一键配置各环境的 LLM；留空仅兼容开发环境的默认模型。
+              </div>
+            </div>
           </template>
 
           <template v-if="selNode.type === 'event'">
@@ -666,27 +681,15 @@ const wf = computed({
           </template>
 
           <template v-if="selNode.type === 'http'">
-            <div class="wfe-field">
-              <label>请求方法</label>
-              <el-select v-model="selNode.data.method" size="small" style="width:100%">
-                <el-option v-for="m in ['GET', 'POST', 'PUT', 'DELETE']" :key="m" :label="m" :value="m" />
-              </el-select>
-            </div>
-            <div class="wfe-field">
-              <label>URL（支持变量）</label>
-              <el-input v-model="selNode.data.url" size="small" class="mono" placeholder="https://api.example.com/v1/audit?org={params.org}" />
-            </div>
-            <div class="wfe-field">
-              <label>请求体（JSON，POST/PUT 时生效）</label>
-              <el-input v-model="jsonText" type="textarea" :rows="4" class="mono" @input="onJsonInput" />
-            </div>
+            <el-alert type="warning" :closable="false" show-icon title="原生 HTTP 节点已停用">
+              请用类型化 Action 配置外部调用，以获得权限、确认、幂等和审计约束。
+            </el-alert>
           </template>
 
           <template v-if="selNode.type === 'script'">
-            <div class="wfe-field">
-              <label>Python 代码（可用 params / ctx / json，结果赋给 result）</label>
-              <el-input v-model="selNode.data.script" type="textarea" :rows="8" class="mono" />
-            </div>
+            <el-alert type="warning" :closable="false" show-icon title="原生 Python 节点已停用">
+              请用已治理的 Skill 或类型化 Action 表达业务副作用。
+            </el-alert>
           </template>
 
           <template v-if="selNode.type === 'end'">

@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .database import init_db
-from .routers import agents, assistant, auth, data_sources, lineage, llm_configs, mcp, operations, permissions, scenarios, skills
+from .routers import agents, assistant, auth, connectors, data_sources, external_api, incidents, lineage, llm_configs, mcp, operations, packages, permissions, releases, scenarios, skills, starter_kits
 from .services import operations_service, permission_service, skill_service
 
 
@@ -70,8 +70,16 @@ app.include_router(mcp.router, prefix=settings.api_prefix)
 app.include_router(agents.router, prefix=settings.api_prefix)
 app.include_router(assistant.router, prefix=settings.api_prefix)
 app.include_router(operations.router, prefix=settings.api_prefix)
+app.include_router(operations.operations_router, prefix=settings.api_prefix)
+app.include_router(incidents.router, prefix=settings.api_prefix)
 app.include_router(permissions.router, prefix=settings.api_prefix)
 app.include_router(lineage.router, prefix=settings.api_prefix)
+app.include_router(releases.router, prefix=settings.api_prefix)
+app.include_router(packages.router, prefix=settings.api_prefix)
+app.include_router(starter_kits.router, prefix=settings.api_prefix)
+app.include_router(connectors.router, prefix=settings.api_prefix)
+app.include_router(external_api.management_router, prefix=settings.api_prefix)
+app.include_router(external_api.router, prefix=settings.api_prefix)
 
 
 @app.get("/")

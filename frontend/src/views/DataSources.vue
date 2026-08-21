@@ -77,9 +77,9 @@
                   <el-button type="primary" @click="runSql" :loading="runningSql">执行</el-button>
                 </div>
                 <el-alert v-if="sqlError" :title="sqlError" type="error" :closable="false" style="margin-bottom:10px" />
-                <el-table v-if="sqlResult" :data="sqlResult.rows" size="small" max-height="380" border>
+                <el-table v-if="sqlResult" :data="sqlRows" size="small" max-height="380" border>
                   <el-table-column v-for="c in sqlResult.columns" :key="c" :prop="c" :label="c" min-width="110">
-                    <template #default="{ row }"><span class="mono">{{ row[c] }}</span></template>
+                    <template #default="{ row }"><span class="mono">{{ formatSqlCell(row[c]) }}</span></template>
                   </el-table-column>
                 </el-table>
                 <div class="muted" v-if="sqlResult" style="margin-top:8px">{{ sqlResult.row_count }} 行 · 只读查询（SELECT）</div>
@@ -251,7 +251,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onBeforeUnmount, onMounted } from 'vue'
+import { computed, ref, onBeforeUnmount, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { api } from '@/api'
@@ -274,6 +274,17 @@ const sql = ref('')
 const runningSql = ref(false)
 const sqlError = ref('')
 const sqlResult = ref<{ columns: string[]; rows: any[]; row_count: number } | null>(null)
+const sqlRows = computed<Record<string, unknown>[]>(() => {
+  const result = sqlResult.value
+  if (!result) return []
+  return result.rows.map((row) => {
+    if (Array.isArray(row)) {
+      return Object.fromEntries(result.columns.map((column, index) => [column, row[index]]))
+    }
+    if (row && typeof row === 'object') return row as Record<string, unknown>
+    return { [result.columns[0] || 'value']: row }
+  })
+})
 const tableDlg = ref(false)
 const curTable = ref<TableInfo | null>(null)
 
@@ -297,6 +308,11 @@ const TYPE_LABELS: Record<string, string> = {
   mysql: 'MySQL', postgres: 'PostgreSQL', sqlite: 'SQLite', file_bucket: '文件桶',
 }
 function typeLabel(t: string) { return TYPE_LABELS[t] || t }
+function formatSqlCell(value: unknown) {
+  if (value === null || value === undefined) return '—'
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
 function fmtSize(n: number) {
   if (n < 1024) return n + ' B'
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'

@@ -1,0 +1,20 @@
+{
+  "id": "bookkeeping",
+  "name": "财税核算 Starter Kit",
+  "industry": "bookkeeping",
+  "version": "1.0.0",
+  "description": "用于会计科目、凭证、凭证明细和核算期间建模的声明性本体起点。",
+  "package_file": "package.json",
+  "fingerprint": "sha256:12eae96d2a59e47223db5fe3d8024d15b99d1b876c1a6a4d6df81e41c17ecbee",
+  "resource_counts": {
+    "entities": 4,
+    "properties": 10,
+    "relations": 3,
+    "mappings": 0,
+    "functions": 0,
+    "actions": 0,
+    "rules": 1,
+    "events": 1,
+    "workflows": 1
+  }
+}

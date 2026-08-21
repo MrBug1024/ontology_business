@@ -2,18 +2,22 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload
 
+from ..config import get_settings
 from ..database import get_db
 from ..models import (
     ActionExecutionLog,
     AuthorizationGrant,
     BusinessScenario,
     DataMapping,
+    DataMappingRefreshJob,
     DataSource,
+    FunctionDefinition,
     MCPConfig,
     OntologyAction,
     OntologyEntity,
@@ -23,6 +27,7 @@ from ..models import (
     OntologyRelation,
     OntologyRule,
     OntologyWorkflow,
+    Skill,
     RelationInstance,
     WorkflowApprovalRequest,
     WorkflowRun,
@@ -35,7 +40,7 @@ from ..schemas import (
     DataMappingIn,
     DataMappingOut,
     DataMappingPreviewOut,
-    DataMappingRefreshOut,
+    DataMappingRefreshJobOut,
     DataMappingTestOut,
     EntityIn,
     EntityOut,
@@ -43,6 +48,8 @@ from ..schemas import (
     EventEnvelopeOut,
     EventPublishIn,
     EventOut,
+    FunctionDefinitionIn,
+    FunctionDefinitionOut,
     InstanceIn,
     InstanceOut,
     Msg,
@@ -70,12 +77,19 @@ from ..schemas import (
 )
 from ..services import (
     ontology_service,
+    connector_service,
+    function_definition_service,
+    mapping_refresh_service,
     operations_service,
     permission_service,
+    release_service,
+    runtime_connector_service,
+    runtime_definition_service,
     tenant_service,
     workflow_service,
 )
 from ..services.auth_service import get_current_user
+from ..services.policies import PolicyViolation
 
 router = APIRouter(
     prefix="/scenarios",
@@ -117,13 +131,57 @@ def _mapping_limit(payload: dict | None, default: int, maximum: int) -> int:
     return max(1, min(value, maximum))
 
 
+def _mapping_identity_contract(
+    entity: OntologyEntity,
+    *,
+    data_source_id: str,
+    binding_key: str,
+    binding_ref: dict,
+    table_name: str,
+    column_map: dict,
+) -> dict:
+    """Return the source-side identity boundary used by incremental imports.
+
+    Instances are keyed by a mapping id and the mapped record key.  Editing
+    display/value columns can therefore preserve the mapping id and update the
+    same objects.  Changing the source, logical binding, table, or key column
+    must instead create a new mapping identity so equal-looking record keys in
+    a different source cannot overwrite prior imported facts.
+    """
+    key_property = next((property.name for property in entity.properties if property.is_key), "")
+    return {
+        "data_source_id": str(data_source_id or ""),
+        "data_source_binding_key": str(binding_key or ""),
+        "data_source_binding_ref": binding_ref or {},
+        "table_name": str(table_name or ""),
+        "key_column": str((column_map or {}).get(key_property) or ""),
+    }
+
+
 def _validate_action_executor(db: Session, scenario_id: str, payload: ActionIn) -> None:
     """校验操作执行器引用的资源边界，保持操作配置可移植且不跨场景。"""
     config = payload.executor_config or {}
+    # These executors cross the platform boundary. Scenario editors may use
+    # pre-approved Actions, but only a tenant manager may bind a new external
+    # target or executable implementation to one.
+    if payload.executor_type in {"skill", "mcp", "http", "script"}:
+        permission_service.require_tenant_permission(db, "manage")
     if payload.executor_type == "sql" and config.get("data_source_id"):
         _source_in_scenario(db, scenario_id, config["data_source_id"])
+    if payload.executor_type == "skill":
+        try:
+            workflow_service.validate_skill_action_config(db, config)
+        except PolicyViolation as exc:
+            raise HTTPException(400, f"Skill Action 配置无效: {exc}") from exc
     if payload.executor_type == "mcp" and config.get("mcp_id"):
         tenant_service.require_visible(db, MCPConfig, config["mcp_id"], "操作引用的 MCP 服务不存在")
+    if payload.executor_type == "http":
+        try:
+            workflow_service.validate_http_action_config(config)
+        except PolicyViolation as exc:
+            raise HTTPException(400, f"HTTP Action 配置无效: {exc}") from exc
+    if payload.executor_type == "script" and not get_settings().allow_unsafe_workflow_nodes:
+        raise HTTPException(400, "脚本 Action 默认停用；请改用受治理的 Action 或工作流节点")
 
 
 def _validate_trigger_actions(db: Session, scenario_id: str, action_ids: list[str] | None) -> None:
@@ -149,16 +207,31 @@ def _validate_workflow_refs(db: Session, scenario_id: str, steps: list, nodes: l
             raise HTTPException(400, f"工作流引用的 {kind} 不属于当前业务场景")
 
 
-def _validate_workflow_trigger(db: Session, scenario_id: str, trigger_type: str, trigger_config: dict) -> None:
+def _validate_workflow_trigger(
+    db: Session,
+    scenario_id: str,
+    trigger_type: str,
+    trigger_config: dict,
+    *,
+    steps: list | None = None,
+    nodes: list | None = None,
+    workflow_id: str | None = None,
+) -> None:
     """把 P1 调度配置校验放在服务端，避免保存无法运行的工作流。"""
     try:
         operations_service.validate_trigger_config(trigger_type, trigger_config)
+        operations_service.validate_approval_nodes(nodes, steps)
+        operations_service.validate_event_feedback_loops(
+            db,
+            scenario_id,
+            trigger_type=trigger_type,
+            trigger_config=trigger_config,
+            nodes=nodes,
+            steps=steps,
+            workflow_id=workflow_id,
+        )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"工作流触发配置无效: {exc}") from exc
-    if trigger_type == "event" and (event_id := (trigger_config or {}).get("event_id")):
-        event = db.get(OntologyEvent, event_id)
-        if not event or event.scenario_id != scenario_id:
-            raise HTTPException(400, "事件触发工作流引用的事件不属于当前业务场景")
 
 
 def _scenario_out(s: BusinessScenario) -> ScenarioOut:
@@ -286,12 +359,24 @@ def _workflow_run_out(db: Session, run: WorkflowRun) -> WorkflowRunOut:
             WorkflowApprovalRequest.status == "pending",
         ).limit(1)
     ).scalar_one_or_none()
+    try:
+        definition = runtime_definition_service.resolve_for_run(db, run)
+        workflow = runtime_definition_service.resolve_resource(
+            definition, "workflow", run.workflow_id
+        )
+    except runtime_definition_service.RuntimeDefinitionError:
+        workflow = None
     return WorkflowRunOut(
         id=run.id,
         scenario_id=run.scenario_id,
         workflow_id=run.workflow_id,
-        workflow_name=run.workflow.name if run.workflow else "",
+        workflow_name=workflow.name if workflow else "",
         trigger_source=run.trigger_source,
+        environment=run.environment or "dev",
+        definition_snapshot_id=run.definition_snapshot_id,
+        release_id=run.release_id,
+        definition_hash=run.definition_hash or "",
+        definition_source=run.definition_source or "live",
         status=run.status,
         input_params=run.input_params or {},
         attempt=run.attempt,
@@ -305,6 +390,8 @@ def _workflow_run_out(db: Session, run: WorkflowRun) -> WorkflowRunOut:
         error=run.error or "",
         result=run.result or {},
         pending_approval=bool(pending),
+        can_execute=bool(workflow and permission_service.check_workflow(db, workflow, "execute").allowed),
+        can_approve=bool(workflow and permission_service.check_workflow(db, workflow, "approve").allowed),
         created_at=run.created_at,
         updated_at=run.updated_at,
     )
@@ -355,9 +442,17 @@ def _relation_out(r: OntologyRelation, entities: list[OntologyEntity]) -> Relati
 
 @router.get("", response_model=list[ScenarioOut])
 def list_scenarios(db: Session = Depends(get_db)):
-    return [_scenario_out(s) for s in db.execute(
-        select(BusinessScenario).where(tenant_service.visible_clause(BusinessScenario, db))
-    ).scalars().all()]
+    # A tenant-visible row is not necessarily ACL-visible: an explicit scenario
+    # deny must also remove it from navigation/list responses, otherwise its
+    # name and counts become an information disclosure even when detail routes
+    # correctly return 403.
+    return [
+        _scenario_out(s)
+        for s in db.execute(
+            select(BusinessScenario).where(tenant_service.visible_clause(BusinessScenario, db))
+        ).scalars().all()
+        if permission_service.check_scenario(db, s, "read").allowed
+    ]
 
 
 @router.post("", response_model=ScenarioOut)
@@ -410,23 +505,72 @@ def _rel_instance_out(ri: RelationInstance) -> RelationInstanceOut:
 def _mapping_out(m: DataMapping) -> DataMappingOut:
     ent = m.entity
     ds = m.data_source
+    runtime_state = mapping_refresh_service.mapping_runtime_state(m)
     return DataMappingOut(
         id=m.id,
         scenario_id=m.scenario_id,
         entity_id=m.entity_id,
         data_source_id=m.data_source_id,
+        data_source_binding_key=m.data_source_binding_key or "",
+        data_source_binding_ref=m.data_source_binding_ref or {},
         table_name=m.table_name,
         column_map=m.column_map or {},
         entity_name=ent.name if ent else "",
         data_source_name=ds.name if ds else "",
         data_source_type=ds.type if ds else "",
-        status=m.status or "unknown",
-        last_error=m.last_error or "",
-        last_checked_at=m.last_checked_at,
-        last_refreshed_at=m.last_refreshed_at,
-        last_row_count=m.last_row_count or 0,
-        last_imported_count=m.last_imported_count or 0,
+        status=runtime_state["status"],
+        last_error=runtime_state["last_error"],
+        last_checked_at=runtime_state["last_checked_at"],
+        last_refreshed_at=runtime_state["last_refreshed_at"],
+        last_row_count=runtime_state["last_row_count"],
+        last_imported_count=runtime_state["last_imported_count"],
         created_at=m.created_at,
+    )
+
+
+def _function_out(function: FunctionDefinition) -> FunctionDefinitionOut:
+    """Return declaration metadata only; FunctionDefinition has no executor."""
+    return FunctionDefinitionOut(
+        id=function.id,
+        scenario_id=function.scenario_id,
+        name=function.name,
+        description=function.description or "",
+        input_schema=function.input_schema or {},
+        output_schema=function.output_schema or {},
+        tags=function.tags or [],
+        visibility=function.visibility or "scenario",
+        created_at=function.created_at,
+        updated_at=function.updated_at,
+    )
+
+
+def _mapping_refresh_job_out(job: DataMappingRefreshJob) -> DataMappingRefreshJobOut:
+    return DataMappingRefreshJobOut(
+        id=job.id,
+        mapping_id=job.mapping_id,
+        scenario_id=job.scenario_id,
+        environment=job.environment,
+        status=job.status,
+        limit=job.limit,
+        attempt=job.attempt,
+        max_attempts=job.max_attempts,
+        timeout_seconds=job.timeout_seconds,
+        available_at=job.available_at,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+        next_retry_at=job.next_retry_at,
+        rows_scanned=job.rows_scanned,
+        instances_created=job.instances_created,
+        instances_updated=job.instances_updated,
+        relations_created=job.relations_created,
+        connector_audit=job.connector_audit or [],
+        definition_snapshot_id=job.definition_snapshot_id,
+        release_id=job.release_id,
+        definition_hash=job.definition_hash or "",
+        definition_source=job.definition_source or "live",
+        error=connector_service.sanitize_message(job.error or ""),
+        created_at=job.created_at,
+        updated_at=job.updated_at,
     )
 
 
@@ -436,23 +580,37 @@ def _object_provenance(
     mapping: DataMapping | None = None,
 ) -> ObjectProvenanceOut:
     """把对象的导入来源解析成安全的、可展示的来源摘要。"""
+    metadata = instance.source_metadata if isinstance(instance.source_metadata, dict) else {}
     if mapping is None:
-        mapping = db.execute(
-            select(DataMapping)
-            .where(
-                DataMapping.scenario_id == instance.scenario_id,
-                DataMapping.entity_id == instance.entity_id,
-            )
-            .limit(1)
-        ).scalar_one_or_none()
+        mapping_id = str(metadata.get("mapping_id") or "").strip()
+        candidate = db.get(DataMapping, mapping_id) if mapping_id else None
+        if candidate and candidate.scenario_id == instance.scenario_id:
+            mapping = candidate
+        else:
+            # Legacy/manual objects may not carry a mapping id.  Keep the old
+            # entity-level fallback only for those records; a historical object
+            # from a replaced mapping must not be mislabeled as the new table.
+            mapping = db.execute(
+                select(DataMapping)
+                .where(
+                    DataMapping.scenario_id == instance.scenario_id,
+                    DataMapping.entity_id == instance.entity_id,
+                )
+                .limit(1)
+            ).scalar_one_or_none() if not mapping_id else None
     source = mapping.data_source if mapping else None
+    if source is None:
+        source_id = str(metadata.get("data_source_id") or "").strip()
+        candidate_source = db.get(DataSource, source_id) if source_id else None
+        if candidate_source and candidate_source.scenario_id in (None, instance.scenario_id):
+            source = candidate_source
     return ObjectProvenanceOut(
         kind=instance.source or "manual",
         reference=instance.source_ref or "",
-        mapping_id=mapping.id if mapping else None,
-        data_source_id=source.id if source else None,
+        mapping_id=mapping.id if mapping else (str(metadata.get("mapping_id") or "") or None),
+        data_source_id=source.id if source else (str(metadata.get("data_source_id") or "") or None),
         data_source_name=source.name if source else "",
-        table_name=mapping.table_name if mapping else "",
+        table_name=mapping.table_name if mapping else str(metadata.get("table_name") or ""),
         status=source.status if source else "unknown",
     )
 
@@ -555,6 +713,7 @@ def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
         and ri.target_instance_id in visible_instance_ids
     ]
     mappings = [_mapping_out(m) for m in s.data_mappings]
+    functions = [_function_out(function) for function in s.function_definitions]
     actions = [
         _action_out(action)
         for action in s.actions
@@ -569,12 +728,14 @@ def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
     ]
     return ScenarioDetail(
         **base.model_dump(),
+        can_write=permission_service.check_scenario(db, s, "write").allowed,
         entities=entities,
         relations=relations,
         data_sources=ds_out,
         instances=instances,
         relation_instances=rel_instances,
         mappings=mappings,
+        functions=functions,
         actions=actions,
         rules=rules,
         events=events,
@@ -707,6 +868,10 @@ def update_scenario(scenario_id: str, payload: ScenarioIn, db: Session = Depends
 @router.delete("/{scenario_id}", response_model=Msg)
 def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
+    try:
+        release_service.assert_scenario_deletion_allowed(db, s)
+    except release_service.ReleaseValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
     db.delete(s)
     db.commit()
     return Msg(message="已删除")
@@ -767,7 +932,18 @@ def delete_entity(entity_id: str, db: Session = Depends(get_db)):
     e = db.get(OntologyEntity, entity_id)
     if not e:
         raise HTTPException(404, "实体不存在")
-    _scenario_for_request(db, e.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, e.scenario_id, writable=True)
+    # Guard before touching relation instances, mappings, or the entity's
+    # cascades; a rejected delete must have no partial operational side effect.
+    try:
+        release_service.assert_resource_deletion_allowed(
+            db,
+            scenario,
+            kind="entity",
+            resource_id=e.id,
+        )
+    except release_service.ReleaseValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
     # 删除关联关系（含关系实例）
     for r in list(e.scenario.relations):
         if r.source_entity_id == entity_id or r.target_entity_id == entity_id:
@@ -820,7 +996,16 @@ def delete_relation(relation_id: str, db: Session = Depends(get_db)):
     r = db.get(OntologyRelation, relation_id)
     if not r:
         raise HTTPException(404, "关系不存在")
-    _scenario_for_request(db, r.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, r.scenario_id, writable=True)
+    try:
+        release_service.assert_resource_deletion_allowed(
+            db,
+            scenario,
+            kind="relation",
+            resource_id=r.id,
+        )
+    except release_service.ReleaseValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
     # 级联删除关系实例
     for ri in list(r.relation_instances):
         db.delete(ri)
@@ -852,7 +1037,11 @@ def apply_ontology(scenario_id: str, payload: dict, db: Session = Depends(get_db
 def create_instance(scenario_id: str, payload: InstanceIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
     _require_restricted_scope_management(db, payload.access_scope)
-    _entity_in_scenario(db, scenario_id, payload.entity_id)
+    entity = _entity_in_scenario(db, scenario_id, payload.entity_id)
+    if entity:
+        permission_service.require_instance_attribute_write_permissions(
+            db, entity, payload.attributes
+        )
     i = OntologyInstance(scenario_id=scenario_id, **payload.model_dump())
     db.add(i)
     db.commit()
@@ -868,7 +1057,11 @@ def update_instance(instance_id: str, payload: InstanceIn, db: Session = Depends
     _scenario_for_request(db, i.scenario_id, writable=True)
     permission_service.require_object_permission(db, i, "write")
     _require_restricted_scope_management(db, payload.access_scope)
-    _entity_in_scenario(db, i.scenario_id, payload.entity_id)
+    entity = _entity_in_scenario(db, i.scenario_id, payload.entity_id)
+    if entity:
+        permission_service.require_instance_attribute_write_permissions(
+            db, entity, payload.attributes
+        )
     for k in ("entity_id", "name", "attributes", "source", "source_ref", "access_scope"):
         setattr(i, k, getattr(payload, k))
     db.commit()
@@ -933,18 +1126,89 @@ def delete_relation_instance(ri_id: str, db: Session = Depends(get_db)):
 @router.post("/{scenario_id}/mappings", response_model=DataMappingOut)
 def create_mapping(scenario_id: str, payload: DataMappingIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
-    _entity_in_scenario(db, scenario_id, payload.entity_id)
+    entity = _entity_in_scenario(db, scenario_id, payload.entity_id)
+    assert entity is not None
     _source_in_scenario(db, scenario_id, payload.data_source_id)
-    # 同一实体只保留一条映射
+    mapping_data = payload.model_dump()
+    try:
+        binding = connector_service.runtime_binding_from_config(mapping_data, "data_source")
+    except connector_service.ConnectorBindingError as exc:
+        raise HTTPException(400, f"映射运行时绑定配置无效: {exc}") from exc
+    key_field, ref_field = connector_service.runtime_binding_fields("data_source")
+    if binding is None:
+        mapping_data[key_field] = ""
+        mapping_data[ref_field] = {}
+    else:
+        # Only retain the compact adapter/capability descriptor.  Names,
+        # endpoints and any credential-shaped values never become mapping state.
+        mapping_data[key_field] = binding["binding_key"]
+        mapping_data[ref_field] = binding["reference"]
+    # 同一实体只保留一条映射。旧实现会删除后新建，这会改变 mapping_id；而已导入
+    # 对象以 (mapping_id, environment, record_key) 保持幂等身份，因此一次无改动
+    # 的“保存”也会在下次刷新时重复导入。对于同一来源/表/主键列，原地更新可保留
+    # 稳定身份和对象血缘；身份边界变化时仍新建映射，避免相同 record_key 覆盖另一
+    # 数据源或表中的历史对象。
     old = db.execute(
-        select(DataMapping).where(
-            DataMapping.scenario_id == scenario_id, DataMapping.entity_id == payload.entity_id
+        select(DataMapping)
+        .where(
+            DataMapping.scenario_id == scenario_id,
+            DataMapping.entity_id == payload.entity_id,
         )
+        .order_by(DataMapping.created_at.asc(), DataMapping.id.asc())
     ).scalars().all()
-    for o in old:
-        db.delete(o)
-    m = DataMapping(scenario_id=scenario_id, **payload.model_dump())
-    db.add(m)
+    incoming_identity = _mapping_identity_contract(
+        entity,
+        data_source_id=mapping_data["data_source_id"],
+        binding_key=mapping_data.get("data_source_binding_key", ""),
+        binding_ref=mapping_data.get("data_source_binding_ref", {}),
+        table_name=mapping_data.get("table_name", ""),
+        column_map=mapping_data.get("column_map", {}),
+    )
+    if old:
+        m = old[0]
+        current_identity = _mapping_identity_contract(
+            entity,
+            data_source_id=m.data_source_id,
+            binding_key=m.data_source_binding_key,
+            binding_ref=m.data_source_binding_ref or {},
+            table_name=m.table_name,
+            column_map=m.column_map or {},
+        )
+        if current_identity == incoming_identity:
+            before = mapping_refresh_service.mapping_fingerprint(m)
+            for field, value in mapping_data.items():
+                setattr(m, field, value)
+            changed = mapping_refresh_service.mapping_fingerprint(m) != before
+            if changed:
+                mapping_refresh_service.cancel_active_mapping_refresh_jobs(
+                    db,
+                    m.id,
+                    reason="映射定义已更新，请重新提交刷新",
+                )
+                mapping_refresh_service.invalidate_mapping_runtime_state(m)
+            # Older databases may have accumulated duplicate mappings before
+            # the one-per-entity API contract existed.  Keep the oldest stable
+            # mapping as the canonical identity and remove the extras as the
+            # old code did.
+            duplicates = old[1:]
+        else:
+            # The import identity boundary changed.  Preserve prior imported
+            # objects as auditable historical facts and give the new source a
+            # new mapping id; otherwise colliding record keys could overwrite
+            # the old source's objects on the next refresh.
+            duplicates = old
+            m = DataMapping(scenario_id=scenario_id, **mapping_data)
+            db.add(m)
+        for duplicate in duplicates:
+            mapping_refresh_service.cancel_active_mapping_refresh_jobs(
+                db,
+                duplicate.id,
+                reason="映射已被同实体的规范定义替换",
+            )
+            db.delete(duplicate)
+    else:
+        m = DataMapping(scenario_id=scenario_id, **mapping_data)
+        db.add(m)
     db.commit()
     db.refresh(m)
     return _mapping_out(m)
@@ -955,7 +1219,21 @@ def delete_mapping(mapping_id: str, db: Session = Depends(get_db)):
     m = db.get(DataMapping, mapping_id)
     if not m:
         raise HTTPException(404, "映射不存在")
-    _scenario_for_request(db, m.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, m.scenario_id, writable=True)
+    try:
+        release_service.assert_resource_deletion_allowed(
+            db,
+            scenario,
+            kind="mapping",
+            resource_id=m.id,
+        )
+    except release_service.ReleaseValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    mapping_refresh_service.cancel_active_mapping_refresh_jobs(
+        db,
+        m.id,
+        reason="映射已删除",
+    )
     db.delete(m)
     db.commit()
     return Msg(message="已删除")
@@ -967,9 +1245,29 @@ def preview_mapping(mapping_id: str, payload: dict | None = None, db: Session = 
     limit = _mapping_limit(payload, 20, 100)
     try:
         scenario = _scenario_for_request(db, mapping.scenario_id)
-        return ontology_service.preview_mapping(db, scenario, mapping, limit=limit)
+        runtime_mapping, definition = mapping_refresh_service.resolve_mapping_runtime_definition(
+            db,
+            scenario,
+            mapping,
+        )
+        source, _audit = mapping_refresh_service.resolve_mapping_data_source(
+            db,
+            scenario,
+            runtime_mapping,
+            release_id=definition.release_id if definition.is_frozen else None,
+        )
+        return ontology_service.preview_mapping(
+            db,
+            scenario,
+            runtime_mapping,
+            limit=limit,
+            data_source=source,
+        )
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(400, f"映射预览失败: {exc}")
+        raise HTTPException(
+            400,
+            f"映射预览失败: {connector_service.sanitize_message(exc)}",
+        ) from exc
 
 
 @router.post("/mappings/{mapping_id}/test", response_model=DataMappingTestOut)
@@ -977,18 +1275,65 @@ def test_mapping(mapping_id: str, payload: dict | None = None, db: Session = Dep
     mapping = _mapping_for_request(db, mapping_id)
     checked_at = datetime.now(timezone.utc)
     scenario = _scenario_for_request(db, mapping.scenario_id)
+    runtime_mapping: Any | None = None
+    definition = None
     try:
-        preview = ontology_service.preview_mapping(db, scenario, mapping, limit=_mapping_limit(payload, 20, 100))
-        mapping.status = "ready" if preview["ok"] else "error"
-        mapping.last_error = "; ".join(preview.get("errors", []))
-        mapping.last_checked_at = checked_at
-        mapping.last_row_count = int(preview.get("row_count", 0))
+        runtime_mapping, definition = mapping_refresh_service.resolve_mapping_runtime_definition(
+            db,
+            scenario,
+            mapping,
+        )
+        source, _audit = mapping_refresh_service.resolve_mapping_data_source(
+            db,
+            scenario,
+            runtime_mapping,
+            release_id=definition.release_id if definition.is_frozen else None,
+        )
+        preview = ontology_service.preview_mapping(
+            db,
+            scenario,
+            runtime_mapping,
+            limit=_mapping_limit(payload, 20, 100),
+            data_source=source,
+        )
+        status = "ready" if preview["ok"] else "error"
+        if (
+            definition is not None
+            and (
+                not definition.is_frozen
+                or mapping_refresh_service.mapping_matches_snapshot(mapping, runtime_mapping)
+            )
+        ):
+            mapping_refresh_service.set_mapping_runtime_state(
+                mapping,
+                status=status,
+                error="; ".join(preview.get("errors", [])),
+                checked_at=checked_at,
+                rows_scanned=int(preview.get("row_count", 0)),
+            )
         db.commit()
-        return DataMappingTestOut(**preview, status=mapping.status, checked_at=checked_at)
+        return DataMappingTestOut(**preview, status=status, checked_at=checked_at)
     except Exception as exc:  # noqa: BLE001
-        mapping.status = "error"
-        mapping.last_error = str(exc)
-        mapping.last_checked_at = checked_at
+        safe_error = connector_service.sanitize_message(exc)
+        # A frozen staging/prod definition may no longer equal the current dev
+        # mapping.  Do not paint that mutable row with an error from another
+        # deployment's released config.
+        if (
+            definition is not None
+            and (
+                not definition.is_frozen
+                or (
+                    runtime_mapping is not None
+                    and mapping_refresh_service.mapping_matches_snapshot(mapping, runtime_mapping)
+                )
+            )
+        ):
+            mapping_refresh_service.set_mapping_runtime_state(
+                mapping,
+                status="error",
+                error=safe_error,
+                checked_at=checked_at,
+            )
         db.commit()
         ds = mapping.data_source
         ent = mapping.entity
@@ -998,56 +1343,157 @@ def test_mapping(mapping_id: str, payload: dict | None = None, db: Session = Dep
             data_source_name=ds.name if ds else "",
             table_name=mapping.table_name,
             ok=False,
-            message=f"映射测试失败: {exc}",
-            errors=[str(exc)],
+            message=f"映射测试失败: {safe_error}",
+            errors=[safe_error],
             status="error",
             checked_at=checked_at,
         )
 
 
-@router.post("/mappings/{mapping_id}/refresh", response_model=DataMappingRefreshOut)
-def refresh_mapping(mapping_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
+def _enqueue_mapping_refresh(
+    mapping_id: str,
+    payload: dict | None,
+    db: Session,
+) -> DataMappingRefreshJobOut:
+    """Persist refresh intent only; the worker owns all external side effects."""
     mapping = _mapping_for_request(db, mapping_id, writable=True)
-    refreshed_at = datetime.now(timezone.utc)
-    scenario = _scenario_for_request(db, mapping.scenario_id)
-    limit = _mapping_limit(payload, 50, 500)
     try:
-        result = ontology_service.import_instances_from_mapping(db, scenario, mapping, limit=limit)
-        mapping.status = "ok"
-        mapping.last_error = ""
-        mapping.last_checked_at = refreshed_at
-        mapping.last_refreshed_at = refreshed_at
-        mapping.last_row_count = int(result.get("rows_scanned", 0))
-        mapping.last_imported_count = int(result.get("instances_created", 0))
-        db.commit()
-        return DataMappingRefreshOut(
-            mapping_id=mapping.id,
-            ok=True,
-            status=mapping.status,
-            message="映射刷新完成",
-            rows_scanned=int(result.get("rows_scanned", 0)),
-            instances_created=int(result.get("instances_created", 0)),
-            relations_created=int(result.get("relations_created", 0)),
-            last_refreshed_at=refreshed_at,
+        job, _created = mapping_refresh_service.enqueue_mapping_refresh(
+            db,
+            mapping,
+            limit=_mapping_limit(payload, 50, 500),
         )
+        db.commit()
+        db.refresh(job)
+        return _mapping_refresh_job_out(job)
     except Exception as exc:  # noqa: BLE001
-        mapping.status = "error"
-        mapping.last_error = str(exc)
-        mapping.last_checked_at = refreshed_at
-        db.commit()
-        return DataMappingRefreshOut(
-            mapping_id=mapping.id,
-            ok=False,
-            status="error",
-            message=f"映射刷新失败: {exc}",
-            last_error=str(exc),
-        )
+        db.rollback()
+        raise HTTPException(400, f"映射刷新入队失败: {connector_service.sanitize_message(exc)}") from exc
 
 
-@router.post("/mappings/{mapping_id}/import")
+@router.post(
+    "/mappings/{mapping_id}/refresh-jobs",
+    response_model=DataMappingRefreshJobOut,
+    status_code=202,
+)
+def enqueue_mapping_refresh_job(
+    mapping_id: str,
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+):
+    """快速入队受限批次刷新；外部查询与对象写入由可恢复 worker 完成。"""
+    return _enqueue_mapping_refresh(mapping_id, payload, db)
+
+
+@router.get("/mappings/refresh-jobs/{job_id}", response_model=DataMappingRefreshJobOut)
+def get_mapping_refresh_job(
+    job_id: str,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    job = db.get(DataMappingRefreshJob, job_id)
+    if not job or job.tenant_id != tenant_service.current_tenant_id(db):
+        raise HTTPException(404, "映射刷新任务不存在")
+    if job.environment != runtime_connector_service.runtime_environment():
+        # Shared metadata storage must not expose one deployment's task state
+        # through another environment's API surface.
+        raise HTTPException(404, "映射刷新任务不存在")
+    _scenario_for_request(db, job.scenario_id)
+    response.headers["Cache-Control"] = "no-store"
+    return _mapping_refresh_job_out(job)
+
+
+@router.post(
+    "/mappings/{mapping_id}/refresh",
+    response_model=DataMappingRefreshJobOut,
+    status_code=202,
+)
+def refresh_mapping(mapping_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
+    """旧刷新入口的异步兼容别名，不在 HTTP 请求中访问外部数据源。"""
+    return _enqueue_mapping_refresh(mapping_id, payload, db)
+
+
+@router.post(
+    "/mappings/{mapping_id}/import",
+    response_model=DataMappingRefreshJobOut,
+    status_code=202,
+)
 def import_mapping(mapping_id: str, payload: dict | None = None, db: Session = Depends(get_db)):
-    """兼容旧客户端：旧的“导入实例”接口复用新的刷新状态闭环。"""
-    return refresh_mapping(mapping_id, payload, db).model_dump()
+    """旧导入入口的异步兼容别名，不在 HTTP 请求中写入对象。"""
+    return _enqueue_mapping_refresh(mapping_id, payload, db)
+
+
+# ── 受治理函数（声明式契约，不执行代码）────────────────────────
+@router.get("/{scenario_id}/functions", response_model=list[FunctionDefinitionOut])
+def list_function_definitions(scenario_id: str, db: Session = Depends(get_db)):
+    _scenario_for_request(db, scenario_id)
+    return [
+        _function_out(function)
+        for function in db.execute(
+            select(FunctionDefinition)
+            .where(FunctionDefinition.scenario_id == scenario_id)
+            .order_by(FunctionDefinition.name.asc(), FunctionDefinition.id.asc())
+        ).scalars().all()
+    ]
+
+
+@router.post("/{scenario_id}/functions", response_model=FunctionDefinitionOut)
+def create_function_definition(
+    scenario_id: str,
+    payload: FunctionDefinitionIn,
+    db: Session = Depends(get_db),
+):
+    _scenario_for_request(db, scenario_id, writable=True)
+    try:
+        declaration = function_definition_service.normalize_definition(payload.model_dump())
+    except function_definition_service.FunctionDefinitionError as exc:
+        raise HTTPException(400, f"函数定义无效: {exc}") from exc
+    function = FunctionDefinition(scenario_id=scenario_id, **declaration)
+    db.add(function)
+    db.commit()
+    db.refresh(function)
+    return _function_out(function)
+
+
+@router.put("/functions/{function_id}", response_model=FunctionDefinitionOut)
+def update_function_definition(
+    function_id: str,
+    payload: FunctionDefinitionIn,
+    db: Session = Depends(get_db),
+):
+    function = db.get(FunctionDefinition, function_id)
+    if not function:
+        raise HTTPException(404, "函数定义不存在")
+    _scenario_for_request(db, function.scenario_id, writable=True)
+    try:
+        declaration = function_definition_service.normalize_definition(payload.model_dump())
+    except function_definition_service.FunctionDefinitionError as exc:
+        raise HTTPException(400, f"函数定义无效: {exc}") from exc
+    for key, value in declaration.items():
+        setattr(function, key, value)
+    db.commit()
+    db.refresh(function)
+    return _function_out(function)
+
+
+@router.delete("/functions/{function_id}", response_model=Msg)
+def delete_function_definition(function_id: str, db: Session = Depends(get_db)):
+    function = db.get(FunctionDefinition, function_id)
+    if not function:
+        raise HTTPException(404, "函数定义不存在")
+    scenario = _scenario_for_request(db, function.scenario_id, writable=True)
+    try:
+        release_service.assert_resource_deletion_allowed(
+            db,
+            scenario,
+            kind="function",
+            resource_id=function.id,
+        )
+    except release_service.ReleaseValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    db.delete(function)
+    db.commit()
+    return Msg(message="已删除")
 
 
 # ── 操作（Actions）────────────────────────────
@@ -1085,7 +1531,16 @@ def delete_action(action_id: str, db: Session = Depends(get_db)):
     a = db.get(OntologyAction, action_id)
     if not a:
         raise HTTPException(404, "操作不存在")
-    _scenario_for_request(db, a.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, a.scenario_id, writable=True)
+    try:
+        release_service.assert_resource_deletion_allowed(
+            db,
+            scenario,
+            kind="action",
+            resource_id=a.id,
+        )
+    except release_service.ReleaseValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
     db.delete(a)
     db.commit()
     return Msg(message="已删除")
@@ -1093,11 +1548,22 @@ def delete_action(action_id: str, db: Session = Depends(get_db)):
 
 @router.post("/actions/{action_id}/execute")
 def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = Depends(get_db)):
-    a = db.get(OntologyAction, action_id)
-    if not a:
+    live_action = db.get(OntologyAction, action_id)
+    if not live_action:
         raise HTTPException(404, "操作不存在")
     # 执行属于写入边界：公共场景可以查看/预演，但只有场景所属租户可确认执行。
-    _scenario_for_request(db, a.scenario_id, writable=not payload.dry_run)
+    scenario = _scenario_for_request(
+        db, live_action.scenario_id, writable=not payload.dry_run
+    )
+    try:
+        definition = runtime_definition_service.resolve_active(
+            db,
+            scenario,
+            environment=runtime_connector_service.runtime_environment(),
+        )
+        a = runtime_definition_service.resolve_resource(definition, "action", action_id)
+    except runtime_definition_service.RuntimeDefinitionError as exc:
+        raise HTTPException(409, f"当前部署定义不可执行该操作: {exc}") from exc
     permission_service.require_action_permission(
         db,
         a,
@@ -1111,6 +1577,8 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
             confirm=payload.confirm,
             dry_run=payload.dry_run,
             idempotency_key=payload.idempotency_key,
+            runtime_environment=definition.environment,
+            runtime_definition=definition,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"执行失败: {exc}")
@@ -1151,7 +1619,16 @@ def delete_rule(rule_id: str, db: Session = Depends(get_db)):
     r = db.get(OntologyRule, rule_id)
     if not r:
         raise HTTPException(404, "规则不存在")
-    _scenario_for_request(db, r.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, r.scenario_id, writable=True)
+    try:
+        release_service.assert_resource_deletion_allowed(
+            db,
+            scenario,
+            kind="rule",
+            resource_id=r.id,
+        )
+    except release_service.ReleaseValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
     db.delete(r)
     db.commit()
     return Msg(message="已删除")
@@ -1197,7 +1674,16 @@ def delete_event(event_id: str, db: Session = Depends(get_db)):
     e = db.get(OntologyEvent, event_id)
     if not e:
         raise HTTPException(404, "事件不存在")
-    _scenario_for_request(db, e.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, e.scenario_id, writable=True)
+    try:
+        release_service.assert_resource_deletion_allowed(
+            db,
+            scenario,
+            kind="event",
+            resource_id=e.id,
+        )
+    except release_service.ReleaseValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
     db.delete(e)
     db.commit()
     return Msg(message="已删除")
@@ -1206,11 +1692,17 @@ def delete_event(event_id: str, db: Session = Depends(get_db)):
 @router.post("/events/{event_id}/publish", response_model=EventEnvelopeOut)
 def publish_event(event_id: str, payload: EventPublishIn, db: Session = Depends(get_db)):
     """发布持久化业务事件，并把订阅该事件的启用工作流异步入队。"""
-    event = db.get(OntologyEvent, event_id)
-    if not event:
+    live_event = db.get(OntologyEvent, event_id)
+    if not live_event:
         raise HTTPException(404, "事件不存在")
-    _scenario_for_request(db, event.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, live_event.scenario_id, writable=True)
     try:
+        definition = runtime_definition_service.resolve_active(
+            db,
+            scenario,
+            environment=runtime_connector_service.runtime_environment(),
+        )
+        event = runtime_definition_service.resolve_resource(definition, "event", event_id)
         envelope, queued_runs = operations_service.publish_event(
             db,
             event,
@@ -1218,6 +1710,7 @@ def publish_event(event_id: str, payload: EventPublishIn, db: Session = Depends(
             source="manual",
             dedupe_key=payload.dedupe_key,
             created_by_user_id=str(db.info.get("user_id") or "") or None,
+            runtime_definition=definition,
         )
         db.commit()
         db.refresh(envelope)
@@ -1229,6 +1722,11 @@ def publish_event(event_id: str, payload: EventPublishIn, db: Session = Depends(
             payload=envelope.payload or {},
             source=envelope.source,
             source_run_id=envelope.source_run_id,
+            environment=envelope.environment or "dev",
+            definition_snapshot_id=envelope.definition_snapshot_id,
+            release_id=envelope.release_id,
+            definition_hash=envelope.definition_hash or "",
+            definition_source=envelope.definition_source or "live",
             created_at=envelope.created_at,
             queued_workflow_run_ids=[run.id for run in queued_runs],
         )
@@ -1243,7 +1741,14 @@ def create_workflow(scenario_id: str, payload: WorkflowIn, db: Session = Depends
     s = _scenario_for_request(db, scenario_id, writable=True)
     _require_restricted_scope_management(db, payload.access_scope)
     _validate_workflow_refs(db, scenario_id, payload.steps, payload.nodes)
-    _validate_workflow_trigger(db, scenario_id, payload.trigger_type, payload.trigger_config)
+    _validate_workflow_trigger(
+        db,
+        scenario_id,
+        payload.trigger_type,
+        payload.trigger_config,
+        steps=payload.steps,
+        nodes=payload.nodes,
+    )
     if payload.nodes:
         try:
             workflow_service.validate_workflow_definition(payload.nodes, payload.edges)
@@ -1262,9 +1767,21 @@ def update_workflow(workflow_id: str, payload: WorkflowIn, db: Session = Depends
     if not w:
         raise HTTPException(404, "工作流不存在")
     _scenario_for_request(db, w.scenario_id, writable=True)
+    try:
+        operations_service.assert_workflow_mutable(db, w.id)
+    except PolicyViolation as exc:
+        raise HTTPException(409, str(exc)) from exc
     _require_restricted_scope_management(db, payload.access_scope)
     _validate_workflow_refs(db, w.scenario_id, payload.steps, payload.nodes)
-    _validate_workflow_trigger(db, w.scenario_id, payload.trigger_type, payload.trigger_config)
+    _validate_workflow_trigger(
+        db,
+        w.scenario_id,
+        payload.trigger_type,
+        payload.trigger_config,
+        steps=payload.steps,
+        nodes=payload.nodes,
+        workflow_id=w.id,
+    )
     if payload.nodes:
         try:
             workflow_service.validate_workflow_definition(payload.nodes, payload.edges)
@@ -1282,7 +1799,20 @@ def delete_workflow(workflow_id: str, db: Session = Depends(get_db)):
     w = db.get(OntologyWorkflow, workflow_id)
     if not w:
         raise HTTPException(404, "工作流不存在")
-    _scenario_for_request(db, w.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, w.scenario_id, writable=True)
+    try:
+        release_service.assert_resource_deletion_allowed(
+            db,
+            scenario,
+            kind="workflow",
+            resource_id=w.id,
+        )
+    except release_service.ReleaseValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    try:
+        operations_service.assert_workflow_mutable(db, w.id)
+    except PolicyViolation as exc:
+        raise HTTPException(409, str(exc)) from exc
     db.delete(w)
     db.commit()
     return Msg(message="已删除")
@@ -1295,10 +1825,21 @@ def create_workflow_run(
     db: Session = Depends(get_db),
 ):
     """P1 异步入口：只提交任务，不在 HTTP 请求中等待工作流完成。"""
-    workflow = db.get(OntologyWorkflow, workflow_id)
-    if not workflow:
+    live_workflow = db.get(OntologyWorkflow, workflow_id)
+    if not live_workflow:
         raise HTTPException(404, "工作流不存在")
-    _scenario_for_request(db, workflow.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, live_workflow.scenario_id, writable=True)
+    try:
+        definition = runtime_definition_service.resolve_active(
+            db,
+            scenario,
+            environment=runtime_connector_service.runtime_environment(),
+        )
+        workflow = runtime_definition_service.resolve_resource(
+            definition, "workflow", workflow_id
+        )
+    except runtime_definition_service.RuntimeDefinitionError as exc:
+        raise HTTPException(409, f"当前部署定义不可执行该工作流: {exc}") from exc
     permission_service.require_workflow_permission(db, workflow, "execute")
     try:
         run, _ = operations_service.enqueue_workflow_run(
@@ -1307,6 +1848,7 @@ def create_workflow_run(
             payload.params,
             trigger_source="manual",
             created_by_user_id=str(db.info.get("user_id") or "") or None,
+            runtime_definition=definition,
         )
         db.commit()
         db.refresh(run)
@@ -1316,19 +1858,23 @@ def create_workflow_run(
         raise HTTPException(409, f"提交任务失败: {exc}") from exc
 
 
-@router.post("/workflows/{workflow_id}/execute")
+@router.post(
+    "/workflows/{workflow_id}/execute",
+    response_model=WorkflowRunOut,
+    status_code=202,
+)
 def execute_workflow(workflow_id: str, payload: WorkflowExecuteRequest, db: Session = Depends(get_db)):
-    w = db.get(OntologyWorkflow, workflow_id)
-    if not w:
-        raise HTTPException(404, "工作流不存在")
-    _scenario_for_request(db, w.scenario_id, writable=True)
-    permission_service.require_workflow_permission(db, w, "execute")
-    if (w.status or ("active" if w.enabled else "disabled")) != "active" or not w.enabled:
-        raise HTTPException(409, "工作流当前未启用，请先将状态设为 active")
-    try:
-        return workflow_service.execute_workflow(db, w, payload.params)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(400, f"执行失败: {exc}")
+    """兼容旧客户端的异步执行别名。
+
+    P1 之后所有工作流都必须先持久化为 ``WorkflowRun``，才能由任务中心承接
+    审批、重试和恢复。保留旧 URL 以避免客户端立即失效，但它不再在 HTTP 请求中
+    同步执行任何节点。
+    """
+    return create_workflow_run(
+        workflow_id,
+        WorkflowRunCreateRequest(params=payload.params),
+        db,
+    )
 
 
 @router.post("/{scenario_id}/workflows/generate")
@@ -1342,12 +1888,44 @@ def generate_workflow(scenario_id: str, payload: WorkflowGenerateRequest, db: Se
 
 
 # ── 执行日志 ──────────────────────────────────
+def _can_read_execution_log(db: Session, log: ActionExecutionLog) -> bool:
+    """Execution logs inherit the target Action/workflow's current read ACL.
+
+    Logs contain parameters and external-result summaries.  A scenario-level read
+    grant must never become a fallback path when the underlying target is denied,
+    deleted, or an old unsupported target type.
+    """
+    if log.target_type == "action":
+        action = db.get(OntologyAction, log.target_id)
+        return bool(
+            action
+            and action.scenario_id == log.scenario_id
+            and permission_service.check_action(db, action, "read").allowed
+        )
+    if log.target_type == "workflow":
+        workflow = db.get(OntologyWorkflow, log.target_id)
+        return bool(
+            workflow
+            and workflow.scenario_id == log.scenario_id
+            and permission_service.check_workflow(db, workflow, "read").allowed
+        )
+    return False
+
+
 @router.get("/{scenario_id}/execution-logs", response_model=list[ActionExecutionLogOut])
-def list_execution_logs(scenario_id: str, limit: int = 50, db: Session = Depends(get_db)):
+def list_execution_logs(
+    scenario_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
     _scenario_for_request(db, scenario_id)
     logs = db.execute(
         select(ActionExecutionLog)
-        .where(ActionExecutionLog.scenario_id == scenario_id)
+        .where(
+            ActionExecutionLog.scenario_id == scenario_id,
+            ActionExecutionLog.environment
+            == runtime_connector_service.runtime_environment(),
+        )
         .order_by(ActionExecutionLog.created_at.desc())
         .limit(limit)
     ).scalars().all()
@@ -1362,10 +1940,17 @@ def list_execution_logs(scenario_id: str, limit: int = 50, db: Session = Depends
             status=l.status,
             mode=l.mode or "execute",
             idempotency_key=l.idempotency_key,
+            environment=l.environment or "dev",
+            definition_snapshot_id=l.definition_snapshot_id,
+            release_id=l.release_id,
+            definition_hash=l.definition_hash or "",
+            definition_source=l.definition_source or "live",
             result=l.result or {},
+            connector_audit=l.connector_audit or [],
             error=l.error,
             duration_ms=l.duration_ms,
             created_at=l.created_at,
         )
         for l in logs
+        if _can_read_execution_log(db, l)
     ]

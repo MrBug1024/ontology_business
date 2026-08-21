@@ -153,7 +153,10 @@ def remove_member(member_id: str, db: Session = Depends(get_db)):
             raise HTTPException(status_code=403, detail="只有所有者可以移除所有者")
         if permission_service.owner_count(db, organization.id) <= 1:
             raise HTTPException(status_code=409, detail="组织至少需要保留一位所有者")
-    db.delete(member)
+    # Preserve a removal tombstone instead of deleting the row.  Organization
+    # bootstrap/login compatibility must never mistake a deliberately removed
+    # same-tenant User for a legacy user and recreate it as an administrator.
+    member.status = "removed"
     db.commit()
     return Msg(message="成员已移除")
 

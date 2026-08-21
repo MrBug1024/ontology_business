@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import patch
 
@@ -16,7 +17,9 @@ from app.models import (
     DocumentChunk,
     DocumentIndexJob,
     LLMConfig,
+    MCPConfig,
     Message,
+    Skill,
     Tenant,
 )
 from app.services.agent_engine import AgentContext, run_agent
@@ -165,8 +168,19 @@ class RagRuntimeTests(unittest.TestCase):
         self.assertEqual([item.id for item in processed], [job.id])
         stored = self.db.get(DocumentIndexJob, job.id)
         self.assertEqual(stored.status, "succeeded")
+        self.assertIsNone(stored.active_key)
         self.assertEqual(self.private_file.index_status, "indexed")
         self.assertTrue(rag_service.search(self.db, [self.private_source.id], "费用审批"))
+
+        # 终态必须释放活跃键，之后的显式重建才可以正常入队。
+        rebuilt, created = rag_service.enqueue_document_index(
+            self.db,
+            self.private_file,
+            parse_document=False,
+            force=True,
+        )
+        self.assertTrue(created)
+        self.assertNotEqual(rebuilt.id, job.id)
 
     def test_document_index_job_records_terminal_parse_failure(self) -> None:
         job, _ = rag_service.enqueue_document_index(
@@ -225,7 +239,35 @@ class RagRuntimeTests(unittest.TestCase):
         tool_names = {item["function"]["name"] for item in context.build_tools()}
         self.assertIn("search_documents", tool_names)
         self.assertNotIn("save_deliverable", tool_names)
-        self.assertIn("只读公开资源", context._save_deliverable("result.md", "不应写入"))
+        self.assertIn(
+            "不直接执行",
+            context.execute_tool("save_deliverable", {"filename": "result.md", "content": "不应写入"}),
+        )
+
+    def test_agent_never_exposes_or_executes_direct_skill_or_mcp_side_effects(self) -> None:
+        skill = Skill(id="skill-direct", tenant_id=self.tenant_a.id, name="危险技能", path="/tmp/skill")
+        mcp = MCPConfig(id="mcp-direct", tenant_id=self.tenant_a.id, name="危险MCP", enabled=True)
+        self.db.add_all([skill, mcp])
+        self.db.commit()
+        agent = Agent(
+            tenant_id=self.tenant_a.id,
+            name="受控执行助手",
+            skill_ids=[skill.id],
+            mcp_ids=[mcp.id],
+        )
+        context = AgentContext(self.db, agent, LLMConfig(name="测试模型"))
+        tool_names = {item["function"]["name"] for item in context.build_tools()}
+        self.assertNotIn("execute_skill", tool_names)
+        self.assertFalse(any(name.startswith("mcp_") for name in tool_names))
+        with patch("app.services.agent_engine.skill_service.execute_skill") as execute_skill, patch(
+            "app.services.agent_engine.mcp_service.call_tool"
+        ) as call_mcp:
+            skill_result = context.execute_tool("execute_skill", {"skill_name": skill.name, "args": []})
+            mcp_result = context.execute_tool("mcp_危险MCP_写入", {})
+        self.assertIn("不直接执行", skill_result)
+        self.assertIn("不直接执行", mcp_result)
+        execute_skill.assert_not_called()
+        call_mcp.assert_not_called()
 
     def test_agent_search_emits_and_persists_stable_visible_citations(self) -> None:
         rag_service.index_file(self.db, self.private_file)
@@ -300,6 +342,48 @@ class RagRuntimeTests(unittest.TestCase):
         self.assertIsNotNone(restored)
         self.assertEqual(restored.citations, citations)
         self.assertEqual(MessageOut.model_validate(restored).citations, citations)
+
+    def test_read_document_emits_a_file_versioned_citation(self) -> None:
+        rag_service.index_file(self.db, self.private_file)
+        self.db.commit()
+        agent = Agent(
+            id="agent-read-document",
+            tenant_id=self.tenant_a.id,
+            name="资料阅读助手",
+            data_source_ids=[self.private_source.id],
+        )
+        context = AgentContext(self.db, agent, LLMConfig(name="测试模型"))
+        payload = json.loads(context.execute_tool("read_document", {"file_id": self.private_file.id}))
+        citation = payload["citation"]
+        self.assertEqual(citation["file_id"], self.private_file.id)
+        self.assertTrue(citation["citation_id"])
+        self.assertEqual(citation["file_content_hash"], self.private_file.indexed_content_hash)
+        self.assertIn("费用控制", payload["content"])
+        self.assertEqual(context.citation_snapshot()[0]["citation_id"], citation["citation_id"])
+
+    def test_index_uses_configured_embedding_runtime_when_available(self) -> None:
+        runtime_config = LLMConfig(
+            id="embedding-runtime",
+            tenant_id=self.tenant_a.id,
+            name="专用向量模型",
+            model="embed-v1",
+            capabilities=["embedding"],
+            enabled=True,
+        )
+        self.db.add(runtime_config)
+        self.db.commit()
+        with patch(
+            "app.services.rag_service.llm_service.embed",
+            return_value=[[0.25, 0.75]],
+        ) as runtime_embed:
+            result = rag_service.index_file(self.db, self.private_file)
+        self.assertTrue(result["indexed"])
+        runtime_embed.assert_called_once()
+        chunk = self.db.scalars(
+            select(DocumentChunk).where(DocumentChunk.bucket_file_id == self.private_file.id)
+        ).one()
+        self.assertEqual(chunk.embedding, [0.25, 0.75])
+        self.assertEqual(chunk.embedding_model, "llm:embedding-runtime")
 
     def test_reindex_reuses_unchanged_content_and_handles_public_sources(self) -> None:
         self.db.info["tenant_id"] = self.tenant_b.id

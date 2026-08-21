@@ -1,0 +1,270 @@
+{
+  "format": "ontology-resource-package",
+  "version": "1.0",
+  "manifest": {
+    "name": "财税核算 Starter Kit",
+    "description": "用于会计科目、凭证、凭证明细和核算期间建模的声明性本体起点。",
+    "industry": "bookkeeping",
+    "starter_kit_id": "bookkeeping",
+    "kit_version": "1.0.0",
+    "resource_counts": {
+      "entities": 4,
+      "properties": 10,
+      "relations": 3,
+      "mappings": 0,
+      "functions": 0,
+      "actions": 0,
+      "rules": 1,
+      "events": 1,
+      "workflows": 1
+    },
+    "fingerprint": "sha256:12eae96d2a59e47223db5fe3d8024d15b99d1b876c1a6a4d6df81e41c17ecbee"
+  },
+  "resources": {
+    "entities": [
+      {
+        "key": "entity/account-subject",
+        "name": "会计科目",
+        "description": "用于归集会计核算口径的科目定义。",
+        "icon": "book",
+        "color": "#0369a1",
+        "is_abstract": false
+      },
+      {
+        "key": "entity/accounting-period",
+        "name": "核算期间",
+        "description": "财务核算和结账所使用的期间。",
+        "icon": "calendar",
+        "color": "#0f766e",
+        "is_abstract": false
+      },
+      {
+        "key": "entity/voucher",
+        "name": "会计凭证",
+        "description": "承载会计分录的业务凭证。",
+        "icon": "receipt",
+        "color": "#7c3aed",
+        "is_abstract": false
+      },
+      {
+        "key": "entity/voucher-line",
+        "name": "凭证明细",
+        "description": "凭证中一条借方或贷方分录。",
+        "icon": "list",
+        "color": "#9333ea",
+        "is_abstract": false
+      }
+    ],
+    "properties": [
+      {
+        "key": "property/entity/account-subject/subject-code",
+        "entity_ref": "entity/account-subject",
+        "name": "科目编码",
+        "data_type": "string",
+        "description": "会计科目的业务唯一编码。",
+        "is_key": true,
+        "is_required": true,
+        "is_enum": false,
+        "enum_values": [],
+        "default_value": "",
+        "is_sensitive": false
+      },
+      {
+        "key": "property/entity/account-subject/subject-name",
+        "entity_ref": "entity/account-subject",
+        "name": "科目名称",
+        "data_type": "string",
+        "description": "会计科目的展示名称。",
+        "is_key": false,
+        "is_required": true,
+        "is_enum": false,
+        "enum_values": [],
+        "default_value": "",
+        "is_sensitive": false
+      },
+      {
+        "key": "property/entity/accounting-period/period-code",
+        "entity_ref": "entity/accounting-period",
+        "name": "期间编码",
+        "data_type": "string",
+        "description": "核算期间的业务唯一编码。",
+        "is_key": true,
+        "is_required": true,
+        "is_enum": false,
+        "enum_values": [],
+        "default_value": "",
+        "is_sensitive": false
+      },
+      {
+        "key": "property/entity/accounting-period/period-status",
+        "entity_ref": "entity/accounting-period",
+        "name": "期间状态",
+        "data_type": "string",
+        "description": "期间的开放或关闭状态。",
+        "is_key": false,
+        "is_required": true,
+        "is_enum": true,
+        "enum_values": ["开放", "关闭"],
+        "default_value": "开放",
+        "is_sensitive": false
+      },
+      {
+        "key": "property/entity/voucher-line/credit-amount",
+        "entity_ref": "entity/voucher-line",
+        "name": "贷方金额",
+        "data_type": "number",
+        "description": "凭证明细的贷方金额。",
+        "is_key": false,
+        "is_required": true,
+        "is_enum": false,
+        "enum_values": [],
+        "default_value": "0",
+        "is_sensitive": false
+      },
+      {
+        "key": "property/entity/voucher-line/debit-amount",
+        "entity_ref": "entity/voucher-line",
+        "name": "借方金额",
+        "data_type": "number",
+        "description": "凭证明细的借方金额。",
+        "is_key": false,
+        "is_required": true,
+        "is_enum": false,
+        "enum_values": [],
+        "default_value": "0",
+        "is_sensitive": false
+      },
+      {
+        "key": "property/entity/voucher-line/line-code",
+        "entity_ref": "entity/voucher-line",
+        "name": "分录编码",
+        "data_type": "string",
+        "description": "凭证明细的业务唯一编码。",
+        "is_key": true,
+        "is_required": true,
+        "is_enum": false,
+        "enum_values": [],
+        "default_value": "",
+        "is_sensitive": false
+      },
+      {
+        "key": "property/entity/voucher-line/summary",
+        "entity_ref": "entity/voucher-line",
+        "name": "摘要",
+        "data_type": "string",
+        "description": "会计分录的业务摘要。",
+        "is_key": false,
+        "is_required": false,
+        "is_enum": false,
+        "enum_values": [],
+        "default_value": "",
+        "is_sensitive": false
+      },
+      {
+        "key": "property/entity/voucher/voucher-code",
+        "entity_ref": "entity/voucher",
+        "name": "凭证编码",
+        "data_type": "string",
+        "description": "会计凭证的业务唯一编码。",
+        "is_key": true,
+        "is_required": true,
+        "is_enum": false,
+        "enum_values": [],
+        "default_value": "",
+        "is_sensitive": false
+      },
+      {
+        "key": "property/entity/voucher/voucher-date",
+        "entity_ref": "entity/voucher",
+        "name": "凭证日期",
+        "data_type": "date",
+        "description": "凭证记账所属日期。",
+        "is_key": false,
+        "is_required": true,
+        "is_enum": false,
+        "enum_values": [],
+        "default_value": "",
+        "is_sensitive": false
+      }
+    ],
+    "relations": [
+      {
+        "key": "relation/accounting-period-contains-voucher",
+        "name": "期间包含凭证",
+        "source_entity_ref": "entity/accounting-period",
+        "target_entity_ref": "entity/voucher",
+        "relation_type": "1:N",
+        "description": "一个核算期间可以归集多张凭证。"
+      },
+      {
+        "key": "relation/voucher-contains-voucher-line",
+        "name": "凭证包含分录",
+        "source_entity_ref": "entity/voucher",
+        "target_entity_ref": "entity/voucher-line",
+        "relation_type": "1:N",
+        "description": "一张凭证由多条凭证明细组成。"
+      },
+      {
+        "key": "relation/voucher-line-posts-to-account-subject",
+        "name": "分录过账科目",
+        "source_entity_ref": "entity/voucher-line",
+        "target_entity_ref": "entity/account-subject",
+        "relation_type": "N:1",
+        "description": "每条凭证明细归集到一个会计科目。"
+      }
+    ],
+    "mappings": [],
+    "functions": [],
+    "actions": [],
+    "rules": [
+      {
+        "key": "rule/voucher-balance-check",
+        "entity_ref": "entity/voucher",
+        "name": "凭证借贷平衡检查",
+        "description": "用于声明凭证入账前应满足借贷平衡的核算规则。",
+        "condition": {
+          "field": "借贷差额",
+          "op": "=",
+          "value": 0
+        },
+        "action_on_match": "允许进入人工复核或后续结账流程。",
+        "trigger_action_refs": [],
+        "severity": "critical",
+        "enabled": true
+      }
+    ],
+    "events": [
+      {
+        "key": "event/voucher-posted",
+        "name": "凭证已过账",
+        "description": "凭证通过受治理过账流程后发布的领域事件定义。",
+        "payload_schema": {
+          "type": "object",
+          "properties": {
+            "voucher_code": {
+              "type": "string"
+            }
+          },
+          "required": ["voucher_code"]
+        },
+        "trigger_source": "由受治理的凭证过账流程发布。",
+        "enabled": true
+      }
+    ],
+    "workflows": [
+      {
+        "key": "workflow/voucher-review",
+        "name": "凭证复核流程",
+        "description": "供租户在绑定执行能力前完善的人工凭证复核流程定义。",
+        "trigger_type": "manual",
+        "trigger_config": {},
+        "steps": [],
+        "nodes": [],
+        "edges": [],
+        "status": "draft",
+        "enabled": false,
+        "access_scope": "tenant"
+      }
+    ]
+  }
+}

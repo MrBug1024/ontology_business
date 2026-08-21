@@ -54,6 +54,9 @@ class UserOut(BaseModel):
     display_name: str = ""
     tenant_id: str
     email_verified: bool = True
+    # UI hint only. Every management endpoint remains responsible for enforcing
+    # its own server-side permission check.
+    can_manage: bool = False
 
 
 class OrganizationOut(BaseModel):
@@ -130,6 +133,246 @@ class PermissionResourceOut(BaseModel):
     entity_id: str | None = None
     is_sensitive: bool = False
     access_scope: str = "tenant"
+
+
+# ──────────────────────────────────────────────
+# P2 本体发布治理
+# ──────────────────────────────────────────────
+class ReleaseBranchCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=4_000)
+
+
+class ReleaseBranchOut(BaseModel):
+    id: str
+    tenant_id: str
+    scenario_id: str
+    name: str
+    description: str = ""
+    status: str
+    base_snapshot_id: str | None = None
+    head_snapshot_id: str | None = None
+    created_by_user_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ReleaseSnapshotOut(BaseModel):
+    id: str
+    tenant_id: str
+    scenario_id: str
+    branch_id: str | None = None
+    parent_snapshot_id: str | None = None
+    kind: str
+    content_hash: str
+    # 已由服务层递归去敏；不会包含 executor/MCP/DataSource 的真实凭据。
+    content: dict = Field(default_factory=dict)
+    created_by_user_id: str | None = None
+    created_at: datetime
+
+
+class ReleaseProposalCreateIn(BaseModel):
+    title: str = Field(min_length=1, max_length=240)
+    description: str = Field(default="", max_length=8_000)
+    # 完整目标本体定义；每个新增/引用对象需提供稳定 id，服务端再做引用校验和去敏。
+    content: dict = Field(default_factory=dict)
+    submit: bool = True
+
+
+class ReleaseReviewCreateIn(BaseModel):
+    decision: Literal["approve", "reject"]
+    comment: str = Field(default="", max_length=8_000)
+
+
+class ReleaseReviewOut(BaseModel):
+    id: str
+    proposal_id: str
+    reviewer_user_id: str | None = None
+    decision: str
+    comment: str = ""
+    created_at: datetime
+
+
+class ReleaseProposalOut(BaseModel):
+    id: str
+    tenant_id: str
+    scenario_id: str
+    branch_id: str
+    base_snapshot_id: str
+    proposed_snapshot_id: str
+    pre_merge_snapshot_id: str | None = None
+    merged_snapshot_id: str | None = None
+    title: str
+    description: str = ""
+    status: str
+    created_by_user_id: str | None = None
+    submitted_at: datetime | None = None
+    merged_at: datetime | None = None
+    merged_by_user_id: str | None = None
+    # 仅用于评审展示的安全快照内容。
+    content: dict = Field(default_factory=dict)
+    reviews: list[ReleaseReviewOut] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReleaseConfirmIn(BaseModel):
+    # 不接受 false 或省略：merge/rollback/publish 均必须由调用方明确确认。
+    confirmed: bool
+    note: str = Field(default="", max_length=8_000)
+
+    @field_validator("confirmed", mode="before")
+    @classmethod
+    def require_literal_true(cls, value: object) -> bool:
+        # ``Literal[True]`` 在部分 Pydantic 版本中会把 JSON 数字 1 判为 True；
+        # 发布确认必须是客户端明确发送的 JSON boolean true。
+        if value is not True:
+            raise ValueError("confirmed 必须显式为 true")
+        return True
+
+
+class ReleasePublishIn(ReleaseConfirmIn):
+    environment: Literal["dev", "staging", "prod"]
+    branch_id: str | None = Field(default=None, min_length=1, max_length=32)
+    proposal_id: str | None = Field(default=None, min_length=1, max_length=32)
+    snapshot_id: str | None = Field(default=None, min_length=1, max_length=32)
+    notes: str = Field(default="", max_length=8_000)
+
+
+class ReleaseRecordOut(BaseModel):
+    id: str
+    tenant_id: str
+    scenario_id: str
+    branch_id: str
+    snapshot_id: str
+    proposal_id: str | None = None
+    environment: str
+    status: str
+    notes: str = ""
+    connector_audit: list[dict] = Field(default_factory=list)
+    created_by_user_id: str | None = None
+    created_at: datetime
+
+
+class ReleaseRollbackIn(ReleaseConfirmIn):
+    target_snapshot_id: str = Field(min_length=1, max_length=32)
+    branch_id: str | None = Field(default=None, min_length=1, max_length=32)
+    environment: Literal["dev", "staging", "prod"] | None = None
+    reason: str = Field(default="", max_length=8_000)
+
+
+class ReleaseRollbackOut(BaseModel):
+    id: str
+    tenant_id: str
+    scenario_id: str
+    branch_id: str
+    from_snapshot_id: str
+    target_snapshot_id: str
+    result_snapshot_id: str
+    environment: str | None = None
+    reason: str = ""
+    connector_audit: list[dict] = Field(default_factory=list)
+    created_by_user_id: str | None = None
+    created_at: datetime
+
+
+class ConnectorCatalogOut(BaseModel):
+    """Credential-free normalized view of a DataSource, MCP or LLM config."""
+
+    id: str
+    name: str
+    kind: Literal["data_source", "mcp", "llm"]
+    adapter_type: str = ""
+    scenario_id: str | None = None
+    enabled: bool = True
+    secret_state: Literal["configured", "missing", "not_required"] = "not_required"
+    health: Literal["unknown", "healthy", "unhealthy"] = "unknown"
+    checked_at: datetime | None = None
+    message: str = ""
+    capabilities: list[str] = Field(default_factory=list)
+
+
+class ConnectorBindingIn(BaseModel):
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    binding_key: str = Field(min_length=1, max_length=180)
+    kind: Literal["data_source", "mcp", "llm"]
+    connector_id: str = Field(min_length=1, max_length=32)
+    reference_label: str = Field(default="", max_length=300)
+    # A health check can start a local process, hit a remote MCP or incur model
+    # usage; callers must request it explicitly rather than binding implicitly.
+    check: bool = False
+
+
+class ConnectorBindingOut(ConnectorCatalogOut):
+    binding_id: str
+    binding_key: str
+    reference_label: str = ""
+    environment: Literal["dev", "staging", "prod"]
+    ready: bool = False
+    blocking_reason: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConnectorReadinessOut(BaseModel):
+    ready: bool
+    environment: Literal["dev", "staging", "prod"]
+    reasons: list[str] = Field(default_factory=list)
+    audit: list[dict] = Field(default_factory=list)
+
+
+class PackageImportProposalIn(BaseModel):
+    """An already-uploaded portable package becomes a proposal, never a live apply."""
+
+    package: dict = Field(default_factory=dict)
+    branch_id: str = Field(min_length=1, max_length=32)
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    title: str = Field(min_length=1, max_length=240)
+    description: str = Field(default="", max_length=7_000)
+    submit: bool = True
+
+
+class PackageImportProposalOut(BaseModel):
+    id: str
+    branch_id: str
+    base_snapshot_id: str
+    proposed_snapshot_id: str
+    status: str
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    package_fingerprint: str
+    summary: dict[str, int] = Field(default_factory=dict)
+
+
+class StarterKitOut(BaseModel):
+    """Safe catalog metadata for a repository-owned governed Starter Kit."""
+
+    id: str
+    name: str
+    industry: str
+    version: str
+    description: str = ""
+    fingerprint: str
+    resource_counts: dict[str, int] = Field(default_factory=dict)
+
+
+class StarterKitImportProposalIn(BaseModel):
+    """Create a proposal from a fixed server-side Starter Kit, never a live apply."""
+
+    branch_id: str = Field(min_length=1, max_length=32)
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    # A Starter Kit is loaded again at the write boundary.  Requiring the
+    # fingerprint observed during preview prevents a user from confirming one
+    # catalog artifact and accidentally creating a proposal from a later one.
+    expected_fingerprint: str = Field(min_length=8, max_length=80)
+    title: str = Field(min_length=1, max_length=240)
+    description: str = Field(default="", max_length=7_000)
+    submit: bool = True
+
+
+class StarterKitImportProposalOut(PackageImportProposalOut):
+    starter_kit: StarterKitOut
 
 
 class AuthMessage(Msg):
@@ -298,6 +541,8 @@ class ObjectDetailOut(ObjectSearchItemOut):
 class DataMappingIn(BaseModel):
     entity_id: str
     data_source_id: str
+    data_source_binding_key: str = ""
+    data_source_binding_ref: dict = Field(default_factory=dict)
     table_name: str = ""
     column_map: dict = Field(default_factory=dict)
 
@@ -362,13 +607,74 @@ class DataMappingRefreshOut(BaseModel):
     last_error: str = ""
 
 
+class DataMappingRefreshJobOut(BaseModel):
+    id: str
+    mapping_id: str
+    scenario_id: str
+    environment: str
+    status: str
+    limit: int = 50
+    attempt: int = 0
+    max_attempts: int = 3
+    timeout_seconds: int = 300
+    available_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    next_retry_at: datetime | None = None
+    rows_scanned: int = 0
+    instances_created: int = 0
+    instances_updated: int = 0
+    relations_created: int = 0
+    connector_audit: list[dict[str, Any]] = Field(default_factory=list)
+    # Provenance is intentionally an identifier/hash summary only.  The frozen
+    # mapping body may contain operational connection descriptors and remains
+    # worker-internal.
+    definition_snapshot_id: str | None = None
+    release_id: str | None = None
+    definition_hash: str = ""
+    definition_source: str = "live"
+    error: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
+def _empty_function_schema() -> dict:
+    return {"type": "object", "properties": {}, "additionalProperties": False}
+
+
+class FunctionDefinitionIn(BaseModel):
+    """A declaration only; executable implementation fields are forbidden."""
+
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=8_000)
+    input_schema: dict = Field(default_factory=_empty_function_schema)
+    output_schema: dict = Field(default_factory=_empty_function_schema)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    visibility: Literal["scenario", "tenant"] = "scenario"
+
+    model_config = {"extra": "forbid"}
+
+
+class FunctionDefinitionOut(FunctionDefinitionIn):
+    id: str
+    scenario_id: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class ScenarioDetail(ScenarioOut):
+    # 由服务端按当前主体的 RBAC + 场景 ACL 计算。前端不能仅依据角色或
+    # 场景归属推断该能力，否则显式 deny 与公共场景只读语义会被绕过。
+    can_write: bool = False
     entities: list[EntityOut] = []
     relations: list[RelationOut] = []
     data_sources: list["DataSourceOut"] = []
     instances: list[InstanceOut] = []
     relation_instances: list[RelationInstanceOut] = []
     mappings: list[DataMappingOut] = []
+    functions: list[FunctionDefinitionOut] = []
     actions: list["ActionOut"] = []
     rules: list["RuleOut"] = []
     events: list["EventOut"] = []
@@ -507,6 +813,11 @@ class LLMTraceOut(BaseModel):
     estimated_cost: float
     currency: str
     tool_count: int
+    correlation_id: str = ""
+    agent_id: str | None = None
+    conversation_id: str | None = None
+    scenario_id: str | None = None
+    user_id: str | None = None
     error: str = ""
     created_at: datetime
 
@@ -767,7 +1078,9 @@ class AssistantChatRequest(BaseModel):
     path: str = ""
     selection: dict = Field(default_factory=dict)
     attachment_ids: list[str] = Field(default_factory=list)
-    mode: Literal["ask", "draft", "execute"] = "ask"
+    # The assistant may answer or prepare a reviewed change set. Effects are
+    # deliberately executed only through the explicit Action/task flows.
+    mode: Literal["ask", "draft"] = "ask"
 
 
 class AssistantProposalApplyRequest(BaseModel):
@@ -888,7 +1201,13 @@ class ActionExecutionLogOut(BaseModel):
     status: str
     mode: str = "execute"
     idempotency_key: str | None = None
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    definition_snapshot_id: str | None = None
+    release_id: str | None = None
+    definition_hash: str = ""
+    definition_source: str = "live"
     result: dict = {}
+    connector_audit: list[dict] = Field(default_factory=list)
     error: str = ""
     duration_ms: int = 0
     created_at: datetime
@@ -919,6 +1238,11 @@ class WorkflowRunOut(BaseModel):
     workflow_id: str
     workflow_name: str = ""
     trigger_source: str
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    definition_snapshot_id: str | None = None
+    release_id: str | None = None
+    definition_hash: str = ""
+    definition_source: str = "live"
     status: str
     input_params: dict = Field(default_factory=dict)
     attempt: int = 0
@@ -932,6 +1256,10 @@ class WorkflowRunOut(BaseModel):
     error: str = ""
     result: dict = Field(default_factory=dict)
     pending_approval: bool = False
+    # 由服务端针对当前主体与工作流 ACL 计算；任务中心据此决定是否呈现
+    # 重试/取消（execute）与审批（approve）操作，不能从任务状态推断权限。
+    can_execute: bool = False
+    can_approve: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -973,7 +1301,114 @@ class EventEnvelopeOut(BaseModel):
     payload: dict = Field(default_factory=dict)
     source: str = "manual"
     source_run_id: str | None = None
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    definition_snapshot_id: str | None = None
+    release_id: str | None = None
+    definition_hash: str = ""
+    definition_source: str = "live"
     created_at: datetime
     queued_workflow_run_ids: list[str] = Field(default_factory=list)
+
+    model_config = {"from_attributes": True}
+
+
+# ──────────────────────────────────────────────
+# P1 运营 Case / Incident 中心
+# ──────────────────────────────────────────────
+class IncidentCaseCreateIn(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    description: str = Field(default="", max_length=12_000)
+    severity: Literal["low", "medium", "high", "critical"] = "medium"
+    source: str = Field(default="manual", min_length=1, max_length=60)
+    source_ref: str = Field(default="", max_length=180)
+    related_object_id: str | None = Field(default=None, min_length=1, max_length=32)
+    assignee_user_id: str | None = Field(default=None, min_length=1, max_length=32)
+    context: dict = Field(default_factory=dict)
+    comment: str = Field(default="", max_length=2_000)
+
+    @field_validator("title")
+    @classmethod
+    def title_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Case 标题不能为空")
+        return normalized
+
+
+class IncidentCaseUpdateIn(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    description: str | None = Field(default=None, max_length=12_000)
+    severity: Literal["low", "medium", "high", "critical"] | None = None
+    related_object_id: str | None = Field(default=None, min_length=1, max_length=32)
+    assignee_user_id: str | None = Field(default=None, min_length=1, max_length=32)
+    context: dict | None = None
+    comment: str = Field(default="", max_length=2_000)
+
+    @field_validator("title")
+    @classmethod
+    def optional_title_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Case 标题不能为空")
+        return normalized
+
+
+class IncidentCaseAcknowledgeIn(BaseModel):
+    comment: str = Field(default="", max_length=2_000)
+
+
+class IncidentCaseResolveIn(BaseModel):
+    resolution: str = Field(min_length=1, max_length=12_000)
+    comment: str = Field(default="", max_length=2_000)
+
+    @field_validator("resolution")
+    @classmethod
+    def resolution_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("解决说明不能为空")
+        return normalized
+
+
+class IncidentCaseOut(BaseModel):
+    id: str
+    tenant_id: str
+    scenario_id: str
+    title: str
+    description: str = ""
+    severity: Literal["low", "medium", "high", "critical"] = "medium"
+    status: Literal["open", "acknowledged", "resolved"] = "open"
+    source: str = "manual"
+    source_ref: str = ""
+    related_object_id: str | None = None
+    assignee_user_id: str | None = None
+    context: dict = Field(default_factory=dict)
+    created_by_user_id: str | None = None
+    acknowledged_by_user_id: str | None = None
+    acknowledged_at: datetime | None = None
+    resolved_by_user_id: str | None = None
+    resolved_at: datetime | None = None
+    resolution: str = ""
+    created_at: datetime
+    updated_at: datetime
+    history_count: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+class IncidentCaseHistoryOut(BaseModel):
+    id: str
+    incident_case_id: str
+    tenant_id: str
+    scenario_id: str
+    action: Literal["created", "updated", "acknowledged", "resolved"]
+    actor_user_id: str | None = None
+    from_status: str = ""
+    to_status: str = ""
+    changes: dict = Field(default_factory=dict)
+    comment: str = ""
+    created_at: datetime
 
     model_config = {"from_attributes": True}

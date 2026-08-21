@@ -1,0 +1,20 @@
+{
+  "id": "supply-chain",
+  "name": "供应链协同 Starter Kit",
+  "industry": "supply-chain",
+  "version": "1.0.0",
+  "description": "用于供应商、采购订单、仓库、库存和发运协同建模的声明性本体起点。",
+  "package_file": "package.json",
+  "fingerprint": "sha256:6eca77498afb44efc4db3b2bb9b16e70a80c294066360c8c92ff63448cf248ed",
+  "resource_counts": {
+    "entities": 6,
+    "properties": 14,
+    "relations": 5,
+    "mappings": 0,
+    "functions": 0,
+    "actions": 0,
+    "rules": 1,
+    "events": 1,
+    "workflows": 1
+  }
+}

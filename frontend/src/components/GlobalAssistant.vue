@@ -1,5 +1,6 @@
 <template>
   <button
+    v-if="showLauncher"
     class="assistant-launcher"
     type="button"
     aria-label="打开全局 AI 助手"
@@ -115,7 +116,7 @@
               </div>
             </div>
             <div class="message-bubble" :class="{ user: message.role === 'user' }">
-              <div v-if="message.role === 'assistant'" class="md-body" v-html="renderMarkdown(message.content)"></div>
+              <SafeMarkdown v-if="message.role === 'assistant'" :content="message.content" />
               <span v-if="message.role === 'assistant' && message.streaming" class="stream-cursor" aria-hidden="true">▍</span>
               <div v-else-if="message.role !== 'assistant'" class="user-content">{{ message.content }}</div>
             </div>
@@ -227,9 +228,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { marked } from 'marked'
 import { api, streamAssistantChat } from '@/api'
 import type { AssistantAttachment, AssistantMessage, AssistantProposal, AssistantThread, AssistantThought } from '@/types'
+import SafeMarkdown from '@/components/SafeMarkdown.vue'
 
 interface AssistantContext {
   page?: string
@@ -264,13 +265,12 @@ const assistantScopeKey = computed(() => `${context.value.scenario_id || 'global
 const storageKey = computed(() => `ontology-assistant-thread:${encodeURIComponent(assistantScopeKey.value)}`)
 const currentThread = computed(() => threads.value.find((thread) => thread.id === threadId.value))
 const hasStreamingAssistant = computed(() => messages.value.some((message) => message.role === 'assistant' && message.streaming))
+// The Agent chat owns the bottom-right composer controls. A persistent global
+// launcher must not cover its primary send action or keyboard focus target.
+const showLauncher = computed(() => !/^\/agents\/[^/]+\/chat(?:\/|$|\?)/.test(context.value.path))
 const starterSuggestions = computed(() => context.value.scenario_id
   ? ['解释当前业务场景', '根据当前资料生成本体草稿', '把当前业务流程编排为工作流']
   : ['这个平台可以帮我做什么？', '如何开始建立一个业务本体？', '我应该先准备哪些业务资料？'])
-
-function renderMarkdown(content: string) {
-  return marked.parse(content || '', { breaks: true }) as string
-}
 
 function proposalOf(message: AssistantMessage): AssistantProposal | null {
   const proposal = message.proposal as AssistantProposal | undefined
@@ -642,6 +642,9 @@ watch(() => storageKey.value, async () => {
   if (visible.value) {
     await loadContext()
   }
+})
+watch(showLauncher, (show) => {
+  if (!show) visible.value = false
 })
 
 onMounted(() => window.addEventListener('ontology-selection-change', onSelection))

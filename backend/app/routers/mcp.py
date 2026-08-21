@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from ..models import MCPConfig
 from ..schemas import MCPConfigIn, MCPConfigOut, MCPToolInfo, Msg
-from ..services import mcp_service, tenant_service
+from ..services import connector_service, mcp_service, permission_service, tenant_service
 from ..services.auth_service import get_tenant_db
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
@@ -56,6 +56,7 @@ def list_mcp(db: Session = Depends(get_tenant_db)):
 
 @router.post("", response_model=MCPConfigOut)
 def create_mcp(payload: MCPConfigIn, db: Session = Depends(get_tenant_db)):
+    permission_service.require_tenant_permission(db, "manage")
     c = MCPConfig(tenant_id=tenant_service.current_tenant_id(db), **payload.model_dump())
     db.add(c)
     db.commit()
@@ -65,12 +66,14 @@ def create_mcp(payload: MCPConfigIn, db: Session = Depends(get_tenant_db)):
 
 @router.put("/{mcp_id}", response_model=MCPConfigOut)
 def update_mcp(mcp_id: str, payload: MCPConfigIn, db: Session = Depends(get_tenant_db)):
+    permission_service.require_tenant_permission(db, "manage")
     c = tenant_service.require_owned(db, MCPConfig, mcp_id, "MCP 不存在")
     values = payload.model_dump()
     values["env"] = _merge_map(c.env, values.get("env"))
     values["headers"] = _merge_map(c.headers, values.get("headers"))
     for k, v in values.items():
         setattr(c, k, v)
+    connector_service.invalidate_connector_bindings(db, "mcp", c.id)
     db.commit()
     db.refresh(c)
     return _out(c)
@@ -78,7 +81,12 @@ def update_mcp(mcp_id: str, payload: MCPConfigIn, db: Session = Depends(get_tena
 
 @router.delete("/{mcp_id}", response_model=Msg)
 def delete_mcp(mcp_id: str, db: Session = Depends(get_tenant_db)):
+    permission_service.require_tenant_permission(db, "manage")
     c = tenant_service.require_owned(db, MCPConfig, mcp_id, "MCP 不存在")
+    try:
+        connector_service.assert_connector_not_bound(db, "mcp", c.id)
+    except connector_service.ConnectorBindingConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.delete(c)
     db.commit()
     return Msg(message="已删除")
@@ -86,14 +94,20 @@ def delete_mcp(mcp_id: str, db: Session = Depends(get_tenant_db)):
 
 @router.post("/{mcp_id}/test", response_model=Msg)
 def test_mcp(mcp_id: str, db: Session = Depends(get_tenant_db)):
-    c = tenant_service.require_visible(db, MCPConfig, mcp_id, "MCP 不存在")
+    permission_service.require_tenant_permission(db, "manage")
+    c = tenant_service.require_owned(db, MCPConfig, mcp_id, "MCP 不存在")
+    if not c.enabled:
+        raise HTTPException(409, "MCP 当前已停用")
     ok, msg = mcp_service.test_connection(c)
     return Msg(ok=ok, message=msg)
 
 
 @router.get("/{mcp_id}/tools", response_model=list[MCPToolInfo])
 def mcp_tools(mcp_id: str, db: Session = Depends(get_tenant_db)):
-    c = tenant_service.require_visible(db, MCPConfig, mcp_id, "MCP 不存在")
+    permission_service.require_tenant_permission(db, "manage")
+    c = tenant_service.require_owned(db, MCPConfig, mcp_id, "MCP 不存在")
+    if not c.enabled:
+        raise HTTPException(409, "MCP 当前已停用")
     try:
         return mcp_service.list_tools(c)
     except Exception as exc:  # noqa: BLE001

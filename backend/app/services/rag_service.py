@@ -13,10 +13,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..models import BucketFile, DataSource, DocumentChunk, DocumentIndexJob
-from . import tenant_service
+from ..models import BucketFile, DataSource, DocumentChunk, DocumentIndexJob, LLMConfig
+from . import llm_service, tenant_service
 
 
 EMBEDDING_MODEL = "local-semantic-hash-192-v1"
@@ -54,6 +55,11 @@ def _aware(value: datetime | None) -> datetime | None:
 
 def _content_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _document_active_key(file_id: str) -> str:
+    """同一租户下一个文件只能有一个活跃解析/索引任务。"""
+    return str(file_id)
 
 
 def _tokens(text: str) -> list[str]:
@@ -106,9 +112,49 @@ def embed(text: str) -> list[float]:
 def _cosine(left: Iterable[float] | None, right: Iterable[float] | None) -> float:
     left_values = list(left or [])
     right_values = list(right or [])
-    if len(left_values) != EMBEDDING_DIMENSIONS or len(right_values) != EMBEDDING_DIMENSIONS:
+    if not left_values or len(left_values) != len(right_values):
         return 0.0
-    return max(0.0, sum(float(a) * float(b) for a, b in zip(left_values, right_values)))
+    left_norm = math.sqrt(sum(float(value) ** 2 for value in left_values))
+    right_norm = math.sqrt(sum(float(value) ** 2 for value in right_values))
+    if not left_norm or not right_norm:
+        return 0.0
+    return max(
+        0.0,
+        sum(float(a) * float(b) for a, b in zip(left_values, right_values)) / (left_norm * right_norm),
+    )
+
+
+def _runtime_embedding_marker(config: LLMConfig) -> str:
+    """保存配置 ID 而非展示名称，避免同名模型或改名后混用向量空间。"""
+    return f"llm:{config.id}"
+
+
+def _embedding_config_for_marker(db: Session, marker: str) -> LLMConfig | None:
+    if not str(marker or "").startswith("llm:"):
+        return None
+    config_id = str(marker).split(":", 1)[1]
+    config = tenant_service.get_visible(db, LLMConfig, config_id)
+    if not config or not llm_service.supports_capability(config, "embedding"):
+        return None
+    return config
+
+
+def _embed_for_index(db: Session, texts: list[str]) -> tuple[list[list[float]], str]:
+    """优先使用当前租户路由的专用 Embedding；未配置时保留离线回退。"""
+    candidates = llm_service.routable_configs(db, "embedding")
+    if not candidates:
+        return [embed(text) for text in texts], EMBEDDING_MODEL
+    config = candidates[0]
+    return llm_service.embed(config, texts, db=db, operation="rag_index"), _runtime_embedding_marker(config)
+
+
+def _query_embedding_for_marker(db: Session, marker: str, query: str) -> list[float] | None:
+    if marker == EMBEDDING_MODEL:
+        return embed(query)
+    config = _embedding_config_for_marker(db, marker)
+    if not config:
+        return None
+    return llm_service.embed(config, [query], db=db, operation="rag_search")[0]
 
 
 def _keyword_score(query_tokens: set[str], text: str) -> float:
@@ -205,8 +251,14 @@ def index_file(db: Session, file: BucketFile, *, force: bool = False) -> dict[st
         spans = chunk_spans(text)
         partial = len(spans) > MAX_CHUNKS_PER_FILE
         spans = spans[:MAX_CHUNKS_PER_FILE]
+        vectors, embedding_model = _embed_for_index(
+            db,
+            [chunk_text for _start, _end, chunk_text in spans],
+        )
+        if len(vectors) != len(spans):
+            raise RuntimeError("Embedding 返回数量与文档分块不一致")
         db.execute(delete(DocumentChunk).where(DocumentChunk.bucket_file_id == file.id))
-        for ordinal, (char_start, char_end, chunk_text) in enumerate(spans):
+        for ordinal, ((char_start, char_end, chunk_text), vector) in enumerate(zip(spans, vectors)):
             db.add(
                 DocumentChunk(
                     bucket_file_id=file.id,
@@ -216,8 +268,8 @@ def index_file(db: Session, file: BucketFile, *, force: bool = False) -> dict[st
                     char_end=char_end,
                     text=chunk_text,
                     content_hash=_content_hash(chunk_text),
-                    embedding=embed(chunk_text),
-                    embedding_model=EMBEDDING_MODEL,
+                    embedding=vector,
+                    embedding_model=embedding_model,
                 )
             )
         file.index_status = "partial" if partial else "indexed"
@@ -276,12 +328,12 @@ def enqueue_document_index(
     """将一个文件的解析/索引持久化入队；相同文件只保留一个活跃任务。"""
     source = _require_owned_file(db, file)
     tenant_id = tenant_service.current_tenant_id(db)
+    active_key = _document_active_key(file.id)
     active = db.execute(
         select(DocumentIndexJob)
         .where(
-            DocumentIndexJob.bucket_file_id == file.id,
             DocumentIndexJob.tenant_id == tenant_id,
-            DocumentIndexJob.status.in_(("queued", "running", "retry_waiting")),
+            DocumentIndexJob.active_key == active_key,
         )
         .order_by(DocumentIndexJob.created_at.desc())
         .limit(1)
@@ -299,6 +351,7 @@ def enqueue_document_index(
         bucket_file_id=file.id,
         parse_document=parse_document,
         force=force,
+        active_key=active_key,
         status="queued",
         max_attempts=DOCUMENT_JOB_MAX_ATTEMPTS,
         timeout_seconds=DOCUMENT_JOB_TIMEOUT_SECONDS,
@@ -306,8 +359,27 @@ def enqueue_document_index(
     )
     file.index_status = "queued"
     file.index_error = ""
-    db.add(job)
-    db.flush()
+    try:
+        # 活跃键有唯一约束。savepoint 让并发请求输掉竞争后仍可继续读取赢家，
+        # 不会把上层 HTTP / worker 事务一并标记为 rollback-only。
+        with db.begin_nested():
+            db.add(job)
+            db.flush()
+    except IntegrityError:
+        active = db.execute(
+            select(DocumentIndexJob)
+            .where(
+                DocumentIndexJob.tenant_id == tenant_id,
+                DocumentIndexJob.active_key == active_key,
+            )
+            .order_by(DocumentIndexJob.created_at.desc())
+            .limit(1)
+        ).scalars().first()
+        if active is None:
+            raise
+        active.parse_document = active.parse_document or parse_document
+        active.force = active.force or force
+        return active, False
     return job, True
 
 
@@ -369,6 +441,7 @@ def _retry_document_job(
             file.index_error = ""
     else:
         job.status = status
+        job.active_key = None
         job.completed_at = now
         job.next_retry_at = None
         if file:
@@ -423,6 +496,7 @@ def process_document_index_jobs(
     ).scalars().all()
     processed: list[DocumentIndexJob] = []
     for job_id in job_ids:
+        claimed_at = utc_now()
         claimed = db.execute(
             update(DocumentIndexJob)
             .where(
@@ -433,7 +507,7 @@ def process_document_index_jobs(
             .values(
                 status="running",
                 attempt=DocumentIndexJob.attempt + 1,
-                started_at=now,
+                started_at=claimed_at,
                 next_retry_at=None,
                 error="",
             )
@@ -478,7 +552,8 @@ def process_document_index_jobs(
             if result.get("status") not in {"indexed", "partial"}:
                 raise RuntimeError(str(result.get("error") or "建立检索索引失败"))
             finished_at = utc_now()
-            if finished_at > now + timedelta(seconds=job.timeout_seconds):
+            started_at = _aware(job.started_at) or claimed_at
+            if finished_at > started_at + timedelta(seconds=job.timeout_seconds):
                 _retry_document_job(
                     db,
                     job,
@@ -489,6 +564,7 @@ def process_document_index_jobs(
                 )
             else:
                 job.status = "succeeded"
+                job.active_key = None
                 job.error = ""
                 job.completed_at = finished_at
                 job.next_retry_at = None
@@ -576,11 +652,19 @@ def search(
     )
     stmt = stmt.where(tenant_service.visible_clause(DataSource, db))
 
-    query_embedding = embed(query)
     query_tokens = set(_tokens(query))
     scored: list[tuple[float, float, float, DocumentChunk, BucketFile, DataSource]] = []
+    query_embeddings: dict[str, list[float] | None] = {}
     for chunk, file, source in db.execute(stmt).all():
-        vector_score = _cosine(query_embedding, chunk.embedding)
+        marker = str(chunk.embedding_model or EMBEDDING_MODEL)
+        if marker not in query_embeddings:
+            try:
+                query_embeddings[marker] = _query_embedding_for_marker(db, marker, query)
+            except Exception:  # noqa: BLE001
+                # 已有索引仍可用关键词检索；把 provider 失败降级为 0 向量分，
+                # 不能因此跨租户回退到其他模型或悄悄重建索引。
+                query_embeddings[marker] = None
+        vector_score = _cosine(query_embeddings[marker], chunk.embedding)
         keyword_score = _keyword_score(query_tokens, chunk.text)
         # 局部哈希碰撞造成的极低相似会被阈值排除，精确关键词仍占混合分的 24%。
         score = vector_score * 0.76 + keyword_score * 0.24
@@ -611,6 +695,7 @@ def search(
                 "char_end": chunk.char_end,
                 "chunk_ordinal": chunk.ordinal,
                 "content_hash": chunk.content_hash,
+                "file_content_hash": file.indexed_content_hash,
                 "embedding_model": chunk.embedding_model,
                 "index_version": file.index_version,
                 "score": round(score, 4),

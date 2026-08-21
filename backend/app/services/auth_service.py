@@ -213,9 +213,12 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     request.state.tenant_id = session.user.tenant_id
     db.info["user_id"] = session.user.id
     db.info["tenant_id"] = session.user.tenant_id
-    # 升级前账号没有成员表记录时，在真实、已验证的登录主体下回填默认 owner/admin。
-    # 后续权限服务不会为缺失上下文自动放行，因而这里是兼容旧用户的唯一兜底入口。
+    # 仅初始化尚不存在的组织及其历史成员；绝不因一次登录把已被管理员移除的
+    # 用户重新补成 admin。缺失成员身份会在权限校验时保持拒绝，直到管理员显式添加。
     permission_service.ensure_organization(db, session.user.tenant_id)
+    if not permission_service.ensure_user_membership(db, session.user):
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="当前用户没有有效组织成员身份")
     db.commit()
     return session.user
 

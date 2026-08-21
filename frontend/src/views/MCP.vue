@@ -3,10 +3,19 @@
     <div class="page-header">
       <div>
         <h2>MCP 服务</h2>
-        <div class="sub">Model Context Protocol 工具服务，为 Agent 扩展外部工具能力</div>
+        <div class="sub">Model Context Protocol 工具服务，供受治理的 Action / 工作流配置外部工具连接</div>
       </div>
-      <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
+      <el-button v-if="canManage" type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
     </div>
+
+    <el-alert
+      v-if="!canManage"
+      class="readonly-notice"
+      type="info"
+      title="当前账户为只读：可查看 MCP 配置，不能新建、修改、测试或查看远端工具。"
+      show-icon
+      :closable="false"
+    />
 
     <el-row :gutter="16" v-loading="loading">
       <el-col :xs="24" :sm="12" :lg="8" v-for="m in mcps" :key="m.id">
@@ -17,12 +26,13 @@
               <div class="mc-name">{{ m.name }}</div>
               <el-tag size="small" type="info" effect="light">{{ m.transport }}</el-tag>
             </div>
-            <el-switch :model-value="!!m.enabled" @change="(v:any)=>toggle(m, v)" style="margin-left:auto" />
+            <el-switch v-if="canManage" :model-value="!!m.enabled" @change="(v:any)=>toggle(m, v)" style="margin-left:auto" />
+            <el-tag v-else size="small" :type="m.enabled ? 'success' : 'info'" effect="light">{{ m.enabled ? '已启用' : '已停用' }}</el-tag>
           </div>
           <div class="muted mono mc-cmd">
             {{ m.transport === 'stdio' ? `${m.command} ${(m.args||[]).join(' ')}` : m.url }}
           </div>
-          <div class="mc-actions">
+          <div v-if="canManage" class="mc-actions">
             <el-button size="small" plain @click="test(m)" :loading="m._testing"><el-icon><Link /></el-icon> 测试</el-button>
             <el-button size="small" type="primary" plain @click="showTools(m)"><el-icon><Tools /></el-icon> 工具</el-button>
             <el-button size="small" text type="primary" @click="openEdit(m)"><el-icon><Edit /></el-icon> 编辑</el-button>
@@ -33,12 +43,12 @@
     </el-row>
     <div v-if="!loading && !mcps.length" class="empty-wrap">
       <div class="empty-icon"><el-icon :size="28"><Connection /></el-icon></div>
-      <div>暂无 MCP 服务，点击右上角「新建 MCP」接入工具服务</div>
-      <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
+      <div>{{ canManage ? '暂无 MCP 服务，点击右上角「新建 MCP」接入工具服务' : '暂无可查看的 MCP 服务' }}</div>
+      <el-button v-if="canManage" type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
     </div>
 
     <!-- 编辑对话框 -->
-    <el-dialog v-model="dlg" :title="form.id ? '编辑 MCP' : '新建 MCP'" width="600px">
+    <el-dialog v-if="canManage" v-model="dlg" :title="form.id ? '编辑 MCP' : '新建 MCP'" width="600px">
       <el-form :model="form" label-width="90px">
         <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：文件系统、天气服务" /></el-form-item>
         <el-form-item label="传输方式" required>
@@ -69,7 +79,7 @@
     </el-dialog>
 
     <!-- 工具列表 -->
-    <el-dialog v-model="toolsDlg" :title="'MCP 工具：' + (curMcp?.name || '')" width="640px" top="6vh">
+    <el-dialog v-if="canManage" v-model="toolsDlg" :title="'MCP 工具：' + (curMcp?.name || '')" width="640px" top="6vh">
       <el-table :data="tools" size="small" v-loading="loadingTools">
         <el-table-column prop="name" label="工具名" min-width="160">
           <template #default="{ row }"><span class="mono">{{ row.name }}</span></template>
@@ -82,11 +92,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
+import { useAuthStore } from '@/stores/auth'
 import type { MCPConfig, MCPTool } from '@/types'
 
+const auth = useAuthStore()
+const canManage = computed(() => auth.user?.can_manage === true)
 const mcps = ref<(MCPConfig & { _testing?: boolean })[]>([])
 const dlg = ref(false)
 const saving = ref(false)
@@ -111,12 +124,14 @@ async function load() {
   }
 }
 function openCreate() {
+  if (!canManage.value) return
   form.value = { name: '', transport: 'stdio', command: '', args: [], enabled: true }
   argsText.value = ''
   envText.value = ''
   dlg.value = true
 }
 function openEdit(m: MCPConfig) {
+  if (!canManage.value) return
   form.value = { ...m, args: [...(m.args || [])], env: { ...(m.env || {}) } }
   argsText.value = (m.args || []).join(' ')
   envText.value = Object.entries(m.env || {}).map(([k, v]) => `${k}=${v}`).join('\n')
@@ -131,6 +146,7 @@ function parseEnv(t: string) {
   return out
 }
 async function save() {
+  if (!canManage.value) return
   if (!form.value.name) return ElMessage.warning('请填写名称')
   const payload: any = { ...form.value }
   if (form.value.transport === 'stdio') {
@@ -153,6 +169,7 @@ async function save() {
   }
 }
 async function toggle(m: MCPConfig, v: boolean) {
+  if (!canManage.value) return
   try {
     await api.updateMCP(m.id!, { ...m, enabled: v })
     m.enabled = v
@@ -161,6 +178,7 @@ async function toggle(m: MCPConfig, v: boolean) {
   }
 }
 async function test(m: MCPConfig & { _testing?: boolean }) {
+  if (!canManage.value) return
   m._testing = true
   try {
     const r: any = await api.testMCP(m.id!)
@@ -172,6 +190,7 @@ async function test(m: MCPConfig & { _testing?: boolean }) {
   }
 }
 async function showTools(m: MCPConfig) {
+  if (!canManage.value) return
   curMcp.value = m
   tools.value = []
   toolsDlg.value = true
@@ -185,6 +204,7 @@ async function showTools(m: MCPConfig) {
   }
 }
 async function remove(m: MCPConfig) {
+  if (!canManage.value) return
   try {
     await ElMessageBox.confirm(`删除 MCP「${m.name}」？`, '确认', { type: 'warning' })
     await api.deleteMCP(m.id!)
@@ -239,4 +259,5 @@ onMounted(load)
   border-top: 1px solid var(--border);
   padding-top: 10px;
 }
+.readonly-notice { margin-bottom: 16px; }
 </style>

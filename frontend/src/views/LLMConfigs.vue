@@ -6,8 +6,17 @@
         <h2 id="model-title">模型与路由</h2>
         <p>配置模型能力、路由优先级和预算；每次调用的延迟、Token 与成本均可审计。</p>
       </div>
-      <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建模型配置</el-button>
+      <el-button v-if="canManage" type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建模型配置</el-button>
     </header>
+
+    <el-alert
+      v-if="!canManage"
+      class="model-alert"
+      type="info"
+      title="当前账户为只读：可查看模型、路由与运营数据，不能修改配置、测试连接或记录评测。"
+      show-icon
+      :closable="false"
+    />
 
     <section class="route-grid" aria-labelledby="route-title" aria-live="polite">
       <div class="route-title">
@@ -44,20 +53,20 @@
         </dl>
         <footer class="model-actions">
           <el-button size="small" plain @click="openOperations(config)"><el-icon><DataAnalysis /></el-icon> 运营数据</el-button>
-          <el-button size="small" plain :loading="config._testing" @click="test(config)"><el-icon><Link /></el-icon> 测试</el-button>
-          <el-button size="small" text type="primary" @click="openEdit(config)"><el-icon><Edit /></el-icon> 编辑</el-button>
-          <el-button size="small" text type="danger" @click="remove(config)"><el-icon><Delete /></el-icon> 删除</el-button>
+          <el-button v-if="canManage" size="small" plain :loading="config._testing" @click="test(config)"><el-icon><Link /></el-icon> 测试</el-button>
+          <el-button v-if="canManage" size="small" text type="primary" @click="openEdit(config)"><el-icon><Edit /></el-icon> 编辑</el-button>
+          <el-button v-if="canManage" size="small" text type="danger" @click="remove(config)"><el-icon><Delete /></el-icon> 删除</el-button>
         </footer>
       </article>
       <div v-if="!loading && !llms.length" class="empty-state card">
         <el-icon :size="30"><Cpu /></el-icon>
         <strong>尚未配置可用模型</strong>
         <span>新建后选择能力和优先级，Agent 与工作流即可按路由使用它。</span>
-        <el-button type="primary" size="small" @click="openCreate">新建模型配置</el-button>
+        <el-button v-if="canManage" type="primary" size="small" @click="openCreate">新建模型配置</el-button>
       </div>
     </section>
 
-    <el-dialog v-model="dialogVisible" :title="form.id ? '编辑模型配置' : '新建模型配置'" width="min(720px, calc(100vw - 28px))" destroy-on-close>
+    <el-dialog v-if="canManage" v-model="dialogVisible" :title="form.id ? '编辑模型配置' : '新建模型配置'" width="min(720px, calc(100vw - 28px))" destroy-on-close>
       <el-form :model="form" label-position="top" class="model-form">
         <div class="form-grid">
           <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：业务对话主模型" /></el-form-item>
@@ -118,7 +127,7 @@
               </el-table>
             </el-tab-pane>
             <el-tab-pane label="基础评测" name="evaluations">
-              <div class="evaluation-actions"><span>记录人工或外部评测的非敏感摘要。</span><el-button size="small" type="primary" @click="evaluationDialog = true"><el-icon><Plus /></el-icon> 记录评测</el-button></div>
+              <div class="evaluation-actions"><span>记录人工或外部评测的非敏感摘要。</span><el-button v-if="canManage" size="small" type="primary" @click="evaluationDialog = true"><el-icon><Plus /></el-icon> 记录评测</el-button></div>
               <el-table :data="evaluations" size="small" max-height="300" empty-text="尚无评测记录">
                 <el-table-column prop="name" label="评测" min-width="160" />
                 <el-table-column prop="capability" label="能力" width="92"><template #default="{ row }">{{ capabilityLabel(row.capability) }}</template></el-table-column>
@@ -133,7 +142,7 @@
       </div>
     </el-drawer>
 
-    <el-dialog v-model="evaluationDialog" title="记录基础评测" width="min(520px, calc(100vw - 28px))" destroy-on-close>
+    <el-dialog v-if="canManage" v-model="evaluationDialog" title="记录基础评测" width="min(520px, calc(100vw - 28px))" destroy-on-close>
       <el-form :model="evaluationForm" label-position="top">
         <el-form-item label="评测名称" required><el-input v-model="evaluationForm.name" /></el-form-item>
         <div class="form-grid compact"><el-form-item label="能力"><el-select v-model="evaluationForm.capability" style="width:100%"><el-option v-for="capability in capabilities" :key="capability" :label="capabilityLabel(capability)" :value="capability" /></el-select></el-form-item><el-form-item label="通过"><el-switch v-model="evaluationForm.passed" /></el-form-item><el-form-item label="得分（0–1）"><el-input-number v-model="evaluationForm.score" :min="0" :max="1" :step="0.01" style="width:100%" /></el-form-item><el-form-item label="延迟（ms）"><el-input-number v-model="evaluationForm.latency_ms" :min="0" style="width:100%" /></el-form-item></div>
@@ -148,12 +157,15 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
+import { useAuthStore } from '@/stores/auth'
 import type { LLMConfig, LLMEvaluation, LLMEvaluationSummary, LLMTrace, LLMUsageSummary } from '@/types'
 
 type ConfigCard = LLMConfig & { _testing?: boolean }
 type Capability = 'chat' | 'embedding' | 'vision' | 'tool'
 const capabilities: Capability[] = ['chat', 'embedding', 'vision', 'tool']
 const providers = ['openai', 'deepseek', 'dashscope', 'ollama', 'vllm', 'openai_compatible']
+const auth = useAuthStore()
+const canManage = computed(() => auth.user?.can_manage === true)
 const llms = ref<ConfigCard[]>([])
 const loading = ref(false)
 const saving = ref(false)
@@ -198,23 +210,25 @@ async function load() {
   loading.value = true; error.value = ''
   try { llms.value = await api.listLLM(); await loadRoutes() } catch (cause: any) { error.value = cause?.message || '模型配置加载失败' } finally { loading.value = false }
 }
-function openCreate() { form.value = newForm(); dialogVisible.value = true }
-function openEdit(config: LLMConfig) { form.value = { ...newForm(), ...config, api_key: '' }; dialogVisible.value = true }
+function openCreate() { if (canManage.value) { form.value = newForm(); dialogVisible.value = true } }
+function openEdit(config: LLMConfig) { if (canManage.value) { form.value = { ...newForm(), ...config, api_key: '' }; dialogVisible.value = true } }
 function selectCapability(capability: Capability) { const config = capabilityRoutes.value.find((item) => item.capability === capability)?.config; if (config) openOperations(config) }
 async function save() {
+  if (!canManage.value) return
   if (!form.value.name || !form.value.base_url || !form.value.model) return ElMessage.warning('请填写名称、Base URL 和模型标识')
   if (!form.value.id && !form.value.api_key) return ElMessage.warning('新建模型配置时请填写 API Key')
   if (!form.value.capabilities?.length) return ElMessage.warning('至少选择一种模型能力')
   saving.value = true
   try { if (form.value.id) await api.updateLLM(form.value.id, form.value); else await api.createLLM(form.value); ElMessage.success('模型配置已保存'); dialogVisible.value = false; await load() } catch (cause: any) { ElMessage.error(cause?.message || '保存失败') } finally { saving.value = false }
 }
-async function test(config: ConfigCard) { config._testing = true; try { const result: any = await api.testLLM(config.id!); ElMessage.success(result.message || '连接成功'); await load() } catch (cause: any) { ElMessage.error(`连接失败：${cause?.message || '未知错误'}`) } finally { config._testing = false } }
-async function remove(config: LLMConfig) { try { await ElMessageBox.confirm(`删除模型配置「${config.name}」？其历史 trace 和评测也将一并删除。`, '确认删除', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }); await api.deleteLLM(config.id!); ElMessage.success('已删除'); await load() } catch (cause: any) { if (cause !== 'cancel' && cause !== 'close') ElMessage.error(cause?.message || '删除失败') } }
+async function test(config: ConfigCard) { if (!canManage.value) return; config._testing = true; try { const result: any = await api.testLLM(config.id!); ElMessage.success(result.message || '连接成功'); await load() } catch (cause: any) { ElMessage.error(`连接失败：${cause?.message || '未知错误'}`) } finally { config._testing = false } }
+async function remove(config: LLMConfig) { if (!canManage.value) return; try { await ElMessageBox.confirm(`删除模型配置「${config.name}」？其历史 trace 和评测也将一并删除。`, '确认删除', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }); await api.deleteLLM(config.id!); ElMessage.success('已删除'); await load() } catch (cause: any) { if (cause !== 'cancel' && cause !== 'close') ElMessage.error(cause?.message || '删除失败') } }
 async function openOperations(config: LLMConfig) {
   activeConfig.value = config; operationsVisible.value = true; operationsLoading.value = true; operationsError.value = ''; operationsTab.value = 'traces'
   try { const [nextUsage, nextTraces, nextEvaluations, nextEvaluationSummary] = await Promise.all([api.getLLMUsageSummary(config.id!), api.listLLMTraces(config.id!), api.listLLMEvaluations(config.id!), api.getLLMEvaluationSummary(config.id!)]); usage.value = nextUsage; traces.value = nextTraces; evaluations.value = nextEvaluations; evaluationSummary.value = nextEvaluationSummary } catch (cause: any) { operationsError.value = cause?.message || '运营数据加载失败' } finally { operationsLoading.value = false }
 }
 async function saveEvaluation() {
+  if (!canManage.value) return
   if (!activeConfig.value?.id || !evaluationForm.value.name) return ElMessage.warning('请填写评测名称')
   evaluationSaving.value = true
   try { await api.createLLMEvaluation(activeConfig.value.id, evaluationForm.value); ElMessage.success('评测已记录'); evaluationDialog.value = false; evaluationForm.value = newEvaluation(); await openOperations(activeConfig.value) } catch (cause: any) { ElMessage.error(cause?.message || '评测保存失败') } finally { evaluationSaving.value = false }

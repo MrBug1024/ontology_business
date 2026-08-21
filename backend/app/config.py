@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -37,6 +38,14 @@ class Settings(BaseSettings):
     llm_timeout: float = 120.0
     max_upload_bytes: int = 50 * 1024 * 1024
     allow_unsafe_workflow_nodes: bool = False
+    # HTTP Action 默认只允许公网 HTTPS 目标。开发环境如确有受控本地模拟端点，
+    # 必须由部署配置显式开启，不能由 API 请求覆盖。
+    allow_insecure_http_actions: bool = False
+
+    # A process is deployed to exactly one governed runtime environment.  This
+    # value is deliberately server-side: callers cannot select prod/staging by
+    # adding a request parameter to an Action or workflow invocation.
+    runtime_environment: Literal["dev", "staging", "prod"] = "dev"
 
     # Authentication / mail
     auth_cookie_name: str = "ontology_session"

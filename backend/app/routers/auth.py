@@ -27,14 +27,34 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 
-def _user_out(user: User) -> UserOut:
+def _user_out(user: User, *, can_manage: bool = False) -> UserOut:
     return UserOut(
         id=user.id,
         email=user.email,
         display_name=user.display_name,
         tenant_id=user.tenant_id,
         email_verified=bool(user.email_verified_at),
+        can_manage=can_manage,
     )
+
+
+def _can_manage_tenant(db: Session, user: User) -> bool:
+    """Evaluate the same tenant-management policy exposed by management APIs."""
+    prior_tenant_id = db.info.get("tenant_id")
+    prior_user_id = db.info.get("user_id")
+    db.info["tenant_id"] = user.tenant_id
+    db.info["user_id"] = user.id
+    try:
+        return permission_service.check_tenant_permission(db, "manage").allowed
+    finally:
+        if prior_tenant_id is None:
+            db.info.pop("tenant_id", None)
+        else:
+            db.info["tenant_id"] = prior_tenant_id
+        if prior_user_id is None:
+            db.info.pop("user_id", None)
+        else:
+            db.info["user_id"] = prior_user_id
 
 
 def _find_code(db: Session, user: User, code: str, purpose: str) -> EmailVerificationCode:
@@ -147,7 +167,7 @@ def login(payload: LoginIn, response: Response, db: Session = Depends(get_db)):
     if user.status != "active":
         raise HTTPException(403, "请先完成邮箱验证")
     auth_service.set_session_cookie(response, user, db)
-    return _user_out(user)
+    return _user_out(user, can_manage=_can_manage_tenant(db, user))
 
 
 @router.post("/logout", response_model=Msg)
@@ -157,8 +177,8 @@ def logout(request: Request, response: Response, db: Session = Depends(get_db)):
 
 
 @router.get("/me", response_model=UserOut)
-def me(user: User = Depends(auth_service.get_current_user)):
-    return _user_out(user)
+def me(user: User = Depends(auth_service.get_current_user), db: Session = Depends(get_db)):
+    return _user_out(user, can_manage=_can_manage_tenant(db, user))
 
 
 @router.post("/forgot-password", response_model=AuthMessage)

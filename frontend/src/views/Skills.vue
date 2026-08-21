@@ -3,10 +3,19 @@
     <div class="page-header">
       <div>
         <h2>技能（Skills）</h2>
-        <div class="sub">可执行的能力单元，Agent 可在对话中调用（如 OCR 解析、数据分析）</div>
+        <div class="sub">受治理的能力单元，供已配置的 Action / 工作流使用（如 OCR 解析、数据分析）</div>
       </div>
-      <el-button @click="rescan"><el-icon><Refresh /></el-icon> 重新扫描</el-button>
+      <el-button v-if="canManage" @click="rescan"><el-icon><Refresh /></el-icon> 重新扫描</el-button>
     </div>
+
+    <el-alert
+      v-if="!canManage"
+      class="readonly-notice"
+      type="info"
+      title="当前账户为只读：可查看技能信息，不能扫描、启停或测试执行。"
+      show-icon
+      :closable="false"
+    />
 
     <el-row :gutter="16" v-loading="loading">
       <el-col :xs="24" :sm="12" :lg="8" v-for="s in skills" :key="s.id">
@@ -17,11 +26,12 @@
               <div class="sk-name">{{ s.name }}</div>
               <el-tag size="small" :type="s.source === 'builtin' ? 'success' : 'info'" effect="light">{{ s.source }}</el-tag>
             </div>
-            <el-switch v-model="s.enabled" @change="(v:any)=>toggle(s, v)" style="margin-left:auto" />
+            <el-switch v-if="canManage" v-model="s.enabled" @change="(v:any)=>toggle(s, v)" style="margin-left:auto" />
+            <el-tag v-else size="small" :type="s.enabled ? 'success' : 'info'" effect="light">{{ s.enabled ? '已启用' : '已停用' }}</el-tag>
           </div>
           <div class="sk-desc">{{ s.description || '暂无描述' }}</div>
           <div class="muted mono sk-path">{{ s.path }}</div>
-          <div class="sk-actions">
+          <div v-if="canManage" class="sk-actions">
             <el-button size="small" type="primary" plain :disabled="!s.enabled" @click="openExec(s)">
               <el-icon><VideoPlay /></el-icon> 测试执行
             </el-button>
@@ -31,12 +41,12 @@
     </el-row>
     <div v-if="!loading && !skills.length" class="empty-wrap">
       <div class="empty-icon"><el-icon :size="28"><MagicStick /></el-icon></div>
-      <div>暂无技能，将技能目录放入 backend/skills/ 后点击重新扫描</div>
-      <el-button type="primary" size="small" @click="rescan"><el-icon><Refresh /></el-icon> 重新扫描</el-button>
+      <div>{{ canManage ? '暂无技能，将技能目录放入 backend/skills/ 后点击重新扫描' : '暂无可查看的技能' }}</div>
+      <el-button v-if="canManage" type="primary" size="small" @click="rescan"><el-icon><Refresh /></el-icon> 重新扫描</el-button>
     </div>
 
     <!-- 执行对话框 -->
-    <el-dialog v-model="execDlg" :title="'执行技能：' + (curSkill?.name || '')" width="680px" top="6vh">
+    <el-dialog v-if="canManage" v-model="execDlg" :title="'执行技能：' + (curSkill?.name || '')" width="680px" top="6vh">
       <el-form label-width="80px">
         <el-form-item label="参数">
           <el-input v-model="execArgs" type="textarea" :rows="2" class="mono"
@@ -55,11 +65,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
+import { useAuthStore } from '@/stores/auth'
 import type { Skill } from '@/types'
 
+const auth = useAuthStore()
+const canManage = computed(() => auth.user?.can_manage === true)
 const skills = ref<Skill[]>([])
 const execDlg = ref(false)
 const curSkill = ref<Skill | null>(null)
@@ -80,11 +93,13 @@ async function load() {
   }
 }
 async function rescan() {
+  if (!canManage.value) return
   await api.rescanSkills()
   ElMessage.success('已重新扫描')
   load()
 }
 async function toggle(s: Skill, v: boolean) {
+  if (!canManage.value) return
   try {
     await api.toggleSkill(s.id, v)
   } catch (e: any) {
@@ -93,13 +108,14 @@ async function toggle(s: Skill, v: boolean) {
   }
 }
 function openExec(s: Skill) {
+  if (!canManage.value) return
   curSkill.value = s
   execArgs.value = ''
   execOut.value = null
   execDlg.value = true
 }
 async function doExec() {
-  if (!curSkill.value) return
+  if (!canManage.value || !curSkill.value) return
   executing.value = true
   execOut.value = null
   try {
@@ -157,4 +173,5 @@ onMounted(load)
   text-overflow: ellipsis;
 }
 .sk-actions { border-top: 1px solid var(--border); padding-top: 8px; }
+.readonly-notice { margin-bottom: 16px; }
 </style>

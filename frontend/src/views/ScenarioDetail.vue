@@ -1,5 +1,27 @@
 <template>
-  <div class="sd-page">
+  <div v-if="scenarioLoading" class="sd-page scenario-state" aria-busy="true" aria-label="正在加载业务场景">
+    <el-skeleton :rows="5" animated />
+  </div>
+  <div v-else-if="scenarioAccessDenied" class="sd-page scenario-state">
+    <el-result
+      icon="warning"
+      title="你没有访问此业务场景的权限"
+      sub-title="该场景可能已被限制、移除，或当前账号没有读取权限。"
+    >
+      <template #extra>
+        <el-button type="primary" @click="goBack">返回业务场景</el-button>
+      </template>
+    </el-result>
+  </div>
+  <div v-else-if="scenarioLoadError" class="sd-page scenario-state">
+    <el-result icon="error" title="业务场景加载失败" :sub-title="scenarioLoadError">
+      <template #extra>
+        <el-button type="primary" @click="load">重新加载</el-button>
+        <el-button @click="goBack">返回业务场景</el-button>
+      </template>
+    </el-result>
+  </div>
+  <div v-else class="sd-page">
     <div class="page-header sd-header">
       <div class="ph-left">
         <el-button class="back-btn" @click="goBack"><el-icon><ArrowLeft /></el-icon> 返回</el-button>
@@ -9,7 +31,8 @@
         </div>
       </div>
       <div class="ph-right">
-        <el-button class="ai-btn" @click="runGenerate"><el-icon><MagicStick /></el-icon> AI 生成本体</el-button>
+        <el-tag v-if="!canWrite" type="info" effect="plain" aria-label="当前场景为只读访问">只读访问</el-tag>
+        <el-button v-else class="ai-btn" @click="runGenerate"><el-icon><MagicStick /></el-icon> AI 生成本体</el-button>
       </div>
     </div>
 
@@ -21,7 +44,7 @@
             <span class="stat">实体 <b>{{ detail.entities.length }}</b></span>
             <span class="stat">关系 <b>{{ detail.relations.length }}</b></span>
           </div>
-          <div class="tab-actions">
+          <div v-if="canWrite" class="tab-actions">
             <el-button size="small" @click="openEntity()"><el-icon><Plus /></el-icon> 实体</el-button>
             <el-button size="small" @click="openRelation()"><el-icon><Plus /></el-icon> 关系</el-button>
           </div>
@@ -31,14 +54,14 @@
             :data="schemaGraph"
             mode="schema"
             :legend="legend"
-            empty-text="暂无本体，点击「实体」创建，或用 AI 生成"
+            :empty-text="canWrite ? '暂无本体，点击「实体」创建，或用 AI 生成' : '暂无本体'"
             @select="onNodeSelect"
             @edge-click="onEdgeClick"
             @add-relation="onAddRelation"
             @canvas-click="clearSelection"
           />
           <EditorPanel
-            v-if="editor"
+            v-if="editor && canWrite"
             :editor="editor"
             :entities="detail.entities"
             :saving="saving"
@@ -61,7 +84,7 @@
             <el-select v-model="instFilter" placeholder="全部实体" clearable size="small" class="inst-filter">
               <el-option v-for="e in detail.entities" :key="e.id" :label="e.name" :value="e.id" />
             </el-select>
-            <el-button size="small" type="primary" @click="openInstance()"><el-icon><Plus /></el-icon> 添加实例</el-button>
+            <el-button v-if="canWrite" size="small" type="primary" @click="openInstance()"><el-icon><Plus /></el-icon> 添加实例</el-button>
           </div>
         </div>
         <div class="instance-workspace">
@@ -70,12 +93,12 @@
               :data="instanceGraph"
               mode="instance"
               :legend="legend"
-              empty-text="暂无实例，点击「添加实例」创建"
+              :empty-text="canWrite ? '暂无实例，点击「添加实例」创建' : '暂无实例'"
               @select="onInstSelect"
               @canvas-click="clearSelection"
             />
             <EditorPanel
-              v-if="editor"
+              v-if="editor && canWrite"
               :editor="editor"
               :entities="detail.entities"
               :saving="saving"
@@ -110,7 +133,7 @@
               >
                 <template #prefix><el-icon><Search /></el-icon></template>
               </el-input>
-              <span class="explorer-hint">回车搜索 · {{ objectTotal }} 个结果</span>
+              <span class="explorer-hint" role="status" aria-live="polite" aria-atomic="true">{{ objectResultStatus }}</span>
             </div>
             <div class="object-list" v-loading="objectLoading">
               <button
@@ -133,6 +156,21 @@
                 <span>{{ objectQuery ? '没有匹配对象，试试更短的关键词' : '暂无可浏览对象' }}</span>
               </div>
             </div>
+            <div v-if="!objectLoading && objectItems.length" class="object-pagination">
+              <span v-if="objectFilterPending" class="object-pagination-note">搜索条件已变更，按回车应用后会从第 1 条重新加载。</span>
+              <template v-else>
+                <span class="object-pagination-note">{{ hasMoreObjects ? `还可加载 ${Math.max(objectTotal - objectNextOffset, 0)} 个对象` : `已显示全部 ${objectTotal} 个对象` }}</span>
+                <el-button
+                  size="small"
+                  plain
+                  type="primary"
+                  :loading="objectLoadingMore"
+                  :disabled="objectLoading || objectLoadingMore || !hasMoreObjects"
+                  :aria-label="hasMoreObjects ? `加载更多对象，当前已加载 ${objectItems.length} 个，共 ${objectTotal} 个` : `已加载全部 ${objectTotal} 个对象`"
+                  @click="loadMoreObjects"
+                ><el-icon v-if="hasMoreObjects" aria-hidden="true"><MoreFilled /></el-icon>{{ hasMoreObjects ? '加载更多' : '已加载全部' }}</el-button>
+              </template>
+            </div>
             <div v-if="objectDetail" class="object-detail" aria-live="polite">
               <div class="object-detail-head">
                 <div class="object-title-wrap">
@@ -142,7 +180,7 @@
                     <small>{{ objectDetail.entity_name }}</small>
                   </div>
                 </div>
-                <el-button size="small" text type="primary" @click="openInstance(objectDetail.id)">编辑</el-button>
+                <el-button v-if="canWrite" size="small" text type="primary" @click="openInstance(objectDetail.id)">编辑</el-button>
               </div>
               <div class="object-meta-line">
                 <span class="runtime-badge" :class="`is-${objectDetail.provenance.kind}`">{{ objectDetail.provenance.kind === 'imported' ? '已导入' : '手动' }}</span>
@@ -190,7 +228,7 @@
       <el-tab-pane label="数据映射" name="mappings">
         <div class="tab-toolbar">
           <div class="tab-stats"><span class="stat">映射 <b>{{ detail.mappings.length }}</b></span></div>
-          <div class="tab-actions">
+          <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" @click="openMapping()"><el-icon><Plus /></el-icon> 添加映射</el-button>
           </div>
         </div>
@@ -228,17 +266,84 @@
                   <el-tooltip v-if="row.last_error" :content="row.last_error" placement="top">
                     <el-icon class="mapping-error-icon" aria-label="查看映射错误"><WarningFilled /></el-icon>
                   </el-tooltip>
+                  <small v-if="mappingRefreshJob(row)" class="mapping-job-state" role="status" aria-live="polite" aria-atomic="true">
+                    {{ row.entity_name || '数据映射' }}：{{ mappingJobLabel(mappingRefreshJob(row)?.status) }}
+                    <template v-if="mappingRefreshJob(row)?.status === 'queued'">（最多 {{ mappingRefreshJob(row)?.max_attempts || 0 }} 次）</template>
+                    <template v-else> · 第 {{ mappingRefreshJob(row)?.attempt || 0 }}/{{ mappingRefreshJob(row)?.max_attempts || 0 }} 次</template>
+                  </small>
                   <small v-if="row.last_refreshed_at" class="muted">{{ formatDate(row.last_refreshed_at) }}</small>
                 </div>
               </template>
             </el-table-column>
-            <el-table-column label="操作" min-width="340" fixed="right">
+            <el-table-column label="操作" :width="canWrite ? 340 : 82" fixed="right">
               <template #default="{ row }">
-                <el-button size="small" text @click="openMapping(row.id)">编辑</el-button>
+                <el-button v-if="canWrite" size="small" text @click="openMapping(row.id)">编辑</el-button>
                 <el-button size="small" text @click="doPreviewMapping(row)">预览</el-button>
-                <el-button size="small" text :loading="row._testing" @click="doTestMapping(row)">测试</el-button>
-                <el-button size="small" text type="primary" :loading="row._refreshing" @click="doRefreshMapping(row)">刷新实例</el-button>
-                <el-button size="small" text type="danger" @click="removeMapping(row.id)">删除</el-button>
+                <el-button v-if="canWrite" size="small" text :loading="row._testing" @click="doTestMapping(row)">测试</el-button>
+                <el-button v-if="canWrite" size="small" text type="primary" :loading="mappingRefreshActive(row)" :disabled="mappingRefreshActive(row)" @click="doRefreshMapping(row)">{{ mappingRefreshActive(row) ? '刷新中' : '刷新实例' }}</el-button>
+                <el-button v-if="canWrite" size="small" text type="danger" @click="removeMapping(row.id)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
+
+      <!-- ═══════════ 受治理函数（声明式契约）═══════════ -->
+      <el-tab-pane label="函数" name="functions" data-testid="functions-tab">
+        <div class="tab-toolbar">
+          <div class="tab-stats"><span class="stat">函数 <b>{{ detail.functions.length }}</b></span></div>
+          <div v-if="canWrite" class="tab-actions">
+            <el-button size="small" type="primary" data-testid="create-function" @click="openFunction()"><el-icon><Plus /></el-icon> 添加函数</el-button>
+          </div>
+        </div>
+        <el-alert
+          class="function-declaration-note"
+          title="函数仅登记声明式输入/输出契约，不包含代码、执行器或运行入口。"
+          type="info"
+          :closable="false"
+          show-icon
+        />
+        <div class="card map-card">
+          <el-table :data="detail.functions" class="map-table" :empty-text="canWrite ? '暂无函数，点击「添加函数」登记声明式契约' : '暂无函数'">
+            <el-table-column label="名称 / 说明" min-width="190">
+              <template #default="{ row }">
+                <div class="function-name-cell">
+                  <b>{{ row.name }}</b>
+                  <span class="muted">{{ row.description || '—' }}</span>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="输入 Schema" min-width="240">
+              <template #default="{ row }">
+                <pre class="function-schema mono" :aria-label="`${row.name} 的输入 Schema`">{{ formatFunctionSchema(row.input_schema) }}</pre>
+              </template>
+            </el-table-column>
+            <el-table-column label="输出 Schema" min-width="240">
+              <template #default="{ row }">
+                <pre class="function-schema mono" :aria-label="`${row.name} 的输出 Schema`">{{ formatFunctionSchema(row.output_schema) }}</pre>
+              </template>
+            </el-table-column>
+            <el-table-column label="标签" min-width="150">
+              <template #default="{ row }">
+                <div v-if="row.tags?.length" class="function-tags">
+                  <el-tag v-for="tag in row.tags" :key="tag" size="small" effect="plain">{{ tag }}</el-tag>
+                </div>
+                <span v-else class="muted">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="可见性" width="120">
+              <template #default="{ row }">
+                <el-tooltip content="仅为声明展示元数据；实际访问仍由场景 ACL 决定" placement="top">
+                  <el-tag size="small" effect="plain" :type="row.visibility === 'tenant' ? 'success' : 'info'">
+                    {{ row.visibility === 'tenant' ? '租户' : '场景内' }}
+                  </el-tag>
+                </el-tooltip>
+              </template>
+            </el-table-column>
+            <el-table-column v-if="canWrite" label="操作" width="145" fixed="right">
+              <template #default="{ row }">
+                <el-button size="small" text @click="openFunction(row.id)">编辑</el-button>
+                <el-button size="small" text type="danger" @click="removeFunction(row.id)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -249,12 +354,12 @@
       <el-tab-pane label="操作" name="actions">
         <div class="tab-toolbar">
           <div class="tab-stats"><span class="stat">操作 <b>{{ detail.actions.length }}</b></span></div>
-          <div class="tab-actions">
+          <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" @click="openAction()"><el-icon><Plus /></el-icon> 添加操作</el-button>
           </div>
         </div>
         <div class="card map-card">
-          <el-table :data="detail.actions" class="map-table" empty-text="暂无操作，点击「添加操作」创建">
+          <el-table :data="detail.actions" class="map-table" :empty-text="canWrite ? '暂无操作，点击「添加操作」创建' : '暂无操作'">
             <el-table-column label="名称" min-width="140">
               <template #default="{ row }"><b>{{ row.name }}</b></template>
             </el-table-column>
@@ -278,7 +383,7 @@
                 <el-tag size="small" :type="row.enabled === false ? 'info' : 'success'">{{ row.enabled === false ? '否' : '是' }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="245" fixed="right">
+            <el-table-column v-if="canWrite" label="操作" width="245" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" text @click="openAction(row.id)">编辑</el-button>
                 <el-button size="small" text type="primary" :loading="row._executing" @click="doExecuteAction(row)">参数与执行</el-button>
@@ -293,12 +398,12 @@
       <el-tab-pane label="规则" name="rules">
         <div class="tab-toolbar">
           <div class="tab-stats"><span class="stat">规则 <b>{{ detail.rules.length }}</b></span></div>
-          <div class="tab-actions">
+          <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" @click="openRule()"><el-icon><Plus /></el-icon> 添加规则</el-button>
           </div>
         </div>
         <div class="card map-card">
-          <el-table :data="detail.rules" class="map-table" empty-text="暂无规则，点击「添加规则」创建">
+          <el-table :data="detail.rules" class="map-table" :empty-text="canWrite ? '暂无规则，点击「添加规则」创建' : '暂无规则'">
             <el-table-column label="名称" min-width="140">
               <template #default="{ row }"><b>{{ row.name }}</b></template>
             </el-table-column>
@@ -318,7 +423,7 @@
             <el-table-column label="条件" min-width="220">
               <template #default="{ row }"><span class="mono cond-text">{{ condSummary(row.condition) }}</span></template>
             </el-table-column>
-            <el-table-column label="操作" width="200" fixed="right">
+            <el-table-column v-if="canWrite" label="操作" width="200" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" text @click="openRule(row.id)">编辑</el-button>
                 <el-button size="small" text type="primary" @click="doEvalRule(row)">评估</el-button>
@@ -333,12 +438,12 @@
       <el-tab-pane label="事件" name="events">
         <div class="tab-toolbar">
           <div class="tab-stats"><span class="stat">事件 <b>{{ detail.events.length }}</b></span></div>
-          <div class="tab-actions">
+          <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" @click="openEvent()"><el-icon><Plus /></el-icon> 添加事件</el-button>
           </div>
         </div>
         <div class="card map-card">
-          <el-table :data="detail.events" class="map-table" empty-text="暂无事件，点击「添加事件」创建">
+          <el-table :data="detail.events" class="map-table" :empty-text="canWrite ? '暂无事件，点击「添加事件」创建' : '暂无事件'">
             <el-table-column label="名称" min-width="140">
               <template #default="{ row }"><b>{{ row.name }}</b></template>
             </el-table-column>
@@ -353,8 +458,17 @@
                 <el-tag size="small" :type="row.enabled === false ? 'info' : 'success'">{{ row.enabled === false ? '否' : '是' }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="140" fixed="right">
+            <el-table-column v-if="canWrite" label="操作" width="205" fixed="right">
               <template #default="{ row }">
+                <el-button
+                  size="small"
+                  text
+                  type="primary"
+                  :disabled="row.enabled === false"
+                  :loading="publishingEventId === row.id"
+                  :title="row.enabled === false ? '请先启用事件后再发布' : '发布事件并异步触发订阅工作流'"
+                  @click="publishEvent(row)"
+                >发布</el-button>
                 <el-button size="small" text @click="openEvent(row.id)">编辑</el-button>
                 <el-button size="small" text type="danger" @click="removeEvent(row.id)">删除</el-button>
               </template>
@@ -366,7 +480,7 @@
       <!-- ═══════════ 工作流（Workflows）═══════════ -->
       <el-tab-pane label="工作流" name="workflows">
         <!-- 可视化编排画布 -->
-        <div v-if="wfEditor" class="wf-editor-stage">
+        <div v-if="wfEditor && canWrite" class="wf-editor-stage">
           <WorkflowEditor
             :model-value="wfEditor"
             :scenario-id="sid"
@@ -384,12 +498,12 @@
         <template v-else>
           <div class="tab-toolbar">
             <div class="tab-stats"><span class="stat">工作流 <b>{{ detail.workflows.length }}</b></span></div>
-            <div class="tab-actions">
+            <div v-if="canWrite" class="tab-actions">
               <el-button size="small" type="primary" @click="openWorkflow()"><el-icon><Plus /></el-icon> 新建工作流</el-button>
             </div>
           </div>
           <div class="card map-card">
-            <el-table :data="detail.workflows" class="map-table" empty-text="暂无工作流，点击「新建工作流」开始可视化编排">
+            <el-table :data="detail.workflows" class="map-table" :empty-text="canWrite ? '暂无工作流，点击「新建工作流」开始可视化编排' : '暂无工作流'">
               <el-table-column label="名称" min-width="140">
                 <template #default="{ row }"><b>{{ row.name }}</b></template>
               </el-table-column>
@@ -417,12 +531,12 @@
               <el-table-column label="描述" min-width="160">
                 <template #default="{ row }"><span class="muted">{{ row.description || '—' }}</span></template>
               </el-table-column>
-              <el-table-column label="操作" width="258" fixed="right">
+              <el-table-column label="操作" :width="canWrite ? 258 : 74" fixed="right">
                 <template #default="{ row }">
-                  <el-button size="small" text @click="openWorkflow(row.id)">编排</el-button>
-                  <el-button size="small" text type="primary" :disabled="row.status !== 'active'" :loading="row._executing" @click="doExecuteWorkflow(row)">执行</el-button>
+                  <el-button v-if="canWrite" size="small" text @click="openWorkflow(row.id)">编排</el-button>
+                  <el-button v-if="canWrite" size="small" text type="primary" :disabled="row.status !== 'active'" :loading="row._executing" @click="doExecuteWorkflow(row)">执行</el-button>
                   <el-button size="small" text @click="goToWorkflowTasks(row)">任务</el-button>
-                  <el-button size="small" text type="danger" @click="removeWorkflow(row.id)">删除</el-button>
+                  <el-button v-if="canWrite" size="small" text type="danger" @click="removeWorkflow(row.id)">删除</el-button>
                 </template>
               </el-table-column>
             </el-table>
@@ -432,7 +546,7 @@
     </el-tabs>
 
     <!-- ═══════════ 数据映射对话框 ═══════════ -->
-    <el-dialog v-model="mappingDlg" title="数据映射" width="600px" class="glass-dialog">
+    <el-dialog v-if="canWrite" v-model="mappingDlg" title="数据映射" width="600px" class="glass-dialog">
       <el-form label-position="top">
         <el-form-item label="目标实体">
           <el-select v-model="mappingForm.entity_id" style="width:100%">
@@ -443,6 +557,17 @@
           <el-select v-model="mappingForm.data_source_id" style="width:100%" @change="onMapDsChange">
             <el-option v-for="d in dataSources" :key="d.id" :label="d.name" :value="d.id" />
           </el-select>
+        </el-form-item>
+        <el-form-item label="运行时绑定键（非开发环境必填）">
+          <el-input
+            v-model.trim="mappingForm.data_source_binding_key"
+            class="mono"
+            placeholder="例如 data_source:orders:sqlite"
+            aria-describedby="mapping-runtime-binding-help"
+          />
+          <div id="mapping-runtime-binding-help" class="form-help">
+            在“连接器与环境”中为同一键配置各环境的数据源；留空仅兼容开发环境的当前数据源。
+          </div>
         </el-form-item>
         <el-form-item label="表名">
           <el-select v-model="mappingForm.table_name" style="width:100%" filterable allow-create placeholder="选择或输入表名">
@@ -541,8 +666,63 @@
       </template>
     </el-dialog>
 
+    <!-- ═══════════ 受治理函数对话框（仅声明式契约）═══════════ -->
+    <el-dialog v-if="canWrite" v-model="functionDlg" :title="functionForm.id ? '编辑函数' : '添加函数'" width="680px" class="glass-dialog" data-testid="function-dialog">
+      <el-alert
+        title="此处仅保存声明式 JSON Schema 契约；不支持代码、脚本、命令、URL 或执行配置。"
+        type="info"
+        :closable="false"
+        show-icon
+      />
+      <el-form label-position="top" class="function-form">
+        <div class="form-row">
+          <el-form-item label="函数名称" required class="form-col">
+            <el-input v-model="functionForm.name" maxlength="200" show-word-limit placeholder="如：计算订单风险等级" />
+          </el-form-item>
+          <el-form-item label="可见性" class="form-col">
+            <el-select v-model="functionForm.visibility" style="width:100%">
+              <el-option label="仅当前场景" value="scenario" />
+              <el-option label="租户范围展示" value="tenant" />
+            </el-select>
+            <div class="form-help">仅影响声明展示；实际授权始终以场景 ACL 为准。</div>
+          </el-form-item>
+        </div>
+        <el-form-item label="说明">
+          <el-input v-model="functionForm.description" type="textarea" :rows="2" maxlength="8000" show-word-limit placeholder="说明这个业务函数的输入、输出与适用范围" />
+        </el-form-item>
+        <el-form-item label="标签（用逗号分隔，可选）">
+          <el-input v-model="functionForm.tags_text" maxlength="1619" placeholder="如：订单、风险、只读" />
+          <div class="form-help">最多 20 个标签，每个标签最多 80 个字符。</div>
+        </el-form-item>
+        <el-form-item label="输入 Schema（JSON）" required>
+          <el-input
+            v-model="functionForm.input_schema_text"
+            type="textarea"
+            :rows="8"
+            class="mono"
+            placeholder='{"type":"object","properties":{"order_id":{"type":"string"}},"required":["order_id"],"additionalProperties":false}'
+          />
+          <div class="form-help">顶层必须是 <code>object</code> 类型 JSON Schema；仅描述数据结构。</div>
+        </el-form-item>
+        <el-form-item label="输出 Schema（JSON）" required>
+          <el-input
+            v-model="functionForm.output_schema_text"
+            type="textarea"
+            :rows="8"
+            class="mono"
+            placeholder='{"type":"object","properties":{"risk_level":{"type":"string"}},"additionalProperties":false}'
+          />
+          <div class="form-help">顶层必须是 <code>object</code> 类型 JSON Schema；不会创建执行能力。</div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button :disabled="functionSaving" @click="functionDlg = false">取消</el-button>
+        <el-button type="primary" :loading="functionSaving" @click="saveFunction">保存声明</el-button>
+      </template>
+    </el-dialog>
+
     <!-- ═══════════ 操作对话框 ═══════════ -->
-    <el-dialog v-model="actionDlg" :title="actionForm.id ? '编辑操作' : '添加操作'" width="640px" class="glass-dialog">
+    <el-dialog v-if="canWrite" v-model="actionDlg" :title="actionForm.id ? '编辑操作' : '添加操作'" width="640px" class="glass-dialog">
       <el-form label-position="top">
         <div class="form-row">
           <el-form-item label="名称" class="form-col">
@@ -561,10 +741,9 @@
           <el-form-item label="执行方式" class="form-col">
             <el-select v-model="actionForm.executor_type" style="width:100%">
               <el-option label="SQL 查询" value="sql" />
-              <el-option label="技能 (Skill)" value="skill" />
+              <el-option label="受管技能 (Skill)" value="skill" />
               <el-option label="MCP 工具" value="mcp" />
               <el-option label="HTTP 请求" value="http" />
-              <el-option label="Python 脚本" value="script" />
             </el-select>
           </el-form-item>
           <el-form-item label="启用" class="form-col">
@@ -583,6 +762,9 @@
         </div>
         <el-form-item label="执行配置（JSON，按执行方式不同而不同）">
           <el-input v-model="actionForm.executor_config_text" type="textarea" :rows="5" class="mono" placeholder='{"data_source_id": "...", "sql": "SELECT ..."}' />
+          <div class="form-help" data-testid="action-runtime-binding-help">
+            受治理的 SQL/MCP 可额外保存 <code>data_source_binding_key</code> 或 <code>mcp_binding_key</code>（以及对应的 <code>…_binding_ref</code>）；Skill 必须使用 <code>skill_id</code>。运行环境由部署实例固定；生产和预发布不会回退到开发环境的直接 ID。
+          </div>
         </el-form-item>
         <el-form-item label="输入参数 Schema（JSON，可选）">
           <el-input v-model="actionForm.input_schema_text" type="textarea" :rows="3" class="mono" placeholder='{"drug_name": {"type": "string"}}' />
@@ -595,7 +777,7 @@
     </el-dialog>
 
     <!-- ═══════════ 操作参数与安全执行对话框 ═══════════ -->
-    <el-dialog v-model="actionExecuteDlg" :title="`执行操作：${actionExecuteRow?.name || ''}`" width="640px" class="glass-dialog">
+    <el-dialog v-if="canWrite" v-model="actionExecuteDlg" :title="`执行操作：${actionExecuteRow?.name || ''}`" width="640px" class="glass-dialog">
       <el-alert
         :title="`权限范围：${actionExecuteRow?.permission_scope || 'scenario'} · ${actionExecuteRow?.requires_confirmation === false ? '可直接执行' : '需要确认后执行'}`"
         type="info"
@@ -641,6 +823,34 @@
         <template #title>预演完成：未调用执行器，可确认执行</template>
         <pre class="action-preview-text mono">{{ JSON.stringify(actionPreviewResult.result?.plan || actionPreviewResult.result, null, 2) }}</pre>
       </el-alert>
+      <div v-if="actionPreviewResult?.connector_audit?.length" class="action-runtime-audit" role="status">
+        <span>运行时连接器</span>
+        <el-tag v-for="audit in actionPreviewResult.connector_audit" :key="`${audit.kind}-${audit.binding_id || audit.connector_id}`" size="small" effect="plain">
+          {{ audit.environment }} · {{ audit.connector_name || audit.connector_id }}{{ audit.managed ? '（受治理绑定）' : '（兼容直连）' }}
+        </el-tag>
+      </div>
+      <dl v-if="actionPreviewResult" class="action-runtime-provenance" aria-label="本次预演的运行定义证据">
+        <div>
+          <dt>运行环境</dt>
+          <dd>{{ actionPreviewResult.environment || 'dev' }}</dd>
+        </div>
+        <div>
+          <dt>定义来源</dt>
+          <dd>{{ actionPreviewResult.definition_source === 'release' ? '已发布快照' : '开发中定义' }}</dd>
+        </div>
+        <div v-if="actionPreviewResult.definition_snapshot_id">
+          <dt>发布快照 ID</dt>
+          <dd class="mono">{{ actionPreviewResult.definition_snapshot_id }}</dd>
+        </div>
+        <div v-if="actionPreviewResult.release_id">
+          <dt>发布记录 ID</dt>
+          <dd class="mono">{{ actionPreviewResult.release_id }}</dd>
+        </div>
+        <div v-if="actionPreviewResult.definition_hash">
+          <dt>定义校验哈希</dt>
+          <dd class="mono">{{ actionPreviewResult.definition_hash }}</dd>
+        </div>
+      </dl>
       <template #footer>
         <el-button @click="actionExecuteDlg = false">取消</el-button>
         <el-button :loading="actionPreviewing" @click="previewActionExecution">预演</el-button>
@@ -649,7 +859,7 @@
     </el-dialog>
 
     <!-- ═══════════ 规则对话框 ═══════════ -->
-    <el-dialog v-model="ruleDlg" :title="ruleForm.id ? '编辑规则' : '添加规则'" width="640px" class="glass-dialog">
+    <el-dialog v-if="canWrite" v-model="ruleDlg" :title="ruleForm.id ? '编辑规则' : '添加规则'" width="640px" class="glass-dialog">
       <el-form label-position="top">
         <div class="form-row">
           <el-form-item label="名称" class="form-col">
@@ -690,7 +900,7 @@
     </el-dialog>
 
     <!-- ═══════════ 事件对话框 ═══════════ -->
-    <el-dialog v-model="eventDlg" :title="eventForm.id ? '编辑事件' : '添加事件'" width="560px" class="glass-dialog">
+    <el-dialog v-if="canWrite" v-model="eventDlg" :title="eventForm.id ? '编辑事件' : '添加事件'" width="560px" class="glass-dialog">
       <el-form label-position="top">
         <div class="form-row">
           <el-form-item label="名称" class="form-col">
@@ -725,7 +935,7 @@
     </el-dialog>
 
     <!-- ═══════════ AI 生成对话框 ═══════════ -->
-    <el-dialog v-model="aiDlg" title="AI 生成本体" width="640px" class="glass-dialog">
+    <el-dialog v-if="canWrite" v-model="aiDlg" title="AI 生成本体" width="640px" class="glass-dialog">
       <el-input v-model="aiDesc" type="textarea" :rows="3" placeholder="描述你的业务场景，AI 将自动设计实体、属性与关系…" />
       <div class="ai-preview" v-if="aiResult">
         <div class="ai-sec">
@@ -761,18 +971,24 @@ import { api } from '@/api'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import EditorPanel from '@/components/EditorPanel.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
-import type { ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, DataMapping, DataMappingPreview, ObjectDetail, ObjectSearchItem, WorkflowRun } from '@/types'
+import type { ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, WorkflowRun } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
 const sid = route.params.id as string
+const scenarioLoading = ref(true)
+const scenarioAccessDenied = ref(false)
+const scenarioLoadError = ref('')
 
 const detail = ref<ScenarioDetail>({
   id: sid, name: '', description: '',
   entities: [], relations: [], data_sources: [],
   instances: [], relation_instances: [], mappings: [],
+  functions: [],
   actions: [], rules: [], events: [], workflows: [],
 })
+// The API supplies this per current user; treat an absent value as read-only.
+const canWrite = computed(() => detail.value.can_write === true)
 const dataSources = ref<any[]>([])
 const llmConfigs = ref<any[]>([])
 const tab = ref('ontology')
@@ -782,8 +998,15 @@ const objectQuery = ref('')
 const objectItems = ref<ObjectSearchItem[]>([])
 const objectTotal = ref(0)
 const objectLoading = ref(false)
+const objectLoadingMore = ref(false)
+const objectNextOffset = ref(0)
+const objectAppliedKey = ref('')
 const selectedObjectId = ref<string | null>(null)
 const objectDetail = ref<ObjectDetail | null>(null)
+const OBJECT_PAGE_SIZE = 50
+let objectRequestId = 0
+let objectSearchViewDisposed = false
+let objectPendingKey = ''
 
 const graphPalette = ['#27b9b0', '#438be5', '#65a9df', '#4aa9c1', '#52c3a1', '#6f93d7']
 function visualColor(color: string | undefined, index: number) {
@@ -850,6 +1073,20 @@ const instanceGraph = computed<GraphData>(() => {
   return { nodes, edges }
 })
 const legend = computed(() => detail.value.entities.map((e, index) => ({ label: e.name, color: visualColor(e.color, index) })))
+function objectSearchKey() {
+  return JSON.stringify([objectQuery.value.trim(), instFilter.value || ''])
+}
+const objectFilterPending = computed(() => Boolean(objectAppliedKey.value) && objectAppliedKey.value !== objectSearchKey())
+const hasMoreObjects = computed(() => !objectFilterPending.value && objectNextOffset.value < objectTotal.value)
+const objectResultStatus = computed(() => {
+  if (objectLoading.value) return '正在加载对象列表…'
+  if (objectLoadingMore.value) return `正在加载更多对象；已加载 ${objectItems.value.length} / ${objectTotal.value} 个结果`
+  if (objectFilterPending.value) return `当前显示 ${objectItems.value.length} / ${objectTotal.value} 个结果；搜索条件已变更，按回车应用`
+  if (!objectTotal.value) return objectQuery.value.trim() ? '没有匹配对象' : '暂无可浏览对象'
+  return hasMoreObjects.value
+    ? `已加载 ${objectItems.value.length} / ${objectTotal.value} 个结果，可继续加载更多`
+    : `已加载全部 ${objectTotal.value} 个结果`
+})
 
 function entName(id: string) { return detail.value.entities.find((e) => e.id === id)?.name || '—' }
 function entColor(id: string) {
@@ -860,23 +1097,71 @@ function dsName(id: string) { return dataSources.value.find((d) => d.id === id)?
 
 // ── 对象运行时浏览 ──
 async function searchObjects() {
+  const requestKey = objectSearchKey()
+  if (objectLoading.value && requestKey === objectPendingKey) return
+  const requestId = ++objectRequestId
+  objectPendingKey = requestKey
   objectLoading.value = true
+  // A reset invalidates an older append request. It is not safe to append a
+  // page captured under a prior entity filter or keyword after this point.
+  objectLoadingMore.value = false
   try {
     const result = await api.searchObjects(sid, {
       q: objectQuery.value.trim() || undefined,
       entity_id: instFilter.value || undefined,
-      limit: 50,
+      limit: OBJECT_PAGE_SIZE,
+      offset: 0,
     })
+    if (objectSearchViewDisposed || requestId !== objectRequestId || requestKey !== objectSearchKey()) return
     objectItems.value = result.items
     objectTotal.value = result.total
+    objectNextOffset.value = result.offset + result.items.length
+    objectAppliedKey.value = requestKey
     if (selectedObjectId.value && !result.items.some((item) => item.id === selectedObjectId.value)) {
       selectedObjectId.value = null
       objectDetail.value = null
     }
   } catch (e: any) {
-    ElMessage.error(e?.response?.data?.detail || e?.message || '对象列表加载失败')
+    if (!objectSearchViewDisposed && requestId === objectRequestId) {
+      // Preserve the current visible page and the existing ACL/error behavior.
+      // A failed refresh must never discard objects the user was already allowed to see.
+      ElMessage.error(e?.response?.data?.detail || e?.message || '对象列表加载失败')
+    }
   } finally {
-    objectLoading.value = false
+    if (!objectSearchViewDisposed && requestId === objectRequestId) {
+      objectLoading.value = false
+      objectPendingKey = ''
+    }
+  }
+}
+
+async function loadMoreObjects() {
+  if (objectLoading.value || objectLoadingMore.value || objectFilterPending.value || !hasMoreObjects.value) return
+  const requestKey = objectSearchKey()
+  const offset = objectNextOffset.value
+  const requestId = ++objectRequestId
+  objectLoadingMore.value = true
+  try {
+    const result = await api.searchObjects(sid, {
+      q: objectQuery.value.trim() || undefined,
+      entity_id: instFilter.value || undefined,
+      limit: OBJECT_PAGE_SIZE,
+      offset,
+    })
+    if (objectSearchViewDisposed || requestId !== objectRequestId || requestKey !== objectSearchKey() || objectAppliedKey.value !== requestKey) return
+    // Offset pagination may overlap if the dataset changes while the user is
+    // browsing. Deduplicate by stable object ID rather than showing duplicate rows.
+    const knownIds = new Set(objectItems.value.map((item) => item.id))
+    const appended = result.items.filter((item) => !knownIds.has(item.id))
+    objectItems.value = [...objectItems.value, ...appended]
+    objectTotal.value = result.total
+    objectNextOffset.value = Math.max(objectNextOffset.value, result.offset + result.items.length)
+  } catch (e: any) {
+    if (!objectSearchViewDisposed && requestId === objectRequestId) {
+      ElMessage.error(e?.response?.data?.detail || e?.message || '加载更多对象失败')
+    }
+  } finally {
+    if (!objectSearchViewDisposed && requestId === objectRequestId) objectLoadingMore.value = false
   }
 }
 
@@ -901,6 +1186,7 @@ function onNodeSelect(node: any) {
   window.dispatchEvent(new CustomEvent('ontology-selection-change', {
     detail: { id: node.id, kind: tab.value === 'instances' ? 'instance' : 'entity', label: node.label || node.name || node.id },
   }))
+  if (!canWrite.value) return
   if (tab.value === 'instances') openInstance(node.id)
   else openEntity(node.id)
 }
@@ -908,9 +1194,11 @@ function onInstSelect(node: any) {
   window.dispatchEvent(new CustomEvent('ontology-selection-change', {
     detail: { id: node.id, kind: node.id.startsWith('ent:') ? 'entity' : 'instance', label: node.label || node.name || node.id },
   }))
-  if (node.id.startsWith('ent:')) openEntity(node.id.slice(4))
+  if (node.id.startsWith('ent:')) {
+    if (canWrite.value) openEntity(node.id.slice(4))
+  }
   else {
-    openInstance(node.id)
+    if (canWrite.value) openInstance(node.id)
     selectObject(node.id)
   }
 }
@@ -918,9 +1206,10 @@ function onEdgeClick(edge: any) {
   window.dispatchEvent(new CustomEvent('ontology-selection-change', {
     detail: { id: edge.id, kind: tab.value === 'instances' ? 'relation-instance' : 'relation', label: edge.label || edge.id },
   }))
-  if (tab.value !== 'instances') openRelation(edge.id)
+  if (canWrite.value && tab.value !== 'instances') openRelation(edge.id)
 }
 function onAddRelation(sourceId: string, targetId: string) {
+  if (!canWrite.value) return
   openRelation()
   if (editor.value) {
     editor.value.form.source_entity_id = sourceId
@@ -937,6 +1226,7 @@ function closeEditor() { editor.value = null }
 
 // ── 打开编辑器 ──
 function openEntity(id?: string) {
+  if (!canWrite.value) return
   const e = id ? detail.value.entities.find((x) => x.id === id) : null
   editor.value = {
     kind: 'entity',
@@ -947,6 +1237,7 @@ function openEntity(id?: string) {
   }
 }
 function openRelation(id?: string) {
+  if (!canWrite.value) return
   const r = id ? detail.value.relations.find((x) => x.id === id) : null
   editor.value = {
     kind: 'relation',
@@ -957,6 +1248,7 @@ function openRelation(id?: string) {
   }
 }
 function openInstance(id?: string) {
+  if (!canWrite.value) return
   const i = id ? detail.value.instances.find((x) => x.id === id) : null
   editor.value = {
     kind: 'instance',
@@ -969,7 +1261,7 @@ function openInstance(id?: string) {
 
 // ── 保存 / 删除 ──
 async function saveEditor() {
-  if (!editor.value) return
+  if (!canWrite.value || !editor.value) return
   const { kind, id, form } = editor.value
   saving.value = true
   try {
@@ -999,7 +1291,7 @@ async function saveEditor() {
   }
 }
 async function deleteEditor() {
-  if (!editor.value) return
+  if (!canWrite.value || !editor.value) return
   const { kind, id } = editor.value
   if (!id) { editor.value = null; return }
   const names = { entity: '实体', relation: '关系', instance: '实例' }
@@ -1022,6 +1314,10 @@ const mapCols = ref<string[]>([])
 const mappingPreviewDlg = ref(false)
 const mappingPreviewLoading = ref(false)
 const mappingPreview = ref<DataMappingPreview | null>(null)
+const mappingRefreshJobs = ref<Record<string, DataMappingRefreshJob>>({})
+const mappingRefreshTimers = new Map<string, number>()
+const mappingRefreshFailures = new Map<string, number>()
+let mappingRefreshViewDisposed = false
 const mappingPreviewRows = computed(() => {
   const preview = mappingPreview.value
   if (!preview) return []
@@ -1031,10 +1327,90 @@ const mappingPreviewRows = computed(() => {
 })
 
 function mappingStatusLabel(status?: string) {
-  return ({ unknown: '未检查', ready: '已通过', ok: '已刷新', error: '有错误' } as Record<string, string>)[status || 'unknown'] || '未检查'
+  return ({ unknown: '未检查', ready: '已通过', queued: '已排队', refreshing: '刷新中', retry_waiting: '等待重试', ok: '已刷新', error: '有错误' } as Record<string, string>)[status || 'unknown'] || '未检查'
 }
 function mappingStatusType(status?: string) {
-  return ({ unknown: 'info', ready: 'success', ok: 'success', error: 'danger' } as Record<string, string>)[status || 'unknown'] || 'info'
+  return ({ unknown: 'info', ready: 'success', queued: 'warning', refreshing: 'primary', retry_waiting: 'warning', ok: 'success', error: 'danger' } as Record<string, string>)[status || 'unknown'] || 'info'
+}
+function mappingRefreshJob(row: DataMapping): DataMappingRefreshJob | undefined {
+  return row.id ? mappingRefreshJobs.value[row.id] : undefined
+}
+function mappingRefreshActive(row: DataMapping): boolean {
+  return ['queued', 'running', 'retry_waiting'].includes(mappingRefreshJob(row)?.status || '')
+}
+function mappingJobLabel(status?: string): string {
+  return ({ queued: '已排队', running: '刷新中', retry_waiting: '等待重试', succeeded: '已完成', failed: '失败', timed_out: '超时', cancelled: '已取消', tracking_unavailable: '状态暂不可查询' } as Record<string, string>)[status || ''] || '处理中'
+}
+function clearMappingRefreshTimer(mappingId: string) {
+  const timer = mappingRefreshTimers.get(mappingId)
+  if (timer !== undefined) window.clearTimeout(timer)
+  mappingRefreshTimers.delete(mappingId)
+}
+function mappingRefreshIsCurrent(mappingId: string, jobId: string): boolean {
+  return mappingRefreshJobs.value[mappingId]?.id === jobId
+}
+function clearMappingRefreshTracking(mappingId: string) {
+  clearMappingRefreshTimer(mappingId)
+  mappingRefreshFailures.delete(mappingId)
+  if (mappingRefreshJobs.value[mappingId]) {
+    const { [mappingId]: _removed, ...remaining } = mappingRefreshJobs.value
+    mappingRefreshJobs.value = remaining
+  }
+}
+function stopMappingRefreshPolling(mappingId: string, jobId: string, message: string) {
+  if (!mappingRefreshIsCurrent(mappingId, jobId)) return
+  clearMappingRefreshTimer(mappingId)
+  mappingRefreshFailures.delete(mappingId)
+  const job = mappingRefreshJobs.value[mappingId]
+  if (job) {
+    mappingRefreshJobs.value = {
+      ...mappingRefreshJobs.value,
+      // 后台任务仍是持久化的未知状态；不能把本地轮询失败误报成服务端失败。
+      [mappingId]: { ...job, status: 'tracking_unavailable', error: message },
+    }
+  }
+  ElMessage.error(message)
+}
+async function pollMappingRefresh(mappingId: string, jobId: string) {
+  if (mappingRefreshViewDisposed || !mappingRefreshIsCurrent(mappingId, jobId)) return
+  try {
+    const job = await api.getMappingRefreshJob(jobId)
+    if (mappingRefreshViewDisposed || !mappingRefreshIsCurrent(mappingId, jobId)) return
+    mappingRefreshFailures.delete(mappingId)
+    mappingRefreshJobs.value = { ...mappingRefreshJobs.value, [mappingId]: job }
+    if (['queued', 'running', 'retry_waiting'].includes(job.status)) {
+      clearMappingRefreshTimer(mappingId)
+      mappingRefreshTimers.set(mappingId, window.setTimeout(() => { void pollMappingRefresh(mappingId, jobId) }, 900))
+      return
+    }
+    clearMappingRefreshTimer(mappingId)
+    mappingRefreshFailures.delete(mappingId)
+    if (job.status === 'succeeded') {
+      ElMessage.success(`刷新完成：扫描 ${job.rows_scanned} 行，新增 ${job.instances_created} 个对象，更新 ${job.instances_updated} 个对象`)
+    } else {
+      ElMessage.error(job.error || `映射刷新${mappingJobLabel(job.status)}`)
+    }
+    if (mappingRefreshViewDisposed || !mappingRefreshIsCurrent(mappingId, jobId)) return
+    await load()
+  } catch (e: any) {
+    // 短暂网络抖动不应把持久化任务误报为失败；保留状态并继续轮询。
+    if (mappingRefreshViewDisposed || !mappingRefreshIsCurrent(mappingId, jobId)) return
+    const responseStatus = Number(e?.status || e?.response?.status || 0)
+    const failureCount = (mappingRefreshFailures.get(mappingId) || 0) + 1
+    if ([401, 403, 404].includes(responseStatus) || failureCount > 5) {
+      const detail = e?.response?.data?.detail || e?.message
+      stopMappingRefreshPolling(
+        mappingId,
+        jobId,
+        detail || (responseStatus ? '无法继续读取映射刷新状态，请稍后重试' : '刷新状态暂时不可查询，请稍后再次点击刷新继续跟踪'),
+      )
+      return
+    }
+    mappingRefreshFailures.set(mappingId, failureCount)
+    clearMappingRefreshTimer(mappingId)
+    const retryDelay = Math.min(1500 * (2 ** (failureCount - 1)), 15000)
+    mappingRefreshTimers.set(mappingId, window.setTimeout(() => { void pollMappingRefresh(mappingId, jobId) }, retryDelay))
+  }
 }
 function mappingFieldLabel(status: string) {
   return ({ mapped: '已映射', missing: '未配置', invalid: '源列不存在' } as Record<string, string>)[status] || status
@@ -1054,10 +1430,11 @@ function formatDate(value?: string) {
 }
 
 function openMapping(id?: string) {
+  if (!canWrite.value) return
   const m = id ? detail.value.mappings.find((x) => x.id === id) : null
   mappingForm.value = m
-    ? { ...m, column_map: { ...(m.column_map || {}) } }
-    : { entity_id: detail.value.entities[0]?.id, data_source_id: dataSources.value[0]?.id, table_name: '', column_map: {} }
+    ? { ...m, data_source_binding_ref: { ...(m.data_source_binding_ref || {}) }, column_map: { ...(m.column_map || {}) } }
+    : { entity_id: detail.value.entities[0]?.id, data_source_id: dataSources.value[0]?.id, data_source_binding_key: '', data_source_binding_ref: {}, table_name: '', column_map: {} }
   mappingDlg.value = true
   loadTables()
 }
@@ -1076,9 +1453,18 @@ watch(() => mappingForm.value.table_name, () => {
   if (mappingForm.value.data_source_id) loadTables()
 })
 async function saveMapping() {
+  if (!canWrite.value) return
   try {
     // 后端无独立更新接口：create 会替换同实体的旧映射
-    await api.createMapping(sid, mappingForm.value)
+    const replacedMappingId = mappingForm.value.id
+    const bindingKey = (mappingForm.value.data_source_binding_key || '').trim()
+    const saved = await api.createMapping(sid, {
+      ...mappingForm.value,
+      data_source_binding_key: bindingKey,
+      // 表单只编辑键；清空键即明确解除旧的兼容描述，避免提交孤立 ref。
+      data_source_binding_ref: bindingKey ? (mappingForm.value.data_source_binding_ref || {}) : {},
+    })
+    if (replacedMappingId && replacedMappingId !== saved.id) clearMappingRefreshTracking(replacedMappingId)
     mappingDlg.value = false
     await load()
     ElMessage.success('已保存')
@@ -1099,7 +1485,7 @@ async function doPreviewMapping(row: DataMapping) {
   }
 }
 async function doTestMapping(row: any) {
-  if (!row.id) return
+  if (!canWrite.value || !row.id) return
   row._testing = true
   try {
     const result = await api.testMapping(row.id)
@@ -1113,26 +1499,138 @@ async function doTestMapping(row: any) {
   } finally { row._testing = false }
 }
 async function doRefreshMapping(row: any) {
-  if (!row.id) return
-  row._refreshing = true
+  if (!canWrite.value || !row.id || mappingRefreshActive(row)) return
   try {
-    const result = await api.refreshMapping(row.id)
-    if (!result.ok) {
-      ElMessage.error(result.message || result.last_error || '映射刷新失败')
-      await load()
-      return
-    }
-    ElMessage.success(`刷新完成：扫描 ${result.rows_scanned} 行，新增 ${result.instances_created} 个对象`)
+    const job = await api.enqueueMappingRefresh(row.id)
+    mappingRefreshJobs.value = { ...mappingRefreshJobs.value, [row.id]: job }
+    clearMappingRefreshTimer(row.id)
+    mappingRefreshFailures.delete(row.id)
+    ElMessage.info(job.status === 'queued' ? '映射刷新已入队' : `映射刷新${mappingJobLabel(job.status)}`)
     await load()
+    void pollMappingRefresh(row.id, job.id)
   } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '映射刷新失败') }
-  finally { row._refreshing = false }
 }
 async function removeMapping(id: string) {
+  if (!canWrite.value) return
   try {
     await ElMessageBox.confirm('确定删除该映射？', '提示', { type: 'warning' })
     await api.deleteMapping(id)
+    clearMappingRefreshTracking(id)
     await load()
   } catch { /* ignore */ }
+}
+
+// ── 受治理函数（仅声明式契约，不执行）──
+type FunctionForm = {
+  id?: string
+  name: string
+  description: string
+  tags_text: string
+  visibility: 'scenario' | 'tenant'
+  input_schema_text: string
+  output_schema_text: string
+}
+
+const emptyFunctionSchema = (): Record<string, unknown> => ({
+  type: 'object', properties: {}, additionalProperties: false,
+})
+const functionDlg = ref(false)
+const functionSaving = ref(false)
+const functionForm = ref<FunctionForm>({
+  name: '', description: '', tags_text: '', visibility: 'scenario',
+  input_schema_text: JSON.stringify(emptyFunctionSchema(), null, 2),
+  output_schema_text: JSON.stringify(emptyFunctionSchema(), null, 2),
+})
+
+function formatFunctionSchema(schema?: Record<string, unknown>) {
+  return JSON.stringify(schema || emptyFunctionSchema(), null, 2)
+}
+function openFunction(id?: string) {
+  if (!canWrite.value) return
+  const fn = id ? detail.value.functions.find((item) => item.id === id) : null
+  functionForm.value = fn
+    ? {
+        id: fn.id,
+        name: fn.name,
+        description: fn.description || '',
+        tags_text: (fn.tags || []).join(', '),
+        visibility: fn.visibility === 'tenant' ? 'tenant' : 'scenario',
+        input_schema_text: formatFunctionSchema(fn.input_schema),
+        output_schema_text: formatFunctionSchema(fn.output_schema),
+      }
+    : {
+        name: '', description: '', tags_text: '', visibility: 'scenario',
+        input_schema_text: JSON.stringify(emptyFunctionSchema(), null, 2),
+        output_schema_text: JSON.stringify(emptyFunctionSchema(), null, 2),
+      }
+  functionDlg.value = true
+}
+function parseFunctionSchema(text: string, label: string): Record<string, unknown> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error(`${label}必须是有效 JSON`)
+  }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+    throw new Error(`${label}必须是 JSON Schema 对象`)
+  }
+  if ((parsed as Record<string, unknown>).type !== 'object') {
+    throw new Error(`${label}顶层 type 必须为 object`)
+  }
+  return parsed as Record<string, unknown>
+}
+function parseFunctionTags(text: string): string[] {
+  const tags = [...new Set(text.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean))]
+  if (tags.length > 20) throw new Error('函数标签不能超过 20 个')
+  if (tags.some((tag) => tag.length > 80)) throw new Error('单个函数标签不能超过 80 个字符')
+  return tags
+}
+async function saveFunction() {
+  if (!canWrite.value || functionSaving.value) return
+  const name = functionForm.value.name.trim()
+  if (!name) { ElMessage.error('请填写函数名称'); return }
+  let payload: FunctionDefinition
+  try {
+    payload = {
+      name,
+      description: functionForm.value.description.trim(),
+      tags: parseFunctionTags(functionForm.value.tags_text),
+      visibility: functionForm.value.visibility,
+      input_schema: parseFunctionSchema(functionForm.value.input_schema_text, '输入 Schema'),
+      output_schema: parseFunctionSchema(functionForm.value.output_schema_text, '输出 Schema'),
+    }
+  } catch (error: any) {
+    ElMessage.error(error?.message || '函数声明格式错误')
+    return
+  }
+  functionSaving.value = true
+  try {
+    if (functionForm.value.id) await api.updateFunction(functionForm.value.id, payload)
+    else await api.createFunction(sid, payload)
+    functionDlg.value = false
+    await load()
+    ElMessage.success('函数声明已保存')
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.detail || error?.message || '函数声明保存失败')
+  } finally {
+    functionSaving.value = false
+  }
+}
+async function removeFunction(id?: string) {
+  if (!canWrite.value || !id) return
+  try {
+    await ElMessageBox.confirm('确定删除该函数声明？删除不会执行函数，但可能受已发布版本保护。', '删除函数声明', {
+      type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消',
+    })
+  } catch { return }
+  try {
+    await api.deleteFunction(id)
+    await load()
+    ElMessage.success('函数声明已删除')
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.detail || error?.message || '函数声明删除失败')
+  }
 }
 
 // ── 操作（Actions）──
@@ -1169,6 +1667,7 @@ function createIdempotencyKey() {
   return `action-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
 function openAction(id?: string) {
+  if (!canWrite.value) return
   const a = id ? detail.value.actions.find((x) => x.id === id) : null
   actionForm.value = a
     ? { ...a, executor_config_text: JSON.stringify(a.executor_config || {}, null, 2), input_schema_text: JSON.stringify(a.input_schema || {}, null, 2) }
@@ -1180,6 +1679,7 @@ function openAction(id?: string) {
   actionDlg.value = true
 }
 async function saveAction() {
+  if (!canWrite.value) return
   const f = { ...actionForm.value }
   try {
     f.executor_config = f.executor_config_text ? JSON.parse(f.executor_config_text) : {}
@@ -1195,6 +1695,7 @@ async function saveAction() {
   } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
 }
 async function removeAction(id: string) {
+  if (!canWrite.value) return
   try {
     await ElMessageBox.confirm('确定删除该操作？', '提示', { type: 'warning' })
     await api.deleteAction(id)
@@ -1202,6 +1703,7 @@ async function removeAction(id: string) {
   } catch { /* ignore */ }
 }
 async function doExecuteAction(row: any) {
+  if (!canWrite.value) return
   actionExecuteRow.value = row
   actionParamsForm.value = {}
   actionParamsText.value = {}
@@ -1239,7 +1741,7 @@ function buildActionParams(): Record<string, any> {
   return params
 }
 async function previewActionExecution() {
-  if (!actionExecuteRow.value?.id) return
+  if (!canWrite.value || !actionExecuteRow.value?.id) return
   actionPreviewing.value = true
   try {
     const params = buildActionParams()
@@ -1251,7 +1753,7 @@ async function previewActionExecution() {
   } finally { actionPreviewing.value = false }
 }
 async function confirmActionExecution() {
-  if (!actionExecuteRow.value?.id) return
+  if (!canWrite.value || !actionExecuteRow.value?.id) return
   actionExecuting.value = true
   try {
     const params = buildActionParams()
@@ -1274,6 +1776,7 @@ async function confirmActionExecution() {
 const ruleDlg = ref(false)
 const ruleForm = ref<any>({ condition_text: '' })
 function openRule(id?: string) {
+  if (!canWrite.value) return
   const r = id ? detail.value.rules.find((x) => x.id === id) : null
   ruleForm.value = r
     ? { ...r, condition_text: JSON.stringify(r.condition || {}, null, 2) }
@@ -1281,6 +1784,7 @@ function openRule(id?: string) {
   ruleDlg.value = true
 }
 async function saveRule() {
+  if (!canWrite.value) return
   const f = { ...ruleForm.value }
   try {
     f.condition = f.condition_text ? JSON.parse(f.condition_text) : {}
@@ -1295,6 +1799,7 @@ async function saveRule() {
   } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
 }
 async function removeRule(id: string) {
+  if (!canWrite.value) return
   try {
     await ElMessageBox.confirm('确定删除该规则？', '提示', { type: 'warning' })
     await api.deleteRule(id)
@@ -1302,6 +1807,7 @@ async function removeRule(id: string) {
   } catch { /* ignore */ }
 }
 async function doEvalRule(row: any) {
+  if (!canWrite.value) return
   try {
     const record = await promptParams(row.condition, '输入待评估的数据记录（JSON）')
     const res = await api.evaluateRule(row.id!, record)
@@ -1322,7 +1828,9 @@ function condSummary(c: any): string {
 // ── 事件（Events）──
 const eventDlg = ref(false)
 const eventForm = ref<any>({ payload_schema_text: '' })
+const publishingEventId = ref<string | null>(null)
 function openEvent(id?: string) {
+  if (!canWrite.value) return
   const e = id ? detail.value.events.find((x) => x.id === id) : null
   eventForm.value = e
     ? { ...e, payload_schema_text: JSON.stringify(e.payload_schema || {}, null, 2) }
@@ -1330,6 +1838,7 @@ function openEvent(id?: string) {
   eventDlg.value = true
 }
 async function saveEvent() {
+  if (!canWrite.value) return
   const f = { ...eventForm.value }
   try {
     f.payload_schema = f.payload_schema_text ? JSON.parse(f.payload_schema_text) : {}
@@ -1344,6 +1853,7 @@ async function saveEvent() {
   } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
 }
 async function removeEvent(id: string) {
+  if (!canWrite.value) return
   try {
     await ElMessageBox.confirm('确定删除该事件？', '提示', { type: 'warning' })
     await api.deleteEvent(id)
@@ -1354,6 +1864,7 @@ async function removeEvent(id: string) {
 // ── 工作流（Workflows）：可视化编排 ──
 const wfEditor = ref<any>(null)
 function openWorkflow(id?: string) {
+  if (!canWrite.value) return
   const w = id ? detail.value.workflows.find((x) => x.id === id) : null
   wfEditor.value = w
     ? {
@@ -1370,6 +1881,7 @@ function openWorkflow(id?: string) {
       }
 }
 async function saveWorkflow(w: any) {
+  if (!canWrite.value) return
   try {
     if (w.id) await api.updateWorkflow(w.id, w)
     else await api.createWorkflow(sid, w)
@@ -1379,6 +1891,7 @@ async function saveWorkflow(w: any) {
   } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
 }
 async function removeWorkflow(id: string) {
+  if (!canWrite.value) return
   try {
     await ElMessageBox.confirm('确定删除该工作流？', '提示', { type: 'warning' })
     await api.deleteWorkflow(id)
@@ -1386,6 +1899,7 @@ async function removeWorkflow(id: string) {
   } catch { /* ignore */ }
 }
 async function doExecuteWorkflow(row: any) {
+  if (!canWrite.value) return
   if (row.status !== 'active') {
     ElMessage.warning('请先将工作流状态设为「启用」')
     return
@@ -1399,6 +1913,41 @@ async function doExecuteWorkflow(row: any) {
   } catch (e: any) {
     if (e !== 'cancel') ElMessage.error(e?.response?.data?.detail || e?.message || '执行失败')
   } finally { row._executing = false }
+}
+async function publishEvent(event: { id?: string; name?: string; enabled?: boolean }) {
+  if (!canWrite.value || !event.id || event.enabled === false) return
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '输入事件载荷 JSON。发布后，订阅该事件的已启用工作流会异步进入任务队列。',
+      `发布事件：${event.name || '未命名事件'}`,
+      {
+        inputType: 'textarea',
+        inputValue: '{}',
+        inputPlaceholder: '{"record_id": "..."}',
+        inputValidator: (input: string) => {
+          try {
+            const parsed = JSON.parse(input || '{}')
+            return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? true : '事件载荷必须是 JSON 对象'
+          } catch {
+            return '请输入有效的 JSON 对象'
+          }
+        },
+        confirmButtonText: '发布事件',
+        cancelButtonText: '取消',
+        type: 'warning',
+      },
+    )
+    publishingEventId.value = event.id
+    const envelope = await api.publishEvent(event.id, { payload: JSON.parse(value || '{}') })
+    const count = envelope.queued_workflow_run_ids?.length || 0
+    ElMessage.success(count ? `事件已发布，${count} 个工作流任务已进入队列` : '事件已发布；当前没有可触发的工作流')
+  } catch (e: any) {
+    if (e !== 'cancel' && e !== 'close' && e?.message !== 'cancel' && e?.message !== 'close') {
+      ElMessage.error(e?.response?.data?.detail || e?.message || '事件发布失败')
+    }
+  } finally {
+    publishingEventId.value = null
+  }
 }
 function openWorkflowRun(run: WorkflowRun) {
   router.push({
@@ -1473,7 +2022,20 @@ const aiDlg = ref(false)
 const aiDesc = ref('')
 const aiLoading = ref(false)
 const aiResult = ref<any>(null)
+watch(canWrite, (allowed) => {
+  if (allowed) return
+  editor.value = null
+  mappingDlg.value = false
+  functionDlg.value = false
+  actionDlg.value = false
+  actionExecuteDlg.value = false
+  ruleDlg.value = false
+  eventDlg.value = false
+  wfEditor.value = null
+  aiDlg.value = false
+})
 async function runGenerate() {
+  if (!canWrite.value) return
   aiDlg.value = true
   if (aiResult.value) return
   aiLoading.value = true
@@ -1483,7 +2045,7 @@ async function runGenerate() {
   finally { aiLoading.value = false }
 }
 async function applyAI() {
-  if (!aiResult.value) return
+  if (!canWrite.value || !aiResult.value) return
   try {
     await api.applyOntology(sid, aiResult.value)
     aiDlg.value = false
@@ -1495,14 +2057,29 @@ async function applyAI() {
 
 // ── 加载 ──
 async function load() {
+  scenarioLoading.value = true
+  scenarioAccessDenied.value = false
+  scenarioLoadError.value = ''
   try {
     detail.value = await api.getScenario(sid)
-    dataSources.value = await api.listDataSources()
-    llmConfigs.value = await api.listLLM()
-    await searchObjects()
   } catch (e: any) {
-    ElMessage.error(e?.response?.data?.detail || '加载失败')
+    if (Number(e?.status || e?.response?.status) === 403) {
+      scenarioAccessDenied.value = true
+    } else {
+      scenarioLoadError.value = e?.response?.data?.detail || e?.message || '请稍后重试。'
+    }
+    return
+  } finally {
+    scenarioLoading.value = false
   }
+  try {
+    const [sources, configs] = await Promise.all([api.listDataSources(), api.listLLM()])
+    dataSources.value = sources
+    llmConfigs.value = configs
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '场景关联资源加载失败')
+  }
+  await searchObjects()
 }
 function goBack() { router.push('/scenarios') }
 function onAssistantApplied(event: Event) {
@@ -1516,11 +2093,20 @@ function workflowStatusType(status?: string) {
   return status === 'active' ? 'success' : status === 'disabled' ? 'info' : 'warning'
 }
 onMounted(() => {
+  mappingRefreshViewDisposed = false
+  objectSearchViewDisposed = false
   load()
   window.addEventListener('assistant-proposal-applied', onAssistantApplied)
 })
 onBeforeUnmount(() => {
+  mappingRefreshViewDisposed = true
+  objectSearchViewDisposed = true
+  objectRequestId += 1
+  objectPendingKey = ''
   window.removeEventListener('assistant-proposal-applied', onAssistantApplied)
+  for (const timer of mappingRefreshTimers.values()) window.clearTimeout(timer)
+  mappingRefreshTimers.clear()
+  mappingRefreshFailures.clear()
   window.dispatchEvent(new CustomEvent('ontology-selection-change', { detail: {} }))
 })
 </script>
@@ -1714,6 +2300,22 @@ onBeforeUnmount(() => {
   overflow: auto;
   padding: 0 8px 8px;
 }
+.object-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.object-pagination-note {
+  min-width: 0;
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.object-pagination .el-button { flex: 0 0 auto; }
 .object-row,
 .relation-row {
   width: 100%;
@@ -2118,6 +2720,39 @@ onBeforeUnmount(() => {
   font-size: 11px;
   line-height: 1.45;
 }
+.function-declaration-note {
+  margin: 0 0 12px;
+}
+.function-form {
+  margin-top: 16px;
+}
+.function-name-cell {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.function-name-cell .muted {
+  overflow-wrap: anywhere;
+}
+.function-schema {
+  max-width: 340px;
+  max-height: 116px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+.function-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
 .action-params-form {
   margin-top: 18px;
   max-height: 360px;
@@ -2142,6 +2777,37 @@ onBeforeUnmount(() => {
 }
 .action-preview-alert {
   margin-top: 14px;
+}
+.action-runtime-audit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.action-runtime-provenance {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-2);
+  font-size: 12px;
+}
+.action-runtime-provenance div {
+  min-width: 0;
+}
+.action-runtime-provenance dt {
+  color: var(--text-3);
+}
+.action-runtime-provenance dd {
+  margin: 3px 0 0;
+  color: var(--text-1);
+  overflow-wrap: anywhere;
 }
 .action-preview-text {
   max-height: 150px;
@@ -2181,6 +2847,12 @@ onBeforeUnmount(() => {
   word-break: break-all;
 }
 
+@media (max-width: 640px) {
+  .action-runtime-provenance {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 /* ── 响应式 ── */
 @media (max-width: 900px) {
   .ph-title b { font-size: 17px; }
@@ -2199,6 +2871,13 @@ onBeforeUnmount(() => {
   background:
     radial-gradient(620px 280px at 92% 0%, rgba(71, 157, 229, .10), transparent 68%),
     radial-gradient(560px 260px at 2% 42%, rgba(41, 190, 177, .07), transparent 70%);
+}
+.scenario-state {
+  align-items: center;
+  justify-content: center;
+}
+.scenario-state :deep(.el-result) {
+  max-width: 560px;
 }
 .sd-page::before {
   content: '';
