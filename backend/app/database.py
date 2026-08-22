@@ -7,7 +7,7 @@ import json
 import uuid
 
 from fastapi import Request
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import MetaData, Table, create_engine, event, inspect
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import get_settings
@@ -20,6 +20,18 @@ class Base(DeclarativeBase):
 _settings = get_settings()
 connect_args = {"check_same_thread": False} if _settings.database_url.startswith("sqlite") else {}
 engine = create_engine(_settings.database_url, connect_args=connect_args, pool_pre_ping=True)
+
+
+if _settings.database_url.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
+
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
@@ -41,36 +53,78 @@ def _migrate_data_sources_nullable_scenario() -> None:
     """SQLite 不支持 ALTER COLUMN：若 data_sources.scenario_id 仍为 NOT NULL，则重建表使其可空。"""
     if not _settings.database_url.startswith("sqlite"):
         return
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         row = conn.exec_driver_sql(
             'SELECT "notnull" FROM pragma_table_info(\'data_sources\') WHERE name = \'scenario_id\''
         ).fetchone()
         if not row or not row[0]:
             return  # 已是可空（或表不存在），无需迁移
+
+        # Reflect the exact installed schema.  Older deployments may already
+        # contain tenancy, public-access, connector-revision, or future columns;
+        # rebuilding from a hard-coded subset would irreversibly erase them.
+        source_metadata = MetaData()
+        source_table = Table("data_sources", source_metadata, autoload_with=conn)
+        explicit_index_sql = [
+            str(sql)
+            for (sql,) in conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'index' AND tbl_name = 'data_sources' AND sql IS NOT NULL"
+            ).fetchall()
+        ]
+        conn.commit()  # PRAGMA foreign_keys can only change outside a transaction.
+
         conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
-        conn.exec_driver_sql(
-            """
-            CREATE TABLE data_sources_new (
-                id VARCHAR(32) NOT NULL,
-                scenario_id VARCHAR(32),
-                name VARCHAR(200) NOT NULL,
-                type VARCHAR(30) NOT NULL,
-                config JSON,
-                status VARCHAR(20),
-                last_error TEXT,
-                created_at DATETIME,
-                PRIMARY KEY (id),
-                FOREIGN KEY(scenario_id) REFERENCES business_scenarios (id) ON DELETE CASCADE
-            )
-            """
-        )
-        conn.exec_driver_sql(
-            "INSERT INTO data_sources_new SELECT id, scenario_id, name, type, config, status, last_error, created_at FROM data_sources"
-        )
-        conn.exec_driver_sql("DROP TABLE data_sources")
-        conn.exec_driver_sql("ALTER TABLE data_sources_new RENAME TO data_sources")
-        conn.exec_driver_sql("CREATE INDEX ix_data_sources_scenario_id ON data_sources (scenario_id)")
-        conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+        if conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() != 0:
+            conn.commit()
+            raise RuntimeError("无法在 data_sources 重建前暂停 SQLite 外键检查")
+        conn.commit()
+        temporary_name = f"data_sources_migration_{uuid.uuid4().hex[:12]}"
+        try:
+            with conn.begin():
+                target_metadata = MetaData()
+                # Resolve reflected FK targets before cloning only the source
+                # table under its temporary name.
+                for table in source_metadata.tables.values():
+                    if table is not source_table:
+                        table.to_metadata(target_metadata)
+                target_table = source_table.to_metadata(
+                    target_metadata,
+                    name=temporary_name,
+                )
+                target_table.c.scenario_id.nullable = True
+                # Explicit indexes cannot coexist under their old global names
+                # while the source table is still present.  Recreate their exact
+                # SQLite DDL after the rename; UNIQUE table constraints remain.
+                target_table.indexes.clear()
+                target_table.create(conn)
+
+                quote = conn.dialect.identifier_preparer.quote
+                columns = ", ".join(quote(column.name) for column in source_table.columns)
+                conn.exec_driver_sql(
+                    f"INSERT INTO {quote(temporary_name)} ({columns}) "
+                    f"SELECT {columns} FROM {quote('data_sources')}"
+                )
+                conn.exec_driver_sql(f"DROP TABLE {quote('data_sources')}")
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {quote(temporary_name)} RENAME TO {quote('data_sources')}"
+                )
+                for ddl in explicit_index_sql:
+                    conn.exec_driver_sql(ddl)
+        finally:
+            if conn.in_transaction():
+                conn.rollback()
+            conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+            enabled = conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one()
+            conn.commit()
+            if enabled != 1:
+                conn.invalidate()
+                raise RuntimeError("data_sources 迁移后未能恢复 SQLite 外键检查")
+
+        violations = conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+        conn.commit()
+        if violations:
+            raise RuntimeError("data_sources 迁移后检测到外键完整性错误")
 
 
 def _migrate_workflows_dag() -> None:
@@ -850,6 +904,291 @@ def _migrate_runtime_definition_pins() -> None:
                 conn.exec_driver_sql(f"CREATE INDEX {name} ON {table} ({columns})")
 
 
+def _migrate_action_decision_chain() -> None:
+    """Add verifiable user/Agent/model/data/permission provenance to Action logs.
+
+    Existing rows cannot prove those identities, so the migration intentionally
+    leaves all identity columns NULL and labels their actor as ``unknown``.
+    This is preferable to fabricating the scenario owner or a system actor.
+    """
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if not inspector.has_table("action_execution_logs"):
+            return
+        existing = {
+            column["name"] for column in inspector.get_columns("action_execution_logs")
+        }
+        columns = {
+            "actor_type": "VARCHAR(20)",
+            "actor_user_id": "VARCHAR(32)",
+            "agent_id": "VARCHAR(32)",
+            "llm_config_id": "VARCHAR(32)",
+            "model_name": "VARCHAR(240)",
+            "permission_decision": "JSON",
+            "data_context": "JSON",
+            "correlation_id": "VARCHAR(64)",
+            "parent_action_log_id": "VARCHAR(32)",
+            "agent_message_id": "VARCHAR(32)",
+            "assistant_message_id": "VARCHAR(32)",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE action_execution_logs ADD COLUMN {name} {definition}"
+                )
+        conn.exec_driver_sql(
+            "UPDATE action_execution_logs SET actor_type = 'unknown' "
+            "WHERE actor_type IS NULL OR TRIM(actor_type) = ''"
+        )
+        conn.exec_driver_sql(
+            "UPDATE action_execution_logs SET model_name = '' WHERE model_name IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE action_execution_logs SET correlation_id = '' WHERE correlation_id IS NULL"
+        )
+        for column in ("permission_decision", "data_context"):
+            conn.exec_driver_sql(
+                f"UPDATE action_execution_logs SET {column} = '{{}}' WHERE {column} IS NULL"
+            )
+
+        refreshed = inspect(conn)
+        existing_indexes = {
+            index["name"] for index in refreshed.get_indexes("action_execution_logs")
+        }
+        for name, column in (
+            ("ix_action_execution_logs_actor_user_id", "actor_user_id"),
+            ("ix_action_execution_logs_agent_id", "agent_id"),
+            ("ix_action_execution_logs_llm_config_id", "llm_config_id"),
+            ("ix_action_execution_logs_correlation_id", "correlation_id"),
+            ("ix_action_execution_logs_parent_action_log_id", "parent_action_log_id"),
+            ("ix_action_execution_logs_agent_message_id", "agent_message_id"),
+            ("ix_action_execution_logs_assistant_message_id", "assistant_message_id"),
+        ):
+            if name not in existing_indexes:
+                try:
+                    conn.exec_driver_sql(
+                        f"CREATE INDEX {name} ON action_execution_logs ({column})"
+                    )
+                except Exception:  # noqa: BLE001 - tolerate startup index races.
+                    pass
+        existing_indexes = {
+            index["name"] for index in inspect(conn).get_indexes("action_execution_logs")
+        }
+        if "uq_action_execution_logs_parent_preview" not in existing_indexes:
+            try:
+                conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX uq_action_execution_logs_parent_preview "
+                    "ON action_execution_logs (parent_action_log_id)"
+                )
+            except Exception:  # noqa: BLE001 - startup race or invalid legacy duplicates.
+                pass
+
+        # SQLite cannot attach REFERENCES constraints with ALTER COLUMN.  For
+        # upgraded databases, clean unverifiable orphan ids and install
+        # equivalent fail-closed/set-null triggers.  Fresh databases already
+        # have native FKs; the triggers are idempotent and reinforce the same
+        # behavior rather than changing it.
+        if conn.dialect.name == "sqlite":
+            refreshed = inspect(conn)
+            references = (
+                ("actor_user_id", "users", "id"),
+                ("agent_id", "agents", "id"),
+                ("llm_config_id", "llm_configs", "id"),
+                ("parent_action_log_id", "action_execution_logs", "id"),
+                ("agent_message_id", "messages", "id"),
+                ("assistant_message_id", "assistant_messages", "id"),
+            )
+            for column, parent_table, parent_key in references:
+                if not refreshed.has_table(parent_table):
+                    continue
+                conn.exec_driver_sql(
+                    f"UPDATE action_execution_logs SET {column} = NULL "
+                    f"WHERE {column} IS NOT NULL AND NOT EXISTS ("
+                    f"SELECT 1 FROM {parent_table} p WHERE p.{parent_key} = action_execution_logs.{column})"
+                )
+                trigger_base = f"trg_action_logs_{column}"
+                conn.exec_driver_sql(
+                    f"CREATE TRIGGER IF NOT EXISTS {trigger_base}_insert "
+                    "BEFORE INSERT ON action_execution_logs "
+                    f"WHEN NEW.{column} IS NOT NULL AND NOT EXISTS ("
+                    f"SELECT 1 FROM {parent_table} p WHERE p.{parent_key} = NEW.{column}) "
+                    "BEGIN SELECT RAISE(ABORT, 'invalid action audit reference'); END"
+                )
+                conn.exec_driver_sql(
+                    f"CREATE TRIGGER IF NOT EXISTS {trigger_base}_update "
+                    f"BEFORE UPDATE OF {column} ON action_execution_logs "
+                    f"WHEN NEW.{column} IS NOT NULL AND NOT EXISTS ("
+                    f"SELECT 1 FROM {parent_table} p WHERE p.{parent_key} = NEW.{column}) "
+                    "BEGIN SELECT RAISE(ABORT, 'invalid action audit reference'); END"
+                )
+                conn.exec_driver_sql(
+                    f"CREATE TRIGGER IF NOT EXISTS {trigger_base}_delete "
+                    f"AFTER DELETE ON {parent_table} BEGIN "
+                    f"UPDATE action_execution_logs SET {column} = NULL "
+                    f"WHERE {column} = OLD.{parent_key}; END"
+                )
+
+
+def _migrate_ontology_runtime_metadata() -> None:
+    """Add the P0 namespace/constraint/state/validity/quality/mapping metadata."""
+    columns_by_table = {
+        "business_scenarios": {
+            "namespace": "VARCHAR(180)",
+        },
+        "ontology_entities": {
+            "namespace": "VARCHAR(180)",
+            "state_property": "VARCHAR(200)",
+        },
+        "ontology_properties": {
+            "constraints": "JSON",
+        },
+        "ontology_relations": {
+            "namespace": "VARCHAR(180)",
+        },
+        "ontology_instances": {
+            "state": "VARCHAR(120)",
+            "valid_from": "DATETIME",
+            "valid_to": "DATETIME",
+            "quality": "JSON",
+        },
+        "data_mappings": {
+            "transform_rules": "JSON",
+        },
+    }
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        for table, columns in columns_by_table.items():
+            if not inspector.has_table(table):
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for name, definition in columns.items():
+                if name not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        for table, column, value in (
+            ("business_scenarios", "namespace", "default"),
+            ("ontology_entities", "namespace", "default"),
+            ("ontology_entities", "state_property", ""),
+            ("ontology_relations", "namespace", "default"),
+            ("ontology_instances", "state", ""),
+        ):
+            if inspector.has_table(table):
+                conn.exec_driver_sql(
+                    f"UPDATE {table} SET {column} = :value "
+                    f"WHERE {column} IS NULL OR TRIM({column}) = ''",
+                    {"value": value},
+                )
+        for table, column in (
+            ("ontology_properties", "constraints"),
+            ("ontology_instances", "quality"),
+            ("data_mappings", "transform_rules"),
+        ):
+            if inspector.has_table(table):
+                conn.exec_driver_sql(
+                    f"UPDATE {table} SET {column} = '{{}}' WHERE {column} IS NULL"
+                )
+        if inspector.has_table("ontology_instances"):
+            indexes = {
+                index["name"] for index in inspect(conn).get_indexes("ontology_instances")
+            }
+            if "ix_ontology_instances_state" not in indexes:
+                try:
+                    conn.exec_driver_sql(
+                        "CREATE INDEX ix_ontology_instances_state ON ontology_instances (state)"
+                    )
+                except Exception:  # noqa: BLE001 - tolerate startup races.
+                    pass
+
+
+def _migrate_assistant_attachment_lifecycle() -> None:
+    """Bind temporary uploads to one thread and give legacy rows a short TTL."""
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if not inspector.has_table("assistant_attachments"):
+            return
+        existing = {
+            column["name"] for column in inspector.get_columns("assistant_attachments")
+        }
+        for name, definition in (
+            ("thread_id", "VARCHAR(32)"),
+            ("consumed_at", "DATETIME"),
+            ("expires_at", "DATETIME"),
+        ):
+            if name not in existing:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE assistant_attachments ADD COLUMN {name} {definition}"
+                )
+        expiry = datetime.now(timezone.utc)
+        conn.exec_driver_sql(
+            "UPDATE assistant_attachments SET expires_at = :expiry WHERE expires_at IS NULL",
+            {"expiry": expiry},
+        )
+        if inspector.has_table("assistant_threads"):
+            # SQLite cannot add an FK with ALTER TABLE.  Delete unowned orphan
+            # context and install equivalent fail-closed/cascade triggers for
+            # upgraded databases.  Fresh databases already have the real FK;
+            # the idempotent triggers are harmless there.
+            conn.exec_driver_sql(
+                "DELETE FROM assistant_attachments "
+                "WHERE thread_id IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM assistant_threads WHERE assistant_threads.id = assistant_attachments.thread_id"
+                ")"
+            )
+            conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS trg_assistant_attachment_thread_insert "
+                "BEFORE INSERT ON assistant_attachments "
+                "WHEN NEW.thread_id IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM assistant_threads WHERE id = NEW.thread_id"
+                ") BEGIN SELECT RAISE(ABORT, 'invalid assistant attachment thread'); END"
+            )
+            conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS trg_assistant_attachment_thread_update "
+                "BEFORE UPDATE OF thread_id ON assistant_attachments "
+                "WHEN NEW.thread_id IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM assistant_threads WHERE id = NEW.thread_id"
+                ") BEGIN SELECT RAISE(ABORT, 'invalid assistant attachment thread'); END"
+            )
+            conn.exec_driver_sql(
+                "CREATE TRIGGER IF NOT EXISTS trg_assistant_attachment_thread_delete "
+                "AFTER DELETE ON assistant_threads BEGIN "
+                "DELETE FROM assistant_attachments WHERE thread_id = OLD.id; END"
+            )
+        indexes = {
+            index["name"] for index in inspect(conn).get_indexes("assistant_attachments")
+        }
+        for name, column in (
+            ("ix_assistant_attachments_thread_id", "thread_id"),
+            ("ix_assistant_attachments_expires_at", "expires_at"),
+        ):
+            if name not in indexes:
+                try:
+                    conn.exec_driver_sql(
+                        f"CREATE INDEX {name} ON assistant_attachments ({column})"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def _migrate_property_default_json() -> None:
+    """Make legacy VARCHAR defaults valid JSON before the ORM reads them."""
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if not inspector.has_table("ontology_properties"):
+            return
+        columns = {column["name"] for column in inspector.get_columns("ontology_properties")}
+        if "default_value" not in columns:
+            return
+        conn.exec_driver_sql(
+            "UPDATE ontology_properties SET default_value = 'null' "
+            "WHERE default_value IS NULL OR default_value = ''"
+        )
+        conn.exec_driver_sql(
+            "UPDATE ontology_properties SET default_value = json_quote(default_value) "
+            "WHERE json_valid(default_value) = 0"
+        )
+
+
 def _migrate_external_api_key_audit() -> None:
     """Add non-forged credential lifecycle actor fields to legacy databases.
 
@@ -974,5 +1313,9 @@ def init_db() -> None:
     _migrate_workflow_run_environment()
     _migrate_workflow_run_execution_key()
     _migrate_runtime_definition_pins()
+    _migrate_assistant_attachment_lifecycle()
+    _migrate_property_default_json()
+    _migrate_ontology_runtime_metadata()
+    _migrate_action_decision_chain()
     _migrate_function_runtimes()
     _migrate_external_api_key_audit()

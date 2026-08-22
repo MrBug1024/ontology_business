@@ -14,6 +14,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ..models import (
+    AssistantAttachment,
     BusinessScenario,
     EventEnvelope,
     OntologyEvent,
@@ -1353,6 +1354,38 @@ def assert_workflow_mutable(db: Session, workflow_id: str) -> None:
         raise PolicyViolation("工作流存在进行中的任务，不能编辑或删除；请先取消或等待完成")
 
 
+def purge_expired_assistant_attachments(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    limit: int = 200,
+) -> int:
+    """Globally purge a bounded batch of temporary assistant content.
+
+    This worker path intentionally has no tenant/user filter: expired rows from
+    deleted users and fail-closed legacy rows with no owner must not retain
+    parsed business text forever.
+    """
+    cutoff = now or utc_now()
+    bounded_limit = max(1, min(int(limit), 1000))
+    expired = list(
+        db.execute(
+            select(AssistantAttachment)
+            .where(
+                (AssistantAttachment.expires_at.is_(None))
+                | (AssistantAttachment.expires_at <= cutoff)
+            )
+            .order_by(AssistantAttachment.expires_at, AssistantAttachment.created_at)
+            .limit(bounded_limit)
+        ).scalars().all()
+    )
+    for attachment in expired:
+        db.delete(attachment)
+    if expired:
+        db.flush()
+    return len(expired)
+
+
 def worker_tick(*, limit: int = 8) -> int:
     """供应用生命周期后台协程调用的一次无状态轮询。"""
     from ..database import SessionLocal
@@ -1361,6 +1394,7 @@ def worker_tick(*, limit: int = 8) -> int:
     db = SessionLocal()
     try:
         expire_stale_operations(db)
+        purge_expired_assistant_attachments(db, limit=max(50, limit * 25))
         rag_service.expire_stale_document_index_jobs(db)
         mapping_refresh_service.expire_stale_mapping_refresh_jobs(db)
         enqueue_due_schedules(db)

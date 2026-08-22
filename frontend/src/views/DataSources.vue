@@ -2,10 +2,22 @@
   <div class="page data-sources-page">
     <div class="page-header">
       <div>
-        <h2>数据源</h2>
+        <h1>数据源</h1>
         <div class="sub">接入数据库（MySQL / PostgreSQL / SQLite）或文件桶（Excel / Word / PDF / 图片…）</div>
       </div>
-      <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建数据源</el-button>
+      <div class="data-source-header-actions">
+        <el-select
+          v-model="scenarioScope"
+          clearable
+          filterable
+          aria-label="按业务场景筛选数据源"
+          placeholder="全部业务场景"
+          @change="changeScenarioScope"
+        >
+          <el-option v-for="scenario in scenarios" :key="scenario.id" :label="scenario.name" :value="scenario.id" />
+        </el-select>
+        <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建数据源</el-button>
+      </div>
     </div>
 
     <el-row :gutter="16">
@@ -13,7 +25,7 @@
         <div class="card data-sources-list-card" v-loading="loading">
           <div class="card-title"><el-icon><Coin /></el-icon> 数据源列表</div>
           <div class="ds-list">
-            <div v-for="ds in dataSources" :key="ds.id" class="ds-item" :class="{ active: selected?.id === ds.id }" role="button" tabindex="0" :aria-current="selected?.id === ds.id ? 'true' : undefined" :aria-label="`选择数据源：${ds.name}`" @click="select(ds)" @keydown.enter.prevent="select(ds)" @keydown.space.prevent="select(ds)">
+            <button v-for="ds in dataSources" :key="ds.id" type="button" class="ds-item" :class="{ active: selected?.id === ds.id }" :aria-current="selected?.id === ds.id ? 'true' : undefined" :aria-label="`选择数据源：${ds.name}`" @click="select(ds)">
               <div class="ds-icon" :class="ds.type">
                 <el-icon :size="18"><component :is="ds.type === 'file_bucket' ? 'FolderOpened' : 'Coin'" /></el-icon>
               </div>
@@ -24,7 +36,7 @@
               <el-tag v-if="ds.status === 'ok'" size="small" type="success">正常</el-tag>
               <el-tag v-else-if="ds.status === 'error'" size="small" type="danger">异常</el-tag>
               <el-tag v-else size="small" type="info">未测试</el-tag>
-            </div>
+            </button>
             <div v-if="!loading && !dataSources.length" class="empty-wrap">
               <div class="empty-icon"><el-icon :size="26"><Coin /></el-icon></div>
               <div>暂无数据源</div>
@@ -52,10 +64,10 @@
           <!-- 数据库：表 + SQL -->
           <template v-if="selected.type !== 'file_bucket'">
             <el-tabs v-model="dbTab">
-              <el-tab-pane label="数据表" name="tables" style="height:calc(100vh - 360px)">
-                <el-table :data="tables" size="small" height="calc(100% - 36px)" @row-click="(r:any)=>openTable(r)"  style="cursor:pointer">
+              <el-tab-pane label="数据表" name="tables">
+                <el-table :data="tables" size="small" max-height="520">
                   <el-table-column prop="name" label="表名" min-width="160">
-                    <template #default="{ row }"><span class="mono">{{ row.name }}</span></template>
+                    <template #default="{ row }"><button type="button" class="table-open mono" @click="openTable(row)">{{ row.name }}</button></template>
                   </el-table-column>
                   <el-table-column prop="row_count" label="行数" width="90" align="right" />
                   <el-table-column label="字段" min-width="220">
@@ -149,7 +161,7 @@
                 </div>
               </section>
               <el-empty v-if="!loadingFiles && !files.length" description="资料库暂无文件；上传资料后即可建立检索索引。" class="bucket-empty" />
-              <el-table v-else :data="files" size="small" height="calc(100vh -  520px)">
+              <el-table v-else :data="files" size="small" max-height="560">
                 <el-table-column prop="filename" label="文件名" min-width="180">
                   <template #default="{ row }"><span class="mono">{{ row.filename }}</span></template>
                 </el-table-column>
@@ -251,7 +263,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onBeforeUnmount, onMounted } from 'vue'
+import { computed, ref, onBeforeUnmount, onMounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { api } from '@/api'
@@ -261,6 +274,13 @@ const dataSources = ref<DataSource[]>([])
 const scenarios = ref<Scenario[]>([])
 const selected = ref<DataSource | null>(null)
 const loading = ref(false)
+const route = useRoute()
+const router = useRouter()
+const routeScenarioId = () => {
+  const value = route.query.scenario_id
+  return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
+}
+const scenarioScope = ref(routeScenarioId())
 
 const dlg = ref(false)
 const saving = ref(false)
@@ -303,6 +323,14 @@ const searched = ref(false)
 const searchError = ref('')
 const searchNotice = ref('')
 let indexPollTimer: number | undefined
+let viewDisposed = false
+let loadRequest = 0
+let tableRequest = 0
+let fileRequest = 0
+let sqlRequest = 0
+let searchRequest = 0
+let testRequest = 0
+let textRequest = 0
 
 const TYPE_LABELS: Record<string, string> = {
   mysql: 'MySQL', postgres: 'PostgreSQL', sqlite: 'SQLite', file_bucket: '文件桶',
@@ -329,54 +357,102 @@ function indexTagType(status?: string): 'success' | 'warning' | 'danger' | 'info
 }
 
 async function load() {
+  const request = ++loadRequest
+  const scope = scenarioScope.value
   loading.value = true
   try {
-    const [ds, sc] = await Promise.all([api.listDataSources(), api.listScenarios()])
+    const [ds, sc] = await Promise.all([api.listDataSources(scope || undefined), api.listScenarios()])
+    if (viewDisposed || request !== loadRequest || scope !== scenarioScope.value) return
     dataSources.value = ds
     scenarios.value = sc
-    if (selected.value) {
-      const fresh = ds.find((d) => d.id === selected.value!.id)
-      if (fresh) select(fresh)
-    }
+    const requestedSource = Array.isArray(route.query.source_id) ? route.query.source_id[0] : route.query.source_id
+    const nextSelection = ds.find((source) => source.id === requestedSource)
+      || ds.find((source) => source.id === selected.value?.id)
+      || ds[0]
+    if (nextSelection) select(nextSelection, false)
+    else clearSelection()
   } catch (e: any) {
-    ElMessage.error('加载失败：' + e.message)
+    if (!viewDisposed && request === loadRequest) ElMessage.error('加载失败：' + e.message)
   } finally {
-    loading.value = false
+    if (!viewDisposed && request === loadRequest) loading.value = false
   }
 }
-function select(ds: DataSource) {
+function invalidateDetailRequests() {
+  tableRequest += 1
+  fileRequest += 1
+  sqlRequest += 1
+  searchRequest += 1
+  testRequest += 1
+  textRequest += 1
+  loadingTables.value = false
+  loadingFiles.value = false
+  runningSql.value = false
+  searching.value = false
+  testing.value = false
+  tableDlg.value = false
+  curTable.value = null
+  textDlg.value = false
+  textFile.value = ''
+  textContent.value = ''
+  if (indexPollTimer) window.clearTimeout(indexPollTimer)
+  indexPollTimer = undefined
+}
+function clearSelection() {
+  invalidateDetailRequests()
+  selected.value = null
+  tables.value = []
+  files.value = []
+}
+function select(ds: DataSource, syncRoute = true) {
+  invalidateDetailRequests()
   selected.value = ds
+  tables.value = []
+  files.value = []
   sqlResult.value = null
   sqlError.value = ''
   searchResults.value = []
   searched.value = false
   searchError.value = ''
   searchNotice.value = ''
-  if (ds.type !== 'file_bucket') loadTables()
-  else loadFiles()
+  if (ds.type !== 'file_bucket') void loadTables()
+  else void loadFiles()
+  if (syncRoute && route.query.source_id !== ds.id) {
+    void router.replace({ name: 'data-sources', query: { ...route.query, source_id: ds.id } })
+  }
 }
 async function loadTables() {
-  if (!selected.value) return
+  const sourceId = selected.value?.id
+  if (!sourceId || selected.value?.type === 'file_bucket') return
+  const request = ++tableRequest
   loadingTables.value = true
   try {
-    tables.value = await api.listTables(selected.value.id!)
+    const freshTables = await api.listTables(sourceId)
+    if (viewDisposed || request !== tableRequest || selected.value?.id !== sourceId) return
+    tables.value = freshTables
   } catch (e: any) {
-    ElMessage.error('获取表列表失败：' + e.message)
+    if (!viewDisposed && request === tableRequest && selected.value?.id === sourceId) {
+      ElMessage.error('获取表列表失败：' + e.message)
+    }
   } finally {
-    loadingTables.value = false
+    if (!viewDisposed && request === tableRequest) loadingTables.value = false
   }
 }
 async function runSql() {
-  if (!sql.value.trim()) return
+  const sourceId = selected.value?.id
+  const statement = sql.value.trim()
+  if (!sourceId || !statement) return
+  const request = ++sqlRequest
   runningSql.value = true
   sqlError.value = ''
   sqlResult.value = null
   try {
-    sqlResult.value = await api.query(selected.value!.id!, sql.value)
+    const result = await api.query(sourceId, statement)
+    if (viewDisposed || request !== sqlRequest || selected.value?.id !== sourceId) return
+    sqlResult.value = result
   } catch (e: any) {
-    sqlError.value = e.message
+    if (!viewDisposed && request === sqlRequest && selected.value?.id === sourceId) sqlError.value = e.message
   } finally {
-    runningSql.value = false
+    if (!viewDisposed && request === sqlRequest) runningSql.value = false
   }
 }
 function openTable(t: TableInfo) {
@@ -384,16 +460,22 @@ function openTable(t: TableInfo) {
   tableDlg.value = true
 }
 async function testConn() {
+  const source = selected.value
+  if (!source?.id) return
+  const request = ++testRequest
   testing.value = true
   try {
-    const r: any = await api.testDataSource(selected.value!.id!)
+    const r: any = await api.testDataSource(source.id)
+    if (viewDisposed || request !== testRequest || selected.value?.id !== source.id) return
     ElMessage.success(r.message || '连接成功')
-    selected.value!.status = 'ok'
+    source.status = 'ok'
   } catch (e: any) {
-    ElMessage.error('连接失败：' + e.message)
-    selected.value!.status = 'error'
+    if (!viewDisposed && request === testRequest && selected.value?.id === source.id) {
+      ElMessage.error('连接失败：' + e.message)
+      source.status = 'error'
+    }
   } finally {
-    testing.value = false
+    if (!viewDisposed && request === testRequest) testing.value = false
   }
 }
 
@@ -423,29 +505,40 @@ async function doUpload() {
   }
 }
 async function loadFiles() {
-  if (!selected.value) return
-  const sourceId = selected.value.id
+  const sourceId = selected.value?.id
+  if (!sourceId || selected.value?.type !== 'file_bucket') return
+  const request = ++fileRequest
   loadingFiles.value = true
   try {
-    files.value = await api.listFiles(selected.value.id!)
+    const freshFiles = await api.listFiles(sourceId)
+    if (viewDisposed || request !== fileRequest || selected.value?.id !== sourceId) return
+    files.value = freshFiles
     if (indexPollTimer) window.clearTimeout(indexPollTimer)
     if (files.value.some((file) => ['pending', 'queued'].includes(file.index_status || 'pending'))) {
       indexPollTimer = window.setTimeout(() => {
         if (selected.value?.id === sourceId) void loadFiles()
       }, 1000)
     }
+  } catch (e: any) {
+    if (!viewDisposed && request === fileRequest && selected.value?.id === sourceId) {
+      ElMessage.error('获取文件列表失败：' + e.message)
+    }
   } finally {
-    loadingFiles.value = false
+    if (!viewDisposed && request === fileRequest) loadingFiles.value = false
   }
 }
 async function viewText(f: BucketFile) {
+  const sourceId = selected.value?.id
+  if (!sourceId) return
+  const request = ++textRequest
   try {
     const r = await api.fileText(f.id)
+    if (viewDisposed || request !== textRequest || selected.value?.id !== sourceId) return
     textFile.value = f.filename
     textContent.value = r.text || '（空）'
     textDlg.value = true
   } catch (e: any) {
-    ElMessage.error(e.message)
+    if (!viewDisposed && request === textRequest && selected.value?.id === sourceId) ElMessage.error(e.message)
   }
 }
 async function reparse(f: BucketFile & { _loading?: boolean }) {
@@ -480,7 +573,10 @@ async function reindexFiles() {
   }
 }
 async function searchDocuments() {
-  if (!selected.value || !retrievalQuery.value.trim()) return
+  const source = selected.value
+  const query = retrievalQuery.value.trim()
+  if (!source?.id || !query) return
+  const request = ++searchRequest
   searching.value = true
   searched.value = false
   searchError.value = ''
@@ -488,24 +584,27 @@ async function searchDocuments() {
   searchResults.value = []
   try {
     const result = await api.searchDocuments({
-      query: retrievalQuery.value.trim(),
-      data_source_ids: [selected.value.id!],
-      scenario_id: selected.value.scenario_id,
+      query,
+      data_source_ids: [source.id],
+      scenario_id: source.scenario_id,
       top_k: 5,
     })
+    if (viewDisposed || request !== searchRequest || selected.value?.id !== source.id) return
     searchResults.value = result.results || []
     searchNotice.value = result.permission_message || (
-      selected.value?.can_write ? '' : '当前为只读公开资料库，结果仅来自已建立的公开索引。'
+      source.can_write ? '' : '当前为只读公开资料库，结果仅来自已建立的公开索引。'
     )
     if (!searchResults.value.length && files.value.some((file) => ['pending', 'queued'].includes(file.index_status || 'pending'))) {
       searchNotice.value = '资料仍在后台解析或建立索引，请稍候自动刷新后再次检索。'
     }
     searched.value = true
   } catch (e: any) {
-    searchError.value = e.message || '检索失败，请稍后重试。'
-    searched.value = true
+    if (!viewDisposed && request === searchRequest && selected.value?.id === source.id) {
+      searchError.value = e.message || '检索失败，请稍后重试。'
+      searched.value = true
+    }
   } finally {
-    searching.value = false
+    if (!viewDisposed && request === searchRequest) searching.value = false
   }
 }
 function viewCitation(citation: RagCitation) {
@@ -531,7 +630,12 @@ function onTypeChange() {
     : { host: '127.0.0.1', port: 5432, database: '', username: 'postgres', password: '' }
 }
 function openCreate() {
-  form.value = { name: '', type: 'mysql', config: { host: '127.0.0.1', port: 3306, database: '', username: 'root', password: '' } }
+  form.value = {
+    name: '',
+    scenario_id: scenarioScope.value || undefined,
+    type: 'mysql',
+    config: { host: '127.0.0.1', port: 3306, database: '', username: 'root', password: '' },
+  }
   dlg.value = true
 }
 function openEdit(ds: DataSource) {
@@ -542,11 +646,15 @@ async function save() {
   if (!form.value.name) return ElMessage.warning('请填写名称')
   saving.value = true
   try {
-    if (form.value.id) await api.updateDataSource(form.value.id, form.value)
-    else await api.createDataSource(form.value)
+    const saved = form.value.id
+      ? await api.updateDataSource(form.value.id, form.value)
+      : await api.createDataSource(form.value)
     ElMessage.success('已保存')
     dlg.value = false
-    load()
+    if (saved.id) {
+      await router.replace({ name: 'data-sources', query: { ...route.query, source_id: saved.id } })
+    }
+    await load()
   } catch (e: any) {
     ElMessage.error(e.message)
   } finally {
@@ -557,7 +665,7 @@ async function remove(ds: DataSource) {
   try {
     await ElMessageBox.confirm(`删除数据源「${ds.name}」？`, '确认', { type: 'warning' })
     await api.deleteDataSource(ds.id!)
-    selected.value = null
+    clearSelection()
     ElMessage.success('已删除')
     await load()
   } catch (e: any) {
@@ -565,8 +673,30 @@ async function remove(ds: DataSource) {
   }
 }
 
-onMounted(load)
+async function changeScenarioScope(value: string) {
+  const query = { ...route.query }
+  if (value) query.scenario_id = value
+  else delete query.scenario_id
+  delete query.source_id
+  clearSelection()
+  await router.replace({ name: 'data-sources', query })
+  return
+}
+
+onMounted(() => {
+  viewDisposed = false
+  void load()
+})
+watch(() => route.query.source_id, (value) => {
+  const id = Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
+  if (!id || id === selected.value?.id) return
+  const source = dataSources.value.find((item) => item.id === id)
+  if (source) select(source, false)
+})
 onBeforeUnmount(() => {
+  viewDisposed = true
+  loadRequest += 1
+  invalidateDetailRequests()
   if (indexPollTimer) window.clearTimeout(indexPollTimer)
 })
 </script>
@@ -574,12 +704,17 @@ onBeforeUnmount(() => {
 <style scoped>
 .ds-item {
   display: flex;
+  width: 100%;
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
   border-radius: var(--radius-sm);
   cursor: pointer;
   border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
   margin-bottom: 6px;
   transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
 }
@@ -589,6 +724,8 @@ onBeforeUnmount(() => {
   border-color: var(--border-strong);
 }
 .ds-item:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: 2px; }
+.table-open { min-height: 44px; padding: 3px 0; border: 0; background: transparent; color: var(--primary-600); font-family: 'Cascadia Code', Consolas, monospace; text-align: left; cursor: pointer; }
+.table-open:hover, .table-open:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
 .pk-icon { margin-left: 3px; color: var(--warning); vertical-align: -2px; }
 .ds-icon {
   width: 38px; height: 38px;
@@ -607,94 +744,42 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
 }
 
-/* ── 数据源工作区：列表与详情各自滚动，避免撑开主页面 ── */
+/* ── 数据源工作区：主页面统一滚动，长表格仅在必要时局部限高 ── */
 .data-sources-page {
-  height: calc(100dvh - 68px);
-  min-height: 0;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
+  min-height: 100%;
   box-sizing: border-box;
 }
-.data-sources-page > .page-header {
-  flex: 0 0 auto;
-}
 .data-sources-page > .el-row {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow: hidden;
-  align-items: stretch;
+  align-items: flex-start;
 }
 .data-sources-page > .el-row > .el-col {
-  min-height: 0;
-  display: flex;
+  min-width: 0;
 }
 .data-sources-list-col > .card,
 .data-source-detail-col > .card,
 .data-source-detail-col > .el-empty {
   width: 100%;
-  min-height: 0;
-}
-.data-sources-list-card,
-.data-source-detail-card {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-.data-sources-list-card .card-title,
-.data-source-detail-card > .card-title {
-  flex: 0 0 auto;
 }
 .ds-list {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
   padding-right: 2px;
-  scrollbar-gutter: stable;
 }
 .data-source-detail-card > .card-title {
   flex-wrap: wrap;
 }
-.data-source-detail-card > :deep(.el-tabs) {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-.data-source-detail-card :deep(.el-tabs__header) {
-  flex: 0 0 auto;
-}
 .data-source-detail-card :deep(.el-tabs__content) {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow: auto;
-  scrollbar-gutter: stable;
-}
-.data-source-detail-card :deep(.el-tab-pane) {
-  min-height: 100%;
+  overflow: visible;
 }
 .bucket-detail {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  overflow-y: auto;
-  scrollbar-gutter: stable;
-}
-.bucket-detail :deep(.el-upload) {
-  flex: 0 0 auto;
+  min-width: 0;
 }
 .bucket-actions {
   display: flex;
-  flex: 0 0 auto;
   flex-wrap: wrap;
   gap: 8px;
   margin: 12px 0;
 }
-.bucket-detail > :deep(.el-table) {
-  flex: 1 1 auto;
-  min-height: 0;
-}
+.data-source-header-actions { display: flex; align-items: center; gap: 8px; }
+.data-source-header-actions :deep(.el-select) { width: min(240px, 38vw); }
 .retrieval-panel {
   flex: 0 0 auto;
   margin: 2px 0 14px;
@@ -729,22 +814,19 @@ onBeforeUnmount(() => {
 
 @media (max-width: 767px) {
   .data-sources-page {
-    height: calc(100dvh - 68px);
     padding: 14px;
   }
   .data-sources-page > .el-row {
     flex-direction: column;
-    overflow: hidden;
   }
   .data-sources-page > .el-row > .data-sources-list-col {
-    flex: 0 0 190px;
     width: 100%;
     max-width: none;
   }
   .data-sources-page > .el-row > .data-source-detail-col {
-    flex: 1 1 auto;
     width: 100%;
     max-width: none;
+    margin-top: 12px;
   }
   .data-sources-list-card { padding: 14px; }
   .data-source-detail-card { padding: 14px; }
@@ -756,5 +838,7 @@ onBeforeUnmount(() => {
   .retrieval-head, .retrieval-query { align-items: stretch; flex-direction: column; }
   .retrieval-head > :deep(.el-tag) { align-self: flex-start; }
   .retrieval-query :deep(.el-button) { min-height: 44px; }
+  .data-source-header-actions { width: 100%; align-items: stretch; }
+  .data-source-header-actions :deep(.el-select) { min-width: 0; flex: 1; width: auto; }
 }
 </style>

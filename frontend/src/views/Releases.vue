@@ -3,7 +3,7 @@
     <header class="release-header">
       <div>
         <span class="eyebrow">RELEASE GOVERNANCE</span>
-        <h2 id="release-page-title">发布治理</h2>
+        <h1 id="release-page-title">发布治理</h1>
         <p>在同一条可审计路径中管理分支、变更提案、评审、环境发布与可确认回滚。</p>
       </div>
       <div class="release-header-actions">
@@ -170,10 +170,10 @@
                     <el-icon aria-hidden="true"><View /></el-icon>{{ selectedProposalId === proposal.id ? '当前提案' : '设为当前提案' }}
                   </el-button>
                   <el-button v-if="canSubmitProposal(proposal)" text type="primary" :loading="actionLoading === 'submit-proposal'" @click="submitReleaseProposal(proposal)">
-                    <el-icon aria-hidden="true"><Upload /></el-icon>提交评审
+                    <el-icon aria-hidden="true"><Upload /></el-icon>送审
                   </el-button>
                   <el-button v-if="canReview(proposal)" text type="warning" @click="openReviewDialog(proposal)">
-                    <el-icon aria-hidden="true"><UserFilled /></el-icon>提交评审
+                    <el-icon aria-hidden="true"><UserFilled /></el-icon>填写评审结论
                   </el-button>
                   <el-button v-if="proposal.status === 'approved'" text type="success" @click="openMergeDialog(proposal)">
                     <el-icon aria-hidden="true"><CircleCheckFilled /></el-icon>确认合入
@@ -582,7 +582,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '@/api'
 import { useAuthStore } from '@/stores/auth'
@@ -631,6 +631,10 @@ const connectorReadiness = ref<Partial<Record<EnvironmentId, ConnectorReadiness>
 const connectorReadinessLoading = ref(false)
 const connectorReadinessError = ref('')
 let connectorReadinessRequest = 0
+let viewDisposed = false
+let scenarioLoadRequest = 0
+let releaseDataRequest = 0
+let starterKitRequest = 0
 
 const branchDialogVisible = ref(false)
 const proposalDialogVisible = ref(false)
@@ -964,16 +968,22 @@ function toErrorMessage(cause: unknown, fallback: string) {
 }
 
 async function loadScenarios() {
+  const request = ++scenarioLoadRequest
   loading.value = true
   error.value = ''
   try {
     // Generic discovery also includes foreign public scenarios.  Release
     // governance deliberately lists only scenarios owned by this tenant.
-    scenarios.value = await api.listReleaseScenarios()
+    const availableScenarios = await api.listReleaseScenarios()
+    if (viewDisposed || request !== scenarioLoadRequest) return
+    scenarios.value = availableScenarios
     const requested = routeScenarioId()
     const available = scenarios.value.some((scenario) => scenario.id === requested) ? requested : scenarios.value[0]?.id || ''
     scenarioId.value = available
-    if (available && requested !== available) await router.replace({ query: { ...route.query, scenario_id: available } })
+    if (available && requested !== available) {
+      await router.replace({ query: { ...route.query, scenario_id: available } })
+      return
+    }
     if (!available) {
       branches.value = []
       proposals.value = []
@@ -985,15 +995,17 @@ async function loadScenarios() {
     }
     await loadReleaseData(available, false)
   } catch (cause) {
-    error.value = toErrorMessage(cause, '业务场景加载失败')
+    if (!viewDisposed && request === scenarioLoadRequest) error.value = toErrorMessage(cause, '业务场景加载失败')
   } finally {
-    loading.value = false
+    if (!viewDisposed && request === scenarioLoadRequest) loading.value = false
   }
 }
 async function loadStarterKits() {
+  const request = ++starterKitRequest
   starterKitsLoading.value = true
   try {
     const kits = await api.listStarterKits()
+    if (viewDisposed || request !== starterKitRequest) return
     starterKits.value = kits
     if (!kits.some((kit) => kit.id === selectedStarterKitId.value)) {
       selectedStarterKitId.value = kits[0]?.id || ''
@@ -1001,9 +1013,9 @@ async function loadStarterKits() {
   } catch (cause) {
     // The normal package exchange remains available if the optional static
     // catalog cannot be loaded.  Keep a recoverable message on this page.
-    error.value = toErrorMessage(cause, 'Starter Kit 目录加载失败')
+    if (!viewDisposed && request === starterKitRequest) error.value = toErrorMessage(cause, 'Starter Kit 目录加载失败')
   } finally {
-    starterKitsLoading.value = false
+    if (!viewDisposed && request === starterKitRequest) starterKitsLoading.value = false
   }
 }
 async function loadConnectorReadiness(id = scenarioId.value) {
@@ -1011,24 +1023,28 @@ async function loadConnectorReadiness(id = scenarioId.value) {
   const request = ++connectorReadinessRequest
   connectorReadiness.value = {}
   connectorReadinessError.value = ''
-  if (!id || !snapshotId) return
+  if (!id || !snapshotId) {
+    connectorReadinessLoading.value = false
+    return
+  }
   connectorReadinessLoading.value = true
   try {
     const results = await Promise.all(ENVIRONMENTS.map(async (environment) => [
       environment.id,
       await api.getConnectorReadiness(id, { snapshot_id: snapshotId, environment: environment.id }),
     ] as const))
-    if (request !== connectorReadinessRequest || id !== scenarioId.value || snapshotId !== publishSnapshotId.value) return
+    if (viewDisposed || request !== connectorReadinessRequest || id !== scenarioId.value || snapshotId !== publishSnapshotId.value) return
     connectorReadiness.value = Object.fromEntries(results) as Partial<Record<EnvironmentId, ConnectorReadiness>>
   } catch {
-    if (request !== connectorReadinessRequest || id !== scenarioId.value) return
+    if (viewDisposed || request !== connectorReadinessRequest || id !== scenarioId.value) return
     connectorReadinessError.value = '连接器状态读取失败'
   } finally {
-    if (request === connectorReadinessRequest) connectorReadinessLoading.value = false
+    if (!viewDisposed && request === connectorReadinessRequest) connectorReadinessLoading.value = false
   }
 }
 async function loadReleaseData(id = scenarioId.value, showLoading = true) {
   if (!id) return
+  const request = ++releaseDataRequest
   if (showLoading) loading.value = true
   error.value = ''
   try {
@@ -1037,7 +1053,7 @@ async function loadReleaseData(id = scenarioId.value, showLoading = true) {
       api.listReleaseProposals(id),
       api.listReleaseRecords(id),
     ])
-    if (id !== scenarioId.value) return
+    if (viewDisposed || request !== releaseDataRequest || id !== scenarioId.value) return
     branches.value = branchList
     proposals.value = proposalList
     records.value = recordList
@@ -1047,9 +1063,9 @@ async function loadReleaseData(id = scenarioId.value, showLoading = true) {
     if (!current.some((proposal) => proposal.id === selectedProposalId.value)) selectedProposalId.value = current[0]?.id || ''
     await loadConnectorReadiness(id)
   } catch (cause) {
-    error.value = toErrorMessage(cause, '发布治理数据加载失败')
+    if (!viewDisposed && request === releaseDataRequest) error.value = toErrorMessage(cause, '发布治理数据加载失败')
   } finally {
-    if (showLoading) loading.value = false
+    if (showLoading && !viewDisposed && request === releaseDataRequest) loading.value = false
   }
 }
 async function selectScenario(id: string) {
@@ -1061,7 +1077,10 @@ async function selectScenario(id: string) {
   connectorReadinessError.value = ''
   connectorReadinessRequest += 1
   clearPackageImportState()
-  if (routeScenarioId() !== id) await router.replace({ query: { ...route.query, scenario_id: id } })
+  if (routeScenarioId() !== id) {
+    await router.replace({ query: { ...route.query, scenario_id: id } })
+    return
+  }
   await loadReleaseData(id)
 }
 function selectProposal(id: string) {
@@ -1129,7 +1148,7 @@ async function openPublishDialog(environment: EnvironmentId) {
 }
 function openConnectorSettings(environment: EnvironmentId) {
   if (!scenarioId.value) return
-  void router.push({ path: '/connectors', query: { scenario_id: scenarioId.value, environment } })
+  void router.push({ path: '/connectors', query: { scenario_id: scenarioId.value, environment, return_to: route.fullPath } })
 }
 function openRollback(record: ReleaseRecord) {
   rollbackTarget.value = record
@@ -1159,6 +1178,7 @@ function openConnectorBinding(binding: Record<string, any>) {
       binding_key: String(binding.binding_key),
       kind: String(binding.kind),
       reference_label: referenceLabel,
+      return_to: route.fullPath,
     },
   })
 }
@@ -1517,25 +1537,18 @@ watch([packageImportEnvironment, selectedStarterKitId], () => {
     packagePreviewRequest += 1
   }
 })
-watch(() => route.query.scenario_id, (value) => {
-  const id = Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
-  if (!id || id === scenarioId.value) return
-  if (scenarios.value.length && !scenarios.value.some((scenario) => scenario.id === id)) {
-    void loadScenarios()
-    return
-  }
-  scenarioId.value = id
-  selectedBranchId.value = ''
-  selectedProposalId.value = ''
-  connectorReadiness.value = {}
-  connectorReadinessError.value = ''
-  connectorReadinessRequest += 1
-  clearPackageImportState()
-  void loadReleaseData(id)
-})
 onMounted(() => {
+  viewDisposed = false
   void loadScenarios()
   void loadStarterKits()
+})
+onBeforeUnmount(() => {
+  viewDisposed = true
+  scenarioLoadRequest += 1
+  releaseDataRequest += 1
+  starterKitRequest += 1
+  connectorReadinessRequest += 1
+  packagePreviewRequest += 1
 })
 </script>
 
@@ -1543,7 +1556,7 @@ onMounted(() => {
 .release-page { min-height: 100%; max-width: 1600px; margin: 0 auto; padding: 24px 28px 36px; }
 .release-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 14px; }
 .eyebrow { display: inline-block; color: var(--primary); font-size: 10px; font-weight: 800; letter-spacing: .15em; }
-.release-header h2 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
+.release-header h1 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
 .release-header p { max-width: 680px; margin: 0; color: var(--text-2); font-size: 13px; }
 .release-header-actions, .section-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
 .release-header-actions :deep(.el-button), .section-actions :deep(.el-button) { min-height: 40px; }

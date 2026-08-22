@@ -157,16 +157,22 @@ export interface Property {
   is_enum?: boolean
   enum_values?: string[]
   default_value?: string
+  /** Server-validated declarative constraints (for example minimum or pattern). */
+  constraints?: Record<string, unknown>
+  is_sensitive?: boolean
 }
 
 export interface Entity {
   id?: string
   scenario_id?: string
   name: string
+  namespace?: string
   description?: string
   icon?: string
   color?: string
   is_abstract?: boolean
+  /** Name of the enum property used as this entity's lifecycle state. */
+  state_property?: string
   properties: Property[]
   created_at?: string
 }
@@ -175,6 +181,7 @@ export interface Relation {
   id?: string
   scenario_id?: string
   name: string
+  namespace?: string
   source_entity_id: string
   target_entity_id: string
   relation_type: string
@@ -188,6 +195,7 @@ export interface Scenario {
   name: string
   description?: string
   industry?: string
+  namespace?: string
   status?: string
   /** Whether the current user may mutate resources in this scenario. */
   can_write?: boolean
@@ -210,6 +218,18 @@ export interface OntologyInstance {
   attributes: Record<string, any>
   source?: string
   source_ref?: string
+  state?: string
+  valid_from?: string | null
+  valid_to?: string | null
+  quality?: {
+    score?: number
+    status?: 'unknown' | 'valid' | 'warning' | 'invalid' | string
+    issues?: string[]
+    checked_at?: string
+    source?: string
+    [key: string]: unknown
+  }
+  access_scope?: 'tenant' | 'restricted'
   entity_name?: string
   entity_color?: string
   created_at?: string
@@ -283,6 +303,12 @@ export interface DataMapping {
   data_source_binding_ref?: Record<string, any>
   table_name: string
   column_map: Record<string, string>
+  transform_rules?: Record<string, Array<{
+    op: 'trim' | 'lower' | 'upper' | 'default' | 'replace' | 'to_string' | 'to_integer' | 'to_float' | 'to_boolean' | string
+    value?: unknown
+    old?: string
+    new?: string
+  }>>
   entity_name?: string
   data_source_name?: string
   data_source_type?: string
@@ -303,6 +329,12 @@ export interface DataMappingFieldPreview {
   source_column: string
   source_exists: boolean
   status: 'mapped' | 'missing' | 'invalid'
+  transform_rules?: Array<{
+    op: string
+    old?: string
+    new?: string
+    value?: unknown
+  }>
 }
 
 export interface DataMappingPreview {
@@ -314,6 +346,7 @@ export interface DataMappingPreview {
   message: string
   columns: string[]
   sample_rows: any[][]
+  transformed_rows?: Record<string, unknown>[]
   row_count: number
   truncated: boolean
   fields: DataMappingFieldPreview[]
@@ -603,6 +636,18 @@ export interface ActionExecutionLog {
     connector_name?: string
     adapter_type?: string
   }>
+  /** Verified decision-chain facts; legacy/context-less rows stay `unknown`. */
+  actor_type?: 'user' | 'agent' | 'unknown'
+  actor_user_id?: string | null
+  agent_id?: string | null
+  llm_config_id?: string | null
+  model_name?: string | null
+  permission_decision?: Record<string, unknown>
+  data_context?: Record<string, unknown>
+  correlation_id?: string
+  parent_action_log_id?: string | null
+  agent_message_id?: string | null
+  assistant_message_id?: string | null
   error?: string
   duration_ms?: number
   created_at?: string
@@ -1137,6 +1182,56 @@ export interface AssistantAttachment {
   created_at?: string
 }
 
+export interface AssistantQuestion {
+  id: string
+  title: string
+  message: string
+  options?: Array<{
+    label: string
+    value?: string
+    impact: string
+    recommended?: boolean
+    prompt?: string
+  }>
+}
+
+export interface AssistantEvidence {
+  rules_used: Array<{ id?: string; name: string; result?: string }>
+  tools_called: Array<{ name: string; status?: string; purpose?: string }>
+  confidence: number
+  uncertainties: string[]
+}
+
+export interface AssistantActionPreview {
+  target?: { id?: string; name?: string; entity_id?: string }
+  parameter_schema?: Record<string, unknown>
+  parameters?: Record<string, unknown>
+  missing_parameters?: string[]
+  impact?: { precondition?: string; postcondition?: string; executor_type?: string; side_effects_skipped?: boolean }
+  permission?: Record<string, unknown>
+  preview?: Record<string, any>
+  requires_approval?: boolean
+  execution_boundary?: string
+}
+
+/** A re-authorized source card attached to an assistant answer. */
+export interface AssistantSource {
+  id: string
+  kind?: 'rag' | 'attachment' | string
+  filename: string
+  status?: string
+  citation_id?: string
+  data_source_id?: string
+  data_source_name?: string
+  file_id?: string
+  chunk_id?: string
+  char_start?: number
+  char_end?: number
+  content_hash?: string
+  file_content_hash?: string
+  index_version?: string
+}
+
 /** P1 检索命中：可直接跳转至原文的稳定引用。 */
 export interface RagCitation {
   citation_id: string
@@ -1177,7 +1272,7 @@ export interface DocumentReindexResult {
 }
 
 export interface AssistantProposal {
-  kind: 'ontology' | 'workflow'
+  kind: 'scenario' | 'ontology' | 'mapping' | 'workflow'
   proposal_id: string
   title: string
   summary?: string
@@ -1210,8 +1305,10 @@ export interface AssistantMessage {
   context?: Record<string, any>
   attachments?: AssistantAttachment[] | Record<string, any>[]
   proposal?: AssistantProposal | Record<string, any>
-  questions?: { id: string; title: string; message: string }[]
-  sources?: { id: string; filename: string; status?: string }[]
+  questions?: AssistantQuestion[]
+  sources?: AssistantSource[]
+  evidence?: AssistantEvidence
+  action_preview?: AssistantActionPreview
   thinking?: AssistantThought[]
   streaming?: boolean
   created_at?: string
@@ -1221,9 +1318,11 @@ export interface AssistantReply {
   thread_id: string
   reply: string
   proposal?: AssistantProposal | Record<string, any>
-  questions?: { id: string; title: string; message: string }[]
+  questions?: AssistantQuestion[]
   suggestions?: string[]
-  sources?: { id: string; filename: string; status?: string }[]
+  sources?: AssistantSource[]
+  evidence?: AssistantEvidence
+  action_preview?: AssistantActionPreview
 }
 
 export interface ChatEvent {

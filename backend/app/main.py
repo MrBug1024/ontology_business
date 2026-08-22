@@ -37,6 +37,7 @@ async def lifespan(_: FastAPI):
     db = SessionLocal()
     try:
         permission_service.bootstrap_authorization(db)
+        operations_service.purge_expired_assistant_attachments(db)
         db.commit()
         skill_service.sync_skills_to_db(db)
     finally:

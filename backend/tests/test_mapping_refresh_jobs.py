@@ -74,7 +74,10 @@ class MappingRefreshJobTests(unittest.TestCase):
             is_required=True,
         )
         self.amount = OntologyProperty(
-            id="property-mapping-amount", entity_id=self.entity.id, name="amount"
+            id="property-mapping-amount",
+            entity_id=self.entity.id,
+            name="amount",
+            data_type="number",
         )
         self.mapping = DataMapping(
             id="mapping-job-1",

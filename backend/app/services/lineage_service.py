@@ -545,10 +545,17 @@ def build_scenario_lineage(db: Session, scenario_id: str, *, limit: int = 300) -
     for message in assistant_messages:
         source_cards = message.attachments if isinstance(message.attachments, list) else []
         rag_sources = [card for card in source_cards if _is_assistant_rag_source(card)]
+        message_context = message.context if isinstance(message.context, dict) else {}
+        assistant_preview = message_context.get("action_preview") or {}
+        assistant_preview_log_id = str(
+            ((assistant_preview.get("preview") or {}).get("log_id"))
+            if isinstance(assistant_preview, dict)
+            else ""
+        )
         # Only RAG-backed global answers participate in document lineage.  A
         # malformed/stale one invalidates the entire answer, matching history
         # redaction and preventing its generic node from becoming a side-channel.
-        if not rag_sources:
+        if not rag_sources and not assistant_preview_log_id:
             continue
         resolved_sources = [
             (card, _current_assistant_rag_source(db, scenario_id, card))
@@ -568,6 +575,12 @@ def build_scenario_lineage(db: Session, scenario_id: str, *, limit: int = 300) -
                 "source": "global_assistant",
             },
         )
+        if assistant_preview_log_id:
+            add_edge(
+                answer_node,
+                _node_id("action_preview", assistant_preview_log_id),
+                "requested_preview",
+            )
         for card, resolved in resolved_sources:
             # ``resolved`` is non-None after the all() check above.
             source, bucket_file, chunk = resolved  # type: ignore[misc]
@@ -619,6 +632,8 @@ def build_scenario_lineage(db: Session, scenario_id: str, *, limit: int = 300) -
     if len(action_logs) > max_items:
         truncated = True
         action_logs = action_logs[:max_items]
+    action_log_nodes: dict[str, str] = {}
+    visible_action_logs: list[ActionExecutionLog] = []
     for log in action_logs:
         resource, definition = _resource_for_execution_log(
             db,
@@ -630,6 +645,7 @@ def build_scenario_lineage(db: Session, scenario_id: str, *, limit: int = 300) -
         # mutable or stale label for the definition that actually ran.
         if not resource:
             continue
+        visible_action_logs.append(log)
         target_kind = str(log.target_type)
         target_name = str(resource.name or log.target_id)
         provenance = _definition_meta(log, definition)
@@ -657,10 +673,12 @@ def build_scenario_lineage(db: Session, scenario_id: str, *, limit: int = 300) -
             target_name,
             target_meta,
         )
+        is_preview = (log.mode or "") == "dry_run" or log.status == "dry_run"
+        log_kind = "action_preview" if is_preview else "action_execution"
         log_node = add_node(
-            "action_execution",
+            log_kind,
             log.id,
-            f"{target_name} · {log.status}",
+            f"{target_name} · {'预演' if is_preview else log.status}",
             {
                 "log_id": log.id,
                 "status": log.status,
@@ -668,23 +686,46 @@ def build_scenario_lineage(db: Session, scenario_id: str, *, limit: int = 300) -
                 **provenance,
             },
         )
+        action_log_nodes[log.id] = log_node
         add_edge(
             target_node,
             log_node,
-            "executed_as",
+            "previewed_as" if is_preview else "executed_as",
             log.mode or "execute",
             provenance,
         )
-        result_node = add_node(
-            "external_result",
-            log.id,
-            "外部执行结果",
-            {"log_id": log.id, "status": log.status, "has_error": bool(log.error)},
-        )
-        # The external-result edge is the most direct path users inspect in
-        # the graph.  Carry the same immutable-definition evidence as the
-        # execution edge so a result cannot be mistaken for a live definition.
-        add_edge(log_node, result_node, "returned", log.status, provenance)
+        if not is_preview and log.mode == "execute" and log.status == "success":
+            result_node = add_node(
+                "external_result",
+                log.id,
+                "外部执行结果",
+                {"log_id": log.id, "status": log.status, "has_error": False},
+            )
+            # Only a successful real execution is an external result.  Dry-run
+            # plans and failed/confirmation records remain explicit audit nodes.
+            add_edge(log_node, result_node, "returned", log.status, provenance)
+
+    for log in visible_action_logs:
+        log_node = action_log_nodes[log.id]
+        if log.parent_action_log_id and log.parent_action_log_id in action_log_nodes:
+            add_edge(
+                action_log_nodes[log.parent_action_log_id],
+                log_node,
+                "confirmed_as",
+                log.correlation_id or "",
+            )
+        if log.agent_message_id:
+            add_edge(
+                _node_id("ai_answer", log.agent_message_id),
+                log_node,
+                "requested_preview" if (log.mode or "") == "dry_run" else "requested_action",
+            )
+        if log.assistant_message_id:
+            add_edge(
+                _node_id("ai_answer", f"assistant:{log.assistant_message_id}"),
+                log_node,
+                "requested_preview" if (log.mode or "") == "dry_run" else "requested_action",
+            )
 
     workflow_runs = db.execute(
         select(WorkflowRun)
@@ -740,7 +781,9 @@ def build_scenario_lineage(db: Session, scenario_id: str, *, limit: int = 300) -
     for message_id, log_ids in action_ids_by_message.items():
         answer_node = _node_id("ai_answer", message_id)
         for log_id in log_ids:
-            add_edge(answer_node, _node_id("action_execution", log_id), "requested_action")
+            target = action_log_nodes.get(log_id, _node_id("action_execution", log_id))
+            kind = "requested_preview" if target.startswith("action_preview:") else "requested_action"
+            add_edge(answer_node, target, kind)
 
     for message_id, object_ids in object_ids_by_message.items():
         answer_node = _node_id("ai_answer", message_id)

@@ -132,11 +132,19 @@
                 </el-tag>
               </div>
               <div class="proposal-preview">
-                <template v-if="proposalOf(message)?.kind === 'ontology'">
+                <template v-if="proposalOf(message)?.kind === 'scenario'">
+                  <span>业务场景 1</span>
+                  <span>状态 {{ proposalOf(message)?.payload?.status || 'draft' }}</span>
+                </template>
+                <template v-else-if="proposalOf(message)?.kind === 'ontology'">
                   <span>实体 {{ proposalOf(message)?.payload?.entities?.length || 0 }}</span>
                   <span>关系 {{ proposalOf(message)?.payload?.relations?.length || 0 }}</span>
                 </template>
-                <template v-else>
+                <template v-else-if="proposalOf(message)?.kind === 'mapping'">
+                  <span>目标 {{ proposalOf(message)?.payload?.entity_name || '实体' }}</span>
+                  <span>字段 {{ Object.keys(proposalOf(message)?.payload?.column_map || {}).length }}</span>
+                </template>
+                <template v-else-if="proposalOf(message)?.kind === 'workflow'">
                   <span>节点 {{ proposalOf(message)?.payload?.nodes?.length || 0 }}</span>
                   <span>连线 {{ proposalOf(message)?.payload?.edges?.length || 0 }}</span>
                 </template>
@@ -154,26 +162,74 @@
               </div>
               <pre v-if="expandedProposal[index]" class="proposal-code">{{ proposalText(proposalOf(message)) }}</pre>
               <div class="proposal-actions">
-                <el-button size="small" type="primary" :loading="applyingIndex === index" :disabled="!context.scenario_id || proposalOf(message)?.status === 'applied' || !proposalOf(message)?.proposal_id" @click="applyProposal(message, index)">
-                  <el-icon aria-hidden="true"><Check /></el-icon>{{ proposalOf(message)?.status === 'applied' ? '已应用到场景草稿' : '确认并应用变更' }}
+                <el-button size="small" type="primary" :loading="applyingIndex === index" :disabled="!proposalCanApply(proposalOf(message)) || proposalOf(message)?.status === 'applied' || !proposalOf(message)?.proposal_id" @click="applyProposal(message, index)">
+                  <el-icon aria-hidden="true"><Check /></el-icon>{{ proposalApplyLabel(proposalOf(message)) }}
                 </el-button>
-                <span v-if="!context.scenario_id" class="proposal-hint">请先打开业务场景</span>
-                <span v-else-if="!proposalOf(message)?.proposal_id" class="proposal-hint">此草稿缺少安全标识，请重新生成</span>
+                <span v-if="proposalApplyHint(proposalOf(message))" class="proposal-hint">{{ proposalApplyHint(proposalOf(message)) }}</span>
               </div>
             </div>
 
-            <div v-if="sourcesOf(message).length" class="message-sources">
-              <span class="sources-label">参考资料</span>
-              <el-tag v-for="source in sourcesOf(message)" :key="source.id || source.filename" size="small" effect="plain" type="info">
-                <el-icon aria-hidden="true"><Paperclip /></el-icon>{{ source.filename }}
-              </el-tag>
+            <div v-if="sourcesOf(message).length" class="message-sources" aria-label="回答引用">
+              <span class="sources-label">回答依据</span>
+              <button
+                v-for="source in sourcesOf(message)"
+                :key="source.id || source.filename"
+                type="button"
+                class="source-card"
+                :class="{ 'is-clickable': source.file_id }"
+                :disabled="!source.file_id"
+                :title="source.file_id ? `查看引用原文：${source.filename}` : '本次对话的临时附件'"
+                @click="openSource(source)"
+              >
+                <span class="source-mark">{{ source.citation_id || (source.kind === 'rag' ? '引用' : '附件') }}</span>
+                <span class="source-copy"><strong>{{ source.filename }}</strong><small>{{ source.data_source_name || (source.file_id ? '正式资料库' : '临时上下文') }}</small></span>
+                <el-icon v-if="source.file_id" aria-hidden="true"><ArrowRight /></el-icon>
+              </button>
             </div>
+
+            <section v-if="hasAssistantEvidence(message)" class="answer-evidence" aria-label="回答的规则、工具与不确定项">
+              <header>
+                <span><el-icon aria-hidden="true"><DocumentChecked /></el-icon>回答证据</span>
+                <el-tag size="small" effect="plain" :type="confidenceType(message.evidence?.confidence)">置信度 {{ confidencePercent(message.evidence?.confidence) }}</el-tag>
+              </header>
+              <div class="evidence-meta-grid">
+                <div v-if="message.evidence?.rules_used?.length"><b>使用规则</b><span>{{ message.evidence.rules_used.map((item) => item.result || item.name).join('；') }}</span></div>
+                <div v-if="message.evidence?.tools_called?.length"><b>调用工具</b><span>{{ message.evidence.tools_called.map((item) => `${item.name}${item.purpose ? ` · ${item.purpose}` : ''}`).join('；') }}</span></div>
+              </div>
+              <div v-if="message.evidence?.uncertainties?.length" class="evidence-uncertainties"><b>仍需确认</b><ul><li v-for="item in message.evidence.uncertainties" :key="item">{{ item }}</li></ul></div>
+            </section>
+
+            <section v-if="hasActionPreview(message)" class="assistant-action-preview" aria-label="Action 影响与预演结果">
+              <header>
+                <div><span class="eyebrow">GOVERNED ACTION</span><b>{{ message.action_preview?.target?.name || '待选择 Action' }}</b></div>
+                <el-tag size="small" effect="plain" :type="message.action_preview?.requires_approval ? 'warning' : 'info'">{{ message.action_preview?.requires_approval ? '需要确认或审批' : '仍需显式提交' }}</el-tag>
+              </header>
+              <dl>
+                <div><dt>执行器</dt><dd>{{ message.action_preview?.impact?.executor_type || '尚未确定' }}</dd></div>
+                <div><dt>权限检查</dt><dd>{{ assistantPermissionLabel(message.action_preview?.permission) }}</dd></div>
+                <div><dt>副作用</dt><dd>{{ message.action_preview?.impact?.side_effects_skipped === true ? '已跳过，仅预演' : '未创建预演' }}</dd></div>
+              </dl>
+              <p v-if="message.action_preview?.impact?.postcondition">影响：{{ message.action_preview.impact.postcondition }}</p>
+              <pre v-if="Object.keys(message.action_preview?.parameters || {}).length" class="action-preview-params">{{ JSON.stringify(message.action_preview?.parameters, null, 2) }}</pre>
+              <div class="assistant-action-next">
+                <span>{{ message.action_preview?.execution_boundary || '真实执行必须进入类型化 Action 并重新确认。' }}</span>
+                <el-button v-if="message.action_preview?.target?.id && context.scenario_id" size="small" type="primary" plain @click="continueGovernedAction(message.action_preview)">
+                  {{ message.action_preview?.preview?.log_id ? '进入 Action 确认' : '填写参数并预演' }}
+                </el-button>
+              </div>
+            </section>
 
             <div v-if="message.questions?.length" class="question-list">
               <div v-for="question in message.questions" :key="question.id" class="question-card">
                 <b>{{ question.title }}</b>
                 <span>{{ question.message }}</span>
-                <el-button size="small" text type="primary" @click="send(question.title)">继续说明</el-button>
+                <div v-if="question.options?.length" class="question-options">
+                  <button v-for="option in question.options" :key="option.value || option.label" type="button" @click="answerQuestion(question, option, message)">
+                    <span><strong>{{ option.label }}</strong><em v-if="option.recommended">推荐</em></span>
+                    <small>{{ option.impact }}</small>
+                  </button>
+                </div>
+                <el-button v-else size="small" text type="primary" @click="answerQuestion(question)">补充信息</el-button>
               </div>
             </div>
           </div>
@@ -194,17 +250,27 @@
             <el-tag v-else-if="item.status === 'error'" size="small" type="danger">失败</el-tag>
             <button type="button" :aria-label="`移除附件 ${item.filename}`" title="移除附件" @click="removeAttachment(item)"><el-icon aria-hidden="true"><Close /></el-icon></button>
           </div>
+          <div class="temporary-context-note"><el-icon aria-hidden="true"><Lock /></el-icon>临时上下文仅随下一条消息发送，不会自动进入正式数据源或对象映射。</div>
         </div>
         <div class="composer-tools">
-          <label class="tool-button" title="添加临时附件">
-            <el-icon aria-hidden="true"><Paperclip /></el-icon><span>添加附件</span>
-            <input ref="fileInput" type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.pptx,.md,.txt,.csv,.json,.png,.jpg,.jpeg" @change="onFilesPicked" />
+          <label class="tool-button" :class="{ disabled: uploadingFiles > 0 }" title="添加临时附件">
+            <el-icon v-if="uploadingFiles" class="is-loading" aria-hidden="true"><Loading /></el-icon>
+            <el-icon v-else aria-hidden="true"><Paperclip /></el-icon><span>{{ uploadingFiles ? `正在解析 ${uploadingFiles} 个文件` : '添加附件' }}</span>
+            <input ref="fileInput" type="file" multiple :disabled="uploadingFiles > 0" accept=".pdf,.docx,.xlsx,.xls,.pptx,.md,.txt,.csv,.json,.png,.jpg,.jpeg" @change="onFilesPicked" />
           </label>
-          <el-button size="small" :type="mode === 'draft' ? 'primary' : 'default'" plain @click="mode = mode === 'draft' ? 'ask' : 'draft'">
-            <el-icon aria-hidden="true"><MagicStick /></el-icon>{{ mode === 'draft' ? '草稿模式' : '生成草稿' }}
-          </el-button>
-          <span class="composer-hint">{{ mode === 'draft' ? '将优先生成可检查的本体或流程草稿' : 'Enter 发送 · Shift+Enter 换行' }}</span>
+          <div class="assistant-mode-switch" role="group" aria-label="助手工作模式">
+            <button
+              v-for="option in modeOptions"
+              :key="option.value"
+              type="button"
+              :class="{ active: mode === option.value }"
+              :aria-pressed="mode === option.value"
+              :title="option.hint"
+              @click="mode = option.value"
+            >{{ option.label }}</button>
+          </div>
         </div>
+        <div class="composer-mode-hint" role="status"><b>{{ activeModeOption.label }}</b><span>{{ activeModeOption.hint }}</span></div>
         <div class="composer-input-row">
           <el-input
             v-model="input"
@@ -213,23 +279,36 @@
             resize="none"
             maxlength="12000"
             show-word-limit
-            :placeholder="mode === 'draft' ? '描述要建模或编排的业务，例如：根据附件建立供应商管理本体…' : '描述你正在处理的业务问题…'"
+            :placeholder="activeModeOption.placeholder"
             @keydown.enter.exact.prevent="send()"
           />
-          <el-button class="send-button" type="primary" :loading="loading" :disabled="!input.trim()" aria-label="发送消息" title="发送" @click="send()">
+          <el-button class="send-button" type="primary" :loading="loading" :disabled="!input.trim() || uploadingFiles > 0" aria-label="发送消息" title="发送" @click="send()">
             <el-icon aria-hidden="true"><Promotion /></el-icon>
           </el-button>
         </div>
       </footer>
     </div>
   </el-drawer>
+
+  <el-dialog v-model="sourcePreviewVisible" title="引用原文" width="min(720px, 94vw)" append-to-body>
+    <div v-loading="sourcePreviewLoading" class="source-preview">
+      <div v-if="sourcePreview" class="source-preview-meta">
+        <el-tag v-if="sourcePreview.citation_id" type="info" effect="plain">{{ sourcePreview.citation_id }}</el-tag>
+        <div><strong>{{ sourcePreview.filename }}</strong><span>{{ sourcePreview.data_source_name || '正式资料库' }}</span></div>
+      </div>
+      <el-alert title="以下内容按当前账号权限重新读取；历史引用失效或权限收回后将无法显示。" type="info" :closable="false" show-icon />
+      <pre class="source-preview-text">{{ sourcePreviewText || '暂无可显示的引用片段' }}</pre>
+    </div>
+    <template #footer><el-button type="primary" @click="sourcePreviewVisible = false">关闭</el-button></template>
+  </el-dialog>
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamAssistantChat } from '@/api'
-import type { AssistantAttachment, AssistantMessage, AssistantProposal, AssistantThread, AssistantThought } from '@/types'
+import type { AssistantActionPreview, AssistantAttachment, AssistantMessage, AssistantProposal, AssistantQuestion, AssistantSource, AssistantThread, AssistantThought } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 
 interface AssistantContext {
@@ -239,10 +318,19 @@ interface AssistantContext {
 }
 
 const props = defineProps<{ context: AssistantContext }>()
+const router = useRouter()
+type AssistantMode = 'explain' | 'draft' | 'apply' | 'execute'
 const visible = ref(false)
 const loading = ref(false)
 const input = ref('')
-const mode = ref<'ask' | 'draft'>('ask')
+const mode = ref<AssistantMode>('explain')
+const modeOptions: Array<{ value: AssistantMode; label: string; hint: string; placeholder: string }> = [
+  { value: 'explain', label: '只解释', hint: '只读取和说明，不生成或写入变更。', placeholder: '询问当前业务事实、规则、来源或不确定项…' },
+  { value: 'draft', label: '生成草稿', hint: '生成可检查的 Change Set，确认前不写入。', placeholder: '描述要创建的场景、本体、映射或工作流草稿…' },
+  { value: 'apply', label: '应用修改', hint: '定位待应用草稿；写入仍需在 Change Set 卡片二次确认。', placeholder: '说明要应用哪份草稿或需要核对的变更范围…' },
+  { value: 'execute', label: '执行操作', hint: '分析影响并引导预演/审批；不会从聊天直接触发副作用。', placeholder: '描述要执行的 Action、参数和期望结果，以便检查权限与影响…' },
+]
+const activeModeOption = computed(() => modeOptions.find((option) => option.value === mode.value) || modeOptions[0])
 const messages = ref<AssistantMessage[]>([])
 const attachments = ref<AssistantAttachment[]>([])
 const threadId = ref('')
@@ -251,7 +339,12 @@ const historyVisible = ref(false)
 const threadsLoading = ref(false)
 const messageRef = ref<HTMLElement>()
 const fileInput = ref<HTMLInputElement>()
+const uploadingFiles = ref(0)
 const applyingIndex = ref<number | null>(null)
+const sourcePreviewVisible = ref(false)
+const sourcePreviewLoading = ref(false)
+const sourcePreview = ref<AssistantSource | null>(null)
+const sourcePreviewText = ref('')
 const expandedProposal = reactive<Record<number, boolean>>({})
 const expandedThinking = reactive<Record<string, boolean>>({})
 const selection = reactive<{ label: string; kind: string; id: string }>({ label: '', kind: '', id: '' })
@@ -269,8 +362,8 @@ const hasStreamingAssistant = computed(() => messages.value.some((message) => me
 // launcher must not cover its primary send action or keyboard focus target.
 const showLauncher = computed(() => !/^\/agents\/[^/]+\/chat(?:\/|$|\?)/.test(context.value.path))
 const starterSuggestions = computed(() => context.value.scenario_id
-  ? ['解释当前业务场景', '根据当前资料生成本体草稿', '把当前业务流程编排为工作流']
-  : ['这个平台可以帮我做什么？', '如何开始建立一个业务本体？', '我应该先准备哪些业务资料？'])
+  ? ['解释当前业务场景', '根据当前资料生成本体草稿', '根据现有实体和数据源生成映射草稿', '把当前业务流程编排为工作流']
+  : ['根据我的业务描述生成场景草稿', '这个平台可以帮我做什么？', '我应该先准备哪些业务资料？'])
 
 function proposalOf(message: AssistantMessage): AssistantProposal | null {
   const proposal = message.proposal as AssistantProposal | undefined
@@ -282,6 +375,25 @@ function proposalText(proposal: AssistantProposal | null) {
   return JSON.stringify(proposal.payload, null, 2)
 }
 
+function proposalCanApply(proposal: AssistantProposal | null) {
+  if (!proposal) return false
+  return proposal.kind === 'scenario' ? !context.value.scenario_id : Boolean(context.value.scenario_id)
+}
+
+function proposalApplyLabel(proposal: AssistantProposal | null) {
+  if (!proposal) return '确认并应用变更'
+  if (proposal.status === 'applied') return proposal.kind === 'scenario' ? '场景已创建' : '变更已应用'
+  return ({ scenario: '确认并创建场景', mapping: '确认并保存映射', ontology: '确认并应用本体', workflow: '确认并保存流程' } as Record<string, string>)[proposal.kind] || '确认并应用变更'
+}
+
+function proposalApplyHint(proposal: AssistantProposal | null) {
+  if (!proposal?.proposal_id) return '此草稿缺少安全标识，请重新生成'
+  if (proposal.kind === 'scenario' && context.value.scenario_id) return '场景草稿只能在全局工作区创建'
+  if (proposal.kind !== 'scenario' && !context.value.scenario_id) return '请先打开业务场景'
+  if (proposal.kind === 'mapping') return '保存后仍需预览、测试并刷新对象'
+  return ''
+}
+
 function proposalOperationLabel(operation: string) {
   return ({ add: '新增', update: '修改', delete: '删除', skip: '跳过' } as Record<string, string>)[operation] || operation
 }
@@ -291,13 +403,73 @@ function proposalOperationType(operation: string) {
 }
 
 function proposalResourceLabel(resource: string) {
-  return ({ entity: '实体', relation: '关系', workflow: '工作流', workflow_node: '工作流节点', workflow_edge: '工作流连线' } as Record<string, string>)[resource] || resource
+  return ({
+    scenario: '业务场景', entity: '实体', property: '属性', relation: '关系', mapping: '数据映射', mapping_field: '映射字段', data_mapping: '数据映射',
+    action: '操作', rule: '规则', workflow: '工作流', workflow_node: '工作流节点', workflow_edge: '工作流连线',
+  } as Record<string, string>)[resource] || resource
 }
 
-function sourcesOf(message: AssistantMessage) {
+function sourcesOf(message: AssistantMessage): AssistantSource[] {
   return message.sources?.length
     ? message.sources
-    : (Array.isArray(message.attachments) ? message.attachments : []) as { id?: string; filename: string; status?: string }[]
+    : (Array.isArray(message.attachments) ? message.attachments : []) as AssistantSource[]
+}
+
+function hasAssistantEvidence(message: AssistantMessage) {
+  const evidence = message.evidence
+  return Boolean(evidence && (evidence.rules_used?.length || evidence.tools_called?.length || evidence.uncertainties?.length || evidence.confidence > 0))
+}
+function confidencePercent(value?: number) { return `${Math.round(Math.max(0, Math.min(Number(value || 0), 1)) * 100)}%` }
+function confidenceType(value?: number): 'success' | 'warning' | 'danger' {
+  const score = Number(value || 0)
+  return score >= .8 ? 'success' : score >= .6 ? 'warning' : 'danger'
+}
+function hasActionPreview(message: AssistantMessage) { return Boolean(message.action_preview && Object.keys(message.action_preview).length) }
+function assistantPermissionLabel(permission?: Record<string, unknown>) {
+  if (!permission || !Object.keys(permission).length) return '尚未检查'
+  const allowed = permission.allowed ?? permission.decision ?? permission.result
+  if (allowed === true || allowed === 'allow' || allowed === 'allowed') return '允许预演'
+  if (allowed === false || allowed === 'deny' || allowed === 'denied') return '未获允许'
+  return String(allowed ?? '已检查')
+}
+async function continueGovernedAction(preview?: AssistantActionPreview) {
+  const actionId = preview?.target?.id
+  if (!actionId || !context.value.scenario_id) return
+  visible.value = false
+  await router.push({
+    name: 'scenario-detail',
+    params: { id: context.value.scenario_id },
+    query: { stage: 'actions', action_id: actionId, return_to: context.value.path || undefined },
+    state: { assistant_action_preview: JSON.parse(JSON.stringify(preview || {})) },
+  })
+  window.dispatchEvent(new CustomEvent('open-governed-action', { detail: { action_id: actionId, preview } }))
+}
+
+async function openSource(source: AssistantSource) {
+  if (!source.file_id) return
+  sourcePreview.value = source
+  sourcePreviewText.value = ''
+  sourcePreviewVisible.value = true
+  sourcePreviewLoading.value = true
+  try {
+    const result = await api.fileText(source.file_id)
+    const text = result.text || ''
+    const hasRange = Number.isFinite(source.char_start) && Number.isFinite(source.char_end)
+    if (!hasRange) {
+      sourcePreviewText.value = text.slice(0, 5000)
+      return
+    }
+    const start = Math.max(Number(source.char_start || 0), 0)
+    const end = Math.max(Number(source.char_end || start), start)
+    const contextStart = Math.max(start - 240, 0)
+    const contextEnd = Math.min(end + 240, text.length)
+    sourcePreviewText.value = `${contextStart > 0 ? '…' : ''}${text.slice(contextStart, contextEnd)}${contextEnd < text.length ? '…' : ''}`
+  } catch (error: any) {
+    sourcePreviewText.value = ''
+    ElMessage.error(error.message || '引用原文读取失败，资料可能已变更或权限已收回')
+  } finally {
+    sourcePreviewLoading.value = false
+  }
 }
 
 function toggleProposal(index: number) {
@@ -470,18 +642,25 @@ async function deleteThread(thread: AssistantThread) {
   }
 }
 
-async function onFilesPicked(event: Event) {
-  const target = event.target as HTMLInputElement
-  const files = Array.from(target.files || [])
+async function uploadTemporaryFiles(files: File[]) {
   for (const file of files) {
+    uploadingFiles.value += 1
     try {
       const uploaded = await api.uploadAssistantAttachment(file)
       attachments.value.push(uploaded)
       if (uploaded.status === 'error') ElMessage.warning(`${uploaded.filename}：${uploaded.error || '解析失败'}`)
     } catch (error: any) {
       ElMessage.error(`${file.name} 上传失败：${error.message || '请求失败'}`)
+    } finally {
+      uploadingFiles.value = Math.max(uploadingFiles.value - 1, 0)
     }
   }
+}
+
+async function onFilesPicked(event: Event) {
+  const target = event.target as HTMLInputElement
+  const files = Array.from(target.files || [])
+  await uploadTemporaryFiles(files)
   target.value = ''
 }
 
@@ -519,6 +698,9 @@ function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantM
     case 'proposal':
       ai.proposal = event.data || {}
       break
+    case 'action_preview':
+      ai.action_preview = event.data || undefined
+      break
     case 'meta': {
       const data = event.data || {}
       if (data.thread_id) {
@@ -530,6 +712,8 @@ function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantM
       ai.proposal = data.proposal || ai.proposal || {}
       ai.questions = data.questions || []
       ai.sources = data.sources || []
+      ai.evidence = data.evidence || undefined
+      ai.action_preview = data.action_preview || undefined
       if (Array.isArray(data.thinking)) ai.thinking = data.thinking
       break
     }
@@ -550,7 +734,7 @@ function finishStream(ai: AssistantMessage) {
 
 function send(text?: string) {
   const content = (text ?? input.value).trim()
-  if (!content || loading.value) return
+  if (!content || loading.value || uploadingFiles.value > 0) return
   if (messages.value.length === 1 && messages.value[0].role === 'assistant' && !messages.value[0].id) messages.value = []
   const currentAttachments = [...attachments.value]
   messages.value.push({ role: 'user', content, attachments: currentAttachments })
@@ -588,12 +772,59 @@ function send(text?: string) {
   )
 }
 
+async function answerQuestion(
+  question: AssistantQuestion,
+  option?: NonNullable<AssistantQuestion['options']>[number],
+  sourceMessage?: AssistantMessage,
+) {
+  if (!option) {
+    input.value = `${question.title}：`
+    return
+  }
+  if (option.value === 'open_scenario') {
+    visible.value = false
+    await router.push({ name: 'scenarios' })
+    return
+  }
+  if (option.value === 'draft_scenario') {
+    mode.value = 'draft'
+    input.value = '请根据以下业务目标创建业务场景草稿：\n'
+    return
+  }
+  if (['provide_params', 'inspect_schema'].includes(String(option.value || '')) && sourceMessage?.action_preview?.target?.id) {
+    await continueGovernedAction(sourceMessage.action_preview)
+    return
+  }
+  if (option.value === 'configure_action' && context.value.scenario_id) {
+    visible.value = false
+    await router.push({
+      name: 'scenario-detail',
+      params: { id: context.value.scenario_id },
+      query: { stage: 'actions', return_to: context.value.path || undefined },
+    })
+    return
+  }
+  const prompt = option.prompt?.trim() || [
+    question.title,
+    `我的选择：${option.label}${option.value ? `（${option.value}）` : ''}`,
+    `已了解影响：${option.impact}`,
+    '请按这个选择继续，并明确后续仍需我确认的变更或操作。',
+  ].join('\n')
+  send(prompt)
+}
+
 async function applyProposal(message: AssistantMessage, index: number) {
   const proposal = proposalOf(message)
-  if (!proposal || proposal.status === 'applied' || !context.value.scenario_id || !threadId.value || !proposal.proposal_id || applyingIndex.value !== null) return
+  if (!proposal || proposal.status === 'applied' || !proposalCanApply(proposal) || !threadId.value || !proposal.proposal_id || applyingIndex.value !== null) return
+  const effectiveChanges = proposal.changes?.filter((change) => change.operation !== 'skip').length || 0
+  const confirmation = proposal.kind === 'scenario'
+    ? `将根据这份草稿创建业务场景“${proposal.payload?.name || '未命名场景'}”。附件仍只属于助手临时上下文，不会成为正式数据源。`
+    : proposal.kind === 'mapping'
+      ? `将把 ${effectiveChanges} 项映射差异保存到当前场景。保存不会导入数据，之后仍需预览、测试并刷新对象。`
+      : `将把 ${effectiveChanges} 项变更写入当前场景草稿。草稿状态的工作流不会立即执行。`
   try {
     await ElMessageBox.confirm(
-      `将把 ${proposal.changes?.filter((change) => change.operation !== 'skip').length || 0} 项变更写入当前场景草稿。草稿状态的工作流不会立即执行。`,
+      confirmation,
       '确认应用 Change Set',
       {
         type: 'warning',
@@ -609,15 +840,25 @@ async function applyProposal(message: AssistantMessage, index: number) {
   try {
     const result = await api.applyAssistantProposal({
       kind: proposal.kind,
-      scenario_id: context.value.scenario_id,
+      scenario_id: proposal.kind === 'scenario' ? undefined : context.value.scenario_id,
       thread_id: threadId.value,
       proposal_id: proposal.proposal_id,
       confirm: true,
     })
-    message.content += '\n\n变更已应用到当前场景草稿。'
+    const appliedScenarioId = proposal.kind === 'scenario' ? result?.data?.scenario_id : ''
+    message.content += proposal.kind === 'scenario'
+      ? '\n\n业务场景已创建，正在进入闭环工作台。'
+      : proposal.kind === 'mapping'
+        ? '\n\n映射草稿已保存。下一步请预览、测试并刷新对象。'
+        : '\n\n变更已应用到当前场景草稿。'
     message.proposal = { ...proposal, status: 'applied', apply_result: result?.data || {} }
-    window.dispatchEvent(new CustomEvent('assistant-proposal-applied', { detail: { scenario_id: context.value.scenario_id, kind: proposal.kind } }))
-    ElMessage.success(result?.status === 'replayed' ? '该变更已应用过，已恢复应用结果' : '变更已应用到场景草稿')
+    window.dispatchEvent(new CustomEvent('assistant-proposal-applied', { detail: { scenario_id: appliedScenarioId || context.value.scenario_id, kind: proposal.kind } }))
+    if (result?.status === 'replayed') ElMessage.info('该变更已应用过，已恢复应用结果')
+    else ElMessage.success(proposal.kind === 'scenario' ? '业务场景已创建' : proposal.kind === 'mapping' ? '映射草稿已保存' : '变更已应用到场景草稿')
+    if (appliedScenarioId) {
+      visible.value = false
+      await router.push({ name: 'scenario-detail', params: { id: appliedScenarioId }, query: { stage: 'flow' } })
+    }
   } catch (error: any) {
     ElMessage.error(error.message || '应用变更失败')
   } finally {
@@ -632,12 +873,32 @@ function onSelection(event: Event) {
   selection.id = detail.id || ''
 }
 
+async function onAssistantOpenRequest(event: Event) {
+  const detail = (event as CustomEvent<{ mode?: AssistantMode | 'ask'; prompt?: string; files?: File[] }>).detail || {}
+  if (loading.value) {
+    ElMessage.info('当前助手任务完成后可继续新的建模步骤')
+    return
+  }
+  await nextTick()
+  if (!visible.value) await openAssistant()
+  historyVisible.value = false
+  if (detail.mode) mode.value = detail.mode === 'ask' ? 'explain' : detail.mode
+  if (typeof detail.prompt === 'string') input.value = detail.prompt
+  const files = Array.isArray(detail.files) ? detail.files.filter((file): file is File => file instanceof File) : []
+  if (files.length) await uploadTemporaryFiles(files)
+  scrollBottom()
+}
+
 watch(() => storageKey.value, async () => {
+  streamController?.abort()
+  streamController = null
+  loading.value = false
   messages.value = []
   threads.value = []
   threadId.value = ''
   historyVisible.value = false
   attachments.value = []
+  sourcePreviewVisible.value = false
   Object.keys(expandedThinking).forEach((key) => delete expandedThinking[key])
   if (visible.value) {
     await loadContext()
@@ -647,10 +908,14 @@ watch(showLauncher, (show) => {
   if (!show) visible.value = false
 })
 
-onMounted(() => window.addEventListener('ontology-selection-change', onSelection))
+onMounted(() => {
+  window.addEventListener('ontology-selection-change', onSelection)
+  window.addEventListener('assistant-open-request', onAssistantOpenRequest)
+})
 onBeforeUnmount(() => {
   streamController?.abort()
   window.removeEventListener('ontology-selection-change', onSelection)
+  window.removeEventListener('assistant-open-request', onAssistantOpenRequest)
 })
 </script>
 
@@ -775,12 +1040,60 @@ onBeforeUnmount(() => {
 .proposal-code { max-height: 180px; margin: 0 12px 10px; padding: 10px; overflow: auto; border-radius: 8px; color: #e2e8f0; background: #1d2930; font-size: 10px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 .proposal-actions { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-top: 1px solid var(--border); }
 .proposal-hint { color: var(--text-3); font-size: 10.5px; }
-.message-sources { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-top: 7px; }
+.message-sources { display: grid; gap: 5px; margin-top: 8px; }
 .sources-label { color: var(--text-3); font-size: 10.5px; }
+.source-card {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 42px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text-2);
+  background: var(--surface-2);
+  font: inherit;
+  text-align: left;
+}
+.source-card.is-clickable { cursor: pointer; }
+.source-card.is-clickable:hover, .source-card.is-clickable:focus-visible { border-color: var(--primary); background: var(--primary-soft); outline: none; }
+.source-card:disabled { opacity: 1; }
+.source-mark { flex: 0 0 auto; padding: 2px 6px; border-radius: 5px; color: var(--primary-600); background: var(--primary-soft); font-size: 9px; font-weight: 800; }
+.source-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
+.source-copy strong { overflow: hidden; color: var(--text-2); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.source-copy small { color: var(--text-3); font-size: 9.5px; }
 .question-list { display: flex; flex-direction: column; gap: 7px; margin-top: 8px; }
 .question-card { display: flex; flex-direction: column; gap: 4px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; color: var(--text-2); background: var(--surface-2); font-size: 11.5px; line-height: 1.5; }
 .question-card b { color: var(--text); }
 .question-card .el-button { align-self: flex-start; padding-left: 0; }
+.answer-evidence, .assistant-action-preview { margin-top: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); color: var(--text-2); font-size: 11px; }
+.answer-evidence > header, .assistant-action-preview > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 9px; }
+.answer-evidence > header > span { display: inline-flex; align-items: center; gap: 5px; color: var(--text); font-weight: 750; }
+.evidence-meta-grid { display: grid; gap: 6px; margin-top: 8px; }
+.evidence-meta-grid > div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 7px; }
+.evidence-meta-grid b, .evidence-uncertainties b { color: var(--text-3); font-size: 10px; }
+.evidence-meta-grid span { overflow-wrap: anywhere; line-height: 1.5; }
+.evidence-uncertainties { margin-top: 7px; padding-top: 7px; border-top: 1px dashed var(--border); }
+.evidence-uncertainties ul { margin: 3px 0 0; padding-left: 16px; color: var(--warning); }
+.assistant-action-preview header > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.assistant-action-preview header b { color: var(--text); font-size: 12px; }
+.assistant-action-preview dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; margin: 9px 0 0; }
+.assistant-action-preview dl div { min-width: 0; padding: 6px; border-radius: 7px; background: var(--surface); }
+.assistant-action-preview dt { color: var(--text-3); font-size: 9px; }
+.assistant-action-preview dd { margin: 2px 0 0; overflow-wrap: anywhere; color: var(--text); font-size: 10px; }
+.assistant-action-preview p { margin: 8px 0 0; line-height: 1.5; }
+.action-preview-params { max-height: 130px; margin: 8px 0 0; padding: 8px; overflow: auto; border-radius: 7px; background: #1d2930; color: #e2e8f0; font: 10px/1.5 'Cascadia Code', Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.assistant-action-next { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.assistant-action-next span { min-width: 0; color: var(--text-3); line-height: 1.45; }
+.assistant-action-next .el-button { flex: 0 0 auto; }
+.question-options { display: grid; gap: 6px; margin-top: 4px; }
+.question-options button { display: grid; min-height: 48px; gap: 3px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--text-2); font: inherit; text-align: left; cursor: pointer; transition: border-color var(--dur), background var(--dur); }
+.question-options button:hover, .question-options button:focus-visible { border-color: var(--primary); background: var(--primary-soft); outline: none; }
+.question-options button > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.question-options strong { color: var(--text); font-size: 11.5px; }
+.question-options em { padding: 1px 5px; border-radius: 999px; background: var(--primary-soft); color: var(--primary-600); font-size: 9px; font-style: normal; font-weight: 750; }
+.question-options small { color: var(--text-3); font-size: 10.5px; line-height: 1.45; }
 .assistant-thinking { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; color: var(--text-3); font-size: 11.5px; }
 .assistant-thinking .message-avatar { width: 30px; height: 30px; border-radius: 10px; }
 .thinking-title { color: var(--text-2); }
@@ -792,14 +1105,28 @@ onBeforeUnmount(() => {
 .attachment-chip span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-chip button { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 5px; color: var(--text-3); background: transparent; cursor: pointer; }
 .attachment-chip button:hover, .attachment-chip button:focus-visible { color: var(--danger); background: var(--danger-soft); outline: none; }
-.composer-tools { display: flex; align-items: center; gap: 7px; min-height: 30px; margin-bottom: 7px; }
+.temporary-context-note { display: flex; align-items: center; gap: 5px; color: var(--text-3); font-size: 10px; line-height: 1.45; }
+.composer-tools { display: flex; align-items: center; gap: 7px; min-height: 32px; margin-bottom: 6px; }
 .tool-button { display: inline-flex; align-items: center; gap: 4px; min-height: 30px; padding: 0 8px; border: 1px solid var(--border); border-radius: 7px; color: var(--text-2); background: var(--surface); cursor: pointer; font-size: 11.5px; }
 .tool-button:hover, .tool-button:focus-within { border-color: var(--primary); color: var(--primary-600); background: var(--primary-soft); }
+.tool-button.disabled { cursor: wait; opacity: .72; }
 .tool-button input { display: none; }
-.composer-hint { flex: 1; min-width: 0; overflow: hidden; color: var(--text-3); font-size: 10.5px; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.assistant-mode-switch { display: grid; min-width: 0; flex: 1; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 3px; padding: 3px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.assistant-mode-switch button { min-width: 0; min-height: 28px; padding: 3px 5px; overflow: hidden; border: 0; border-radius: 6px; background: transparent; color: var(--text-3); font: inherit; font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.assistant-mode-switch button:hover { color: var(--text); background: var(--surface); }
+.assistant-mode-switch button.active { background: var(--primary); color: #fff; box-shadow: var(--shadow-xs); }
+.composer-mode-hint { display: flex; min-height: 22px; align-items: center; gap: 6px; margin-bottom: 5px; overflow: hidden; color: var(--text-3); font-size: 10px; }
+.composer-mode-hint b { flex: 0 0 auto; color: var(--primary-600); }
+.composer-mode-hint span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-input-row { display: flex; align-items: flex-end; gap: 8px; }
 .composer-input-row :deep(.el-textarea__inner) { min-height: 74px !important; padding-right: 12px; }
 .send-button { width: 42px; height: 42px; padding: 0; flex: 0 0 auto; }
+.source-preview { min-height: 260px; }
+.source-preview-meta { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
+.source-preview-meta > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.source-preview-meta strong { overflow: hidden; color: var(--text); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.source-preview-meta span { color: var(--text-3); font-size: 10px; }
+.source-preview-text { min-height: 170px; max-height: 50vh; margin: 12px 0 0; padding: 14px; overflow: auto; border-radius: 10px; color: var(--text-2); background: var(--surface-2); font: 12px/1.75 'Cascadia Code', Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 @media (prefers-reduced-motion: reduce) {
   .thinking-chevron, .stream-cursor { transition: none; animation: none; }
@@ -814,6 +1141,10 @@ onBeforeUnmount(() => {
   .assistant-messages { padding: 14px; }
   .assistant-history { padding: 14px; }
   .assistant-composer { padding: 9px 10px 12px; }
-  .composer-hint { display: none; }
+  .composer-mode-hint span { display: none; }
+  .tool-button span { display: none; }
+  .assistant-action-preview dl { grid-template-columns: 1fr; }
+  .assistant-action-next { align-items: stretch; flex-direction: column; }
+  .assistant-action-next .el-button { width: 100%; min-height: 44px; }
 }
 </style>

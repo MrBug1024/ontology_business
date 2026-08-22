@@ -489,13 +489,52 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
     conv_id = conv.id
     trace_context = {
         "correlation_id": uuid.uuid4().hex,
+        # Preallocate the answer id so Action dry-runs emitted during the tool
+        # loop can durably point at the AI answer before SSE persistence ends.
+        "assistant_message_id": uuid.uuid4().hex,
         "agent_id": a.id,
         "conversation_id": conv_id,
         "scenario_id": a.scenario_id or "",
         "user_id": str(db.info.get("user_id") or "") or None,
     }
+    # Action tools may commit their dry-run audit row before the streaming turn
+    # finishes.  Persist its parent answer first so SQLite/Postgres FK checks and
+    # lineage never depend on a not-yet-created message id.
+    db.add(
+        Message(
+            id=trace_context["assistant_message_id"],
+            conversation_id=conv_id,
+            role="assistant",
+            content="正在准备受控工具调用。",
+        )
+    )
+    db.commit()
+
+    def persist_answer(
+        content: str,
+        tool_calls: list[dict[str, Any]],
+        tool_results: list[dict[str, Any]],
+        citations: list[dict[str, Any]],
+    ) -> None:
+        save_db = SessionLocal()
+        try:
+            message = save_db.get(Message, trace_context["assistant_message_id"])
+            if (
+                not message
+                or message.conversation_id != conv_id
+                or message.role != "assistant"
+            ):
+                raise RuntimeError("Agent 回答占位消息不存在或上下文不匹配")
+            message.content = content
+            message.tool_calls = tool_calls
+            message.tool_results = tool_results
+            message.citations = citations
+            save_db.commit()
+        finally:
+            save_db.close()
 
     def event_stream():
+        cancelled = False
         assistant_content = ""
         tool_calls_log: list[dict[str, Any]] = []
         tool_results_log: list[dict[str, Any]] = []
@@ -522,26 +561,42 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
                     # 引用由 AgentContext 在当前租户、绑定数据源范围内生成；作为
                     # 独立字段持久化，历史消息无需再从工具文本中反向解析。
                     citations_log = ev["data"] if isinstance(ev["data"], list) else []
-                yield f"data: {json.dumps({'type': etype, 'data': ev['data']}, ensure_ascii=False)}\n\n"
-            # 保存助手消息（用独立会话，避免请求作用域 db 在流式期间被关闭）
-            save_db = SessionLocal()
-            try:
-                save_db.add(
-                    Message(
-                        conversation_id=conv_id,
-                        role="assistant",
-                        content=assistant_content,
-                        tool_calls=tool_calls_log,
-                        tool_results=tool_results_log,
-                        citations=citations_log,
+                if etype in {"tool_result", "citations"}:
+                    # A tool result can contain a durable Action dry-run id.  Save
+                    # it into the already-existing answer before the SSE event is
+                    # visible so early client cancellation cannot break lineage.
+                    db.commit()
+                    persist_answer(
+                        assistant_content or "已完成受控工具预演，正在整理最终说明。",
+                        tool_calls_log,
+                        tool_results_log,
+                        citations_log,
                     )
-                )
-                save_db.commit()
-            finally:
-                save_db.close()
+                yield f"data: {json.dumps({'type': etype, 'data': ev['data']}, ensure_ascii=False)}\n\n"
+            # Complete the pre-persisted answer using an independent session;
+            # the request-scoped session may be closed while SSE is streaming.
+            persist_answer(
+                assistant_content,
+                tool_calls_log,
+                tool_results_log,
+                citations_log,
+            )
+        except GeneratorExit:
+            cancelled = True
+            raise
         except Exception as exc:  # noqa: BLE001
+            try:
+                persist_answer(
+                    assistant_content or f"这次 Agent 对话没有完成：{exc}",
+                    tool_calls_log,
+                    tool_results_log,
+                    citations_log,
+                )
+            except Exception:  # noqa: BLE001 - preserve the original SSE error.
+                pass
             yield f"data: {json.dumps({'type': 'error', 'data': str(exc)}, ensure_ascii=False)}\n\n"
         finally:
-            yield "data: [DONE]\n\n"
+            if not cancelled:
+                yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

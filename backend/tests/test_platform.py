@@ -14,7 +14,15 @@ from app.services.policies import PolicyViolation, validate_action_params, valid
 from app.services.auth_service import hash_password, verify_password
 from app.services.ontology_service import _quoted_mapping_table, preview_mapping
 from app.services.workflow_service import evaluate_condition, execute_workflow, validate_workflow_definition
-from app.routers.assistant import _build_proposal, _context_scope, _intent, _sse, apply_proposal
+from app.routers.assistant import (
+    _build_proposal,
+    _context_scope,
+    _intent,
+    _scenario_snapshot,
+    _snapshot_matches,
+    _sse,
+    apply_proposal,
+)
 
 
 class SQLPolicyTests(unittest.TestCase):
@@ -138,6 +146,9 @@ class AssistantIntentTests(unittest.TestCase):
         self.assertEqual(_intent("把异常处理编排成审批工作流", "ask"), "workflow")
         self.assertEqual(_intent("帮我看看当前页面", "ask"), "chat")
         self.assertEqual(_intent("继续分析", "draft"), "ontology")
+        self.assertEqual(_intent("帮我创建场景", "explain"), "explain")
+        self.assertEqual(_intent("立即应用这份草稿", "apply"), "apply_guidance")
+        self.assertEqual(_intent("执行这个工作流", "execute"), "execute_guidance")
 
     def test_session_scope_includes_current_route_and_scenario(self) -> None:
         self.assertEqual(_context_scope("scenario-1", "/scenarios/scenario-1?tab=ontology"), "scenario:scenario-1|path:/scenarios/scenario-1")
@@ -170,6 +181,14 @@ class AssistantIntentTests(unittest.TestCase):
         self.assertEqual(proposal["status"], "pending")
         self.assertEqual(proposal["base_snapshot"]["entity_names"], ["客户"])
         self.assertEqual([item["operation"] for item in proposal["changes"]], ["skip", "add", "skip"])
+        self.assertEqual(len(proposal["base_snapshot"]["revision"]), 64)
+        scenario.entities[0].description = "并发修改了实体定义"
+        self.assertFalse(
+            _snapshot_matches(
+                proposal["base_snapshot"],
+                _scenario_snapshot(scenario),
+            )
+        )
 
     def test_apply_request_requires_confirmation_and_saved_proposal_identity(self) -> None:
         request = AssistantProposalApplyRequest(
@@ -196,12 +215,12 @@ class AssistantIntentTests(unittest.TestCase):
     def test_apply_proposal_uses_saved_payload_and_marks_message_applied(self) -> None:
         scenario = SimpleNamespace(id="scenario-1", entities=[], relations=[], workflows=[])
         thread = SimpleNamespace(id="thread-1", scenario_id="scenario-1")
-        proposal_message = SimpleNamespace(proposal={})
+        proposal_message = SimpleNamespace(id="message-1", proposal={})
         saved_proposal = {
             "proposal_id": "proposal-1",
             "kind": "workflow",
             "status": "pending",
-            "base_snapshot": {"entity_names": [], "relation_names": [], "workflow_names": []},
+            "base_snapshot": _scenario_snapshot(scenario),
             "payload": {
                 "name": "审批草稿",
                 "nodes": [{"id": "start", "type": "start"}, {"id": "end", "type": "end"}],
@@ -228,6 +247,18 @@ class AssistantIntentTests(unittest.TestCase):
             def rollback(self) -> None:
                 return None
 
+            def execute(self, _statement):
+                return self
+
+            def scalars(self):
+                return self
+
+            def first(self):
+                return scenario
+
+            def expire(self, _value, _attributes) -> None:
+                return None
+
         db = FakeDb()
         request = AssistantProposalApplyRequest(
             kind="workflow",
@@ -238,9 +269,13 @@ class AssistantIntentTests(unittest.TestCase):
             payload={"name": "客户端篡改的工作流", "nodes": [], "edges": []},
         )
         fake_workflow = SimpleNamespace(id="workflow-1")
+        claim = SimpleNamespace(status="applying", result={}, applied_at=None)
         with patch("app.routers.assistant._scenario", return_value=scenario), patch(
             "app.routers.assistant._find_saved_proposal",
             return_value=(thread, proposal_message, saved_proposal),
+        ), patch(
+            "app.routers.assistant._claim_proposal_application",
+            return_value=(claim, True),
         ), patch("app.routers.assistant.OntologyWorkflow", return_value=fake_workflow):
             result = apply_proposal(request, db)
 

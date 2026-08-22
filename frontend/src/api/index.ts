@@ -180,9 +180,9 @@ export const api = {
     path?: string
     selection?: Record<string, any>
     attachment_ids?: string[]
-    mode?: 'ask' | 'draft'
+    mode?: 'ask' | 'explain' | 'draft' | 'apply' | 'execute'
   }) => http.post<AssistantReply>('/assistant/chat', d),
-  applyAssistantProposal: (d: { kind: 'ontology' | 'workflow'; scenario_id: string; thread_id: string; proposal_id: string; confirm: boolean }) =>
+  applyAssistantProposal: (d: { kind: 'scenario' | 'ontology' | 'mapping' | 'workflow'; scenario_id?: string; thread_id: string; proposal_id: string; confirm: boolean }) =>
     http.post('/assistant/proposals/apply', d),
 
   // 场景
@@ -355,7 +355,18 @@ export const api = {
   createAction: (sid: string, d: any) => http.post(`/scenarios/${sid}/actions`, d),
   updateAction: (id: string, d: any) => http.put(`/scenarios/actions/${id}`, d),
   deleteAction: (id: string) => http.delete(`/scenarios/actions/${id}`),
-  executeAction: (id: string, payload: { params: any; dry_run?: boolean; confirm?: boolean; idempotency_key?: string }) =>
+  executeAction: (id: string, payload: {
+    params: any
+    dry_run?: boolean
+    confirm?: boolean
+    idempotency_key?: string
+    preview_log_id?: string
+    correlation_id?: string
+    expected_environment?: 'dev' | 'staging' | 'prod'
+    expected_definition_snapshot_id?: string
+    expected_release_id?: string
+    expected_definition_hash?: string
+  }) =>
     http.post(`/scenarios/actions/${id}/execute`, payload),
 
   // 规则（Rules）
@@ -396,7 +407,8 @@ export const api = {
   cancelTask: (id: string) => http.post<WorkflowRun>(`/operations/runs/${id}/cancel`),
 
   // 执行日志（P0 兼容）
-  listExecutionLogs: (sid: string) => http.get<ActionExecutionLog[]>(`/scenarios/${sid}/execution-logs`),
+  listExecutionLogs: (sid: string, limit = 50) =>
+    http.get<ActionExecutionLog[]>(`/scenarios/${sid}/execution-logs`, { params: { limit } }),
 
   // 数据源
   listDataSources: (sid?: string) =>
@@ -525,7 +537,7 @@ export function streamAssistantChat(
     path?: string
     selection?: Record<string, any>
     attachment_ids?: string[]
-    mode?: 'ask' | 'draft'
+    mode?: 'ask' | 'explain' | 'draft' | 'apply' | 'execute'
   },
   onEvent: (ev: { type: string; data: any }) => void,
   onDone: () => void,

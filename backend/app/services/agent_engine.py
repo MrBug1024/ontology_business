@@ -736,11 +736,19 @@ def run_agent(
 ) -> Iterator[dict[str, Any]]:
     """执行 Agent 并在每个真实模型 trace 中保留最小可审计回链。"""
     previous = db.info.get("llm_trace_context")
+    previous_action_audit = db.info.get("action_audit_context")
     context = dict(trace_context or {})
     context.setdefault("agent_id", agent.id)
     context.setdefault("scenario_id", agent.scenario_id or "")
     if context:
         db.info["llm_trace_context"] = context
+    # Action tools are preview-only, but their durable audit row must still
+    # identify which Agent and routed model produced the recommendation.
+    db.info["action_audit_context"] = {
+        "agent_id": agent.id,
+        "llm_config_id": llm.id,
+        "model_name": llm.model or "",
+    }
     try:
         yield from _run_agent(
             db,
@@ -756,3 +764,7 @@ def run_agent(
             db.info.pop("llm_trace_context", None)
         else:
             db.info["llm_trace_context"] = previous
+        if previous_action_audit is None:
+            db.info.pop("action_audit_context", None)
+        else:
+            db.info["action_audit_context"] = previous_action_audit

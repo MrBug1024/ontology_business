@@ -3,7 +3,7 @@
     <header class="task-header">
       <div>
         <div class="eyebrow">OPERATIONS</div>
-        <h2 id="task-page-title">任务中心</h2>
+        <h1 id="task-page-title">任务中心</h1>
         <p>跟踪工作流队列、重试和人工审批，所有状态均可回溯。</p>
       </div>
       <div class="task-header-actions">
@@ -12,6 +12,19 @@
         </el-button>
       </div>
     </header>
+
+    <section v-if="workflowIdFilter || returnTo" class="workflow-context card" aria-label="当前任务上下文">
+      <div class="workflow-context-copy">
+        <span class="eyebrow">CURRENT CONTEXT</span>
+        <p v-if="workflowIdFilter">仅显示工作流 <code class="mono">{{ workflowIdFilter }}</code> 的任务。</p>
+        <p v-if="returnTo">当前任务来自上一工作区，处理完成后可以原路返回。</p>
+      </div>
+      <div class="workflow-context-actions">
+        <el-button v-if="returnTo" type="primary" plain @click="returnToWorkspace">返回上一工作区</el-button>
+        <el-button v-if="workflowIdFilter" text @click="clearWorkflowContext">清除工作流范围</el-button>
+        <el-button v-if="returnTo" text @click="clearReturnContext">清除返回位置</el-button>
+      </div>
+    </section>
 
     <section class="task-summary" aria-label="任务状态概览" aria-live="polite">
       <button class="summary-card summary-card--approval" type="button" @click="setStatusFilter('awaiting_approval')">
@@ -81,16 +94,17 @@
         </el-table-column>
         <el-table-column label="操作" width="205" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" text @click="showTask(row.id)">详情</el-button>
-            <el-button v-if="canApprove(row)" size="small" text type="primary" @click="showTask(row.id)">审批</el-button>
-            <el-button v-else-if="canRetry(row)" size="small" text type="warning" @click="retryTask(row)">重试</el-button>
+            <el-button size="small" text :type="canApprove(row) ? 'primary' : undefined" @click="showTask(row.id)">
+              {{ canApprove(row) ? '审批' : '详情' }}
+            </el-button>
+            <el-button v-if="canRetry(row)" size="small" text type="warning" @click="retryTask(row)">重试</el-button>
             <el-button v-if="canCancel(row)" size="small" text type="danger" :loading="cancellingTaskId === row.id" @click="cancelTask(row)">取消</el-button>
           </template>
         </el-table-column>
       </el-table>
     </section>
 
-    <el-drawer v-model="taskDrawer" size="min(620px, 100vw)" :with-header="false" @closed="clearSelectedTaskQuery">
+    <el-drawer v-model="taskDrawer" class="task-detail-drawer" size="min(620px, 100vw)" :with-header="false" @closed="clearSelectedTaskQuery">
       <section v-if="selectedTask" class="task-detail" aria-labelledby="task-detail-title" v-loading="detailLoading">
         <header class="task-detail-header">
           <div>
@@ -98,7 +112,12 @@
             <h3 id="task-detail-title">{{ selectedTask.workflow_name || '工作流任务' }}</h3>
             <p class="mono">{{ selectedTask.id }}</p>
           </div>
-          <el-tag effect="plain" :type="statusMeta(selectedTask.status).type">{{ statusMeta(selectedTask.status).label }}</el-tag>
+          <div class="task-detail-tools">
+            <el-tag effect="plain" :type="statusMeta(selectedTask.status).type">{{ statusMeta(selectedTask.status).label }}</el-tag>
+            <el-button class="drawer-close" text circle aria-label="关闭任务详情" title="关闭任务详情" @click="taskDrawer = false">
+              <el-icon aria-hidden="true"><Close /></el-icon>
+            </el-button>
+          </div>
         </header>
 
         <el-alert v-if="selectedTask.error" class="task-error-alert" type="error" :closable="false" show-icon>
@@ -149,10 +168,9 @@
           <pre class="detail-code mono">{{ formatJson(selectedTask.result) }}</pre>
         </section>
 
-        <footer class="task-detail-footer">
+        <footer v-if="canCancel(selectedTask) || canRetry(selectedTask)" class="task-detail-footer">
           <el-button v-if="canCancel(selectedTask)" type="danger" plain :loading="cancellingTaskId === selectedTask.id" @click="cancelTask(selectedTask)">取消任务</el-button>
           <el-button v-if="canRetry(selectedTask)" type="warning" plain :loading="retrySubmitting" @click="retryTask(selectedTask)">重新提交</el-button>
-          <el-button @click="taskDrawer = false">关闭</el-button>
         </footer>
       </section>
     </el-drawer>
@@ -184,6 +202,7 @@ const selectedTask = ref<WorkflowRun | null>(null)
 const scenarioFilter = ref('')
 const statusFilter = ref('')
 const workflowIdFilter = ref('')
+const returnTo = ref('')
 
 const statusOptions = [
   { value: 'queued', label: '排队中' },
@@ -217,11 +236,22 @@ const activeCount = computed(() => tasks.value.filter((task) => ['queued', 'runn
 const approvalCount = computed(() => tasks.value.filter((task) => task.status === 'awaiting_approval').length || approvals.value.filter(isWaitingApproval).length)
 const retryCount = computed(() => tasks.value.filter((task) => task.status === 'retry_waiting').length)
 const problemCount = computed(() => tasks.value.filter((task) => ['failed', 'timed_out'].includes(task.status)).length)
-const hasFilters = computed(() => Boolean(scenarioFilter.value || statusFilter.value || workflowIdFilter.value))
+const hasFilters = computed(() => Boolean(scenarioFilter.value || statusFilter.value))
 const activeApproval = computed(() => approvalFor(selectedTask.value))
 
 function queryValue(value: unknown): string {
   return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
+}
+function safeReturnPath(value: unknown): string {
+  const candidate = queryValue(value).trim()
+  if (!candidate.startsWith('/') || candidate.startsWith('//') || candidate.includes('\\')) return ''
+  try {
+    const url = new URL(candidate, window.location.origin)
+    if (url.origin !== window.location.origin) return ''
+    return `${url.pathname}${url.search}${url.hash}`
+  } catch {
+    return ''
+  }
 }
 function statusMeta(status: string): StatusMeta {
   return STATUS_META[status] || { label: status || '未知', type: 'info', description: '服务端返回的任务状态' }
@@ -273,12 +303,14 @@ function readRoute() {
   scenarioFilter.value = queryValue(route.query.scenario_id)
   statusFilter.value = queryValue(route.query.status)
   workflowIdFilter.value = queryValue(route.query.workflow_id)
+  returnTo.value = safeReturnPath(route.query.return_to)
 }
 function baseQuery(taskId?: string) {
   return {
     scenario_id: scenarioFilter.value || undefined,
     status: statusFilter.value || undefined,
     workflow_id: workflowIdFilter.value || undefined,
+    return_to: returnTo.value || undefined,
     task: taskId || undefined,
   }
 }
@@ -413,8 +445,24 @@ async function applyFilters() {
 function clearFilters() {
   scenarioFilter.value = ''
   statusFilter.value = ''
+  void router.replace({ name: 'tasks', query: baseQuery() })
+}
+function clearWorkflowContext() {
   workflowIdFilter.value = ''
-  void router.replace({ name: 'tasks', query: {} })
+  void router.replace({ name: 'tasks', query: baseQuery() })
+}
+function clearReturnContext() {
+  returnTo.value = ''
+  void router.replace({ name: 'tasks', query: baseQuery() })
+}
+function returnToWorkspace() {
+  const target = safeReturnPath(returnTo.value)
+  if (!target) {
+    clearReturnContext()
+    ElMessage.warning('返回位置无效，已从任务上下文中移除')
+    return
+  }
+  void router.push(target)
 }
 function setStatusFilter(status: string) {
   statusFilter.value = status
@@ -450,8 +498,13 @@ onBeforeUnmount(() => {
 .task-page { min-height: 100%; padding: 24px 28px 32px; }
 .task-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .eyebrow { color: var(--primary); font-size: 10px; font-weight: 800; letter-spacing: .15em; }
-.task-header h2 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
+.task-header h1 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
 .task-header p { margin: 0; color: var(--text-2); font-size: 13px; }
+.workflow-context { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; padding: 13px 14px; border-color: color-mix(in srgb, var(--primary) 28%, var(--border)); background: color-mix(in srgb, var(--primary-soft) 62%, var(--surface)); }
+.workflow-context-copy { min-width: 0; }
+.workflow-context-copy p { margin: 4px 0 0; color: var(--text-2); font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+.workflow-context-copy code { color: var(--primary-600); font-size: 11px; }
+.workflow-context-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .task-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
 .summary-card { min-height: 84px; display: flex; align-items: center; gap: 11px; padding: 14px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); cursor: pointer; text-align: left; box-shadow: var(--shadow-xs); transition: transform var(--dur) var(--ease), border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
 .summary-card:hover { transform: translateY(-2px); border-color: var(--border-strong); box-shadow: var(--shadow-sm); }
@@ -476,10 +529,13 @@ onBeforeUnmount(() => {
 .attempt-label { color: var(--text-2); font-size: 12px; font-variant-numeric: tabular-nums; }
 .task-error { color: var(--danger); }
 .mono { font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace; }
+.task-detail-drawer :deep(.el-drawer__body) { padding: 0; scroll-padding-bottom: 88px; }
 .task-detail { min-height: 100%; padding: 26px; background: var(--surface); }
 .task-detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
 .task-detail-header h3 { margin: 5px 0; color: var(--text); font-size: 20px; letter-spacing: -.025em; }
 .task-detail-header p { margin: 0; color: var(--text-3); font-size: 10px; overflow-wrap: anywhere; }
+.task-detail-tools { display: flex; flex: 0 0 auto; align-items: center; gap: 7px; }
+.drawer-close { min-width: 44px; min-height: 44px; margin: -9px -10px -9px 0; color: var(--text-2); }
 .task-error-alert { margin-bottom: 14px; }
 .approval-panel { margin-bottom: 16px; padding: 16px; border: 1px solid color-mix(in srgb, var(--warning) 36%, var(--border)); border-radius: 14px; background: var(--warning-soft); }
 .approval-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
@@ -499,8 +555,8 @@ onBeforeUnmount(() => {
 .detail-section { margin-top: 14px; }
 .detail-section h4 { margin: 0 0 7px; color: var(--text-2); font-size: 12px; }
 .detail-code { max-height: 260px; margin: 0; padding: 12px; overflow: auto; border-radius: 10px; background: #1d2930; color: #e2e8f0; font-size: 11px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
-.task-detail-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
+.task-detail-footer { position: sticky; bottom: 0; z-index: 2; display: flex; justify-content: flex-end; gap: 8px; margin: 22px -26px -26px; padding: 14px 26px max(14px, env(safe-area-inset-bottom)); border-top: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 96%, transparent); backdrop-filter: blur(12px); }
 @media (max-width: 960px) { .task-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 720px) { .task-page { padding: 18px 14px 22px; } .task-header { flex-direction: column; } .task-filter { flex-wrap: wrap; } .filter-scenario, .filter-status { flex: 1 1 180px; } }
-@media (max-width: 460px) { .task-summary, .detail-grid, .approval-meta { grid-template-columns: 1fr; } .approval-panel-head { flex-direction: column; } .approval-expiry { text-align: left; } }
+@media (max-width: 720px) { .task-page { padding: 18px 14px 22px; } .task-header, .workflow-context { align-items: flex-start; flex-direction: column; } .workflow-context-actions { width: 100%; justify-content: flex-start; } .task-filter { flex-wrap: wrap; } .filter-scenario, .filter-status { flex: 1 1 180px; } }
+@media (max-width: 460px) { .task-summary, .detail-grid, .approval-meta { grid-template-columns: 1fr; } .task-detail-header, .approval-panel-head { flex-direction: column; } .task-detail-tools { width: 100%; justify-content: space-between; } .approval-expiry { text-align: left; } }
 </style>

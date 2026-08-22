@@ -139,6 +139,7 @@ def _mapping_identity_contract(
     binding_ref: dict,
     table_name: str,
     column_map: dict,
+    transform_rules: dict,
 ) -> dict:
     """Return the source-side identity boundary used by incremental imports.
 
@@ -155,6 +156,7 @@ def _mapping_identity_contract(
         "data_source_binding_ref": binding_ref or {},
         "table_name": str(table_name or ""),
         "key_column": str((column_map or {}).get(key_property) or ""),
+        "key_transform_rules": (transform_rules or {}).get(key_property, []),
     }
 
 
@@ -240,6 +242,7 @@ def _scenario_out(s: BusinessScenario) -> ScenarioOut:
         name=s.name,
         description=s.description,
         industry=s.industry,
+        namespace=s.namespace or "default",
         status=s.status,
         created_at=s.created_at,
         updated_at=s.updated_at,
@@ -402,10 +405,12 @@ def _entity_out(db: Session, e: OntologyEntity) -> EntityOut:
         id=e.id,
         scenario_id=e.scenario_id,
         name=e.name,
+        namespace=e.namespace or (e.scenario.namespace if e.scenario else "default") or "default",
         description=e.description,
         icon=e.icon,
         color=e.color,
         is_abstract=e.is_abstract,
+        state_property=e.state_property or "",
         created_at=e.created_at,
         properties=[
             PropertyIn(
@@ -417,6 +422,7 @@ def _entity_out(db: Session, e: OntologyEntity) -> EntityOut:
                 is_enum=p.is_enum,
                 enum_values=p.enum_values or [],
                 default_value=p.default_value,
+                constraints=p.constraints or {},
                 is_sensitive=bool(p.is_sensitive),
             )
             for p in e.properties
@@ -431,6 +437,7 @@ def _relation_out(r: OntologyRelation, entities: list[OntologyEntity]) -> Relati
         id=r.id,
         scenario_id=r.scenario_id,
         name=r.name,
+        namespace=r.namespace or (r.scenario.namespace if r.scenario else "default") or "default",
         source_entity_id=r.source_entity_id,
         target_entity_id=r.target_entity_id,
         relation_type=r.relation_type,
@@ -458,6 +465,10 @@ def list_scenarios(db: Session = Depends(get_db)):
 @router.post("", response_model=ScenarioOut)
 def create_scenario(payload: ScenarioIn, db: Session = Depends(get_db)):
     permission_service.require_tenant_permission(db, "write")
+    try:
+        payload.namespace = ontology_service.validate_namespace(payload.namespace)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     s = BusinessScenario(
         tenant_id=tenant_service.current_tenant_id(db),
         **payload.model_dump(),
@@ -479,6 +490,10 @@ def _instance_out(db: Session, i: OntologyInstance) -> InstanceOut:
         attributes=permission_service.filter_instance_attributes(db, i) if can_read else {},
         source=i.source,
         source_ref=i.source_ref,
+        state=i.state or "",
+        valid_from=i.valid_from,
+        valid_to=i.valid_to,
+        quality=i.quality or {},
         access_scope=i.access_scope or "tenant",
         entity_name=ent.name if ent else "",
         entity_color=ent.color if ent else "",
@@ -515,6 +530,7 @@ def _mapping_out(m: DataMapping) -> DataMappingOut:
         data_source_binding_ref=m.data_source_binding_ref or {},
         table_name=m.table_name,
         column_map=m.column_map or {},
+        transform_rules=m.transform_rules or {},
         entity_name=ent.name if ent else "",
         data_source_name=ds.name if ds else "",
         data_source_type=ds.type if ds else "",
@@ -638,6 +654,10 @@ def _object_item_out(
         attributes=permission_service.filter_instance_attributes(db, instance),
         source=instance.source or "manual",
         source_ref=instance.source_ref or "",
+        state=instance.state or "",
+        valid_from=instance.valid_from,
+        valid_to=instance.valid_to,
+        quality=instance.quality or {},
         access_scope=instance.access_scope or "tenant",
         provenance=_object_provenance(db, instance, mapping),
         relation_count=relation_count,
@@ -860,6 +880,10 @@ def get_object(scenario_id: str, object_id: str, db: Session = Depends(get_db)):
 @router.put("/{scenario_id}", response_model=ScenarioOut)
 def update_scenario(scenario_id: str, payload: ScenarioIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
+    try:
+        payload.namespace = ontology_service.validate_namespace(payload.namespace)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     for k, v in payload.model_dump().items():
         setattr(s, k, v)
     db.commit()
@@ -883,6 +907,15 @@ def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
 @router.post("/{scenario_id}/entities", response_model=EntityOut)
 def create_entity(scenario_id: str, payload: EntityIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
+    try:
+        ontology_service.validate_entity_definition(
+            payload, scenario_namespace=s.namespace or "default"
+        )
+        payload.namespace = ontology_service.validate_namespace(
+            payload.namespace, default=s.namespace or "default"
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     _require_sensitive_property_management(db, payload.properties)
     e = OntologyEntity(scenario_id=scenario_id, **{k: v for k, v in payload.model_dump().items() if k != "properties"})
     db.add(e)
@@ -899,9 +932,18 @@ def update_entity(entity_id: str, payload: EntityIn, db: Session = Depends(get_d
     e = db.get(OntologyEntity, entity_id)
     if not e:
         raise HTTPException(404, "实体不存在")
-    _scenario_for_request(db, e.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, e.scenario_id, writable=True)
+    try:
+        ontology_service.validate_entity_definition(
+            payload, scenario_namespace=scenario.namespace or "default"
+        )
+        payload.namespace = ontology_service.validate_namespace(
+            payload.namespace, default=scenario.namespace or "default"
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     _require_sensitive_property_management(db, payload.properties)
-    for k in ("name", "description", "icon", "color", "is_abstract"):
+    for k in ("name", "namespace", "description", "icon", "color", "is_abstract", "state_property"):
         setattr(e, k, getattr(payload, k))
     # 按名称原位更新属性，避免属性级 ACL 因编辑实体描述而丢失稳定 resource_id。
     remaining_by_name: dict[str, list[OntologyProperty]] = {}
@@ -968,6 +1010,12 @@ def delete_entity(entity_id: str, db: Session = Depends(get_db)):
 @router.post("/{scenario_id}/relations", response_model=RelationOut)
 def create_relation(scenario_id: str, payload: RelationIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
+    try:
+        payload.namespace = ontology_service.validate_namespace(
+            payload.namespace, default=s.namespace or "default"
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     _entity_in_scenario(db, scenario_id, payload.source_entity_id)
     _entity_in_scenario(db, scenario_id, payload.target_entity_id)
     r = OntologyRelation(scenario_id=scenario_id, **payload.model_dump())
@@ -982,7 +1030,13 @@ def update_relation(relation_id: str, payload: RelationIn, db: Session = Depends
     r = db.get(OntologyRelation, relation_id)
     if not r:
         raise HTTPException(404, "关系不存在")
-    _scenario_for_request(db, r.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, r.scenario_id, writable=True)
+    try:
+        payload.namespace = ontology_service.validate_namespace(
+            payload.namespace, default=scenario.namespace or "default"
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     _entity_in_scenario(db, r.scenario_id, payload.source_entity_id)
     _entity_in_scenario(db, r.scenario_id, payload.target_entity_id)
     for k, v in payload.model_dump().items():
@@ -1044,6 +1098,19 @@ def create_instance(scenario_id: str, payload: InstanceIn, db: Session = Depends
         permission_service.require_instance_attribute_write_permissions(
             db, entity, payload.attributes
         )
+        try:
+            payload.attributes, payload.state, payload.quality = (
+                ontology_service.validate_instance_payload(
+                    entity,
+                    payload.attributes,
+                    state=payload.state,
+                    valid_from=payload.valid_from,
+                    valid_to=payload.valid_to,
+                    quality=payload.quality,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     i = OntologyInstance(scenario_id=scenario_id, **payload.model_dump())
     db.add(i)
     db.commit()
@@ -1064,7 +1131,31 @@ def update_instance(instance_id: str, payload: InstanceIn, db: Session = Depends
         permission_service.require_instance_attribute_write_permissions(
             db, entity, payload.attributes
         )
-    for k in ("entity_id", "name", "attributes", "source", "source_ref", "access_scope"):
+        try:
+            payload.attributes, payload.state, payload.quality = (
+                ontology_service.validate_instance_payload(
+                    entity,
+                    payload.attributes,
+                    state=payload.state,
+                    valid_from=payload.valid_from,
+                    valid_to=payload.valid_to,
+                    quality=payload.quality,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    for k in (
+        "entity_id",
+        "name",
+        "attributes",
+        "source",
+        "source_ref",
+        "state",
+        "valid_from",
+        "valid_to",
+        "quality",
+        "access_scope",
+    ):
         setattr(i, k, getattr(payload, k))
     db.commit()
     db.refresh(i)
@@ -1133,6 +1224,12 @@ def create_mapping(scenario_id: str, payload: DataMappingIn, db: Session = Depen
     _source_in_scenario(db, scenario_id, payload.data_source_id)
     mapping_data = payload.model_dump()
     try:
+        mapping_data["transform_rules"] = ontology_service.normalize_transform_rules(
+            entity, mapping_data.get("transform_rules")
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
         binding = connector_service.runtime_binding_from_config(mapping_data, "data_source")
     except connector_service.ConnectorBindingError as exc:
         raise HTTPException(400, f"映射运行时绑定配置无效: {exc}") from exc
@@ -1165,6 +1262,7 @@ def create_mapping(scenario_id: str, payload: DataMappingIn, db: Session = Depen
         binding_ref=mapping_data.get("data_source_binding_ref", {}),
         table_name=mapping_data.get("table_name", ""),
         column_map=mapping_data.get("column_map", {}),
+        transform_rules=mapping_data.get("transform_rules", {}),
     )
     if old:
         m = old[0]
@@ -1175,6 +1273,7 @@ def create_mapping(scenario_id: str, payload: DataMappingIn, db: Session = Depen
             binding_ref=m.data_source_binding_ref or {},
             table_name=m.table_name,
             column_map=m.column_map or {},
+            transform_rules=m.transform_rules or {},
         )
         if current_identity == incoming_identity:
             before = mapping_refresh_service.mapping_fingerprint(m)
@@ -1566,11 +1665,67 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
         a = runtime_definition_service.resolve_resource(definition, "action", action_id)
     except runtime_definition_service.RuntimeDefinitionError as exc:
         raise HTTPException(409, f"当前部署定义不可执行该操作: {exc}") from exc
+    pin_values = (
+        payload.correlation_id,
+        payload.expected_environment,
+        payload.expected_definition_snapshot_id,
+        payload.expected_release_id,
+        payload.expected_definition_hash,
+    )
+    if any(value is not None for value in pin_values) and not payload.preview_log_id:
+        raise HTTPException(409, "确认信息缺少 preview_log_id，请重新预演")
+    preview_log: ActionExecutionLog | None = None
+    if payload.preview_log_id:
+        if payload.dry_run or not payload.confirm:
+            raise HTTPException(409, "预演固定版本只能用于显式确认执行")
+        preview_log = db.get(ActionExecutionLog, payload.preview_log_id)
+        normalized = workflow_service.validate_action_params(
+            a.input_schema or {}, payload.params
+        )
+        current_user_id = str(db.info.get("user_id") or "") or None
+        if (
+            not preview_log
+            or preview_log.scenario_id != scenario.id
+            or preview_log.target_type != "action"
+            or preview_log.target_id != a.id
+            or preview_log.mode != "dry_run"
+            or preview_log.status != "dry_run"
+            or preview_log.actor_user_id != current_user_id
+            or (preview_log.input_params or {}) != normalized
+        ):
+            raise HTTPException(409, "Action 预演与当前用户、目标或参数不一致，请重新预演")
+        required_pin = {
+            "correlation_id": payload.correlation_id,
+            "expected_environment": payload.expected_environment,
+            "expected_definition_hash": payload.expected_definition_hash,
+        }
+        if any(not value for value in required_pin.values()):
+            raise HTTPException(409, "确认必须携带预演的 correlation、environment 和 definition_hash")
+        if (
+            payload.correlation_id != preview_log.correlation_id
+            or payload.expected_environment != preview_log.environment
+            or payload.expected_definition_snapshot_id != preview_log.definition_snapshot_id
+            or payload.expected_release_id != preview_log.release_id
+            or payload.expected_definition_hash != preview_log.definition_hash
+            or definition.environment != preview_log.environment
+            or definition.snapshot_id != preview_log.definition_snapshot_id
+            or definition.release_id != preview_log.release_id
+            or definition.definition_hash != preview_log.definition_hash
+        ):
+            raise HTTPException(409, "Action 定义在预演后已变化，请重新预演")
     permission_service.require_action_permission(
         db,
         a,
         "read" if payload.dry_run else "execute",
     )
+    previous_lineage = db.info.get("action_lineage_context")
+    if preview_log:
+        db.info["action_lineage_context"] = {
+            "correlation_id": preview_log.correlation_id,
+            "parent_action_log_id": preview_log.id,
+            "agent_message_id": preview_log.agent_message_id,
+            "assistant_message_id": preview_log.assistant_message_id,
+        }
     try:
         return workflow_service.execute_action(
             db,
@@ -1582,8 +1737,16 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
             runtime_environment=definition.environment,
             runtime_definition=definition,
         )
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"执行失败: {exc}")
+    finally:
+        if preview_log:
+            if previous_lineage is None:
+                db.info.pop("action_lineage_context", None)
+            else:
+                db.info["action_lineage_context"] = previous_lineage
 
 
 # ── 规则（Rules）──────────────────────────────
@@ -1949,6 +2112,17 @@ def list_execution_logs(
             definition_source=l.definition_source or "live",
             result=l.result or {},
             connector_audit=l.connector_audit or [],
+            actor_type=l.actor_type or "unknown",
+            actor_user_id=l.actor_user_id,
+            agent_id=l.agent_id,
+            llm_config_id=l.llm_config_id,
+            model_name=l.model_name or "",
+            permission_decision=l.permission_decision or {},
+            data_context=l.data_context or {},
+            correlation_id=l.correlation_id or "",
+            parent_action_log_id=l.parent_action_log_id,
+            agent_message_id=l.agent_message_id,
+            assistant_message_id=l.assistant_message_id,
             error=l.error,
             duration_ms=l.duration_ms,
             created_at=l.created_at,

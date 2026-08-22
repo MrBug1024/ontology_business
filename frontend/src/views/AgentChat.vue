@@ -3,19 +3,21 @@
     <!-- 左侧：会话列表 -->
     <div class="chat-side">
       <div class="side-head">
-        <el-button text @click="$router.push('/agents')" aria-label="返回 Agent 列表" title="返回 Agent 列表"><el-icon aria-hidden="true"><ArrowLeft /></el-icon></el-button>
+        <el-button text @click="goBack" aria-label="返回 Agent 列表" title="返回 Agent 列表"><el-icon aria-hidden="true"><ArrowLeft /></el-icon></el-button>
         <div class="agent-title">
           <div class="agent-name">{{ agent?.name }}</div>
           <div class="muted">{{ agent?.scenario_name || '未绑定场景' }}</div>
         </div>
       </div>
       <div class="conv-list">
-        <el-button type="primary" size="small" style="width:100%;margin:10px" @click="newConv">
-          <el-icon><Plus /></el-icon> 新对话
+        <el-button class="new-conv-button" type="primary" @click="newConv">
+          <el-icon aria-hidden="true"><Plus /></el-icon> 新对话
         </el-button>
-        <div v-for="c in conversations" :key="c.id" class="conv-item" :class="{ active: curConv?.id === c.id }" role="button" tabindex="0" :aria-current="curConv?.id === c.id ? 'true' : undefined" :aria-label="`打开对话：${c.title || '新对话'}`" @click="openConv(c)" @keydown.enter.prevent="openConv(c)" @keydown.space.prevent="openConv(c)">
-          <el-icon aria-hidden="true"><ChatLineRound /></el-icon>
-          <span class="conv-title">{{ c.title || '新对话' }}</span>
+        <div v-for="c in conversations" :key="c.id" class="conv-item" :class="{ active: curConv?.id === c.id }">
+          <button class="conv-open" type="button" :aria-current="curConv?.id === c.id ? 'page' : undefined" :aria-label="`打开对话：${c.title || '新对话'}`" @click="openConv(c)">
+            <el-icon aria-hidden="true"><ChatLineRound /></el-icon>
+            <span class="conv-title">{{ c.title || '新对话' }}</span>
+          </button>
           <button class="conv-del" type="button" :aria-label="`删除对话：${c.title || '新对话'}`" title="删除对话" @click.stop="delConv(c)"><el-icon aria-hidden="true"><Delete /></el-icon></button>
         </div>
         <el-empty v-if="!conversations.length" description="暂无对话" :image-size="50" />
@@ -155,14 +157,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
-import { useRoute } from 'vue-router'
+import { ref, onBeforeUnmount, onMounted, nextTick } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamChat } from '@/api'
 import type { Agent, ChatMessage, Conversation, RagCitation } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 
 const route = useRoute()
+const router = useRouter()
 const agent = ref<Agent | null>(null)
 const conversations = ref<Conversation[]>([])
 const curConv = ref<Conversation | null>(null)
@@ -188,6 +191,29 @@ const suggestions = [
   '根据已配置规则检查一组业务数据',
   '检索业务文档并给出要点总结',
 ]
+
+function queryValue(value: unknown) {
+  return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
+}
+function safeReturnPath(value: unknown) {
+  const candidate = queryValue(value).trim()
+  if (!candidate.startsWith('/') || candidate.startsWith('//') || candidate.includes('\\')) return ''
+  try {
+    const url = new URL(candidate, window.location.origin)
+    return url.origin === window.location.origin ? `${url.pathname}${url.search}${url.hash}` : ''
+  } catch {
+    return ''
+  }
+}
+function goBack() {
+  const returnTo = safeReturnPath(route.query.return_to)
+  if (returnTo) {
+    void router.push(returnTo)
+    return
+  }
+  const scenarioId = agent.value?.scenario_id || queryValue(route.query.scenario_id)
+  void router.push({ name: 'agents', query: { scenario_id: scenarioId || undefined } })
+}
 
 // ── 附件：从消息内容中提取 save_deliverable 生成的下载链接 ──
 const ATTACH_RE = /\/api\/data-sources\/files\/([a-f0-9]{32})\/download/g
@@ -346,8 +372,18 @@ function scrollBottom() {
 }
 
 async function loadAgent() {
-  agent.value = await api.getAgent(route.params.id as string)
-  loadConvs()
+  const loadedAgent = await api.getAgent(route.params.id as string)
+  const agentScenarioId = loadedAgent.scenario_id || ''
+  if (agentScenarioId && queryValue(route.query.scenario_id) !== agentScenarioId) {
+    await router.replace({
+      name: 'agent-chat',
+      params: { id: loadedAgent.id || route.params.id },
+      query: { ...route.query, scenario_id: agentScenarioId },
+    })
+    return
+  }
+  agent.value = loadedAgent
+  void loadConvs()
 }
 async function loadConvs() {
   if (!agent.value) return
@@ -468,7 +504,13 @@ function stop() {
   streaming.value = false
 }
 
-onMounted(loadAgent)
+onMounted(() => {
+  document.getElementById('main-content')?.classList.add('agent-chat-active')
+  void loadAgent()
+})
+onBeforeUnmount(() => {
+  document.getElementById('main-content')?.classList.remove('agent-chat-active')
+})
 </script>
 
 <style scoped>
@@ -479,7 +521,15 @@ onMounted(loadAgent)
   padding: 14px 14px 10px;
   border-bottom: 1px solid var(--border);
 }
-.chat-layout { height: calc(100dvh - 68px); min-height: 0; overflow: hidden; }
+:global(.main-area.agent-chat-active) { display: flex; height: 100%; min-height: 0; flex-direction: column; overflow: hidden; }
+:global(.main-area.agent-chat-active > .topbar), :global(.main-area.agent-chat-active > .flow-rail) { flex: 0 0 auto; }
+:global(.main-area.agent-chat-active > .route-viewport) { flex: 1; min-height: 0; }
+.chat-layout { height: 100%; min-height: 0; overflow: hidden; }
+.chat-side, .chat-main { min-height: 0; overflow: hidden; }
+.chat-messages { min-height: 0; overscroll-behavior: contain; }
+.chat-layout button, .chat-layout :deep(.el-button) { touch-action: manipulation; }
+.chat-layout :deep(.el-button) { min-height: 44px; }
+.side-head :deep(.el-button) { min-width: 44px; }
 .agent-title { flex: 1; min-width: 0; }
 .agent-name {
   font-weight: 700;
@@ -488,28 +538,30 @@ onMounted(loadAgent)
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.conv-list { flex: 1; overflow-y: auto; }
+.conv-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.new-conv-button { width: calc(100% - 20px); margin: 10px; }
 .conv-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 9px 14px;
-  cursor: pointer;
+  gap: 2px;
+  min-height: 52px;
+  padding: 4px 6px 4px 14px;
   font-size: 13px;
   color: var(--text-2);
   border-left: 2px solid transparent;
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 .conv-item:hover { background: var(--surface-2); }
-.conv-item:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: -2px; }
 .conv-item.active {
   background: var(--primary-soft);
   color: var(--primary-600);
   font-weight: 600;
   border-left-color: var(--primary);
 }
+.conv-open { display: flex; min-width: 0; min-height: 44px; flex: 1; align-items: center; gap: 8px; padding: 0; border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; text-align: left; }
+.conv-open:focus-visible, .conv-del:focus-visible, .sug:focus-visible, .attach-name:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: 2px; }
 .conv-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conv-del { opacity: 0; transition: opacity var(--dur); width: 28px; height: 28px; border: 0; border-radius: 7px; background: transparent; color: var(--text-3); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.conv-del { opacity: .72; transition: opacity var(--dur), color var(--dur), background var(--dur); width: 44px; height: 44px; border: 0; border-radius: 9px; background: transparent; color: var(--text-3); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .conv-item:hover .conv-del { opacity: 1; }
 .conv-del:hover, .conv-del:focus-visible { opacity: 1; color: var(--danger); background: var(--danger-soft); }
 .side-foot {
@@ -580,6 +632,7 @@ onMounted(loadAgent)
   gap: 6px;
   margin-bottom: 4px;
 }
+.tool-card .head { min-height: 44px; }
 .citation-sources {
   margin-top: 12px;
   padding: 11px;
@@ -636,9 +689,7 @@ onMounted(loadAgent)
 .citation-info strong { color: var(--text); font-size: 13px; }
 .citation-info small { margin-top: 2px; color: var(--text-3); font-size: 11px; }
 .citation-excerpt {
-  max-height: 10.4em;
   margin: 8px 0 0;
-  overflow: auto;
   color: var(--text-2);
   font-size: 12px;
   line-height: 1.55;
@@ -696,6 +747,10 @@ onMounted(loadAgent)
   min-width: 0;
 }
 .attach-name {
+  display: flex;
+  width: 100%;
+  min-height: 44px;
+  align-items: center;
   border: 0;
   padding: 0;
   background: transparent;
@@ -727,10 +782,10 @@ onMounted(loadAgent)
 }
 
 @media (max-width: 720px) {
-  .chat-layout { height: auto; min-height: calc(100dvh - 68px); flex-direction: column; }
-  .chat-side { width: 100%; height: 220px; flex: 0 0 220px; }
+  .chat-layout { flex-direction: column; }
+  .chat-side { width: 100%; height: clamp(128px, 34%, 220px); flex: 0 0 clamp(128px, 34%, 220px); }
   .conv-list { min-height: 0; }
-  .chat-main { min-height: 440px; height: calc(100dvh - 288px); }
+  .chat-main { min-height: 0; height: auto; }
   .chat-messages { padding: 18px 14px; }
   .chat-input-area { padding: 12px 14px 16px; }
   .attach-card { align-items: flex-start; flex-wrap: wrap; }

@@ -3,7 +3,7 @@
     <header class="model-header">
       <div>
         <span class="eyebrow">MODEL OPERATIONS</span>
-        <h2 id="model-title">模型与路由</h2>
+        <h1 id="model-title">模型与路由</h1>
         <p>配置模型能力、路由优先级和预算；每次调用的延迟、Token 与成本均可审计。</p>
       </div>
       <el-button v-if="canManage" type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建模型配置</el-button>
@@ -240,7 +240,7 @@ onMounted(load)
 .model-page { min-height: 100%; padding: 24px 28px 34px; }
 .model-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
 .eyebrow { color: var(--primary); font-size: 10px; font-weight: 800; letter-spacing: .15em; }
-.model-header h2 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
+.model-header h1 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
 .model-header p { margin: 0; color: var(--text-2); font-size: 13px; }
 .route-grid { display: grid; grid-template-columns: minmax(160px, .8fr) repeat(4, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
 .route-title, .route-card { min-height: 90px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow-xs); }

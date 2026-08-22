@@ -2,7 +2,7 @@
   <div class="page">
     <div class="page-header">
       <div>
-        <h2>技能（Skills）</h2>
+        <h1>技能（Skills）</h1>
         <div class="sub">受治理的能力单元，供已配置的 Action / 工作流使用（如 OCR 解析、数据分析）</div>
       </div>
       <el-button v-if="canManage" @click="rescan"><el-icon><Refresh /></el-icon> 重新扫描</el-button>

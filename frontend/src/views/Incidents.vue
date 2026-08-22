@@ -3,7 +3,7 @@
     <header class="incident-header">
       <div>
         <span class="eyebrow">OPERATIONS CASES</span>
-        <h2 id="incident-page-title">事件中心</h2>
+        <h1 id="incident-page-title">事件中心</h1>
         <p>在场景范围内记录、确认和闭环异常事项。所有状态变化和说明都会保留为可追溯历史。</p>
       </div>
       <div class="incident-header-actions">
@@ -254,7 +254,7 @@
       </template>
     </el-dialog>
 
-    <el-drawer v-model="detailDrawer" size="min(700px, 100vw)" :with-header="false" @closed="clearSelectedIncident">
+    <el-drawer v-model="detailDrawer" class="incident-detail-drawer" size="min(700px, 100vw)" :with-header="false" @closed="clearSelectedIncident">
       <section v-if="selectedIncident" class="incident-detail" aria-labelledby="incident-detail-title" v-loading="detailLoading">
         <header class="detail-header">
           <div>
@@ -262,9 +262,14 @@
             <h3 id="incident-detail-title">{{ selectedIncident.title }}</h3>
             <p class="mono">{{ selectedIncident.id }}</p>
           </div>
-          <div class="detail-tags">
-            <el-tag effect="plain" :type="severityMeta(selectedIncident.severity).type">{{ severityMeta(selectedIncident.severity).label }}</el-tag>
-            <el-tag effect="plain" :type="statusMeta(selectedIncident.status).type">{{ statusMeta(selectedIncident.status).label }}</el-tag>
+          <div class="detail-tools">
+            <div class="detail-tags">
+              <el-tag effect="plain" :type="severityMeta(selectedIncident.severity).type">{{ severityMeta(selectedIncident.severity).label }}</el-tag>
+              <el-tag effect="plain" :type="statusMeta(selectedIncident.status).type">{{ statusMeta(selectedIncident.status).label }}</el-tag>
+            </div>
+            <el-button class="drawer-close" text circle aria-label="关闭 Case 详情" title="关闭 Case 详情" @click="detailDrawer = false">
+              <el-icon aria-hidden="true"><Close /></el-icon>
+            </el-button>
           </div>
         </header>
 
@@ -320,11 +325,10 @@
           </section>
         </template>
 
-        <footer v-if="!detailError" class="detail-footer">
+        <footer v-if="!detailError && (canEdit(selectedIncident) || canAcknowledge(selectedIncident) || canResolve(selectedIncident))" class="detail-footer">
           <el-button v-if="canEdit(selectedIncident)" @click="openEditDialog"><el-icon aria-hidden="true"><EditPen /></el-icon>编辑</el-button>
           <el-button v-if="canAcknowledge(selectedIncident)" type="primary" plain :loading="acknowledging" @click="acknowledgeIncident"><el-icon aria-hidden="true"><CircleCheck /></el-icon>确认 Case</el-button>
           <el-button v-if="canResolve(selectedIncident)" type="success" :loading="resolving" @click="openResolveDialog"><el-icon aria-hidden="true"><Finished /></el-icon>解决 Case</el-button>
-          <el-button @click="detailDrawer = false">关闭</el-button>
         </footer>
       </section>
     </el-drawer>
@@ -944,7 +948,7 @@ onBeforeUnmount(() => {
 .incident-page { min-height: 100%; padding: 24px 28px 34px; }
 .incident-header, .incident-header-actions, .section-header, .detail-header, .detail-section-heading, .resolution-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
 .incident-header { margin-bottom: 18px; }
-.incident-header h2 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
+.incident-header h1 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
 .incident-header p { max-width: 710px; margin: 0; color: var(--text-2); font-size: 13px; line-height: 1.65; }
 .incident-header-actions { flex-wrap: wrap; justify-content: flex-end; }
 .eyebrow, .section-kicker { color: var(--primary); font-size: 10px; font-weight: 800; letter-spacing: .14em; }
@@ -989,11 +993,14 @@ onBeforeUnmount(() => {
 .field-help.with-action { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .field-help.with-action .el-button { flex: 0 0 auto; padding: 0; height: auto; }
 .dialog-error { margin-bottom: 12px; outline: none; }
+.incident-detail-drawer :deep(.el-drawer__body) { padding: 0; scroll-padding-bottom: 88px; }
 .incident-detail { min-height: 100%; padding: 26px; background: var(--surface); }
 .detail-header { margin-bottom: 18px; }
 .detail-header h3 { max-width: 480px; margin: 5px 0; color: var(--text); font-size: 20px; letter-spacing: -.025em; overflow-wrap: anywhere; }
 .detail-header p { margin: 0; color: var(--text-3); font-size: 10px; overflow-wrap: anywhere; }
-.detail-tags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.detail-tools { display: flex; flex: 0 0 auto; align-items: flex-start; justify-content: flex-end; gap: 7px; }
+.detail-tags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; padding-top: 2px; }
+.drawer-close { min-width: 44px; min-height: 44px; margin: -9px -10px -9px 0; color: var(--text-2); }
 .detail-alert { margin-bottom: 14px; }
 .case-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-bottom: 18px; }
 .case-facts div { min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
@@ -1020,8 +1027,8 @@ onBeforeUnmount(() => {
 .history-transition { color: var(--primary-600); font-weight: 650; }
 .history-changes { max-height: 180px; margin: 8px 0 0; padding: 9px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text-2); font-size: 10.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .history-empty { list-style: none; padding: 5px 0 14px 25px; color: var(--text-3); font-size: 12px; }
-.detail-footer { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 22px; }
+.detail-footer { position: sticky; bottom: 0; z-index: 2; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin: 22px -26px -26px; padding: 14px 26px max(14px, env(safe-area-inset-bottom)); border-top: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 96%, transparent); backdrop-filter: blur(12px); }
 @media (max-width: 1080px) { .incident-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 720px) { .incident-page { padding: 18px 14px 22px; } .incident-header { flex-direction: column; } .incident-header-actions { width: 100%; justify-content: flex-start; } .scenario-select { flex: 1 1 220px; } .form-grid { grid-template-columns: 1fr; } .access-card { align-items: flex-start; flex-wrap: wrap; } }
-@media (max-width: 480px) { .incident-summary, .case-facts { grid-template-columns: 1fr; } .summary-card p { grid-column: 2; } .detail-header, .detail-section-heading { flex-direction: column; } .detail-tags { justify-content: flex-start; } .case-count { white-space: normal; } .field-help.with-action { align-items: flex-start; flex-direction: column; gap: 2px; } }
+@media (max-width: 480px) { .incident-summary, .case-facts { grid-template-columns: 1fr; } .summary-card p { grid-column: 2; } .detail-header, .detail-section-heading { flex-direction: column; } .detail-tools { width: 100%; justify-content: space-between; } .detail-tags { justify-content: flex-start; } .case-count { white-space: normal; } .field-help.with-action { align-items: flex-start; flex-direction: column; gap: 2px; } }
 </style>

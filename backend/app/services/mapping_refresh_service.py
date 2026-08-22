@@ -77,6 +77,11 @@ def mapping_snapshot(mapping: Any) -> dict[str, Any]:
         raw_column_map = {}
     if not isinstance(raw_column_map, Mapping):
         raise PolicyViolation("映射字段配置无效，无法创建刷新快照")
+    raw_transform_rules = _mapping_snapshot_value(mapping, "transform_rules", {})
+    if raw_transform_rules is None:
+        raw_transform_rules = {}
+    if not isinstance(raw_transform_rules, Mapping):
+        raise PolicyViolation("映射转换规则无效，无法创建刷新快照")
     config = {
         "data_source_id": str(_mapping_snapshot_value(mapping, "data_source_id", "") or ""),
         "data_source_binding_key": _mapping_snapshot_value(
@@ -110,6 +115,7 @@ def mapping_snapshot(mapping: Any) -> dict[str, Any]:
         "data_source_binding_ref": copy.deepcopy(config["data_source_binding_ref"]),
         "table_name": str(_mapping_snapshot_value(mapping, "table_name", "") or ""),
         "column_map": copy.deepcopy(dict(raw_column_map)),
+        "transform_rules": copy.deepcopy(dict(raw_transform_rules)),
     }
 
 

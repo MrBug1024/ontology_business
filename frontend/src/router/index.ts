@@ -1,8 +1,28 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { api } from '@/api'
 
+const mainScrollPositions = new Map<string, number>()
+const MAX_SAVED_SCROLL_POSITIONS = 100
+
+function saveMainScrollPosition(fullPath: string) {
+  const main = document.getElementById('main-content')
+  if (!main) return
+  // Refresh insertion order so the cap evicts the least recently visited path.
+  mainScrollPositions.delete(fullPath)
+  mainScrollPositions.set(fullPath, main.scrollTop)
+  if (mainScrollPositions.size <= MAX_SAVED_SCROLL_POSITIONS) return
+  const oldestPath = mainScrollPositions.keys().next().value
+  if (oldestPath) mainScrollPositions.delete(oldestPath)
+}
+
 const router = createRouter({
   history: createWebHistory(),
+  scrollBehavior(to, from, savedPosition) {
+    if (savedPosition) return savedPosition
+    if (to.hash) return { el: to.hash, behavior: 'smooth' }
+    if (to.path !== from.path || to.name !== from.name) return { top: 0 }
+    return false
+  },
   routes: [
     { path: '/', redirect: '/dashboard' },
     { path: '/login', name: 'login', component: () => import('@/views/Login.vue'), meta: { title: '登录', public: true } },
@@ -25,9 +45,20 @@ const router = createRouter({
   ],
 })
 
-router.afterEach((to) => {
+router.afterEach((to, from, failure) => {
+  if (failure) return
+  if (from.matched.length) saveMainScrollPosition(from.fullPath)
   document.title = `${to.meta.title || ''} · 业务场景本体智能平台`
-  requestAnimationFrame(() => document.getElementById('main-content')?.focus())
+  if (to.path === from.path && to.name === from.name) return
+  const targetFullPath = to.fullPath
+  const targetScrollTop = mainScrollPositions.get(targetFullPath) ?? 0
+  requestAnimationFrame(() => {
+    if (router.currentRoute.value.fullPath !== targetFullPath) return
+    const main = document.getElementById('main-content')
+    if (!main) return
+    main.scrollTop = targetScrollTop
+    main.focus({ preventScroll: true })
+  })
 })
 
 router.beforeEach(async (to) => {

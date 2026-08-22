@@ -32,6 +32,12 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _assistant_attachment_expiry() -> datetime:
+    from datetime import timedelta
+
+    return _now() + timedelta(hours=24)
+
+
 def _runtime_environment_default() -> str:
     """Keep direct ORM-created runs aligned with this server deployment."""
     return get_settings().runtime_environment
@@ -247,6 +253,7 @@ class BusinessScenario(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     industry: Mapped[str] = mapped_column(String(100), default="")
+    namespace: Mapped[str] = mapped_column(String(180), default="default")
     status: Mapped[str] = mapped_column(String(20), default="draft")  # draft / active
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
@@ -330,10 +337,12 @@ class OntologyEntity(Base):
         ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    namespace: Mapped[str] = mapped_column(String(180), default="default")
     description: Mapped[str] = mapped_column(Text, default="")
     icon: Mapped[str] = mapped_column(String(50), default="box")
     color: Mapped[str] = mapped_column(String(20), default="#4f46e5")
     is_abstract: Mapped[bool] = mapped_column(Boolean, default=False)
+    state_property: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship(back_populates="entities")
@@ -370,7 +379,10 @@ class OntologyProperty(Base):
     is_required: Mapped[bool] = mapped_column(Boolean, default=False)
     is_enum: Mapped[bool] = mapped_column(Boolean, default=False)
     enum_values: Mapped[list] = mapped_column(JSON, default=list)
-    default_value: Mapped[str] = mapped_column(String(500), default="")
+    # JSON preserves typed defaults (number/boolean/object/list) instead of
+    # forcing everything through a string that can bypass runtime type checks.
+    default_value: Mapped[object] = mapped_column(JSON, default="")
+    constraints: Mapped[dict] = mapped_column(JSON, default=dict)
     # 敏感属性默认仅 owner/admin 可见；其他成员需通过 AuthorizationGrant 显式授权。
     is_sensitive: Mapped[bool] = mapped_column(Boolean, default=False)
 
@@ -387,6 +399,7 @@ class OntologyRelation(Base):
         ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    namespace: Mapped[str] = mapped_column(String(180), default="default")
     source_entity_id: Mapped[str] = mapped_column(
         ForeignKey("ontology_entities.id", ondelete="CASCADE"), index=True
     )
@@ -422,6 +435,10 @@ class OntologyInstance(Base):
     source_ref: Mapped[str] = mapped_column(String(500), default="")  # 来源引用（表.行 等）
     # 内部血缘快照（mapping_id/data_source_id/table/key 等）；对外 DTO 保持兼容。
     source_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    state: Mapped[str] = mapped_column(String(120), default="", index=True)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    quality: Mapped[dict] = mapped_column(JSON, default=dict)
     # tenant: 遵循场景角色矩阵；restricted: 非 owner/admin 必须获得对象级显式授权。
     access_scope: Mapped[str] = mapped_column(String(20), default="tenant")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -488,6 +505,7 @@ class DataMapping(Base):
     data_source_binding_ref: Mapped[dict] = mapped_column(JSON, default=dict)
     table_name: Mapped[str] = mapped_column(String(300), default="")
     column_map: Mapped[dict] = mapped_column(JSON, default=dict)  # {本体属性名: 表列名}
+    transform_rules: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="unknown")  # unknown / ready / ok / error
     last_error: Mapped[str] = mapped_column(Text, default="")
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1095,6 +1113,39 @@ class AssistantMessage(Base):
     thread: Mapped[AssistantThread] = relationship(back_populates="messages")
 
 
+class AssistantProposalApplication(Base):
+    """Atomic, replayable claim for applying one assistant Change Set.
+
+    ``proposal_id`` is generated server-side and globally unique.  Making it
+    the primary key turns two concurrent confirmations into one transaction
+    that owns the write and one unique-key replay/conflict, including on
+    SQLite where ``SELECT FOR UPDATE`` is unavailable.
+    """
+
+    __tablename__ = "assistant_proposal_applications"
+
+    proposal_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    thread_id: Mapped[str] = mapped_column(
+        ForeignKey("assistant_threads.id", ondelete="CASCADE"), index=True
+    )
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("assistant_messages.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="applying")
+    applied_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class AssistantAttachment(Base):
     """助手临时附件：只保存解析后的文本，用户确认后再提升为正式数据源。"""
 
@@ -1106,12 +1157,23 @@ class AssistantAttachment(Base):
     created_by_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
     )
+    thread_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assistant_threads.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
     mime: Mapped[str] = mapped_column(String(200), default="")
     size: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / parsed / error
     parsed_text: Mapped[str] = mapped_column(Text, default="")
     error: Mapped[str] = mapped_column(Text, default="")
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_assistant_attachment_expiry, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -1951,6 +2013,11 @@ class ActionExecutionLog(Base):
             "idempotency_key",
             unique=True,
         ),
+        Index(
+            "uq_action_execution_logs_parent_preview",
+            "parent_action_log_id",
+            unique=True,
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -1985,6 +2052,37 @@ class ActionExecutionLog(Base):
     result: Mapped[dict] = mapped_column(JSON, default=dict)
     # Credential-free runtime connector evidence (environment/key/target only).
     connector_audit: Mapped[list] = mapped_column(JSON, default=list)
+    # Complete decision-chain provenance.  These columns deliberately remain
+    # nullable for legacy/background records that do not carry a verifiable
+    # identity; migration code never guesses an actor, Agent or model.
+    actor_type: Mapped[str] = mapped_column(String(20), default="unknown")
+    actor_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    agent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    llm_config_id: Mapped[str | None] = mapped_column(
+        ForeignKey("llm_configs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    model_name: Mapped[str] = mapped_column(String(240), default="")
+    permission_decision: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Safe identifiers/hashes describing the data plane used by the run.  Raw
+    # rows, prompts, credentials and connection configuration never enter it.
+    data_context: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Correlates an AI-requested dry-run with the later user-confirmed effect.
+    # Agent and global-assistant messages live in separate tables, hence the
+    # two explicit nullable references instead of one ambiguous string.
+    correlation_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    parent_action_log_id: Mapped[str | None] = mapped_column(
+        ForeignKey("action_execution_logs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    agent_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    assistant_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assistant_messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     # 错误信息
     error: Mapped[str] = mapped_column(Text, default="")
     # 执行耗时（毫秒）

@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import date, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -19,6 +21,409 @@ from ..models import (
     RelationInstance,
 )
 from . import datasource_service, llm_service, permission_service, tenant_service
+
+
+_NAMESPACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,179}$")
+_PROPERTY_TYPES = {
+    "string",
+    "text",
+    "integer",
+    "float",
+    "number",
+    "boolean",
+    "date",
+    "datetime",
+    "json",
+}
+_CONSTRAINT_KEYS = {
+    "minimum",
+    "maximum",
+    "exclusive_minimum",
+    "exclusive_maximum",
+    "min_length",
+    "max_length",
+    "pattern",
+    "format",
+}
+_TRANSFORM_OPS = {
+    "trim",
+    "lower",
+    "upper",
+    "default",
+    "replace",
+    "to_string",
+    "to_integer",
+    "to_float",
+    "to_boolean",
+}
+
+
+def validate_namespace(value: str, *, default: str = "default") -> str:
+    namespace = str(value or default).strip()
+    if not _NAMESPACE_RE.fullmatch(namespace):
+        raise ValueError("命名空间必须以字母开头，且只能包含字母、数字、点、横线和下划线")
+    return namespace
+
+
+def normalize_property_constraints(
+    data_type: str,
+    constraints: dict[str, Any] | None,
+) -> dict[str, Any]:
+    kind = str(data_type or "string").strip().lower()
+    if kind not in _PROPERTY_TYPES:
+        raise ValueError(f"不支持的属性类型：{kind}")
+    if not isinstance(constraints or {}, dict):
+        raise ValueError("属性约束必须是对象")
+    unknown = sorted(set(constraints or {}) - _CONSTRAINT_KEYS)
+    if unknown:
+        raise ValueError(f"属性约束包含不支持的字段：{'、'.join(unknown)}")
+    numeric_keys = {"minimum", "maximum", "exclusive_minimum", "exclusive_maximum"}
+    text_keys = {"min_length", "max_length", "pattern", "format"}
+    incompatible = (
+        (set(constraints or {}) - numeric_keys)
+        if kind in {"integer", "float", "number"}
+        else (set(constraints or {}) - text_keys)
+        if kind in {"string", "text", "date", "datetime"}
+        else set(constraints or {})
+    )
+    if incompatible:
+        raise ValueError(
+            f"{kind} 类型不支持约束：{'、'.join(sorted(incompatible))}"
+        )
+    result: dict[str, Any] = {}
+    for key, value in (constraints or {}).items():
+        if key in {"minimum", "maximum", "exclusive_minimum", "exclusive_maximum"}:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"属性约束 {key} 必须是数字")
+        elif key in {"min_length", "max_length"}:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 100_000:
+                raise ValueError(f"属性约束 {key} 必须是 0 到 100000 的整数")
+        elif key == "pattern":
+            value = str(value)
+            if (
+                len(value) > 200
+                or "(?" in value
+                or re.search(r"\\[1-9]", value)
+                # Python's stdlib regex engine has no match timeout.  Repeated
+                # groups are therefore rejected at definition time rather than
+                # trying to distinguish every catastrophic-backtracking shape
+                # (for example ``(a?)+`` or ``(a|aa)+``).  Ordinary, unquantified
+                # groups and quantified character classes remain available.
+                or re.search(r"\)(?:[+*?]|\{\d+(?:,\d*)?\})", value)
+                or ".*" in value
+                or ".+" in value
+            ):
+                raise ValueError("pattern 过于复杂；不允许回溯型断言、反向引用、量化分组或无界通配符")
+            try:
+                re.compile(value)
+            except re.error as exc:
+                raise ValueError("pattern 不是有效的正则表达式") from exc
+        elif key == "format":
+            value = str(value)
+            if value not in {"email", "uri", "date", "date-time"}:
+                raise ValueError("format 只能是 email、uri、date 或 date-time")
+        result[key] = value
+    if (
+        "minimum" in result
+        and "maximum" in result
+        and result["minimum"] > result["maximum"]
+    ):
+        raise ValueError("minimum 不能大于 maximum")
+    if (
+        "min_length" in result
+        and "max_length" in result
+        and result["min_length"] > result["max_length"]
+    ):
+        raise ValueError("min_length 不能大于 max_length")
+    return result
+
+
+def validate_entity_definition(payload: Any, *, scenario_namespace: str = "default") -> None:
+    namespace = str(getattr(payload, "namespace", "") or scenario_namespace)
+    validate_namespace(namespace)
+    properties = list(getattr(payload, "properties", []) or [])
+    names = [str(prop.name).strip() for prop in properties]
+    if any(not name for name in names) or len(names) != len(set(names)):
+        raise ValueError("实体属性名不能为空或重复")
+    key_count = sum(1 for prop in properties if bool(prop.is_key))
+    if key_count > 1:
+        raise ValueError("一个实体最多只能有一个主键属性")
+    for prop in properties:
+        prop.data_type = str(prop.data_type or "string").strip().lower()
+        prop.constraints = normalize_property_constraints(prop.data_type, prop.constraints)
+        values = [str(value) for value in (prop.enum_values or [])]
+        if prop.is_enum and not values:
+            raise ValueError(f"枚举属性“{prop.name}”必须提供至少一个枚举值")
+        if len(values) != len(set(values)):
+            raise ValueError(f"枚举属性“{prop.name}”包含重复枚举值")
+        prop.default_value = normalize_property_default(prop)
+    state_property = str(getattr(payload, "state_property", "") or "").strip()
+    if state_property:
+        candidate = next((prop for prop in properties if prop.name == state_property), None)
+        if candidate is None:
+            raise ValueError("状态属性必须引用当前实体中的属性")
+        if not candidate.is_enum:
+            raise ValueError("状态属性必须配置为枚举，才能形成稳定生命周期")
+
+
+def _validate_property_value(
+    prop: Any,
+    value: Any,
+    *,
+    strict_type: bool = True,
+) -> None:
+    if value is None:
+        if bool(getattr(prop, "is_required", False)):
+            raise ValueError(f"必填属性“{prop.name}”不能为空")
+        return
+    kind = str(prop.data_type or "string").lower()
+    valid = True
+    if kind in {"string", "text", "date", "datetime"}:
+        valid = isinstance(value, str) or (
+            kind == "date" and isinstance(value, date)
+        ) or (kind == "datetime" and isinstance(value, datetime))
+    elif kind == "integer":
+        valid = isinstance(value, int) and not isinstance(value, bool)
+    elif kind in {"float", "number"}:
+        valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+    elif kind == "boolean":
+        valid = isinstance(value, bool)
+    elif kind == "json":
+        valid = isinstance(value, (dict, list))
+    constraints = normalize_property_constraints(
+        kind, getattr(prop, "constraints", {}) or {}
+    )
+    enforce_type = strict_type or bool(constraints) or bool(
+        getattr(prop, "is_enum", False)
+    )
+    if not valid and enforce_type:
+        raise ValueError(f"属性“{prop.name}”的值不符合 {kind} 类型")
+    if not valid:
+        return
+    if bool(getattr(prop, "is_enum", False)) and str(value) not in {
+        str(item) for item in (getattr(prop, "enum_values", []) or [])
+    }:
+        raise ValueError(f"属性“{prop.name}”不在允许的枚举范围内")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in constraints and value < constraints["minimum"]:
+            raise ValueError(f"属性“{prop.name}”小于最小值")
+        if "maximum" in constraints and value > constraints["maximum"]:
+            raise ValueError(f"属性“{prop.name}”大于最大值")
+        if "exclusive_minimum" in constraints and value <= constraints["exclusive_minimum"]:
+            raise ValueError(f"属性“{prop.name}”必须大于约束值")
+        if "exclusive_maximum" in constraints and value >= constraints["exclusive_maximum"]:
+            raise ValueError(f"属性“{prop.name}”必须小于约束值")
+    if isinstance(value, str):
+        if "min_length" in constraints and len(value) < constraints["min_length"]:
+            raise ValueError(f"属性“{prop.name}”长度不足")
+        if "max_length" in constraints and len(value) > constraints["max_length"]:
+            raise ValueError(f"属性“{prop.name}”长度超限")
+        if "pattern" in constraints and re.fullmatch(constraints["pattern"], value) is None:
+            raise ValueError(f"属性“{prop.name}”格式不匹配")
+        expected_format = constraints.get("format")
+        format_valid = True
+        if expected_format == "email":
+            format_valid = re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value) is not None
+        elif expected_format == "uri":
+            parsed = urlparse(value)
+            format_valid = bool(parsed.scheme and (parsed.netloc or parsed.path))
+        elif expected_format == "date":
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                format_valid = False
+        elif expected_format == "date-time":
+            try:
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                format_valid = False
+        if not format_valid:
+            raise ValueError(f"属性“{prop.name}”不符合 {expected_format} 格式")
+
+
+def normalize_property_default(prop: Any) -> Any:
+    """Coerce legacy text defaults once, then validate the typed JSON value."""
+    value = getattr(prop, "default_value", "")
+    if value is None or value == "":
+        return value
+    kind = str(getattr(prop, "data_type", "string") or "string").lower()
+    try:
+        if isinstance(value, str):
+            token = value.strip()
+            if kind == "integer":
+                value = int(token)
+            elif kind in {"float", "number"}:
+                value = float(token)
+            elif kind == "boolean":
+                lowered = token.lower()
+                if lowered in {"true", "1", "yes"}:
+                    value = True
+                elif lowered in {"false", "0", "no"}:
+                    value = False
+                else:
+                    raise ValueError
+            elif kind == "json":
+                value = json.loads(token)
+        _validate_property_value(prop, value, strict_type=True)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"属性“{prop.name}”的默认值不符合 {kind} 类型或约束") from exc
+    return value
+
+
+def normalize_quality(value: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(value or {}, dict):
+        raise ValueError("质量信息必须是对象")
+    allowed = {"score", "status", "issues", "checked_at", "source"}
+    unknown = sorted(set(value or {}) - allowed)
+    if unknown:
+        raise ValueError(f"质量信息包含不支持的字段：{'、'.join(unknown)}")
+    result = dict(value or {})
+    if "score" in result:
+        score = result["score"]
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
+            raise ValueError("质量分数必须在 0 到 1 之间")
+        result["score"] = float(score)
+    status = str(result.get("status") or "unknown")
+    if status not in {"unknown", "valid", "warning", "invalid"}:
+        raise ValueError("质量状态不合法")
+    result["status"] = status
+    issues = result.get("issues") or []
+    if not isinstance(issues, list) or len(issues) > 100:
+        raise ValueError("质量问题必须是不超过 100 项的列表")
+    result["issues"] = [str(item)[:500] for item in issues]
+    for key in ("checked_at", "source"):
+        if key in result:
+            result[key] = str(result[key])[:200]
+    return result
+
+
+def validate_instance_payload(
+    entity: OntologyEntity,
+    attributes: dict[str, Any],
+    *,
+    state: str = "",
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
+    quality: dict[str, Any] | None = None,
+    strict_types: bool = True,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    values = dict(attributes or {})
+    for prop in entity.properties:
+        default_value = getattr(prop, "default_value", "")
+        if prop.name not in values and default_value not in (None, ""):
+            values[prop.name] = default_value
+        if prop.name not in values:
+            if bool(getattr(prop, "is_required", False)):
+                raise ValueError(f"缺少必填属性“{prop.name}”")
+            continue
+        _validate_property_value(
+            prop,
+            values[prop.name],
+            strict_type=strict_types,
+        )
+    resolved_state = str(state or "").strip()
+    state_property = str(getattr(entity, "state_property", "") or "")
+    if state_property:
+        state_prop = next(
+            (prop for prop in entity.properties if prop.name == state_property),
+            None,
+        )
+        attribute_state = values.get(state_property)
+        if not resolved_state and attribute_state is not None:
+            resolved_state = str(attribute_state)
+        if (
+            state_prop
+            and resolved_state
+            and resolved_state
+            not in {str(item) for item in (getattr(state_prop, "enum_values", []) or [])}
+        ):
+            raise ValueError("对象状态不在实体生命周期枚举中")
+        if attribute_state is not None and resolved_state != str(attribute_state):
+            raise ValueError("对象状态必须与实体状态属性保持一致")
+    if valid_from and valid_to:
+        try:
+            invalid_window = valid_to <= valid_from
+        except TypeError as exc:
+            raise ValueError("有效期起止时间的时区格式不一致") from exc
+        if invalid_window:
+            raise ValueError("valid_to 必须晚于 valid_from")
+    return values, resolved_state[:120], normalize_quality(quality)
+
+
+def normalize_transform_rules(
+    entity: OntologyEntity,
+    rules: dict[str, Any] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(rules or {}, dict):
+        raise ValueError("转换规则必须是对象")
+    property_names = {prop.name for prop in entity.properties}
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    for property_name, raw_rules in (rules or {}).items():
+        property_name = str(property_name)
+        if property_name not in property_names:
+            raise ValueError(f"转换规则引用了不存在的属性“{property_name}”")
+        if not isinstance(raw_rules, list) or len(raw_rules) > 20:
+            raise ValueError("每个属性的转换规则必须是不超过 20 项的列表")
+        items: list[dict[str, Any]] = []
+        for raw in raw_rules:
+            if not isinstance(raw, dict):
+                raise ValueError("转换规则项必须是对象")
+            op = str(raw.get("op") or "").strip()
+            if op not in _TRANSFORM_OPS:
+                raise ValueError(f"不支持的声明式转换操作：{op}")
+            allowed_keys = {
+                "replace": {"op", "old", "new"},
+                "default": {"op", "value"},
+            }.get(op, {"op"})
+            if set(raw) - allowed_keys:
+                raise ValueError(f"转换操作 {op} 包含不允许的参数")
+            item: dict[str, Any] = {"op": op}
+            if op == "replace":
+                item["old"] = str(raw.get("old") or "")[:500]
+                if not item["old"]:
+                    raise ValueError("replace 转换的 old 不能为空")
+                item["new"] = str(raw.get("new") or "")[:500]
+            elif op == "default":
+                item["value"] = raw.get("value")
+            items.append(item)
+        normalized[property_name] = items
+    return normalized
+
+
+def apply_transform_rules(value: Any, rules: list[dict[str, Any]]) -> Any:
+    result = value
+    for rule in rules:
+        op = rule["op"]
+        if op == "default":
+            if result is None or result == "":
+                result = rule.get("value")
+        elif result is None:
+            continue
+        elif op == "trim":
+            result = str(result).strip()
+        elif op == "lower":
+            result = str(result).lower()
+        elif op == "upper":
+            result = str(result).upper()
+        elif op == "replace":
+            result = str(result).replace(str(rule.get("old") or ""), str(rule.get("new") or ""))
+        elif op == "to_string":
+            result = str(result)
+        elif op == "to_integer":
+            result = int(result)
+        elif op == "to_float":
+            result = float(result)
+        elif op == "to_boolean":
+            if isinstance(result, bool):
+                continue
+            token = str(result).strip().lower()
+            if token in {"1", "true", "yes", "y", "是"}:
+                result = True
+            elif token in {"0", "false", "no", "n", "否"}:
+                result = False
+            else:
+                raise ValueError(f"值“{result}”不能转换为布尔值")
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -173,7 +578,7 @@ _GEN_PROMPT = """你是资深业务架构师，擅长为任意行业构建本体
 
 要求：
 1. 实体（entities）：3~8 个核心业务对象，命名使用业务领域中的稳定名词。
-2. 每个实体给出 3~8 个属性（properties），属性名用中文，data_type 只能是：string / integer / float / boolean / date / datetime / json / text。
+2. 每个实体给出 3~8 个属性（properties），属性名用中文，data_type 只能是：string / integer / float / boolean / date / datetime / json / text；需要状态机时使用 is_enum/enum_values，并在实体 state_property 指向该枚举属性。
 3. 每个实体必须恰好有 1 个 is_key=true 的主键属性。
 4. 关系（relations）：2~8 条，relation_type 只能是 1:1 / 1:N / N:M。
 5. 只输出 JSON，不要输出任何解释文字。
@@ -181,8 +586,8 @@ _GEN_PROMPT = """你是资深业务架构师，擅长为任意行业构建本体
 输出格式（严格 JSON）：
 {
   "entities": [
-    {"name": "业务对象", "description": "业务领域中的核心对象", "is_abstract": false,
-     "properties": [{"name": "对象ID", "data_type": "string", "is_key": true, "is_required": true}, ...]}
+    {"name": "业务对象", "description": "业务领域中的核心对象", "is_abstract": false, "state_property": "",
+     "properties": [{"name": "对象ID", "data_type": "string", "is_key": true, "is_required": true, "is_enum": false, "enum_values": [], "constraints": {}}, ...]}
   ],
   "relations": [
     {"name": "关联", "source": "业务对象", "target": "相关对象", "relation_type": "1:N", "description": ""}
@@ -264,6 +669,7 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
         e["name"] = str(e.get("name", "")).strip()
         e["description"] = str(e.get("description", ""))
         e["is_abstract"] = bool(e.get("is_abstract", False))
+        e["state_property"] = str(e.get("state_property", "")).strip()
         props = []
         has_key = False
         for p in e.get("properties") or []:
@@ -273,6 +679,12 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
                 "description": str(p.get("description", "")),
                 "is_key": bool(p.get("is_key", False)),
                 "is_required": bool(p.get("is_required", False)),
+                "is_enum": bool(p.get("is_enum", False)),
+                "enum_values": [str(item) for item in (p.get("enum_values") or [])],
+                "constraints": normalize_property_constraints(
+                    str(p.get("data_type", "string")),
+                    p.get("constraints") if isinstance(p.get("constraints"), dict) else {},
+                ),
             }
             if not p["name"]:
                 continue
@@ -284,6 +696,11 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
         if not has_key and props:
             props[0]["is_key"] = True
         e["properties"] = props
+        if e["state_property"] and not any(
+            prop["name"] == e["state_property"] and prop["is_enum"]
+            for prop in props
+        ):
+            e["state_property"] = ""
         name_to_idx[e["name"]] = i
 
     clean_rels = []
@@ -324,6 +741,8 @@ def apply_generated_ontology(
             name=e["name"],
             description=e.get("description", ""),
             is_abstract=bool(e.get("is_abstract", False)),
+            namespace=scenario.namespace or "default",
+            state_property=e.get("state_property", ""),
         )
         db.add(ent)
         db.flush()
@@ -338,6 +757,9 @@ def apply_generated_ontology(
                     description=p.get("description", ""),
                     is_key=bool(p.get("is_key", False)),
                     is_required=bool(p.get("is_required", False)),
+                    is_enum=bool(p.get("is_enum", False)),
+                    enum_values=p.get("enum_values") or [],
+                    constraints=p.get("constraints") or {},
                 )
             )
         name_map[e["name"]] = ent
@@ -361,6 +783,7 @@ def apply_generated_ontology(
                 target_entity_id=tgt.id,
                 relation_type=r.get("relation_type", "1:N"),
                 description=r.get("description", ""),
+                namespace=scenario.namespace or "default",
             )
         )
         relation_keys.add(relation_key)
@@ -430,6 +853,7 @@ def preview_mapping(
     columns = [str(column) for column in result.get("columns", [])]
     available_columns = set(columns)
     col_map = {str(key): str(value) for key, value in (mapping.column_map or {}).items() if value}
+    transform_rules = normalize_transform_rules(ent, getattr(mapping, "transform_rules", {}) or {})
     known_properties = {prop.name for prop in ent.properties}
     fields: list[dict[str, Any]] = []
     missing_properties: list[str] = []
@@ -449,6 +873,7 @@ def preview_mapping(
                 "source_column": source_column,
                 "source_exists": source_exists,
                 "status": status,
+                "transform_rules": transform_rules.get(prop.name, []),
             }
         )
         if not source_exists:
@@ -475,6 +900,27 @@ def preview_mapping(
     if result.get("truncated"):
         warnings.append(f"仅展示前 {sample_limit} 行样本")
 
+    transformed_rows: list[dict[str, Any]] = []
+    for row_index, row in enumerate(result.get("rows") or [], start=1):
+        record = dict(zip(columns, row))
+        attributes: dict[str, Any] = {}
+        try:
+            for property_name, source_column in col_map.items():
+                if source_column in record:
+                    attributes[property_name] = apply_transform_rules(
+                        record[source_column],
+                        transform_rules.get(property_name, []),
+                    )
+            attributes, _state, _quality = validate_instance_payload(
+                ent,
+                attributes,
+                quality={},
+                strict_types=True,
+            )
+            transformed_rows.append(attributes)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"样本第 {row_index} 行转换或类型校验失败：{exc}")
+
     ok = not errors
     return {
         "mapping_id": mapping.id,
@@ -485,6 +931,7 @@ def preview_mapping(
         "message": "映射检查通过" if ok else "映射存在需要修正的问题",
         "columns": columns,
         "sample_rows": result.get("rows", []),
+        "transformed_rows": transformed_rows,
         "row_count": int(result.get("row_count", 0)),
         "truncated": bool(result.get("truncated", False)),
         "fields": fields,
@@ -514,6 +961,7 @@ def import_instances_from_mapping(
     ds, ent = _mapping_context(db, scenario, mapping, data_source=data_source)
     runtime_environment = str(environment or "dev").strip().lower() or "dev"
     col_map = mapping.column_map or {}
+    transform_rules = normalize_transform_rules(ent, getattr(mapping, "transform_rules", {}) or {})
 
     result = datasource_service.run_query(
         ds,
@@ -562,12 +1010,26 @@ def import_instances_from_mapping(
     row_instances: list[OntologyInstance] = []
     for row in rows:
         rec = dict(zip(columns, row))
-        attrs = {}
+        attrs: dict[str, Any] = {}
         for prop_name, col in col_map.items():
             if col in rec:
-                attrs[prop_name] = rec[col]
-        if key_col and key_col in rec and rec.get(key_col) is not None:
-            record_key = str(rec[key_col])
+                attrs[prop_name] = apply_transform_rules(
+                    rec[col],
+                    transform_rules.get(prop_name, []),
+                )
+        attrs, object_state, object_quality = validate_instance_payload(
+            ent,
+            attrs,
+            quality={
+                "score": 1.0,
+                "status": "valid",
+                "issues": [],
+                "source": f"mapping:{mapping.id}",
+            },
+            strict_types=True,
+        )
+        if key_prop and attrs.get(key_prop) is not None:
+            record_key = str(attrs[key_prop])
         else:
             # 没有映射主键时，用规范化整行哈希代替递增序号。该键对相同源记录稳定，
             # 不会在每次 refresh 时生成重复对象；预览/校验会继续提示应配置主键。
@@ -585,7 +1047,8 @@ def import_instances_from_mapping(
             "table_name": mapping.table_name,
             "key_column": key_col or "",
             "record_key": record_key,
-            "version": "mapping-v1",
+            "transform_rules": transform_rules,
+            "version": "mapping-v2",
         }
         if not inst:
             inst = OntologyInstance(
@@ -596,6 +1059,8 @@ def import_instances_from_mapping(
                 source="imported",
                 source_ref=ref,
                 source_metadata=metadata,
+                state=object_state,
+                quality=object_quality,
             )
             db.add(inst)
             db.flush()
@@ -610,11 +1075,15 @@ def import_instances_from_mapping(
                 or (inst.attributes or {}) != attrs
                 or inst.source_ref != ref
                 or (inst.source_metadata or {}) != metadata
+                or (inst.state or "") != object_state
+                or (inst.quality or {}) != object_quality
             ):
                 inst.name = display
                 inst.attributes = attrs
                 inst.source_ref = ref
                 inst.source_metadata = metadata
+                inst.state = object_state
+                inst.quality = object_quality
                 updated_instances += 1
         row_instances.append(inst)
 

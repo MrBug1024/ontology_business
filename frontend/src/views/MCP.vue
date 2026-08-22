@@ -2,7 +2,7 @@
   <div class="page">
     <div class="page-header">
       <div>
-        <h2>MCP 服务</h2>
+        <h1>MCP 服务</h1>
         <div class="sub">Model Context Protocol 工具服务，供受治理的 Action / 工作流配置外部工具连接</div>
       </div>
       <el-button v-if="canManage" type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>

@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 from fastapi import HTTPException
@@ -43,7 +44,13 @@ from ..models import (
     RelationInstance,
     WorkflowRun,
 )
-from . import advanced_runtime_service, connector_service, function_definition_service, permission_service
+from . import (
+    advanced_runtime_service,
+    connector_service,
+    function_definition_service,
+    ontology_service,
+    permission_service,
+)
 from .policies import validate_workflow_graph
 
 
@@ -293,16 +300,38 @@ def _bool(value: Any, label: str, *, default: bool = False) -> bool:
 def _normalize_property(raw: Any) -> dict:
     if not isinstance(raw, dict):
         raise ReleaseValidationError("属性必须是对象")
+    data_type = _string(raw.get("data_type"), "属性类型", default="string", maximum=50)
+    try:
+        constraints = ontology_service.normalize_property_constraints(
+            data_type,
+            _dict(raw.get("constraints"), "属性约束"),
+        )
+    except ValueError as exc:
+        raise ReleaseValidationError(str(exc)) from exc
+    default_probe = SimpleNamespace(
+        name=str(raw.get("name") or ""),
+        data_type=data_type,
+        default_value=copy.deepcopy(raw.get("default_value", "")),
+        constraints=constraints,
+        is_required=_bool(raw.get("is_required"), "属性 is_required"),
+        is_enum=_bool(raw.get("is_enum"), "属性 is_enum"),
+        enum_values=_list(raw.get("enum_values"), "属性枚举值"),
+    )
+    try:
+        default_value = ontology_service.normalize_property_default(default_probe)
+    except ValueError as exc:
+        raise ReleaseValidationError(str(exc)) from exc
     return {
         "id": _required_id(raw.get("id"), "属性 id"),
         "name": _string(raw.get("name"), "属性名称", maximum=200),
-        "data_type": _string(raw.get("data_type"), "属性类型", default="string", maximum=50),
+        "data_type": data_type,
         "description": _string(raw.get("description"), "属性说明"),
         "is_key": _bool(raw.get("is_key"), "属性 is_key"),
-        "is_required": _bool(raw.get("is_required"), "属性 is_required"),
-        "is_enum": _bool(raw.get("is_enum"), "属性 is_enum"),
-        "enum_values": _list(raw.get("enum_values"), "属性枚举值"),
-        "default_value": _string(raw.get("default_value"), "属性默认值", maximum=500),
+        "is_required": default_probe.is_required,
+        "is_enum": default_probe.is_enum,
+        "enum_values": default_probe.enum_values,
+        "default_value": default_value,
+        "constraints": constraints,
         "is_sensitive": _bool(raw.get("is_sensitive"), "属性 is_sensitive"),
     }
 
@@ -314,13 +343,31 @@ def _normalize_entity(raw: Any) -> dict:
     property_ids = [item["id"] for item in properties]
     if len(set(property_ids)) != len(property_ids):
         raise ReleaseValidationError("同一实体中不能重复属性 id")
+    state_property = _string(
+        raw.get("state_property"), "实体状态属性", maximum=200
+    )
+    if state_property:
+        state_definition = next(
+            (item for item in properties if item["name"] == state_property),
+            None,
+        )
+        if not state_definition or not state_definition["is_enum"]:
+            raise ReleaseValidationError("实体状态属性必须引用当前实体的枚举属性")
+    try:
+        namespace = ontology_service.validate_namespace(
+            _string(raw.get("namespace"), "实体命名空间", default="default", maximum=180)
+        )
+    except ValueError as exc:
+        raise ReleaseValidationError(str(exc)) from exc
     return {
         "id": _required_id(raw.get("id"), "实体 id"),
         "name": _string(raw.get("name"), "实体名称", maximum=200),
+        "namespace": namespace,
         "description": _string(raw.get("description"), "实体说明"),
         "icon": _string(raw.get("icon"), "实体图标", default="box", maximum=50),
         "color": _string(raw.get("color"), "实体颜色", default="#4f46e5", maximum=20),
         "is_abstract": _bool(raw.get("is_abstract"), "实体 is_abstract"),
+        "state_property": state_property,
         "properties": properties,
     }
 
@@ -331,9 +378,16 @@ def _normalize_relation(raw: Any) -> dict:
     relation_type = _string(raw.get("relation_type"), "关系类型", default="1:N", maximum=10)
     if relation_type not in {"1:1", "1:N", "N:1", "N:M"}:
         raise ReleaseValidationError("关系类型必须为 1:1、1:N、N:1 或 N:M")
+    try:
+        namespace = ontology_service.validate_namespace(
+            _string(raw.get("namespace"), "关系命名空间", default="default", maximum=180)
+        )
+    except ValueError as exc:
+        raise ReleaseValidationError(str(exc)) from exc
     return {
         "id": _required_id(raw.get("id"), "关系 id"),
         "name": _string(raw.get("name"), "关系名称", maximum=200),
+        "namespace": namespace,
         "source_entity_id": _required_id(raw.get("source_entity_id"), "关系源实体 id"),
         "target_entity_id": _required_id(raw.get("target_entity_id"), "关系目标实体 id"),
         "relation_type": relation_type,
@@ -358,6 +412,9 @@ def _normalize_mapping(raw: Any) -> dict:
         "data_source_binding_ref": {},
         "table_name": _string(raw.get("table_name"), "数据映射表名", maximum=300),
         "column_map": _sanitize_secret_values(_dict(raw.get("column_map"), "数据映射字段")),
+        "transform_rules": _sanitize_secret_values(
+            _dict(raw.get("transform_rules"), "数据映射转换规则")
+        ),
     }
     try:
         binding = connector_service.runtime_binding_from_config(raw, "data_source")
@@ -657,6 +714,19 @@ def normalize_snapshot_content(content: Any) -> dict:
     for mapping in mappings:
         if mapping["entity_id"] not in entity_id_set:
             raise ReleaseValidationError("数据映射引用了不存在的实体")
+        entity_data = next(item for item in entities if item["id"] == mapping["entity_id"])
+        try:
+            mapping["transform_rules"] = ontology_service.normalize_transform_rules(
+                SimpleNamespace(
+                    properties=[
+                        SimpleNamespace(name=prop["name"])
+                        for prop in entity_data["properties"]
+                    ]
+                ),
+                mapping.get("transform_rules"),
+            )
+        except ValueError as exc:
+            raise ReleaseValidationError(str(exc)) from exc
     for action in actions:
         if action["entity_id"] not in entity_id_set:
             raise ReleaseValidationError("Action 引用了不存在的实体")
@@ -673,12 +743,24 @@ def normalize_snapshot_content(content: Any) -> dict:
             except Exception as exc:  # noqa: BLE001
                 raise ReleaseValidationError(f"工作流图校验失败: {exc}") from exc
 
+    try:
+        scenario_namespace = ontology_service.validate_namespace(
+            _string(
+                scenario_raw.get("namespace"),
+                "场景命名空间",
+                default="default",
+                maximum=180,
+            )
+        )
+    except ValueError as exc:
+        raise ReleaseValidationError(str(exc)) from exc
     normalized = {
         "schema_version": 1,
         "scenario": {
             "name": _string(scenario_raw.get("name"), "场景名称", maximum=200),
             "description": _string(scenario_raw.get("description"), "场景说明"),
             "industry": _string(scenario_raw.get("industry"), "场景行业", maximum=100),
+            "namespace": scenario_namespace,
             "status": _string(scenario_raw.get("status"), "场景状态", default="draft", maximum=20),
         },
         "entities": entities,
@@ -736,16 +818,19 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
             "name": scenario.name,
             "description": scenario.description or "",
             "industry": scenario.industry or "",
+            "namespace": scenario.namespace or "default",
             "status": scenario.status or "draft",
         },
         "entities": [
             {
                 "id": entity.id,
                 "name": entity.name,
+                "namespace": entity.namespace or scenario.namespace or "default",
                 "description": entity.description or "",
                 "icon": entity.icon or "box",
                 "color": entity.color or "#4f46e5",
                 "is_abstract": bool(entity.is_abstract),
+                "state_property": entity.state_property or "",
                 "properties": [
                     {
                         "id": prop.id,
@@ -757,6 +842,7 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
                         "is_enum": bool(prop.is_enum),
                         "enum_values": prop.enum_values or [],
                         "default_value": prop.default_value or "",
+                        "constraints": copy.deepcopy(prop.constraints or {}),
                         "is_sensitive": bool(prop.is_sensitive),
                     }
                     for prop in sorted(entity.properties, key=lambda item: item.id)
@@ -768,6 +854,7 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
             {
                 "id": relation.id,
                 "name": relation.name,
+                "namespace": relation.namespace or scenario.namespace or "default",
                 "source_entity_id": relation.source_entity_id,
                 "target_entity_id": relation.target_entity_id,
                 "relation_type": relation.relation_type or "1:N",
@@ -792,6 +879,7 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
                 ),
                 "table_name": mapping.table_name or "",
                 "column_map": _sanitize_secret_values(mapping.column_map or {}),
+                "transform_rules": _sanitize_secret_values(mapping.transform_rules or {}),
             }
             for mapping in db.execute(
                 select(DataMapping)
@@ -1669,6 +1757,7 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
     scenario.name = scenario_data["name"]
     scenario.description = scenario_data["description"]
     scenario.industry = scenario_data["industry"]
+    scenario.namespace = scenario_data["namespace"]
     scenario.status = scenario_data["status"]
 
     for entity_data in content["entities"]:
@@ -1676,7 +1765,15 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
         if not entity:
             entity = OntologyEntity(id=entity_data["id"], scenario_id=scenario.id)
             db.add(entity)
-        for key in ("name", "description", "icon", "color", "is_abstract"):
+        for key in (
+            "name",
+            "namespace",
+            "description",
+            "icon",
+            "color",
+            "is_abstract",
+            "state_property",
+        ):
             setattr(entity, key, entity_data[key])
     db.flush()
 
@@ -1706,6 +1803,7 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
                 "is_enum",
                 "enum_values",
                 "default_value",
+                "constraints",
                 "is_sensitive",
             ):
                 setattr(prop, key, copy.deepcopy(prop_data[key]))
@@ -1716,7 +1814,14 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
         if not relation:
             relation = OntologyRelation(id=relation_data["id"], scenario_id=scenario.id)
             db.add(relation)
-        for key in ("name", "source_entity_id", "target_entity_id", "relation_type", "description"):
+        for key in (
+            "name",
+            "namespace",
+            "source_entity_id",
+            "target_entity_id",
+            "relation_type",
+            "description",
+        ):
             setattr(relation, key, relation_data[key])
 
     # Mapping removal is intentionally not performed as a side effect of a
@@ -1747,6 +1852,7 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
             "data_source_binding_ref",
             "table_name",
             "column_map",
+            "transform_rules",
         ):
             setattr(mapping, key, copy.deepcopy(mapping_data[key]))
         if prior_fingerprint and mapping_refresh_service.mapping_fingerprint(mapping) != prior_fingerprint:

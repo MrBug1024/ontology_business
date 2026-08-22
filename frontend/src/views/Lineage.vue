@@ -3,7 +3,7 @@
     <header class="lineage-header">
       <div>
         <span class="eyebrow">TRACEABILITY</span>
-        <h2 id="lineage-title">端到端血缘</h2>
+        <h1 id="lineage-title">端到端血缘</h1>
         <p>从数据源、本体对象和 AI 回答，一直追到 Action 与外部执行结果。</p>
       </div>
       <div class="header-actions">
@@ -216,7 +216,7 @@ onMounted(loadScenarios)
 .lineage-page { min-height: 100%; padding: 24px 28px 34px; }
 .lineage-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; margin-bottom: 18px; }
 .eyebrow { color: var(--primary); font-size: 10px; font-weight: 800; letter-spacing: .15em; }
-.lineage-header h2 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
+.lineage-header h1 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
 .lineage-header p { margin: 0; color: var(--text-2); font-size: 13px; }
 .header-actions { display: flex; align-items: center; gap: 8px; }
 .scenario-select { width: min(280px, 48vw); }

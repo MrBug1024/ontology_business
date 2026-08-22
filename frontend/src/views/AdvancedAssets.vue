@@ -3,11 +3,11 @@
     <header class="page-header advanced-header">
       <div>
         <span class="eyebrow">P2 ADVANCED RUNTIME</span>
-        <h2 id="advanced-title">高级数据与模型</h2>
+        <h1 id="advanced-title">高级数据与模型</h1>
         <p class="sub">把空间、时序、媒体、实时流和可治理模型接入本体场景；每条记录、每次运行和每条反馈都可追溯。</p>
       </div>
       <div class="header-actions">
-        <el-select v-model="selectedScenarioId" aria-label="选择业务场景" placeholder="选择业务场景" class="scenario-select" @change="loadAssets">
+        <el-select v-model="selectedScenarioId" aria-label="选择业务场景" placeholder="选择业务场景" class="scenario-select" @change="selectScenario">
           <el-option v-for="scenario in scenarios" :key="scenario.id" :label="scenario.name" :value="scenario.id" />
         </el-select>
         <el-button v-if="canManage && selectedScenarioId" type="primary" @click="openCreate">新建资产</el-button>
@@ -20,7 +20,7 @@
       <div class="asset-list-panel">
         <div class="section-head">
           <div><span class="eyebrow">CATALOG</span><h3>资产目录</h3></div>
-          <el-select v-model="kindFilter" aria-label="按类型筛选" clearable placeholder="全部类型" size="small" @change="loadAssets">
+          <el-select v-model="kindFilter" aria-label="按类型筛选" clearable placeholder="全部类型" size="small" @change="loadAssets()">
             <el-option v-for="item in kindOptions" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
         </div>
@@ -37,7 +37,7 @@
       <section v-if="selectedAsset" class="asset-detail card" aria-labelledby="asset-detail-title">
         <header class="detail-head">
           <div><span class="eyebrow">{{ kindLabel(selectedAsset.kind) }}</span><h3 id="asset-detail-title">{{ selectedAsset.name }}</h3><p>{{ selectedAsset.description || '暂无资产说明' }}</p></div>
-          <div class="detail-actions"><el-button size="small" :loading="detailLoading" @click="refreshDetail">刷新</el-button><el-button v-if="canManage" size="small" type="danger" plain @click="removeAsset">删除</el-button></div>
+          <div class="detail-actions"><el-button size="small" :loading="detailLoading" @click="refreshDetail()">刷新</el-button><el-button v-if="canManage" size="small" type="danger" plain @click="removeAsset">删除</el-button></div>
         </header>
         <div class="metric-grid" aria-label="资产统计">
           <div><span>记录</span><b>{{ summary?.record_count || 0 }}</b></div>
@@ -85,7 +85,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { DataAnalysis, Location, VideoCamera, Connection, TrendCharts, Cpu, SetUp } from '@element-plus/icons-vue'
 import { api } from '@/api'
@@ -93,6 +94,8 @@ import { useAuthStore } from '@/stores/auth'
 import type { AdvancedAsset, AdvancedAssetSummary, AdvancedFeedback, AdvancedRecord, AdvancedRun, Scenario } from '@/types'
 
 const auth = useAuthStore()
+const route = useRoute()
+const router = useRouter()
 const canManage = computed(() => auth.user?.can_manage === true)
 const scenarios = ref<Scenario[]>([])
 const selectedScenarioId = ref('')
@@ -120,6 +123,8 @@ const idempotencyKey = ref('')
 const assetForm = ref({ name: '', kind: 'timeseries', description: '', configText: '{}' })
 const feedbackForm = ref<{ run_id: string; label: string; score?: number; notes: string }>({ run_id: '', label: '', score: undefined, notes: '' })
 let pollTimer: number | undefined
+let assetRequest = 0
+let initialized = false
 
 const kindOptions = [
   { value: 'geospatial', label: '地理空间' }, { value: 'timeseries', label: '时序数据' }, { value: 'media', label: '媒体' },
@@ -133,30 +138,139 @@ function runOptionsForAsset(kind: string) { return kind === 'timeseries' ? [{ va
 function formatDate(value?: string) { return value ? new Date(value).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—' }
 function compactJson(value: any) { const text = JSON.stringify(value || {}); return text.length > 130 ? `${text.slice(0, 127)}…` : text }
 function clearPoll() { if (pollTimer) { window.clearInterval(pollTimer); pollTimer = undefined } }
-
-async function loadAssets() {
-  if (!selectedScenarioId.value) return
-  loading.value = true; error.value = ''
-  try { assets.value = await api.listAdvancedAssets(selectedScenarioId.value, kindFilter.value || undefined); if (selectedAsset.value && !assets.value.find((item) => item.id === selectedAsset.value?.id)) selectedAsset.value = null; } catch (cause: any) { error.value = cause?.message || '高级资产加载失败' } finally { loading.value = false }
+function queryValue(value: unknown) { return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : '' }
+function clearAssetSelection() {
+  clearPoll()
+  selectedAsset.value = null
+  detailLoading.value = false
+  summary.value = null
+  records.value = []
+  runs.value = []
+  feedback.value = []
 }
-async function selectAsset(asset: AdvancedAsset) { selectedAsset.value = asset; activeTab.value = 'records'; runType.value = asset.kind === 'timeseries' ? 'aggregate' : asset.kind === 'simulation' ? 'simulate' : asset.kind === 'optimization' ? 'optimize' : 'predict'; runText.value = asset.kind === 'timeseries' ? '{"values":[],"aggregation":"avg"}' : asset.kind === 'simulation' ? '{"state":{}}' : asset.kind === 'optimization' ? '{"candidates":[]}' : '{"features":{}}'; await refreshDetail(); clearPoll(); if (asset.kind === 'realtime') pollTimer = window.setInterval(() => refreshDetail(true), 5000) }
+async function syncScenarioQuery() {
+  if (queryValue(route.query.scenario_id) === selectedScenarioId.value) return
+  await router.replace({
+    name: 'advanced-assets',
+    query: { ...route.query, scenario_id: selectedScenarioId.value || undefined },
+  })
+}
+
+async function selectScenario(value: string | number | boolean) {
+  const nextScenarioId = String(value || '')
+  if (!nextScenarioId) return
+  selectedScenarioId.value = nextScenarioId
+  assets.value = []
+  clearAssetSelection()
+  await syncScenarioQuery()
+  await loadAssets()
+}
+async function loadAssets(preferredAssetId = '') {
+  const scenarioId = selectedScenarioId.value
+  const request = ++assetRequest
+  if (!scenarioId) {
+    assets.value = []
+    clearAssetSelection()
+    return
+  }
+  loading.value = true
+  error.value = ''
+  try {
+    const freshAssets = await api.listAdvancedAssets(scenarioId, kindFilter.value || undefined)
+    if (request !== assetRequest || scenarioId !== selectedScenarioId.value) return
+    assets.value = freshAssets
+    const targetId = preferredAssetId || selectedAsset.value?.id || ''
+    const nextAsset = freshAssets.find((item) => item.id === targetId) || freshAssets[0] || null
+    if (!nextAsset) {
+      clearAssetSelection()
+      return
+    }
+    if (selectedAsset.value?.id !== nextAsset.id) await selectAsset(nextAsset)
+  } catch (cause: any) {
+    if (request !== assetRequest) return
+    assets.value = []
+    clearAssetSelection()
+    error.value = cause?.message || '高级资产加载失败'
+  } finally {
+    if (request === assetRequest) loading.value = false
+  }
+}
+async function selectAsset(asset: AdvancedAsset) {
+  clearPoll()
+  selectedAsset.value = asset
+  summary.value = null
+  records.value = []
+  runs.value = []
+  feedback.value = []
+  activeTab.value = 'records'
+  runType.value = asset.kind === 'timeseries' ? 'aggregate' : asset.kind === 'simulation' ? 'simulate' : asset.kind === 'optimization' ? 'optimize' : 'predict'
+  runText.value = asset.kind === 'timeseries' ? '{"values":[],"aggregation":"avg"}' : asset.kind === 'simulation' ? '{"state":{}}' : asset.kind === 'optimization' ? '{"candidates":[]}' : '{"features":{}}'
+  await refreshDetail()
+  if (selectedAsset.value?.id === asset.id && asset.kind === 'realtime') pollTimer = window.setInterval(() => refreshDetail(true), 5000)
+}
 async function refreshDetail(silent = false) {
-  if (!selectedAsset.value) return
+  const asset = selectedAsset.value
+  if (!asset) return
   detailLoading.value = !silent
-  try { const [s, page, r, f] = await Promise.all([api.getAdvancedAssetSummary(selectedAsset.value.id), api.listAdvancedRecords(selectedAsset.value.id, { limit: 100 }), api.listAdvancedRuns(selectedAsset.value.id), selectedAsset.value.kind === 'ml_model' ? api.listAdvancedFeedback(selectedAsset.value.id) : Promise.resolve([])]); summary.value = s; records.value = page.items; runs.value = r; feedback.value = f as AdvancedFeedback[] } catch (cause: any) { if (!silent) ElMessage.error(cause?.message || '资产详情加载失败') } finally { detailLoading.value = false }
+  try {
+    const [nextSummary, page, nextRuns, nextFeedback] = await Promise.all([
+      api.getAdvancedAssetSummary(asset.id),
+      api.listAdvancedRecords(asset.id, { limit: 100 }),
+      api.listAdvancedRuns(asset.id),
+      asset.kind === 'ml_model' ? api.listAdvancedFeedback(asset.id) : Promise.resolve([]),
+    ])
+    if (selectedAsset.value?.id !== asset.id) return
+    summary.value = nextSummary
+    records.value = page.items
+    runs.value = nextRuns
+    feedback.value = nextFeedback as AdvancedFeedback[]
+  } catch (cause: any) {
+    if (!silent && selectedAsset.value?.id === asset.id) ElMessage.error(cause?.message || '资产详情加载失败')
+  } finally {
+    if (selectedAsset.value?.id === asset.id) detailLoading.value = false
+  }
 }
 function openCreate() { assetForm.value = { name: '', kind: 'timeseries', description: '', configText: '{}' }; createDialog.value = true }
 async function createAsset() {
   if (!selectedScenarioId.value || !assetForm.value.name.trim()) return ElMessage.warning('请填写资产名称')
   saving.value = true
-  try { let config: Record<string, any>; try { config = JSON.parse(assetForm.value.configText || '{}') } catch { return ElMessage.warning('运行配置必须是有效 JSON') }; await api.createAdvancedAsset(selectedScenarioId.value, { name: assetForm.value.name.trim(), kind: assetForm.value.kind as any, description: assetForm.value.description, status: 'ready', schema: {}, config }); createDialog.value = false; ElMessage.success('资产已创建'); await loadAssets() } catch (cause: any) { ElMessage.error(cause?.message || '创建失败') } finally { saving.value = false }
+  try { let config: Record<string, any>; try { config = JSON.parse(assetForm.value.configText || '{}') } catch { return ElMessage.warning('运行配置必须是有效 JSON') }; const created = await api.createAdvancedAsset(selectedScenarioId.value, { name: assetForm.value.name.trim(), kind: assetForm.value.kind as any, description: assetForm.value.description, status: 'ready', schema: {}, config }); createDialog.value = false; kindFilter.value = ''; ElMessage.success('资产已创建'); await loadAssets(created.id) } catch (cause: any) { ElMessage.error(cause?.message || '创建失败') } finally { saving.value = false }
 }
 async function createRecord() { if (!selectedAsset.value) return; saving.value = true; try { await api.createAdvancedRecord(selectedAsset.value.id, JSON.parse(recordText.value)); recordDialog.value = false; ElMessage.success('记录已写入'); await refreshDetail() } catch (cause: any) { ElMessage.error(cause?.message || '记录写入失败，请检查 JSON') } finally { saving.value = false } }
 async function runAsset() { if (!selectedAsset.value) return; saving.value = true; try { const run = await api.runAdvancedAsset(selectedAsset.value.id, runType.value, { params: JSON.parse(runText.value), idempotency_key: idempotencyKey.value || undefined }); runDialog.value = false; ElMessage[run.status === 'succeeded' ? 'success' : 'warning'](run.status === 'succeeded' ? '运行完成' : run.error || '运行失败'); await refreshDetail() } catch (cause: any) { ElMessage.error(cause?.message || '运行失败，请检查参数 JSON') } finally { saving.value = false } }
 async function uploadMedia(event: Event) { const file = (event.target as HTMLInputElement).files?.[0]; if (!file || !selectedAsset.value) return; saving.value = true; try { await api.uploadAdvancedMedia(selectedAsset.value.id, file); ElMessage.success('媒体已上传'); await refreshDetail() } catch (cause: any) { ElMessage.error(cause?.message || '媒体上传失败') } finally { saving.value = false; (event.target as HTMLInputElement).value = '' } }
 async function createFeedback() { if (!selectedAsset.value) return; saving.value = true; try { await api.createAdvancedFeedback(selectedAsset.value.id, feedbackForm.value); feedbackDialog.value = false; ElMessage.success('反馈已记录'); await refreshDetail() } catch (cause: any) { ElMessage.error(cause?.message || '反馈记录失败') } finally { saving.value = false } }
 async function removeAsset() { if (!selectedAsset.value) return; try { await ElMessageBox.confirm(`删除资产「${selectedAsset.value.name}」及其运行记录？`, '确认删除', { type: 'warning' }); await api.deleteAdvancedAsset(selectedAsset.value.id); ElMessage.success('资产已删除'); selectedAsset.value = null; await loadAssets() } catch (cause: any) { if (cause !== 'cancel' && cause !== 'close') ElMessage.error(cause?.message || '删除失败') } }
-onMounted(async () => { try { scenarios.value = await api.listScenarios(); selectedScenarioId.value = scenarios.value[0]?.id || ''; await loadAssets() } catch (cause: any) { error.value = cause?.message || '场景加载失败' } })
+onMounted(async () => {
+  try {
+    scenarios.value = await api.listScenarios()
+    const requestedScenarioId = queryValue(route.query.scenario_id)
+    selectedScenarioId.value = scenarios.value.some((scenario) => scenario.id === requestedScenarioId)
+      ? requestedScenarioId
+      : scenarios.value[0]?.id || ''
+    initialized = true
+    await syncScenarioQuery()
+    await loadAssets()
+  } catch (cause: any) {
+    error.value = cause?.message || '场景加载失败'
+  }
+})
+watch(() => route.query.scenario_id, (value) => {
+  if (!initialized) return
+  const requestedScenarioId = queryValue(value)
+  const nextScenarioId = scenarios.value.some((scenario) => scenario.id === requestedScenarioId)
+    ? requestedScenarioId
+    : scenarios.value[0]?.id || ''
+  if (nextScenarioId === selectedScenarioId.value) {
+    if (requestedScenarioId !== nextScenarioId) void syncScenarioQuery()
+    return
+  }
+  selectedScenarioId.value = nextScenarioId
+  assets.value = []
+  clearAssetSelection()
+  if (requestedScenarioId !== nextScenarioId) void syncScenarioQuery()
+  void loadAssets()
+})
 onBeforeUnmount(clearPoll)
 </script>
 

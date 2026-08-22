@@ -2,21 +2,34 @@
   <div class="page">
     <div class="page-header">
       <div>
-        <h2>Agent 管理</h2>
+        <h1>Agent 管理</h1>
         <div class="sub">绑定业务场景、LLM、技能、MCP 与数据源，构建智能体</div>
       </div>
-      <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 Agent</el-button>
+      <div class="agent-header-actions">
+        <el-select
+          v-model="scenarioScope"
+          clearable
+          filterable
+          aria-label="按业务场景筛选 Agent"
+          placeholder="全部业务场景"
+          @change="changeScenarioScope"
+        >
+          <el-option v-for="scenario in scenarios" :key="scenario.id" :label="scenario.name" :value="scenario.id" />
+        </el-select>
+        <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 Agent</el-button>
+      </div>
     </div>
 
     <el-row :gutter="16" v-loading="loading">
       <el-col :xs="24" :sm="12" :lg="8" v-for="a in agents" :key="a.id">
-        <div class="card agent-card" role="button" tabindex="0" :aria-label="`打开 Agent 对话：${a.name}`" @click="$router.push('/agents/' + a.id + '/chat')" @keydown.enter.prevent="$router.push('/agents/' + a.id + '/chat')" @keydown.space.prevent="$router.push('/agents/' + a.id + '/chat')">
+        <article class="card agent-card">
           <div class="ag-head">
             <div class="ag-avatar"><el-icon :size="20"><Cpu /></el-icon></div>
             <div class="ag-title">
               <div class="ag-name">{{ a.name }}</div>
               <div class="muted">{{ a.scenario_name || '未绑定场景' }}</div>
             </div>
+            <el-tag size="small" effect="plain" :type="agentReady(a) ? 'success' : 'warning'">{{ agentReady(a) ? '可测试' : '待配置' }}</el-tag>
           </div>
           <div class="ag-desc">{{ a.description || '暂无描述' }}</div>
           <div class="ag-tags">
@@ -26,12 +39,19 @@
             <el-tag v-for="n in a.data_source_names || []" :key="n" size="small" type="info" effect="light"><el-icon aria-hidden="true"><Coin /></el-icon>{{ n }}</el-tag>
             <span class="muted" v-if="!(a.llm_name || a.skill_names?.length || a.mcp_names?.length || a.data_source_names?.length)">未配置能力</span>
           </div>
-          <div class="ag-actions" @click.stop>
-            <el-button size="small" type="primary" @click="$router.push('/agents/' + a.id + '/chat')"><el-icon><ChatDotRound /></el-icon> 对话</el-button>
-            <el-button size="small" text type="primary" @click="openEdit(a)"><el-icon><Edit /></el-icon> 编辑</el-button>
+          <div class="agent-readiness" :class="{ ready: agentReady(a) }">
+            <span><el-icon><component :is="a.scenario_id ? 'CircleCheck' : 'Warning'" /></el-icon>场景</span>
+            <span><el-icon><component :is="a.llm_config_id ? 'CircleCheck' : 'Warning'" /></el-icon>模型</span>
+            <span><el-icon><component :is="a.data_source_ids?.length ? 'CircleCheck' : 'InfoFilled'" /></el-icon>数据</span>
+          </div>
+          <div class="ag-actions">
+            <el-button v-if="agentReady(a)" size="small" type="primary" @click="openAgentChat(a)"><el-icon><ChatDotRound /></el-icon> 测试对话</el-button>
+            <el-button size="small" :type="agentReady(a) ? 'primary' : 'warning'" :text="agentReady(a)" :plain="!agentReady(a)" @click="openEdit(a)">
+              <el-icon><Setting /></el-icon> {{ agentReady(a) ? '配置' : '补齐配置' }}
+            </el-button>
             <el-button size="small" text type="danger" @click="remove(a)"><el-icon><Delete /></el-icon> 删除</el-button>
           </div>
-        </div>
+        </article>
       </el-col>
     </el-row>
     <div v-if="!loading && !agents.length" class="empty-wrap">
@@ -91,7 +111,7 @@
 
         <el-form-item label="数据源">
           <el-select v-model="form.data_source_ids" multiple placeholder="绑定数据源（数据库 / 文件桶）" style="width:100%">
-            <el-option v-for="d in dataSources" :key="d.id" :label="d.name" :value="d.id">
+            <el-option v-for="d in availableDataSources" :key="d.id" :label="d.name" :value="d.id">
               <span>{{ d.name }}</span>
               <span class="muted" style="float:right">{{ d.type }}</span>
             </el-option>
@@ -107,7 +127,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onBeforeUnmount, onMounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import type { Agent, Scenario, LLMConfig, Skill, MCPConfig, DataSource } from '@/types'
@@ -118,38 +139,75 @@ const llms = ref<LLMConfig[]>([])
 const skills = ref<Skill[]>([])
 const mcps = ref<MCPConfig[]>([])
 const dataSources = ref<DataSource[]>([])
+const route = useRoute()
+const router = useRouter()
+const queryScenarioId = () => {
+  const value = route.query.scenario_id
+  return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
+}
+const scenarioScope = ref(queryScenarioId())
 
 const dlg = ref(false)
 const saving = ref(false)
 const loading = ref(false)
 const form = ref<Partial<Agent>>({ skill_ids: [], mcp_ids: [], data_source_ids: [] })
+let viewDisposed = false
+let loadRequest = 0
+const availableDataSources = computed(() => {
+  const scenarioId = form.value.scenario_id
+  return dataSources.value.filter((source) => !scenarioId || !source.scenario_id || source.scenario_id === scenarioId)
+})
+function agentReady(agent: Agent) {
+  return Boolean(agent.scenario_id && agent.llm_config_id)
+}
 
 async function load() {
+  const request = ++loadRequest
+  const scope = scenarioScope.value
   loading.value = true
   try {
     const [ag, sc, ll, sk, mc, ds] = await Promise.all([
       api.listAgents(), api.listScenarios(), api.listLLM(),
       api.listSkills(), api.listMCP(), api.listDataSources(),
     ])
-    agents.value = ag
+    if (viewDisposed || request !== loadRequest || scope !== scenarioScope.value) return
+    agents.value = scope ? ag.filter((agent) => agent.scenario_id === scope) : ag
     scenarios.value = sc
     llms.value = ll
     skills.value = sk
     mcps.value = mc
     dataSources.value = ds
   } catch (e: any) {
-    ElMessage.error('加载失败：' + e.message)
+    if (!viewDisposed && request === loadRequest) ElMessage.error('加载失败：' + e.message)
   } finally {
-    loading.value = false
+    if (!viewDisposed && request === loadRequest) loading.value = false
   }
 }
 function openCreate() {
-  form.value = { name: '', description: '', skill_ids: [], mcp_ids: [], data_source_ids: [] }
+  form.value = {
+    name: '',
+    description: '',
+    scenario_id: scenarioScope.value || undefined,
+    skill_ids: [],
+    mcp_ids: [],
+    data_source_ids: [],
+  }
   dlg.value = true
 }
 function openEdit(a: Agent) {
   form.value = { ...a, skill_ids: [...(a.skill_ids || [])], mcp_ids: [...(a.mcp_ids || [])], data_source_ids: [...(a.data_source_ids || [])] }
   dlg.value = true
+}
+function openAgentChat(agent: Agent) {
+  if (!agent.id) return
+  void router.push({
+    name: 'agent-chat',
+    params: { id: agent.id },
+    query: {
+      scenario_id: agent.scenario_id || scenarioScope.value || undefined,
+      return_to: route.fullPath,
+    },
+  })
 }
 async function save() {
   if (!form.value.name) return ElMessage.warning('请填写名称')
@@ -176,12 +234,29 @@ async function remove(a: Agent) {
     if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
   }
 }
-onMounted(load)
+async function changeScenarioScope(value: string) {
+  const query = { ...route.query }
+  if (value) query.scenario_id = value
+  else delete query.scenario_id
+  await router.replace({ name: 'agents', query })
+  return
+}
+watch(() => form.value.scenario_id, () => {
+  const allowedIds = new Set(availableDataSources.value.map((source) => source.id))
+  form.value.data_source_ids = (form.value.data_source_ids || []).filter((id) => allowedIds.has(id))
+})
+onMounted(() => {
+  viewDisposed = false
+  void load()
+})
+onBeforeUnmount(() => {
+  viewDisposed = true
+  loadRequest += 1
+})
 </script>
 
 <style scoped>
 .agent-card {
-  cursor: pointer;
   transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease), border-color var(--dur) var(--ease);
   margin-bottom: 16px;
   position: relative;
@@ -232,5 +307,16 @@ onMounted(load)
 .ag-actions {
   display: flex; gap: 4px;
   border-top: 1px solid var(--border); padding-top: 8px;
+}
+.agent-readiness { display: flex; flex-wrap: wrap; gap: 7px; margin: 2px 0 10px; }
+.agent-readiness span { display: inline-flex; align-items: center; gap: 4px; color: var(--text-3); font-size: 10.5px; }
+.agent-readiness .el-icon { color: var(--warning); }
+.agent-readiness.ready span:first-child .el-icon,
+.agent-readiness.ready span:nth-child(2) .el-icon { color: var(--success); }
+.agent-header-actions { display: flex; align-items: center; gap: 8px; }
+.agent-header-actions :deep(.el-select) { width: min(240px, 38vw); }
+@media (max-width: 640px) {
+  .agent-header-actions { width: 100%; align-items: stretch; }
+  .agent-header-actions :deep(.el-select) { min-width: 0; flex: 1; width: auto; }
 }
 </style>

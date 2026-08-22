@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -27,6 +29,8 @@ from app.models import (
     DataSource,
 )
 from app.services import permission_service
+from app.routers import scenarios as scenario_routes
+from app.schemas import ActionExecuteRequest
 from app.services.lineage_service import build_scenario_lineage
 
 
@@ -274,6 +278,95 @@ class LineageRuntimeTests(unittest.TestCase):
         self.db.commit()
         graph = build_scenario_lineage(self.db, self.scenario.id, limit=1)
         self.assertTrue(graph["truncated"])
+
+    def test_ai_preview_confirmed_action_and_external_result_share_one_lineage(self) -> None:
+        self.db.info["action_lineage_context"] = {
+            "correlation_id": "corr-preview-old",
+            "agent_message_id": self.message.id,
+        }
+        preview = scenario_routes.execute_action(
+            self.action.id,
+            ActionExecuteRequest(params={}, dry_run=True),
+            self.db,
+        )
+        self.assertEqual(preview["status"], "dry_run")
+        self.assertTrue(preview["definition_hash"])
+
+        # A mutable dev definition changed after preview: confirmation must
+        # fail closed instead of executing the newer meaning.
+        self.action.description = "预演后发生定义变化"
+        self.db.commit()
+        with self.assertRaises(HTTPException) as stale:
+            scenario_routes.execute_action(
+                self.action.id,
+                ActionExecuteRequest(
+                    params={},
+                    confirm=True,
+                    idempotency_key="stale-preview",
+                    preview_log_id=preview["log_id"],
+                    correlation_id=preview["correlation_id"],
+                    expected_environment=preview["environment"],
+                    expected_definition_snapshot_id=preview["definition_snapshot_id"],
+                    expected_release_id=preview["release_id"],
+                    expected_definition_hash=preview["definition_hash"],
+                ),
+                self.db,
+            )
+        self.assertEqual(stale.exception.status_code, 409)
+
+        self.db.info["action_lineage_context"] = {
+            "correlation_id": "corr-preview-current",
+            "agent_message_id": self.message.id,
+        }
+        current = scenario_routes.execute_action(
+            self.action.id,
+            ActionExecuteRequest(params={}, dry_run=True),
+            self.db,
+        )
+        with patch(
+            "app.services.workflow_service._dispatch_executor",
+            return_value=({"external_reference": "approved-1"}, []),
+        ):
+            executed = scenario_routes.execute_action(
+                self.action.id,
+                ActionExecuteRequest(
+                    params={},
+                    confirm=True,
+                    idempotency_key="confirmed-preview",
+                    preview_log_id=current["log_id"],
+                    correlation_id=current["correlation_id"],
+                    expected_environment=current["environment"],
+                    expected_definition_snapshot_id=current["definition_snapshot_id"],
+                    expected_release_id=current["release_id"],
+                    expected_definition_hash=current["definition_hash"],
+                ),
+                self.db,
+            )
+        self.assertEqual(executed["status"], "success")
+        self.assertEqual(executed["parent_action_log_id"], current["log_id"])
+        self.assertEqual(executed["correlation_id"], current["correlation_id"])
+
+        graph = build_scenario_lineage(self.db, self.scenario.id)
+        node_ids = {node["id"] for node in graph["nodes"]}
+        self.assertIn(f"action_preview:{current['log_id']}", node_ids)
+        self.assertIn(f"action_execution:{executed['log_id']}", node_ids)
+        self.assertIn(f"external_result:{executed['log_id']}", node_ids)
+        self.assertNotIn(f"external_result:{current['log_id']}", node_ids)
+        self.assertTrue(
+            any(
+                edge["source"] == f"action_preview:{current['log_id']}"
+                and edge["target"] == f"action_execution:{executed['log_id']}"
+                and edge["kind"] == "confirmed_as"
+                for edge in graph["edges"]
+            )
+        )
+        self.assertTrue(
+            any(
+                edge["source"] == f"ai_answer:{self.message.id}"
+                and edge["target"] == f"action_preview:{current['log_id']}"
+                for edge in graph["edges"]
+            )
+        )
 
 
 if __name__ == "__main__":

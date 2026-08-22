@@ -17,6 +17,7 @@ import json
 import re
 import socket
 import time
+import uuid
 from typing import Any
 from urllib.parse import urlparse
 
@@ -348,6 +349,77 @@ def _permission_summary(
     }
 
 
+def _decision_chain_context(
+    db: Session,
+    permission: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Capture only provenance supplied by authenticated server-side context."""
+    actor_user_id = str(db.info.get("user_id") or "").strip() or None
+    agent_context = db.info.get("action_audit_context")
+    if not isinstance(agent_context, dict):
+        agent_context = {}
+    agent_id = str(agent_context.get("agent_id") or "").strip() or None
+    llm_config_id = str(agent_context.get("llm_config_id") or "").strip() or None
+    model_name = str(agent_context.get("model_name") or "").strip()[:240]
+    trace_context = db.info.get("llm_trace_context")
+    if not isinstance(trace_context, dict):
+        trace_context = {}
+    lineage_context = db.info.get("action_lineage_context")
+    if not isinstance(lineage_context, dict):
+        lineage_context = {}
+    correlation_id = str(
+        lineage_context.get("correlation_id")
+        or trace_context.get("correlation_id")
+        or uuid.uuid4().hex
+    )[:64]
+    agent_message_id = str(
+        lineage_context.get("agent_message_id")
+        or (trace_context.get("assistant_message_id") if agent_id else "")
+        or ""
+    ).strip() or None
+    assistant_message_id = str(
+        lineage_context.get("assistant_message_id") or ""
+    ).strip() or None
+    parent_action_log_id = str(
+        lineage_context.get("parent_action_log_id") or ""
+    ).strip() or None
+    return {
+        "actor_type": "agent" if agent_id else "user" if actor_user_id else "unknown",
+        "actor_user_id": actor_user_id,
+        "agent_id": agent_id,
+        "llm_config_id": llm_config_id,
+        "model_name": model_name,
+        "permission_decision": dict(permission or {}),
+        "data_context": {},
+        "correlation_id": correlation_id,
+        "parent_action_log_id": parent_action_log_id,
+        "agent_message_id": agent_message_id,
+        "assistant_message_id": assistant_message_id,
+    }
+
+
+def _safe_data_context(connector_audit: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Build a credential-free data-plane summary from governed connector evidence."""
+    evidence = [dict(item) for item in (connector_audit or []) if isinstance(item, dict)]
+    return {
+        "connector_audit": evidence,
+        "connector_ids": sorted(
+            {
+                str(item.get("connector_id") or item.get("target_id") or "")
+                for item in evidence
+                if item.get("connector_id") or item.get("target_id")
+            }
+        ),
+        "binding_keys": sorted(
+            {
+                str(item.get("binding_key") or "")
+                for item in evidence
+                if item.get("binding_key")
+            }
+        ),
+    }
+
+
 def _action_runtime_connector(
     db: Session,
     action: Any,
@@ -449,6 +521,17 @@ def _response_from_log(log: ActionExecutionLog, status: str | None = None) -> di
         "release_id": log.release_id,
         "definition_hash": log.definition_hash or "",
         "definition_source": log.definition_source or "live",
+        "actor_type": log.actor_type or "unknown",
+        "actor_user_id": log.actor_user_id,
+        "agent_id": log.agent_id,
+        "llm_config_id": log.llm_config_id,
+        "model_name": log.model_name or "",
+        "permission_decision": log.permission_decision or {},
+        "data_context": log.data_context or {},
+        "correlation_id": log.correlation_id or "",
+        "parent_action_log_id": log.parent_action_log_id,
+        "agent_message_id": log.agent_message_id,
+        "assistant_message_id": log.assistant_message_id,
     }
 
 
@@ -513,6 +596,7 @@ def preview_action(
         mode="dry_run",
         result={"plan": plan, "permission": permission},
         connector_audit=plan.get("connector_audit", []),
+        **_decision_chain_context(db, permission),
         **provenance,
         duration_ms=int((time.time() - start) * 1000),
     )
@@ -574,6 +658,7 @@ def execute_action(
             # 确认提醒不占用幂等键；真正的 execute 记录才会保留并竞争该键。
             idempotency_key=None,
             result={"permission": permission},
+            **_decision_chain_context(db, permission),
             **provenance,
         )
         db.add(log)
@@ -606,6 +691,7 @@ def execute_action(
         status="running",
         mode="execute",
         idempotency_key=scoped_idempotency_key,
+        **_decision_chain_context(db, permission),
         **provenance,
     )
     db.add(log)
@@ -634,6 +720,7 @@ def execute_action(
         log.status = "success"
         log.result = result if isinstance(result, dict) else {"output": str(result)[:2000]}
         log.connector_audit = connector_audit
+        log.data_context = _safe_data_context(connector_audit)
     except Exception as exc:  # noqa: BLE001
         log.status = "failed"
         log.error = str(exc)
@@ -931,6 +1018,12 @@ def execute_workflow(
         raise PolicyViolation("没有执行该工作流的权限")
     start = time.time()
     provenance = _runtime_provenance(runtime_definition, runtime_environment)
+    workflow_permission_summary = {
+        "allowed": workflow_permission.allowed,
+        "scope": "workflow",
+        "reason": workflow_permission.reason,
+        "role": workflow_permission.role_key,
+    }
     log = ActionExecutionLog(
         scenario_id=workflow.scenario_id,
         target_type="workflow",
@@ -938,6 +1031,7 @@ def execute_workflow(
         target_name=workflow.name,
         input_params=params,
         status="running",
+        **_decision_chain_context(db, workflow_permission_summary),
         **provenance,
     )
     db.add(log)
@@ -982,6 +1076,7 @@ def execute_workflow(
             for audit in (step.get("connector_audit") or [])
             if isinstance(audit, dict)
         ]
+        log.data_context = _safe_data_context(log.connector_audit)
         failed = next((step for step in step_results if step.get("status") == "failed"), None)
         waiting = next((step for step in step_results if step.get("status") == "awaiting_approval"), None)
         if failed:

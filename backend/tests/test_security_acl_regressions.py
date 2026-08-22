@@ -621,8 +621,9 @@ class SecurityAclRegressionTests(unittest.TestCase):
                 "attachment_ids": [self.owner_attachment.id],
             },
         )
-        self.assertEqual(foreign.status_code, 200, foreign.text)
-        self.assertEqual(foreign.json()["sources"], [])
+        self.assertEqual(foreign.status_code, 409, foreign.text)
+        self.assertNotIn(self.owner_attachment.id, foreign.text)
+        self.assertNotIn(self.owner_attachment.parsed_text, foreign.text)
         deleted = self.client.delete(f"/api/assistant/attachments/{self.owner_attachment.id}")
         self.assertEqual(deleted.status_code, 404, deleted.text)
 

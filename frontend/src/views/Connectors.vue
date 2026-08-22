@@ -3,7 +3,7 @@
     <header class="page-header connector-header">
       <div>
         <span class="eyebrow">CONNECTOR GOVERNANCE</span>
-        <h2 id="connector-page-title">连接器与环境</h2>
+        <h1 id="connector-page-title">连接器与环境</h1>
         <p class="sub">把已配置的数据源、MCP 服务和 LLM 部署安全地绑定到场景环境；凭据始终留在原配置中。</p>
       </div>
       <div class="header-actions">
@@ -54,7 +54,7 @@
           <h3 id="environment-title">选择目标环境</h3>
           <p>同一个外部引用可在开发、预发布和生产环境绑定到不同的实际连接器；这里管理目标绑定，不会切换当前实例的运行环境。</p>
         </div>
-        <el-radio-group v-model="environment" class="environment-switch" aria-label="目标环境" @change="loadBindings">
+        <el-radio-group v-model="environment" class="environment-switch" aria-label="目标环境" @change="changeEnvironment">
           <el-radio-button v-for="item in environments" :key="item.id" :value="item.id">{{ item.label }}</el-radio-button>
         </el-radio-group>
       </section>
@@ -211,7 +211,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
@@ -237,6 +237,10 @@ const error = ref('')
 const feedback = ref('')
 const catalogKind = ref<'all' | ConnectorKind>('all')
 const pendingRequirement = ref<{ key: string; kind: ConnectorKind; label: string } | null>(null)
+let routeSyncReady = false
+let viewDisposed = false
+let bootstrapRequest = 0
+let connectionRequest = 0
 const bindingForm = ref<{ binding_key: string; kind: ConnectorKind; connector_id: string; reference_label: string; check: boolean }>({
   binding_key: '', kind: 'data_source', connector_id: '', reference_label: '', check: true,
 })
@@ -277,6 +281,7 @@ function formatDate(value?: string | null) {
 function toErrorMessage(cause: unknown, fallback: string) { return cause instanceof Error ? cause.message : fallback }
 
 function hydrateRequirement() {
+  pendingRequirement.value = null
   const requestedEnvironment = queryValue('environment')
   const requestedKey = queryValue('binding_key')
   const requestedKind = queryValue('kind')
@@ -294,7 +299,34 @@ function hydrateRequirement() {
   }
 }
 
+function requirementKey() {
+  const requirement = pendingRequirement.value
+  return requirement ? `${requirement.key}|${requirement.kind}|${requirement.label}` : ''
+}
+
+async function syncRouteContext() {
+  if (!routeSyncReady) return
+  const requestedScenario = queryValue('scenario_id')
+  const nextScenario = scenarios.value.some((item) => item.id === requestedScenario)
+    ? requestedScenario
+    : scenarios.value[0]?.id || ''
+  const requestedEnvironment = queryValue('environment')
+  const nextEnvironment: Environment = isEnvironment(requestedEnvironment) ? requestedEnvironment : 'dev'
+  const scenarioChanged = nextScenario !== scenarioId.value
+  const environmentChanged = nextEnvironment !== environment.value
+  const previousRequirement = requirementKey()
+  scenarioId.value = nextScenario
+  environment.value = nextEnvironment
+  hydrateRequirement()
+  const requirementChanged = previousRequirement !== requirementKey()
+  if ((scenarioChanged || requirementChanged) && !pendingRequirement.value) resetBindingForm()
+  feedback.value = ''
+  if (scenarioChanged) return
+  else if (environmentChanged) await loadBindings()
+}
+
 async function bootstrap() {
+  const request = ++bootstrapRequest
   loading.value = true
   error.value = ''
   try {
@@ -302,56 +334,85 @@ async function bootstrap() {
       api.listReleaseScenarios(),
       api.getRuntimeEnvironment(),
     ])
+    if (viewDisposed || request !== bootstrapRequest) return
     scenarios.value = availableScenarios
     if (isEnvironment(runtime.environment)) runtimeEnvironment.value = runtime.environment
     const requestedScenario = queryValue('scenario_id')
     scenarioId.value = scenarios.value.some((item) => item.id === requestedScenario)
       ? requestedScenario
       : scenarios.value[0]?.id || ''
+    if (scenarioId.value && requestedScenario !== scenarioId.value) {
+      await router.replace({ query: { ...route.query, scenario_id: scenarioId.value } })
+      return
+    }
     hydrateRequirement()
     if (scenarioId.value) await loadConnections()
   } catch (cause) {
-    error.value = toErrorMessage(cause, '加载连接器场景失败')
+    if (!viewDisposed && request === bootstrapRequest) error.value = toErrorMessage(cause, '加载连接器场景失败')
   } finally {
-    loading.value = false
+    if (!viewDisposed && request === bootstrapRequest) loading.value = false
   }
 }
 async function loadConnections() {
-  if (!scenarioId.value) return
+  const targetScenario = scenarioId.value
+  const targetEnvironment = environment.value
+  if (!targetScenario) return
+  const request = ++connectionRequest
   loadingCatalog.value = true
   loadingBindings.value = true
   error.value = ''
   try {
     const [targets, bound] = await Promise.all([
-      api.listConnectors(scenarioId.value),
-      api.listConnectorBindings(scenarioId.value, environment.value),
+      api.listConnectors(targetScenario),
+      api.listConnectorBindings(targetScenario, targetEnvironment),
     ])
+    if (
+      viewDisposed
+      || request !== connectionRequest
+      || targetScenario !== scenarioId.value
+      || targetEnvironment !== environment.value
+    ) return
     catalog.value = targets
     bindings.value = bound
   } catch (cause) {
-    error.value = toErrorMessage(cause, '加载连接器目录或环境绑定失败')
+    if (!viewDisposed && request === connectionRequest) error.value = toErrorMessage(cause, '加载连接器目录或环境绑定失败')
   } finally {
-    loadingCatalog.value = false
-    loadingBindings.value = false
+    if (!viewDisposed && request === connectionRequest) {
+      loadingCatalog.value = false
+      loadingBindings.value = false
+    }
   }
 }
 async function loadBindings() {
-  if (!scenarioId.value) return
+  const targetScenario = scenarioId.value
+  const targetEnvironment = environment.value
+  if (!targetScenario) return
+  const request = ++connectionRequest
   loadingBindings.value = true
   error.value = ''
   try {
-    bindings.value = await api.listConnectorBindings(scenarioId.value, environment.value)
+    const bound = await api.listConnectorBindings(targetScenario, targetEnvironment)
+    if (
+      viewDisposed
+      || request !== connectionRequest
+      || targetScenario !== scenarioId.value
+      || targetEnvironment !== environment.value
+    ) return
+    bindings.value = bound
   } catch (cause) {
-    error.value = toErrorMessage(cause, '加载环境绑定失败')
+    if (!viewDisposed && request === connectionRequest) error.value = toErrorMessage(cause, '加载环境绑定失败')
   } finally {
-    loadingBindings.value = false
+    if (!viewDisposed && request === connectionRequest) loadingBindings.value = false
   }
 }
 async function changeScenario() {
   const query = { ...route.query, scenario_id: scenarioId.value }
   await router.replace({ query })
-  resetBindingForm()
-  await loadConnections()
+  return
+}
+async function changeEnvironment() {
+  await router.replace({ query: { ...route.query, environment: environment.value } })
+  await loadBindings()
 }
 function resetBindingForm() {
   bindingForm.value = {
@@ -414,19 +475,41 @@ async function deleteBinding(binding: ConnectorBinding) {
     deletingBindingId.value = ''
   }
 }
-function openSource(connector: Pick<ConnectorCatalogItem, 'kind'>) {
-  const path = connector.kind === 'data_source' ? '/data-sources' : connector.kind === 'mcp' ? '/mcp' : '/llm'
-  void router.push(path)
+function openSource(connector: { id?: string; connector_id?: string; kind: ConnectorKind }) {
+  const name = connector.kind === 'data_source' ? 'data-sources' : connector.kind === 'mcp' ? 'mcp' : 'llm'
+  const selectedKey = connector.kind === 'data_source' ? 'source_id' : 'connector_id'
+  const connectorId = connector.id || connector.connector_id || ''
+  void router.push({
+    name,
+    query: {
+      scenario_id: scenarioId.value,
+      [selectedKey]: connectorId,
+      environment: environment.value,
+      return_to: route.fullPath,
+    },
+  })
 }
 
-onMounted(bootstrap)
+watch(() => route.fullPath, () => { void syncRouteContext() })
+onMounted(async () => {
+  viewDisposed = false
+  await bootstrap()
+  if (viewDisposed) return
+  routeSyncReady = true
+})
+onBeforeUnmount(() => {
+  viewDisposed = true
+  routeSyncReady = false
+  bootstrapRequest += 1
+  connectionRequest += 1
+})
 </script>
 
 <style scoped>
 .connector-page { max-width: 1440px; margin: 0 auto; padding-bottom: 34px; }
 .connector-header, .header-actions, .section-head, .catalog-head, .catalog-title, .catalog-state, .form-actions { display: flex; align-items: center; }
 .connector-header { justify-content: space-between; gap: 20px; }
-.connector-header h2 { margin: 4px 0 7px; }
+.connector-header h1 { margin: 4px 0 7px; font-size: 24px; }
 .connector-header .sub { max-width: 720px; }
 .header-actions { gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .runtime-context { padding: 6px 9px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); color: var(--text-2); font-size: 12px; white-space: nowrap; }

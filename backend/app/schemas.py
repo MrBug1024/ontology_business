@@ -390,16 +390,19 @@ class PropertyIn(BaseModel):
     is_required: bool = False
     is_enum: bool = False
     enum_values: list[str] = []
-    default_value: str = ""
+    default_value: Any = ""
+    constraints: dict = Field(default_factory=dict)
     is_sensitive: bool = False
 
 
 class EntityIn(BaseModel):
     name: str
+    namespace: str = Field(default="", max_length=180)
     description: str = ""
     icon: str = "box"
     color: str = "#4f46e5"
     is_abstract: bool = False
+    state_property: str = Field(default="", max_length=200)
     properties: list[PropertyIn] = []
 
 
@@ -413,6 +416,7 @@ class EntityOut(EntityIn):
 
 class RelationIn(BaseModel):
     name: str
+    namespace: str = Field(default="", max_length=180)
     source_entity_id: str
     target_entity_id: str
     relation_type: str = "1:N"
@@ -432,6 +436,7 @@ class ScenarioIn(BaseModel):
     name: str
     description: str = ""
     industry: str = ""
+    namespace: str = Field(default="default", min_length=1, max_length=180)
     status: str = "draft"
 
 
@@ -456,6 +461,10 @@ class InstanceIn(BaseModel):
     attributes: dict = Field(default_factory=dict)
     source: str = "manual"
     source_ref: str = ""
+    state: str = Field(default="", max_length=120)
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    quality: dict = Field(default_factory=dict)
     access_scope: Literal["tenant", "restricted"] = "tenant"
 
 
@@ -519,6 +528,10 @@ class ObjectSearchItemOut(BaseModel):
     attributes: dict = Field(default_factory=dict)
     source: str = "manual"
     source_ref: str = ""
+    state: str = ""
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    quality: dict = Field(default_factory=dict)
     access_scope: Literal["tenant", "restricted"] = "tenant"
     provenance: ObjectProvenanceOut
     relation_count: int = 0
@@ -545,6 +558,7 @@ class DataMappingIn(BaseModel):
     data_source_binding_ref: dict = Field(default_factory=dict)
     table_name: str = ""
     column_map: dict = Field(default_factory=dict)
+    transform_rules: dict = Field(default_factory=dict)
 
 
 class DataMappingOut(DataMappingIn):
@@ -570,6 +584,7 @@ class DataMappingFieldPreviewOut(BaseModel):
     source_column: str = ""
     source_exists: bool = False
     status: Literal["mapped", "missing", "invalid"] = "missing"
+    transform_rules: list[dict] = Field(default_factory=list)
 
 
 class DataMappingPreviewOut(BaseModel):
@@ -581,6 +596,7 @@ class DataMappingPreviewOut(BaseModel):
     message: str = ""
     columns: list[str] = []
     sample_rows: list[list[Any]] = []
+    transformed_rows: list[dict[str, Any]] = Field(default_factory=list)
     row_count: int = 0
     truncated: bool = False
     fields: list[DataMappingFieldPreviewOut] = []
@@ -1175,6 +1191,8 @@ class AssistantMessageOut(BaseModel):
     attachments: list = Field(default_factory=list)
     proposal: dict = Field(default_factory=dict)
     thinking: list = Field(default_factory=list)
+    evidence: dict = Field(default_factory=dict)
+    action_preview: dict = Field(default_factory=dict)
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -1202,12 +1220,19 @@ class AssistantChatRequest(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list)
     # The assistant may answer or prepare a reviewed change set. Effects are
     # deliberately executed only through the explicit Action/task flows.
-    mode: Literal["ask", "draft"] = "ask"
+    # ``ask`` is kept for existing clients.  The four explicit modes make the
+    # safety boundary visible to newer clients: explanation is read-only,
+    # draft may only prepare a Change Set, and apply/execute in chat merely
+    # guide the user to the separately governed confirmation/execution flows.
+    mode: Literal["ask", "explain", "draft", "apply", "execute"] = "ask"
 
 
 class AssistantProposalApplyRequest(BaseModel):
-    kind: Literal["ontology", "workflow"]
-    scenario_id: str
+    kind: Literal["scenario", "ontology", "mapping", "workflow"]
+    # ``scenario`` proposals originate from a global assistant thread and do
+    # not have a scenario id until they are explicitly applied.  Every other
+    # proposal kind remains scenario-bound and is checked at the write edge.
+    scenario_id: str | None = None
     thread_id: str = Field(min_length=1)
     proposal_id: str = Field(min_length=1, max_length=64)
     confirm: bool = False
@@ -1215,13 +1240,36 @@ class AssistantProposalApplyRequest(BaseModel):
     payload: dict = Field(default_factory=dict)
 
 
+class AssistantQuestionOptionOut(BaseModel):
+    label: str
+    value: str
+    impact: str
+    recommended: bool = False
+
+
+class AssistantQuestionOut(BaseModel):
+    id: str
+    title: str
+    message: str
+    options: list[AssistantQuestionOptionOut] = Field(default_factory=list)
+
+
+class AssistantEvidenceOut(BaseModel):
+    rules_used: list[dict] = Field(default_factory=list)
+    tools_called: list[dict] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    uncertainties: list[str] = Field(default_factory=list)
+
+
 class AssistantReplyOut(BaseModel):
     thread_id: str
     reply: str
     proposal: dict = Field(default_factory=dict)
-    questions: list[dict] = Field(default_factory=list)
+    questions: list[AssistantQuestionOut] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
     sources: list[dict] = Field(default_factory=list)
+    evidence: AssistantEvidenceOut = Field(default_factory=AssistantEvidenceOut)
+    action_preview: dict = Field(default_factory=dict)
 
 
 # ──────────────────────────────────────────────
@@ -1330,6 +1378,20 @@ class ActionExecutionLogOut(BaseModel):
     definition_source: str = "live"
     result: dict = {}
     connector_audit: list[dict] = Field(default_factory=list)
+    # Decision-chain provenance.  Values are copied only from authenticated
+    # request/worker context; legacy or context-less rows remain explicitly
+    # unknown instead of inventing a user, Agent or model identity.
+    actor_type: Literal["user", "agent", "unknown"] = "unknown"
+    actor_user_id: str | None = None
+    agent_id: str | None = None
+    llm_config_id: str | None = None
+    model_name: str = ""
+    permission_decision: dict = Field(default_factory=dict)
+    data_context: dict = Field(default_factory=dict)
+    correlation_id: str = ""
+    parent_action_log_id: str | None = None
+    agent_message_id: str | None = None
+    assistant_message_id: str | None = None
     error: str = ""
     duration_ms: int = 0
     created_at: datetime
@@ -1342,6 +1404,14 @@ class ActionExecuteRequest(BaseModel):
     dry_run: bool = False
     confirm: bool = False
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=120)
+    # Optional preview pin.  When supplied on confirm, all fields are matched
+    # against the persisted dry-run and the current runtime definition.
+    preview_log_id: str | None = Field(default=None, min_length=1, max_length=32)
+    correlation_id: str | None = Field(default=None, min_length=1, max_length=64)
+    expected_environment: Literal["dev", "staging", "prod"] | None = None
+    expected_definition_snapshot_id: str | None = Field(default=None, max_length=32)
+    expected_release_id: str | None = Field(default=None, max_length=32)
+    expected_definition_hash: str | None = Field(default=None, max_length=64)
 
 
 class WorkflowExecuteRequest(BaseModel):

@@ -12,6 +12,8 @@ or retry underneath an operator.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Iterable
@@ -117,18 +119,49 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
             select(OntologyWorkflow).where(OntologyWorkflow.scenario_id == scenario.id)
         ).scalars().all()
     }
+    definition_groups = {
+        "functions": functions,
+        "mappings": mappings,
+        "actions": actions,
+        "rules": rules,
+        "events": events,
+        "workflows": workflows,
+    }
+
+    # Dev remains mutable, but a dry-run still needs a reproducible optimistic
+    # pin.  Hash only definition columns (not refresh/error/runtime state) so a
+    # confirmed action is rejected when its meaning changed after preview.
+    definition_fields = {
+        "functions": ("id", "name", "description", "input_schema", "output_schema", "tags", "visibility", "runtime_kind", "runtime_config"),
+        "mappings": ("id", "entity_id", "data_source_id", "data_source_binding_key", "data_source_binding_ref", "table_name", "column_map", "transform_rules"),
+        "actions": ("id", "entity_id", "name", "description", "input_schema", "executor_type", "executor_config", "precondition", "postcondition", "enabled", "requires_confirmation", "idempotency_required", "permission_scope", "access_scope"),
+        "rules": ("id", "entity_id", "name", "description", "condition", "action_on_match", "trigger_action_ids", "severity", "enabled"),
+        "events": ("id", "name", "description", "payload_schema", "trigger_source", "enabled"),
+        "workflows": ("id", "name", "description", "trigger_type", "trigger_config", "steps", "nodes", "edges", "status", "enabled", "access_scope"),
+    }
+    digest_payload = {
+        group: [
+            {field: getattr(item, field, None) for field in definition_fields[group]}
+            for _resource_id, item in sorted(resources.items())
+        ]
+        for group, resources in definition_groups.items()
+    }
+    canonical = json.dumps(
+        digest_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    live_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     return RuntimeDefinition(
         scenario=scenario,
         environment=environment,
         source="live",
         snapshot_id=None,
         release_id=None,
-        # Live/dev execution intentionally preserves compatibility with legacy
-        # definitions that may be invalid halfway through authoring.  A hash
-        # capture normalizes and validates the whole graph, which would turn a
-        # normal runtime failure of one broken workflow into a global dev
-        # scheduling outage.  Frozen releases always have a verified hash.
-        definition_hash="",
+        definition_hash=live_hash,
         actions=actions,
         functions=functions,
         mappings=mappings,

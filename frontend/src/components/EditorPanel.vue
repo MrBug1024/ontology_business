@@ -16,6 +16,11 @@
           <label>名称</label>
           <el-input v-model="editor.form.name" placeholder="如：业务对象、资源、事项" />
         </div>
+        <div class="ep-field">
+          <label>命名空间</label>
+          <el-input v-model.trim="editor.form.namespace" placeholder="如：supply.procurement" />
+          <small class="field-help">以字母开头，可使用字母、数字、点、横线和下划线；留空继承场景命名空间。</small>
+        </div>
         <div class="ep-row2">
           <div class="ep-field">
             <label>颜色</label>
@@ -29,6 +34,13 @@
         <div class="ep-field">
           <label>描述</label>
           <el-input v-model="editor.form.description" type="textarea" :rows="2" placeholder="实体说明" />
+        </div>
+        <div class="ep-field">
+          <label>生命周期状态属性</label>
+          <el-select v-model="editor.form.state_property" clearable style="width:100%" placeholder="可选：选择一个枚举属性">
+            <el-option v-for="p in statePropertyOptions" :key="p.name" :label="p.name" :value="p.name" />
+          </el-select>
+          <small class="field-help">只有已启用枚举且至少包含一个枚举值的属性可作为稳定状态。</small>
         </div>
 
         <div class="ep-sec">
@@ -44,7 +56,34 @@
             <div class="prop-flags">
               <el-checkbox v-model="p.is_key" label="主键" />
               <el-checkbox v-model="p.is_required" label="必填" />
-          <el-button size="small" text type="danger" @click="editor.form.properties.splice(i, 1)" :aria-label="`删除属性：${p.name || i + 1}`" title="删除属性"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
+              <el-checkbox v-model="p.is_enum" label="枚举" />
+              <el-button size="small" text type="danger" @click="removeProp(i)" :aria-label="`删除属性：${p.name || i + 1}`" title="删除属性"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
+            </div>
+            <div v-if="p.is_enum" class="prop-detail">
+              <label>枚举值</label>
+              <el-select
+                v-model="p.enum_values"
+                multiple
+                filterable
+                allow-create
+                default-first-option
+                style="width:100%"
+                size="small"
+                placeholder="输入值后按回车，可添加多个"
+              >
+                <el-option v-for="value in p.enum_values" :key="value" :label="value" :value="value" />
+              </el-select>
+            </div>
+            <div class="prop-detail">
+              <label>约束 JSON</label>
+              <el-input
+                v-model="constraintDrafts[i]"
+                type="textarea"
+                :rows="2"
+                resize="vertical"
+                class="mono-input"
+                placeholder='如：{"minimum":0,"maximum":100} 或 {"pattern":"PR-[0-9]+"}'
+              />
             </div>
           </div>
           <div class="muted" v-if="!editor.form.properties.length" style="padding:6px 2px">暂无属性，点击「添加」</div>
@@ -56,6 +95,11 @@
         <div class="ep-field">
           <label>关系名</label>
           <el-input v-model="editor.form.name" placeholder="如：下单、属于" />
+        </div>
+        <div class="ep-field">
+          <label>命名空间</label>
+          <el-input v-model.trim="editor.form.namespace" placeholder="如：supply.procurement" />
+          <small class="field-help">以字母开头，可使用字母、数字、点、横线和下划线；留空继承场景命名空间。</small>
         </div>
         <div class="ep-field">
           <label>源实体</label>
@@ -83,6 +127,22 @@
 
       <!-- ══ 实例编辑 ══ -->
       <template v-else-if="editor.kind === 'instance'">
+        <el-alert
+          v-if="runtimeLoading"
+          class="runtime-alert"
+          type="info"
+          title="正在读取对象的状态、有效期与质量信息…"
+          :closable="false"
+          show-icon
+        />
+        <el-alert
+          v-else-if="runtimeHydrationError"
+          class="runtime-alert"
+          type="error"
+          :title="runtimeHydrationError"
+          :closable="false"
+          show-icon
+        />
         <div class="ep-field">
           <label>所属实体</label>
           <el-select v-model="editor.form.entity_id" style="width:100%" :disabled="!!editor.id" @change="onEntityChange">
@@ -93,11 +153,80 @@
           <label>名称</label>
           <el-input v-model="editor.form.name" placeholder="实例名称，如：对象A、记录#1001" />
         </div>
+        <div class="ep-field">
+          <label>对象状态</label>
+          <el-select
+            v-if="instanceStateOptions.length"
+            :model-value="editor.form.state"
+            clearable
+            style="width:100%"
+            placeholder="选择生命周期状态"
+            @change="setInstanceState"
+          >
+            <el-option v-for="value in instanceStateOptions" :key="value" :label="value" :value="value" />
+          </el-select>
+          <el-input v-else :model-value="editor.form.state" clearable placeholder="可选：当前业务状态" @update:model-value="setInstanceState" />
+        </div>
+        <div class="ep-row2 validity-row">
+          <div class="ep-field">
+            <label>有效期开始</label>
+            <el-date-picker v-model="editor.form.valid_from" type="datetime" value-format="YYYY-MM-DDTHH:mm:ssZ" clearable style="width:100%" placeholder="可选" />
+          </div>
+          <div class="ep-field">
+            <label>有效期结束</label>
+            <el-date-picker v-model="editor.form.valid_to" type="datetime" value-format="YYYY-MM-DDTHH:mm:ssZ" clearable style="width:100%" placeholder="可选" />
+          </div>
+        </div>
+        <div class="ep-field">
+          <label>质量信息 JSON</label>
+          <el-input
+            v-model="qualityDraft"
+            type="textarea"
+            :rows="3"
+            resize="vertical"
+            class="mono-input"
+            placeholder='如：{"score":0.98,"status":"valid","issues":[]}'
+          />
+          <small class="field-help">支持 score（0–1）、status、issues、checked_at 和 source。</small>
+        </div>
         <div class="ep-sec"><span>属性值</span></div>
         <div class="ep-props">
           <div class="attr-row" v-for="row in attrRows" :key="row.name">
             <div class="attr-name">{{ row.name }} <el-tag v-if="row.key" size="small" type="warning" effect="plain">主键</el-tag></div>
-            <el-input v-model="editor.form.attributes[row.name]" size="small" :placeholder="row.type" />
+            <el-select v-if="row.enumValues.length" v-model="editor.form.attributes[row.name]" clearable size="small" :placeholder="row.type">
+              <el-option v-for="value in row.enumValues" :key="value" :label="value" :value="coerceEnumValue(value, row.type)" />
+            </el-select>
+            <el-select v-else-if="row.type === 'boolean'" v-model="editor.form.attributes[row.name]" clearable size="small" placeholder="未设置">
+              <el-option label="是 / true" :value="true" />
+              <el-option label="否 / false" :value="false" />
+            </el-select>
+            <el-input-number
+              v-else-if="row.type === 'integer' || row.type === 'float' || row.type === 'number'"
+              v-model="editor.form.attributes[row.name]"
+              :precision="row.type === 'integer' ? 0 : undefined"
+              :step="row.type === 'integer' ? 1 : 0.1"
+              controls-position="right"
+              style="width:100%"
+              size="small"
+            />
+            <el-date-picker
+              v-else-if="row.type === 'date' || row.type === 'datetime'"
+              v-model="editor.form.attributes[row.name]"
+              :type="row.type === 'date' ? 'date' : 'datetime'"
+              :value-format="row.type === 'date' ? 'YYYY-MM-DD' : 'YYYY-MM-DDTHH:mm:ssZ'"
+              clearable
+              style="width:100%"
+              size="small"
+            />
+            <el-input
+              v-else-if="row.type === 'json'"
+              v-model="jsonAttributeDrafts[row.name]"
+              type="textarea"
+              :rows="2"
+              class="mono-input"
+              placeholder="请输入 JSON 对象或数组"
+            />
+            <el-input v-else v-model="editor.form.attributes[row.name]" size="small" :placeholder="row.type" />
           </div>
           <div class="muted" v-if="!attrRows.length" style="padding:6px 2px">该实体暂无属性</div>
         </div>
@@ -109,16 +238,18 @@
         <el-icon><Delete /></el-icon> 删除
       </el-button>
       <el-button size="small" @click="emit('close')">取消</el-button>
-      <el-button size="small" type="primary" :loading="saving" @click="emit('save')">保存</el-button>
+      <el-button size="small" type="primary" :loading="saving || runtimeLoading" :disabled="Boolean(runtimeHydrationError)" @click="prepareAndSave">保存</el-button>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import { api } from '@/api'
 import type { Entity, Property } from '@/types'
 
-const DATA_TYPES = ['string', 'integer', 'float', 'boolean', 'date', 'datetime', 'json', 'text']
+const DATA_TYPES = ['string', 'integer', 'float', 'number', 'boolean', 'date', 'datetime', 'json', 'text']
 const REL_TYPES = ['1:1', '1:N', 'N:1', 'N:M']
 
 const props = defineProps<{
@@ -131,6 +262,13 @@ const emit = defineEmits<{
   (e: 'delete'): void
   (e: 'close'): void
 }>()
+
+const constraintDrafts = ref<string[]>([])
+const qualityDraft = ref('{}')
+const jsonAttributeDrafts = ref<Record<string, string>>({})
+const runtimeLoading = ref(false)
+const runtimeHydrationError = ref('')
+let hydrationRequest = 0
 
 const title = computed(() => {
   const map = { entity: '实体', relation: '关系', instance: '实例' }
@@ -156,22 +294,201 @@ const accent = computed(() => {
 })
 
 function addProp() {
-  props.editor.form.properties.push({ name: '', data_type: 'string', is_key: false, is_required: false })
+  props.editor.form.properties.push({
+    name: '', data_type: 'string', is_key: false, is_required: false,
+    is_enum: false, enum_values: [], constraints: {},
+  })
+  constraintDrafts.value.push('{}')
 }
+
+function removeProp(index: number) {
+  props.editor.form.properties.splice(index, 1)
+  constraintDrafts.value.splice(index, 1)
+}
+
+const statePropertyOptions = computed(() => (
+  props.editor.kind === 'entity'
+    ? (props.editor.form.properties || []).filter((property: Property) => property.is_enum && property.name && property.enum_values?.length)
+    : []
+))
+
+const currentEntity = computed(() => props.entities.find((entity) => entity.id === props.editor.form.entity_id))
+const instanceStateProperty = computed(() => {
+  const entity = currentEntity.value
+  return entity?.properties.find((property) => property.name === entity.state_property)
+})
+const instanceStateOptions = computed(() => instanceStateProperty.value?.enum_values || [])
+
+function prettyJson(value: unknown, fallback = '{}') {
+  try { return JSON.stringify(value ?? {}, null, 2) } catch { return fallback }
+}
+
+function initializeDrafts() {
+  hydrationRequest += 1
+  runtimeLoading.value = false
+  runtimeHydrationError.value = ''
+  constraintDrafts.value = []
+  qualityDraft.value = '{}'
+  jsonAttributeDrafts.value = {}
+
+  if (props.editor.kind === 'entity') {
+    const original = props.entities.find((entity) => entity.id === props.editor.id)
+    if (props.editor.form.namespace === undefined) props.editor.form.namespace = original?.namespace || ''
+    if (props.editor.form.state_property === undefined) props.editor.form.state_property = original?.state_property || ''
+    for (const property of props.editor.form.properties || []) {
+      if (!Array.isArray(property.enum_values)) property.enum_values = []
+      if (!property.constraints || typeof property.constraints !== 'object' || Array.isArray(property.constraints)) property.constraints = {}
+      constraintDrafts.value.push(prettyJson(property.constraints))
+    }
+    return
+  }
+
+  if (props.editor.kind === 'relation') {
+    props.editor.form.namespace ??= ''
+    return
+  }
+
+  if (props.editor.kind !== 'instance') return
+  props.editor.form.state ??= ''
+  props.editor.form.valid_from ??= null
+  props.editor.form.valid_to ??= null
+  props.editor.form.quality ??= {}
+  resetInstanceJsonDrafts()
+  if (props.editor.id) void hydrateExistingInstance(++hydrationRequest)
+}
+
+function resetInstanceJsonDrafts() {
+  qualityDraft.value = prettyJson(props.editor.form.quality)
+  const drafts: Record<string, string> = {}
+  for (const property of currentEntity.value?.properties || []) {
+    if (property.data_type !== 'json') continue
+    const value = props.editor.form.attributes?.[property.name]
+    drafts[property.name] = value === undefined || value === null ? '' : prettyJson(value)
+  }
+  jsonAttributeDrafts.value = drafts
+}
+
+async function hydrateExistingInstance(request: number) {
+  const scenarioId = currentEntity.value?.scenario_id
+  if (!scenarioId || !props.editor.id) {
+    runtimeHydrationError.value = '无法确认对象所属场景；为避免覆盖既有运行时元数据，当前不能保存。'
+    return
+  }
+  runtimeLoading.value = true
+  try {
+    const object = await api.getObject(scenarioId, props.editor.id)
+    if (request !== hydrationRequest || props.editor.kind !== 'instance' || props.editor.id !== object.id) return
+    props.editor.form.state = object.state || ''
+    props.editor.form.valid_from = object.valid_from || null
+    props.editor.form.valid_to = object.valid_to || null
+    props.editor.form.quality = object.quality || {}
+    props.editor.form.access_scope = object.access_scope || 'tenant'
+    props.editor.form.source = object.source || 'manual'
+    props.editor.form.source_ref = object.source_ref || ''
+    resetInstanceJsonDrafts()
+  } catch (error: any) {
+    if (request !== hydrationRequest) return
+    runtimeHydrationError.value = error?.message || '对象运行时元数据读取失败；为避免覆盖既有值，当前不能保存。'
+  } finally {
+    if (request === hydrationRequest) runtimeLoading.value = false
+  }
+}
+
+watch(() => props.editor, initializeDrafts, { immediate: true })
 
 // 实例属性行
 const attrRows = computed(() => {
   const ent = props.entities.find((e) => e.id === props.editor.form.entity_id)
   const attrs = props.editor.form.attributes || {}
-  return (ent?.properties || []).map((p: Property) => ({
+  return (ent?.properties || []).filter((p: Property) => p.name !== ent?.state_property).map((p: Property) => ({
     name: p.name,
     type: p.data_type,
     key: !!p.is_key,
+    enumValues: p.is_enum ? (p.enum_values || []) : [],
     value: String(attrs[p.name] ?? ''),
   }))
 })
 function onEntityChange() {
   props.editor.form.attributes = {}
+  props.editor.form.state = ''
+  resetInstanceJsonDrafts()
+}
+
+function setInstanceState(value: string) {
+  props.editor.form.state = value || ''
+  const stateProperty = currentEntity.value?.state_property
+  if (!stateProperty) return
+  if (value) props.editor.form.attributes[stateProperty] = coerceEnumValue(value, instanceStateProperty.value?.data_type || 'string')
+  else delete props.editor.form.attributes[stateProperty]
+}
+
+function coerceEnumValue(value: string, dataType: string): string | number | boolean {
+  if (dataType === 'integer' || dataType === 'float' || dataType === 'number') {
+    const numberValue = Number(value)
+    return Number.isFinite(numberValue) ? numberValue : value
+  }
+  if (dataType === 'boolean') {
+    if (value.toLowerCase() === 'true') return true
+    if (value.toLowerCase() === 'false') return false
+  }
+  return value
+}
+
+function parseJsonObject(value: string, label: string): Record<string, unknown> {
+  let parsed: unknown
+  try { parsed = JSON.parse(value || '{}') } catch { throw new Error(`${label}必须是有效 JSON`) }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${label}必须是 JSON 对象`)
+  return parsed as Record<string, unknown>
+}
+
+function validateNamespace(value: unknown) {
+  const namespace = String(value || '').trim()
+  if (namespace.length > 180 || (namespace && !/^[A-Za-z][A-Za-z0-9._-]*$/.test(namespace))) {
+    throw new Error('命名空间格式不正确：须以字母开头，最长 180 个字符')
+  }
+  return namespace
+}
+
+function prepareAndSave() {
+  if (runtimeLoading.value || runtimeHydrationError.value) return
+  try {
+    if (props.editor.kind === 'entity') {
+      props.editor.form.namespace = validateNamespace(props.editor.form.namespace)
+      const stateProperty = String(props.editor.form.state_property || '')
+      if (stateProperty && !statePropertyOptions.value.some((property: Property) => property.name === stateProperty)) {
+        throw new Error('生命周期状态属性必须是包含枚举值的枚举属性')
+      }
+      for (const [index, property] of (props.editor.form.properties || []).entries()) {
+        property.constraints = parseJsonObject(constraintDrafts.value[index] || '{}', `属性“${property.name || index + 1}”的约束`)
+        property.enum_values = property.is_enum
+          ? [...new Set((property.enum_values || []).map((value: unknown) => String(value).trim()).filter(Boolean))]
+          : []
+        if (property.is_enum && !property.enum_values.length) throw new Error(`枚举属性“${property.name || index + 1}”至少需要一个枚举值`)
+      }
+    } else if (props.editor.kind === 'relation') {
+      props.editor.form.namespace = validateNamespace(props.editor.form.namespace)
+    } else if (props.editor.kind === 'instance') {
+      props.editor.form.quality = parseJsonObject(qualityDraft.value, '质量信息')
+      for (const property of currentEntity.value?.properties || []) {
+        if (property.data_type !== 'json') continue
+        const text = jsonAttributeDrafts.value[property.name] || ''
+        if (!text.trim() && !property.is_required) {
+          delete props.editor.form.attributes[property.name]
+          continue
+        }
+        let parsed: unknown
+        try { parsed = JSON.parse(text) } catch { throw new Error(`属性“${property.name}”必须是有效 JSON`) }
+        if (!parsed || typeof parsed !== 'object') throw new Error(`属性“${property.name}”必须是 JSON 对象或数组`)
+        props.editor.form.attributes[property.name] = parsed
+      }
+      if (props.editor.form.valid_from && props.editor.form.valid_to && new Date(props.editor.form.valid_to) <= new Date(props.editor.form.valid_from)) {
+        throw new Error('有效期结束时间必须晚于开始时间')
+      }
+    }
+    emit('save')
+  } catch (error: any) {
+    ElMessage.error(error?.message || '请检查表单中的 JSON 与约束配置')
+  }
 }
 </script>
 
@@ -247,6 +564,20 @@ function onEntityChange() {
   color: var(--text-2);
   margin-bottom: 5px;
 }
+.field-help {
+  display: block;
+  margin-top: 5px;
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.runtime-alert {
+  margin-bottom: 12px;
+}
+.mono-input :deep(textarea) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
 .ep-row2 {
   display: flex;
   gap: 12px;
@@ -292,6 +623,15 @@ function onEntityChange() {
 .prop-flags .el-button {
   margin-left: auto;
 }
+.prop-detail {
+  padding-top: 2px;
+}
+.prop-detail > label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-3);
+  font-size: 11px;
+}
 .attr-row {
   display: flex;
   flex-direction: column;
@@ -322,6 +662,9 @@ function onEntityChange() {
     bottom: 10px;
     width: auto;
     max-height: 70%;
+  }
+  .validity-row {
+    display: block;
   }
 }
 </style>

@@ -126,19 +126,21 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 # unknown *resource-level* field must never be silently discarded during import.
 _RESOURCE_ALLOWED_FIELDS: dict[str, frozenset[str]] = {
     "entities": frozenset({
-        "key", "name", "description", "icon", "color", "is_abstract",
+        "key", "name", "namespace", "description", "icon", "color", "is_abstract",
+        "state_property",
     }),
     "properties": frozenset({
         "key", "entity_ref", "name", "data_type", "description", "is_key",
-        "is_required", "is_enum", "enum_values", "default_value", "is_sensitive",
+        "is_required", "is_enum", "enum_values", "default_value", "constraints",
+        "is_sensitive",
     }),
     "relations": frozenset({
         "key", "name", "source_entity_ref", "target_entity_ref", "relation_type",
-        "description",
+        "description", "namespace",
     }),
     "mappings": frozenset({
         "key", "entity_ref", "data_source_ref", "data_source_binding_key",
-        "data_source_binding_ref", "table_name", "column_map",
+        "data_source_binding_ref", "table_name", "column_map", "transform_rules",
     }),
     "functions": frozenset({
         "key", "name", "description", "input_schema", "output_schema", "tags", "visibility",
@@ -625,6 +627,7 @@ def _build_resources(
         lambda mapping: (
             str(mapping.table_name),
             _canonical_json(mapping.column_map or {}),
+            _canonical_json(mapping.transform_rules or {}),
             str(mapping.id),
         ),
     )
@@ -671,10 +674,12 @@ def _build_resources(
             {
                 "key": entity_keys[id(entity)],
                 "name": entity.name,
+                "namespace": entity.namespace or entity.scenario.namespace or "default",
                 "description": entity.description or "",
                 "icon": entity.icon or "box",
                 "color": entity.color or "#4f46e5",
                 "is_abstract": bool(entity.is_abstract),
+                "state_property": entity.state_property or "",
             }
             for entity in entities
         ],
@@ -690,6 +695,7 @@ def _build_resources(
                 "is_enum": bool(prop.is_enum),
                 "enum_values": _plain_json(prop.enum_values or []),
                 "default_value": prop.default_value or "",
+                "constraints": _plain_json(prop.constraints or {}),
                 "is_sensitive": bool(prop.is_sensitive),
             }
             for prop in properties
@@ -698,6 +704,7 @@ def _build_resources(
             {
                 "key": relation_keys[id(relation)],
                 "name": relation.name,
+                "namespace": relation.namespace or relation.scenario.namespace or "default",
                 "source_entity_ref": entity_key_by_id.get(relation.source_entity_id, "entity/unresolved"),
                 "target_entity_ref": entity_key_by_id.get(relation.target_entity_id, "entity/unresolved"),
                 "relation_type": relation.relation_type or "1:N",
@@ -718,6 +725,7 @@ def _build_resources(
                 ),
                 "table_name": mapping.table_name or "",
                 "column_map": _plain_json(mapping.column_map or {}),
+                "transform_rules": _plain_json(mapping.transform_rules or {}),
             }
             for mapping in mappings
         ],
@@ -2109,10 +2117,12 @@ def _compile_package_overlay(
             {
                 "id": item_id,
                 "name": item.get("name", ""),
+                "namespace": item.get("namespace", "default"),
                 "description": item.get("description", ""),
                 "icon": item.get("icon", "box"),
                 "color": item.get("color", "#4f46e5"),
                 "is_abstract": item.get("is_abstract", False),
+                "state_property": item.get("state_property", ""),
                 "properties": existing.get("properties", []),
             }
         )
@@ -2132,6 +2142,7 @@ def _compile_package_overlay(
             "is_enum": item.get("is_enum", False),
             "enum_values": copy.deepcopy(item.get("enum_values", [])),
             "default_value": item.get("default_value", ""),
+            "constraints": copy.deepcopy(item.get("constraints", {})),
             "is_sensitive": item.get("is_sensitive", False),
         }
         parent, existing = properties_by_id.get(item_id, (None, None))
@@ -2155,6 +2166,7 @@ def _compile_package_overlay(
             {
                 "id": ids_by_kind["relations"][str(item["key"])],
                 "name": item.get("name", ""),
+                "namespace": item.get("namespace", "default"),
                 "source_entity_id": source_id,
                 "target_entity_id": target_id,
                 "relation_type": item.get("relation_type", "1:N"),
@@ -2200,6 +2212,7 @@ def _compile_package_overlay(
                 binding_targets=binding_targets,
                 path=f"{mapping_path}.column_map",
             ),
+            "transform_rules": copy.deepcopy(item.get("transform_rules", {})),
         }
         if isinstance(source_ref, Mapping):
             _attach_runtime_binding(

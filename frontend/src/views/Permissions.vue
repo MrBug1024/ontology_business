@@ -3,7 +3,7 @@
     <header class="permissions-header">
       <div>
         <div class="eyebrow">GOVERNANCE</div>
-        <h2 id="permissions-page-title">权限与成员</h2>
+        <h1 id="permissions-page-title">权限与成员</h1>
         <p>管理组织成员、系统角色以及面向场景、对象、属性、Action 与工作流的精确授权。</p>
       </div>
       <el-button :loading="loading" @click="load">
@@ -589,7 +589,7 @@ onMounted(load)
 .permissions-header, .section-heading, .section-toolbar, .resource-picker { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .eyebrow, .section-kicker { color: var(--primary); font-size: 10px; font-weight: 800; letter-spacing: .14em; }
 .permissions-header { margin-bottom: 18px; }
-.permissions-header h2 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
+.permissions-header h1 { margin: 5px 0 6px; color: var(--text); font-size: 25px; letter-spacing: -.035em; }
 .permissions-header p { max-width: 760px; margin: 0; color: var(--text-2); font-size: 13px; line-height: 1.65; }
 .page-alert { margin-bottom: 16px; }
 .loading-card { padding: 22px; }
