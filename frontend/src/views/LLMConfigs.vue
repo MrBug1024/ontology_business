@@ -13,7 +13,7 @@
       v-if="!canManage"
       class="model-alert"
       type="info"
-      title="当前账户为只读：可查看模型、路由与运营数据，不能修改配置、测试连接或记录评测。"
+      title="当前账户为只读：可查看模型、路由、使用情况与评测，不能修改配置或测试连接。"
       show-icon
       :closable="false"
     />
@@ -52,7 +52,7 @@
           <div class="wide"><dt>预算</dt><dd>{{ budgetText(config) }}</dd></div>
         </dl>
         <footer class="model-actions">
-          <el-button size="small" plain @click="openOperations(config)"><el-icon><DataAnalysis /></el-icon> 运营数据</el-button>
+          <el-button size="small" plain @click="openOperations(config)"><el-icon><DataAnalysis /></el-icon> 使用与评测</el-button>
           <el-button v-if="canManage" size="small" plain :loading="config._testing" @click="test(config)"><el-icon><Link /></el-icon> 测试</el-button>
           <el-button v-if="canManage" size="small" text type="primary" @click="openEdit(config)"><el-icon><Edit /></el-icon> 编辑</el-button>
           <el-button v-if="canManage" size="small" text type="danger" @click="remove(config)"><el-icon><Delete /></el-icon> 删除</el-button>
@@ -101,7 +101,7 @@
       <template #footer><el-button @click="dialogVisible = false">取消</el-button><el-button type="primary" :loading="saving" @click="save">保存</el-button></template>
     </el-dialog>
 
-    <el-drawer v-model="operationsVisible" :title="`${activeConfig?.name || '模型'} · 运营数据`" size="min(880px, 94vw)" destroy-on-close>
+    <el-drawer v-model="operationsVisible" :title="`${activeConfig?.name || '模型'} · 使用与评测`" size="min(880px, 94vw)" destroy-on-close>
       <div v-loading="operationsLoading" class="operations-drawer">
         <el-alert v-if="operationsError" type="error" :title="operationsError" show-icon :closable="false" role="alert" />
         <template v-else-if="activeConfig">
@@ -225,7 +225,7 @@ async function test(config: ConfigCard) { if (!canManage.value) return; config._
 async function remove(config: LLMConfig) { if (!canManage.value) return; try { await ElMessageBox.confirm(`删除模型配置「${config.name}」？其历史 trace 和评测也将一并删除。`, '确认删除', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }); await api.deleteLLM(config.id!); ElMessage.success('已删除'); await load() } catch (cause: any) { if (cause !== 'cancel' && cause !== 'close') ElMessage.error(cause?.message || '删除失败') } }
 async function openOperations(config: LLMConfig) {
   activeConfig.value = config; operationsVisible.value = true; operationsLoading.value = true; operationsError.value = ''; operationsTab.value = 'traces'
-  try { const [nextUsage, nextTraces, nextEvaluations, nextEvaluationSummary] = await Promise.all([api.getLLMUsageSummary(config.id!), api.listLLMTraces(config.id!), api.listLLMEvaluations(config.id!), api.getLLMEvaluationSummary(config.id!)]); usage.value = nextUsage; traces.value = nextTraces; evaluations.value = nextEvaluations; evaluationSummary.value = nextEvaluationSummary } catch (cause: any) { operationsError.value = cause?.message || '运营数据加载失败' } finally { operationsLoading.value = false }
+  try { const [nextUsage, nextTraces, nextEvaluations, nextEvaluationSummary] = await Promise.all([api.getLLMUsageSummary(config.id!), api.listLLMTraces(config.id!), api.listLLMEvaluations(config.id!), api.getLLMEvaluationSummary(config.id!)]); usage.value = nextUsage; traces.value = nextTraces; evaluations.value = nextEvaluations; evaluationSummary.value = nextEvaluationSummary } catch (cause: any) { operationsError.value = cause?.message || '使用与评测数据加载失败' } finally { operationsLoading.value = false }
 }
 async function saveEvaluation() {
   if (!canManage.value) return

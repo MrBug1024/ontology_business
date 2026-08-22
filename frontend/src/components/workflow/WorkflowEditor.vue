@@ -10,6 +10,7 @@ import type { Node, Edge, Connection } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import WFNode from './WFNode.vue'
+import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import { api } from '@/api'
 import type { WorkflowRun } from '@/types'
 import '@vue-flow/core/dist/style.css'
@@ -33,6 +34,9 @@ const emit = defineEmits<{
 
 // 注入场景资源给节点卡片（显示引用的操作/规则/事件名称）
 const refs = reactive({ actions: props.actions, rules: props.rules, events: props.events })
+function actionExecutorLabel(type?: string) {
+  return ({ sql: '数据库查询', skill: '本地技能', mcp: '外部工具', http: 'HTTPS 接口', script: '受控脚本' } as Record<string, string>)[type || ''] || '未配置'
+}
 watch(
   () => [props.actions, props.rules, props.events],
   () => {
@@ -333,7 +337,7 @@ function validate(): string[] {
     if (n.type === 'event' && !d.event_id) errs.push(`节点「${nm}」未选择事件`)
     if (n.type === 'approval' && !(d.instructions || '').trim()) errs.push(`审批节点「${nm}」未填写审批说明`)
     if (n.type === 'llm' && !(d.prompt || '').trim()) errs.push(`节点「${nm}」未填写提示词`)
-    if (n.type === 'http' || n.type === 'script') errs.push(`节点「${nm}」使用了已停用的原生高风险节点；请改为类型化 Action`)
+    if (n.type === 'http' || n.type === 'script') errs.push(`节点「${nm}」使用了已停用的高风险节点；请改为场景中已配置的操作`)
   }
   for (const n of ns) {
     if (n.type !== 'rule') continue
@@ -382,22 +386,29 @@ function save() {
 }
 
 const executing = ref(false)
+const runParamsDlg = ref(false)
+const runParams = ref<Record<string, any>>({})
+function workflowParameterTemplate() {
+  const names = new Set<string>()
+  const source = JSON.stringify(graph.value)
+  for (const match of source.matchAll(/\{\{\s*params\.([a-zA-Z0-9_]+)[^}]*\}\}/g)) names.add(match[1])
+  return Object.fromEntries([...names].map((name) => [name, '']))
+}
 async function doExecute() {
   if (!props.modelValue.id) {
     ElMessage.warning('请先保存工作流，再执行')
     return
   }
+  runParams.value = workflowParameterTemplate()
+  runParamsDlg.value = true
+}
+async function confirmExecute() {
+  if (!props.modelValue.id) return
   executing.value = true
   try {
-    const { value } = await ElMessageBox.prompt('输入工作流参数（JSON，可为空 {}）', '执行工作流', {
-      inputValue: '{}',
-      inputPattern: /\S/,
-      confirmButtonText: '执行',
-      cancelButtonText: '取消',
-    })
-    const params = JSON.parse(value || '{}')
-    const run = await api.submitWorkflowRun(props.modelValue.id, params)
+    const run = await api.submitWorkflowRun(props.modelValue.id, structuredClone(runParams.value))
     emit('run-created', run)
+    runParamsDlg.value = false
     ElMessage.success(run.status === 'awaiting_approval' ? '任务已提交，正在等待审批' : '任务已提交到运行队列')
   } catch (e: any) {
     if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(e?.message || '执行失败')
@@ -430,31 +441,6 @@ async function runAiGenerate() {
     ElMessage.error(e?.message || '生成失败')
   } finally {
     aiLoading.value = false
-  }
-}
-
-// ── 右侧配置面板：JSON 字段 ──
-const jsonText = ref('')
-const jsonKey = computed(() => {
-  switch (selNode.value?.type) {
-    case 'action': return 'params'
-    case 'rule': return 'record'
-    case 'event': return 'payload'
-    case 'http': return 'body'
-    default: return ''
-  }
-})
-watch(selectedId, () => {
-  const n = selNode.value
-  if (n && jsonKey.value) jsonText.value = JSON.stringify(n.data[jsonKey.value] ?? {}, null, 2)
-})
-function onJsonInput() {
-  const n = selNode.value
-  if (!n || !jsonKey.value) return
-  try {
-    n.data[jsonKey.value] = jsonText.value.trim() ? JSON.parse(jsonText.value) : {}
-  } catch {
-    /* 等待 JSON 合法后再应用 */
   }
 }
 
@@ -601,12 +587,12 @@ const wf = computed({
             <div class="wfe-field">
               <label>选择操作</label>
               <el-select v-model="selNode.data.action_id" size="small" style="width:100%" placeholder="选择要执行的操作">
-                <el-option v-for="a in actions" :key="a.id" :label="`${a.name}（${a.executor_type}）`" :value="a.id" />
+                <el-option v-for="a in actions" :key="a.id" :label="`${a.name}（${actionExecutorLabel(a.executor_type)}）`" :value="a.id" />
               </el-select>
             </div>
             <div class="wfe-field">
-              <label>参数（JSON，支持 {{ '{params.x}' }} 变量）</label>
-              <el-input v-model="jsonText" type="textarea" :rows="6" class="mono" @input="onJsonInput" />
+              <label>参数（可填写 {{ '{params.x}' }} 变量）</label>
+              <KeyValueEditor v-model="selNode.data.params" value-placeholder="固定值或 {{params.field}}" empty-text="此操作节点暂不传递参数" />
             </div>
           </template>
 
@@ -618,8 +604,8 @@ const wf = computed({
               </el-select>
             </div>
             <div class="wfe-field">
-              <label>评估记录（JSON，支持变量引用）</label>
-              <el-input v-model="jsonText" type="textarea" :rows="6" class="mono" @input="onJsonInput" />
+              <label>评估字段（支持变量引用）</label>
+              <KeyValueEditor v-model="selNode.data.record" value-placeholder="固定值或 {{node.result}}" empty-text="添加规则需要读取的字段" />
             </div>
             <div class="wfe-hint">命中 → 右侧「命中」出口；未命中 → 下方「未命中」出口</div>
           </template>
@@ -633,19 +619,6 @@ const wf = computed({
               <label>系统提示（可选）</label>
           <el-input v-model="selNode.data.system" type="textarea" :rows="2" placeholder="你是一个严谨的业务助手" />
             </div>
-            <div class="wfe-field">
-              <label for="workflow-llm-binding-key">运行时绑定键（非开发环境必填）</label>
-              <el-input
-                id="workflow-llm-binding-key"
-                v-model.trim="selNode.data.llm_binding_key"
-                class="mono"
-                aria-describedby="workflow-llm-binding-help"
-                placeholder="例如 llm:operations:chat"
-              />
-              <div id="workflow-llm-binding-help" class="wfe-hint">
-                在“连接器与环境”中为同一键配置各环境的 LLM；留空仅兼容开发环境的默认模型。
-              </div>
-            </div>
           </template>
 
           <template v-if="selNode.type === 'event'">
@@ -656,8 +629,8 @@ const wf = computed({
               </el-select>
             </div>
             <div class="wfe-field">
-              <label>事件负载（JSON，支持变量）</label>
-              <el-input v-model="jsonText" type="textarea" :rows="4" class="mono" @input="onJsonInput" />
+              <label>事件载荷（支持变量）</label>
+              <KeyValueEditor v-model="selNode.data.payload" value-placeholder="固定值或 {{node.result}}" empty-text="该事件节点暂不携带字段" />
             </div>
           </template>
 
@@ -682,13 +655,13 @@ const wf = computed({
 
           <template v-if="selNode.type === 'http'">
             <el-alert type="warning" :closable="false" show-icon title="原生 HTTP 节点已停用">
-              请用类型化 Action 配置外部调用，以获得权限、确认、幂等和审计约束。
+              请用场景中的“操作”配置外部调用，以获得权限检查、执行确认、防重复提交和审计保护。
             </el-alert>
           </template>
 
           <template v-if="selNode.type === 'script'">
             <el-alert type="warning" :closable="false" show-icon title="原生 Python 节点已停用">
-              请用已治理的 Skill 或类型化 Action 表达业务副作用。
+              请用受控本地技能或场景中的“操作”表达业务副作用。
             </el-alert>
           </template>
 
@@ -717,6 +690,15 @@ const wf = computed({
       <template #footer>
         <el-button @click="aiDlg = false">取消</el-button>
         <el-button type="primary" :loading="aiLoading" @click="runAiGenerate">生成</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="runParamsDlg" title="执行工作流" width="600px" class="glass-dialog">
+      <p class="wfe-run-help">系统已从流程中的 <code>{{ '{params.field}' }}</code> 引用识别参数；也可以按需添加字段。</p>
+      <KeyValueEditor v-model="runParams" empty-text="该工作流无需运行参数" />
+      <template #footer>
+        <el-button @click="runParamsDlg = false">取消</el-button>
+        <el-button type="primary" :loading="executing" @click="confirmExecute">执行</el-button>
       </template>
     </el-dialog>
 
@@ -762,6 +744,7 @@ const wf = computed({
 .wfe-config-field--event { min-width: 180px; }
 .wfe-config-field label { color: var(--text-3); font-size: 10px; font-weight: 750; }
 .wfe-config-help { align-self: center; max-width: 220px; color: var(--text-3); font-size: 10.5px; line-height: 1.45; }
+.wfe-run-help { margin: 0 0 12px; color: var(--text-3); font-size: 11px; line-height: 1.6; }
 .wfe-body {
   flex: 1;
   min-height: 0;

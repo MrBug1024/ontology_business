@@ -91,7 +91,7 @@
                 <el-alert v-if="sqlError" :title="sqlError" type="error" :closable="false" style="margin-bottom:10px" />
                 <el-table v-if="sqlResult" :data="sqlRows" size="small" max-height="380" border>
                   <el-table-column v-for="c in sqlResult.columns" :key="c" :prop="c" :label="c" min-width="110">
-                    <template #default="{ row }"><span class="mono">{{ formatSqlCell(row[c]) }}</span></template>
+                    <template #default="{ row }"><StructuredValueCell :value="row[c]" /></template>
                   </el-table-column>
                 </el-table>
                 <div class="muted" v-if="sqlResult" style="margin-top:8px">{{ sqlResult.row_count }} 行 · 只读查询（SELECT）</div>
@@ -172,7 +172,7 @@
                   <template #default="{ row }">
                     <el-tag v-if="row.status === 'parsed'" size="small" type="success">已解析</el-tag>
                     <el-tag v-else-if="row.status === 'error'" size="small" type="danger">失败</el-tag>
-                    <el-tag v-else size="small" type="warning">{{ row.status }}</el-tag>
+                    <el-tag v-else size="small" type="warning">{{ fileStatusLabel(row.status) }}</el-tag>
                   </template>
                 </el-table-column>
                 <el-table-column label="检索索引" width="142" align="center">
@@ -269,6 +269,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { api } from '@/api'
 import type { DataSource, Scenario, TableInfo, BucketFile, RagCitation } from '@/types'
+import StructuredValueCell from '@/components/StructuredValueCell.vue'
 
 const dataSources = ref<DataSource[]>([])
 const scenarios = ref<Scenario[]>([])
@@ -336,11 +337,6 @@ const TYPE_LABELS: Record<string, string> = {
   mysql: 'MySQL', postgres: 'PostgreSQL', sqlite: 'SQLite', file_bucket: '文件桶',
 }
 function typeLabel(t: string) { return TYPE_LABELS[t] || t }
-function formatSqlCell(value: unknown) {
-  if (value === null || value === undefined) return '—'
-  if (typeof value === 'object') return JSON.stringify(value)
-  return String(value)
-}
 function fmtSize(n: number) {
   if (n < 1024) return n + ' B'
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
@@ -348,6 +344,9 @@ function fmtSize(n: number) {
 }
 function indexLabel(status?: string) {
   return ({ indexed: '已建立', partial: '部分建立', queued: '排队中', pending: '待建立', error: '索引失败' } as Record<string, string>)[status || 'pending'] || '待建立'
+}
+function fileStatusLabel(status?: string) {
+  return ({ pending: '待解析', queued: '排队中', parsing: '解析中', processing: '处理中', uploaded: '待解析' } as Record<string, string>)[status || 'pending'] || '处理中'
 }
 function indexTagType(status?: string): 'success' | 'warning' | 'danger' | 'info' {
   if (status === 'indexed') return 'success'

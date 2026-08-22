@@ -3,7 +3,7 @@
     <div class="page-header">
       <div>
         <h1>业务场景</h1>
-        <div class="sub">从业务描述开始，依次完成建模、映射、查询、审批执行与审计</div>
+        <div class="sub">从业务描述开始，依次完成本体建模、数据接入与映射、业务能力和 Agent 配置</div>
       </div>
       <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建场景</el-button>
     </div>
@@ -22,14 +22,14 @@
           </div>
           <div class="sc-desc">{{ s.description || '暂无描述' }}</div>
           <div class="sc-stats">
-            <div><b>{{ s.entity_count || 0 }}</b><span>实体</span></div>
+            <div><b>{{ s.entity_count || 0 }}</b><span>对象类型</span></div>
             <div class="sc-sep"></div>
-            <div><b>{{ s.relation_count || 0 }}</b><span>关系</span></div>
+            <div><b>{{ s.relation_count || 0 }}</b><span>关系类型</span></div>
             <div class="sc-sep"></div>
             <div><b>{{ s.data_source_count || 0 }}</b><span>数据源</span></div>
           </div>
           <div class="sc-actions">
-            <el-button size="small" type="primary" plain @click="$router.push('/scenarios/' + s.id)"><el-icon><ArrowRight /></el-icon> 进入闭环</el-button>
+            <el-button size="small" type="primary" plain @click="$router.push('/scenarios/' + s.id)"><el-icon><ArrowRight /></el-icon> 进入场景</el-button>
             <el-button size="small" text type="primary" @click="openEdit(s)"><el-icon><Edit /></el-icon> 编辑</el-button>
             <el-button size="small" text type="danger" @click="remove(s)"><el-icon><Delete /></el-icon> 删除</el-button>
           </div>
@@ -79,7 +79,7 @@
                 </el-button>
               </div>
             </div>
-            <p class="scenario-file-help">附件只会先进入 AI 临时上下文，不会写入正式数据源；你确认 Change Set 后，本体草稿才会保存。</p>
+            <p class="scenario-file-help">附件只会先进入 AI 临时上下文，不会写入正式数据源；你确认变更清单后，本体草稿才会保存。</p>
           </div>
         </el-form-item>
         <el-form-item v-if="!form.id" label="下一步">
@@ -91,7 +91,7 @@
       </el-form>
       <template #footer>
         <el-button @click="dlg = false">取消</el-button>
-        <el-button type="primary" :loading="saving" @click="save">{{ form.id ? '保存修改' : '创建并进入闭环' }}</el-button>
+        <el-button type="primary" :loading="saving" @click="save">{{ form.id ? '保存修改' : '创建并开始建模' }}</el-button>
       </template>
     </el-dialog>
   </div>
@@ -169,14 +169,14 @@ async function save() {
     const shouldOpenAssistant = startWithAI.value
     const description = (form.value.description || '').trim()
     dlg.value = false
-    ElMessage.success('场景已创建，正在进入闭环工作台')
-    await router.push({ name: 'scenario-detail', params: { id: created.id }, query: { stage: 'flow' } })
+    ElMessage.success('场景已创建，正在进入本体建模')
+    await router.push({ name: 'scenario-detail', params: { id: created.id }, query: { stage: 'ontology' } })
     if (shouldOpenAssistant) {
       window.dispatchEvent(new CustomEvent('assistant-open-request', {
         detail: {
           mode: 'draft',
           files,
-          prompt: `请根据以下业务描述${files.length ? '和临时附件' : ''}生成本体 Change Set 草稿，覆盖核心实体、属性、关系，并指出后续数据映射所需的信息。\n\n业务场景：${created.name}\n业务描述：${description || '请先根据场景名称提出需要补充的关键信息。'}`,
+          prompt: `请只根据以下业务描述${files.length ? '和临时附件' : ''}生成本体模型变更清单。完整提取对象类型、属性、主键、关系类型、基数和约束，逐项标注来源并列出不确定项；不要生成数据映射或工作流。\n\n业务场景：${created.name}\n业务描述：${description || '请先根据场景名称提出需要补充的关键信息。'}`,
         },
       }))
     }

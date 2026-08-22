@@ -1,7 +1,7 @@
-"""P2 regression tests for declaration-only governed function resources."""
+"""Regression tests for governed function definitions and their runtime."""
 from __future__ import annotations
 
-import copy
+import json
 import unittest
 from types import SimpleNamespace
 
@@ -12,11 +12,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
-from app.models import BusinessScenario, FunctionDefinition, Tenant, User
+from app.models import Agent, BusinessScenario, FunctionDefinition, FunctionRun, LLMConfig, Tenant, User
+from app.routers import functions as functions_router
 from app.routers import scenarios as scenarios_router
 from app.services import (
+    agent_engine,
     function_definition_service,
-    package_service,
     permission_service,
     release_service,
     runtime_definition_service,
@@ -96,6 +97,7 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
 
         self.app = FastAPI()
         self.app.include_router(scenarios_router.router, prefix="/api")
+        self.app.include_router(functions_router.router, prefix="/api")
 
         def override_current_user():
             return SimpleNamespace(id=self.user.id, tenant_id=self.tenant.id)
@@ -202,7 +204,7 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
         columns = {column["name"] for column in inspect(self.engine).get_columns("function_definitions")}
         self.assertFalse({"code", "script", "executor", "executor_config", "handler"} & columns)
 
-    def test_release_and_package_freeze_function_contract_and_block_direct_delete(self) -> None:
+    def test_release_freezes_function_contract_and_blocks_direct_delete(self) -> None:
         created = self._create_function()
         snapshot_id, release_id = self._publish_staging()
 
@@ -231,13 +233,6 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
             self.assertEqual(released_function.name, "计算订单风险")
             self.assertIn("risk_level", released_function.output_schema["properties"])
 
-            package = package_service.export_scenario_package(db, scenario)
-            self.assertEqual(package_service.validate_package(package)["valid"], True)
-            self.assertEqual(len(package["resources"]["functions"]), 1)
-            self.assertNotIn("executor", package["resources"]["functions"][0])
-            unsafe_package = copy.deepcopy(package)
-            unsafe_package["resources"]["functions"][0]["code"] = "return 1"
-            self.assertFalse(package_service.validate_package(unsafe_package)["valid"])
         finally:
             db.close()
 
@@ -247,6 +242,98 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
         verify = self.Session()
         try:
             self.assertIsNotNone(verify.get(FunctionDefinition, created["id"]))
+        finally:
+            verify.close()
+
+    def test_agent_can_discover_and_run_side_effect_free_function(self) -> None:
+        payload = self._payload(name="订单加权评分")
+        payload.update({
+            "input_schema": _contract_schema({"amount": {"type": "number"}}, ["amount"]),
+            "runtime_kind": "weighted_score",
+            "runtime_config": {"weights": {"amount": 0.5}, "bias": 2},
+        })
+        created = self.client.post(f"/api/scenarios/{self.scenario.id}/functions", json=payload)
+        self.assertEqual(created.status_code, 200, created.text)
+
+        db = self.Session()
+        db.info["tenant_id"] = self.tenant.id
+        db.info["user_id"] = self.user.id
+        try:
+            agent = Agent(
+                tenant_id=self.tenant.id,
+                name="订单助手",
+                scenario_id=self.scenario.id,
+                data_source_ids=[],
+            )
+            db.add(agent)
+            db.flush()
+            context = agent_engine.AgentContext(db, agent, LLMConfig(name="工具模型"))
+            tool_names = {tool["function"]["name"] for tool in context.build_tools()}
+            self.assertTrue({"list_functions", "run_function"}.issubset(tool_names))
+            result = context.execute_tool(
+                "run_function",
+                {"function_id": created.json()["id"], "params": {"amount": 10}},
+            )
+            self.assertEqual(json.loads(result)["score"], 7)
+            self.assertEqual(db.query(FunctionRun).count(), 1)
+        finally:
+            db.rollback()
+            db.close()
+
+    def test_function_runtime_is_independent_and_uses_a_function_only_table(self) -> None:
+        payload = self._payload(name="订单加权评分")
+        payload.update({
+            "input_schema": _contract_schema(
+                {"amount": {"type": "number"}},
+                ["amount"],
+            ),
+            "runtime_kind": "weighted_score",
+            "runtime_config": {"weights": {"amount": 0.2}, "bias": 1},
+        })
+        created = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/functions",
+            json=payload,
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        function_id = created.json()["id"]
+
+        first = self.client.post(
+            f"/api/functions/{function_id}/run",
+            json={"params": {"amount": 10}, "idempotency_key": "score-order-1"},
+        )
+        self.assertEqual(first.status_code, 201, first.text)
+        self.assertEqual(first.json()["status"], "succeeded")
+        self.assertEqual(first.json()["output_payload"]["score"], 3)
+        self.assertNotIn("asset_id", first.json())
+
+        replay = self.client.post(
+            f"/api/functions/{function_id}/run",
+            json={"params": {"amount": 999}, "idempotency_key": "score-order-1"},
+        )
+        self.assertEqual(replay.status_code, 201, replay.text)
+        self.assertEqual(replay.json()["id"], first.json()["id"])
+
+        missing = self.client.post(
+            f"/api/functions/{function_id}/run",
+            json={"params": {}},
+        )
+        self.assertEqual(missing.status_code, 201, missing.text)
+        self.assertEqual(missing.json()["status"], "failed")
+        self.assertIn("缺少必填参数", missing.json()["error"])
+
+        listed = self.client.get(f"/api/functions/{function_id}/runs")
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(len(listed.json()), 2)
+
+        db_inspector = inspect(self.engine)
+        self.assertIn("function_runs", db_inspector.get_table_names())
+        columns = {column["name"] for column in db_inspector.get_columns("function_runs")}
+        self.assertNotIn("asset_id", columns)
+        verify = self.Session()
+        try:
+            run = verify.get(FunctionRun, first.json()["id"])
+            self.assertIsNotNone(run)
+            self.assertEqual(run.function_id, function_id)
         finally:
             verify.close()
 

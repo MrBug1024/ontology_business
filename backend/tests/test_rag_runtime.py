@@ -17,9 +17,7 @@ from app.models import (
     DocumentChunk,
     DocumentIndexJob,
     LLMConfig,
-    MCPConfig,
     Message,
-    Skill,
     Tenant,
 )
 from app.services.agent_engine import AgentContext, run_agent
@@ -245,29 +243,18 @@ class RagRuntimeTests(unittest.TestCase):
         )
 
     def test_agent_never_exposes_or_executes_direct_skill_or_mcp_side_effects(self) -> None:
-        skill = Skill(id="skill-direct", tenant_id=self.tenant_a.id, name="危险技能", path="/tmp/skill")
-        mcp = MCPConfig(id="mcp-direct", tenant_id=self.tenant_a.id, name="危险MCP", enabled=True)
-        self.db.add_all([skill, mcp])
-        self.db.commit()
         agent = Agent(
             tenant_id=self.tenant_a.id,
             name="受控执行助手",
-            skill_ids=[skill.id],
-            mcp_ids=[mcp.id],
         )
         context = AgentContext(self.db, agent, LLMConfig(name="测试模型"))
         tool_names = {item["function"]["name"] for item in context.build_tools()}
         self.assertNotIn("execute_skill", tool_names)
         self.assertFalse(any(name.startswith("mcp_") for name in tool_names))
-        with patch("app.services.agent_engine.skill_service.execute_skill") as execute_skill, patch(
-            "app.services.agent_engine.mcp_service.call_tool"
-        ) as call_mcp:
-            skill_result = context.execute_tool("execute_skill", {"skill_name": skill.name, "args": []})
-            mcp_result = context.execute_tool("mcp_危险MCP_写入", {})
+        skill_result = context.execute_tool("execute_skill", {"skill_name": "未绑定技能", "args": []})
+        mcp_result = context.execute_tool("mcp_未绑定服务_写入", {})
         self.assertIn("不直接执行", skill_result)
         self.assertIn("不直接执行", mcp_result)
-        execute_skill.assert_not_called()
-        call_mcp.assert_not_called()
 
     def test_agent_search_emits_and_persists_stable_visible_citations(self) -> None:
         rag_service.index_file(self.db, self.private_file)

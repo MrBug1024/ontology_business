@@ -134,14 +134,14 @@
               <div class="proposal-preview">
                 <template v-if="proposalOf(message)?.kind === 'scenario'">
                   <span>业务场景 1</span>
-                  <span>状态 {{ proposalOf(message)?.payload?.status || 'draft' }}</span>
+                  <span>状态 {{ scenarioStatusLabel(proposalOf(message)?.payload?.status) }}</span>
                 </template>
                 <template v-else-if="proposalOf(message)?.kind === 'ontology'">
-                  <span>实体 {{ proposalOf(message)?.payload?.entities?.length || 0 }}</span>
-                  <span>关系 {{ proposalOf(message)?.payload?.relations?.length || 0 }}</span>
+                  <span>对象类型 {{ proposalOf(message)?.payload?.entities?.length || 0 }}</span>
+                  <span>关系类型 {{ proposalOf(message)?.payload?.relations?.length || 0 }}</span>
                 </template>
                 <template v-else-if="proposalOf(message)?.kind === 'mapping'">
-                  <span>目标 {{ proposalOf(message)?.payload?.entity_name || '实体' }}</span>
+                  <span>目标 {{ proposalOf(message)?.payload?.entity_name || '对象类型' }}</span>
                   <span>字段 {{ Object.keys(proposalOf(message)?.payload?.column_map || {}).length }}</span>
                 </template>
                 <template v-else-if="proposalOf(message)?.kind === 'workflow'">
@@ -151,7 +151,7 @@
                 <span v-if="proposalOf(message)?.changes?.length">差异 {{ proposalOf(message)?.changes?.length }}</span>
                 <button type="button" class="preview-toggle" @click="toggleProposal(index)">{{ expandedProposal[index] ? '收起详情' : '查看详情' }}</button>
               </div>
-              <div v-if="expandedProposal[index] && proposalOf(message)?.changes?.length" class="proposal-changes" aria-label="Change Set 差异">
+              <div v-if="expandedProposal[index] && proposalOf(message)?.changes?.length" class="proposal-changes" aria-label="变更清单差异">
                 <div v-for="(change, changeIndex) in proposalOf(message)?.changes" :key="`${change.resource}-${change.name}-${changeIndex}`" class="proposal-change">
                   <el-tag size="small" effect="plain" :type="proposalOperationType(change.operation)">{{ proposalOperationLabel(change.operation) }}</el-tag>
                   <div class="proposal-change-copy">
@@ -160,7 +160,55 @@
                   </div>
                 </div>
               </div>
-              <pre v-if="expandedProposal[index]" class="proposal-code">{{ proposalText(proposalOf(message)) }}</pre>
+              <div v-if="expandedProposal[index]" class="proposal-detail" aria-label="草稿结构化内容">
+                <template v-if="proposalOf(message)?.kind === 'scenario'">
+                  <dl class="proposal-summary-grid">
+                    <div><dt>场景名称</dt><dd>{{ proposalOf(message)?.payload?.name || '未命名场景' }}</dd></div>
+                    <div><dt>行业领域</dt><dd>{{ proposalOf(message)?.payload?.industry || '未指定' }}</dd></div>
+                    <div><dt>命名空间</dt><dd>{{ proposalOf(message)?.payload?.namespace || 'default' }}</dd></div>
+                  </dl>
+                  <p v-if="proposalOf(message)?.payload?.description" class="proposal-description">{{ proposalOf(message)?.payload?.description }}</p>
+                </template>
+                <template v-else-if="proposalOf(message)?.kind === 'ontology'">
+                  <section class="proposal-section">
+                    <h4>对象类型</h4>
+                    <article v-for="entity in proposalOf(message)?.payload?.entities || []" :key="entity.name" class="ontology-preview-card">
+                      <div><strong>{{ entity.name || '未命名对象类型' }}</strong><span>{{ entity.description || '暂无说明' }}</span></div>
+                      <div class="ontology-property-list">
+                        <span v-for="property in entity.properties || []" :key="property.name">
+                          <b>{{ property.name }}</b>{{ propertyTypeLabel(property.data_type) }}<em v-if="property.is_key">主键</em><em v-if="property.is_required">必填</em>
+                        </span>
+                        <small v-if="!(entity.properties || []).length">暂未定义属性</small>
+                      </div>
+                    </article>
+                  </section>
+                  <section class="proposal-section">
+                    <h4>关系类型</h4>
+                    <div v-for="relation in proposalOf(message)?.payload?.relations || []" :key="`${relation.name}-${relation.source}-${relation.target}`" class="relation-preview-row">
+                      <strong>{{ relation.name || '未命名关系' }}</strong><span>{{ relation.source || '?' }} → {{ relation.target || '?' }}</span><el-tag size="small" effect="plain">{{ relation.relation_type || '1:N' }}</el-tag>
+                    </div>
+                    <small v-if="!(proposalOf(message)?.payload?.relations || []).length" class="proposal-empty">暂未识别关系类型，请在应用前确认业务文档是否描述了对象间关系。</small>
+                  </section>
+                </template>
+                <template v-else-if="proposalOf(message)?.kind === 'mapping'">
+                  <dl class="proposal-summary-grid">
+                    <div><dt>目标对象类型</dt><dd>{{ proposalOf(message)?.payload?.entity_name || proposalOf(message)?.payload?.entity_id || '未选择' }}</dd></div>
+                    <div><dt>数据源</dt><dd>{{ proposalOf(message)?.payload?.data_source_name || proposalOf(message)?.payload?.data_source_id || '未选择' }}</dd></div>
+                    <div><dt>表 / 文件结构</dt><dd>{{ proposalOf(message)?.payload?.table_name || '未选择' }}</dd></div>
+                  </dl>
+                  <div class="mapping-preview-list">
+                    <div v-for="(sourceColumn, propertyName) in proposalOf(message)?.payload?.column_map || {}" :key="String(propertyName)"><b>{{ propertyName }}</b><span>←</span><strong>{{ sourceColumn }}</strong></div>
+                  </div>
+                </template>
+                <template v-else-if="proposalOf(message)?.kind === 'workflow'">
+                  <section class="proposal-section">
+                    <h4>{{ proposalOf(message)?.payload?.name || '工作流草稿' }}</h4>
+                    <div class="workflow-preview-list">
+                      <div v-for="(node, nodeIndex) in proposalOf(message)?.payload?.nodes || []" :key="node.id || nodeIndex"><span>{{ nodeIndex + 1 }}</span><b>{{ node.name || node.label || node.id || '未命名节点' }}</b><el-tag size="small" effect="plain">{{ workflowNodeTypeLabel(node.type) }}</el-tag></div>
+                    </div>
+                  </section>
+                </template>
+              </div>
               <div class="proposal-actions">
                 <el-button size="small" type="primary" :loading="applyingIndex === index" :disabled="!proposalCanApply(proposalOf(message)) || proposalOf(message)?.status === 'applied' || !proposalOf(message)?.proposal_id" @click="applyProposal(message, index)">
                   <el-icon aria-hidden="true"><Check /></el-icon>{{ proposalApplyLabel(proposalOf(message)) }}
@@ -199,22 +247,22 @@
               <div v-if="message.evidence?.uncertainties?.length" class="evidence-uncertainties"><b>仍需确认</b><ul><li v-for="item in message.evidence.uncertainties" :key="item">{{ item }}</li></ul></div>
             </section>
 
-            <section v-if="hasActionPreview(message)" class="assistant-action-preview" aria-label="Action 影响与预演结果">
+            <section v-if="hasActionPreview(message)" class="assistant-action-preview" aria-label="操作影响与预演结果">
               <header>
-                <div><span class="eyebrow">GOVERNED ACTION</span><b>{{ message.action_preview?.target?.name || '待选择 Action' }}</b></div>
+                <div><span class="eyebrow">安全预演</span><b>{{ message.action_preview?.target?.name || '待选择操作' }}</b></div>
                 <el-tag size="small" effect="plain" :type="message.action_preview?.requires_approval ? 'warning' : 'info'">{{ message.action_preview?.requires_approval ? '需要确认或审批' : '仍需显式提交' }}</el-tag>
               </header>
               <dl>
-                <div><dt>执行器</dt><dd>{{ message.action_preview?.impact?.executor_type || '尚未确定' }}</dd></div>
+                <div><dt>执行方式</dt><dd>{{ actionExecutorLabel(message.action_preview?.impact?.executor_type) }}</dd></div>
                 <div><dt>权限检查</dt><dd>{{ assistantPermissionLabel(message.action_preview?.permission) }}</dd></div>
                 <div><dt>副作用</dt><dd>{{ message.action_preview?.impact?.side_effects_skipped === true ? '已跳过，仅预演' : '未创建预演' }}</dd></div>
               </dl>
               <p v-if="message.action_preview?.impact?.postcondition">影响：{{ message.action_preview.impact.postcondition }}</p>
-              <pre v-if="Object.keys(message.action_preview?.parameters || {}).length" class="action-preview-params">{{ JSON.stringify(message.action_preview?.parameters, null, 2) }}</pre>
+              <KeyValueEditor v-if="Object.keys(message.action_preview?.parameters || {}).length" :model-value="message.action_preview?.parameters" readonly empty-text="暂无执行参数" class="action-preview-params" />
               <div class="assistant-action-next">
-                <span>{{ message.action_preview?.execution_boundary || '真实执行必须进入类型化 Action 并重新确认。' }}</span>
+                <span>{{ message.action_preview?.execution_boundary || '真实执行必须进入已配置的操作并重新确认。' }}</span>
                 <el-button v-if="message.action_preview?.target?.id && context.scenario_id" size="small" type="primary" plain @click="continueGovernedAction(message.action_preview)">
-                  {{ message.action_preview?.preview?.log_id ? '进入 Action 确认' : '填写参数并预演' }}
+                  {{ message.action_preview?.preview?.log_id ? '进入操作确认' : '填写参数并预演' }}
                 </el-button>
               </div>
             </section>
@@ -310,6 +358,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamAssistantChat } from '@/api'
 import type { AssistantActionPreview, AssistantAttachment, AssistantMessage, AssistantProposal, AssistantQuestion, AssistantSource, AssistantThread, AssistantThought } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
+import KeyValueEditor from '@/components/KeyValueEditor.vue'
 
 interface AssistantContext {
   page?: string
@@ -317,7 +366,9 @@ interface AssistantContext {
   scenario_id?: string
 }
 
-const props = defineProps<{ context: AssistantContext }>()
+const props = withDefaults(defineProps<{ context: AssistantContext; hideLauncher?: boolean }>(), {
+  hideLauncher: false,
+})
 const router = useRouter()
 type AssistantMode = 'explain' | 'draft' | 'apply' | 'execute'
 const visible = ref(false)
@@ -326,9 +377,9 @@ const input = ref('')
 const mode = ref<AssistantMode>('explain')
 const modeOptions: Array<{ value: AssistantMode; label: string; hint: string; placeholder: string }> = [
   { value: 'explain', label: '只解释', hint: '只读取和说明，不生成或写入变更。', placeholder: '询问当前业务事实、规则、来源或不确定项…' },
-  { value: 'draft', label: '生成草稿', hint: '生成可检查的 Change Set，确认前不写入。', placeholder: '描述要创建的场景、本体、映射或工作流草稿…' },
-  { value: 'apply', label: '应用修改', hint: '定位待应用草稿；写入仍需在 Change Set 卡片二次确认。', placeholder: '说明要应用哪份草稿或需要核对的变更范围…' },
-  { value: 'execute', label: '执行操作', hint: '分析影响并引导预演/审批；不会从聊天直接触发副作用。', placeholder: '描述要执行的 Action、参数和期望结果，以便检查权限与影响…' },
+  { value: 'draft', label: '生成草稿', hint: '生成可检查的变更清单，确认前不写入。', placeholder: '描述要创建的场景、本体、映射或工作流草稿…' },
+  { value: 'apply', label: '应用修改', hint: '定位待应用草稿；写入仍需在变更清单中二次确认。', placeholder: '说明要应用哪份草稿或需要核对的变更范围…' },
+  { value: 'execute', label: '执行操作', hint: '分析影响并引导预演/审批；不会从聊天直接触发副作用。', placeholder: '描述要执行的操作、参数和期望结果，以便检查权限与影响…' },
 ]
 const activeModeOption = computed(() => modeOptions.find((option) => option.value === mode.value) || modeOptions[0])
 const messages = ref<AssistantMessage[]>([])
@@ -360,19 +411,20 @@ const currentThread = computed(() => threads.value.find((thread) => thread.id ==
 const hasStreamingAssistant = computed(() => messages.value.some((message) => message.role === 'assistant' && message.streaming))
 // The Agent chat owns the bottom-right composer controls. A persistent global
 // launcher must not cover its primary send action or keyboard focus target.
-const showLauncher = computed(() => !/^\/agents\/[^/]+\/chat(?:\/|$|\?)/.test(context.value.path))
+const showLauncher = computed(() => {
+  if (props.hideLauncher) return false
+  const path = context.value.path
+  // 场景建模页已有唯一的“AI 建模助手”入口；不再叠加浮动按钮遮挡编辑面板。
+  return !/^\/agents\/[^/]+\/chat(?:\/|$|\?)/.test(path)
+    && !/^\/scenarios\/[^/?]+(?:\/|$|\?)/.test(path)
+})
 const starterSuggestions = computed(() => context.value.scenario_id
-  ? ['解释当前业务场景', '根据当前资料生成本体草稿', '根据现有实体和数据源生成映射草稿', '把当前业务流程编排为工作流']
+  ? ['解释当前业务场景', '根据当前资料生成本体草稿', '根据现有对象类型和数据源生成映射草稿', '把当前业务流程编排为工作流']
   : ['根据我的业务描述生成场景草稿', '这个平台可以帮我做什么？', '我应该先准备哪些业务资料？'])
 
 function proposalOf(message: AssistantMessage): AssistantProposal | null {
   const proposal = message.proposal as AssistantProposal | undefined
   return proposal && proposal.kind && proposal.payload ? proposal : null
-}
-
-function proposalText(proposal: AssistantProposal | null) {
-  if (!proposal) return ''
-  return JSON.stringify(proposal.payload, null, 2)
 }
 
 function proposalCanApply(proposal: AssistantProposal | null) {
@@ -404,9 +456,25 @@ function proposalOperationType(operation: string) {
 
 function proposalResourceLabel(resource: string) {
   return ({
-    scenario: '业务场景', entity: '实体', property: '属性', relation: '关系', mapping: '数据映射', mapping_field: '映射字段', data_mapping: '数据映射',
+    scenario: '业务场景', entity: '对象类型', property: '属性', relation: '关系类型', mapping: '数据映射', mapping_field: '映射字段', data_mapping: '数据映射',
     action: '操作', rule: '规则', workflow: '工作流', workflow_node: '工作流节点', workflow_edge: '工作流连线',
   } as Record<string, string>)[resource] || resource
+}
+
+function scenarioStatusLabel(status?: string) {
+  return ({ draft: '草稿', active: '已启用', archived: '已归档' } as Record<string, string>)[status || 'draft'] || '草稿'
+}
+
+function propertyTypeLabel(type?: string) {
+  return ({ string: '文本', integer: '整数', number: '数值', boolean: '是/否', date: '日期', datetime: '日期时间', object: '对象', array: '列表', uuid: '唯一标识' } as Record<string, string>)[type || 'string'] || '文本'
+}
+
+function workflowNodeTypeLabel(type?: string) {
+  return ({ start: '开始', end: '结束', action: '执行操作', rule: '规则判断', event: '业务事件', condition: '条件分支', llm: '模型处理', parallel: '并行处理', loop: '循环处理', delay: '等待' } as Record<string, string>)[type || ''] || '业务节点'
+}
+
+function actionExecutorLabel(type?: string) {
+  return ({ sql: '数据库查询', skill: '本地技能', mcp: '外部工具', http: 'HTTPS 接口', script: '受控脚本' } as Record<string, string>)[type || ''] || '尚未确定'
 }
 
 function sourcesOf(message: AssistantMessage): AssistantSource[] {
@@ -825,7 +893,7 @@ async function applyProposal(message: AssistantMessage, index: number) {
   try {
     await ElMessageBox.confirm(
       confirmation,
-      '确认应用 Change Set',
+      '确认应用变更清单',
       {
         type: 'warning',
         confirmButtonText: '确认应用',
@@ -847,7 +915,7 @@ async function applyProposal(message: AssistantMessage, index: number) {
     })
     const appliedScenarioId = proposal.kind === 'scenario' ? result?.data?.scenario_id : ''
     message.content += proposal.kind === 'scenario'
-      ? '\n\n业务场景已创建，正在进入闭环工作台。'
+      ? '\n\n业务场景已创建，正在进入场景建设。'
       : proposal.kind === 'mapping'
         ? '\n\n映射草稿已保存。下一步请预览、测试并刷新对象。'
         : '\n\n变更已应用到当前场景草稿。'
@@ -1037,7 +1105,30 @@ onBeforeUnmount(() => {
 .proposal-change-copy { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
 .proposal-change-copy strong { color: var(--text); font-size: 11px; font-weight: 750; line-height: 1.4; }
 .proposal-change-copy span { color: var(--text-3); font-size: 10.5px; line-height: 1.45; }
-.proposal-code { max-height: 180px; margin: 0 12px 10px; padding: 10px; overflow: auto; border-radius: 8px; color: #e2e8f0; background: #1d2930; font-size: 10px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.proposal-detail { display: grid; gap: 10px; max-height: 300px; margin: 0 12px 10px; padding: 10px; overflow: auto; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); }
+.proposal-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 0; }
+.proposal-summary-grid div { padding: 7px 8px; border-radius: 7px; background: var(--surface); }
+.proposal-summary-grid dt { color: var(--text-3); font-size: 9.5px; }
+.proposal-summary-grid dd { margin: 3px 0 0; color: var(--text); font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
+.proposal-description { margin: 0; color: var(--text-2); font-size: 11px; line-height: 1.6; }
+.proposal-section { display: grid; gap: 7px; }
+.proposal-section h4 { margin: 0; color: var(--text); font-size: 11px; }
+.ontology-preview-card { display: grid; gap: 7px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.ontology-preview-card > div:first-child { display: flex; flex-direction: column; gap: 2px; }
+.ontology-preview-card > div:first-child strong { color: var(--text); font-size: 11px; }
+.ontology-preview-card > div:first-child span { color: var(--text-3); font-size: 10px; }
+.ontology-property-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.ontology-property-list > span { display: inline-flex; align-items: center; gap: 4px; padding: 4px 6px; border-radius: 6px; color: var(--text-3); background: var(--surface-2); font-size: 9.5px; }
+.ontology-property-list b { color: var(--text-2); }
+.ontology-property-list em { padding: 1px 4px; border-radius: 999px; color: var(--primary-600); background: var(--primary-soft); font-size: 8px; font-style: normal; }
+.relation-preview-row { display: grid; grid-template-columns: minmax(80px, .8fr) minmax(120px, 1.2fr) auto; align-items: center; gap: 7px; padding: 7px 8px; border-radius: 7px; background: var(--surface); font-size: 10px; }
+.relation-preview-row span { color: var(--text-3); overflow-wrap: anywhere; }
+.proposal-empty { color: var(--warning); line-height: 1.5; }
+.mapping-preview-list, .workflow-preview-list { display: grid; gap: 5px; }
+.mapping-preview-list > div, .workflow-preview-list > div { display: grid; grid-template-columns: minmax(90px, 1fr) auto minmax(90px, 1fr); align-items: center; gap: 7px; padding: 7px 8px; border-radius: 7px; background: var(--surface); font-size: 10px; }
+.mapping-preview-list > div span { color: var(--text-3); }
+.workflow-preview-list > div { grid-template-columns: 22px minmax(0, 1fr) auto; }
+.workflow-preview-list > div > span { display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; color: var(--primary-600); background: var(--primary-soft); font-size: 9px; font-weight: 800; }
 .proposal-actions { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-top: 1px solid var(--border); }
 .proposal-hint { color: var(--text-3); font-size: 10.5px; }
 .message-sources { display: grid; gap: 5px; margin-top: 8px; }
@@ -1083,7 +1174,7 @@ onBeforeUnmount(() => {
 .assistant-action-preview dt { color: var(--text-3); font-size: 9px; }
 .assistant-action-preview dd { margin: 2px 0 0; overflow-wrap: anywhere; color: var(--text); font-size: 10px; }
 .assistant-action-preview p { margin: 8px 0 0; line-height: 1.5; }
-.action-preview-params { max-height: 130px; margin: 8px 0 0; padding: 8px; overflow: auto; border-radius: 7px; background: #1d2930; color: #e2e8f0; font: 10px/1.5 'Cascadia Code', Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.action-preview-params { max-height: 150px; margin: 8px 0 0; padding: 8px; overflow: auto; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
 .assistant-action-next { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
 .assistant-action-next span { min-width: 0; color: var(--text-3); line-height: 1.45; }
 .assistant-action-next .el-button { flex: 0 0 auto; }

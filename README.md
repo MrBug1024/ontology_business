@@ -2,31 +2,31 @@
 
 一个受 **Palantir Ontology** 启发的通用业务智能平台。核心理念：**不绑定任何特定行业**——
 你可以为任意业务场景构建「本体（Ontology）」，再基于本体创建 **Agent**，
-让大模型通过 **SQL 查询、文档检索（RAG）、技能（Skill）、MCP 工具** 自主完成该场景下的任意业务需求。
+让大模型通过 **对象与数据查询、文档检索、确定性函数、规则、受控操作和工作流** 完成该场景下的业务需求。
 
-```
-业务场景（本体：实体/属性/关系）
-        │
-        ▼
-   Agent（绑定 场景 + LLM + 技能 + MCP + 数据源 + 系统提示词）
-        │
-        ▼
-   AI 对话（ReAct 工具调用循环，SSE 流式输出）
+```text
+业务场景
+  → 本体骨架（对象类型 / 属性 / 关系类型）
+  → 数据源接入与测试
+  → 数据映射（形成对象实例与关系实例）
+  → 函数 / 操作 / 规则 / 事件 / 工作流
+  → Agent（场景 + 模型 + 已映射数据）
+  → AI 对话（查询、计算、规则判断、操作预演与工作流协作）
 ```
 
 ## 功能特性
 
-- **业务场景 / 本体建模**：可视化拖拽画布定义实体、属性、关系，支持抽象实体，任意行业通用。
+- **业务场景 / 本体建模**：使用行业通用术语定义对象类型、属性、关系类型、对象实例与关系实例，支持命名空间、主键、枚举、约束、生命周期和来源信息。
 - **数据源**：
   - 关系型数据库：MySQL / PostgreSQL / SQLite（表浏览 + SQL 查询）。
   - 文件桶（file bucket）：上传 Excel / Word / Markdown / PDF / 图片，自动解析入库用于 RAG 检索。
-- **技能（Skill）**：以子进程方式安装并调用本地脚本/服务，内置 `ocr-parser`（OCR 文档解析）与 `data-analyzer`。
-- **MCP 服务**：接入 Model Context Protocol 工具服务（stdio / SSE / streamable_http），自动发现工具并暴露给 Agent。
+- **技能（Skill）**：安装受控的本地能力，供已配置的操作或工作流调用；内置 `ocr-parser`（OCR 文档解析）与 `data-analyzer`。
+- **MCP 服务**：接入 Model Context Protocol 工具服务（stdio / SSE / streamable_http），供已配置的操作或工作流连接外部工具。
 - **LLM 配置**：OpenAI 兼容协议（OpenAI / DeepSeek / 通义 / Ollama / vLLM…），多配置、可设默认、可测试连通性。
-- **Agent 管理**：绑定场景、LLM、技能、MCP、数据源与系统提示词，一键创建智能体。
-- **AI 对话**：可配置轮数的 ReAct 工具调用循环（默认最多 20 轮），SSE 流式输出，工具调用卡片实时展示参数与结果，Markdown 渲染。
-- **高级数据与模型运行时**：在“高级数据与模型”工作台管理地理空间、时序、媒体、实时流、仿真、优化和机器学习资产；记录、运行、反馈均带审计信息。
-- **发布与资源治理**：支持分支、提案、评审、合并、回滚、多环境发布、连接器绑定、资源包导入导出和代码版本化 Starter Kit。
+- **业务能力**：用结构化表单配置无副作用函数、可预演操作、规则、事件和可视化工作流，无需手写 JSON。
+- **Agent 管理**：绑定场景、LLM 与已映射数据；只有本体、数据源、映射、模型和 Agent 数据绑定均完成后才开放对话。
+- **AI 对话**：ReAct 工具循环可查询对象与数据、检索文档、调用确定性函数、评估规则、生成操作预演并协助提交工作流。
+- **任务中心**：集中处理工作流状态、重试和人工审批；运行时内部保留权限、连接解析和定义快照等安全内核，但不作为独立业务菜单暴露。
 
 ## 技术栈
 
@@ -59,7 +59,7 @@ project-root
 │   │   └── data-analyzer/     # 数据分析技能
 │   ├── tests/                 # 平台策略与核心行为回归测试
 │   ├── data/                  # platform.db + buckets/（文件桶存储）
-│   ├── .env                   # OCR / 调试配置
+│   ├── .env.example           # 无密钥配置模板；复制为 .env 后按需填写
 │   └── requirements.txt
 └── frontend/
     ├── src/
@@ -68,29 +68,34 @@ project-root
     │   ├── stores/            # Pinia
     │   ├── types/             # 领域类型
     │   ├── styles/            # 全局样式
-    │   └── views/             # Dashboard / Scenarios / ScenarioDetail / DataSources / Agents / AgentChat / Skills / MCP / LLMConfigs
+    │   └── views/             # Scenarios / ScenarioDetail / DataSources / Agents / AgentChat / Tasks / Skills / MCP / LLMConfigs
     ├── vite.config.ts         # 端口 5173，/api 代理到 127.0.0.1:8001
     └── package.json
 ```
 
 ## 快速开始
 
-### 1. 后端（Python 3.12，conda 环境 `ontology_platform_env`）
+以下命令都在仓库根目录执行。
+
+### 1. 后端（Python 3.12）
 
 ```powershell
-# 激活环境（已创建）
-conda activate ontology_platform_env
+# 创建并激活虚拟环境（首次）
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 
 # 安装依赖（首次）
-pip install -r <project-root>\backend\requirements.txt
+python -m pip install -r .\backend\requirements.txt
+
+# 创建本地配置（首次；不要提交真实密钥）
+Copy-Item .\backend\.env.example .\backend\.env
 
 # 生成演示数据（可选；演示种子不属于平台运行时代码）
-$env:PYTHONPATH="<project-root>\backend"
-python <project-root>\backend\examples\seed_retail.py
-python <project-root>\backend\examples\seed_bookkeeping.py
+$env:PYTHONPATH=(Resolve-Path .\backend).Path
+python .\backend\examples\seed_retail.py
+python .\backend\examples\seed_bookkeeping.py
 
-# 启动后端（端口 8001，8000 被占用）
-$env:PYTHONPATH="<project-root>\backend"
+# 启动后端（默认使用 8001）
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 ```
 
@@ -100,19 +105,19 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 
 ```powershell
 # 安装依赖（首次）
-npm --prefix <project-root>\frontend install
+npm --prefix .\frontend install
 # 若 npm 11 拦截了 postinstall 脚本：
-npm --prefix <project-root>\frontend approve-scripts esbuild vue-demi
+npm --prefix .\frontend approve-scripts esbuild vue-demi
 
 # 启动开发服务器（端口 5173，/api 自动代理到 8001）
-npm --prefix <project-root>\frontend run dev
+npm --prefix .\frontend run dev
 ```
 
 > 打开浏览器访问：http://127.0.0.1:5173
 
 ## 配置说明
 
-### OCR 服务（`backend/.env`）
+### OCR 服务（把 `backend/.env.example` 复制为 `backend/.env`）
 
 `ocr-parser` 技能与 PDF/图片解析依赖外部 OCR 服务：
 
@@ -124,16 +129,16 @@ OCR_API_KEY=你的密钥
 - 未配置 `OCR_API_KEY` 时：PDF 回退到 `pypdf` 提取文本，图片解析会报错。
 - 配置后：PDF / 图片均可走 OCR 服务获得更高质量文本。
 
-### LLM 配置（前端「LLM 配置」页）
+### LLM 配置（前端「能力配置 → 大模型」）
 
 种子数据默认创建了一个 `gpt-4o-mini` 配置（占位 API Key）。
-请在 **LLM 配置** 页面编辑或新建，填入真实的 `Base URL` / `API Key` / `模型`，
+请在 **大模型** 页面编辑或新建，填入真实的 `Base URL` / `API Key` / `模型`，
 并勾选「设为默认」。支持任意 OpenAI 兼容服务（DeepSeek、通义、Ollama、vLLM 等）。
 
 ### 邮箱认证（`backend/.env`）
 
 平台支持邮箱注册、邮箱验证码验证、登录、退出登录和密码重置。邮件服务只从后端环境变量读取，
-不会写入平台代码；`backend/.env` 已按当前 SMTP 服务配置完成，部署到其他环境时请替换为对应环境变量。
+不会写入平台代码。仓库只提供不含密钥的 `backend/.env.example`；注册和密码重置需要部署者在本地 `backend/.env` 中配置邮件服务。
 
 ```ini
 MAIL_USERNAME=你的邮箱账号
@@ -151,20 +156,15 @@ MAIL_TIMEOUT_SECONDS=20
 数据源、LLM、MCP 和技能可被登录用户读取/使用，但公共资源不允许被其他租户修改。首次注册时，旧版本未带租户
 信息的私有演示数据会认领到首个用户的工作区。
 
-## 使用流程（Builder 5 阶段 + Operator 日常闭环）
+## 第一版使用流程
 
-Builder 模式按页面顶部流水线推进，当前场景会随链接保持，不需要在模块间反复选择：
+平台只有一套导航和一条主链路：
 
-1. **定义场景与本体**：从业务描述和临时附件开始，确认 AI Change Set，再定义对象、属性、关系与规则。
-2. **接入并映射数据**：连接数据库或文件桶，预览字段、配置转换与主键，刷新形成可追踪的真实对象。
-3. **编排智能与动作**：配置模型、Agent、技能/MCP、类型化 Action 和带人工审批的工作流。
-4. **校验评审并发布**：核对差异和测试结果，经独立评审后发布到目标环境；运行定义被固定到发布快照。
-5. **运营、审批与复盘**：在任务、异常和血缘页面完成审批、恢复与端到端审计。
-
-Operator 模式默认只突出“今日总览 → 业务对象工作台 → 待办与审批 → 异常处置”，治理与技术配置收纳到构建/管理区域。
-
-高级能力可从左侧 **高级数据与模型** 进入。资产运行器只执行服务端 allowlist 内的确定性算子，
-不会执行用户提交的 Python、SQL、Shell 或远程代码；生产/预发布环境优先读取已发布的冻结资产定义。
+1. **创建业务场景并建立本体骨架**：先定义对象类型、属性、主键和关系类型；也可以上传业务文档，由 AI 生成可检查的变更清单，确认后才写入。
+2. **接入并测试数据源**：数据库先读取表结构，文件桶先完成解析与索引。没有真实字段时不能创建数据映射。
+3. **配置数据映射**：把源表/文件字段映射到对象属性，预览、测试并刷新为对象实例。顺序是“本体骨架 → 数据源 → 映射”，不是在数据源和映射之间二选一。
+4. **配置业务能力**：按需定义函数、操作、规则、事件和工作流。函数用于无副作用计算；操作用于写入或外部调用并要求预演/确认。
+5. **创建 Agent 并进入对话**：绑定场景、模型及映射所用数据源，让 Agent 基于本体语义和受治理能力完成业务需求。
 
 ## 内置工具（Agent 可调用）
 
@@ -175,8 +175,10 @@ Operator 模式默认只突出“今日总览 → 业务对象工作台 → 待�
 | `run_sql` | 在指定数据源执行 SQL 查询 |
 | `search_documents` | 在文件桶中做 RAG 语义/关键词检索 |
 | `read_document` | 读取指定文档全文 |
-| `execute_skill` | 以子进程执行已安装技能 |
-| `mcp_{name}_{tool}` | 调用已接入 MCP 服务的工具 |
+| `list_functions` / `run_function` | 查看并调用无副作用的确定性业务函数 |
+| `list_rules` / `evaluate_rule` | 查看并评估业务规则 |
+| `list_actions` / `execute_action` | 查看操作并生成安全预演；真实副作用仍需用户确认 |
+| `list_workflows` / `execute_workflow` | 查看工作流并返回显式提交指引 |
 
 ## 平台边界与安全策略
 
@@ -189,14 +191,13 @@ Operator 模式默认只突出“今日总览 → 业务对象工作台 → 待�
 ## 回归验证
 
 ```powershell
-$env:PYTHONPATH="<project-root>\backend"
-python -m unittest discover -s <project-root>\backend\tests -v
-npm --prefix <project-root>\frontend run build
+$env:PYTHONPATH=(Resolve-Path .\backend).Path
+python -m pytest .\backend\tests -q
+npm --prefix .\frontend run build
 ```
 
 ## 常见问题
 
-- **端口 8000 被占用**：本项目后端固定使用 **8001**，前端代理已指向 8001。
+- **需要改后端端口**：同步设置前端环境变量 `VITE_API_PROXY_TARGET`，默认代理目标是 `http://127.0.0.1:8001`。
 - **npm 11 拦截 postinstall**：执行 `npm approve-scripts esbuild vue-demi`。
-- **PowerShell 终端 cwd 重置**：使用 `npm --prefix <project-root>\frontend ...` 与 `$env:PYTHONPATH="<project-root>\backend"` 前缀，避免 `Set-Location` 被剥离。
 - **LLM 调用失败**：检查 LLM 配置的 API Key 是否真实有效，可在 LLM 配置页点「测试」。

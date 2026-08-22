@@ -3,7 +3,7 @@
     <div class="page-header">
       <div>
         <h1>MCP 服务</h1>
-        <div class="sub">Model Context Protocol 工具服务，供受治理的 Action / 工作流配置外部工具连接</div>
+        <div class="sub">Model Context Protocol 工具服务，供已配置的操作和工作流连接外部工具</div>
       </div>
       <el-button v-if="canManage" type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
     </div>
@@ -24,7 +24,7 @@
             <div class="mc-icon"><el-icon :size="20"><Connection /></el-icon></div>
             <div class="mc-title">
               <div class="mc-name">{{ m.name }}</div>
-              <el-tag size="small" type="info" effect="light">{{ m.transport }}</el-tag>
+              <el-tag size="small" type="info" effect="light">{{ transportLabel(m.transport) }}</el-tag>
             </div>
             <el-switch v-if="canManage" :model-value="!!m.enabled" @change="(v:any)=>toggle(m, v)" style="margin-left:auto" />
             <el-tag v-else size="small" :type="m.enabled ? 'success' : 'info'" effect="light">{{ m.enabled ? '已启用' : '已停用' }}</el-tag>
@@ -53,23 +53,21 @@
         <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：文件系统、天气服务" /></el-form-item>
         <el-form-item label="传输方式" required>
           <el-radio-group v-model="form.transport">
-            <el-radio value="stdio">stdio</el-radio>
-            <el-radio value="sse">sse</el-radio>
-            <el-radio value="streamable_http">streamable_http</el-radio>
+            <el-radio value="stdio">本地进程</el-radio>
+            <el-radio value="sse">事件流</el-radio>
+            <el-radio value="streamable_http">流式 HTTP</el-radio>
           </el-radio-group>
         </el-form-item>
         <template v-if="form.transport === 'stdio'">
           <el-form-item label="命令" required><el-input v-model="form.command" placeholder="如：npx 或 python" /></el-form-item>
-          <el-form-item label="参数">
-            <el-input v-model="argsText" placeholder="空格分隔，如：-m mcp-server-filesystem /data" />
+          <el-form-item label="启动参数">
+            <el-select v-model="form.args" multiple filterable allow-create default-first-option placeholder="输入一项后按回车添加" style="width:100%" />
           </el-form-item>
         </template>
         <template v-else>
           <el-form-item label="URL" required><el-input v-model="form.url" placeholder="http://host:port/sse" /></el-form-item>
         </template>
-        <el-form-item label="环境变量">
-          <el-input v-model="envText" type="textarea" :rows="2" class="mono" placeholder="每行 KEY=VALUE" />
-        </el-form-item>
+        <el-form-item label="环境变量"><KeyValueEditor v-model="form.env" key-placeholder="变量名" value-placeholder="变量值" empty-text="没有额外环境变量" /></el-form-item>
         <el-form-item label="启用"><el-switch v-model="form.enabled" /></el-form-item>
       </el-form>
       <template #footer>
@@ -97,6 +95,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 import type { MCPConfig, MCPTool } from '@/types'
+import KeyValueEditor from '@/components/KeyValueEditor.vue'
 
 const auth = useAuthStore()
 const canManage = computed(() => auth.user?.can_manage === true)
@@ -105,8 +104,6 @@ const dlg = ref(false)
 const saving = ref(false)
 const loading = ref(false)
 const form = ref<Partial<MCPConfig>>({ transport: 'stdio', enabled: true })
-const argsText = ref('')
-const envText = ref('')
 
 const toolsDlg = ref(false)
 const curMcp = ref<MCPConfig | null>(null)
@@ -125,36 +122,23 @@ async function load() {
 }
 function openCreate() {
   if (!canManage.value) return
-  form.value = { name: '', transport: 'stdio', command: '', args: [], enabled: true }
-  argsText.value = ''
-  envText.value = ''
+  form.value = { name: '', transport: 'stdio', command: '', args: [], env: {}, enabled: true }
   dlg.value = true
 }
 function openEdit(m: MCPConfig) {
   if (!canManage.value) return
   form.value = { ...m, args: [...(m.args || [])], env: { ...(m.env || {}) } }
-  argsText.value = (m.args || []).join(' ')
-  envText.value = Object.entries(m.env || {}).map(([k, v]) => `${k}=${v}`).join('\n')
   dlg.value = true
 }
-function parseEnv(t: string) {
-  const out: Record<string, string> = {}
-  for (const line of t.split('\n')) {
-    const i = line.indexOf('=')
-    if (i > 0) out[line.slice(0, i).trim()] = line.slice(i + 1).trim()
-  }
-  return out
+function transportLabel(transport?: string) {
+  return ({ stdio: '本地进程', sse: '事件流', streamable_http: '流式 HTTP' } as Record<string, string>)[transport || ''] || '外部工具'
 }
 async function save() {
   if (!canManage.value) return
   if (!form.value.name) return ElMessage.warning('请填写名称')
   const payload: any = { ...form.value }
-  if (form.value.transport === 'stdio') {
-    payload.args = argsText.value.trim() ? argsText.value.trim().split(/\s+/) : []
-  } else {
-    payload.args = []
-  }
-  payload.env = parseEnv(envText.value)
+  payload.args = form.value.transport === 'stdio' ? [...(form.value.args || [])] : []
+  payload.env = { ...(form.value.env || {}) }
   saving.value = true
   try {
     if (form.value.id) await api.updateMCP(form.value.id, payload)

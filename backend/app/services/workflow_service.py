@@ -165,6 +165,42 @@ def validate_workflow_definition(nodes: list[dict[str, Any]], edges: list[dict[s
         )
 
 
+def validate_workflow_references(
+    db: Session,
+    scenario_id: str,
+    *,
+    steps: list[dict[str, Any]] | None = None,
+    nodes: list[dict[str, Any]] | None = None,
+) -> None:
+    """校验工作流引用完整且不跨业务场景。"""
+    references = [
+        (str(step.get("type") or ""), step)
+        for step in (steps or [])
+        if isinstance(step, dict)
+    ] + [
+        (str(node.get("type") or ""), node.get("data") or {})
+        for node in (nodes or [])
+        if isinstance(node, dict)
+    ]
+    labels = {"action": "操作", "rule": "规则", "event": "事件"}
+    definitions = {
+        "action": (OntologyAction, "action_id"),
+        "rule": (OntologyRule, "rule_id"),
+        "event": (OntologyEvent, "event_id"),
+    }
+    for kind, data in references:
+        definition = definitions.get(kind)
+        if definition is None:
+            continue
+        model, key = definition
+        resource_id = str((data or {}).get(key) or "").strip()
+        if not resource_id:
+            raise PolicyViolation(f"工作流的{labels[kind]}节点缺少已配置的{labels[kind]}引用")
+        resource = db.get(model, resource_id)
+        if not resource or resource.scenario_id != scenario_id:
+            raise PolicyViolation(f"工作流引用的{labels[kind]}不存在或不属于当前业务场景")
+
+
 _HTTP_ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
 _HTTP_BLOCKED_HEADERS = {"host", "connection", "proxy-authorization", "proxy-connection"}
 _UNMANAGED_SKILL_CONFIG_FIELDS = {"skill_name", "skill_path", "script", "interpreter"}
@@ -1560,6 +1596,9 @@ def _try_parse_json(text: str) -> Any:
 # ──────────────────────────────────────────────
 # AI 生成可视化工作流（DAG 草稿，不落库）
 # ──────────────────────────────────────────────
+WORKFLOW_CONTEXT_MAX_CHARS = 100_000
+
+
 _WF_GEN_PROMPT = """你是资深业务流程架构师，擅长把业务描述编排成可视化工作流（DAG）。
 请根据下面的业务描述，设计一个简洁、可执行的工作流。
 
@@ -1612,9 +1651,23 @@ _WF_GEN_PROMPT = """你是资深业务流程架构师，擅长把业务描述编
 """
 
 
+def _workflow_context(description: str) -> str:
+    """返回完整且有明确边界的输入，不对业务文档做静默截断。"""
+    context = str(description or "")
+    if len(context) > WORKFLOW_CONTEXT_MAX_CHARS:
+        raise ValueError(
+            f"工作流生成上下文共 {len(context)} 个字符，超过单次生成"
+            f" {WORKFLOW_CONTEXT_MAX_CHARS} 个字符的明确边界；"
+            "系统不会静默截断文档，请拆分文档后分批生成并审阅工作流草稿"
+        )
+    return context
+
+
 def generate_workflow(db: Session, scenario: BusinessScenario, description: str) -> dict[str, Any]:
     """调用 LLM 生成可视化工作流草稿（DAG 节点+连线，不落库）。"""
     from ..models import OntologyEvent
+
+    context = _workflow_context(description or scenario.description or "")
 
     llm = tenant_service.get_visible(db, LLMConfig, scenario.llm_config_id) if getattr(scenario, "llm_config_id", None) and db.info.get("tenant_id") else None
     if not llm:
@@ -1641,7 +1694,7 @@ def generate_workflow(db: Session, scenario: BusinessScenario, description: str)
         _WF_GEN_PROMPT.replace("{actions}", _fmt(actions))
         .replace("{rules}", _fmt(rules))
         .replace("{events}", _fmt(events))
-        .replace("{description}", (description or scenario.description or "")[:3000])
+        .replace("{description}", context)
     )
 
     from .ontology_service import _extract_json

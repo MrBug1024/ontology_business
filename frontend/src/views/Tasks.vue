@@ -62,7 +62,7 @@
           <template #default="{ row }">
             <button class="task-name" type="button" @click="showTask(row.id)">
               <b>{{ row.workflow_name || '未命名工作流' }}</b>
-              <small>{{ row.trigger_source || 'manual' }} · {{ shortId(row.id) }}</small>
+              <small>{{ triggerSourceLabel(row.trigger_source) }} · {{ shortId(row.id) }}</small>
             </button>
           </template>
         </el-table-column>
@@ -146,12 +146,8 @@
         </section>
 
         <section class="detail-grid" aria-label="任务信息">
-          <div><span>触发来源</span><b>{{ selectedTask.trigger_source || 'manual' }}</b></div>
-          <div><span>运行环境</span><b>{{ selectedTask.environment || 'dev' }}</b></div>
-          <div><span>定义版本</span><b>{{ selectedTask.definition_source === 'release' ? '已冻结发布快照' : '实时开发定义' }}</b></div>
-          <div v-if="selectedTask.definition_snapshot_id"><span>发布快照 ID</span><b class="mono">{{ selectedTask.definition_snapshot_id }}</b></div>
-          <div v-if="selectedTask.release_id"><span>发布记录 ID</span><b class="mono">{{ selectedTask.release_id }}</b></div>
-          <div v-if="selectedTask.definition_hash"><span>定义校验哈希</span><b class="mono">{{ selectedTask.definition_hash }}</b></div>
+          <div><span>触发来源</span><b>{{ triggerSourceLabel(selectedTask.trigger_source) }}</b></div>
+          <div><span>定义依据</span><b>{{ selectedTask.definition_source === 'release' ? '已固定的场景定义' : '当前场景定义' }}</b></div>
           <div><span>执行尝试</span><b>{{ Math.max(selectedTask.attempt || 0, 1) }} / {{ Math.max(selectedTask.max_attempts || 0, 1) }}</b></div>
           <div><span>超时设置</span><b>{{ selectedTask.timeout_seconds || 0 }} 秒</b></div>
           <div><span>下次重试</span><b>{{ formatDate(selectedTask.next_retry_at) || '—' }}</b></div>
@@ -161,11 +157,11 @@
 
         <section class="detail-section">
           <h4>输入参数</h4>
-          <pre class="detail-code mono">{{ formatJson(selectedTask.input_params) }}</pre>
+          <StructuredValueViewer :value="selectedTask.input_params" empty-text="无需输入参数" />
         </section>
         <section v-if="selectedTask.result && Object.keys(selectedTask.result).length" class="detail-section">
           <h4>执行结果</h4>
-          <pre class="detail-code mono">{{ formatJson(selectedTask.result) }}</pre>
+          <StructuredValueViewer :value="selectedTask.result" empty-text="暂无执行结果" />
         </section>
 
         <footer v-if="canCancel(selectedTask) || canRetry(selectedTask)" class="task-detail-footer">
@@ -183,6 +179,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import type { Scenario, WorkflowApproval, WorkflowRun } from '@/types'
+import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
 
 type StatusTagType = 'success' | 'warning' | 'danger' | 'info' | 'primary' | ''
 type StatusMeta = { label: string; type: StatusTagType; description: string }
@@ -256,6 +253,16 @@ function safeReturnPath(value: unknown): string {
 function statusMeta(status: string): StatusMeta {
   return STATUS_META[status] || { label: status || '未知', type: 'info', description: '服务端返回的任务状态' }
 }
+function triggerSourceLabel(source?: string | null) {
+  return ({
+    manual: '人工发起',
+    agent: 'Agent 对话',
+    event: '业务事件',
+    workflow: '工作流',
+    api: '外部系统',
+    retry: '自动重试',
+  } as Record<string, string>)[String(source || 'manual').toLowerCase()] || '系统触发'
+}
 function isWaitingApproval(approval: WorkflowApproval) {
   return ['pending', 'awaiting_approval', 'awaiting', 'requested'].includes(approval.status)
 }
@@ -284,9 +291,6 @@ function formatDate(value?: string | null) {
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN', {
     month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
   })
-}
-function formatJson(value: unknown) {
-  return JSON.stringify(value || {}, null, 2)
 }
 function isCancelled(error: unknown) {
   if (error === 'cancel' || error === 'close') return true

@@ -49,7 +49,7 @@ def _database_path() -> Path:
 
 
 def _seed_source_database(path: Path) -> None:
-    """Create a harmless external SQLite source used by the read-only SQL Action."""
+    """Create a harmless external SQLite source used by the read-only operation."""
     if path.exists():
         raise SystemExit(f"Refusing to overwrite existing fixture source database: {path}")
     connection = sqlite3.connect(path)
@@ -168,7 +168,6 @@ def main() -> None:
     from app.services import (
         auth_service,
         datasource_service,
-        incident_service,
         permission_service,
         rag_service,
         workflow_service,
@@ -227,7 +226,7 @@ def main() -> None:
         scenario = BusinessScenario(
             tenant_id=tenant.id,
             name="P1 浏览器联调场景",
-            description="覆盖对象、资料检索、Action、工作流、事件、Case、Agent 与血缘的隔离联调数据。",
+            description="覆盖对象、资料检索、操作、规则、事件、工作流与 Agent 的隔离联调数据。",
             industry="采购运营",
             status="active",
         )
@@ -361,7 +360,7 @@ def main() -> None:
             "# P1 采购运营手册\n\n"
             "金额超过 10000 元的采购申请必须经过人工审批，审批人需核对供应商、预算和证据资料。\n\n"
             "采购申请提交后会发布“采购申请已提交”事件；事件订阅工作流仅可在有明确执行主体时运行。\n\n"
-            "所有 Action 必须预演、确认并保留幂等键，Agent 只生成预演，不直接执行外部副作用。"
+            "所有操作必须预演、确认并防止重复提交，Agent 只生成预演，不直接执行外部副作用。"
         )
         bucket_file = datasource_service.save_bucket_file(
             bucket_source,
@@ -513,10 +512,8 @@ def main() -> None:
             description="绑定采购场景、资料库和本地 Mock LLM 的只读/预演 Agent。",
             scenario_id=scenario.id,
             llm_config_id=llm.id,
-            system_prompt="优先引用资料库；只预演 Action，绝不直接执行外部副作用。",
+            system_prompt="优先引用资料库；只预演操作，绝不直接执行外部副作用。",
             data_source_ids=[bucket_source.id, sql_source.id],
-            skill_ids=[],
-            mcp_ids=[],
             temperature=0.1,
             max_tokens=1024,
         )
@@ -602,25 +599,8 @@ def main() -> None:
             ]
         )
 
-        incident = incident_service.create_incident(
-            db,
-            scenario,
-            {
-                "title": "待处理：采购额度核验",
-                "description": "联调用高优先级 Case；可在浏览器中确认并解决，完整历史会被保留。",
-                "severity": "high",
-                "source": "workflow",
-                "source_ref": approval_workflow.id,
-                "related_object_id": instances[0].id,
-                "assignee_user_id": owner.id,
-                "context": {"fixture": True, "action_id": action.id},
-            },
-            actor_user_id=owner.id,
-            tenant_id=tenant.id,
-        )
-
-        # A real, side-effect-free read-only Action record lets the lineage
-        # page demonstrate Action -> external result without requiring the
+        # A real, side-effect-free read-only operation lets the execution
+        # page demonstrate operation -> external result without requiring the
         # browser run to manufacture its own prior history.
         db.commit()
         action_result = workflow_service.execute_action(
@@ -631,7 +611,7 @@ def main() -> None:
             idempotency_key="e2e-fixture-readonly-action",
         )
         if action_result.get("status") != "success":
-            raise RuntimeError(f"Could not execute fixture read-only Action: {action_result}")
+            raise RuntimeError(f"Could not execute fixture read-only operation: {action_result}")
 
         pending_run, pending_approval = _add_initial_pending_run(
             db,
@@ -661,7 +641,6 @@ def main() -> None:
             "event_workflow_id": event_workflow.id,
             "initial_pending_run_id": pending_run.id,
             "initial_pending_approval_id": pending_approval.id,
-            "incident_id": incident.id,
             "agent_id": agent.id,
             "assistant_thread_id": assistant_thread.id,
             "llm_config_id": llm.id,
@@ -669,8 +648,6 @@ def main() -> None:
                 "scenario": f"/scenarios/{scenario.id}",
                 "agent": f"/agents/{agent.id}/chat",
                 "tasks": f"/tasks?scenario_id={scenario.id}",
-                "incidents": f"/incidents?scenario_id={scenario.id}",
-                "lineage": f"/lineage?scenario_id={scenario.id}",
             },
         }
         print("E2E_P1_FIXTURE=" + json.dumps(payload, ensure_ascii=False, sort_keys=True))

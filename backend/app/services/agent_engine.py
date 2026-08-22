@@ -6,6 +6,8 @@
 - run_sql             在数据源上执行只读 SQL
 - search_documents    在文件桶中检索相关文档片段（RAG）
 - read_document       读取某个已解析文档的全文
+- list_functions      列出场景中的无副作用业务函数
+- run_function        调用确定性业务函数
 
 Agent 只承担读取、检索、解释和受控 Action 预演。任何外部副作用都必须由用户
 通过类型化 Action 或任务中心的显式确认入口触发，不能由模型工具调用直接执行。
@@ -24,15 +26,14 @@ from ..models import (
     BusinessScenario,
     BucketFile,
     DataSource,
+    FunctionDefinition,
     LLMConfig,
-    MCPConfig,
     OntologyAction,
     OntologyEvent,
     OntologyRule,
     OntologyWorkflow,
-    Skill,
 )
-from . import datasource_service, llm_service, mcp_service, ontology_service, permission_service, rag_service, skill_service, tenant_service, workflow_service
+from . import datasource_service, function_runtime_service, llm_service, ontology_service, permission_service, rag_service, tenant_service, workflow_service
 
 class AgentContext:
     """一次 Agent 会话的运行时上下文。"""
@@ -60,8 +61,6 @@ class AgentContext:
         # 一次回答内的引用编号必须稳定、全局唯一；不能把每次检索各自的 C1 混在一起。
         self.citations: list[dict[str, Any]] = []
         self._citations_by_key: dict[tuple[str, str, int, int], dict[str, Any]] = {}
-        self.skills: list[Skill] = []
-        self.mcps: list[MCPConfig] = []
         self._load_bindings()
 
     def _load_bindings(self) -> None:
@@ -77,25 +76,22 @@ class AgentContext:
                     )
                 ).scalars().all()
             )
-        sk_ids = self.agent.skill_ids or []
-        if sk_ids:
-            skill_scope = tenant_service.visible_clause(Skill, self.db)
-            self.skills = list(
-                self.db.execute(select(Skill).where(Skill.id.in_(sk_ids), Skill.enabled == True, skill_scope)).scalars().all()  # noqa: E712
-            )
-        mcp_ids = self.agent.mcp_ids or []
-        if mcp_ids:
-            mcp_scope = tenant_service.visible_clause(MCPConfig, self.db)
-            self.mcps = list(
-                self.db.execute(select(MCPConfig).where(MCPConfig.id.in_(mcp_ids), MCPConfig.enabled == True, mcp_scope)).scalars().all()  # noqa: E712
-            )
-        # 本体扩展：操作 / 规则 / 事件 / 工作流（按场景加载）
+        # 本体扩展：函数 / 操作 / 规则 / 事件 / 工作流（按场景加载）
+        self.functions: list[FunctionDefinition] = []
         self.actions: list[OntologyAction] = []
         self.rules: list[OntologyRule] = []
         self.events: list[OntologyEvent] = []
         self.workflows: list[OntologyWorkflow] = []
         sid = self.agent.scenario_id
         if sid:
+            self.functions = list(
+                self.db.execute(
+                    select(FunctionDefinition).where(
+                        FunctionDefinition.scenario_id == sid,
+                        FunctionDefinition.runtime_kind != "contract",
+                    )
+                ).scalars().all()
+            )
             candidate_actions = list(
                 self.db.execute(select(OntologyAction).where(OntologyAction.scenario_id == sid, OntologyAction.enabled == True)).scalars().all()  # noqa: E712
             )
@@ -234,19 +230,32 @@ class AgentContext:
                     },
                 ),
             ]
+        # 函数是闭集、确定性且无副作用的计算能力，可由 Agent 直接调用。
+        if self.functions:
+            tools.append(_tool("list_functions", "列出当前业务场景中可调用的业务函数及输入输出字段。", {}))
+            tools.append(
+                _tool(
+                    "run_function",
+                    "调用无副作用的确定性业务函数。先用 list_functions 获取函数 id 和字段。",
+                    {
+                        "function_id": {"type": "string", "description": "业务函数 id", "required": True},
+                        "params": {"type": "object", "description": "按函数输入字段填写的参数", "required": True},
+                    },
+                )
+            )
         # 本体扩展工具：操作 / 规则 / 工作流
         if self.actions:
             tools.append(
                 _tool(
                     "list_actions",
-                    "列出当前业务场景中定义的所有可执行操作（Actions），返回 id、名称、所属实体、执行方式。",
+                    "列出当前业务场景中定义的所有可执行操作，返回 id、名称、所属对象类型和执行方式。",
                     {},
                 )
             )
             tools.append(
                 _tool(
                     "execute_action",
-                    "执行场景中定义的某个操作（Action）。参数 action_id 为操作 id，params 为输入参数对象。",
+                    "预演场景中定义的某个操作。参数 action_id 为操作 id，params 为输入参数对象。",
                     {
                         "action_id": {"type": "string", "description": "操作 id"},
                         "params": {"type": "object", "description": "输入参数"},
@@ -353,10 +362,42 @@ class AgentContext:
                 return self._read_doc(args.get("file_id", ""), args.get("filename", ""))
             if name == "save_deliverable" or name == "execute_skill" or name.startswith("mcp_"):
                 return (
-                    "Agent 不直接执行 Skill、MCP 或写入文件；请将该副作用配置为类型化 Action，"
+                    "Agent 不直接执行本地技能、外部工具或写入文件；请将该副作用配置为场景操作，"
                     "由用户在操作页或任务中心完成预演和显式确认。"
                 )
             # 本体扩展工具
+            if name == "list_functions":
+                return _dump(
+                    [
+                        {
+                            "id": function.id,
+                            "name": function.name,
+                            "description": function.description[:120],
+                            "input_schema": function.input_schema or {},
+                            "output_schema": function.output_schema or {},
+                            "runtime": function.runtime_kind,
+                        }
+                        for function in self.functions
+                    ]
+                )
+            if name == "run_function":
+                key = str(args.get("function_id") or "")
+                function = next((item for item in self.functions if item.id == key or item.name == key), None)
+                if not function:
+                    names = "、".join(item.name for item in self.functions)
+                    return f"未找到可调用函数: {key}（可用函数: {names}）"
+                run = function_runtime_service.create_function_run(
+                    self.db,
+                    function,
+                    args.get("params") or {},
+                    tenant_id=self.tenant_id,
+                    scenario_id=function.scenario_id,
+                    user_id=str(self.db.info.get("user_id")) if self.db.info.get("user_id") else None,
+                )
+                self.db.flush()
+                if run.status != "succeeded":
+                    return f"函数运行失败: {run.error}"
+                return _dump(run.output_payload or {})
             if name == "list_actions":
                 return _dump(
                     [
@@ -499,15 +540,15 @@ class AgentContext:
     def _save_deliverable(self, filename: str, content: str) -> str:
         """Legacy direct-write hook retained as a non-executing compatibility response."""
         return (
-            "Agent 不直接写入文件桶；请通过类型化 Action 配置文件交付，"
+            "Agent 不直接写入文件桶；请通过场景操作配置文件交付，"
             "并由用户在操作页或任务中心完成确认。"
         )
 
     def _exec_skill(self, skill_name: str, args: list[str]) -> str:
-        return "Agent 不直接执行 Skill；请通过类型化 Action 配置技能并由用户确认。"
+        return "Agent 不直接执行本地技能；请通过场景操作配置技能并由用户确认。"
 
     def _exec_mcp(self, tool_name: str, args: dict[str, Any]) -> str:
-        return "Agent 不直接调用 MCP；请通过类型化 Action 配置 MCP 工具并由用户确认。"
+        return "Agent 不直接调用外部工具服务；请通过场景操作配置工具并由用户确认。"
 
 
 def _tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, Any]:
@@ -570,15 +611,15 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
         table_map = _table_map(ctx)
         if table_map:
             parts.append("\n【实体 → 数据库表名映射】（run_sql 时请使用下列真实表名，不要臆造）\n" + table_map)
-    if ctx.skills:
-        parts.append("\n【已安装技能】\n" + "\n".join(f"- {s.name}: {s.description[:80]}" for s in ctx.skills))
-        parts.append("这些能力只能通过已经配置并获确认的 Action 使用，不能由对话直接执行。")
-    if ctx.mcps:
-        parts.append("\n【已安装 MCP 服务】\n" + "\n".join(f"- {m.name}（{m.transport}）" for m in ctx.mcps))
-        parts.append("这些能力只能通过已经配置并获确认的 Action 使用，不能由对话直接调用。")
+    if ctx.functions:
+        parts.append(
+            "\n【业务函数（无副作用计算）】\n"
+            + "\n".join(f"- {function.name}（id={function.id}，{function.runtime_kind}）: {function.description[:60]}" for function in ctx.functions)
+            + "\n你可以用 list_functions 查看输入输出字段，用 run_function 直接完成确定性计算。"
+        )
     if ctx.actions:
         parts.append(
-            "\n【可执行操作（Actions）】\n"
+            "\n【可执行操作】\n"
             + "\n".join(f"- {a.name}（id={a.id}，{a.entity.name if a.entity else '?'}，{a.executor_type}）: {a.description[:60]}" for a in ctx.actions)
             + "\n你可以用 list_actions 查看操作列表，用 execute_action 生成预演；实际执行须由用户在操作页或任务中心确认。"
         )
@@ -597,7 +638,7 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
     parts.append(
         "\n【工作方式】请根据用户问题，自主调用合适的工具获取数据，然后给出准确、结构化的回答。"
         "涉及数据时务必基于工具返回的真实数据，不要编造；无法确认时明确说明数据缺口。"
-        "如果场景定义了本体、操作、规则或工作流，优先使用这些业务抽象来完成任务。"
+        "如果场景定义了本体、函数、操作、规则或工作流，优先使用这些业务抽象来完成任务。"
     )
     return "\n".join(parts)
 
@@ -619,8 +660,14 @@ def ontology_summary_for(scenario) -> str:
         tgt = next((e.name for e in scenario.entities if e.id == r.target_entity_id), "?")
         lines.append(f"- 关系: {src} --[{r.name}]--({r.relation_type})--> {tgt}")
     # 本体扩展维度
+    if getattr(scenario, "function_definitions", None):
+        executable = [function for function in scenario.function_definitions if function.runtime_kind != "contract"]
+        if executable:
+            lines.append("\n【业务函数（Functions）】")
+            for function in executable:
+                lines.append(f"- 函数「{function.name}」({function.runtime_kind}): {function.description[:60]}")
     if getattr(scenario, "actions", None):
-        lines.append("\n【操作（Actions）】")
+        lines.append("\n【操作】")
         for a in scenario.actions:
             ent = next((e.name for e in scenario.entities if e.id == a.entity_id), "?")
             lines.append(f"- 操作「{a.name}」(实体:{ent}, 执行:{a.executor_type}): {a.description[:60]}")

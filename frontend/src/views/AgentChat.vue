@@ -24,8 +24,6 @@
       </div>
       <div class="side-foot" v-if="agent">
         <div class="muted">已配置能力</div>
-        <el-tag v-for="n in agent.skill_names || []" :key="n" size="small" type="success" effect="plain" style="margin:2px"><el-icon aria-hidden="true"><MagicStick /></el-icon>{{ n }}</el-tag>
-        <el-tag v-for="n in agent.mcp_names || []" :key="n" size="small" type="warning" effect="plain" style="margin:2px"><el-icon aria-hidden="true"><Connection /></el-icon>{{ n }}</el-tag>
         <el-tag v-for="n in agent.data_source_names || []" :key="n" size="small" type="info" effect="plain" style="margin:2px"><el-icon aria-hidden="true"><Coin /></el-icon>{{ n }}</el-tag>
       </div>
     </div>
@@ -60,9 +58,9 @@
                 </button>
                 <div class="body">
                   <div class="muted" style="margin-bottom:4px">参数</div>
-                  <pre class="code" style="max-height:160px">{{ JSON.stringify(tc.args, null, 2) }}</pre>
+                  <StructuredValueViewer :value="tc.args" empty-text="无需参数" class="tool-structured-value" />
                   <div v-if="tc.result !== undefined" class="muted" style="margin:8px 0 4px">结果</div>
-                  <pre v-if="tc.result !== undefined" class="code" style="max-height:200px">{{ formatResult(tc.result) }}</pre>
+                  <StructuredValueViewer v-if="tc.result !== undefined" :value="tc.result" empty-text="暂无返回结果" class="tool-structured-value" />
                 </div>
               </div>
             </template>
@@ -163,6 +161,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamChat } from '@/api'
 import type { Agent, ChatMessage, Conversation, RagCitation } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
+import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -346,11 +345,6 @@ async function download(a: { id: string; filename: string; url: string }) {
   } catch (e: any) {
     ElMessage.error('下载失败：' + e.message)
   }
-}
-
-function formatResult(r: any) {
-  if (typeof r === 'string') return r.length > 2000 ? r.slice(0, 2000) + '…' : r
-  return JSON.stringify(r, null, 2)?.slice(0, 2000)
 }
 
 function citationsOf(value: unknown): RagCitation[] {
@@ -633,6 +627,7 @@ onBeforeUnmount(() => {
   margin-bottom: 4px;
 }
 .tool-card .head { min-height: 44px; }
+.tool-structured-value { max-height: 220px; padding: 8px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
 .citation-sources {
   margin-top: 12px;
   padding: 11px;

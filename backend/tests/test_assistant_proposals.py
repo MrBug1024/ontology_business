@@ -721,6 +721,23 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             executor_config={"method": "POST", "url": "https://example.test/agent"},
             requires_confirmation=True,
         )
+        source = DataSource(
+            id="source-agent-fk",
+            tenant_id=self.tenant.id,
+            scenario=scenario,
+            name="Agent 审批数据",
+            type="file_bucket",
+            status="ok",
+        )
+        mapping = DataMapping(
+            id="mapping-agent-fk",
+            scenario=scenario,
+            entity=entity,
+            data_source=source,
+            table_name="approval_records",
+            column_map={},
+            status="ready",
+        )
         llm = LLMConfig(
             tenant_id=self.tenant.id,
             name="Agent 测试模型",
@@ -734,8 +751,9 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             scenario=scenario,
             llm_config=llm,
             name="FK Agent",
+            data_source_ids=[source.id],
         )
-        self.db.add_all([scenario, entity, action, llm, agent])
+        self.db.add_all([scenario, entity, action, source, mapping, llm, agent])
         self.db.commit()
         factory = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
 

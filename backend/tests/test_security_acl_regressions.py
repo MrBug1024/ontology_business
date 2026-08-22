@@ -24,17 +24,19 @@ from app.models import (
     BucketFile,
     BusinessScenario,
     Conversation,
+    DataMapping,
     DataSource,
     DocumentChunk,
     LLMConfig,
     MCPConfig,
     Message,
     OrganizationMember,
+    OntologyEntity,
     Skill,
     Tenant,
     User,
 )
-from app.routers import agents, assistant, data_sources, llm_configs, mcp, permissions, scenarios, skills
+from app.routers import agents, assistant, data_sources, llm_configs, mcp, scenarios, skills
 from app.services import datasource_service, permission_service
 from app.services import auth_service
 from app.services.auth_service import get_current_user, get_tenant_db
@@ -137,12 +139,26 @@ class SecurityAclRegressionTests(unittest.TestCase):
                 content_hash="citation-hash",
                 embedding=[],
             )
+            self.entity = OntologyEntity(
+                id="entity-security",
+                scenario_id=self.scenario.id,
+                name="受限业务对象",
+            )
+            self.mapping = DataMapping(
+                id="mapping-security",
+                scenario_id=self.scenario.id,
+                entity_id=self.entity.id,
+                data_source_id=self.scoped_source.id,
+                table_name="documents",
+                column_map={"name": "filename"},
+                status="ready",
+            )
             self.agent = Agent(
                 id="agent-security",
                 tenant_id=self.tenant.id,
                 scenario_id=self.scenario.id,
                 name="受限场景助手",
-                data_source_ids=[self.foreign_public_source.id],
+                data_source_ids=[self.foreign_public_source.id, self.scoped_source.id],
             )
             self.embedding_only_llm = LLMConfig(
                 id="llm-security-embedding-only",
@@ -233,7 +249,7 @@ class SecurityAclRegressionTests(unittest.TestCase):
                 id="assistant-thread-owner",
                 tenant_id=self.tenant.id,
                 created_by_user_id=self.owner.id,
-                scope_key="global|path:/dashboard",
+                scope_key="global|path:/scenarios",
                 title="所有者私有会话",
             )
             self.owner_attachment = AssistantAttachment(
@@ -258,6 +274,8 @@ class SecurityAclRegressionTests(unittest.TestCase):
                     self.foreign_public_source,
                     self.foreign_file,
                     self.foreign_chunk,
+                    self.entity,
+                    self.mapping,
                     self.agent,
                     self.embedding_only_llm,
                     self.disabled_chat_llm,
@@ -296,7 +314,6 @@ class SecurityAclRegressionTests(unittest.TestCase):
         self.app.include_router(data_sources.router, prefix="/api")
         self.app.include_router(agents.router, prefix="/api")
         self.app.include_router(assistant.router, prefix="/api")
-        self.app.include_router(permissions.router, prefix="/api")
         self.app.include_router(skills.router, prefix="/api")
         self.app.include_router(mcp.router, prefix="/api")
         self.app.include_router(llm_configs.router, prefix="/api")
@@ -497,6 +514,15 @@ class SecurityAclRegressionTests(unittest.TestCase):
         )
         self.assertEqual(chat.status_code, 409, chat.text)
 
+    def test_agent_chat_requires_readiness_chain_even_through_direct_api(self) -> None:
+        response = self.client.post(
+            f"/api/agents/{self.agent.id}/chat",
+            json={"message": "不完整配置不应开始对话"},
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("Agent 尚未就绪", response.json()["detail"])
+        self.assertIn("对话模型", response.json()["detail"])
+
     def test_viewer_cannot_mutate_or_execute_tenant_technical_configuration(self) -> None:
         self._as_viewer()
         # Read-only catalog/config discovery remains available to ordinary
@@ -508,8 +534,6 @@ class SecurityAclRegressionTests(unittest.TestCase):
         protected = [
             ("post", "/api/skills/rescan", None),
             ("put", f"/api/skills/{self.skill.id}", {"enabled": False}),
-            ("post", f"/api/skills/{self.skill.id}/execute", {"args": []}),
-            ("post", f"/api/skills/{self.public_skill.id}/execute", {"args": []}),
             ("post", "/api/mcp", {"name": "viewer-mcp", "command": "never"}),
             ("put", f"/api/mcp/{self.mcp.id}", {"name": "viewer-mcp", "command": "never"}),
             ("delete", f"/api/mcp/{self.mcp.id}", None),
@@ -530,7 +554,7 @@ class SecurityAclRegressionTests(unittest.TestCase):
             response = getattr(self.client, method)(url, **kwargs)
             self.assertEqual(response.status_code, 403, f"{method} {url}: {response.text}")
 
-    def test_direct_technical_execution_requires_enabled_resource(self) -> None:
+    def test_technical_connection_checks_require_enabled_resource(self) -> None:
         db = self.Session()
         try:
             db.get(Skill, self.skill.id).enabled = False
@@ -539,12 +563,6 @@ class SecurityAclRegressionTests(unittest.TestCase):
         finally:
             db.close()
 
-        skill = self.client.post(f"/api/skills/{self.skill.id}/execute", json={"args": []})
-        self.assertEqual(skill.status_code, 409, skill.text)
-        public_skill = self.client.post(
-            f"/api/skills/{self.public_skill.id}/execute", json={"args": []}
-        )
-        self.assertEqual(public_skill.status_code, 409, public_skill.text)
         mcp_tools = self.client.get(f"/api/mcp/{self.mcp.id}/tools")
         self.assertEqual(mcp_tools.status_code, 409, mcp_tools.text)
         llm = self.client.post(f"/api/llm-configs/{self.disabled_chat_llm.id}/test")
@@ -593,16 +611,16 @@ class SecurityAclRegressionTests(unittest.TestCase):
 
     def test_assistant_threads_are_owner_scoped(self) -> None:
         self._as_viewer()
-        listed = self.client.get("/api/assistant/threads?path=/dashboard")
+        listed = self.client.get("/api/assistant/threads?path=/scenarios")
         self.assertEqual(listed.status_code, 200, listed.text)
         self.assertEqual(listed.json(), [])
 
         foreign = self.client.get(
-            f"/api/assistant/threads/{self.owner_thread.id}/messages?path=/dashboard"
+            f"/api/assistant/threads/{self.owner_thread.id}/messages?path=/scenarios"
         )
         self.assertEqual(foreign.status_code, 404, foreign.text)
 
-        created = self.client.post("/api/assistant/threads?path=/dashboard")
+        created = self.client.post("/api/assistant/threads?path=/scenarios")
         self.assertEqual(created.status_code, 200, created.text)
         db = self.Session()
         try:
@@ -617,7 +635,7 @@ class SecurityAclRegressionTests(unittest.TestCase):
             "/api/assistant/chat",
             json={
                 "message": "不能读取其他成员附件",
-                "path": "/dashboard",
+                "path": "/scenarios",
                 "attachment_ids": [self.owner_attachment.id],
             },
         )
@@ -632,7 +650,7 @@ class SecurityAclRegressionTests(unittest.TestCase):
             "/api/assistant/chat",
             json={
                 "message": "读取自己的附件",
-                "path": "/dashboard",
+                "path": "/scenarios",
                 "attachment_ids": [self.owner_attachment.id],
             },
         )
@@ -640,14 +658,16 @@ class SecurityAclRegressionTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in own.json()["sources"]], [self.owner_attachment.id])
 
     def test_removed_member_is_not_recreated_by_bootstrap_or_membership_fallback(self) -> None:
-        members = self.client.get("/api/permissions/members")
-        self.assertEqual(members.status_code, 200, members.text)
-        member_id = next(item["id"] for item in members.json() if item["user_id"] == self.viewer.id)
-        removed = self.client.delete(f"/api/permissions/members/{member_id}")
-        self.assertEqual(removed.status_code, 200, removed.text)
-
         db = self.Session()
         try:
+            member = db.scalars(
+                select(OrganizationMember).where(
+                    OrganizationMember.organization_id == self.organization_id,
+                    OrganizationMember.user_id == self.viewer.id,
+                )
+            ).one()
+            member.status = "removed"
+            db.commit()
             permission_service.ensure_organization(db, self.tenant.id)
             db.commit()
             member = db.scalars(

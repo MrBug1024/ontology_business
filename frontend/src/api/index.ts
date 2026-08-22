@@ -1,12 +1,7 @@
 import axios from 'axios'
 import type {
   ActionExecutionLog,
-  AdvancedAsset,
-  AdvancedAssetSummary,
-  AdvancedFeedback,
-  AdvancedRecord,
-  AdvancedRecordPage,
-  AdvancedRun,
+  FunctionRun,
   Agent,
   AssistantAttachment,
   AssistantMessage,
@@ -16,9 +11,6 @@ import type {
   BucketFile,
   ChatMessage,
   Conversation,
-  ConnectorBinding,
-  ConnectorCatalogItem,
-  ConnectorReadiness,
   DataMapping,
   DataMappingPreview,
   DataMappingRefreshJob,
@@ -29,17 +21,6 @@ import type {
   EventEnvelope,
   FunctionDefinition,
   GraphData,
-  IncidentCase,
-  IncidentCaseCreateInput,
-  IncidentCaseHistory,
-  IncidentCaseUpdateInput,
-  LineageGraph,
-  ReleaseBranch,
-  ReleaseProposal,
-  ReleaseRecord,
-  ReleaseReview,
-  ReleaseRollback,
-  ReleaseSnapshot,
   LLMConfig,
   LLMEvaluation,
   LLMEvaluationSummary,
@@ -48,20 +29,9 @@ import type {
   MCPConfig,
   MCPTool,
   OntologyInstance,
-  OntologyResourcePackage,
-  PackageImportProposal,
-  PackageImportPreview,
-  StarterKit,
-  StarterKitImportProposal,
   RelationInstance,
   ObjectDetail,
   ObjectSearchResult,
-  Organization,
-  OrganizationMember,
-  OrganizationRole,
-  PermissionGrant,
-  PermissionGrantInput,
-  PermissionResource,
   Scenario,
   ScenarioDetail,
   Skill,
@@ -110,34 +80,6 @@ export const api = {
   forgotPassword: (email: string) => http.post<AuthMessage>('/auth/forgot-password', { email }),
   resetPassword: (d: { email: string; code: string; password: string; password_confirm: string }) =>
     http.post<AuthMessage>('/auth/reset-password', d),
-
-  // 组织、角色与细粒度授权（服务端是唯一的权限判定点；管理能力由 API 统一校验）
-  getOrganization: () => http.get<Organization>('/permissions/organization'),
-  listOrganizationRoles: () => http.get<OrganizationRole[]>('/permissions/roles'),
-  listOrganizationMembers: () => http.get<OrganizationMember[]>('/permissions/members'),
-  saveOrganizationMember: (data: { user_id: string; role_key: string }) =>
-    http.post<OrganizationMember>('/permissions/members', data),
-  removeOrganizationMember: (memberId: string) => http.delete<AuthMessage>(`/permissions/members/${memberId}`),
-  listPermissionGrants: () => http.get<PermissionGrant[]>('/permissions/grants'),
-  createPermissionGrant: (data: PermissionGrantInput) => http.post<PermissionGrant>('/permissions/grants', data),
-  deletePermissionGrant: (grantId: string) => http.delete<AuthMessage>(`/permissions/grants/${grantId}`),
-  listPermissionResources: (scenarioId: string) =>
-    http.get<PermissionResource[]>(`/permissions/resources/${scenarioId}`),
-
-  // P1 运营 Case / Incident 中心
-  listIncidents: (scenarioId: string, params: { status?: string; severity?: string; limit?: number } = {}) =>
-    http.get<IncidentCase[]>(`/incidents/scenarios/${scenarioId}`, { params }),
-  createIncident: (scenarioId: string, data: IncidentCaseCreateInput) =>
-    http.post<IncidentCase>(`/incidents/scenarios/${scenarioId}`, data),
-  getIncident: (incidentId: string) => http.get<IncidentCase>(`/incidents/${incidentId}`),
-  updateIncident: (incidentId: string, data: IncidentCaseUpdateInput) =>
-    http.patch<IncidentCase>(`/incidents/${incidentId}`, data),
-  acknowledgeIncident: (incidentId: string, comment = '') =>
-    http.post<IncidentCase>(`/incidents/${incidentId}/acknowledge`, { comment }),
-  resolveIncident: (incidentId: string, data: { resolution: string; comment?: string }) =>
-    http.post<IncidentCase>(`/incidents/${incidentId}/resolve`, data),
-  listIncidentHistory: (incidentId: string) =>
-    http.get<IncidentCaseHistory[]>(`/incidents/${incidentId}/history`),
 
   // 全局 AI 助手
   listAssistantThreads: (context: { scenario_id?: string; page?: string; path?: string } = {}) =>
@@ -205,83 +147,6 @@ export const api = {
   // 图谱
   getGraph: (sid: string, mode: 'schema' | 'instance' = 'schema') =>
     http.get<GraphData>(`/scenarios/${sid}/graph`, { params: { mode } }),
-  getScenarioLineage: (sid: string, limit = 300) =>
-    http.get<LineageGraph>(`/lineage/scenarios/${sid}`, { params: { limit } }),
-
-  // P2 发布治理
-  listReleaseScenarios: () => http.get<Scenario[]>('/releases/scenarios'),
-  listReleaseBranches: (scenarioId: string) =>
-    http.get<ReleaseBranch[]>(`/releases/scenarios/${scenarioId}/branches`),
-  createReleaseBranch: (scenarioId: string, data: { name: string; description?: string }) =>
-    http.post<ReleaseBranch>(`/releases/scenarios/${scenarioId}/branches`, data),
-  getReleaseBranch: (branchId: string) => http.get<ReleaseBranch>(`/releases/branches/${branchId}`),
-  getReleaseSnapshot: (snapshotId: string) => http.get<ReleaseSnapshot>(`/releases/snapshots/${snapshotId}`),
-  listReleaseProposals: (scenarioId: string, params: { branch_id?: string; status?: string } = {}) =>
-    http.get<ReleaseProposal[]>(`/releases/scenarios/${scenarioId}/proposals`, { params }),
-  createReleaseProposal: (branchId: string, data: { title: string; description?: string; content: Record<string, any>; submit?: boolean }) =>
-    http.post<ReleaseProposal>(`/releases/branches/${branchId}/proposals`, data),
-  submitReleaseProposal: (proposalId: string) =>
-    http.post<ReleaseProposal>(`/releases/proposals/${proposalId}/submit`),
-  reviewReleaseProposal: (proposalId: string, data: { decision: 'approve' | 'reject'; comment?: string }) =>
-    http.post<ReleaseReview>(`/releases/proposals/${proposalId}/reviews`, data),
-  mergeReleaseProposal: (proposalId: string, note = '') =>
-    http.post<ReleaseProposal>(`/releases/proposals/${proposalId}/merge`, { confirmed: true, note }),
-  listReleaseRecords: (scenarioId: string, environment?: 'dev' | 'staging' | 'prod') =>
-    http.get<ReleaseRecord[]>(`/releases/scenarios/${scenarioId}/publish`, { params: { environment } }),
-  publishRelease: (scenarioId: string, data: { environment: 'dev' | 'staging' | 'prod'; branch_id?: string; proposal_id?: string; snapshot_id?: string; notes?: string }) =>
-    http.post<ReleaseRecord>(`/releases/scenarios/${scenarioId}/publish`, { ...data, confirmed: true }),
-  rollbackRelease: (scenarioId: string, data: { target_snapshot_id: string; branch_id?: string; environment?: 'dev' | 'staging' | 'prod'; reason?: string }) =>
-    http.post<ReleaseRollback>(`/releases/scenarios/${scenarioId}/rollback`, { ...data, confirmed: true }),
-
-  // P2 标准连接器与环境绑定：只关联既有配置，不返回也不传递任何凭据。
-  listConnectors: (scenarioId: string) =>
-    http.get<ConnectorCatalogItem[]>('/connectors', { params: { scenario_id: scenarioId } }),
-  listConnectorBindings: (scenarioId: string, environment?: 'dev' | 'staging' | 'prod') =>
-    http.get<ConnectorBinding[]>(`/connectors/scenarios/${scenarioId}/bindings`, { params: { environment } }),
-  saveConnectorBinding: (scenarioId: string, data: {
-    environment: 'dev' | 'staging' | 'prod'
-    binding_key: string
-    kind: 'data_source' | 'mcp' | 'llm'
-    connector_id: string
-    reference_label?: string
-    check?: boolean
-  }) => http.put<ConnectorBinding>(`/connectors/scenarios/${scenarioId}/bindings`, data),
-  checkConnectorBinding: (scenarioId: string, bindingId: string) =>
-    http.post<ConnectorBinding>(`/connectors/scenarios/${scenarioId}/bindings/${bindingId}/check`),
-  deleteConnectorBinding: (scenarioId: string, bindingId: string) =>
-    http.delete(`/connectors/scenarios/${scenarioId}/bindings/${bindingId}`),
-  getConnectorReadiness: (scenarioId: string, data: {
-    snapshot_id: string
-    environment: 'dev' | 'staging' | 'prod'
-  }) => http.get<ConnectorReadiness>(`/connectors/scenarios/${scenarioId}/readiness`, { params: data }),
-
-  // P2 可移植资源包：仅导出与导入预检，实际应用必须进入发布提案流程。
-  exportScenarioPackage: (scenarioId: string) =>
-    http.get<OntologyResourcePackage>(`/packages/scenarios/${scenarioId}/export`),
-  validateResourcePackage: (resourcePackage: Record<string, any>) =>
-    http.post<{ valid: boolean; errors: Array<Record<string, any>>; warnings: Array<Record<string, any>>; normalized: OntologyResourcePackage; fingerprint: string }>('/packages/validate', { package: resourcePackage }),
-  previewScenarioPackageImport: (scenarioId: string, resourcePackage: Record<string, any>, environment: 'dev' | 'staging' | 'prod' = 'dev') =>
-    http.post<PackageImportPreview>(`/packages/scenarios/${scenarioId}/import-preview`, { package: resourcePackage, environment }),
-  createPackageImportProposal: (scenarioId: string, data: {
-    package: Record<string, any>
-    branch_id: string
-    environment?: 'dev' | 'staging' | 'prod'
-    title: string
-    description?: string
-    submit?: boolean
-  }) => http.post<PackageImportProposal>(`/packages/scenarios/${scenarioId}/import-proposal`, data),
-  listStarterKits: () => http.get<StarterKit[]>('/starter-kits'),
-  getStarterKit: (starterKitId: string) => http.get<StarterKit>(`/starter-kits/${starterKitId}`),
-  previewStarterKitImport: (starterKitId: string, scenarioId: string, environment: 'dev' | 'staging' | 'prod' = 'dev') =>
-    http.post<PackageImportPreview>(`/starter-kits/${starterKitId}/scenarios/${scenarioId}/import-preview`, { environment }),
-  createStarterKitImportProposal: (starterKitId: string, scenarioId: string, data: {
-    branch_id: string
-    environment?: 'dev' | 'staging' | 'prod'
-    expected_fingerprint: string
-    title: string
-    description?: string
-    submit?: boolean
-  }) => http.post<StarterKitImportProposal>(`/starter-kits/${starterKitId}/scenarios/${scenarioId}/import-proposal`, data),
 
   // AI 生成本体
   generateOntology: (sid: string, description: string) =>
@@ -321,35 +186,9 @@ export const api = {
   updateFunction: (id: string, d: FunctionDefinition) => http.put<FunctionDefinition>(`/scenarios/functions/${id}`, d),
   deleteFunction: (id: string) => http.delete(`/scenarios/functions/${id}`),
   runFunction: (id: string, data: { params: Record<string, any>; idempotency_key?: string }) =>
-    http.post<AdvancedRun>(`/advanced/functions/${id}/run`, data),
+    http.post<FunctionRun>(`/functions/${id}/run`, data),
   listFunctionRuns: (id: string, limit = 100) =>
-    http.get<AdvancedRun[]>(`/advanced/functions/${id}/runs`, { params: { limit } }),
-
-  // P2 高级数据 / 模型资产：记录、实时游标、媒体、仿真与反馈均受场景 ACL 保护。
-  listAdvancedAssets: (scenarioId: string, kind?: string) =>
-    http.get<AdvancedAsset[]>(`/advanced/scenarios/${scenarioId}/assets`, { params: { kind: kind || undefined } }),
-  createAdvancedAsset: (scenarioId: string, data: Partial<AdvancedAsset>) =>
-    http.post<AdvancedAsset>(`/advanced/scenarios/${scenarioId}/assets`, data),
-  updateAdvancedAsset: (assetId: string, data: Partial<AdvancedAsset>) =>
-    http.patch<AdvancedAsset>(`/advanced/assets/${assetId}`, data),
-  deleteAdvancedAsset: (assetId: string) => http.delete(`/advanced/assets/${assetId}`),
-  getAdvancedAssetSummary: (assetId: string) => http.get<AdvancedAssetSummary>(`/advanced/assets/${assetId}/summary`),
-  listAdvancedRecords: (assetId: string, params: { after_sequence?: number; from_time?: string; to_time?: string; event_type?: string; bbox?: string; limit?: number } = {}) =>
-    http.get<AdvancedRecordPage>(`/advanced/assets/${assetId}/records`, { params }),
-  createAdvancedRecord: (assetId: string, data: Partial<AdvancedRecord>) =>
-    http.post<AdvancedRecord>(`/advanced/assets/${assetId}/records`, data),
-  uploadAdvancedMedia: (assetId: string, file: File) => {
-    const fd = new FormData()
-    fd.append('file', file)
-    return http.post<AdvancedRecord>(`/advanced/assets/${assetId}/media`, fd, { headers: { 'Content-Type': 'multipart/form-data' } })
-  },
-  advancedMediaUrl: (assetId: string, recordId: string) => `/api/advanced/assets/${assetId}/media/${recordId}`,
-  runAdvancedAsset: (assetId: string, runType: string, data: { params: Record<string, any>; idempotency_key?: string }) =>
-    http.post<AdvancedRun>(`/advanced/assets/${assetId}/runs`, data, { params: { run_type: runType } }),
-  listAdvancedRuns: (assetId: string, limit = 100) => http.get<AdvancedRun[]>(`/advanced/assets/${assetId}/runs`, { params: { limit } }),
-  createAdvancedFeedback: (assetId: string, data: Partial<AdvancedFeedback>) =>
-    http.post<AdvancedFeedback>(`/advanced/assets/${assetId}/feedback`, data),
-  listAdvancedFeedback: (assetId: string, limit = 100) => http.get<AdvancedFeedback[]>(`/advanced/assets/${assetId}/feedback`, { params: { limit } }),
+    http.get<FunctionRun[]>(`/functions/${id}/runs`, { params: { limit } }),
 
   // 操作（Actions）
   createAction: (sid: string, d: any) => http.post(`/scenarios/${sid}/actions`, d),
@@ -452,7 +291,6 @@ export const api = {
   listSkills: () => http.get<Skill[]>('/skills'),
   rescanSkills: () => http.post('/skills/rescan'),
   toggleSkill: (id: string, enabled: boolean) => http.put<Skill>(`/skills/${id}`, { enabled }),
-  executeSkill: (id: string, args: string[]) => http.post(`/skills/${id}/execute`, { args }),
 
   // MCP
   listMCP: () => http.get<MCPConfig[]>('/mcp'),
@@ -461,9 +299,6 @@ export const api = {
   deleteMCP: (id: string) => http.delete(`/mcp/${id}`),
   testMCP: (id: string) => http.post(`/mcp/${id}/test`),
   mcpTools: (id: string) => http.get<MCPTool[]>(`/mcp/${id}/tools`),
-
-  // Connector runtime (read-only deployment context; callers cannot switch it)
-  getRuntimeEnvironment: () => http.get<{ environment: 'dev' | 'staging' | 'prod' }>('/connectors/runtime-environment'),
 
   // Agent
   listAgents: () => http.get<Agent[]>('/agents'),

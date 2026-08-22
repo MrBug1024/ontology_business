@@ -318,12 +318,6 @@ class BusinessScenario(Base):
     mapping_refresh_jobs: Mapped[list["DataMappingRefreshJob"]] = relationship(
         back_populates="scenario", cascade="all, delete-orphan"
     )
-    incident_cases: Mapped[list["IncidentCase"]] = relationship(
-        back_populates="scenario", cascade="all, delete-orphan"
-    )
-    advanced_assets: Mapped[list["OntologyAdvancedAsset"]] = relationship(
-        back_populates="scenario", cascade="all, delete-orphan"
-    )
     tenant: Mapped[Tenant | None] = relationship()
 
 
@@ -1008,8 +1002,6 @@ class Agent(Base):
         ForeignKey("llm_configs.id", ondelete="SET NULL"), index=True
     )
     system_prompt: Mapped[str] = mapped_column(Text, default="")
-    skill_ids: Mapped[list] = mapped_column(JSON, default=list)
-    mcp_ids: Mapped[list] = mapped_column(JSON, default=list)
     data_source_ids: Mapped[list] = mapped_column(JSON, default=list)
     temperature: Mapped[float] = mapped_column(Float, default=0.2)
     max_tokens: Mapped[int] = mapped_column(Integer, default=4096)
@@ -1236,101 +1228,15 @@ class FunctionDefinition(Base):
     scenario: Mapped[BusinessScenario] = relationship(back_populates="function_definitions")
 
 
-class OntologyAdvancedAsset(Base):
-    """Governed P2 data/model asset attached to an ontology scenario.
+class FunctionRun(Base):
+    """An auditable execution of a governed built-in function runtime."""
 
-    The platform stores a portable descriptor and bounded records here.  It
-    intentionally does not contain executable code or arbitrary connection
-    credentials; external access still goes through the connector binding and
-    release gates already used by the rest of the platform.
-    """
-
-    __tablename__ = "ontology_advanced_assets"
+    __tablename__ = "function_runs"
     __table_args__ = (
-        UniqueConstraint("scenario_id", "name", name="uq_advanced_asset_scenario_name"),
-        Index("ix_advanced_assets_tenant_scenario_kind", "tenant_id", "scenario_id", "kind"),
-    )
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
-    tenant_id: Mapped[str] = mapped_column(
-        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
-    )
-    scenario_id: Mapped[str] = mapped_column(
-        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
-    )
-    name: Mapped[str] = mapped_column(String(200), nullable=False)
-    # geospatial / timeseries / media / realtime / ml_model / simulation /
-    # optimization.  Runtime kind is a closed server-side allowlist.
-    kind: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
-    description: Mapped[str] = mapped_column(Text, default="")
-    schema: Mapped[dict] = mapped_column(JSON, default=dict)
-    config: Mapped[dict] = mapped_column(JSON, default=dict)
-    # draft / ready / disabled
-    status: Mapped[str] = mapped_column(String(20), default="draft")
-    version: Mapped[int] = mapped_column(Integer, default=1)
-    created_by_user_id: Mapped[str | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, onupdate=_now
-    )
-
-    tenant: Mapped[Tenant] = relationship()
-    scenario: Mapped[BusinessScenario] = relationship(back_populates="advanced_assets")
-    records: Mapped[list["OntologyAdvancedRecord"]] = relationship(
-        back_populates="asset", cascade="all, delete-orphan", order_by="OntologyAdvancedRecord.sequence"
-    )
-    runs: Mapped[list["OntologyAdvancedRun"]] = relationship(
-        back_populates="asset", cascade="all, delete-orphan", order_by="OntologyAdvancedRun.created_at.desc()"
-    )
-
-
-class OntologyAdvancedRecord(Base):
-    """A normalized record for spatial, temporal, media and realtime assets."""
-
-    __tablename__ = "ontology_advanced_records"
-    __table_args__ = (
-        Index("ix_advanced_records_asset_event_time", "asset_id", "event_time"),
-        Index("ix_advanced_records_asset_sequence", "asset_id", "sequence"),
-        Index("ix_advanced_records_tenant_created", "tenant_id", "created_at"),
-    )
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
-    tenant_id: Mapped[str] = mapped_column(
-        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
-    )
-    scenario_id: Mapped[str] = mapped_column(
-        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
-    )
-    asset_id: Mapped[str] = mapped_column(
-        ForeignKey("ontology_advanced_assets.id", ondelete="CASCADE"), index=True
-    )
-    sequence: Mapped[int] = mapped_column(Integer, default=0, index=True)
-    event_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-    event_type: Mapped[str] = mapped_column(String(120), default="")
-    geometry: Mapped[dict] = mapped_column(JSON, default=dict)
-    payload: Mapped[dict] = mapped_column(JSON, default=dict)
-    source_ref: Mapped[str] = mapped_column(String(300), default="")
-    content_type: Mapped[str] = mapped_column(String(160), default="")
-    storage_path: Mapped[str] = mapped_column(String(700), default="")
-    checksum: Mapped[str] = mapped_column(String(64), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-
-    tenant: Mapped[Tenant] = relationship()
-    asset: Mapped[OntologyAdvancedAsset] = relationship(back_populates="records")
-
-
-class OntologyAdvancedRun(Base):
-    """An auditable execution of a built-in model/simulation/optimization."""
-
-    __tablename__ = "ontology_advanced_runs"
-    __table_args__ = (
-        Index("ix_advanced_runs_asset_created", "asset_id", "created_at"),
-        Index("ix_advanced_runs_function_created", "function_id", "created_at"),
+        Index("ix_function_runs_function_created", "function_id", "created_at"),
         UniqueConstraint(
             "tenant_id", "idempotency_scope", "idempotency_key",
-            name="uq_advanced_runs_idempotency",
+            name="uq_function_runs_idempotency",
         ),
     )
 
@@ -1340,9 +1246,6 @@ class OntologyAdvancedRun(Base):
     )
     scenario_id: Mapped[str] = mapped_column(
         ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
-    )
-    asset_id: Mapped[str | None] = mapped_column(
-        ForeignKey("ontology_advanced_assets.id", ondelete="CASCADE"), nullable=True, index=True
     )
     function_id: Mapped[str | None] = mapped_column(
         ForeignKey("function_definitions.id", ondelete="CASCADE"), nullable=True, index=True
@@ -1362,44 +1265,7 @@ class OntologyAdvancedRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     tenant: Mapped[Tenant] = relationship()
-    asset: Mapped[OntologyAdvancedAsset | None] = relationship(back_populates="runs")
     function: Mapped[FunctionDefinition | None] = relationship()
-
-
-class OntologyModelFeedback(Base):
-    """Human or external evaluation attached to a governed model run."""
-
-    __tablename__ = "ontology_model_feedback"
-    __table_args__ = (
-        Index("ix_model_feedback_asset_created", "asset_id", "created_at"),
-        Index("ix_model_feedback_tenant_created", "tenant_id", "created_at"),
-    )
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
-    tenant_id: Mapped[str] = mapped_column(
-        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
-    )
-    scenario_id: Mapped[str] = mapped_column(
-        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
-    )
-    asset_id: Mapped[str] = mapped_column(
-        ForeignKey("ontology_advanced_assets.id", ondelete="CASCADE"), index=True
-    )
-    run_id: Mapped[str | None] = mapped_column(
-        ForeignKey("ontology_advanced_runs.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    label: Mapped[str] = mapped_column(String(160), default="")
-    expected_output: Mapped[dict] = mapped_column(JSON, default=dict)
-    actual_output: Mapped[dict] = mapped_column(JSON, default=dict)
-    score: Mapped[float | None] = mapped_column(Float, nullable=True)
-    notes: Mapped[str] = mapped_column(Text, default="")
-    created_by_user_id: Mapped[str | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-
-    tenant: Mapped[Tenant] = relationship()
-    asset: Mapped[OntologyAdvancedAsset] = relationship()
 
 
 class OntologyAction(Base):
@@ -2090,99 +1956,3 @@ class ActionExecutionLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship()
-
-
-# ──────────────────────────────────────────────
-# P1 运营闭环：事件 / Case（异常事项）及其不可变历史
-# ──────────────────────────────────────────────
-class IncidentCase(Base):
-    """场景范围内可分派、确认和闭环的运营异常事项。
-
-    事件、规则或人工发现的问题最终都应落到同一种 durable Case 记录；状态变化
-    只通过服务层写入 ``IncidentCaseHistory``，避免任务中心只展示一次性执行结果。
-    """
-
-    __tablename__ = "incident_cases"
-    __table_args__ = (
-        Index("ix_incident_cases_tenant_scenario_status", "tenant_id", "scenario_id", "status"),
-        Index("ix_incident_cases_scenario_updated", "scenario_id", "updated_at"),
-    )
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
-    tenant_id: Mapped[str] = mapped_column(
-        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
-    )
-    scenario_id: Mapped[str] = mapped_column(
-        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
-    )
-    title: Mapped[str] = mapped_column(String(300), nullable=False)
-    description: Mapped[str] = mapped_column(Text, default="")
-    # low / medium / high / critical
-    severity: Mapped[str] = mapped_column(String(20), default="medium", index=True)
-    # open / acknowledged / resolved
-    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
-    # manual / rule / workflow / agent / import 等可审计来源，不承载凭据。
-    source: Mapped[str] = mapped_column(String(60), default="manual")
-    source_ref: Mapped[str] = mapped_column(String(180), default="")
-    # 不设对象外键，确保对象生命周期不会抹掉已闭环 Case 的来源证据。
-    related_object_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    assignee_user_id: Mapped[str | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    context: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_by_user_id: Mapped[str | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    acknowledged_by_user_id: Mapped[str | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    resolved_by_user_id: Mapped[str | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    resolution: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, onupdate=_now
-    )
-
-    scenario: Mapped[BusinessScenario] = relationship(back_populates="incident_cases")
-    histories: Mapped[list["IncidentCaseHistory"]] = relationship(
-        back_populates="incident_case",
-        cascade="all, delete-orphan",
-        order_by="IncidentCaseHistory.created_at",
-    )
-
-
-class IncidentCaseHistory(Base):
-    """Case 状态/内容变化的追加式审计记录。"""
-
-    __tablename__ = "incident_case_history"
-    __table_args__ = (
-        Index("ix_incident_case_history_case_created", "incident_case_id", "created_at"),
-        Index("ix_incident_case_history_tenant_scenario", "tenant_id", "scenario_id"),
-    )
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
-    incident_case_id: Mapped[str] = mapped_column(
-        ForeignKey("incident_cases.id", ondelete="CASCADE"), index=True
-    )
-    tenant_id: Mapped[str] = mapped_column(
-        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
-    )
-    scenario_id: Mapped[str] = mapped_column(
-        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
-    )
-    # created / updated / acknowledged / resolved
-    action: Mapped[str] = mapped_column(String(30), nullable=False)
-    actor_user_id: Mapped[str | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    from_status: Mapped[str] = mapped_column(String(20), default="")
-    to_status: Mapped[str] = mapped_column(String(20), default="")
-    changes: Mapped[dict] = mapped_column(JSON, default=dict)
-    comment: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-
-    incident_case: Mapped[IncidentCase] = relationship(back_populates="histories")

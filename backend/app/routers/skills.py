@@ -1,7 +1,7 @@
-"""Skill 路由：扫描/同步/启用/执行技能。"""
+"""Skill 路由：扫描、同步和启用技能。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -18,7 +18,6 @@ def _out(s: Skill) -> SkillOut:
         id=s.id,
         name=s.name,
         description=s.description,
-        path=s.path,
         source=s.source,
         enabled=s.enabled,
         metadata=s.meta or {},
@@ -50,15 +49,3 @@ def update_skill(skill_id: str, payload: SkillToggle, db: Session = Depends(get_
     db.commit()
     db.refresh(s)
     return _out(s)
-
-
-@router.post("/{skill_id}/execute")
-def execute_skill(skill_id: str, payload: dict, db: Session = Depends(get_tenant_db)):
-    permission_service.require_tenant_permission(db, "manage")
-    # Built-in skills are intentionally public/global (no tenant owner), but
-    # their subprocess execution is still restricted to a tenant manager.
-    s = tenant_service.require_visible(db, Skill, skill_id, "技能不存在")
-    if not s.enabled:
-        raise HTTPException(409, "技能当前已停用")
-    args = payload.get("args", [])
-    return skill_service.execute_skill(s, args)

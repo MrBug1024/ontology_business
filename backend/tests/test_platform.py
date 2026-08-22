@@ -13,7 +13,14 @@ from app.schemas import AssistantProposalApplyRequest, ObjectProvenanceOut, Obje
 from app.services.policies import PolicyViolation, validate_action_params, validate_read_only_sql, validate_workflow_graph
 from app.services.auth_service import hash_password, verify_password
 from app.services.ontology_service import _quoted_mapping_table, preview_mapping
-from app.services.workflow_service import evaluate_condition, execute_workflow, validate_workflow_definition
+from app.services.workflow_service import (
+    WORKFLOW_CONTEXT_MAX_CHARS,
+    _workflow_context,
+    evaluate_condition,
+    execute_workflow,
+    validate_workflow_definition,
+    validate_workflow_references,
+)
 from app.routers.assistant import (
     _build_proposal,
     _context_scope,
@@ -144,15 +151,55 @@ class AssistantIntentTests(unittest.TestCase):
     def test_routes_business_requests_to_safe_draft_intents(self) -> None:
         self.assertEqual(_intent("请根据资料建立供应商实体和关系", "ask"), "ontology")
         self.assertEqual(_intent("把异常处理编排成审批工作流", "ask"), "workflow")
+        self.assertEqual(
+            _intent("请按文档完成本体建模，文档中还包含规则、事件和工作流", "ask"),
+            "ontology",
+        )
+        self.assertEqual(_intent("基于已有本体编排审批工作流", "ask"), "workflow")
         self.assertEqual(_intent("帮我看看当前页面", "ask"), "chat")
         self.assertEqual(_intent("继续分析", "draft"), "ontology")
         self.assertEqual(_intent("帮我创建场景", "explain"), "explain")
         self.assertEqual(_intent("立即应用这份草稿", "apply"), "apply_guidance")
         self.assertEqual(_intent("执行这个工作流", "execute"), "execute_guidance")
 
+    def test_workflow_context_is_complete_or_explicitly_rejected(self) -> None:
+        document = "建筑业务规则" * 500
+        self.assertEqual(_workflow_context(document), document)
+        with self.assertRaisesRegex(ValueError, "不会静默截断"):
+            _workflow_context("文" * (WORKFLOW_CONTEXT_MAX_CHARS + 1))
+
+    def test_workflow_references_are_required_and_scenario_scoped(self) -> None:
+        class FakeDb:
+            resources = {
+                ("OntologyAction", "action-ok"): SimpleNamespace(scenario_id="scenario-1"),
+                ("OntologyRule", "rule-foreign"): SimpleNamespace(scenario_id="scenario-2"),
+            }
+
+            def get(self, model, resource_id):
+                return self.resources.get((model.__name__, resource_id))
+
+        db = FakeDb()
+        validate_workflow_references(
+            db,
+            "scenario-1",
+            nodes=[{"id": "n1", "type": "action", "data": {"action_id": "action-ok"}}],
+        )
+        with self.assertRaisesRegex(PolicyViolation, "缺少已配置的规则引用"):
+            validate_workflow_references(
+                db,
+                "scenario-1",
+                nodes=[{"id": "n1", "type": "rule", "data": {}}],
+            )
+        with self.assertRaisesRegex(PolicyViolation, "不存在或不属于当前业务场景"):
+            validate_workflow_references(
+                db,
+                "scenario-1",
+                nodes=[{"id": "n1", "type": "rule", "data": {"rule_id": "rule-foreign"}}],
+            )
+
     def test_session_scope_includes_current_route_and_scenario(self) -> None:
         self.assertEqual(_context_scope("scenario-1", "/scenarios/scenario-1?tab=ontology"), "scenario:scenario-1|path:/scenarios/scenario-1")
-        self.assertEqual(_context_scope(None, "/dashboard"), "scenario:global|path:/dashboard")
+        self.assertEqual(_context_scope(None, "/scenarios"), "scenario:global|path:/scenarios")
 
     def test_sse_event_is_framed_as_json_data(self) -> None:
         event = _sse("token", "你好")
@@ -180,7 +227,14 @@ class AssistantIntentTests(unittest.TestCase):
         self.assertEqual(len(proposal["proposal_id"]), 32)
         self.assertEqual(proposal["status"], "pending")
         self.assertEqual(proposal["base_snapshot"]["entity_names"], ["客户"])
-        self.assertEqual([item["operation"] for item in proposal["changes"]], ["skip", "add", "skip"])
+        self.assertEqual(
+            [item["operation"] for item in proposal["changes"]],
+            ["skip", "add", "add", "skip"],
+        )
+        self.assertEqual(
+            [item["resource"] for item in proposal["changes"]],
+            ["entity", "entity", "property", "relation"],
+        )
         self.assertEqual(len(proposal["base_snapshot"]["revision"]), 64)
         scenario.entities[0].description = "并发修改了实体定义"
         self.assertFalse(

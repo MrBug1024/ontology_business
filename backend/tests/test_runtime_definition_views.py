@@ -25,7 +25,6 @@ from app.models import (
 from app.routers import operations as operations_router
 from app.routers import scenarios as scenarios_router
 from app.services import permission_service, release_service, runtime_connector_service
-from app.services.lineage_service import build_scenario_lineage
 
 
 class RuntimeDefinitionReadViewsTests(unittest.TestCase):
@@ -161,7 +160,7 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
         self.db.close()
         self.engine.dispose()
 
-    def test_task_approval_and_lineage_prefer_frozen_release_resources(self) -> None:
+    def test_task_approval_and_logs_prefer_frozen_release_resources(self) -> None:
         task = operations_router._run_out(self.db, self.run)
         self.assertEqual(task.workflow_name, "发布版工作流名称")
         self.assertEqual(task.definition_snapshot_id, self.snapshot.id)
@@ -184,47 +183,8 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
                 limit=80,
                 db=self.db,
             )
-            graph = build_scenario_lineage(self.db, self.scenario.id)
         self.assertEqual([item.workflow_name for item in approvals], ["发布版工作流名称"])
         self.assertEqual([item.id for item in logs], [self.log.id])
-        node_by_id = {node["id"]: node for node in graph["nodes"]}
-        action_node_id = f"action:{self.action.id}@{self.release.id}"
-        workflow_node_id = f"workflow:{self.workflow.id}@{self.release.id}"
-        self.assertEqual(node_by_id[action_node_id]["label"], "发布版操作名称")
-        self.assertEqual(node_by_id[workflow_node_id]["label"], "发布版工作流名称")
-        self.assertNotIn(
-            "后续实时操作名称",
-            {str(node["label"]) for node in graph["nodes"]},
-        )
-        self.assertNotIn(
-            "后续实时工作流名称",
-            {str(node["label"]) for node in graph["nodes"]},
-        )
-        execution_edge = next(
-            edge
-            for edge in graph["edges"]
-            if edge["source"] == action_node_id
-            and edge["target"] == f"action_execution:{self.log.id}"
-        )
-        self.assertEqual(execution_edge["meta"]["release_id"], self.release.id)
-        self.assertEqual(execution_edge["meta"]["definition_snapshot_id"], self.snapshot.id)
-        result_edge = next(
-            edge
-            for edge in graph["edges"]
-            if edge["source"] == f"action_execution:{self.log.id}"
-            and edge["target"] == f"external_result:{self.log.id}"
-        )
-        self.assertEqual(result_edge["meta"]["release_id"], self.release.id)
-        self.assertEqual(result_edge["meta"]["definition_snapshot_id"], self.snapshot.id)
-        self.assertTrue(
-            any(
-                edge["source"] == workflow_node_id
-                and edge["target"] == f"workflow_run:{self.run.id}"
-                and edge["kind"] == "queued_as"
-                and edge["meta"]["release_id"] == self.release.id
-                for edge in graph["edges"]
-            )
-        )
 
     def test_corrupt_frozen_evidence_is_hidden_instead_of_using_live_resources(self) -> None:
         self.run.definition_hash = "invalid-run-hash"
@@ -257,13 +217,6 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as error:
                 operations_router._run_for_request(self.db, self.run.id)
             self.assertEqual(error.exception.status_code, 404)
-            graph = build_scenario_lineage(self.db, self.scenario.id)
-        node_ids = {node["id"] for node in graph["nodes"]}
-        self.assertNotIn(f"action_execution:{self.log.id}", node_ids)
-        self.assertNotIn(f"workflow_run:{self.run.id}", node_ids)
-        labels = {str(node["label"]) for node in graph["nodes"]}
-        self.assertNotIn("后续实时操作名称", labels)
-        self.assertNotIn("后续实时工作流名称", labels)
 
     def test_operational_views_are_scoped_to_the_current_deployment(self) -> None:
         """A dev control-plane process cannot inspect or operate staging work."""
@@ -297,11 +250,6 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as error:
                 operations_router._run_for_request(self.db, self.run.id)
             self.assertEqual(error.exception.status_code, 404)
-            graph = build_scenario_lineage(self.db, self.scenario.id)
-
-        node_ids = {node["id"] for node in graph["nodes"]}
-        self.assertNotIn(f"action_execution:{self.log.id}", node_ids)
-        self.assertNotIn(f"workflow_run:{self.run.id}", node_ids)
 
 
 if __name__ == "__main__":

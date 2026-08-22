@@ -11,7 +11,19 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .database import init_db
-from .routers import agents, assistant, auth, advanced, connectors, data_sources, external_api, incidents, lineage, llm_configs, mcp, operations, packages, permissions, releases, scenarios, skills, starter_kits
+from .routers import (
+    agents,
+    assistant,
+    auth,
+    data_sources,
+    external_api,
+    functions,
+    llm_configs,
+    mcp,
+    operations,
+    scenarios,
+    skills,
+)
 from .services import operations_service, permission_service, skill_service
 
 
@@ -24,7 +36,7 @@ async def _operations_worker() -> None:
         try:
             await asyncio.to_thread(operations_service.worker_tick)
         except Exception:  # noqa: BLE001
-            logger.exception("运营任务 worker 轮询失败")
+            logger.exception("后台任务 worker 轮询失败")
         await asyncio.sleep(1)
 
 
@@ -72,14 +84,7 @@ app.include_router(agents.router, prefix=settings.api_prefix)
 app.include_router(assistant.router, prefix=settings.api_prefix)
 app.include_router(operations.router, prefix=settings.api_prefix)
 app.include_router(operations.operations_router, prefix=settings.api_prefix)
-app.include_router(incidents.router, prefix=settings.api_prefix)
-app.include_router(permissions.router, prefix=settings.api_prefix)
-app.include_router(lineage.router, prefix=settings.api_prefix)
-app.include_router(releases.router, prefix=settings.api_prefix)
-app.include_router(packages.router, prefix=settings.api_prefix)
-app.include_router(starter_kits.router, prefix=settings.api_prefix)
-app.include_router(connectors.router, prefix=settings.api_prefix)
-app.include_router(advanced.router, prefix=settings.api_prefix)
+app.include_router(functions.router, prefix=settings.api_prefix)
 app.include_router(external_api.management_router, prefix=settings.api_prefix)
 app.include_router(external_api.router, prefix=settings.api_prefix)
 

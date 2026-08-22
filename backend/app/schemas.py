@@ -59,322 +59,6 @@ class UserOut(BaseModel):
     can_manage: bool = False
 
 
-class OrganizationOut(BaseModel):
-    id: str
-    tenant_id: str
-    name: str = ""
-    created_at: datetime
-    updated_at: datetime
-
-    model_config = {"from_attributes": True, "populate_by_name": True}
-
-
-class OrganizationRoleOut(BaseModel):
-    id: str
-    key: str
-    name: str
-    description: str = ""
-    is_system: bool = True
-
-    model_config = {"from_attributes": True}
-
-
-class OrganizationMemberOut(BaseModel):
-    id: str
-    user_id: str
-    email: str = ""
-    display_name: str = ""
-    role_id: str
-    role_key: str
-    role_name: str = ""
-    status: str = "active"
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-class OrganizationMemberIn(BaseModel):
-    user_id: str = Field(min_length=1, max_length=32)
-    role_key: Literal["owner", "admin", "operator", "viewer"]
-
-
-class PermissionGrantIn(BaseModel):
-    """角色或单个成员对一个受控资源的精确 allow/deny 规则。"""
-
-    role_key: Literal["owner", "admin", "operator", "viewer"] | None = None
-    user_id: str | None = Field(default=None, min_length=1, max_length=32)
-    resource_type: Literal["scenario", "object", "property", "action", "workflow"]
-    resource_id: str = Field(min_length=1, max_length=64)
-    verb: Literal["read", "write", "execute", "approve", "manage"]
-    effect: Literal["allow", "deny"] = "allow"
-
-
-class PermissionGrantOut(BaseModel):
-    id: str
-    organization_id: str
-    role_id: str | None = None
-    role_key: str = ""
-    user_id: str | None = None
-    resource_type: str
-    resource_id: str
-    verb: str
-    effect: str
-    created_by_user_id: str | None = None
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-class PermissionResourceOut(BaseModel):
-    resource_type: str
-    id: str
-    name: str
-    scenario_id: str
-    entity_id: str | None = None
-    is_sensitive: bool = False
-    access_scope: str = "tenant"
-
-
-# ──────────────────────────────────────────────
-# P2 本体发布治理
-# ──────────────────────────────────────────────
-class ReleaseBranchCreateIn(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    description: str = Field(default="", max_length=4_000)
-
-
-class ReleaseBranchOut(BaseModel):
-    id: str
-    tenant_id: str
-    scenario_id: str
-    name: str
-    description: str = ""
-    status: str
-    base_snapshot_id: str | None = None
-    head_snapshot_id: str | None = None
-    created_by_user_id: str | None = None
-    created_at: datetime
-    updated_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-class ReleaseSnapshotOut(BaseModel):
-    id: str
-    tenant_id: str
-    scenario_id: str
-    branch_id: str | None = None
-    parent_snapshot_id: str | None = None
-    kind: str
-    content_hash: str
-    # 已由服务层递归去敏；不会包含 executor/MCP/DataSource 的真实凭据。
-    content: dict = Field(default_factory=dict)
-    created_by_user_id: str | None = None
-    created_at: datetime
-
-
-class ReleaseProposalCreateIn(BaseModel):
-    title: str = Field(min_length=1, max_length=240)
-    description: str = Field(default="", max_length=8_000)
-    # 完整目标本体定义；每个新增/引用对象需提供稳定 id，服务端再做引用校验和去敏。
-    content: dict = Field(default_factory=dict)
-    submit: bool = True
-
-
-class ReleaseReviewCreateIn(BaseModel):
-    decision: Literal["approve", "reject"]
-    comment: str = Field(default="", max_length=8_000)
-
-
-class ReleaseReviewOut(BaseModel):
-    id: str
-    proposal_id: str
-    reviewer_user_id: str | None = None
-    decision: str
-    comment: str = ""
-    created_at: datetime
-
-
-class ReleaseProposalOut(BaseModel):
-    id: str
-    tenant_id: str
-    scenario_id: str
-    branch_id: str
-    base_snapshot_id: str
-    proposed_snapshot_id: str
-    pre_merge_snapshot_id: str | None = None
-    merged_snapshot_id: str | None = None
-    title: str
-    description: str = ""
-    status: str
-    created_by_user_id: str | None = None
-    submitted_at: datetime | None = None
-    merged_at: datetime | None = None
-    merged_by_user_id: str | None = None
-    # 仅用于评审展示的安全快照内容。
-    content: dict = Field(default_factory=dict)
-    reviews: list[ReleaseReviewOut] = Field(default_factory=list)
-    created_at: datetime
-    updated_at: datetime
-
-
-class ReleaseConfirmIn(BaseModel):
-    # 不接受 false 或省略：merge/rollback/publish 均必须由调用方明确确认。
-    confirmed: bool
-    note: str = Field(default="", max_length=8_000)
-
-    @field_validator("confirmed", mode="before")
-    @classmethod
-    def require_literal_true(cls, value: object) -> bool:
-        # ``Literal[True]`` 在部分 Pydantic 版本中会把 JSON 数字 1 判为 True；
-        # 发布确认必须是客户端明确发送的 JSON boolean true。
-        if value is not True:
-            raise ValueError("confirmed 必须显式为 true")
-        return True
-
-
-class ReleasePublishIn(ReleaseConfirmIn):
-    environment: Literal["dev", "staging", "prod"]
-    branch_id: str | None = Field(default=None, min_length=1, max_length=32)
-    proposal_id: str | None = Field(default=None, min_length=1, max_length=32)
-    snapshot_id: str | None = Field(default=None, min_length=1, max_length=32)
-    notes: str = Field(default="", max_length=8_000)
-
-
-class ReleaseRecordOut(BaseModel):
-    id: str
-    tenant_id: str
-    scenario_id: str
-    branch_id: str
-    snapshot_id: str
-    proposal_id: str | None = None
-    environment: str
-    status: str
-    notes: str = ""
-    connector_audit: list[dict] = Field(default_factory=list)
-    created_by_user_id: str | None = None
-    created_at: datetime
-
-
-class ReleaseRollbackIn(ReleaseConfirmIn):
-    target_snapshot_id: str = Field(min_length=1, max_length=32)
-    branch_id: str | None = Field(default=None, min_length=1, max_length=32)
-    environment: Literal["dev", "staging", "prod"] | None = None
-    reason: str = Field(default="", max_length=8_000)
-
-
-class ReleaseRollbackOut(BaseModel):
-    id: str
-    tenant_id: str
-    scenario_id: str
-    branch_id: str
-    from_snapshot_id: str
-    target_snapshot_id: str
-    result_snapshot_id: str
-    environment: str | None = None
-    reason: str = ""
-    connector_audit: list[dict] = Field(default_factory=list)
-    created_by_user_id: str | None = None
-    created_at: datetime
-
-
-class ConnectorCatalogOut(BaseModel):
-    """Credential-free normalized view of a DataSource, MCP or LLM config."""
-
-    id: str
-    name: str
-    kind: Literal["data_source", "mcp", "llm"]
-    adapter_type: str = ""
-    scenario_id: str | None = None
-    enabled: bool = True
-    secret_state: Literal["configured", "missing", "not_required"] = "not_required"
-    health: Literal["unknown", "healthy", "unhealthy"] = "unknown"
-    checked_at: datetime | None = None
-    message: str = ""
-    capabilities: list[str] = Field(default_factory=list)
-
-
-class ConnectorBindingIn(BaseModel):
-    environment: Literal["dev", "staging", "prod"] = "dev"
-    binding_key: str = Field(min_length=1, max_length=180)
-    kind: Literal["data_source", "mcp", "llm"]
-    connector_id: str = Field(min_length=1, max_length=32)
-    reference_label: str = Field(default="", max_length=300)
-    # A health check can start a local process, hit a remote MCP or incur model
-    # usage; callers must request it explicitly rather than binding implicitly.
-    check: bool = False
-
-
-class ConnectorBindingOut(ConnectorCatalogOut):
-    binding_id: str
-    binding_key: str
-    reference_label: str = ""
-    environment: Literal["dev", "staging", "prod"]
-    ready: bool = False
-    blocking_reason: str = ""
-    created_at: datetime
-    updated_at: datetime
-
-
-class ConnectorReadinessOut(BaseModel):
-    ready: bool
-    environment: Literal["dev", "staging", "prod"]
-    reasons: list[str] = Field(default_factory=list)
-    audit: list[dict] = Field(default_factory=list)
-
-
-class PackageImportProposalIn(BaseModel):
-    """An already-uploaded portable package becomes a proposal, never a live apply."""
-
-    package: dict = Field(default_factory=dict)
-    branch_id: str = Field(min_length=1, max_length=32)
-    environment: Literal["dev", "staging", "prod"] = "dev"
-    title: str = Field(min_length=1, max_length=240)
-    description: str = Field(default="", max_length=7_000)
-    submit: bool = True
-
-
-class PackageImportProposalOut(BaseModel):
-    id: str
-    branch_id: str
-    base_snapshot_id: str
-    proposed_snapshot_id: str
-    status: str
-    environment: Literal["dev", "staging", "prod"] = "dev"
-    package_fingerprint: str
-    summary: dict[str, int] = Field(default_factory=dict)
-
-
-class StarterKitOut(BaseModel):
-    """Safe catalog metadata for a repository-owned governed Starter Kit."""
-
-    id: str
-    name: str
-    industry: str
-    version: str
-    description: str = ""
-    fingerprint: str
-    resource_counts: dict[str, int] = Field(default_factory=dict)
-
-
-class StarterKitImportProposalIn(BaseModel):
-    """Create a proposal from a fixed server-side Starter Kit, never a live apply."""
-
-    branch_id: str = Field(min_length=1, max_length=32)
-    environment: Literal["dev", "staging", "prod"] = "dev"
-    # A Starter Kit is loaded again at the write boundary.  Requiring the
-    # fingerprint observed during preview prevents a user from confirming one
-    # catalog artifact and accidentally creating a proposal from a later one.
-    expected_fingerprint: str = Field(min_length=8, max_length=80)
-    title: str = Field(min_length=1, max_length=240)
-    description: str = Field(default="", max_length=7_000)
-    submit: bool = True
-
-
-class StarterKitImportProposalOut(PackageImportProposalOut):
-    starter_kit: StarterKitOut
-
-
 class AuthMessage(Msg):
     email: str = ""
 
@@ -662,8 +346,8 @@ class FunctionDefinitionIn(BaseModel):
     """A typed contract with an optional closed-list built-in runtime.
 
     ``runtime_kind`` never accepts code, URLs or connector settings.  Runtime
-    execution is limited to the server-side deterministic operators exposed by
-    the P2 advanced runtime.
+    execution is limited to server-side deterministic operators exposed by
+    the function runtime.
     """
 
     name: str = Field(min_length=1, max_length=200)
@@ -689,76 +373,16 @@ class FunctionDefinitionOut(FunctionDefinitionIn):
     model_config = {"from_attributes": True}
 
 
-ADVANCED_ASSET_KINDS = Literal[
-    "geospatial", "timeseries", "media", "realtime", "ml_model", "simulation", "optimization"
-]
-
-
-class AdvancedAssetCreateIn(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
-    kind: ADVANCED_ASSET_KINDS
-    description: str = Field(default="", max_length=8_000)
-    asset_schema: dict = Field(default_factory=dict, alias="schema")
-    config: dict = Field(default_factory=dict)
-    status: Literal["draft", "ready", "disabled"] = "draft"
-
-    model_config = {"populate_by_name": True}
-
-
-class AdvancedAssetUpdateIn(AdvancedAssetCreateIn):
-    pass
-
-
-class AdvancedAssetOut(AdvancedAssetCreateIn):
-    id: str
-    tenant_id: str
-    scenario_id: str
-    version: int = 1
-    created_by_user_id: str | None = None
-    created_at: datetime
-    updated_at: datetime
-
-    model_config = {"from_attributes": True, "populate_by_name": True}
-
-
-class AdvancedRecordIn(BaseModel):
-    event_time: datetime | None = None
-    event_type: str = Field(default="", max_length=120)
-    geometry: dict = Field(default_factory=dict)
-    payload: dict = Field(default_factory=dict)
-    source_ref: str = Field(default="", max_length=300)
-
-
-class AdvancedRecordOut(AdvancedRecordIn):
-    id: str
-    tenant_id: str
-    scenario_id: str
-    asset_id: str
-    sequence: int
-    content_type: str = ""
-    checksum: str = ""
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-class AdvancedRecordPageOut(BaseModel):
-    items: list[AdvancedRecordOut] = Field(default_factory=list)
-    next_sequence: int | None = None
-    total: int = 0
-
-
-class AdvancedRunIn(BaseModel):
+class FunctionRunIn(BaseModel):
     params: dict = Field(default_factory=dict)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=180)
 
 
-class AdvancedRunOut(BaseModel):
+class FunctionRunOut(BaseModel):
     id: str
     tenant_id: str
     scenario_id: str
-    asset_id: str | None = None
-    function_id: str | None = None
+    function_id: str
     run_type: str
     status: str
     input_payload: dict = Field(default_factory=dict)
@@ -770,36 +394,6 @@ class AdvancedRunOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
-
-
-class AdvancedFeedbackIn(BaseModel):
-    run_id: str | None = Field(default=None, max_length=32)
-    label: str = Field(default="", max_length=160)
-    expected_output: dict = Field(default_factory=dict)
-    actual_output: dict = Field(default_factory=dict)
-    score: float | None = Field(default=None, ge=0, le=1)
-    notes: str = Field(default="", max_length=4_000)
-
-
-class AdvancedFeedbackOut(AdvancedFeedbackIn):
-    id: str
-    tenant_id: str
-    scenario_id: str
-    asset_id: str
-    created_by_user_id: str | None = None
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-class AdvancedAssetSummaryOut(BaseModel):
-    asset_id: str
-    kind: str
-    record_count: int = 0
-    run_count: int = 0
-    feedback_count: int = 0
-    last_event_time: datetime | None = None
-    last_sequence: int = 0
 
 
 class ScenarioDetail(ScenarioOut):
@@ -1023,7 +617,6 @@ class SkillOut(BaseModel):
     id: str
     name: str
     description: str
-    path: str
     source: str
     enabled: bool
     metadata: dict = {}
@@ -1069,8 +662,6 @@ class AgentIn(BaseModel):
     scenario_id: Optional[str] = None
     llm_config_id: Optional[str] = None
     system_prompt: str = ""
-    skill_ids: list[str] = []
-    mcp_ids: list[str] = []
     data_source_ids: list[str] = []
     temperature: float = Field(default=0.2, ge=0, le=2)
     max_tokens: int = Field(default=4096, ge=256, le=32768)
@@ -1082,8 +673,6 @@ class AgentOut(AgentIn):
     updated_at: datetime
     scenario_name: str = ""
     llm_name: str = ""
-    skill_names: list[str] = []
-    mcp_names: list[str] = []
     data_source_names: list[str] = []
 
     model_config = {"from_attributes": True}
@@ -1500,107 +1089,5 @@ class EventEnvelopeOut(BaseModel):
     definition_source: str = "live"
     created_at: datetime
     queued_workflow_run_ids: list[str] = Field(default_factory=list)
-
-    model_config = {"from_attributes": True}
-
-
-# ──────────────────────────────────────────────
-# P1 运营 Case / Incident 中心
-# ──────────────────────────────────────────────
-class IncidentCaseCreateIn(BaseModel):
-    title: str = Field(min_length=1, max_length=300)
-    description: str = Field(default="", max_length=12_000)
-    severity: Literal["low", "medium", "high", "critical"] = "medium"
-    source: str = Field(default="manual", min_length=1, max_length=60)
-    source_ref: str = Field(default="", max_length=180)
-    related_object_id: str | None = Field(default=None, min_length=1, max_length=32)
-    assignee_user_id: str | None = Field(default=None, min_length=1, max_length=32)
-    context: dict = Field(default_factory=dict)
-    comment: str = Field(default="", max_length=2_000)
-
-    @field_validator("title")
-    @classmethod
-    def title_must_not_be_blank(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("Case 标题不能为空")
-        return normalized
-
-
-class IncidentCaseUpdateIn(BaseModel):
-    title: str | None = Field(default=None, min_length=1, max_length=300)
-    description: str | None = Field(default=None, max_length=12_000)
-    severity: Literal["low", "medium", "high", "critical"] | None = None
-    related_object_id: str | None = Field(default=None, min_length=1, max_length=32)
-    assignee_user_id: str | None = Field(default=None, min_length=1, max_length=32)
-    context: dict | None = None
-    comment: str = Field(default="", max_length=2_000)
-
-    @field_validator("title")
-    @classmethod
-    def optional_title_must_not_be_blank(cls, value: str | None) -> str | None:
-        if value is None:
-            return value
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("Case 标题不能为空")
-        return normalized
-
-
-class IncidentCaseAcknowledgeIn(BaseModel):
-    comment: str = Field(default="", max_length=2_000)
-
-
-class IncidentCaseResolveIn(BaseModel):
-    resolution: str = Field(min_length=1, max_length=12_000)
-    comment: str = Field(default="", max_length=2_000)
-
-    @field_validator("resolution")
-    @classmethod
-    def resolution_must_not_be_blank(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("解决说明不能为空")
-        return normalized
-
-
-class IncidentCaseOut(BaseModel):
-    id: str
-    tenant_id: str
-    scenario_id: str
-    title: str
-    description: str = ""
-    severity: Literal["low", "medium", "high", "critical"] = "medium"
-    status: Literal["open", "acknowledged", "resolved"] = "open"
-    source: str = "manual"
-    source_ref: str = ""
-    related_object_id: str | None = None
-    assignee_user_id: str | None = None
-    context: dict = Field(default_factory=dict)
-    created_by_user_id: str | None = None
-    acknowledged_by_user_id: str | None = None
-    acknowledged_at: datetime | None = None
-    resolved_by_user_id: str | None = None
-    resolved_at: datetime | None = None
-    resolution: str = ""
-    created_at: datetime
-    updated_at: datetime
-    history_count: int = 0
-
-    model_config = {"from_attributes": True}
-
-
-class IncidentCaseHistoryOut(BaseModel):
-    id: str
-    incident_case_id: str
-    tenant_id: str
-    scenario_id: str
-    action: Literal["created", "updated", "acknowledged", "resolved"]
-    actor_user_id: str | None = None
-    from_status: str = ""
-    to_status: str = ""
-    changes: dict = Field(default_factory=dict)
-    comment: str = ""
-    created_at: datetime
 
     model_config = {"from_attributes": True}

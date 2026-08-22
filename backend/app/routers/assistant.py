@@ -62,6 +62,15 @@ from ..services.policies import PolicyViolation
 router = APIRouter(prefix="/assistant", tags=["assistant"])
 
 
+# Temporary assistant attachments are fed directly to draft generators rather
+# than indexed/retrieved in chunks.  Keep a generous, explicit single-request
+# boundary and reject larger inputs instead of silently dropping the tail of a
+# business document.  The ontology generator has a slightly larger envelope for
+# the user's message and authorised RAG excerpts around this attachment body.
+ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS = 80_000
+ASSISTANT_ATTACHMENT_CONTEXT_MAX_CHARS = 80_000
+
+
 def _tenant(db: Session) -> str:
     return tenant_service.current_tenant_id(db)
 
@@ -297,19 +306,53 @@ def _build_proposal(
     elif kind == "ontology":
         if not scenario:
             raise ValueError("本体草稿必须绑定业务场景")
-        existing_entities = set(snapshot["entity_names"])
+        existing_entity_map = {
+            str(entity.name): entity
+            for entity in (getattr(scenario, "entities", None) or [])
+        }
+        existing_entities = set(existing_entity_map)
         existing_relations = set(snapshot["relation_names"])
         for entity in data.get("entities") or []:
             name = str(entity.get("name") or "未命名实体").strip()
             exists = name in existing_entities
+            existing_property_names = {
+                str(prop.name)
+                for prop in (
+                    getattr(existing_entity_map.get(name), "properties", None) or []
+                )
+            }
+            generated_properties = entity.get("properties") or []
+            missing_properties = [
+                prop
+                for prop in generated_properties
+                if str(prop.get("name") or "").strip() not in existing_property_names
+            ]
+            operation = "add"
+            if exists:
+                operation = "update" if missing_properties else "skip"
             changes.append(
                 {
-                    "operation": "skip" if exists else "add",
+                    "operation": operation,
                     "resource": "entity",
                     "name": name,
-                    "summary": "实体已存在，应用时跳过" if exists else f"新增实体，包含 {len(entity.get('properties') or [])} 个属性",
+                    "summary": (
+                        f"对象类型已存在，补充 {len(missing_properties)} 个新属性"
+                        if exists and missing_properties
+                        else "对象类型和属性均已存在，应用时跳过"
+                        if exists
+                        else f"新增对象类型，包含 {len(generated_properties)} 个属性"
+                    ),
                 }
             )
+            for prop in missing_properties if exists else generated_properties:
+                changes.append(
+                    {
+                        "operation": "add",
+                        "resource": "property",
+                        "name": f"{name}.{str(prop.get('name') or '未命名属性')}",
+                        "summary": "向已有对象类型补充属性" if exists else "随对象类型新增属性",
+                    }
+                )
             existing_entities.add(name)
         for relation in data.get("relations") or []:
             name = str(relation.get("name") or "未命名关系").strip()
@@ -324,7 +367,11 @@ def _build_proposal(
             )
             existing_relations.add(name)
         title = "本体建模变更草稿"
-        summary = f"建议新增 {sum(1 for item in changes if item['operation'] == 'add' and item['resource'] == 'entity')} 个实体和 {sum(1 for item in changes if item['operation'] == 'add' and item['resource'] == 'relation')} 条关系。"
+        summary = (
+            f"建议新增 {sum(1 for item in changes if item['operation'] == 'add' and item['resource'] == 'entity')} 个对象类型，"
+            f"更新 {sum(1 for item in changes if item['operation'] == 'update' and item['resource'] == 'entity')} 个已有对象类型，"
+            f"并新增 {sum(1 for item in changes if item['operation'] == 'add' and item['resource'] == 'relation')} 条关系。"
+        )
     elif kind == "mapping":
         if not scenario:
             raise ValueError("数据映射草稿必须绑定业务场景")
@@ -429,12 +476,33 @@ def _attachment_context(attachments: list[AssistantAttachment]) -> tuple[str, li
         return "", []
     parts: list[str] = []
     sources: list[dict[str, Any]] = []
+    included_chars = 0
     for item in attachments:
-        sources.append({"id": item.id, "filename": item.filename, "status": item.status})
+        parsed_text = str(item.parsed_text or "")
+        sources.append({
+            "id": item.id,
+            "filename": item.filename,
+            "status": item.status,
+            "characters": len(parsed_text),
+            "truncated": False,
+        })
         if item.status == "parsed" and item.parsed_text:
-            parts.append(f"【附件：{item.filename}】\n{item.parsed_text[:12000]}")
+            part = f"【附件：{item.filename}】\n{parsed_text}"
         elif item.error:
-            parts.append(f"【附件：{item.filename}】解析失败：{item.error}")
+            part = f"【附件：{item.filename}】解析失败：{item.error}"
+        else:
+            continue
+        projected = included_chars + (len(parsed_text) if parsed_text else len(part))
+        if projected > ASSISTANT_ATTACHMENT_CONTEXT_MAX_CHARS:
+            raise HTTPException(
+                413,
+                "所选附件正文合计"
+                f" {projected} 个字符，超过单次助手建模上下文"
+                f" {ASSISTANT_ATTACHMENT_CONTEXT_MAX_CHARS} 个字符的明确边界；"
+                "系统不会静默截断文档，请拆分附件后分批生成并审阅本体草稿。",
+            )
+        parts.append(part)
+        included_chars = projected
     return "\n\n".join(parts), sources
 
 
@@ -625,20 +693,41 @@ def _intent(message: str, mode: str) -> str:
     text = message.lower()
     if any(k in text for k in ("创建场景", "新建场景", "建立场景", "业务场景草稿")):
         return "scenario"
-    if any(k in text for k in ("数据映射", "字段映射", "映射草稿", "列映射")):
+    ontology_requested = any(k in text for k in ("本体", "实体", "关系", "建模", "数据模型", "对象类型"))
+    explicit_ontology_requested = any(
+        k in text
+        for k in (
+            "本体建模",
+            "本体模型",
+            "建立本体",
+            "构建本体",
+            "创建本体",
+            "生成本体",
+            "设计本体",
+        )
+    )
+    mapping_requested = any(k in text for k in ("数据映射", "字段映射", "映射草稿", "列映射"))
+    # An ontology brief commonly asks the model to preserve keys for a later
+    # data-mapping step.  That supporting phrase must not turn the whole draft
+    # into a mapping proposal.  A mapping-only request still routes normally.
+    if mapping_requested and not ontology_requested:
         return "mapping"
+    # 复合实施文档通常会在本体建模要求中同时提到规则、事件和工作流；
+    # 这些下游章节不应把整份附件误送到单工作流生成器。
+    if explicit_ontology_requested:
+        return "ontology"
     if any(k in text for k in ("工作流", "流程", "编排", "审批流", "自动化")):
         return "workflow"
-    if mode == "draft" or any(k in text for k in ("本体", "实体", "关系", "建模", "数据模型", "对象类型")):
+    if mode == "draft" or ontology_requested:
         return "ontology"
     return "chat"
 
 
 def _mode_safety_context(mode: str) -> str:
     if mode == "explain":
-        return "\n当前是解释模式：只读分析已授权上下文，不生成 Change Set，不应用变更，不触发执行。"
+        return "\n当前是解释模式：只读分析已授权上下文，不生成变更清单，不应用变更，不触发执行。"
     if mode == "draft":
-        return "\n当前是草稿模式：最多生成待审阅 Change Set，确认前不得写入正式数据。"
+        return "\n当前是草稿模式：最多生成待审阅变更清单，确认前不得写入正式数据。"
     if mode == "apply":
         return "\n当前是应用引导模式：聊天不能写入，只能引导用户在已保存的提案卡片显式确认。"
     if mode == "execute":
@@ -659,9 +748,9 @@ def _assistant_evidence(
         "scenario": ("draft_only", "新场景固定进入 draft，附件不提升为正式数据源"),
         "ontology": ("ontology_validation", "实体、属性、关系和约束在应用边界重新校验"),
         "mapping": ("mapping_reference_validation", "实体、数据源、表、列、主键和必填字段必须真实存在"),
-        "workflow": ("workflow_dag_validation", "节点、连线和 Action 引用在应用边界重新校验"),
+        "workflow": ("workflow_dag_validation", "节点、连线和操作引用在应用边界重新校验"),
         "apply_guidance": ("explicit_confirmation", "聊天不写入，只有已保存提案的 confirm=true 可应用"),
-        "execute_guidance": ("typed_action_only", "聊天只预演，真实副作用必须走类型化 Action 或任务审批"),
+        "execute_guidance": ("typed_action_only", "聊天只预演，真实执行必须进入场景中已配置的操作或任务审批"),
         "explain": ("read_only", "解释模式只读取已授权上下文"),
         "chat": ("read_only", "问答不直接修改或执行平台资源"),
     }
@@ -697,13 +786,13 @@ def _assistant_action_preview(
         question = {
             "id": "execute-scenario",
             "title": "需要业务场景",
-            "message": "Action 预演必须绑定业务场景，才能校验目标、权限和运行定义。",
+            "message": "操作预演必须绑定业务场景，才能校验目标、权限和运行定义。",
             "options": [
-                {"label": "打开业务场景", "value": "open_scenario", "impact": "进入已有场景后可选择 Action 并完成只读预演。", "recommended": True},
+                {"label": "打开业务场景", "value": "open_scenario", "impact": "进入已有场景后可选择操作并完成只读预演。", "recommended": True},
                 {"label": "保持只读说明", "value": "explain_only", "impact": "仅解释执行流程，不创建预演日志，也不触发副作用。"},
             ],
         }
-        return {}, question, "请先打开一个业务场景，我才能安全地解析并预演 Action；聊天不会直接触发任何操作。"
+        return {}, question, "请先打开一个业务场景，我才能安全地解析并预演操作；聊天不会直接触发任何操作。"
 
     readable_actions: list[Any] = []
     for action in list(getattr(scenario, "actions", []) or []):
@@ -744,19 +833,19 @@ def _assistant_action_preview(
         if not options:
             options = [
                 {
-                    "label": "配置类型化 Action",
+                    "label": "配置类型化操作",
                     "value": "configure_action",
-                    "impact": "先由 Builder 定义参数 Schema、权限、幂等和执行器，之后才能预演。",
+                    "impact": "先在场景的“操作”页定义输入字段、权限、重复提交保护和执行方式，之后才能预演。",
                     "recommended": True,
                 }
             ]
         question = {
             "id": "select-action",
-            "title": "选择要预演的 Action",
-            "message": "我不会从模糊文字猜测有副作用的目标。请选择一个当前有权读取的 Action。",
+            "title": "选择要预演的操作",
+            "message": "我不会从模糊文字猜测有副作用的目标。请选择一个当前有权读取的操作。",
             "options": options,
         }
-        return {}, question, "需要先确定一个明确的类型化 Action，聊天不会直接执行任何操作。"
+        return {}, question, "需要先确定一个明确的已配置操作，聊天不会直接执行任何副作用。"
 
     raw_params = selected.get("params", selected.get("parameters", {}))
     params = raw_params if isinstance(raw_params, dict) else {}
@@ -766,11 +855,11 @@ def _assistant_action_preview(
     if missing or not isinstance(raw_params, dict):
         question = {
             "id": "action-parameters",
-            "title": "补充 Action 参数",
-            "message": f"“{action.name}”还缺少必填参数：{'、'.join(missing) if missing else '参数必须是对象'}。",
+            "title": "补充操作参数",
+            "message": f"“{action.name}”还缺少必填参数：{'、'.join(missing) if missing else '请按字段填写参数'}。",
             "options": [
-                {"label": "填写必填参数", "value": "provide_params", "impact": "参数齐全后仅执行权限检查和 dry_run，不触发外部副作用。", "recommended": True},
-                {"label": "查看参数定义", "value": "inspect_schema", "impact": "只查看参数 Schema 与影响说明，不创建预演日志。"},
+                {"label": "填写必填参数", "value": "provide_params", "impact": "参数齐全后仅执行权限检查和预演，不触发外部副作用。", "recommended": True},
+                {"label": "查看参数定义", "value": "inspect_schema", "impact": "只查看输入字段与影响说明，不创建预演日志。"},
             ],
         }
         analysis = {
@@ -788,7 +877,7 @@ def _assistant_action_preview(
             "preview": {},
             "requires_approval": bool(action.requires_confirmation),
         }
-        return analysis, question, f"已定位 Action“{action.name}”，补齐参数后才能完成权限检查和预演。"
+        return analysis, question, f"已定位操作“{action.name}”，补齐参数后才能完成权限检查和预演。"
 
     definition = runtime_definition_service.resolve_active(
         db,
@@ -830,10 +919,10 @@ def _assistant_action_preview(
         "permission": preview.get("permission") or {},
         "preview": preview,
         "requires_approval": bool(runtime_action.requires_confirmation),
-        "execution_boundary": "真实执行必须从类型化 Action/任务入口重新确认；聊天永不设置 confirm=true。",
+        "execution_boundary": "真实执行必须从场景操作或任务入口重新确认；聊天不会跳过确认步骤。",
     }
-    approval = "需要显式确认或审批" if runtime_action.requires_confirmation else "仍需从 Action 入口提交"
-    return analysis, None, f"已完成 Action“{runtime_action.name}”的 dry_run；{approval}，本次没有触发外部副作用。"
+    approval = "需要显式确认或审批" if runtime_action.requires_confirmation else "仍需从操作入口提交"
+    return analysis, None, f"已完成操作“{runtime_action.name}”的预演；{approval}，本次没有触发外部副作用。"
 
 
 def _generate_scenario_draft(db: Session, description: str) -> dict[str, Any]:
@@ -1161,14 +1250,14 @@ def _apply_mapping_draft(
 def _fallback_reply(intent: str, scenario: BusinessScenario | None) -> str:
     if intent == "apply_guidance":
         return (
-            "聊天模式不会直接应用任何变更。请在会话中选择一个已保存的 Change Set 卡片，"
+            "聊天模式不会直接应用任何变更。请在会话中选择一个已保存的变更清单，"
             "先核对变更范围、基线和权限，再点击显式确认；服务端只有在应用接口收到 "
             "confirm=true 时才会写入。"
         )
     if intent == "execute_guidance":
         return (
-            "聊天模式不会直接触发 Action、工作流或外部副作用。请先在对应的 Action/任务界面"
-            "核对目标对象、参数、影响范围、权限决策和预演结果；真正执行仍需走类型化 Action"
+            "聊天模式不会直接触发操作、工作流或外部副作用。请先在对应的操作或任务界面"
+            "核对目标对象、参数、影响范围、权限决策和预演结果；真正执行仍需进入场景中已配置的操作"
             "或任务审批流程。"
         )
     if intent == "explain":
@@ -1425,7 +1514,15 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
             temp_path = tmp.name
         parsed = doc_parser.parse_file(temp_path, filename)
         attachment.status = "parsed" if parsed.get("status") == "success" else "error"
-        attachment.parsed_text = str(parsed.get("text") or "")[:24000]
+        parsed_text = str(parsed.get("text") or "")
+        if attachment.status == "parsed" and len(parsed_text) > ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS:
+            raise HTTPException(
+                413,
+                f"附件“{filename}”解析出 {len(parsed_text)} 个字符，超过单份临时附件"
+                f" {ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS} 个字符的明确边界；"
+                "系统不会静默截断文档，请拆分文件后重新上传。",
+            )
+        attachment.parsed_text = parsed_text
         attachment.error = "" if attachment.status == "parsed" else str(parsed.get("message") or "解析失败")
     finally:
         if temp_path:
@@ -1495,7 +1592,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
             db,
             thread,
             "assistant",
-            "正在准备 Action 安全预演。",
+            "正在准备操作安全预演。",
             {**context, "status": "processing"},
             message_id=assistant_message_id,
         )
@@ -1614,7 +1711,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 })
                 yield _sse("token", reply)
             elif intent == "execute_guidance":
-                yield progress({"id": "action-preview", "title": "分析 Action", "detail": "正在核对目标、参数、影响和权限。", "status": "running"})
+                yield progress({"id": "action-preview", "title": "分析操作", "detail": "正在核对目标、参数、影响和权限。", "status": "running"})
                 action_preview, question, reply = _assistant_action_preview(
                     db,
                     scenario,
@@ -1624,7 +1721,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 )
                 if question:
                     questions.append(question)
-                done_event = progress({"id": "action-preview", "title": "分析 Action", "detail": "Action 分析完成；聊天未触发任何外部副作用。", "status": "done"})
+                done_event = progress({"id": "action-preview", "title": "分析操作", "detail": "操作分析完成；聊天未触发任何外部副作用。", "status": "done"})
                 # Persist the preview card before exposing it over SSE.  A client
                 # may navigate away immediately after receiving the event; the
                 # durable parent message and Action log must already agree.
@@ -1853,7 +1950,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             db,
             thread,
             "assistant",
-            "正在准备 Action 安全预演。",
+            "正在准备操作安全预演。",
             {**context, "status": "processing"},
             message_id=assistant_message_id,
         )
@@ -2160,6 +2257,12 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             nodes = data.get("nodes") or []
             edges = data.get("edges") or []
             workflow_service.validate_workflow_definition(nodes, edges)
+            workflow_service.validate_workflow_references(
+                db,
+                scenario.id,
+                steps=[],
+                nodes=nodes,
+            )
             workflow = OntologyWorkflow(
                 scenario_id=scenario.id,
                 name=str(data.get("name") or "AI 生成工作流"),

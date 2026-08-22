@@ -7,6 +7,7 @@ import re
 from datetime import date, datetime
 from typing import Any
 from urllib.parse import urlparse
+from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -120,8 +121,8 @@ def normalize_property_constraints(
                 raise ValueError("pattern 不是有效的正则表达式") from exc
         elif key == "format":
             value = str(value)
-            if value not in {"email", "uri", "date", "date-time"}:
-                raise ValueError("format 只能是 email、uri、date 或 date-time")
+            if value not in {"email", "uri", "uuid", "date", "date-time"}:
+                raise ValueError("format 只能是 email、uri、uuid、date 或 date-time")
         result[key] = value
     if (
         "minimum" in result
@@ -227,6 +228,11 @@ def _validate_property_value(
         elif expected_format == "uri":
             parsed = urlparse(value)
             format_valid = bool(parsed.scheme and (parsed.netloc or parsed.path))
+        elif expected_format == "uuid":
+            try:
+                UUID(value)
+            except (ValueError, AttributeError):
+                format_valid = False
         elif expected_format == "date":
             try:
                 date.fromisoformat(value)
@@ -573,21 +579,27 @@ def search_instances(
 # ──────────────────────────────────────────────
 # AI 生成本体
 # ──────────────────────────────────────────────
+ONTOLOGY_CONTEXT_MAX_CHARS = 100_000
+ONTOLOGY_MAX_OUTPUT_TOKENS = 12_000
+ONTOLOGY_PROPERTY_TYPES = {"string", "integer", "float", "boolean", "date", "datetime", "json", "text"}
+ONTOLOGY_RELATION_TYPES = {"1:1", "1:N", "N:M"}
+
 _GEN_PROMPT = """你是资深业务架构师，擅长为任意行业构建本体（Ontology）模型。
-请根据下面的业务描述，设计一套简洁、通用、可扩展的本体模型。
+请完整阅读下面的业务描述，设计一套忠实、通用、可扩展的本体模型。输入已在服务端完成完整性边界校验，不要只处理开头部分。
 
 要求：
-1. 实体（entities）：3~8 个核心业务对象，命名使用业务领域中的稳定名词。
-2. 每个实体给出 3~8 个属性（properties），属性名用中文，data_type 只能是：string / integer / float / boolean / date / datetime / json / text；需要状态机时使用 is_enum/enum_values，并在实体 state_property 指向该枚举属性。
+1. 实体（entities）：覆盖文档明确描述的全部核心业务对象，数量由业务内容决定，不设 8 个上限；不要为了简洁遗漏文档中的稳定业务概念，也不要凭空发明概念。
+2. 每个实体覆盖文档明确要求的关键属性（properties），数量由业务内容决定。属性名用中文，data_type 只能是：string / integer / float / boolean / date / datetime / json / text；需要状态机时使用 is_enum/enum_values，并在实体 state_property 指向该枚举属性。文档明确给出默认值或敏感字段时，分别写入 default_value、is_sensitive；没有依据时不要猜测。
 3. 每个实体必须恰好有 1 个 is_key=true 的主键属性。
-4. 关系（relations）：2~8 条，relation_type 只能是 1:1 / 1:N / N:M。
-5. 只输出 JSON，不要输出任何解释文字。
+4. 关系（relations）：覆盖文档明确描述的实体关系，数量由业务内容决定；relation_type 只能是 1:1 / 1:N / N:M。
+5. 对名称、枚举、约束或关系方向没有明确依据时采用保守表达，不把数据表或字段机械等同于业务实体。
+6. 只输出 JSON，不要输出任何解释文字。
 
 输出格式（严格 JSON）：
 {
   "entities": [
     {"name": "业务对象", "description": "业务领域中的核心对象", "is_abstract": false, "state_property": "",
-     "properties": [{"name": "对象ID", "data_type": "string", "is_key": true, "is_required": true, "is_enum": false, "enum_values": [], "constraints": {}}, ...]}
+     "properties": [{"name": "对象ID", "data_type": "string", "is_key": true, "is_required": true, "is_enum": false, "enum_values": [], "default_value": "", "constraints": {}, "is_sensitive": false}, ...]}
   ],
   "relations": [
     {"name": "关联", "source": "业务对象", "target": "相关对象", "relation_type": "1:N", "description": ""}
@@ -618,6 +630,120 @@ def _extract_json(text: str) -> dict[str, Any]:
         return json.loads(repaired)
 
 
+def _ontology_context(description: str) -> str:
+    """Return complete bounded input; never hide a tail-truncation from users."""
+    context = str(description or "")
+    if len(context) > ONTOLOGY_CONTEXT_MAX_CHARS:
+        raise ValueError(
+            f"本体生成上下文共 {len(context)} 个字符，超过单次生成"
+            f" {ONTOLOGY_CONTEXT_MAX_CHARS} 个字符的明确边界；"
+            "系统不会静默截断文档，请拆分文档后分批生成并审阅本体草稿"
+        )
+    return context
+
+
+def normalize_generated_ontology(
+    data: dict[str, Any],
+    *,
+    existing_entity_names: set[str] | None = None,
+) -> dict[str, Any]:
+    """把模型输出收敛到平台本体契约，并保留指向已有对象类型的关系。"""
+    known_entity_names = {
+        str(name).strip() for name in (existing_entity_names or set()) if str(name).strip()
+    }
+    generated_entity_names: set[str] = set()
+    entities: list[dict[str, Any]] = []
+    for raw_entity in data.get("entities") or []:
+        if not isinstance(raw_entity, dict):
+            continue
+        name = str(raw_entity.get("name") or "").strip()
+        if not name or name in generated_entity_names:
+            continue
+        generated_entity_names.add(name)
+        properties: list[dict[str, Any]] = []
+        property_names: set[str] = set()
+        key_seen = False
+        for raw_property in raw_entity.get("properties") or []:
+            if not isinstance(raw_property, dict):
+                continue
+            property_name = str(raw_property.get("name") or "").strip()
+            if not property_name or property_name in property_names:
+                continue
+            data_type = str(raw_property.get("data_type") or "string").strip().lower()
+            if data_type not in ONTOLOGY_PROPERTY_TYPES:
+                raise ValueError(f"对象类型“{name}”的属性“{property_name}”使用了不支持的数据类型: {data_type}")
+            is_key = bool(raw_property.get("is_key", False)) and not key_seen
+            key_seen = key_seen or is_key
+            is_enum = bool(raw_property.get("is_enum", False))
+            enum_values = [str(item) for item in (raw_property.get("enum_values") or [])]
+            properties.append(
+                {
+                    "name": property_name,
+                    "data_type": data_type,
+                    "description": str(raw_property.get("description") or ""),
+                    "is_key": is_key,
+                    "is_required": bool(raw_property.get("is_required", False)) or is_key,
+                    "is_enum": is_enum,
+                    "enum_values": enum_values if is_enum else [],
+                    "default_value": raw_property.get("default_value", ""),
+                    "constraints": normalize_property_constraints(
+                        data_type,
+                        raw_property.get("constraints")
+                        if isinstance(raw_property.get("constraints"), dict)
+                        else {},
+                    ),
+                    "is_sensitive": bool(raw_property.get("is_sensitive", False)),
+                }
+            )
+            property_names.add(property_name)
+        if not key_seen and properties:
+            properties[0]["is_key"] = True
+            properties[0]["is_required"] = True
+        state_property = str(raw_entity.get("state_property") or "").strip()
+        if state_property and not any(
+            prop["name"] == state_property and prop["is_enum"] for prop in properties
+        ):
+            state_property = ""
+        entities.append(
+            {
+                "name": name,
+                "description": str(raw_entity.get("description") or ""),
+                "is_abstract": bool(raw_entity.get("is_abstract", False)),
+                "state_property": state_property,
+                "properties": properties,
+            }
+        )
+
+    all_entity_names = known_entity_names | generated_entity_names
+    relations: list[dict[str, Any]] = []
+    relation_keys: set[tuple[str, str, str]] = set()
+    for raw_relation in data.get("relations") or []:
+        if not isinstance(raw_relation, dict):
+            continue
+        source = str(raw_relation.get("source") or "").strip()
+        target = str(raw_relation.get("target") or "").strip()
+        if source not in all_entity_names or target not in all_entity_names:
+            continue
+        relation_type = str(raw_relation.get("relation_type") or "1:N").strip().upper()
+        if relation_type not in ONTOLOGY_RELATION_TYPES:
+            raise ValueError(f"关系“{raw_relation.get('name') or f'{source}-{target}'}”使用了不支持的基数: {relation_type}")
+        name = str(raw_relation.get("name") or "").strip() or f"{source}-{target}"
+        key = (name, source, target)
+        if key in relation_keys:
+            continue
+        relation_keys.add(key)
+        relations.append(
+            {
+                "name": name,
+                "source": source,
+                "target": target,
+                "relation_type": relation_type,
+                "description": str(raw_relation.get("description") or ""),
+            }
+        )
+    return {"entities": entities, "relations": relations}
+
+
 def generate_ontology(db: Session, scenario: BusinessScenario, description: str) -> dict[str, Any]:
     """调用 LLM 生成本体草稿（不落库），返回 {entities, relations}。"""
     from ..models import LLMConfig
@@ -635,7 +761,8 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
         raise ValueError("请先在「LLM 配置」中配置并启用一个默认模型")
 
     # 注意：_GEN_PROMPT 内含 JSON 示例花括号，不能用 str.format（会触发 KeyError），
-    # 用 replace 注入业务描述。LLM 输出可能不稳定，最多重试 3 次。
+    # 用 replace 注入业务描述。输入在调用前完成显式边界校验，不能再做切片。
+    context = _ontology_context(description)
     last_err: Exception | None = None
     data: dict[str, Any] = {}
     for _ in range(3):
@@ -643,10 +770,10 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
             llm,
             [
                 {"role": "system", "content": "你只输出 JSON。"},
-                {"role": "user", "content": _GEN_PROMPT.replace("{description}", description[:3000])},
+                {"role": "user", "content": _GEN_PROMPT.replace("{description}", context)},
             ],
             temperature=0.3,
-            max_tokens=4096,
+            max_tokens=ONTOLOGY_MAX_OUTPUT_TOKENS,
             db=db,
         )
         try:
@@ -658,65 +785,16 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
             last_err = exc
     else:
         raise ValueError(f"AI 多次生成均失败: {last_err}")
-    entities = data.get("entities") or []
-    relations = data.get("relations") or []
-    if not entities:
+    if not data.get("entities"):
         raise ValueError("AI 未返回有效实体，请补充业务描述后重试")
-
-    # 规范化
-    name_to_idx: dict[str, int] = {}
-    for i, e in enumerate(entities):
-        e["name"] = str(e.get("name", "")).strip()
-        e["description"] = str(e.get("description", ""))
-        e["is_abstract"] = bool(e.get("is_abstract", False))
-        e["state_property"] = str(e.get("state_property", "")).strip()
-        props = []
-        has_key = False
-        for p in e.get("properties") or []:
-            p = {
-                "name": str(p.get("name", "")).strip(),
-                "data_type": str(p.get("data_type", "string")),
-                "description": str(p.get("description", "")),
-                "is_key": bool(p.get("is_key", False)),
-                "is_required": bool(p.get("is_required", False)),
-                "is_enum": bool(p.get("is_enum", False)),
-                "enum_values": [str(item) for item in (p.get("enum_values") or [])],
-                "constraints": normalize_property_constraints(
-                    str(p.get("data_type", "string")),
-                    p.get("constraints") if isinstance(p.get("constraints"), dict) else {},
-                ),
-            }
-            if not p["name"]:
-                continue
-            if p["is_key"] and not has_key:
-                has_key = True
-            else:
-                p["is_key"] = False
-            props.append(p)
-        if not has_key and props:
-            props[0]["is_key"] = True
-        e["properties"] = props
-        if e["state_property"] and not any(
-            prop["name"] == e["state_property"] and prop["is_enum"]
-            for prop in props
-        ):
-            e["state_property"] = ""
-        name_to_idx[e["name"]] = i
-
-    clean_rels = []
-    for r in relations:
-        src, tgt = str(r.get("source", "")).strip(), str(r.get("target", "")).strip()
-        if src in name_to_idx and tgt in name_to_idx:
-            clean_rels.append(
-                {
-                    "name": str(r.get("name", "")).strip() or f"{src}-{tgt}",
-                    "source": src,
-                    "target": tgt,
-                    "relation_type": str(r.get("relation_type", "1:N")),
-                    "description": str(r.get("description", "")),
-                }
-            )
-    return {"entities": entities, "relations": clean_rels}
+    return normalize_generated_ontology(
+        data,
+        existing_entity_names={
+            str(entity.name)
+            for entity in (getattr(scenario, "entities", None) or [])
+            if str(getattr(entity, "name", "")).strip()
+        },
+    )
 
 
 def apply_generated_ontology(
@@ -726,44 +804,60 @@ def apply_generated_ontology(
     *,
     commit: bool = True,
 ) -> dict[str, int]:
-    """把 AI 生成的本体草稿写入场景（追加，不覆盖已有）。"""
+    """把 AI 生成的本体草稿写入场景（追加，不覆盖已有定义）。"""
     name_map = {e.name: e for e in scenario.entities}
     relation_keys = {(r.name, r.source_entity_id, r.target_entity_id) for r in scenario.relations}
     relation_names = {r.name for r in scenario.relations}
     entities_added = 0
     entities_skipped = 0
+    properties_added = 0
+    properties_skipped = 0
     for e in data.get("entities", []):
-        if e["name"] in name_map:
+        ent = name_map.get(e["name"])
+        if ent is not None:
             entities_skipped += 1
-            continue
-        ent = OntologyEntity(
-            scenario_id=scenario.id,
-            name=e["name"],
-            description=e.get("description", ""),
-            is_abstract=bool(e.get("is_abstract", False)),
-            namespace=scenario.namespace or "default",
-            state_property=e.get("state_property", ""),
-        )
-        db.add(ent)
-        db.flush()
+        else:
+            ent = OntologyEntity(
+                scenario_id=scenario.id,
+                name=e["name"],
+                description=e.get("description", ""),
+                is_abstract=bool(e.get("is_abstract", False)),
+                namespace=scenario.namespace or "default",
+                state_property=e.get("state_property", ""),
+            )
+            db.add(ent)
+            db.flush()
+            name_map[e["name"]] = ent
+            entities_added += 1
+
+        existing_properties = {
+            prop.name: prop for prop in (getattr(ent, "properties", None) or [])
+        }
+        has_key = any(bool(prop.is_key) for prop in existing_properties.values())
         for p in e.get("properties", []):
+            if p["name"] in existing_properties:
+                properties_skipped += 1
+                continue
             from ..models import OntologyProperty
 
-            db.add(
-                OntologyProperty(
-                    entity_id=ent.id,
-                    name=p["name"],
-                    data_type=p.get("data_type", "string"),
-                    description=p.get("description", ""),
-                    is_key=bool(p.get("is_key", False)),
-                    is_required=bool(p.get("is_required", False)),
-                    is_enum=bool(p.get("is_enum", False)),
-                    enum_values=p.get("enum_values") or [],
-                    constraints=p.get("constraints") or {},
-                )
+            is_key = bool(p.get("is_key", False)) and not has_key
+            prop = OntologyProperty(
+                entity_id=ent.id,
+                name=p["name"],
+                data_type=p.get("data_type", "string"),
+                description=p.get("description", ""),
+                is_key=is_key,
+                is_required=bool(p.get("is_required", False)) or is_key,
+                is_enum=bool(p.get("is_enum", False)),
+                enum_values=p.get("enum_values") or [],
+                default_value=p.get("default_value", ""),
+                constraints=p.get("constraints") or {},
+                is_sensitive=bool(p.get("is_sensitive", False)),
             )
-        name_map[e["name"]] = ent
-        entities_added += 1
+            db.add(prop)
+            existing_properties[p["name"]] = prop
+            has_key = has_key or is_key
+            properties_added += 1
     relations_added = 0
     relations_skipped = 0
     for r in data.get("relations", []):
@@ -794,6 +888,8 @@ def apply_generated_ontology(
     return {
         "entities_added": entities_added,
         "entities_skipped": entities_skipped,
+        "properties_added": properties_added,
+        "properties_skipped": properties_skipped,
         "relations_added": relations_added,
         "relations_skipped": relations_skipped,
     }

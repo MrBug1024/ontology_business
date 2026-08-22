@@ -22,7 +22,6 @@ from app.models import (
 )
 from app.routers import assistant
 from app.services import permission_service, rag_service
-from app.services.lineage_service import build_scenario_lineage
 
 
 class AssistantRagHistoryTests(unittest.TestCase):
@@ -193,28 +192,6 @@ class AssistantRagHistoryTests(unittest.TestCase):
             [],
         )
 
-    def test_global_assistant_rag_answer_is_versioned_in_lineage(self) -> None:
-        graph = build_scenario_lineage(self.db, self.scenario.id)
-        node_ids = {node["id"] for node in graph["nodes"]}
-        answer_node = f"ai_answer:assistant:{self.answer.id}"
-        self.assertIn(answer_node, node_ids)
-        self.assertTrue(
-            any(
-                edge["source"] == f"document_chunk:{self.chunk.id}"
-                and edge["target"] == answer_node
-                and edge["kind"] == "cited_by"
-                for edge in graph["edges"]
-            )
-        )
-        node = next(item for item in graph["nodes"] if item["id"] == answer_node)
-        self.assertEqual(node["label"], "全局助手回答")
-        self.assertNotIn(self.secret, str(node))
-
-        self.file.parsed_text = "已替换资料"
-        self.db.flush()
-        changed_graph = build_scenario_lineage(self.db, self.scenario.id)
-        self.assertNotIn(answer_node, {node["id"] for node in changed_graph["nodes"]})
-
     def test_public_foreign_source_is_not_durable_assistant_context(self) -> None:
         # ``get_visible`` alone would admit this source because it is public.
         # A private assistant thread nevertheless requires source tenancy to
@@ -226,11 +203,6 @@ class AssistantRagHistoryTests(unittest.TestCase):
         output = assistant._assistant_message_out(self.db, self.thread, self.answer)
         self.assertEqual(output.attachments, [])
         self.assertNotIn(self.secret, output.content)
-        graph = build_scenario_lineage(self.db, self.scenario.id)
-        self.assertNotIn(
-            f"ai_answer:assistant:{self.answer.id}",
-            {node["id"] for node in graph["nodes"]},
-        )
 
     def test_scenario_acl_revocation_redacts_stored_rag_answer(self) -> None:
         self.db.add(

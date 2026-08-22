@@ -9,139 +9,6 @@ export interface User {
   can_manage?: boolean
 }
 
-/** P1 组织与细粒度授权模型。租户仍是数据隔离边界，组织承载成员和 ACL。 */
-export interface Organization {
-  id: string
-  tenant_id: string
-  name: string
-  created_at?: string
-  updated_at?: string
-}
-
-export type OrganizationRoleKey = 'owner' | 'admin' | 'operator' | 'viewer'
-
-export interface OrganizationRole {
-  id: string
-  key: OrganizationRoleKey | string
-  name: string
-  description?: string
-  is_system?: boolean
-}
-
-export interface OrganizationMember {
-  id: string
-  user_id: string
-  email: string
-  display_name?: string
-  role_id: string
-  role_key: OrganizationRoleKey | string
-  role_name?: string
-  status: 'active' | 'removed' | string
-  created_at?: string
-}
-
-export type PermissionResourceType = 'scenario' | 'object' | 'property' | 'action' | 'workflow'
-export type PermissionVerb = 'read' | 'write' | 'execute' | 'approve' | 'manage'
-export type PermissionEffect = 'allow' | 'deny'
-
-export interface PermissionGrantInput {
-  role_key?: OrganizationRoleKey
-  user_id?: string
-  resource_type: PermissionResourceType
-  resource_id: string
-  verb: PermissionVerb
-  effect?: PermissionEffect
-}
-
-export interface PermissionGrant {
-  id: string
-  organization_id: string
-  role_id?: string | null
-  role_key?: string
-  user_id?: string | null
-  resource_type: PermissionResourceType | string
-  resource_id: string
-  verb: PermissionVerb | string
-  effect: PermissionEffect | string
-  created_by_user_id?: string | null
-  created_at?: string
-}
-
-export interface PermissionResource {
-  resource_type: PermissionResourceType | string
-  id: string
-  name: string
-  scenario_id: string
-  entity_id?: string | null
-  is_sensitive?: boolean
-  access_scope?: string
-}
-
-/** P1 运营闭环：场景范围内的事件 / Case 及其不可变历史。 */
-export type IncidentSeverity = 'low' | 'medium' | 'high' | 'critical'
-export type IncidentStatus = 'open' | 'acknowledged' | 'resolved'
-export type IncidentHistoryAction = 'created' | 'updated' | 'acknowledged' | 'resolved'
-
-export interface IncidentCase {
-  id: string
-  tenant_id: string
-  scenario_id: string
-  title: string
-  description: string
-  severity: IncidentSeverity
-  status: IncidentStatus
-  source: string
-  source_ref: string
-  related_object_id?: string | null
-  assignee_user_id?: string | null
-  context: Record<string, unknown>
-  created_by_user_id?: string | null
-  acknowledged_by_user_id?: string | null
-  acknowledged_at?: string | null
-  resolved_by_user_id?: string | null
-  resolved_at?: string | null
-  resolution: string
-  created_at: string
-  updated_at: string
-  history_count: number
-}
-
-export interface IncidentCaseCreateInput {
-  title: string
-  description?: string
-  severity?: IncidentSeverity
-  source?: string
-  source_ref?: string
-  related_object_id?: string | null
-  assignee_user_id?: string | null
-  context?: Record<string, unknown>
-  comment?: string
-}
-
-export interface IncidentCaseUpdateInput {
-  title?: string
-  description?: string
-  severity?: IncidentSeverity
-  related_object_id?: string | null
-  assignee_user_id?: string | null
-  context?: Record<string, unknown>
-  comment?: string
-}
-
-export interface IncidentCaseHistory {
-  id: string
-  incident_case_id: string
-  tenant_id: string
-  scenario_id: string
-  action: IncidentHistoryAction
-  actor_user_id?: string | null
-  from_status: string
-  to_status: string
-  changes: Record<string, unknown>
-  comment: string
-  created_at: string
-}
-
 export interface AuthMessage {
   ok: boolean
   message: string
@@ -440,51 +307,10 @@ export interface FunctionDefinition {
   updated_at?: string
 }
 
-export type AdvancedAssetKind = 'geospatial' | 'timeseries' | 'media' | 'realtime' | 'ml_model' | 'simulation' | 'optimization'
-
-export interface AdvancedAsset {
+export interface FunctionRun {
   id: string
   tenant_id: string
   scenario_id: string
-  name: string
-  kind: AdvancedAssetKind | string
-  description?: string
-  schema?: Record<string, any>
-  config?: Record<string, any>
-  status: 'draft' | 'ready' | 'disabled' | string
-  version?: number
-  created_by_user_id?: string
-  created_at?: string
-  updated_at?: string
-}
-
-export interface AdvancedRecord {
-  id: string
-  tenant_id: string
-  scenario_id: string
-  asset_id: string
-  sequence: number
-  event_time?: string
-  event_type?: string
-  geometry?: Record<string, any>
-  payload?: Record<string, any>
-  source_ref?: string
-  content_type?: string
-  checksum?: string
-  created_at?: string
-}
-
-export interface AdvancedRecordPage {
-  items: AdvancedRecord[]
-  next_sequence?: number | null
-  total: number
-}
-
-export interface AdvancedRun {
-  id: string
-  tenant_id: string
-  scenario_id: string
-  asset_id?: string
   function_id?: string
   run_type: string
   status: string
@@ -495,31 +321,6 @@ export interface AdvancedRun {
   completed_at?: string
   created_by_user_id?: string
   created_at?: string
-}
-
-export interface AdvancedFeedback {
-  id: string
-  tenant_id: string
-  scenario_id: string
-  asset_id: string
-  run_id?: string
-  label?: string
-  expected_output?: Record<string, any>
-  actual_output?: Record<string, any>
-  score?: number
-  notes?: string
-  created_by_user_id?: string
-  created_at?: string
-}
-
-export interface AdvancedAssetSummary {
-  asset_id: string
-  kind: string
-  record_count: number
-  run_count: number
-  feedback_count: number
-  last_event_time?: string
-  last_sequence: number
 }
 
 export interface OntologyAction {
@@ -808,238 +609,10 @@ export interface LLMEvaluationSummary {
   latest_at?: string | null
 }
 
-export interface LineageNode {
-  id: string
-  kind: 'data_source' | 'mapping' | 'object' | 'document' | 'document_chunk' | 'ai_answer' | 'action' | 'action_execution' | 'external_result' | 'workflow_run' | string
-  label: string
-  meta?: Record<string, unknown>
-}
-
-export interface LineageEdge {
-  id: string
-  source: string
-  target: string
-  kind: string
-  label?: string
-  meta?: Record<string, unknown>
-}
-
-export interface LineageGraph {
-  scenario_id: string
-  nodes: LineageNode[]
-  edges: LineageEdge[]
-  truncated: boolean
-  summary: {
-    data_sources: number
-    objects: number
-    ai_answers: number
-    action_executions: number
-  }
-}
-
-/** P2 本体发布治理：所有内容均为服务端已经脱敏的定义快照。 */
-export interface ReleaseBranch {
-  id: string
-  tenant_id: string
-  scenario_id: string
-  name: string
-  description?: string
-  status: 'active' | 'merged' | 'archived' | string
-  base_snapshot_id?: string | null
-  head_snapshot_id?: string | null
-  created_by_user_id?: string | null
-  created_at?: string
-  updated_at?: string
-}
-
-export interface ReleaseSnapshot {
-  id: string
-  tenant_id: string
-  scenario_id: string
-  branch_id?: string | null
-  parent_snapshot_id?: string | null
-  kind: string
-  content_hash: string
-  content: Record<string, any>
-  created_by_user_id?: string | null
-  created_at?: string
-}
-
-export interface ReleaseReview {
-  id: string
-  proposal_id: string
-  reviewer_user_id?: string | null
-  decision: 'approve' | 'reject' | string
-  comment?: string
-  created_at?: string
-}
-
-export interface ReleaseProposal {
-  id: string
-  tenant_id: string
-  scenario_id: string
-  branch_id: string
-  base_snapshot_id: string
-  proposed_snapshot_id: string
-  pre_merge_snapshot_id?: string | null
-  merged_snapshot_id?: string | null
-  title: string
-  description?: string
-  status: 'draft' | 'submitted' | 'approved' | 'rejected' | 'merged' | 'withdrawn' | string
-  created_by_user_id?: string | null
-  submitted_at?: string | null
-  merged_at?: string | null
-  merged_by_user_id?: string | null
-  content: Record<string, any>
-  reviews?: ReleaseReview[]
-  created_at?: string
-  updated_at?: string
-}
-
-export interface ReleaseRecord {
-  id: string
-  tenant_id: string
-  scenario_id: string
-  branch_id: string
-  snapshot_id: string
-  proposal_id?: string | null
-  environment: 'dev' | 'staging' | 'prod' | string
-  status: 'released' | 'superseded' | 'rolled_back' | string
-  notes?: string
-  connector_audit?: Array<Record<string, any>>
-  created_by_user_id?: string | null
-  created_at?: string
-}
-
-export interface ReleaseRollback {
-  id: string
-  tenant_id: string
-  scenario_id: string
-  branch_id: string
-  from_snapshot_id: string
-  target_snapshot_id: string
-  result_snapshot_id: string
-  environment?: 'dev' | 'staging' | 'prod' | string | null
-  reason?: string
-  connector_audit?: Array<Record<string, any>>
-  created_by_user_id?: string | null
-  created_at?: string
-}
-
-/** P2 可移植资源包。定义资源会使用稳定 key；凭据与运行时对象不在包内。 */
-export interface OntologyResourcePackage {
-  format: 'ontology-resource-package' | string
-  version: string
-  manifest: {
-    name: string
-    description?: string
-    industry?: string
-    fingerprint?: string
-    resource_counts?: Record<string, number>
-  }
-  resources: Record<string, Array<Record<string, any>>>
-}
-
-export interface PackageIssue {
-  code: string
-  path: string
-  message: string
-}
-
-/** 导入只生成预检和差异；实际应用需转入受治理的发布提案。 */
-export interface PackageImportPreview {
-  valid: boolean
-  applicable: boolean
-  target_scenario_id: string
-  environment?: 'dev' | 'staging' | 'prod' | string
-  package_fingerprint: string
-  /** Present only when the server loaded a fixed, code-versioned Starter Kit. */
-  starter_kit?: StarterKit
-  errors: PackageIssue[]
-  warnings: PackageIssue[]
-  proposal: {
-    mode: 'preview' | string
-    mutates_target: false | boolean
-    ready_to_apply: boolean
-    target?: { id: string; name: string }
-    environment?: 'dev' | 'staging' | 'prod' | string
-    summary: Record<string, number>
-    changes: Array<Record<string, any>>
-    conflicts: Array<Record<string, any>>
-    required_bindings: Array<Record<string, any>>
-    resolved_bindings?: Array<Record<string, any>>
-  }
-}
-
-/** 资源包预检通过后，由服务端编译并创建的受治理提案摘要。 */
-export interface PackageImportProposal {
-  id: string
-  branch_id: string
-  base_snapshot_id: string
-  proposed_snapshot_id: string
-  status: 'draft' | 'submitted' | 'approved' | 'rejected' | 'merged' | 'withdrawn' | string
-  environment?: 'dev' | 'staging' | 'prod' | string
-  package_fingerprint: string
-  summary: Record<string, number>
-}
-
-/** Repository-owned, server-verified industry starter-kit catalog entry. */
-export interface StarterKit {
-  id: string
-  name: string
-  industry: string
-  version: string
-  description?: string
-  fingerprint: string
-  resource_counts: Record<string, number>
-}
-
-export interface StarterKitImportProposal extends PackageImportProposal {
-  starter_kit: StarterKit
-}
-
-export type ConnectorKind = 'data_source' | 'mcp' | 'llm'
-export type ConnectorHealth = 'unknown' | 'healthy' | 'unhealthy'
-
-/** Safe logical view of an existing DataSource, MCP or LLM deployment. */
-export interface ConnectorCatalogItem {
-  id: string
-  name: string
-  kind: ConnectorKind
-  adapter_type: string
-  scenario_id?: string | null
-  enabled: boolean
-  secret_state: 'configured' | 'missing' | 'not_required'
-  health: ConnectorHealth
-  checked_at?: string | null
-  message?: string
-  capabilities: string[]
-}
-
-/** A scenario/environment mapping; never contains connector config or secrets. */
-export interface ConnectorBinding extends ConnectorCatalogItem {
-  binding_id: string
-  binding_key: string
-  reference_label?: string
-  environment: 'dev' | 'staging' | 'prod'
-  ready: boolean
-  blocking_reason?: string
-  created_at?: string
-  updated_at?: string
-}
-
-export interface ConnectorReadiness {
-  ready: boolean
-  environment: 'dev' | 'staging' | 'prod'
-  reasons: string[]
-  audit: Array<Record<string, any>>
-}
-
 export interface Skill {
   id: string
   name: string
   description: string
-  path: string
   source: string
   enabled: boolean
   metadata: Record<string, any>
@@ -1072,8 +645,6 @@ export interface Agent {
   scenario_id?: string | null
   llm_config_id?: string | null
   system_prompt?: string
-  skill_ids: string[]
-  mcp_ids: string[]
   data_source_ids: string[]
   temperature?: number
   max_tokens?: number
@@ -1081,8 +652,6 @@ export interface Agent {
   updated_at?: string
   scenario_name?: string
   llm_name?: string
-  skill_names?: string[]
-  mcp_names?: string[]
   data_source_names?: string[]
 }
 

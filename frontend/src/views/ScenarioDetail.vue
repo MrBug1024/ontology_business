@@ -37,201 +37,16 @@
     </div>
 
     <el-tabs v-model="tab" class="sd-tabs">
-      <!-- ═══════════ 首个可验收闭环：唯一主路径 ═══════════ -->
-      <el-tab-pane label="闭环工作台" name="flow">
-        <main class="flow-workbench" aria-labelledby="flow-workbench-title">
-          <section class="flow-hero">
-            <div>
-              <span class="eyebrow">GUIDED DELIVERY</span>
-              <h2 id="flow-workbench-title">从业务描述到受控执行</h2>
-              <p>沿一条主线完成 AI 草稿、数据映射、对象证据、人工审批与审计回看；下方技术工作区用于深入配置。</p>
-            </div>
-            <div class="flow-progress" role="status" aria-live="polite">
-              <span><b>{{ completedFlowSteps }}</b> / {{ flowSteps.length }} 已完成</span>
-              <el-progress :percentage="flowProgress" :show-text="false" :stroke-width="8" />
-            </div>
-          </section>
-
-          <ol class="flow-step-list" aria-label="业务闭环步骤">
-            <li v-for="step in flowSteps" :key="step.id" :class="`is-${step.status}`">
-              <button type="button" :aria-current="step.status === 'current' ? 'step' : undefined" @click="activateFlowStep(step.id)">
-                <span class="flow-step-index">
-                  <el-icon v-if="step.status === 'complete'" aria-hidden="true"><Check /></el-icon>
-                  <span v-else>{{ step.number }}</span>
-                </span>
-                <span class="flow-step-copy"><strong>{{ step.title }}</strong><small>{{ step.description }}</small></span>
-                <el-tag size="small" effect="plain" :type="flowStatusType(step.status)">{{ flowStatusLabel(step.status) }}</el-tag>
-                <el-icon class="flow-step-arrow" aria-hidden="true"><ArrowRight /></el-icon>
-              </button>
-            </li>
-          </ol>
-
-          <section class="flow-next" aria-labelledby="flow-next-title">
-            <div class="flow-next-mark" aria-hidden="true"><el-icon><Guide /></el-icon></div>
-            <div>
-              <span>建议下一步</span>
-              <h3 id="flow-next-title">{{ nextFlowStep.title }}</h3>
-              <p>{{ nextFlowStep.nextHint }}</p>
-            </div>
-            <el-button type="primary" @click="activateFlowStep(nextFlowStep.id)">{{ nextFlowStep.actionLabel }}<el-icon><ArrowRight /></el-icon></el-button>
-          </section>
-
-          <div class="flow-main-grid">
-            <section ref="querySectionRef" class="flow-section query-workbench" aria-labelledby="object-query-title">
-              <header class="flow-section-head">
-                <div>
-                  <span class="section-number">03</span>
-                  <div><h3 id="object-query-title">用自然语言查询对象</h3><p>回答只基于当前账号可见的运行时对象，并逐条给出来源与关系引用。</p></div>
-                </div>
-                <el-tag size="small" effect="plain" type="info">{{ objectTotal }} 个可见对象</el-tag>
-              </header>
-              <div class="object-question-box">
-                <el-input
-                  ref="objectQuestionInputRef"
-                  v-model="objectQuestion"
-                  clearable
-                  maxlength="200"
-                  aria-label="输入要查询的对象问题"
-                  placeholder="例如：查找张三相关的订单，并告诉我数据来自哪里"
-                  @keyup.enter="runObjectQuestion"
-                >
-                  <template #prefix><el-icon><Search /></el-icon></template>
-                </el-input>
-                <el-button type="primary" :loading="objectQuestionLoading" :disabled="!objectQuestion.trim()" @click="runObjectQuestion">查询并引用</el-button>
-              </div>
-              <div v-if="querySuggestions.length" class="query-suggestions" aria-label="查询示例">
-                <span>可尝试</span>
-                <button v-for="suggestion in querySuggestions" :key="suggestion" type="button" @click="askObjectSuggestion(suggestion)">{{ suggestion }}</button>
-              </div>
-              <div v-if="objectQuestionAnswer" class="query-answer" role="status" aria-live="polite">
-                <div class="query-answer-head"><el-icon aria-hidden="true"><DocumentChecked /></el-icon><strong>基于对象运行时的回答</strong></div>
-                <p>{{ objectQuestionAnswer }}</p>
-                <small v-if="objectQuestionTerm">实际检索词：“{{ objectQuestionTerm }}”；未使用模型推测未命中的事实。</small>
-              </div>
-              <div v-if="objectQuestionEvidence.length" class="evidence-list" aria-label="对象查询引用">
-                <article v-for="(item, index) in objectQuestionEvidence" :key="item.id" class="evidence-card">
-                  <header>
-                    <span class="evidence-id">[O{{ index + 1 }}]</span>
-                    <div><strong>{{ item.name }}</strong><small>{{ item.entity_name || '未分类对象' }}</small></div>
-                    <el-button text type="primary" @click="openEvidenceObject(item.id)">查看对象</el-button>
-                  </header>
-                  <dl>
-                    <div><dt>数据来源</dt><dd>{{ objectSourceLabel(item) }}</dd></div>
-                    <div><dt>来源定位</dt><dd class="mono">{{ objectSourceReference(item) }}</dd></div>
-                    <div><dt>关系证据</dt><dd>{{ objectRelationSummary(item) }}</dd></div>
-                  </dl>
-                  <div v-if="objectAttributeEntries(item).length" class="evidence-attributes">
-                    <span v-for="entry in objectAttributeEntries(item)" :key="entry[0]"><b>{{ entry[0] }}</b>{{ formatObjectValue(entry[1]) }}</span>
-                  </div>
-                </article>
-              </div>
-              <el-empty v-else-if="objectQuestionSearched && !objectQuestionLoading" :image-size="56" description="没有找到可引用对象；可缩短关键词或先完成映射刷新" />
-            </section>
-
-            <section class="flow-section governed-execution" aria-labelledby="governed-execution-title">
-              <header class="flow-section-head">
-                <div>
-                  <span class="section-number">04</span>
-                  <div><h3 id="governed-execution-title">审批后执行 Action</h3><p>先预演影响；需要人工批准时，用“审批 → Action”工作流提交任务。</p></div>
-                </div>
-                <el-button text type="primary" @click="goToScenarioTasks">任务中心</el-button>
-              </header>
-              <el-alert
-                title="直接执行只包含权限检查、预演和明确确认；人工审批必须通过含审批节点的工作流。"
-                type="warning"
-                :closable="false"
-                show-icon
-              />
-              <div v-if="detail.actions.length" class="controlled-action-box">
-                <label for="controlled-action">选择要受控执行的 Action</label>
-                <el-select id="controlled-action" v-model="controlledActionId" placeholder="选择 Action" style="width:100%">
-                  <el-option v-for="action in detail.actions" :key="action.id" :label="action.name" :value="action.id" :disabled="action.enabled === false" />
-                </el-select>
-                <div class="controlled-action-meta" v-if="controlledAction">
-                  <span><b>参数</b>{{ Object.keys(actionSchemaRoot(controlledAction.input_schema).properties).length }} 项</span>
-                  <span><b>执行器</b>{{ controlledAction.executor_type || '未配置' }}</span>
-                  <span><b>幂等</b>{{ controlledAction.idempotency_required === false ? '未要求' : '已要求' }}</span>
-                </div>
-                <div class="controlled-action-buttons">
-                  <el-button :disabled="!controlledAction || !canWrite" @click="controlledAction && doExecuteAction(controlledAction)">先预演直接执行</el-button>
-                  <el-button type="primary" :disabled="!controlledAction || !canWrite" @click="prepareApprovalWorkflow">生成审批流程草稿</el-button>
-                </div>
-              </div>
-              <div v-else class="execution-empty">
-                <p>还没有类型化 Action。先定义参数 Schema、执行器、权限与幂等约束。</p>
-                <el-button v-if="canWrite" type="primary" plain @click="openActionsWorkspace">创建 Action</el-button>
-              </div>
-
-              <div class="approval-workflows">
-                <div class="subsection-title"><span>可用审批流程</span><b>{{ approvalWorkflows.length }}</b></div>
-                <article v-for="workflow in approvalWorkflows" :key="workflow.id" class="approval-workflow-row">
-                  <div><strong>{{ workflow.name }}</strong><small>{{ workflow.status === 'active' ? '已启用，可提交审批任务' : '草稿需检查并启用' }}</small></div>
-                  <el-tag size="small" effect="plain" :type="workflowStatusType(workflow.status)">{{ workflowStatusLabel(workflow.status) }}</el-tag>
-                  <el-button v-if="workflow.status === 'active'" size="small" type="primary" :loading="workflow._executing" @click="doExecuteWorkflow(workflow)">提交</el-button>
-                  <el-button v-else-if="canWrite" size="small" @click="openWorkflowWorkspace(workflow.id)">继续配置</el-button>
-                </article>
-                <p v-if="!approvalWorkflows.length" class="muted">尚无包含人工审批节点的工作流。</p>
-              </div>
-            </section>
-          </div>
-
-          <section ref="auditSectionRef" class="flow-section audit-workbench" aria-labelledby="audit-workbench-title">
-            <header class="flow-section-head">
-              <div>
-                <span class="section-number">05</span>
-                <div><h3 id="audit-workbench-title">执行审计与结果证据</h3><p>同页核对环境、定义版本、参数、连接器、结果和错误，不需要在多个页面来回跳转。</p></div>
-              </div>
-              <el-button :loading="auditLoading" @click="loadExecutionLogs"><el-icon><Refresh /></el-icon>刷新审计</el-button>
-            </header>
-            <div v-if="executionLogs.length" class="audit-list" aria-live="polite">
-              <details v-for="log in executionLogs" :key="log.id" class="audit-entry">
-                <summary>
-                  <span class="audit-status-dot" :class="`is-${auditStatusTone(log.status)}`" aria-hidden="true"></span>
-                  <span class="audit-summary-copy"><strong>{{ log.target_name || '未命名执行' }}</strong><small>{{ log.target_type === 'workflow' ? '工作流' : 'Action' }} · {{ formatDate(log.created_at) }}</small></span>
-                  <el-tag size="small" effect="plain" :type="auditStatusType(log.status)">{{ auditStatusLabel(log.status) }}</el-tag>
-                  <span class="audit-duration">{{ log.duration_ms || 0 }} ms</span>
-                  <el-icon class="audit-chevron" aria-hidden="true"><ArrowDown /></el-icon>
-                </summary>
-                <div class="audit-detail-grid">
-                  <div><span>运行环境</span><b>{{ log.environment || 'dev' }}</b></div>
-                  <div><span>定义来源</span><b>{{ log.definition_source === 'release' ? '已发布快照' : '开发中定义' }}</b></div>
-                  <div><span>发起主体</span><b>{{ auditActorLabel(log) }}</b></div>
-                  <div><span>模型</span><b>{{ log.model_name || log.llm_config_id || '未使用或未知' }}</b></div>
-                  <div><span>权限判定</span><b>{{ auditPermissionLabel(log) }}</b></div>
-                  <div><span>数据上下文</span><b>{{ auditDataContextLabel(log) }}</b></div>
-                  <div v-if="log.correlation_id"><span>决策链路</span><b class="mono">{{ log.correlation_id }}</b></div>
-                  <div v-if="log.parent_action_log_id"><span>来源预演</span><b class="mono">{{ log.parent_action_log_id }}</b></div>
-                  <div v-if="log.assistant_message_id || log.agent_message_id"><span>AI 消息证据</span><b class="mono">{{ log.assistant_message_id || log.agent_message_id }}</b></div>
-                  <div v-if="log.idempotency_key"><span>幂等键</span><b class="mono">{{ log.idempotency_key }}</b></div>
-                  <div v-if="log.definition_hash"><span>定义哈希</span><b class="mono">{{ log.definition_hash }}</b></div>
-                </div>
-                <div v-if="log.connector_audit?.length" class="audit-connectors">
-                  <span>连接器证据</span>
-                  <el-tag v-for="connector in log.connector_audit" :key="`${connector.kind}-${connector.binding_id || connector.connector_id}`" size="small" effect="plain">
-                    {{ connector.environment }} · {{ connector.connector_name || connector.connector_id }}
-                  </el-tag>
-                </div>
-                <div class="audit-payload-grid">
-                  <section><h4>输入参数</h4><pre>{{ JSON.stringify(log.input_params || {}, null, 2) }}</pre></section>
-                  <section><h4>执行结果</h4><pre>{{ JSON.stringify(log.result || (log.error ? { error: log.error } : {}), null, 2) }}</pre></section>
-                </div>
-              </details>
-            </div>
-            <el-empty v-else v-loading="auditLoading" :image-size="64" description="暂无可见执行审计；完成一次预演或受控执行后在这里回看" />
-          </section>
-        </main>
-      </el-tab-pane>
-
       <!-- ═══════════ 本体 ═══════════ -->
       <el-tab-pane label="本体模型" name="ontology">
         <div class="tab-toolbar">
           <div class="tab-stats">
-            <span class="stat">实体 <b>{{ detail.entities.length }}</b></span>
-            <span class="stat">关系 <b>{{ detail.relations.length }}</b></span>
+            <span class="stat">对象类型 <b>{{ detail.entities.length }}</b></span>
+            <span class="stat">关系类型 <b>{{ detail.relations.length }}</b></span>
           </div>
           <div v-if="canWrite" class="tab-actions">
-            <el-button size="small" @click="openEntity()"><el-icon><Plus /></el-icon> 实体</el-button>
-            <el-button size="small" @click="openRelation()"><el-icon><Plus /></el-icon> 关系</el-button>
+            <el-button size="small" @click="openEntity()"><el-icon><Plus /></el-icon> 对象类型</el-button>
+            <el-button size="small" @click="openRelation()"><el-icon><Plus /></el-icon> 关系类型</el-button>
           </div>
         </div>
         <div class="graph-stage">
@@ -239,7 +54,7 @@
             :data="schemaGraph"
             mode="schema"
             :legend="legend"
-            :empty-text="canWrite ? '暂无本体，点击「实体」创建，或用 AI 生成' : '暂无本体'"
+            :empty-text="canWrite ? '暂无本体，点击「对象类型」创建，或用 AI 生成' : '暂无本体'"
             @select="onNodeSelect"
             @edge-click="onEdgeClick"
             @add-relation="onAddRelation"
@@ -258,18 +73,19 @@
       </el-tab-pane>
 
       <!-- ═══════════ 实例 ═══════════ -->
-      <el-tab-pane label="对象与来源" name="instances">
+      <el-tab-pane label="实例数据" name="instances">
         <div class="tab-toolbar">
           <div class="tab-stats">
-            <span class="stat">实例 <b>{{ detail.instances.length }}</b></span>
+            <span class="stat">对象实例 <b>{{ detail.instances.length }}</b></span>
             <span class="stat">关系实例 <b>{{ detail.relation_instances.length }}</b></span>
             <span class="stat stat-runtime">运行时对象 <b>{{ objectTotal }}</b></span>
           </div>
           <div class="tab-actions">
-            <el-select v-model="instFilter" placeholder="全部实体" clearable size="small" class="inst-filter">
+            <el-select v-model="instFilter" placeholder="全部对象类型" clearable size="small" class="inst-filter">
               <el-option v-for="e in detail.entities" :key="e.id" :label="e.name" :value="e.id" />
             </el-select>
-            <el-button v-if="canWrite" size="small" type="primary" @click="openInstance()"><el-icon><Plus /></el-icon> 添加实例</el-button>
+            <el-button v-if="canWrite" size="small" plain @click="openRelationInstanceManager"><el-icon><Connection /></el-icon> 管理关系实例</el-button>
+            <el-button v-if="canWrite" size="small" type="primary" @click="openInstance()"><el-icon><Plus /></el-icon> 添加对象实例</el-button>
           </div>
         </div>
         <div class="instance-workspace">
@@ -280,6 +96,7 @@
               :legend="legend"
               :empty-text="canWrite ? '暂无实例，点击「添加实例」创建' : '暂无实例'"
               @select="onInstSelect"
+              @edge-click="openRelationInstanceManager"
               @canvas-click="clearSelection"
             />
             <EditorPanel
@@ -376,7 +193,7 @@
                 <div v-if="Object.keys(objectDetail.attributes || {}).length" class="attribute-grid">
                   <div v-for="(value, key) in objectDetail.attributes" :key="key" class="attribute-item">
                     <span>{{ key }}</span>
-                    <strong>{{ formatObjectValue(value) }}</strong>
+                    <StructuredValueCell :value="value" />
                   </div>
                 </div>
                 <span v-else class="muted">暂无属性值</span>
@@ -411,15 +228,26 @@
 
       <!-- ═══════════ 数据映射 ═══════════ -->
       <el-tab-pane label="数据映射" name="mappings">
+        <el-alert
+          v-if="!scenarioDataSources.length"
+          class="mapping-prerequisite"
+          title="请先接入并测试数据源，再配置字段映射"
+          description="没有数据源结构时，系统无法知道可映射的表和字段。"
+          type="warning"
+          :closable="false"
+          show-icon
+        >
+          <template #default><el-button type="primary" plain size="small" @click="goToDataSources">接入数据源</el-button></template>
+        </el-alert>
         <div class="tab-toolbar">
           <div class="tab-stats"><span class="stat">映射 <b>{{ detail.mappings.length }}</b></span></div>
           <div v-if="canWrite" class="tab-actions">
-            <el-button size="small" type="primary" @click="openMapping()"><el-icon><Plus /></el-icon> 添加映射</el-button>
+            <el-button size="small" type="primary" :disabled="!scenarioDataSources.length || !detail.entities.length" @click="openMapping()"><el-icon><Plus /></el-icon> 添加映射</el-button>
           </div>
         </div>
         <div class="card map-card">
           <el-table :data="detail.mappings" class="map-table" empty-text="暂无数据映射">
-            <el-table-column label="实体" min-width="120">
+            <el-table-column label="对象类型" min-width="120">
               <template #default="{ row }">
                 <span class="ent-chip" :style="{ color: entColor(row.entity_id) }">
                   <i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}
@@ -473,7 +301,7 @@
         </div>
       </el-tab-pane>
 
-      <!-- ═══════════ 受治理函数（声明式契约）═══════════ -->
+      <!-- ═══════════ 业务函数（无副作用、可由 Agent 调用）═══════════ -->
       <el-tab-pane label="函数" name="functions" data-testid="functions-tab">
         <div class="tab-toolbar">
           <div class="tab-stats"><span class="stat">函数 <b>{{ detail.functions.length }}</b></span></div>
@@ -483,13 +311,13 @@
         </div>
         <el-alert
           class="function-declaration-note"
-          title="函数仅登记声明式输入/输出契约，不包含代码、执行器或运行入口。"
+          title="函数用于确定性计算且不产生外部副作用；需要写数据或调用外部系统时，请使用“操作”。"
           type="info"
           :closable="false"
           show-icon
         />
         <div class="card map-card">
-          <el-table :data="detail.functions" class="map-table" :empty-text="canWrite ? '暂无函数，点击「添加函数」登记声明式契约' : '暂无函数'">
+          <el-table :data="detail.functions" class="map-table" :empty-text="canWrite ? '暂无函数，点击「添加函数」配置可供 Agent 调用的确定性计算' : '暂无函数'">
             <el-table-column label="名称 / 说明" min-width="190">
               <template #default="{ row }">
                 <div class="function-name-cell">
@@ -498,15 +326,11 @@
                 </div>
               </template>
             </el-table-column>
-            <el-table-column label="输入 Schema" min-width="240">
-              <template #default="{ row }">
-                <pre class="function-schema mono" :aria-label="`${row.name} 的输入 Schema`">{{ formatFunctionSchema(row.input_schema) }}</pre>
-              </template>
+            <el-table-column label="输入字段" min-width="250">
+              <template #default="{ row }"><SchemaFieldBuilder :model-value="row.input_schema" readonly empty-text="无需输入" /></template>
             </el-table-column>
-            <el-table-column label="输出 Schema" min-width="240">
-              <template #default="{ row }">
-                <pre class="function-schema mono" :aria-label="`${row.name} 的输出 Schema`">{{ formatFunctionSchema(row.output_schema) }}</pre>
-              </template>
+            <el-table-column label="输出字段" min-width="250">
+              <template #default="{ row }"><SchemaFieldBuilder :model-value="row.output_schema" readonly empty-text="无结构化输出" /></template>
             </el-table-column>
             <el-table-column label="标签" min-width="150">
               <template #default="{ row }">
@@ -516,18 +340,24 @@
                 <span v-else class="muted">—</span>
               </template>
             </el-table-column>
+            <el-table-column label="运行方式" min-width="130">
+              <template #default="{ row }">
+                <el-tag size="small" effect="plain" :type="row.runtime_kind === 'contract' ? 'info' : 'success'">{{ functionRuntimeLabel(row.runtime_kind) }}</el-tag>
+              </template>
+            </el-table-column>
             <el-table-column label="可见性" width="120">
               <template #default="{ row }">
-                <el-tooltip content="仅为声明展示元数据；实际访问仍由场景 ACL 决定" placement="top">
+                <el-tooltip content="这里只说明适用范围；实际访问仍由当前场景的权限决定" placement="top">
                   <el-tag size="small" effect="plain" :type="row.visibility === 'tenant' ? 'success' : 'info'">
                     {{ row.visibility === 'tenant' ? '租户' : '场景内' }}
                   </el-tag>
                 </el-tooltip>
               </template>
             </el-table-column>
-            <el-table-column v-if="canWrite" label="操作" width="145" fixed="right">
+            <el-table-column v-if="canWrite" label="操作" width="210" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" text @click="openFunction(row.id)">编辑</el-button>
+                <el-button v-if="row.runtime_kind !== 'contract'" size="small" text type="primary" @click="doRunFunction(row)">运行</el-button>
                 <el-button size="small" text type="danger" @click="removeFunction(row.id)">删除</el-button>
               </template>
             </el-table-column>
@@ -548,7 +378,7 @@
             <el-table-column label="名称" min-width="140">
               <template #default="{ row }"><b>{{ row.name }}</b></template>
             </el-table-column>
-            <el-table-column label="所属实体" min-width="120">
+            <el-table-column label="所属对象类型" min-width="120">
               <template #default="{ row }">
                 <span class="ent-chip" :style="{ color: entColor(row.entity_id) }">
                   <i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}
@@ -557,7 +387,7 @@
             </el-table-column>
             <el-table-column label="执行方式" width="110">
               <template #default="{ row }">
-                <el-tag size="small" effect="plain">{{ row.executor_type || '—' }}</el-tag>
+                <el-tag size="small" effect="plain">{{ actionExecutorLabel(row.executor_type) }}</el-tag>
               </template>
             </el-table-column>
             <el-table-column label="描述" min-width="200">
@@ -592,7 +422,7 @@
             <el-table-column label="名称" min-width="140">
               <template #default="{ row }"><b>{{ row.name }}</b></template>
             </el-table-column>
-            <el-table-column label="关联实体" min-width="120">
+            <el-table-column label="关联对象类型" min-width="120">
               <template #default="{ row }">
                 <span v-if="row.entity_id" class="ent-chip" :style="{ color: entColor(row.entity_id) }">
                   <i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}
@@ -731,35 +561,71 @@
     </el-tabs>
 
     <!-- ═══════════ 数据映射对话框 ═══════════ -->
+    <el-dialog v-if="canWrite" v-model="relationInstanceDlg" title="关系实例" width="min(780px, 94vw)" class="glass-dialog">
+      <el-alert v-if="!detail.relations.length" type="warning" :closable="false" show-icon title="请先在「本体模型」中创建关系类型，才能连接对象实例。" />
+      <template v-else>
+        <el-form label-position="top">
+          <el-form-item label="关系类型" required>
+            <el-select v-model="relationInstanceForm.relation_id" style="width:100%" placeholder="选择关系类型" @change="resetRelationInstanceEndpoints">
+              <el-option v-for="relation in detail.relations" :key="relation.id" :value="relation.id" :label="`${entName(relation.source_entity_id)} — ${relation.name} → ${entName(relation.target_entity_id)}`" />
+            </el-select>
+          </el-form-item>
+          <div class="form-row relation-instance-form-row">
+            <el-form-item label="来源对象实例" class="form-col" required>
+              <el-select v-model="relationInstanceForm.source_instance_id" filterable placeholder="选择来源对象" style="width:100%">
+                <el-option v-for="instance in relationSourceInstances" :key="instance.id" :value="instance.id" :label="instance.name" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="目标对象实例" class="form-col" required>
+              <el-select v-model="relationInstanceForm.target_instance_id" filterable placeholder="选择目标对象" style="width:100%">
+                <el-option v-for="instance in relationTargetInstances" :key="instance.id" :value="instance.id" :label="instance.name" />
+              </el-select>
+            </el-form-item>
+          </div>
+          <el-alert v-if="selectedRelationDefinition && (!relationSourceInstances.length || !relationTargetInstances.length)" type="warning" :closable="false" show-icon title="这个关系类型的一端还没有对象实例，请先添加对应对象。" />
+          <el-form-item label="关系属性">
+            <KeyValueEditor v-model="relationInstanceForm.attributes" empty-text="此关系实例没有额外属性" />
+          </el-form-item>
+          <el-button type="primary" :loading="relationInstanceSaving" :disabled="!canCreateRelationInstance" @click="saveRelationInstance"><el-icon><Plus /></el-icon> 添加关系实例</el-button>
+        </el-form>
+      </template>
+      <el-divider content-position="left">已有关系实例</el-divider>
+      <el-table class="relation-instance-table" :data="detail.relation_instances" size="small" max-height="280" empty-text="暂无关系实例">
+        <el-table-column prop="relation_name" label="关系类型" min-width="130" />
+        <el-table-column prop="source_instance_name" label="来源对象" min-width="140" />
+        <el-table-column label="" width="38" align="center"><template #default>→</template></el-table-column>
+        <el-table-column prop="target_instance_name" label="目标对象" min-width="140" />
+        <el-table-column label="操作" width="72" align="right">
+          <template #default="{ row }"><el-button text type="danger" size="small" @click="removeRelationInstance(row)">删除</el-button></template>
+        </el-table-column>
+      </el-table>
+      <div class="relation-instance-cards">
+        <article v-for="row in detail.relation_instances" :key="row.id" class="relation-instance-card">
+          <div><b>{{ row.relation_name }}</b><span>{{ row.source_instance_name }} → {{ row.target_instance_name }}</span></div>
+          <el-button text type="danger" size="small" @click="removeRelationInstance(row)">删除</el-button>
+        </article>
+        <div v-if="!detail.relation_instances.length" class="muted">暂无关系实例</div>
+      </div>
+    </el-dialog>
+
     <el-dialog v-if="canWrite" v-model="mappingDlg" title="数据映射" width="min(840px, 94vw)" class="glass-dialog">
       <el-form label-position="top">
-        <el-form-item label="目标实体">
+        <el-form-item label="目标对象类型">
           <el-select v-model="mappingForm.entity_id" style="width:100%" @change="onMappingEntityChange">
             <el-option v-for="e in detail.entities" :key="e.id" :label="e.name" :value="e.id" />
           </el-select>
         </el-form-item>
         <el-form-item label="数据源">
           <el-select v-model="mappingForm.data_source_id" style="width:100%" @change="onMapDsChange">
-            <el-option v-for="d in dataSources" :key="d.id" :label="d.name" :value="d.id" />
+            <el-option v-for="d in scenarioDataSources" :key="d.id" :label="d.name" :value="d.id" />
           </el-select>
-        </el-form-item>
-        <el-form-item label="运行时绑定键（非开发环境必填）">
-          <el-input
-            v-model.trim="mappingForm.data_source_binding_key"
-            class="mono"
-            placeholder="例如 data_source:orders:sqlite"
-            aria-describedby="mapping-runtime-binding-help"
-          />
-          <div id="mapping-runtime-binding-help" class="form-help">
-            在“连接器与环境”中为同一键配置各环境的数据源；留空仅兼容开发环境的当前数据源。
-          </div>
         </el-form-item>
         <el-form-item label="表名">
           <el-select v-model="mappingForm.table_name" style="width:100%" filterable allow-create placeholder="选择或输入表名">
             <el-option v-for="t in mapTables" :key="t" :label="t" :value="t" />
           </el-select>
         </el-form-item>
-        <el-form-item label="列映射（实体属性 ← 数据列）">
+        <el-form-item label="字段映射（对象属性 ← 数据列）">
           <div class="colmap-list">
             <div class="mapping-property" v-for="p in (detail.entities.find((e) => e.id === mappingForm.entity_id)?.properties || [])" :key="p.name">
               <div class="colmap-row">
@@ -835,8 +701,8 @@
         <div class="mapping-preview-grid">
           <section class="mapping-coverage">
             <div class="preview-section-title">属性覆盖</div>
-            <el-table :data="mappingPreview.fields" size="small" empty-text="实体暂无属性">
-              <el-table-column label="实体属性" min-width="150">
+            <el-table :data="mappingPreview.fields" size="small" empty-text="对象类型暂无属性">
+              <el-table-column label="对象属性" min-width="150">
                 <template #default="{ row }">
                   <span>{{ row.property_name }}</span>
                   <el-tag v-if="row.is_key" size="small" effect="plain" class="field-flag">主键</el-tag>
@@ -856,14 +722,18 @@
           <section class="mapping-samples">
             <div class="preview-section-title">源表样本</div>
             <el-table :data="mappingPreviewRows" size="small" max-height="300" empty-text="暂无数据">
-              <el-table-column v-for="column in mappingPreview.columns" :key="column" :prop="column" :label="column" min-width="130" show-overflow-tooltip />
+              <el-table-column v-for="column in mappingPreview.columns" :key="column" :prop="column" :label="column" min-width="130">
+                <template #default="{ row }"><StructuredValueCell :value="row[column]" /></template>
+              </el-table-column>
             </el-table>
           </section>
         </div>
         <section v-if="mappingTransformedRows.length" class="mapping-transformed">
           <div class="preview-section-title">转换后的对象样本</div>
           <el-table :data="mappingTransformedRows" size="small" max-height="300">
-            <el-table-column v-for="column in mappingTransformedColumns" :key="column" :prop="column" :label="column" min-width="130" show-overflow-tooltip />
+            <el-table-column v-for="column in mappingTransformedColumns" :key="column" :prop="column" :label="column" min-width="130">
+              <template #default="{ row }"><StructuredValueCell :value="row[column]" /></template>
+            </el-table-column>
           </el-table>
         </section>
         <div v-if="mappingPreview.unmapped_columns.length" class="unmapped-columns">
@@ -876,10 +746,10 @@
       </template>
     </el-dialog>
 
-    <!-- ═══════════ 受治理函数对话框（仅声明式契约）═══════════ -->
+    <!-- ═══════════ 业务函数对话框 ═══════════ -->
     <el-dialog v-if="canWrite" v-model="functionDlg" :title="functionForm.id ? '编辑函数' : '添加函数'" width="680px" class="glass-dialog" data-testid="function-dialog">
       <el-alert
-        title="此处仅保存声明式 JSON Schema 契约；不支持代码、脚本、命令、URL 或执行配置。"
+        title="选择受治理的内置计算方式，不填写代码、网址或连接凭据。函数可被 Agent 安全调用。"
         type="info"
         :closable="false"
         show-icon
@@ -894,7 +764,7 @@
               <el-option label="仅当前场景" value="scenario" />
               <el-option label="租户范围展示" value="tenant" />
             </el-select>
-            <div class="form-help">仅影响声明展示；实际授权始终以场景 ACL 为准。</div>
+            <div class="form-help">这里只说明适用范围；实际访问仍遵循当前场景的权限。</div>
           </el-form-item>
         </div>
         <el-form-item label="说明">
@@ -904,30 +774,55 @@
           <el-input v-model="functionForm.tags_text" maxlength="1619" placeholder="如：订单、风险、只读" />
           <div class="form-help">最多 20 个标签，每个标签最多 80 个字符。</div>
         </el-form-item>
-        <el-form-item label="输入 Schema（JSON）" required>
-          <el-input
-            v-model="functionForm.input_schema_text"
-            type="textarea"
-            :rows="8"
-            class="mono"
-            placeholder='{"type":"object","properties":{"order_id":{"type":"string"}},"required":["order_id"],"additionalProperties":false}'
-          />
-          <div class="form-help">顶层必须是 <code>object</code> 类型 JSON Schema；仅描述数据结构。</div>
+        <el-form-item label="运行方式" required>
+          <el-select v-model="functionForm.runtime_kind" style="width:100%" @change="resetFunctionRuntime">
+            <el-option label="仅定义输入输出（暂不可调用）" value="contract" />
+            <el-option label="加权评分" value="weighted_score" />
+            <el-option label="阈值判断" value="threshold" />
+            <el-option label="两点地理距离" value="geo_distance" />
+            <el-option label="时序数值聚合" value="timeseries_aggregate" />
+          </el-select>
         </el-form-item>
-        <el-form-item label="输出 Schema（JSON）" required>
-          <el-input
-            v-model="functionForm.output_schema_text"
-            type="textarea"
-            :rows="8"
-            class="mono"
-            placeholder='{"type":"object","properties":{"risk_level":{"type":"string"}},"additionalProperties":false}'
-          />
-          <div class="form-help">顶层必须是 <code>object</code> 类型 JSON Schema；不会创建执行能力。</div>
+        <el-form-item label="输入字段" required>
+          <SchemaFieldBuilder v-model="functionForm.input_schema" empty-text="该函数暂时不需要输入字段" />
+          <div class="form-help">逐项定义函数需要的业务参数；选择可运行的计算方式后，Agent 会按这些字段调用。</div>
+        </el-form-item>
+        <el-form-item label="输出字段" required>
+          <SchemaFieldBuilder v-model="functionForm.output_schema" empty-text="该函数暂时没有结构化输出" />
+          <div class="form-help">逐项说明计算结果，Agent 会按这个结构理解并使用返回值。</div>
+        </el-form-item>
+        <template v-if="functionForm.runtime_kind === 'weighted_score'">
+          <el-form-item label="字段权重" required>
+            <div v-if="functionNumericFields.length" class="function-runtime-fields">
+              <div v-for="field in functionNumericFields" :key="field.name"><span>{{ field.name }}</span><el-input-number v-model="functionForm.runtime_config.weights[field.name]" :step="0.1" controls-position="right" placeholder="权重" /></div>
+            </div>
+            <el-alert v-else title="请先在输入字段中添加至少一个整数或数值字段" type="warning" :closable="false" show-icon />
+          </el-form-item>
+          <el-form-item label="基础分"><el-input-number v-model="functionForm.runtime_config.bias" :step="0.1" controls-position="right" /></el-form-item>
+        </template>
+        <template v-else-if="functionForm.runtime_kind === 'threshold'">
+          <div class="form-row">
+            <el-form-item label="判断字段" required class="form-col">
+              <el-select v-model="functionForm.runtime_config.field" style="width:100%" placeholder="选择数值输入字段">
+                <el-option v-for="field in functionNumericFields" :key="field.name" :label="field.name" :value="field.name" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="比较方式" class="form-col">
+              <el-select v-model="functionForm.runtime_config.operator" style="width:100%"><el-option v-for="operator in ['>', '>=', '<', '<=', '==', '!=']" :key="operator" :label="operator" :value="operator" /></el-select>
+            </el-form-item>
+          </div>
+          <el-form-item label="阈值" required><el-input-number v-model="functionForm.runtime_config.threshold" :step="0.1" controls-position="right" /></el-form-item>
+        </template>
+        <el-form-item v-else-if="functionForm.runtime_kind === 'geo_distance'" label="距离单位">
+          <el-radio-group v-model="functionForm.runtime_config.unit"><el-radio-button value="km">千米</el-radio-button><el-radio-button value="m">米</el-radio-button></el-radio-group>
+        </el-form-item>
+        <el-form-item v-else-if="functionForm.runtime_kind === 'timeseries_aggregate'" label="聚合方式">
+          <el-select v-model="functionForm.runtime_config.aggregation" style="width:100%"><el-option label="求和" value="sum" /><el-option label="平均值" value="avg" /><el-option label="最小值" value="min" /><el-option label="最大值" value="max" /><el-option label="计数" value="count" /></el-select>
         </el-form-item>
       </el-form>
       <template #footer>
         <el-button :disabled="functionSaving" @click="functionDlg = false">取消</el-button>
-        <el-button type="primary" :loading="functionSaving" @click="saveFunction">保存声明</el-button>
+        <el-button type="primary" :loading="functionSaving" @click="saveFunction">保存函数</el-button>
       </template>
     </el-dialog>
 
@@ -938,7 +833,7 @@
           <el-form-item label="名称" class="form-col">
             <el-input v-model="actionForm.name" placeholder="如：标记违规、生成报告" />
           </el-form-item>
-          <el-form-item label="所属实体" class="form-col">
+          <el-form-item label="所属对象类型" class="form-col">
             <el-select v-model="actionForm.entity_id" style="width:100%">
               <el-option v-for="e in detail.entities" :key="e.id" :label="e.name" :value="e.id" />
             </el-select>
@@ -949,7 +844,7 @@
         </el-form-item>
         <div class="form-row">
           <el-form-item label="执行方式" class="form-col">
-            <el-select v-model="actionForm.executor_type" style="width:100%">
+            <el-select v-model="actionForm.executor_type" style="width:100%" @change="resetActionExecutorConfig">
               <el-option label="SQL 查询" value="sql" />
               <el-option label="受管技能 (Skill)" value="skill" />
               <el-option label="MCP 工具" value="mcp" />
@@ -965,19 +860,44 @@
             <el-switch v-model="actionForm.requires_confirmation" />
             <div class="form-help">确认前只允许预演，不会调用执行器</div>
           </el-form-item>
-          <el-form-item label="要求幂等键" class="form-col">
+          <el-form-item label="防止重复提交" class="form-col">
             <el-switch v-model="actionForm.idempotency_required" />
             <div class="form-help">防止同一请求重复执行</div>
           </el-form-item>
         </div>
-        <el-form-item label="执行配置（JSON，按执行方式不同而不同）">
-          <el-input v-model="actionForm.executor_config_text" type="textarea" :rows="5" class="mono" placeholder='{"data_source_id": "...", "sql": "SELECT ..."}' />
-          <div class="form-help" data-testid="action-runtime-binding-help">
-            受治理的 SQL/MCP 可额外保存 <code>data_source_binding_key</code> 或 <code>mcp_binding_key</code>（以及对应的 <code>…_binding_ref</code>）；Skill 必须使用 <code>skill_id</code>。运行环境由部署实例固定；生产和预发布不会回退到开发环境的直接 ID。
-          </div>
+        <template v-if="actionForm.executor_type === 'sql'">
+          <el-form-item label="数据源" required>
+            <el-select v-model="actionForm.executor_config.data_source_id" filterable placeholder="选择已接入的数据源" style="width:100%">
+              <el-option v-for="source in scenarioDataSources" :key="source.id" :label="source.name" :value="source.id" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="只读 SQL" required>
+            <el-input v-model="actionForm.executor_config.sql" type="textarea" :rows="5" class="mono" placeholder="SELECT * FROM orders WHERE order_id = {order_id}" />
+            <div class="form-help">参数用 <code>{字段名}</code> 引用；系统只允许只读查询。</div>
+          </el-form-item>
+        </template>
+        <el-form-item v-else-if="actionForm.executor_type === 'skill'" label="本地技能" required>
+          <el-select v-model="actionForm.executor_config.skill_id" filterable placeholder="选择已启用技能" style="width:100%">
+            <el-option v-for="skill in skills" :key="skill.id" :label="skill.name" :value="skill.id" :disabled="skill.enabled === false" />
+          </el-select>
         </el-form-item>
-        <el-form-item label="输入参数 Schema（JSON，可选）">
-          <el-input v-model="actionForm.input_schema_text" type="textarea" :rows="3" class="mono" placeholder='{"drug_name": {"type": "string"}}' />
+        <template v-else-if="actionForm.executor_type === 'mcp'">
+          <el-form-item label="MCP 服务" required>
+            <el-select v-model="actionForm.executor_config.mcp_id" filterable placeholder="选择外部工具服务" style="width:100%">
+              <el-option v-for="config in mcpConfigs" :key="config.id" :label="config.name" :value="config.id" :disabled="config.enabled === false" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="工具名称" required><el-input v-model.trim="actionForm.executor_config.tool_name" placeholder="例如 create_ticket" /></el-form-item>
+        </template>
+        <template v-else-if="actionForm.executor_type === 'http'">
+          <div class="form-row">
+            <el-form-item label="请求方式" class="form-col"><el-select v-model="actionForm.executor_config.method" style="width:100%"><el-option v-for="method in ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']" :key="method" :label="method" :value="method" /></el-select></el-form-item>
+            <el-form-item label="HTTPS 地址" class="form-col"><el-input v-model.trim="actionForm.executor_config.url" placeholder="https://api.example.com/resource/{id}" /></el-form-item>
+          </div>
+          <el-form-item label="请求头"><KeyValueEditor v-model="actionForm.executor_config.headers" key-placeholder="请求头名称" value-placeholder="请求头值" empty-text="没有额外请求头" /></el-form-item>
+        </template>
+        <el-form-item label="输入参数">
+          <SchemaFieldBuilder v-model="actionForm.input_schema" empty-text="此操作不需要输入参数" />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -989,7 +909,7 @@
     <!-- ═══════════ 操作参数与安全执行对话框 ═══════════ -->
     <el-dialog v-if="canWrite" v-model="actionExecuteDlg" :title="`执行操作：${actionExecuteRow?.name || ''}`" width="640px" class="glass-dialog">
       <el-alert
-        :title="`权限范围：${actionExecuteRow?.permission_scope || 'scenario'} · ${actionExecuteRow?.requires_confirmation === false ? '可直接执行' : '需要确认后执行'}`"
+        :title="`权限范围：当前业务场景 · ${actionExecuteRow?.requires_confirmation === false ? '可直接执行' : '需要确认后执行'}`"
         type="info"
         :closable="false"
         show-icon
@@ -1012,53 +932,29 @@
             style="width:100%"
           />
           <el-switch v-else-if="field.schema.type === 'boolean'" v-model="actionParamsForm[field.name]" />
-          <el-input
-            v-else-if="field.schema.type === 'array' || field.schema.type === 'object'"
-            v-model="actionParamsText[field.name]"
-            type="textarea"
-            :rows="3"
-            class="mono"
-            :placeholder="field.schema.type === 'array' ? '请输入 JSON 数组' : '请输入 JSON 对象'"
-          />
+          <el-select v-else-if="field.schema.type === 'array'" v-model="actionParamsForm[field.name]" multiple filterable allow-create default-first-option placeholder="输入一项后按回车添加" style="width:100%" />
+          <KeyValueEditor v-else-if="field.schema.type === 'object'" v-model="actionParamsForm[field.name]" empty-text="添加对象字段" />
           <el-input v-else v-model="actionParamsForm[field.name]" :placeholder="field.schema.default !== undefined ? `默认值：${field.schema.default}` : '请输入参数'" />
         </el-form-item>
         <el-empty v-if="!actionParameterFields.length" :image-size="56" description="此操作无需输入参数" />
       </el-form>
       <div class="action-execution-meta">
-        <span>幂等键</span>
+        <span>防重复标识</span>
         <code class="mono">{{ actionIdempotencyKey }}</code>
         <span class="muted">本次确认执行保持不变</span>
       </div>
       <el-alert v-if="actionPreviewResult" class="action-preview-alert" type="success" :closable="false" show-icon>
         <template #title>预演完成：未调用执行器，可确认执行</template>
-        <pre class="action-preview-text mono">{{ JSON.stringify(actionPreviewResult.result?.plan || actionPreviewResult.result, null, 2) }}</pre>
+        <KeyValueEditor :model-value="actionPreviewResult.result?.plan || actionPreviewResult.result || {}" readonly empty-text="预演没有返回明细" />
       </el-alert>
-      <div v-if="actionPreviewResult?.connector_audit?.length" class="action-runtime-audit" role="status">
-        <span>运行时连接器</span>
-        <el-tag v-for="audit in actionPreviewResult.connector_audit" :key="`${audit.kind}-${audit.binding_id || audit.connector_id}`" size="small" effect="plain">
-          {{ audit.environment }} · {{ audit.connector_name || audit.connector_id }}{{ audit.managed ? '（受治理绑定）' : '（兼容直连）' }}
-        </el-tag>
-      </div>
-      <dl v-if="actionPreviewResult" class="action-runtime-provenance" aria-label="本次预演的运行定义证据">
+      <dl v-if="actionPreviewResult" class="action-runtime-provenance" aria-label="本次预演的安全检查">
         <div>
-          <dt>运行环境</dt>
-          <dd>{{ actionPreviewResult.environment || 'dev' }}</dd>
+          <dt>定义依据</dt>
+          <dd>{{ actionPreviewResult.definition_source === 'release' ? '已固定的场景定义' : '当前场景定义' }}</dd>
         </div>
         <div>
-          <dt>定义来源</dt>
-          <dd>{{ actionPreviewResult.definition_source === 'release' ? '已发布快照' : '开发中定义' }}</dd>
-        </div>
-        <div v-if="actionPreviewResult.definition_snapshot_id">
-          <dt>发布快照 ID</dt>
-          <dd class="mono">{{ actionPreviewResult.definition_snapshot_id }}</dd>
-        </div>
-        <div v-if="actionPreviewResult.release_id">
-          <dt>发布记录 ID</dt>
-          <dd class="mono">{{ actionPreviewResult.release_id }}</dd>
-        </div>
-        <div v-if="actionPreviewResult.definition_hash">
-          <dt>定义校验哈希</dt>
-          <dd class="mono">{{ actionPreviewResult.definition_hash }}</dd>
+          <dt>外部连接</dt>
+          <dd>{{ actionPreviewResult.connector_audit?.length ? '已检查且可用' : '本操作无需外部连接' }}</dd>
         </div>
       </dl>
       <template #footer>
@@ -1084,7 +980,7 @@
           </el-form-item>
         </div>
         <div class="form-row">
-          <el-form-item label="关联实体（可选，留空为全局规则）" class="form-col">
+          <el-form-item label="关联对象类型（可选，留空为全局规则）" class="form-col">
             <el-select v-model="ruleForm.entity_id" clearable style="width:100%">
               <el-option v-for="e in detail.entities" :key="e.id" :label="e.name" :value="e.id" />
             </el-select>
@@ -1096,8 +992,8 @@
         <el-form-item label="描述">
           <el-input v-model="ruleForm.description" type="textarea" :rows="2" placeholder="这条规则检查什么" />
         </el-form-item>
-        <el-form-item label="条件表达式（JSON，支持 and/or/not 组合）">
-          <el-input v-model="ruleForm.condition_text" type="textarea" :rows="6" class="mono" placeholder='{"op": "and", "conditions": [{"field": "数量", "op": ">", "value": 2}]}' />
+        <el-form-item label="判断条件">
+          <RuleConditionBuilder v-model="ruleForm.condition" :fields="ruleFieldOptions" />
         </el-form-item>
         <el-form-item label="命中后动作（文本说明）">
           <el-input v-model="ruleForm.action_on_match" placeholder="如：标记为疑似违规并通知审核员" />
@@ -1123,8 +1019,8 @@
         <el-form-item label="描述">
           <el-input v-model="eventForm.description" type="textarea" :rows="2" placeholder="这个事件代表什么业务含义" />
         </el-form-item>
-        <el-form-item label="载荷 Schema（JSON，可选）">
-          <el-input v-model="eventForm.payload_schema_text" type="textarea" :rows="4" class="mono" placeholder='{"invoice_id": {"type": "string"}}' />
+        <el-form-item label="事件载荷字段">
+          <SchemaFieldBuilder v-model="eventForm.payload_schema" empty-text="该事件不携带业务字段" />
         </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="eventForm.enabled" />
@@ -1138,9 +1034,18 @@
 
     <!-- ═══════════ 执行结果对话框 ═══════════ -->
     <el-dialog v-model="execResultDlg" title="执行结果" width="640px" class="glass-dialog">
-      <pre class="exec-result mono">{{ execResultText }}</pre>
+      <StructuredValueViewer :value="execResult" empty-text="本次执行没有返回结果" />
       <template #footer>
         <el-button type="primary" @click="execResultDlg = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="recordInputDlg" :title="recordInputTitle" width="600px" class="glass-dialog" @closed="cancelRecordInput">
+      <p class="record-input-help">按字段填写业务数据；需要引用工作流参数时可直接填写 <code>{{ '{params.field}' }}</code>。</p>
+      <StructuredValueEditor v-model="recordInputValue" root />
+      <template #footer>
+        <el-button @click="cancelRecordInput">取消</el-button>
+        <el-button type="primary" @click="confirmRecordInput">确定</el-button>
       </template>
     </el-dialog>
 
@@ -1154,8 +1059,14 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import EditorPanel from '@/components/EditorPanel.vue'
+import KeyValueEditor from '@/components/KeyValueEditor.vue'
+import RuleConditionBuilder from '@/components/RuleConditionBuilder.vue'
+import SchemaFieldBuilder from '@/components/SchemaFieldBuilder.vue'
+import StructuredValueCell from '@/components/StructuredValueCell.vue'
+import StructuredValueEditor from '@/components/StructuredValueEditor.vue'
+import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
-import type { ActionExecutionLog, AssistantActionPreview, ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, WorkflowRun } from '@/types'
+import type { AssistantActionPreview, ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, WorkflowRun } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -1175,9 +1086,12 @@ const detail = ref<ScenarioDetail>({
 const canWrite = computed(() => detail.value.can_write === true)
 const dataSources = ref<any[]>([])
 const llmConfigs = ref<any[]>([])
-const stageNames = new Set(['flow', 'ontology', 'instances', 'mappings', 'functions', 'actions', 'rules', 'events', 'workflows'])
+const skills = ref<any[]>([])
+const mcpConfigs = ref<any[]>([])
+const scenarioDataSources = computed(() => dataSources.value.filter((source) => !source.scenario_id || source.scenario_id === sid))
+const stageNames = new Set(['ontology', 'instances', 'mappings', 'functions', 'actions', 'rules', 'events', 'workflows'])
 const requestedStage = Array.isArray(route.query.stage) ? route.query.stage[0] : route.query.stage
-const tab = ref(typeof requestedStage === 'string' && stageNames.has(requestedStage) ? requestedStage : 'flow')
+const tab = ref(typeof requestedStage === 'string' && stageNames.has(requestedStage) ? requestedStage : 'ontology')
 const instFilter = ref('')
 const saving = ref(false)
 const objectQuery = ref('')
@@ -1189,18 +1103,6 @@ const objectNextOffset = ref(0)
 const objectAppliedKey = ref('')
 const selectedObjectId = ref<string | null>(null)
 const objectDetail = ref<ObjectDetail | null>(null)
-const objectQuestion = ref('')
-const objectQuestionLoading = ref(false)
-const objectQuestionSearched = ref(false)
-const objectQuestionTerm = ref('')
-const objectQuestionAnswer = ref('')
-const objectQuestionEvidence = ref<ObjectDetail[]>([])
-const objectQuestionInputRef = ref<any>(null)
-const querySectionRef = ref<HTMLElement | null>(null)
-const auditSectionRef = ref<HTMLElement | null>(null)
-const executionLogs = ref<ActionExecutionLog[]>([])
-const auditLoading = ref(false)
-const controlledActionId = ref('')
 const OBJECT_PAGE_SIZE = 50
 let objectRequestId = 0
 let objectSearchViewDisposed = false
@@ -1220,7 +1122,6 @@ const editor = ref<{ kind: 'entity' | 'relation' | 'instance'; id?: string; form
 watch(tab, (value) => {
   editor.value = null
   if (value === 'instances') searchObjects()
-  if (value === 'flow') loadExecutionLogs(true)
   if (route.query.stage !== value) {
     void router.replace({ query: { ...route.query, stage: value } })
   }
@@ -1301,273 +1202,15 @@ function entColor(id: string) {
 }
 function dsName(id: string) { return dataSources.value.find((d) => d.id === id)?.name || '—' }
 
-// ── 闭环工作台：状态来自真实资源，不把“访问过”误当作“已完成” ──
-type FlowStepId = 'model' | 'mapping' | 'query' | 'approval' | 'audit'
-type FlowStepStatus = 'complete' | 'current' | 'pending'
-type FlowStep = {
-  id: FlowStepId
-  number: number
-  title: string
-  description: string
-  nextHint: string
-  actionLabel: string
-  status: FlowStepStatus
-}
-
-const controlledAction = computed<any>(() => detail.value.actions.find((action) => action.id === controlledActionId.value) || null)
-const approvalWorkflows = computed<any[]>(() => detail.value.workflows.filter((workflow) =>
-  (workflow.nodes || []).some((node: any) => node.type === 'approval'),
-))
-const querySuggestions = computed(() => {
-  const suggestions: string[] = []
-  for (const item of objectItems.value.slice(0, 2)) suggestions.push(`查找 ${item.name}，说明属性、关系和来源`)
-  for (const entity of detail.value.entities.slice(0, 2)) suggestions.push(`列出可见的${entity.name}对象及其来源`)
-  return [...new Set(suggestions)].slice(0, 3)
-})
-const flowCompletion = computed<Record<FlowStepId, boolean>>(() => ({
-  model: detail.value.entities.length > 0,
-  mapping: detail.value.mappings.length > 0 && objectTotal.value > 0,
-  query: objectQuestionEvidence.value.length > 0,
-  approval: executionLogs.value.some((log) => log.target_type === 'workflow' && log.mode !== 'dry_run' && ['success', 'succeeded'].includes(log.status)),
-  audit: executionLogs.value.length > 0,
-}))
-const flowSteps = computed<FlowStep[]>(() => {
-  const definitions: Omit<FlowStep, 'status'>[] = [
-    { id: 'model', number: 1, title: '描述与附件 → AI 草稿', description: '检查实体、属性、关系和 Change Set 差异', nextHint: '打开 AI 助手，附件保持临时上下文；确认差异后再保存草稿。', actionLabel: '生成或完善草稿' },
-    { id: 'mapping', number: 2, title: '映射并刷新真实对象', description: '预览字段、测试主键与转换，再刷新对象运行时', nextHint: '进入数据映射，先预览和测试，再刷新生成可追踪对象。', actionLabel: '配置数据映射' },
-    { id: 'query', number: 3, title: '查询对象并核对引用', description: '从对象、关系和数据来源形成可复核回答', nextHint: '输入一个业务问题，核对每条 [O] 引用的对象属性、关系和来源。', actionLabel: '开始对象查询' },
-    { id: 'approval', number: 4, title: '预演 → 人工审批 → Action', description: '通过审批工作流暂停副作用，批准后再执行', nextHint: '选择 Action，生成含人工审批节点的流程草稿，启用后提交任务。', actionLabel: '准备审批执行' },
-    { id: 'audit', number: 5, title: '回看参数、结果与运行证据', description: '核对环境、定义版本、连接器和执行结果', nextHint: '展开最新审计记录，检查参数、定义版本、权限判定和结果。', actionLabel: '查看执行审计' },
-  ]
-  const firstIncomplete = definitions.findIndex((step) => !flowCompletion.value[step.id])
-  return definitions.map((step, index) => ({
-    ...step,
-    status: flowCompletion.value[step.id] ? 'complete' : index === firstIncomplete ? 'current' : 'pending',
-  }))
-})
-const completedFlowSteps = computed(() => flowSteps.value.filter((step) => step.status === 'complete').length)
-const flowProgress = computed(() => Math.round((completedFlowSteps.value / Math.max(flowSteps.value.length, 1)) * 100))
-const nextFlowStep = computed(() => flowSteps.value.find((step) => step.status === 'current') || flowSteps.value[flowSteps.value.length - 1])
-
-function flowStatusLabel(status: FlowStepStatus) {
-  return status === 'complete' ? '已完成' : status === 'current' ? '当前步骤' : '待开始'
-}
-function flowStatusType(status: FlowStepStatus) {
-  return status === 'complete' ? 'success' : status === 'current' ? 'warning' : 'info'
-}
 function openAssistantDraft() {
   if (!canWrite.value) return
   window.dispatchEvent(new CustomEvent('assistant-open-request', {
     detail: {
       mode: 'draft',
-      prompt: `请基于“${detail.value.name}”的业务描述生成或完善本体 Change Set 草稿。请覆盖核心实体、属性、关系，列出不确定项，并指出后续数据映射需要确认的数据源、主键和字段。\n\n业务描述：${detail.value.description || '暂无，请先向我询问业务目标和边界。'}`,
+      prompt: `请只生成或完善“${detail.value.name}”的本体模型草稿。完整提取对象类型、属性、主键、关系类型、基数和约束；逐项列出来源与不确定项。不要生成数据映射或工作流。\n\n业务描述：${detail.value.description || '暂无，请先向我询问业务目标和边界。'}`,
     },
   }))
 }
-async function activateFlowStep(id: FlowStepId) {
-  if (id === 'model') {
-    openAssistantDraft()
-    return
-  }
-  if (id === 'mapping') {
-    tab.value = 'mappings'
-    return
-  }
-  if (id === 'query') {
-    tab.value = 'flow'
-    await nextTick()
-    querySectionRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    objectQuestionInputRef.value?.focus?.()
-    return
-  }
-  if (id === 'approval') {
-    if (!detail.value.actions.length) openActionsWorkspace()
-    else if (!approvalWorkflows.value.length && canWrite.value) prepareApprovalWorkflow()
-    else {
-      tab.value = 'flow'
-      await nextTick()
-      document.getElementById('governed-execution-title')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    }
-    return
-  }
-  tab.value = 'flow'
-  await nextTick()
-  auditSectionRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  await loadExecutionLogs(true)
-}
-
-function normalizeObjectQuestionTerm(value: string, entityName = '') {
-  return value
-    .replace(/[“”"'‘’]/g, ' ')
-    .replace(entityName, ' ')
-    .replace(/请|帮我|查询|查找|搜索|查看|找出|列出|展示|告诉我|当前|本场景|可见|所有|相关的?|对象|记录|数据|来源|关系|属性|有哪些|是什么|在哪里|多少|以及|并且|并说明|说明/g, ' ')
-    .replace(/[，。！？?,.;；:：()（）\[\]【】]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-function objectQuestionCandidates(question: string, entityName = '') {
-  const quoted = [...question.matchAll(/[“"'‘]([^”"'’]{1,80})[”"'’]/g)].map((match) => match[1])
-  const segments = question.split(/[的，。！？?,.;；:：]/).map((part) => normalizeObjectQuestionTerm(part, entityName))
-  const cleaned = normalizeObjectQuestionTerm(question, entityName)
-  return [...new Set([...quoted, cleaned, ...segments].map((term) => term.trim()).filter((term) => term && term !== entityName))].sort((a, b) => a.length - b.length)
-}
-async function runObjectQuestion() {
-  const question = objectQuestion.value.trim()
-  if (!question || objectQuestionLoading.value) return
-  objectQuestionLoading.value = true
-  objectQuestionSearched.value = true
-  objectQuestionAnswer.value = ''
-  objectQuestionEvidence.value = []
-  objectQuestionTerm.value = ''
-  try {
-    const mentionedEntity = [...detail.value.entities]
-      .filter((entity) => entity.id && question.includes(entity.name))
-      .sort((a, b) => b.name.length - a.name.length)[0]
-    const terms = objectQuestionCandidates(question, mentionedEntity?.name || '')
-    const attempts = terms.length ? terms : mentionedEntity ? [''] : []
-    if (!attempts.length) {
-      objectQuestionAnswer.value = '请补充一个对象名称、属性值或实体类型；系统不会把缺少依据的推测当作业务事实。'
-      return
-    }
-    let matched: Awaited<ReturnType<typeof api.searchObjects>> | null = null
-    let usedTerm = ''
-    for (const term of attempts.slice(0, 5)) {
-      const result = await api.searchObjects(sid, {
-        q: term || undefined,
-        entity_id: mentionedEntity?.id || undefined,
-        limit: 10,
-        offset: 0,
-      })
-      if (result.items.length) {
-        matched = result
-        usedTerm = term || mentionedEntity?.name || ''
-        break
-      }
-    }
-    if (!matched) {
-      objectQuestionAnswer.value = '当前可见对象中没有找到匹配事实。请缩短关键词，或先检查数据映射是否已经测试并刷新。'
-      return
-    }
-    const settled = await Promise.allSettled(matched.items.slice(0, 5).map((item) => api.getObject(sid, item.id)))
-    objectQuestionEvidence.value = settled
-      .filter((result): result is PromiseFulfilledResult<ObjectDetail> => result.status === 'fulfilled')
-      .map((result) => result.value)
-    objectQuestionTerm.value = usedTerm
-    const shown = objectQuestionEvidence.value.length
-    objectQuestionAnswer.value = `找到 ${matched.total} 个匹配对象，下面展示前 ${shown} 个可复核结果。每条结论都绑定对象引用 [O1]–[O${shown}]，可继续查看完整属性、邻接关系与来源。`
-  } catch (error: any) {
-    objectQuestionAnswer.value = ''
-    ElMessage.error(error?.message || '对象查询失败')
-  } finally {
-    objectQuestionLoading.value = false
-  }
-}
-function askObjectSuggestion(suggestion: string) {
-  objectQuestion.value = suggestion
-  void runObjectQuestion()
-}
-function objectAttributeEntries(item: ObjectDetail) {
-  return Object.entries(item.attributes || {}).slice(0, 5)
-}
-function objectSourceLabel(item: ObjectDetail) {
-  return item.provenance?.data_source_name || (item.provenance?.kind === 'imported' ? '已映射数据源' : '手动创建')
-}
-function objectSourceReference(item: ObjectDetail) {
-  return [item.provenance?.table_name, item.provenance?.reference].filter(Boolean).join(' · ') || `object:${item.id}`
-}
-function objectRelationSummary(item: ObjectDetail) {
-  if (!item.relations?.length) return '暂无可见关系'
-  const summary = item.relations.slice(0, 3).map((relation) => `${relation.relation_name || '关联'} → ${relation.related_object_name}`).join('；')
-  return item.relations.length > 3 ? `${summary} 等 ${item.relations.length} 条` : summary
-}
-async function openEvidenceObject(id: string) {
-  tab.value = 'instances'
-  await nextTick()
-  await selectObject(id)
-}
-
-async function loadExecutionLogs(silent = false) {
-  if (auditLoading.value) return
-  auditLoading.value = true
-  try {
-    executionLogs.value = await api.listExecutionLogs(sid, 50)
-  } catch (error: any) {
-    if (!silent) ElMessage.error(error?.message || '执行审计加载失败')
-  } finally {
-    auditLoading.value = false
-  }
-}
-function auditStatusLabel(status: string) {
-  return ({ success: '成功', succeeded: '成功', failed: '失败', dry_run: '预演', confirmation_required: '待确认', running: '执行中' } as Record<string, string>)[status] || status || '未知'
-}
-function auditStatusType(status: string) {
-  if (['success', 'succeeded'].includes(status)) return 'success'
-  if (['failed', 'error'].includes(status)) return 'danger'
-  if (['dry_run', 'confirmation_required'].includes(status)) return 'warning'
-  return 'info'
-}
-function auditStatusTone(status: string) {
-  if (['success', 'succeeded'].includes(status)) return 'success'
-  if (['failed', 'error'].includes(status)) return 'danger'
-  return 'warning'
-}
-function auditActorLabel(log: ActionExecutionLog) {
-  if (log.actor_type === 'agent') return log.agent_id ? `Agent · ${log.agent_id}` : 'Agent（标识未知）'
-  if (log.actor_type === 'user') return log.actor_user_id ? `用户 · ${log.actor_user_id}` : '已认证用户（标识未知）'
-  return '未知（旧记录或无可验证上下文）'
-}
-function auditPermissionLabel(log: ActionExecutionLog) {
-  const decision = log.permission_decision || {}
-  if (!Object.keys(decision).length) return '未知（旧记录未保存判定）'
-  const value = decision.decision ?? decision.result ?? decision.allowed
-  return value === undefined ? JSON.stringify(decision) : String(value)
-}
-function auditDataContextLabel(log: ActionExecutionLog) {
-  const context = log.data_context || {}
-  if (!Object.keys(context).length) return '无或未知'
-  return Object.entries(context).slice(0, 3).map(([key, value]) => {
-    const display = value && typeof value === 'object' ? JSON.stringify(value) : String(value)
-    return `${key}=${display}`
-  }).join(' · ')
-}
-function openActionsWorkspace() {
-  tab.value = 'actions'
-  if (canWrite.value && !detail.value.actions.length) nextTick(() => openAction())
-}
-function openWorkflowWorkspace(id?: string) {
-  tab.value = 'workflows'
-  nextTick(() => openWorkflow(id))
-}
-function prepareApprovalWorkflow() {
-  if (!canWrite.value || !controlledAction.value?.id) return
-  const action = controlledAction.value
-  tab.value = 'workflows'
-  wfEditor.value = {
-    name: `${action.name}审批执行`,
-    description: `人工审批通过后执行类型化 Action「${action.name}」。保存前请核对参数映射、审批说明和启用状态。`,
-    trigger_type: 'manual',
-    trigger_config: { interval_seconds: 300, max_attempts: 3, retry_backoff_seconds: 5, timeout_seconds: 300, event_id: '' },
-    steps: [],
-    nodes: [
-      { id: 'start', type: 'start', name: '开始', position: { x: 40, y: 120 }, data: { name: '开始' } },
-      { id: 'approval', type: 'approval', name: '业务影响审批', position: { x: 280, y: 120 }, data: { name: '业务影响审批', instructions: `请核对「${action.name}」的对象范围、输入参数、权限和预演影响后批准或驳回。`, timeout_seconds: 86400, on_timeout: 'reject' } },
-      { id: 'action', type: 'action', name: `执行 ${action.name}`, position: { x: 540, y: 120 }, data: { name: `执行 ${action.name}`, action_id: action.id, params: {} } },
-      { id: 'end', type: 'end', name: '结束', position: { x: 800, y: 120 }, data: { name: '结束', summary: '审批通过并完成受控 Action 执行。' } },
-    ],
-    edges: [
-      { id: 'e-start-approval', source: 'start', target: 'approval' },
-      { id: 'e-approval-action', source: 'approval', target: 'action' },
-      { id: 'e-action-end', source: 'action', target: 'end' },
-    ],
-    status: 'draft',
-    enabled: true,
-  }
-  ElMessage.info('已生成“审批 → Action”流程草稿，请核对参数并保存启用')
-}
-function goToScenarioTasks() {
-  router.push({ name: 'tasks', query: { scenario_id: sid, return_to: route.fullPath } })
-}
-
 // ── 对象运行时浏览 ──
 async function searchObjects() {
   const requestKey = objectSearchKey()
@@ -1648,12 +1291,6 @@ async function selectObject(id: string) {
   }
 }
 
-function formatObjectValue(value: any): string {
-  if (value === null || value === undefined || value === '') return '—'
-  if (typeof value === 'object') return JSON.stringify(value)
-  return String(value)
-}
-
 // ── 选择 → 打开悬浮编辑器 ──
 function onNodeSelect(node: any) {
   window.dispatchEvent(new CustomEvent('ontology-selection-change', {
@@ -1732,6 +1369,64 @@ function openInstance(id?: string) {
   }
 }
 
+const relationInstanceDlg = ref(false)
+const relationInstanceSaving = ref(false)
+const relationInstanceForm = ref<Partial<RelationInstance>>({ relation_id: '', source_instance_id: '', target_instance_id: '', attributes: {} })
+const selectedRelationDefinition = computed(() => detail.value.relations.find((relation) => relation.id === relationInstanceForm.value.relation_id))
+const relationSourceInstances = computed(() => detail.value.instances.filter((instance) => instance.entity_id === selectedRelationDefinition.value?.source_entity_id))
+const relationTargetInstances = computed(() => detail.value.instances.filter((instance) => instance.entity_id === selectedRelationDefinition.value?.target_entity_id))
+const canCreateRelationInstance = computed(() => Boolean(
+  relationInstanceForm.value.relation_id
+  && relationInstanceForm.value.source_instance_id
+  && relationInstanceForm.value.target_instance_id,
+))
+function resetRelationInstanceEndpoints() {
+  relationInstanceForm.value.source_instance_id = relationSourceInstances.value[0]?.id || ''
+  relationInstanceForm.value.target_instance_id = relationTargetInstances.value[0]?.id || ''
+  relationInstanceForm.value.attributes = {}
+}
+function openRelationInstanceManager() {
+  if (!canWrite.value) return
+  relationInstanceForm.value = {
+    relation_id: detail.value.relations[0]?.id || '',
+    source_instance_id: '',
+    target_instance_id: '',
+    attributes: {},
+  }
+  resetRelationInstanceEndpoints()
+  relationInstanceDlg.value = true
+}
+async function saveRelationInstance() {
+  if (!canWrite.value || !canCreateRelationInstance.value) return
+  relationInstanceSaving.value = true
+  try {
+    await api.createRelationInstance(sid, {
+      relation_id: relationInstanceForm.value.relation_id,
+      source_instance_id: relationInstanceForm.value.source_instance_id,
+      target_instance_id: relationInstanceForm.value.target_instance_id,
+      attributes: { ...(relationInstanceForm.value.attributes || {}) },
+    })
+    await load()
+    resetRelationInstanceEndpoints()
+    ElMessage.success('关系实例已添加')
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '添加关系实例失败')
+  } finally {
+    relationInstanceSaving.value = false
+  }
+}
+async function removeRelationInstance(row: RelationInstance) {
+  if (!canWrite.value || !row.id) return
+  try {
+    await ElMessageBox.confirm(`删除“${row.source_instance_name || '来源对象'} → ${row.target_instance_name || '目标对象'}”这条关系？`, '确认删除', { type: 'warning' })
+    await api.deleteRelationInstance(row.id)
+    await load()
+    ElMessage.success('关系实例已删除')
+  } catch (e: any) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
+  }
+}
+
 // ── 保存 / 删除 ──
 async function saveEditor() {
   if (!canWrite.value || !editor.value) return
@@ -1767,7 +1462,7 @@ async function deleteEditor() {
   if (!canWrite.value || !editor.value) return
   const { kind, id } = editor.value
   if (!id) { editor.value = null; return }
-  const names = { entity: '实体', relation: '关系', instance: '实例' }
+  const names = { entity: '对象类型', relation: '关系类型', instance: '对象实例' }
   try {
     await ElMessageBox.confirm(`确定删除该${names[kind]}？`, '提示', { type: 'warning' })
   } catch { return }
@@ -1810,12 +1505,12 @@ const mappingPreviewRows = computed(() => {
   const preview = mappingPreview.value
   if (!preview) return []
   return preview.sample_rows.map((row) => Object.fromEntries(
-    preview.columns.map((column, index) => [column, formatMappingValue(row[index])]),
+    preview.columns.map((column, index) => [column, row[index]]),
   ))
 })
-const mappingTransformedRows = computed<Record<string, string>[]>(() => {
+const mappingTransformedRows = computed<Record<string, unknown>[]>(() => {
   const rows = ((mappingPreview.value as DataMappingPreview & { transformed_rows?: Record<string, any>[] } | null)?.transformed_rows || [])
-  return rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, formatMappingValue(value)])))
+  return rows
 })
 const mappingTransformedColumns = computed(() => Object.keys(mappingTransformedRows.value[0] || {}))
 
@@ -1956,11 +1651,6 @@ function mappingFieldLabel(status: string) {
 function mappingFieldType(status: string) {
   return ({ mapped: 'success', missing: 'warning', invalid: 'danger' } as Record<string, string>)[status] || 'info'
 }
-function formatMappingValue(value: any): string {
-  if (value === null || value === undefined || value === '') return '—'
-  if (typeof value === 'object') return JSON.stringify(value)
-  return String(value)
-}
 function formatDate(value?: string) {
   if (!value) return ''
   const date = new Date(value)
@@ -1972,7 +1662,7 @@ function openMapping(id?: string) {
   const m = id ? detail.value.mappings.find((x) => x.id === id) : null
   mappingForm.value = m
     ? { ...m, data_source_binding_ref: { ...(m.data_source_binding_ref || {}) }, column_map: { ...(m.column_map || {}) } }
-    : { entity_id: detail.value.entities[0]?.id, data_source_id: dataSources.value[0]?.id, data_source_binding_key: '', data_source_binding_ref: {}, table_name: '', column_map: {} }
+    : { entity_id: detail.value.entities[0]?.id, data_source_id: scenarioDataSources.value[0]?.id, data_source_binding_key: '', data_source_binding_ref: {}, table_name: '', column_map: {} }
   const savedRules = ((m as unknown as { transform_rules?: Record<string, MappingTransformRule[]> } | null)?.transform_rules || {})
   mappingTransformRules.value = Object.fromEntries(Object.entries(savedRules).map(([propertyName, rules]) => [
     propertyName,
@@ -2089,15 +1779,17 @@ async function removeMapping(id: string) {
   } catch { /* ignore */ }
 }
 
-// ── 受治理函数（仅声明式契约，不执行）──
+// ── 业务函数：闭集、无副作用的确定性运行方式 ──
 type FunctionForm = {
   id?: string
   name: string
   description: string
   tags_text: string
   visibility: 'scenario' | 'tenant'
-  input_schema_text: string
-  output_schema_text: string
+  input_schema: Record<string, unknown>
+  output_schema: Record<string, unknown>
+  runtime_kind: string
+  runtime_config: Record<string, any>
 }
 
 const emptyFunctionSchema = (): Record<string, unknown> => ({
@@ -2107,12 +1799,41 @@ const functionDlg = ref(false)
 const functionSaving = ref(false)
 const functionForm = ref<FunctionForm>({
   name: '', description: '', tags_text: '', visibility: 'scenario',
-  input_schema_text: JSON.stringify(emptyFunctionSchema(), null, 2),
-  output_schema_text: JSON.stringify(emptyFunctionSchema(), null, 2),
+  input_schema: emptyFunctionSchema(), output_schema: emptyFunctionSchema(),
+  runtime_kind: 'contract', runtime_config: {},
 })
-
-function formatFunctionSchema(schema?: Record<string, unknown>) {
-  return JSON.stringify(schema || emptyFunctionSchema(), null, 2)
+const functionInputFields = computed(() => {
+  const root = actionSchemaRoot(functionForm.value.input_schema)
+  return Object.entries(root.properties).map(([name, schema]: [string, any]) => ({ name, type: String(schema?.type || 'string') }))
+})
+const functionNumericFields = computed(() => functionInputFields.value.filter((field) => ['number', 'integer'].includes(field.type)))
+function functionRuntimeLabel(kind?: string) {
+  return ({
+    contract: '仅定义（不可调用）', weighted_score: '加权评分', threshold: '阈值判断',
+    geo_distance: '地理距离', timeseries_aggregate: '时序聚合',
+  } as Record<string, string>)[kind || 'contract'] || kind || '仅定义（不可调用）'
+}
+function runtimeSchema(properties: Record<string, any>, required: string[] = Object.keys(properties)) {
+  return { type: 'object', properties, required, additionalProperties: false }
+}
+function resetFunctionRuntime(kind: string) {
+  if (kind === 'weighted_score') {
+    functionForm.value.runtime_config = { weights: {}, bias: 0 }
+    functionForm.value.output_schema = runtimeSchema({ score: { type: 'number', description: '加权计算结果' } })
+  } else if (kind === 'threshold') {
+    functionForm.value.runtime_config = { field: functionNumericFields.value[0]?.name || '', operator: '>=', threshold: 0 }
+    functionForm.value.output_schema = runtimeSchema({ matched: { type: 'boolean', description: '是否命中阈值' }, value: { type: 'number' }, threshold: { type: 'number' } })
+  } else if (kind === 'geo_distance') {
+    functionForm.value.runtime_config = { unit: 'km' }
+    functionForm.value.input_schema = runtimeSchema({ origin: { type: 'array', description: '起点坐标：[经度, 纬度]' }, target: { type: 'array', description: '终点坐标：[经度, 纬度]' } })
+    functionForm.value.output_schema = runtimeSchema({ distance: { type: 'number', description: '两点距离' }, unit: { type: 'string', description: '距离单位' } })
+  } else if (kind === 'timeseries_aggregate') {
+    functionForm.value.runtime_config = { aggregation: 'avg', value_field: 'value' }
+    functionForm.value.input_schema = runtimeSchema({ values: { type: 'array', description: '待聚合的数值列表' } })
+    functionForm.value.output_schema = runtimeSchema({ aggregation: { type: 'string' }, value: { type: 'number' }, count: { type: 'integer' } })
+  } else {
+    functionForm.value.runtime_config = {}
+  }
 }
 function openFunction(id?: string) {
   if (!canWrite.value) return
@@ -2124,30 +1845,17 @@ function openFunction(id?: string) {
         description: fn.description || '',
         tags_text: (fn.tags || []).join(', '),
         visibility: fn.visibility === 'tenant' ? 'tenant' : 'scenario',
-        input_schema_text: formatFunctionSchema(fn.input_schema),
-        output_schema_text: formatFunctionSchema(fn.output_schema),
+        input_schema: structuredClone(fn.input_schema || emptyFunctionSchema()),
+        output_schema: structuredClone(fn.output_schema || emptyFunctionSchema()),
+        runtime_kind: fn.runtime_kind || 'contract',
+        runtime_config: structuredClone(fn.runtime_config || {}),
       }
     : {
         name: '', description: '', tags_text: '', visibility: 'scenario',
-        input_schema_text: JSON.stringify(emptyFunctionSchema(), null, 2),
-        output_schema_text: JSON.stringify(emptyFunctionSchema(), null, 2),
+        input_schema: emptyFunctionSchema(), output_schema: emptyFunctionSchema(),
+        runtime_kind: 'contract', runtime_config: {},
       }
   functionDlg.value = true
-}
-function parseFunctionSchema(text: string, label: string): Record<string, unknown> {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    throw new Error(`${label}必须是有效 JSON`)
-  }
-  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
-    throw new Error(`${label}必须是 JSON Schema 对象`)
-  }
-  if ((parsed as Record<string, unknown>).type !== 'object') {
-    throw new Error(`${label}顶层 type 必须为 object`)
-  }
-  return parsed as Record<string, unknown>
 }
 function parseFunctionTags(text: string): string[] {
   const tags = [...new Set(text.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean))]
@@ -2166,8 +1874,10 @@ async function saveFunction() {
       description: functionForm.value.description.trim(),
       tags: parseFunctionTags(functionForm.value.tags_text),
       visibility: functionForm.value.visibility,
-      input_schema: parseFunctionSchema(functionForm.value.input_schema_text, '输入 Schema'),
-      output_schema: parseFunctionSchema(functionForm.value.output_schema_text, '输出 Schema'),
+      input_schema: functionForm.value.input_schema,
+      output_schema: functionForm.value.output_schema,
+      runtime_kind: functionForm.value.runtime_kind,
+      runtime_config: functionForm.value.runtime_config,
     }
   } catch (error: any) {
     ElMessage.error(error?.message || '函数声明格式错误')
@@ -2179,9 +1889,9 @@ async function saveFunction() {
     else await api.createFunction(sid, payload)
     functionDlg.value = false
     await load()
-    ElMessage.success('函数声明已保存')
+    ElMessage.success('函数已保存')
   } catch (error: any) {
-    ElMessage.error(error?.response?.data?.detail || error?.message || '函数声明保存失败')
+    ElMessage.error(error?.response?.data?.detail || error?.message || '函数保存失败')
   } finally {
     functionSaving.value = false
   }
@@ -2189,26 +1899,39 @@ async function saveFunction() {
 async function removeFunction(id?: string) {
   if (!canWrite.value || !id) return
   try {
-    await ElMessageBox.confirm('确定删除该函数声明？删除不会执行函数，但可能受已发布版本保护。', '删除函数声明', {
+    await ElMessageBox.confirm('确定删除该函数？正在使用或已固定的场景定义可能会阻止删除。', '删除函数', {
       type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消',
     })
   } catch { return }
   try {
     await api.deleteFunction(id)
     await load()
-    ElMessage.success('函数声明已删除')
+    ElMessage.success('函数已删除')
   } catch (error: any) {
-    ElMessage.error(error?.response?.data?.detail || error?.message || '函数声明删除失败')
+    ElMessage.error(error?.response?.data?.detail || error?.message || '函数删除失败')
+  }
+}
+async function doRunFunction(row: FunctionDefinition) {
+  if (!row.id || row.runtime_kind === 'contract') return ElMessage.warning('该函数尚未选择可运行的计算方式')
+  try {
+    const params = await promptParams(schemaValueTemplate(row.input_schema || {}), `运行函数：${row.name}`)
+    const run = await api.runFunction(row.id, { params, idempotency_key: `function-${row.id}-${Date.now()}` })
+    execResult.value = run.status === 'succeeded'
+      ? run.output_payload || {}
+      : { status: run.status, error: run.error || '函数运行失败' }
+    execResultDlg.value = true
+    if (run.status !== 'succeeded') ElMessage.error(run.error || '函数运行失败')
+  } catch (error: any) {
+    if (error !== 'cancel' && error?.message !== 'cancel') ElMessage.error(error?.response?.data?.detail || error?.message || '函数运行失败')
   }
 }
 
 // ── 操作（Actions）──
 const actionDlg = ref(false)
-const actionForm = ref<any>({ executor_config_text: '', input_schema_text: '' })
+const actionForm = ref<any>({ executor_type: 'sql', executor_config: {}, input_schema: emptyFunctionSchema() })
 const actionExecuteDlg = ref(false)
 const actionExecuteRow = ref<any>(null)
 const actionParamsForm = ref<Record<string, any>>({})
-const actionParamsText = ref<Record<string, string>>({})
 const actionPreviewResult = ref<any>(null)
 const actionPreviewParamsSnapshot = ref('')
 const actionPreviewing = ref(false)
@@ -2232,6 +1955,9 @@ function actionSchemaRoot(schema: any): { properties: Record<string, any>; requi
   }
   return { properties: schema, required: [] }
 }
+function actionExecutorLabel(type?: string) {
+  return ({ sql: '数据库查询', skill: '本地技能', mcp: '外部工具', http: 'HTTPS 接口', script: '受控脚本' } as Record<string, string>)[type || ''] || '未配置'
+}
 const actionParameterFields = computed(() => {
   const root = actionSchemaRoot(actionExecuteRow.value?.input_schema)
   return Object.entries(root.properties).map(([name, schema]: [string, any]) => ({
@@ -2246,26 +1972,39 @@ function createIdempotencyKey() {
   if (cryptoApi?.randomUUID) return cryptoApi.randomUUID()
   return `action-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
+function emptyExecutorConfig(type: string) {
+  if (type === 'sql') return { data_source_id: '', sql: '' }
+  if (type === 'skill') return { skill_id: '' }
+  if (type === 'mcp') return { mcp_id: '', tool_name: '' }
+  if (type === 'http') return { method: 'GET', url: '', headers: {} }
+  return {}
+}
+function resetActionExecutorConfig(type: string) {
+  actionForm.value.executor_config = emptyExecutorConfig(type)
+}
 function openAction(id?: string) {
   if (!canWrite.value) return
   const a = id ? detail.value.actions.find((x) => x.id === id) : null
   actionForm.value = a
-    ? { ...a, executor_config_text: JSON.stringify(a.executor_config || {}, null, 2), input_schema_text: JSON.stringify(a.input_schema || {}, null, 2) }
+    ? {
+        ...a,
+        executor_config: { ...emptyExecutorConfig(a.executor_type || 'sql'), ...structuredClone(a.executor_config || {}) },
+        input_schema: structuredClone(a.input_schema || emptyFunctionSchema()),
+      }
     : {
         entity_id: detail.value.entities[0]?.id || '', name: '', description: '', executor_type: 'sql',
-        executor_config_text: '', input_schema_text: '', enabled: true,
+        executor_config: { data_source_id: '', sql: '' }, input_schema: emptyFunctionSchema(), enabled: true,
         requires_confirmation: true, idempotency_required: true, permission_scope: 'scenario',
       }
   actionDlg.value = true
 }
 async function saveAction() {
   if (!canWrite.value) return
-  const f = { ...actionForm.value }
-  try {
-    f.executor_config = f.executor_config_text ? JSON.parse(f.executor_config_text) : {}
-    f.input_schema = f.input_schema_text ? JSON.parse(f.input_schema_text) : {}
-  } catch { ElMessage.error('JSON 格式错误'); return }
-  delete f.executor_config_text; delete f.input_schema_text
+  const f = {
+    ...actionForm.value,
+    executor_config: structuredClone(actionForm.value.executor_config || {}),
+    input_schema: structuredClone(actionForm.value.input_schema || emptyFunctionSchema()),
+  }
   try {
     if (f.id) await api.updateAction(f.id, f)
     else await api.createAction(sid, f)
@@ -2286,7 +2025,6 @@ async function doExecuteAction(row: any) {
   if (!canWrite.value) return
   actionExecuteRow.value = row
   actionParamsForm.value = {}
-  actionParamsText.value = {}
   actionPreviewResult.value = null
   actionPreviewParamsSnapshot.value = ''
   actionIdempotencyKey.value = createIdempotencyKey()
@@ -2297,23 +2035,15 @@ async function doExecuteAction(row: any) {
       : schema.type === 'boolean' ? false
         : schema.type === 'array' ? []
           : schema.type === 'object' ? {} : ''
-    if (schema.type === 'array' || schema.type === 'object') actionParamsText.value[field.name] = JSON.stringify(defaultValue)
-    else actionParamsForm.value[field.name] = defaultValue
+    actionParamsForm.value[field.name] = defaultValue
   }
   actionExecuteDlg.value = true
 }
 function buildActionParams(): Record<string, any> {
   const params: Record<string, any> = {}
   for (const field of actionParameterFields.value) {
-    const schema = field.schema || {}
-    if (schema.type === 'array' || schema.type === 'object') {
-      const text = actionParamsText.value[field.name]?.trim() || ''
-      if (!text && !field.required) continue
-      try { params[field.name] = JSON.parse(text) } catch { throw new Error(`参数 ${field.name} 必须是有效 JSON`) }
-      continue
-    }
     const value = actionParamsForm.value[field.name]
-    if (value === '' || value === undefined || value === null) {
+    if (value === '' || value === undefined || value === null || (Array.isArray(value) && !value.length)) {
       if (field.required) throw new Error(`请填写必填参数：${field.name}`)
       continue
     }
@@ -2365,18 +2095,17 @@ async function confirmActionExecution() {
       expected_release_id: pinnedPreview.release_id || undefined,
       expected_definition_hash: String(pinnedPreview.definition_hash),
     })
-    if (res.status === 'idempotent_replay') ElMessage.info('检测到相同幂等键，已返回原执行结果')
+    if (res.status === 'idempotent_replay') ElMessage.info('检测到重复提交，已返回原执行结果')
     else if (res.status === 'success') ElMessage.success('操作执行成功')
     else ElMessage.warning(res.error || '操作执行未成功')
     actionExecuteDlg.value = false
     showExecResult(res)
-    await loadExecutionLogs(true)
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.detail || e?.message || '执行失败')
   } finally { actionExecuting.value = false }
 }
 
-watch([actionParamsForm, actionParamsText], () => {
+watch(actionParamsForm, () => {
   if (!actionPreviewResult.value) return
   actionPreviewResult.value = null
   actionPreviewParamsSnapshot.value = ''
@@ -2384,22 +2113,22 @@ watch([actionParamsForm, actionParamsText], () => {
 
 // ── 规则（Rules）──
 const ruleDlg = ref(false)
-const ruleForm = ref<any>({ condition_text: '' })
+const ruleForm = ref<any>({ condition: {} })
+const ruleFieldOptions = computed(() => {
+  const entity = detail.value.entities.find((item) => item.id === ruleForm.value.entity_id)
+  return (entity?.properties || []).map((property) => property.name).filter(Boolean)
+})
 function openRule(id?: string) {
   if (!canWrite.value) return
   const r = id ? detail.value.rules.find((x) => x.id === id) : null
   ruleForm.value = r
-    ? { ...r, condition_text: JSON.stringify(r.condition || {}, null, 2) }
-    : { name: '', description: '', entity_id: '', severity: 'warning', condition_text: '', action_on_match: '', enabled: true }
+    ? { ...r, condition: structuredClone(r.condition || {}) }
+    : { name: '', description: '', entity_id: '', severity: 'warning', condition: {}, action_on_match: '', enabled: true }
   ruleDlg.value = true
 }
 async function saveRule() {
   if (!canWrite.value) return
-  const f = { ...ruleForm.value }
-  try {
-    f.condition = f.condition_text ? JSON.parse(f.condition_text) : {}
-  } catch { ElMessage.error('条件 JSON 格式错误'); return }
-  delete f.condition_text
+  const f = { ...ruleForm.value, condition: structuredClone(ruleForm.value.condition || {}) }
   try {
     if (f.id) await api.updateRule(f.id, f)
     else await api.createRule(sid, f)
@@ -2419,7 +2148,7 @@ async function removeRule(id: string) {
 async function doEvalRule(row: any) {
   if (!canWrite.value) return
   try {
-    const record = await promptParams(row.condition, '输入待评估的数据记录（JSON）')
+    const record = await promptParams(ruleRecordTemplate(row.condition), '填写待评估的业务数据')
     const res = await api.evaluateRule(row.id!, record)
     showExecResult(res)
   } catch (e: any) {
@@ -2432,28 +2161,29 @@ function condSummary(c: any): string {
     return (c.conditions || []).map((x: any) => condSummary(x)).join(` ${c.op.toUpperCase()} `)
   }
   if (c.op === 'not') return `NOT(${condSummary(c.conditions?.[0])})`
-  return `${c.field || '?'} ${c.op || ''} ${JSON.stringify(c.value ?? '')}`
+  const value = Array.isArray(c.value)
+    ? c.value.join('、')
+    : c.value && typeof c.value === 'object'
+      ? '结构化值'
+      : c.value ?? ''
+  return `${c.field || '?'} ${c.op || ''} ${String(value)}`
 }
 
 // ── 事件（Events）──
 const eventDlg = ref(false)
-const eventForm = ref<any>({ payload_schema_text: '' })
+const eventForm = ref<any>({ payload_schema: emptyFunctionSchema() })
 const publishingEventId = ref<string | null>(null)
 function openEvent(id?: string) {
   if (!canWrite.value) return
   const e = id ? detail.value.events.find((x) => x.id === id) : null
   eventForm.value = e
-    ? { ...e, payload_schema_text: JSON.stringify(e.payload_schema || {}, null, 2) }
-    : { name: '', description: '', trigger_source: '', payload_schema_text: '', enabled: true }
+    ? { ...e, payload_schema: structuredClone(e.payload_schema || emptyFunctionSchema()) }
+    : { name: '', description: '', trigger_source: '', payload_schema: emptyFunctionSchema(), enabled: true }
   eventDlg.value = true
 }
 async function saveEvent() {
   if (!canWrite.value) return
-  const f = { ...eventForm.value }
-  try {
-    f.payload_schema = f.payload_schema_text ? JSON.parse(f.payload_schema_text) : {}
-  } catch { ElMessage.error('JSON 格式错误'); return }
-  delete f.payload_schema_text
+  const f = { ...eventForm.value, payload_schema: structuredClone(eventForm.value.payload_schema || emptyFunctionSchema()) }
   try {
     if (f.id) await api.updateEvent(f.id, f)
     else await api.createEvent(sid, f)
@@ -2516,7 +2246,7 @@ async function doExecuteWorkflow(row: any) {
   }
   row._executing = true
   try {
-    const params = await promptParams(null, '输入工作流参数（JSON，可为空 {}）')
+    const params = await promptParams(workflowParameterTemplate(row), '填写工作流参数')
     const run = await api.submitWorkflowRun(row.id!, params)
     ElMessage.success(run.status === 'awaiting_approval' ? '任务已提交，正在等待审批' : '工作流任务已提交到队列')
     openWorkflowRun(run)
@@ -2524,31 +2254,12 @@ async function doExecuteWorkflow(row: any) {
     if (e !== 'cancel') ElMessage.error(e?.response?.data?.detail || e?.message || '执行失败')
   } finally { row._executing = false }
 }
-async function publishEvent(event: { id?: string; name?: string; enabled?: boolean }) {
+async function publishEvent(event: { id?: string; name?: string; enabled?: boolean; payload_schema?: Record<string, any> }) {
   if (!canWrite.value || !event.id || event.enabled === false) return
   try {
-    const { value } = await ElMessageBox.prompt(
-      '输入事件载荷 JSON。发布后，订阅该事件的已启用工作流会异步进入任务队列。',
-      `发布事件：${event.name || '未命名事件'}`,
-      {
-        inputType: 'textarea',
-        inputValue: '{}',
-        inputPlaceholder: '{"record_id": "..."}',
-        inputValidator: (input: string) => {
-          try {
-            const parsed = JSON.parse(input || '{}')
-            return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? true : '事件载荷必须是 JSON 对象'
-          } catch {
-            return '请输入有效的 JSON 对象'
-          }
-        },
-        confirmButtonText: '发布事件',
-        cancelButtonText: '取消',
-        type: 'warning',
-      },
-    )
+    const payload = await promptParams(schemaValueTemplate(event.payload_schema || {}), `发布事件：${event.name || '未命名事件'}`)
     publishingEventId.value = event.id
-    const envelope = await api.publishEvent(event.id, { payload: JSON.parse(value || '{}') })
+    const envelope = await api.publishEvent(event.id, { payload })
     const count = envelope.queued_workflow_run_ids?.length || 0
     ElMessage.success(count ? `事件已发布，${count} 个工作流任务已进入队列` : '事件已发布；当前没有可触发的工作流')
   } catch (e: any) {
@@ -2558,6 +2269,33 @@ async function publishEvent(event: { id?: string; name?: string; enabled?: boole
   } finally {
     publishingEventId.value = null
   }
+}
+function workflowParameterTemplate(workflow: any) {
+  const names = new Set<string>()
+  const source = JSON.stringify({ nodes: workflow.nodes || [], steps: workflow.steps || [] })
+  for (const match of source.matchAll(/\{\{\s*params\.([a-zA-Z0-9_]+)[^}]*\}\}/g)) names.add(match[1])
+  return Object.fromEntries([...names].map((name) => [name, '']))
+}
+function schemaValueTemplate(schema: any) {
+  const root = actionSchemaRoot(schema)
+  return Object.fromEntries(Object.entries(root.properties).map(([name, field]: [string, any]) => {
+    if (field?.default !== undefined) return [name, field.default]
+    if (field?.type === 'boolean') return [name, false]
+    if (field?.type === 'number' || field?.type === 'integer') return [name, 0]
+    if (field?.type === 'array') return [name, []]
+    if (field?.type === 'object') return [name, {}]
+    return [name, '']
+  }))
+}
+function ruleRecordTemplate(condition: any): Record<string, any> {
+  const fields = new Set<string>()
+  const visit = (node: any) => {
+    if (!node || typeof node !== 'object') return
+    if (node.field) fields.add(String(node.field))
+    ;(node.conditions || []).forEach(visit)
+  }
+  visit(condition)
+  return Object.fromEntries([...fields].map((field) => [field, '']))
 }
 function openWorkflowRun(run: WorkflowRun) {
   router.push({
@@ -2606,25 +2344,39 @@ function stepLabel(s: any): string {
 
 // ── 执行结果 ──
 const execResultDlg = ref(false)
-const execResultText = ref('')
+const execResult = ref<Record<string, any>>({})
 function showExecResult(res: any) {
-  execResultText.value = JSON.stringify(res, null, 2)
+  execResult.value = res && typeof res === 'object' && !Array.isArray(res) ? res : { result: res }
   execResultDlg.value = true
 }
-async function promptParams(schema: any, title = '输入参数（JSON）'): Promise<Record<string, any>> {
-  const keys = schema ? Object.keys(schema) : []
-  const template = keys.length
-    ? JSON.stringify(Object.fromEntries(keys.map((k) => [k, ''])), null, 2)
-    : '{}'
-  const { value } = await ElMessageBox.prompt(title, '参数输入', {
-    inputValue: template,
-    inputPattern: /\S/,
-    confirmButtonText: '确定',
-    cancelButtonText: '取消',
+const recordInputDlg = ref(false)
+const recordInputTitle = ref('填写参数')
+const recordInputValue = ref<Record<string, any>>({})
+let recordInputResolve: ((value: Record<string, any>) => void) | null = null
+let recordInputReject: ((reason: string) => void) | null = null
+function promptParams(initialValue: Record<string, any> | null, title = '填写参数'): Promise<Record<string, any>> {
+  if (recordInputReject) recordInputReject('cancel')
+  recordInputTitle.value = title
+  recordInputValue.value = structuredClone(initialValue || {})
+  recordInputDlg.value = true
+  return new Promise((resolve, reject) => {
+    recordInputResolve = resolve
+    recordInputReject = reject
   })
-  const parsed = JSON.parse(value || '{}')
-  if (typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('参数必须是 JSON 对象')
-  return parsed
+}
+function confirmRecordInput() {
+  const resolve = recordInputResolve
+  recordInputResolve = null
+  recordInputReject = null
+  recordInputDlg.value = false
+  resolve?.(structuredClone(recordInputValue.value))
+}
+function cancelRecordInput() {
+  const reject = recordInputReject
+  recordInputResolve = null
+  recordInputReject = null
+  recordInputDlg.value = false
+  reject?.('cancel')
 }
 
 watch(canWrite, (allowed) => {
@@ -2646,9 +2398,6 @@ async function load() {
   scenarioLoadError.value = ''
   try {
     detail.value = await api.getScenario(sid)
-    if (!detail.value.actions.some((action) => action.id === controlledActionId.value && action.enabled !== false)) {
-      controlledActionId.value = detail.value.actions.find((action) => action.enabled !== false)?.id || ''
-    }
   } catch (e: any) {
     if (Number(e?.status || e?.response?.status) === 403) {
       scenarioAccessDenied.value = true
@@ -2660,15 +2409,22 @@ async function load() {
     scenarioLoading.value = false
   }
   try {
-    const [sources, configs] = await Promise.all([api.listDataSources(), api.listLLM()])
+    const [sources, configs, skillItems, mcpItems] = await Promise.all([
+      api.listDataSources(), api.listLLM(), api.listSkills(), api.listMCP(),
+    ])
     dataSources.value = sources
     llmConfigs.value = configs
+    skills.value = skillItems
+    mcpConfigs.value = mcpItems
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.detail || e?.message || '场景关联资源加载失败')
   }
-  await Promise.all([searchObjects(), loadExecutionLogs(true)])
+  await searchObjects()
 }
 function goBack() { router.push('/scenarios') }
+function goToDataSources() {
+  router.push({ name: 'data-sources', query: { scenario_id: sid, return_to: route.fullPath } })
+}
 function onAssistantApplied(event: Event) {
   const detail = (event as CustomEvent<{ scenario_id?: string }>).detail || {}
   if (!detail.scenario_id || detail.scenario_id === sid) load()
@@ -2704,7 +2460,7 @@ async function openGovernedActionById(actionId: string, assistantPreview?: Assis
   if (!actionId || !canWrite.value) return
   const action = detail.value.actions.find((item) => item.id === actionId)
   if (!action) {
-    ElMessage.warning('该 Action 不在当前可编辑场景中，可能已被移除或更换版本')
+    ElMessage.warning('该操作不在当前可编辑场景中，可能已被移除或更换版本')
     return
   }
   tab.value = 'actions'
@@ -2715,11 +2471,7 @@ async function openGovernedActionById(actionId: string, assistantPreview?: Assis
   for (const field of actionParameterFields.value) {
     if (!Object.prototype.hasOwnProperty.call(parameters, field.name)) continue
     const value = parameters[field.name]
-    if (field.schema?.type === 'array' || field.schema?.type === 'object') {
-      actionParamsText.value[field.name] = JSON.stringify(value)
-    } else {
-      actionParamsForm.value[field.name] = value
-    }
+    actionParamsForm.value[field.name] = structuredClone(value)
   }
   // Let the deep parameter watcher finish before restoring the immutable dry-run.
   await nextTick()
@@ -2825,170 +2577,6 @@ onBeforeUnmount(() => {
   box-shadow: var(--shadow-md), var(--shadow-primary);
   color: #fff;
 }
-
-/* ── 闭环工作台：单一纵向滚动面，不在卡片内制造更多滚动区 ── */
-.flow-workbench {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  min-width: 0;
-  padding: 2px 1px 22px;
-}
-.flow-hero,
-.flow-next,
-.flow-section {
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--surface) 92%, transparent);
-  box-shadow: var(--shadow-xs);
-}
-.flow-hero {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 28px;
-  padding: 20px 22px;
-  border-radius: 18px;
-  background:
-    linear-gradient(115deg, color-mix(in srgb, var(--primary-soft) 72%, var(--surface)), var(--surface) 62%),
-    var(--surface);
-}
-.flow-hero h2 { margin: 5px 0 6px; color: var(--text); font-size: 22px; letter-spacing: -.035em; text-wrap: balance; }
-.flow-hero p { max-width: 760px; margin: 0; color: var(--text-2); font-size: 12.5px; line-height: 1.65; }
-.flow-progress { flex: 0 0 220px; }
-.flow-progress > span { display: block; margin-bottom: 7px; color: var(--text-3); font-size: 11px; text-align: right; }
-.flow-progress b { color: var(--primary-600); font-size: 17px; }
-.flow-step-list {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.flow-step-list li { min-width: 0; }
-.flow-step-list button {
-  position: relative;
-  display: grid;
-  grid-template-columns: 32px minmax(0, 1fr);
-  grid-template-rows: auto auto;
-  gap: 8px 9px;
-  width: 100%;
-  min-height: 122px;
-  padding: 13px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  color: var(--text);
-  background: var(--surface);
-  box-shadow: var(--shadow-xs);
-  cursor: pointer;
-  font: inherit;
-  text-align: left;
-  transition: border-color var(--dur) var(--ease), transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
-}
-.flow-step-list button:hover { transform: translateY(-2px); border-color: var(--border-strong); box-shadow: var(--shadow-sm); }
-.flow-step-list button:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 34%, transparent); outline-offset: 2px; }
-.flow-step-list li.is-current button { border-color: color-mix(in srgb, var(--primary) 52%, var(--border)); background: linear-gradient(145deg, var(--primary-soft), var(--surface) 58%); }
-.flow-step-list li.is-complete button { border-color: color-mix(in srgb, var(--success) 30%, var(--border)); }
-.flow-step-index {
-  display: inline-flex;
-  width: 32px;
-  height: 32px;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--border-strong);
-  border-radius: 10px;
-  color: var(--text-2);
-  background: var(--surface-2);
-  font-size: 11px;
-  font-weight: 850;
-}
-.is-current .flow-step-index { border-color: var(--primary); color: #fff; background: var(--primary); }
-.is-complete .flow-step-index { border-color: var(--success); color: #fff; background: var(--success); }
-.flow-step-copy { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
-.flow-step-copy strong { font-size: 12px; line-height: 1.4; }
-.flow-step-copy small { color: var(--text-3); font-size: 10.5px; line-height: 1.5; }
-.flow-step-list .el-tag { grid-column: 2; justify-self: start; }
-.flow-step-arrow { position: absolute; right: 10px; bottom: 11px; color: var(--text-3); }
-.flow-next {
-  display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
-  border-radius: 15px;
-}
-.flow-next-mark { display: inline-flex; width: 44px; height: 44px; align-items: center; justify-content: center; border-radius: 13px; color: var(--primary-600); background: var(--primary-soft); font-size: 20px; }
-.flow-next > div:nth-child(2) { min-width: 0; }
-.flow-next span { color: var(--primary-600); font-size: 9px; font-weight: 850; letter-spacing: .12em; }
-.flow-next h3 { margin: 2px 0; color: var(--text); font-size: 14px; }
-.flow-next p { margin: 0; color: var(--text-3); font-size: 11px; line-height: 1.5; }
-.flow-main-grid { display: grid; grid-template-columns: minmax(0, 1.22fr) minmax(360px, .78fr); gap: 14px; align-items: start; }
-.flow-section { min-width: 0; padding: 17px; border-radius: 17px; }
-.flow-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
-.flow-section-head > div:first-child { display: flex; min-width: 0; align-items: flex-start; gap: 10px; }
-.section-number { flex: 0 0 auto; color: var(--primary-600); font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 850; letter-spacing: .08em; }
-.flow-section-head h3 { margin: 0 0 4px; color: var(--text); font-size: 15px; letter-spacing: -.02em; }
-.flow-section-head p { margin: 0; color: var(--text-3); font-size: 11px; line-height: 1.55; }
-.object-question-box { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
-.query-suggestions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
-.query-suggestions > span { color: var(--text-3); font-size: 10px; }
-.query-suggestions button { min-height: 30px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 7px; color: var(--text-2); background: var(--surface-2); cursor: pointer; font: inherit; font-size: 10.5px; }
-.query-suggestions button:hover, .query-suggestions button:focus-visible { border-color: var(--primary); color: var(--primary-600); outline: none; }
-.query-answer { margin-top: 13px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border)); border-radius: 11px; background: var(--primary-soft); }
-.query-answer-head { display: flex; align-items: center; gap: 6px; color: var(--primary-600); font-size: 11px; }
-.query-answer p { margin: 6px 0 3px; color: var(--text-2); font-size: 12px; line-height: 1.65; }
-.query-answer small { color: var(--text-3); font-size: 10px; }
-.evidence-list { display: grid; gap: 8px; margin-top: 10px; }
-.evidence-card { padding: 11px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-2); }
-.evidence-card header { display: flex; align-items: center; gap: 8px; }
-.evidence-id { flex: 0 0 auto; color: var(--primary-600); font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 800; }
-.evidence-card header > div { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
-.evidence-card header strong { overflow: hidden; color: var(--text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.evidence-card header small { color: var(--text-3); font-size: 10px; }
-.evidence-card dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 9px 0 0; }
-.evidence-card dl > div { min-width: 0; padding: 7px; border-radius: 7px; background: var(--surface); }
-.evidence-card dt { color: var(--text-3); font-size: 9px; }
-.evidence-card dd { margin: 3px 0 0; overflow-wrap: anywhere; color: var(--text-2); font-size: 10.5px; line-height: 1.45; }
-.evidence-attributes { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
-.evidence-attributes span { display: inline-flex; gap: 5px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-2); background: var(--surface); font-size: 10px; }
-.evidence-attributes b { color: var(--text-3); font-weight: 600; }
-.controlled-action-box { margin-top: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-2); }
-.controlled-action-box > label { display: block; margin-bottom: 6px; color: var(--text-2); font-size: 11px; font-weight: 750; }
-.controlled-action-meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: 8px; }
-.controlled-action-meta span { display: flex; min-width: 0; flex-direction: column; gap: 2px; padding: 7px; border-radius: 7px; color: var(--text-2); background: var(--surface); font-size: 10px; }
-.controlled-action-meta b { color: var(--text-3); font-size: 9px; }
-.controlled-action-buttons { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
-.execution-empty { padding: 18px; text-align: center; }
-.execution-empty p { color: var(--text-3); font-size: 11px; line-height: 1.6; }
-.approval-workflows { margin-top: 15px; }
-.subsection-title { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; color: var(--text-2); font-size: 11px; font-weight: 800; }
-.subsection-title b { color: var(--primary-600); }
-.approval-workflow-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 7px; padding: 8px 0; border-top: 1px solid var(--border); }
-.approval-workflow-row > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.approval-workflow-row strong { overflow: hidden; color: var(--text-2); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.approval-workflow-row small { color: var(--text-3); font-size: 9.5px; }
-.audit-list { display: grid; gap: 8px; }
-.audit-entry { overflow: hidden; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-2); }
-.audit-entry summary { display: grid; grid-template-columns: 9px minmax(0, 1fr) auto auto 16px; align-items: center; gap: 9px; min-height: 56px; padding: 8px 11px; cursor: pointer; list-style: none; }
-.audit-entry summary::-webkit-details-marker { display: none; }
-.audit-entry summary:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 34%, transparent); outline-offset: -3px; }
-.audit-status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warning); }
-.audit-status-dot.is-success { background: var(--success); }
-.audit-status-dot.is-danger { background: var(--danger); }
-.audit-summary-copy { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.audit-summary-copy strong { overflow: hidden; color: var(--text); font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
-.audit-summary-copy small, .audit-duration { color: var(--text-3); font-size: 9.5px; }
-.audit-chevron { color: var(--text-3); transition: transform var(--dur) var(--ease); }
-.audit-entry[open] .audit-chevron { transform: rotate(180deg); }
-.audit-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; padding: 11px; border-top: 1px solid var(--border); }
-.audit-detail-grid > div { min-width: 0; padding: 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
-.audit-detail-grid span { display: block; color: var(--text-3); font-size: 9px; }
-.audit-detail-grid b { display: block; margin-top: 3px; overflow-wrap: anywhere; color: var(--text-2); font-size: 10px; }
-.audit-connectors { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 0 11px 10px; color: var(--text-3); font-size: 10px; }
-.audit-payload-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 0 11px 11px; }
-.audit-payload-grid section { min-width: 0; }
-.audit-payload-grid h4 { margin: 0 0 5px; color: var(--text-3); font-size: 9px; }
-.audit-payload-grid pre { margin: 0; padding: 9px; overflow-x: auto; border-radius: 7px; color: #dce7e9; background: #1d2930; font: 10px/1.55 'Cascadia Code', Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ── Tabs ── */
 .sd-tabs {
@@ -3552,6 +3140,19 @@ onBeforeUnmount(() => {
   font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
   font-size: 12px;
 }
+.relation-instance-cards { display: none; }
+.relation-instance-card {
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.relation-instance-card div { display: grid; gap: 3px; min-width: 0; }
+.relation-instance-card b { color: var(--text-1); font-size: 12px; }
+.relation-instance-card span { color: var(--text-3); font-size: 11px; overflow-wrap: anywhere; }
 .form-help,
 .action-param-hint {
   margin-top: 4px;
@@ -3701,6 +3302,10 @@ onBeforeUnmount(() => {
   .tab-toolbar { flex-direction: column; align-items: stretch; }
   .tab-actions { justify-content: flex-end; }
   .inst-filter { width: 100%; }
+  .relation-instance-form-row { flex-direction: column; gap: 0; }
+  .relation-instance-table { display: none; }
+  .relation-instance-cards { display: grid; gap: 8px; }
+  .relation-instance-card { display: flex; }
 }
 
 /* ── 科技白场景工作区：轻玻璃、蓝青高光、明确的操作层级 ── */
@@ -3804,7 +3409,7 @@ onBeforeUnmount(() => {
   .mapping-preview-grid { grid-template-columns: 1fr; }
 }
 
-/* ── 页面滚动归外层 main-area；闭环卡片不再各自抢占滚轮 ── */
+/* ── 页面滚动归外层 main-area，场景卡片不再各自抢占滚轮 ── */
 .sd-page {
   height: auto;
   min-height: 100%;
@@ -3864,26 +3469,9 @@ onBeforeUnmount(() => {
   .wf-editor-stage { min-height: 520px; height: 68vh; }
 }
 
-@media (max-width: 1180px) {
-  .flow-step-list { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .flow-main-grid { grid-template-columns: 1fr; }
-}
 @media (max-width: 760px) {
-  .sd-header :deep(.el-button),
-  .flow-workbench :deep(.el-button),
-  .query-suggestions button { min-height: 44px; }
+  .sd-header :deep(.el-button) { min-height: 44px; }
   .sd-tabs :deep(.el-tabs__item) { height: 44px; }
-  .flow-hero { align-items: stretch; flex-direction: column; gap: 14px; }
-  .flow-progress { flex-basis: auto; }
-  .flow-progress > span { text-align: left; }
-  .flow-step-list { grid-template-columns: 1fr; }
-  .flow-step-list button { min-height: 92px; }
-  .flow-next { grid-template-columns: 40px minmax(0, 1fr); }
-  .flow-next > .el-button { grid-column: 1 / -1; width: 100%; }
-  .object-question-box { grid-template-columns: 1fr; }
-  .evidence-card dl, .controlled-action-meta, .audit-detail-grid, .audit-payload-grid { grid-template-columns: 1fr; }
-  .audit-entry summary { grid-template-columns: 9px minmax(0, 1fr) auto 16px; }
-  .audit-duration { display: none; }
   .colmap-row { align-items: stretch; flex-direction: column; }
   .colmap-attr { width: auto; }
   .transform-rule-list { margin-left: 0; }

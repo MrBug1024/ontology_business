@@ -137,7 +137,7 @@ async function submit() {
   try {
     if (mode.value === 'login') {
       await auth.login(email.value, password.value)
-      await router.replace(String(route.query.redirect || '/dashboard'))
+      await router.replace(String(route.query.redirect || '/scenarios'))
     } else if (mode.value === 'register') {
       await api.register({ email: email.value, password: password.value, password_confirm: passwordConfirm.value, display_name: displayName.value })
       mode.value = 'verify'

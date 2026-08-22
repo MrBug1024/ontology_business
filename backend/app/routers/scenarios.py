@@ -174,16 +174,16 @@ def _validate_action_executor(db: Session, scenario_id: str, payload: ActionIn) 
         try:
             workflow_service.validate_skill_action_config(db, config)
         except PolicyViolation as exc:
-            raise HTTPException(400, f"Skill Action 配置无效: {exc}") from exc
+            raise HTTPException(400, f"本地技能操作配置无效: {exc}") from exc
     if payload.executor_type == "mcp" and config.get("mcp_id"):
         tenant_service.require_visible(db, MCPConfig, config["mcp_id"], "操作引用的 MCP 服务不存在")
     if payload.executor_type == "http":
         try:
             workflow_service.validate_http_action_config(config)
         except PolicyViolation as exc:
-            raise HTTPException(400, f"HTTP Action 配置无效: {exc}") from exc
+            raise HTTPException(400, f"外部接口操作配置无效: {exc}") from exc
     if payload.executor_type == "script" and not get_settings().allow_unsafe_workflow_nodes:
-        raise HTTPException(400, "脚本 Action 默认停用；请改用受治理的 Action 或工作流节点")
+        raise HTTPException(400, "脚本操作默认停用；请改用受治理的操作或工作流节点")
 
 
 def _validate_trigger_actions(db: Session, scenario_id: str, action_ids: list[str] | None) -> None:
@@ -195,18 +195,15 @@ def _validate_trigger_actions(db: Session, scenario_id: str, action_ids: list[st
 
 def _validate_workflow_refs(db: Session, scenario_id: str, steps: list, nodes: list) -> None:
     """校验工作流引用的 Action/Rule/Event，防止跨场景拼接执行图。"""
-    refs = [(s.get("type"), s) for s in (steps or [])] + [(n.get("type"), n.get("data") or n) for n in (nodes or [])]
-    for kind, data in refs:
-        model, key = {
-            "action": (OntologyAction, "action_id"),
-            "rule": (OntologyRule, "rule_id"),
-            "event": (OntologyEvent, "event_id"),
-        }.get(kind, (None, ""))
-        if not model or not data.get(key):
-            continue
-        item = db.get(model, data[key])
-        if not item or item.scenario_id != scenario_id:
-            raise HTTPException(400, f"工作流引用的 {kind} 不属于当前业务场景")
+    try:
+        workflow_service.validate_workflow_references(
+            db,
+            scenario_id,
+            steps=steps,
+            nodes=nodes,
+        )
+    except PolicyViolation as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _validate_workflow_trigger(
@@ -1673,7 +1670,7 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
         payload.expected_definition_hash,
     )
     if any(value is not None for value in pin_values) and not payload.preview_log_id:
-        raise HTTPException(409, "确认信息缺少 preview_log_id，请重新预演")
+        raise HTTPException(409, "确认信息不完整，请重新预演")
     preview_log: ActionExecutionLog | None = None
     if payload.preview_log_id:
         if payload.dry_run or not payload.confirm:
@@ -1693,7 +1690,7 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
             or preview_log.actor_user_id != current_user_id
             or (preview_log.input_params or {}) != normalized
         ):
-            raise HTTPException(409, "Action 预演与当前用户、目标或参数不一致，请重新预演")
+            raise HTTPException(409, "操作预演与当前用户、目标或参数不一致，请重新预演")
         required_pin = {
             "correlation_id": payload.correlation_id,
             "expected_environment": payload.expected_environment,
@@ -1712,7 +1709,7 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
             or definition.release_id != preview_log.release_id
             or definition.definition_hash != preview_log.definition_hash
         ):
-            raise HTTPException(409, "Action 定义在预演后已变化，请重新预演")
+            raise HTTPException(409, "操作定义在预演后已变化，请重新预演")
     permission_service.require_action_permission(
         db,
         a,

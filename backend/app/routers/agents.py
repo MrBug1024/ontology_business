@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..database import SessionLocal
@@ -16,16 +16,16 @@ from ..models import (
     BucketFile,
     BusinessScenario,
     Conversation,
+    DataMapping,
     DataSource,
     DocumentChunk,
+    FunctionDefinition,
     LLMConfig,
-    MCPConfig,
     Message,
     OntologyAction,
     OntologyEntity,
     OntologyRule,
     OntologyWorkflow,
-    Skill,
 )
 from ..schemas import (
     AgentIn,
@@ -115,8 +115,6 @@ def _agent_requires_tool_capability(
     *,
     scenario_id: str | None,
     data_source_ids: list[str] | None,
-    skill_ids: list[str] | None,
-    mcp_ids: list[str] | None,
 ) -> bool:
     """Mirror AgentContext.build_tools before selecting a compatible LLM."""
     # Direct Skill/MCP side-effect tools are intentionally not part of the
@@ -125,12 +123,51 @@ def _agent_requires_tool_capability(
         return True
     if not scenario_id:
         return False
-    for model in (OntologyEntity, OntologyAction, OntologyRule, OntologyWorkflow):
+    for model in (OntologyEntity, FunctionDefinition, OntologyAction, OntologyRule, OntologyWorkflow):
         if db.execute(
             select(model.id).where(model.scenario_id == scenario_id).limit(1)
         ).scalar_one_or_none():
             return True
     return False
+
+
+def _agent_readiness_missing(db: Session, agent: Agent) -> list[str]:
+    """Return business-facing prerequisites that still block Agent chat.
+
+    CRUD deliberately accepts incomplete Agents as drafts.  The chat endpoint
+    enforces the same minimum chain as the UI so it cannot be bypassed by a
+    direct API call.
+    """
+    missing: list[str] = []
+    if not agent.scenario_id:
+        return ["业务场景", "对象类型", "数据源", "数据映射", "对话模型", "映射数据绑定"]
+
+    if not db.execute(
+        select(OntologyEntity.id).where(OntologyEntity.scenario_id == agent.scenario_id).limit(1)
+    ).scalar_one_or_none():
+        missing.append("对象类型")
+
+    has_source = db.execute(
+        select(DataSource.id)
+        .where(
+            tenant_service.visible_clause(DataSource, db),
+            or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == agent.scenario_id),
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+    if not has_source:
+        missing.append("数据源")
+
+    mapped_source_ids = set(db.scalars(
+        select(DataMapping.data_source_id).where(DataMapping.scenario_id == agent.scenario_id)
+    ).all())
+    if not mapped_source_ids:
+        missing.append("数据映射")
+    if not agent.llm_config_id:
+        missing.append("对话模型")
+    if not mapped_source_ids.intersection(agent.data_source_ids or []):
+        missing.append("映射数据绑定")
+    return missing
 
 
 def _can_read_historic_citation(db: Session, agent: Agent, citation: object) -> bool:
@@ -211,8 +248,6 @@ def _message_out(db: Session, message: Message, agent: Agent) -> MessageOut:
 def _out(a: Agent, db: Session) -> AgentOut:
     scenario = tenant_service.get_visible(db, BusinessScenario, a.scenario_id) if a.scenario_id else None
     llm = tenant_service.get_visible(db, LLMConfig, a.llm_config_id) if a.llm_config_id else None
-    skills = db.execute(select(Skill).where(Skill.id.in_(a.skill_ids or []), tenant_service.visible_clause(Skill, db))).scalars().all()
-    mcps = db.execute(select(MCPConfig).where(MCPConfig.id.in_(a.mcp_ids or []), tenant_service.visible_clause(MCPConfig, db))).scalars().all()
     dss = db.execute(
         select(DataSource).where(
             DataSource.id.in_(a.data_source_ids or []),
@@ -227,8 +262,6 @@ def _out(a: Agent, db: Session) -> AgentOut:
         scenario_id=a.scenario_id,
         llm_config_id=a.llm_config_id,
         system_prompt=a.system_prompt,
-        skill_ids=a.skill_ids or [],
-        mcp_ids=a.mcp_ids or [],
         data_source_ids=[source.id for source in dss],
         temperature=a.temperature,
         max_tokens=a.max_tokens,
@@ -236,8 +269,6 @@ def _out(a: Agent, db: Session) -> AgentOut:
         updated_at=a.updated_at,
         scenario_name=scenario.name if scenario else "",
         llm_name=llm.name if llm else "",
-        skill_names=[s.name for s in skills],
-        mcp_names=[m.name for m in mcps],
         data_source_names=[d.name for d in dss],
     )
 
@@ -260,21 +291,9 @@ def _validate_bindings(payload: AgentIn, db: Session) -> None:
             db,
             scenario_id=scenario_id,
             data_source_ids=payload.data_source_ids,
-            skill_ids=payload.skill_ids,
-            mcp_ids=payload.mcp_ids,
         ) and not llm_service.supports_capability(llm, "tool"):
             raise HTTPException(400, "该 Agent 需要工具调用，请绑定启用工具能力的 LLM 配置")
 
-    skills = set(payload.skill_ids or [])
-    if skills:
-        found = set(db.scalars(select(Skill.id).where(Skill.id.in_(skills), tenant_service.visible_clause(Skill, db))).all())
-        if found != skills:
-            raise HTTPException(400, "绑定的技能中存在不存在或已删除的资源")
-    mcps = set(payload.mcp_ids or [])
-    if mcps:
-        found = set(db.scalars(select(MCPConfig.id).where(MCPConfig.id.in_(mcps), tenant_service.visible_clause(MCPConfig, db))).all())
-        if found != mcps:
-            raise HTTPException(400, "绑定的 MCP 服务中存在不存在的资源")
     ds_ids = set(payload.data_source_ids or [])
     if ds_ids:
         sources = db.scalars(select(DataSource).where(DataSource.id.in_(ds_ids), tenant_service.visible_clause(DataSource, db))).all()
@@ -405,12 +424,16 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
         conv = _conversation(db, payload.conversation_id)
         if conv.agent_id != agent_id:
             raise HTTPException(400, "对话不属于当前 Agent")
+    missing = _agent_readiness_missing(db, a)
+    if missing:
+        raise HTTPException(
+            409,
+            "Agent 尚未就绪，请先完成：" + "、".join(missing),
+        )
     requires_tools = _agent_requires_tool_capability(
         db,
         scenario_id=a.scenario_id,
         data_source_ids=a.data_source_ids,
-        skill_ids=a.skill_ids,
-        mcp_ids=a.mcp_ids,
     )
     if a.llm_config_id:
         llm = tenant_service.get_visible(db, LLMConfig, a.llm_config_id)
