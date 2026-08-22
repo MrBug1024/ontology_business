@@ -12,6 +12,7 @@ const router = createRouter({
     { path: '/lineage', name: 'lineage', component: () => import('@/views/Lineage.vue'), meta: { title: '端到端血缘' } },
     { path: '/releases', name: 'releases', component: () => import('@/views/Releases.vue'), meta: { title: '发布治理' } },
     { path: '/connectors', name: 'connectors', component: () => import('@/views/Connectors.vue'), meta: { title: '连接器与环境' } },
+    { path: '/advanced-assets', name: 'advanced-assets', component: () => import('@/views/AdvancedAssets.vue'), meta: { title: '高级数据与模型' } },
     { path: '/scenarios', name: 'scenarios', component: () => import('@/views/Scenarios.vue'), meta: { title: '业务场景' } },
     { path: '/scenarios/:id', name: 'scenario-detail', component: () => import('@/views/ScenarioDetail.vue'), meta: { title: '场景详情' } },
     { path: '/data-sources', name: 'data-sources', component: () => import('@/views/DataSources.vue'), meta: { title: '数据源' } },

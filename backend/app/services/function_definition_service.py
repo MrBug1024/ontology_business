@@ -1,8 +1,9 @@
 """Validation for governed, declarative function definitions.
 
-Functions in this P2 slice are *contracts*, not executable handlers.  Keeping
-the normalizer here lets CRUD, release snapshots, and portable packages enforce
-the same typed-schema boundary without adding a code/runtime escape hatch.
+Functions are typed contracts plus an optional closed-list built-in runtime.
+Keeping the normalizer here lets CRUD, release snapshots, portable packages and
+the execution endpoint enforce the same boundary without adding a code/runtime
+escape hatch.
 """
 from __future__ import annotations
 
@@ -65,6 +66,7 @@ _MAX_SCHEMA_BYTES = 16_000
 _MAX_SCHEMA_DEPTH = 12
 _MAX_PROPERTIES = 100
 _MAX_TAGS = 20
+RUNTIME_KINDS = {"contract", "weighted_score", "threshold", "geo_distance", "timeseries_aggregate"}
 
 
 def _text(value: Any, label: str, *, maximum: int, allow_empty: bool = True) -> str:
@@ -184,10 +186,13 @@ def normalize_schema(value: Any, *, label: str) -> dict[str, Any]:
 
 
 def normalize_definition(value: Mapping[str, Any] | Any) -> dict[str, Any]:
-    """Return the sole safe persisted shape of a function declaration."""
+    """Return the sole safe persisted shape of a function declaration/runtime."""
     if not isinstance(value, Mapping):
         raise FunctionDefinitionError("函数定义必须是对象")
-    allowed = {"name", "description", "input_schema", "output_schema", "tags", "visibility"}
+    allowed = {
+        "name", "description", "input_schema", "output_schema", "tags", "visibility",
+        "runtime_kind", "runtime_config",
+    }
     extra = sorted(str(key) for key in value if str(key) not in allowed)
     if extra:
         raise FunctionDefinitionError(f"函数定义不支持字段: {', '.join(extra)}")
@@ -204,6 +209,45 @@ def normalize_definition(value: Mapping[str, Any] | Any) -> dict[str, Any]:
     visibility = _text(value.get("visibility", "scenario"), "函数可见性", maximum=20, allow_empty=False)
     if visibility not in VISIBILITIES:
         raise FunctionDefinitionError("函数可见性必须为 scenario 或 tenant")
+    runtime_kind = _text(
+        value.get("runtime_kind", "contract"), "函数运行类型", maximum=40, allow_empty=False
+    )
+    if runtime_kind not in RUNTIME_KINDS:
+        raise FunctionDefinitionError("函数运行类型不受支持")
+    runtime_config = _plain_json(value.get("runtime_config", {}), label="函数运行配置")
+    if not isinstance(runtime_config, dict):
+        raise FunctionDefinitionError("函数运行配置必须是对象")
+    if runtime_kind == "contract" and runtime_config:
+        raise FunctionDefinitionError("contract 函数不能包含运行配置")
+    if runtime_kind == "weighted_score":
+        weights = runtime_config.get("weights")
+        if not isinstance(weights, dict) or not weights or any(
+            not isinstance(key, str) or not key.strip() or isinstance(value, bool)
+            or not isinstance(value, (int, float)) for key, value in weights.items()
+        ):
+            raise FunctionDefinitionError("weighted_score 需要非空数字 weights")
+        bias = runtime_config.get("bias", 0)
+        if isinstance(bias, bool) or not isinstance(bias, (int, float)):
+            raise FunctionDefinitionError("weighted_score.bias 必须是数字")
+    elif runtime_kind == "threshold":
+        if not isinstance(runtime_config.get("field"), str) or not runtime_config["field"].strip():
+            raise FunctionDefinitionError("threshold.field 必须是非空字符串")
+        if isinstance(runtime_config.get("threshold"), bool) or not isinstance(
+            runtime_config.get("threshold"), (int, float)
+        ):
+            raise FunctionDefinitionError("threshold.threshold 必须是数字")
+        if runtime_config.get("operator", ">=") not in {">", ">=", "<", "<=", "==", "!="}:
+            raise FunctionDefinitionError("threshold.operator 不受支持")
+    elif runtime_kind == "geo_distance":
+        if runtime_config.get("unit", "km") not in {"km", "m"}:
+            raise FunctionDefinitionError("geo_distance.unit 只能是 km 或 m")
+    elif runtime_kind == "timeseries_aggregate":
+        if runtime_config.get("aggregation", "avg") not in {"sum", "avg", "min", "max", "count"}:
+            raise FunctionDefinitionError("timeseries_aggregate.aggregation 不受支持")
+        if runtime_config.get("value_field", "value") and not isinstance(
+            runtime_config.get("value_field", "value"), str
+        ):
+            raise FunctionDefinitionError("timeseries_aggregate.value_field 必须是字符串")
     return {
         "name": _text(value.get("name"), "函数名称", maximum=200, allow_empty=False),
         "description": _text(value.get("description", ""), "函数说明", maximum=8_000),
@@ -211,4 +255,6 @@ def normalize_definition(value: Mapping[str, Any] | Any) -> dict[str, Any]:
         "output_schema": normalize_schema(value.get("output_schema"), label="输出 Schema"),
         "tags": tags,
         "visibility": visibility,
+        "runtime_kind": runtime_kind,
+        "runtime_config": runtime_config,
     }

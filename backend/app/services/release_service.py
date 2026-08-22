@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     ActionExecutionLog,
+    OntologyAdvancedAsset,
     BusinessScenario,
     DataMapping,
     DataSource,
@@ -42,7 +43,7 @@ from ..models import (
     RelationInstance,
     WorkflowRun,
 )
-from . import connector_service, function_definition_service, permission_service
+from . import advanced_runtime_service, connector_service, function_definition_service, permission_service
 from .policies import validate_workflow_graph
 
 
@@ -375,7 +376,7 @@ def _normalize_mapping(raw: Any) -> dict:
 
 
 def _normalize_function(raw: Any) -> dict:
-    """Normalize a pure function contract; execution fields are never accepted."""
+    """Normalize a typed function plus its safe built-in runtime descriptor."""
     if not isinstance(raw, dict):
         raise ReleaseValidationError("函数定义必须是对象")
     try:
@@ -388,6 +389,19 @@ def _normalize_function(raw: Any) -> dict:
         "id": _required_id(raw.get("id"), "函数定义 id"),
         **declaration,
     }
+
+
+def _normalize_advanced_asset(raw: Any) -> dict:
+    """Normalize a portable P2 asset descriptor without runtime records."""
+    if not isinstance(raw, dict):
+        raise ReleaseValidationError("高级资产必须是对象")
+    try:
+        normalized = advanced_runtime_service.normalize_asset(
+            {key: value for key, value in raw.items() if key != "id"}
+        )
+    except advanced_runtime_service.AdvancedRuntimeError as exc:
+        raise ReleaseValidationError(f"高级资产定义无效：{exc}") from exc
+    return {"id": _required_id(raw.get("id"), "高级资产 id"), **normalized}
 
 
 def _normalize_action(raw: Any) -> dict:
@@ -574,6 +588,11 @@ def normalize_snapshot_content(content: Any) -> dict:
         _normalize_function(item)
         for item in _list(content.get("functions") if functions_present else [], "函数定义列表")
     ]
+    advanced_assets_present = "advanced_assets" in content
+    advanced_assets = [
+        _normalize_advanced_asset(item)
+        for item in _list(content.get("advanced_assets") if advanced_assets_present else [], "高级资产列表")
+    ]
     actions = [_normalize_action(item) for item in _list(content.get("actions"), "Action 列表")]
     rules = [_normalize_rule(item) for item in _list(content.get("rules"), "规则列表")]
     events = [_normalize_event(item) for item in _list(content.get("events"), "事件列表")]
@@ -617,6 +636,7 @@ def normalize_snapshot_content(content: Any) -> dict:
     for label, items in {
         "数据映射": mappings,
         "函数": functions,
+        "高级资产": advanced_assets,
         "关系": relations,
         "Action": actions,
         "规则": rules,
@@ -672,6 +692,8 @@ def normalize_snapshot_content(content: Any) -> dict:
         normalized["mappings"] = mappings
     if functions_present:
         normalized["functions"] = functions
+    if advanced_assets_present:
+        normalized["advanced_assets"] = advanced_assets
     if connector_bindings_present:
         normalized["connector_bindings"] = connector_bindings
     return normalized
@@ -788,11 +810,29 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
                 "output_schema": copy.deepcopy(function.output_schema or {}),
                 "tags": copy.deepcopy(function.tags or []),
                 "visibility": function.visibility or "scenario",
+                "runtime_kind": function.runtime_kind or "contract",
+                "runtime_config": copy.deepcopy(function.runtime_config or {}),
             }
             for function in db.execute(
                 select(FunctionDefinition)
                 .where(FunctionDefinition.scenario_id == scenario.id)
                 .order_by(FunctionDefinition.id.asc())
+            ).scalars().all()
+        ],
+        "advanced_assets": [
+            {
+                "id": asset.id,
+                "name": asset.name,
+                "kind": asset.kind,
+                "description": asset.description or "",
+                "schema": copy.deepcopy(asset.schema or {}),
+                "config": copy.deepcopy(asset.config or {}),
+                "status": asset.status or "draft",
+            }
+            for asset in db.execute(
+                select(OntologyAdvancedAsset)
+                .where(OntologyAdvancedAsset.scenario_id == scenario.id)
+                .order_by(OntologyAdvancedAsset.id.asc())
             ).scalars().all()
         ],
         "actions": [
@@ -1340,6 +1380,7 @@ _ACTIVE_RELEASE_RESOURCE_COLLECTIONS: dict[str, tuple[str, str]] = {
     "relation": ("relations", "关系"),
     "mapping": ("mappings", "数据映射"),
     "function": ("functions", "函数定义"),
+    "advanced_asset": ("advanced_assets", "高级资产"),
     "action": ("actions", "Action"),
     "rule": ("rules", "规则"),
     "event": ("events", "事件"),
@@ -1412,7 +1453,7 @@ def assert_resource_deletion_allowed(
             # Historic snapshots that predate governed mappings cannot prove
             # that a live mapping is absent.  A non-dev deployment with such
             # evidence must not lose a potential runtime anchor by CRUD.
-            if normalized_kind in {"mapping", "function"} and collection not in (snapshot.content or {}):
+            if normalized_kind in {"mapping", "function", "advanced_asset"} and collection not in (snapshot.content or {}):
                 raise ReleaseConflictError(f"活动环境发布快照缺少{label}，拒绝删除")
             snapshot_content = normalize_snapshot_content(snapshot.content or {})
         except ReleaseConflictError:
@@ -1448,6 +1489,17 @@ def _guard_safe_removals(
             ).scalars().all()
         }
     )
+    advanced_assets_present = "advanced_assets" in content
+    desired_advanced_assets = (
+        {item["id"] for item in content["advanced_assets"]}
+        if advanced_assets_present
+        else {
+            item.id
+            for item in db.execute(
+                select(OntologyAdvancedAsset).where(OntologyAdvancedAsset.scenario_id == scenario.id)
+            ).scalars().all()
+        }
+    )
     desired_actions = {item["id"] for item in content["actions"]}
     desired_events = {item["id"] for item in content["events"]}
     desired_workflows = {item["id"] for item in content["workflows"]}
@@ -1461,6 +1513,7 @@ def _guard_safe_removals(
         "entity": set(),
         "relation": set(),
         "function": set(),
+        "advanced_asset": set(),
         "action": set(),
         "rule": set(),
         "event": set(),
@@ -1485,6 +1538,7 @@ def _guard_safe_removals(
             ("entity", "entities"),
             ("relation", "relations"),
             ("function", "functions"),
+            ("advanced_asset", "advanced_assets"),
             ("action", "actions"),
             ("rule", "rules"),
             ("event", "events"),
@@ -1499,6 +1553,7 @@ def _guard_safe_removals(
         "实体": released_ids["entity"] - desired_entities,
         "关系": released_ids["relation"] - desired_relations,
         "函数": released_ids["function"] - desired_functions,
+        "高级资产": released_ids["advanced_asset"] - desired_advanced_assets,
         "Action": released_ids["action"] - desired_actions,
         "规则": released_ids["rule"] - {item["id"] for item in content["rules"]},
         "事件": released_ids["event"] - desired_events,
@@ -1712,8 +1767,36 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
         if not function:
             function = FunctionDefinition(id=function_data["id"], scenario_id=scenario.id)
             db.add(function)
-        for key in ("name", "description", "input_schema", "output_schema", "tags", "visibility"):
+        for key in (
+            "name", "description", "input_schema", "output_schema", "tags", "visibility",
+            "runtime_kind", "runtime_config",
+        ):
             setattr(function, key, copy.deepcopy(function_data[key]))
+
+    for asset_data in content.get("advanced_assets", []):
+        asset = _assert_id_scope(
+            db,
+            OntologyAdvancedAsset,
+            asset_data["id"],
+            scenario.id,
+            "高级资产",
+        )
+        if not asset:
+            asset = OntologyAdvancedAsset(
+                id=asset_data["id"],
+                tenant_id=scenario.tenant_id,
+                scenario_id=scenario.id,
+                created_by_user_id=db.info.get("user_id"),
+            )
+            db.add(asset)
+        changed = any(
+            getattr(asset, key) != asset_data[key]
+            for key in ("name", "kind", "description", "schema", "config", "status")
+        )
+        for key in ("name", "kind", "description", "schema", "config", "status"):
+            setattr(asset, key, copy.deepcopy(asset_data[key]))
+        if changed:
+            asset.version = int(asset.version or 1) + 1
 
     for action_data in content["actions"]:
         action = _assert_id_scope(db, OntologyAction, action_data["id"], scenario.id, "Action")

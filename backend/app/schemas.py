@@ -66,7 +66,7 @@ class OrganizationOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    model_config = {"from_attributes": True}
+    model_config = {"from_attributes": True, "populate_by_name": True}
 
 
 class OrganizationRoleOut(BaseModel):
@@ -643,7 +643,12 @@ def _empty_function_schema() -> dict:
 
 
 class FunctionDefinitionIn(BaseModel):
-    """A declaration only; executable implementation fields are forbidden."""
+    """A typed contract with an optional closed-list built-in runtime.
+
+    ``runtime_kind`` never accepts code, URLs or connector settings.  Runtime
+    execution is limited to the server-side deterministic operators exposed by
+    the P2 advanced runtime.
+    """
 
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=8_000)
@@ -651,6 +656,10 @@ class FunctionDefinitionIn(BaseModel):
     output_schema: dict = Field(default_factory=_empty_function_schema)
     tags: list[str] = Field(default_factory=list, max_length=20)
     visibility: Literal["scenario", "tenant"] = "scenario"
+    runtime_kind: Literal[
+        "contract", "weighted_score", "threshold", "geo_distance", "timeseries_aggregate"
+    ] = "contract"
+    runtime_config: dict = Field(default_factory=dict)
 
     model_config = {"extra": "forbid"}
 
@@ -662,6 +671,119 @@ class FunctionDefinitionOut(FunctionDefinitionIn):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+ADVANCED_ASSET_KINDS = Literal[
+    "geospatial", "timeseries", "media", "realtime", "ml_model", "simulation", "optimization"
+]
+
+
+class AdvancedAssetCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    kind: ADVANCED_ASSET_KINDS
+    description: str = Field(default="", max_length=8_000)
+    asset_schema: dict = Field(default_factory=dict, alias="schema")
+    config: dict = Field(default_factory=dict)
+    status: Literal["draft", "ready", "disabled"] = "draft"
+
+    model_config = {"populate_by_name": True}
+
+
+class AdvancedAssetUpdateIn(AdvancedAssetCreateIn):
+    pass
+
+
+class AdvancedAssetOut(AdvancedAssetCreateIn):
+    id: str
+    tenant_id: str
+    scenario_id: str
+    version: int = 1
+    created_by_user_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True, "populate_by_name": True}
+
+
+class AdvancedRecordIn(BaseModel):
+    event_time: datetime | None = None
+    event_type: str = Field(default="", max_length=120)
+    geometry: dict = Field(default_factory=dict)
+    payload: dict = Field(default_factory=dict)
+    source_ref: str = Field(default="", max_length=300)
+
+
+class AdvancedRecordOut(AdvancedRecordIn):
+    id: str
+    tenant_id: str
+    scenario_id: str
+    asset_id: str
+    sequence: int
+    content_type: str = ""
+    checksum: str = ""
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AdvancedRecordPageOut(BaseModel):
+    items: list[AdvancedRecordOut] = Field(default_factory=list)
+    next_sequence: int | None = None
+    total: int = 0
+
+
+class AdvancedRunIn(BaseModel):
+    params: dict = Field(default_factory=dict)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=180)
+
+
+class AdvancedRunOut(BaseModel):
+    id: str
+    tenant_id: str
+    scenario_id: str
+    asset_id: str | None = None
+    function_id: str | None = None
+    run_type: str
+    status: str
+    input_payload: dict = Field(default_factory=dict)
+    output_payload: dict = Field(default_factory=dict)
+    error: str = ""
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_by_user_id: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AdvancedFeedbackIn(BaseModel):
+    run_id: str | None = Field(default=None, max_length=32)
+    label: str = Field(default="", max_length=160)
+    expected_output: dict = Field(default_factory=dict)
+    actual_output: dict = Field(default_factory=dict)
+    score: float | None = Field(default=None, ge=0, le=1)
+    notes: str = Field(default="", max_length=4_000)
+
+
+class AdvancedFeedbackOut(AdvancedFeedbackIn):
+    id: str
+    tenant_id: str
+    scenario_id: str
+    asset_id: str
+    created_by_user_id: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AdvancedAssetSummaryOut(BaseModel):
+    asset_id: str
+    kind: str
+    record_count: int = 0
+    run_count: int = 0
+    feedback_count: int = 0
+    last_event_time: datetime | None = None
+    last_sequence: int = 0
 
 
 class ScenarioDetail(ScenarioOut):

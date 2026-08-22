@@ -529,7 +529,7 @@ def _mapping_out(m: DataMapping) -> DataMappingOut:
 
 
 def _function_out(function: FunctionDefinition) -> FunctionDefinitionOut:
-    """Return declaration metadata only; FunctionDefinition has no executor."""
+    """Return the typed contract and safe built-in runtime descriptor."""
     return FunctionDefinitionOut(
         id=function.id,
         scenario_id=function.scenario_id,
@@ -539,6 +539,8 @@ def _function_out(function: FunctionDefinition) -> FunctionDefinitionOut:
         output_schema=function.output_schema or {},
         tags=function.tags or [],
         visibility=function.visibility or "scenario",
+        runtime_kind=function.runtime_kind or "contract",
+        runtime_config=function.runtime_config or {},
         created_at=function.created_at,
         updated_at=function.updated_at,
     )

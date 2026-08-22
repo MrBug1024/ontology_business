@@ -38,6 +38,7 @@ from ..models import (
     FunctionDefinition,
     LLMConfig,
     MCPConfig,
+    OntologyAdvancedAsset,
     OntologyAction,
     OntologyBranch,
     OntologyEntity,
@@ -48,7 +49,7 @@ from ..models import (
     OntologySnapshot,
     OntologyWorkflow,
 )
-from . import connector_service, function_definition_service, permission_service, release_service
+from . import advanced_runtime_service, connector_service, function_definition_service, permission_service, release_service
 
 
 PACKAGE_FORMAT = "ontology-resource-package"
@@ -64,11 +65,22 @@ RESOURCE_KINDS = (
     "events",
     "workflows",
 )
+OPTIONAL_PACKAGE_RESOURCE_KINDS = ("advanced_assets",)
+PACKAGE_RESOURCE_KINDS = RESOURCE_KINDS + OPTIONAL_PACKAGE_RESOURCE_KINDS
 
 # A v1 package created before governed functions existed remains portable.  New
 # exports always include this collection; imports that omit it mean no function
 # changes rather than an invalid or destructive package.
-_OPTIONAL_RESOURCE_KINDS = {"functions"}
+_OPTIONAL_RESOURCE_KINDS = {"functions", "advanced_assets"}
+
+
+def _resource_kinds(resources: Mapping[str, Any] | None = None) -> tuple[str, ...]:
+    """Return core kinds plus optional collections explicitly present in a payload."""
+    if resources is None:
+        return RESOURCE_KINDS
+    return RESOURCE_KINDS + tuple(
+        kind for kind in OPTIONAL_PACKAGE_RESOURCE_KINDS if kind in resources
+    )
 
 _RESOURCE_PREFIXES = {
     "entities": "entity/",
@@ -80,6 +92,7 @@ _RESOURCE_PREFIXES = {
     "rules": "rule/",
     "events": "event/",
     "workflows": "workflow/",
+    "advanced_assets": "advanced/",
 }
 _SINGULAR_RESOURCE_NAMES = {
     "entities": "entity",
@@ -91,6 +104,7 @@ _SINGULAR_RESOURCE_NAMES = {
     "rules": "rule",
     "events": "event",
     "workflows": "workflow",
+    "advanced_assets": "advanced_asset",
 }
 _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "entities": ("key", "name"),
@@ -102,6 +116,7 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "rules": ("key", "name"),
     "events": ("key", "name"),
     "workflows": ("key", "name"),
+    "advanced_assets": ("key", "name", "kind"),
 }
 
 # A resource package is a versioned contract, not a generic JSON transport.
@@ -127,6 +142,10 @@ _RESOURCE_ALLOWED_FIELDS: dict[str, frozenset[str]] = {
     }),
     "functions": frozenset({
         "key", "name", "description", "input_schema", "output_schema", "tags", "visibility",
+        "runtime_kind", "runtime_config",
+    }),
+    "advanced_assets": frozenset({
+        "key", "name", "kind", "description", "schema", "config", "status",
     }),
     "actions": frozenset({
         "key", "entity_ref", "name", "description", "input_schema", "executor_type",
@@ -506,6 +525,9 @@ def _scenario_rows(
         workflows = db.execute(
             select(OntologyWorkflow).where(OntologyWorkflow.scenario_id == scenario_id)
         ).scalars().all()
+        advanced_assets = db.execute(
+            select(OntologyAdvancedAsset).where(OntologyAdvancedAsset.scenario_id == scenario_id)
+        ).scalars().all()
         # A stale/manual mapping could point at a public source owned by another
         # tenant.  Such a source may be usable at runtime under ACL, but its name,
         # type and configuration relationship must not be copied into a package.
@@ -538,6 +560,7 @@ def _scenario_rows(
         "rules": rules,
         "events": events,
         "workflows": workflows,
+        "advanced_assets": advanced_assets,
         "sources": sources,
         "mcps": mcps,
         "llms": llms,
@@ -564,6 +587,7 @@ def _build_resources(
     rules: list[OntologyRule] = rows["rules"]
     events: list[OntologyEvent] = rows["events"]
     workflows: list[OntologyWorkflow] = rows["workflows"]
+    advanced_assets: list[OntologyAdvancedAsset] = rows["advanced_assets"]
     source_by_id = {source.id: source for source in rows["sources"]}
     mcp_by_id = {config.id: config for config in rows["mcps"]}
     llm_by_id = {config.id: config for config in rows["llms"]}
@@ -628,6 +652,11 @@ def _build_resources(
         workflows,
         lambda workflow: f"workflow/{_key_token(workflow.name)}",
         lambda workflow: (str(workflow.name), str(workflow.description), str(workflow.id)),
+    )
+    advanced_asset_keys = _assign_keys(
+        advanced_assets,
+        lambda asset: f"advanced/{_key_token(asset.kind)}/{_key_token(asset.name)}",
+        lambda asset: (str(asset.kind), str(asset.name), str(asset.id)),
     )
 
     internal_refs = {
@@ -701,6 +730,8 @@ def _build_resources(
                 "output_schema": _plain_json(function.output_schema or {}),
                 "tags": _plain_json(function.tags or []),
                 "visibility": function.visibility or "scenario",
+                "runtime_kind": function.runtime_kind or "contract",
+                "runtime_config": _plain_json(function.runtime_config or {}),
             }
             for function in functions
         ],
@@ -801,7 +832,20 @@ def _build_resources(
             for workflow in workflows
         ],
     }
-    for kind in RESOURCE_KINDS:
+    if advanced_assets:
+        resources["advanced_assets"] = [
+            {
+                "key": advanced_asset_keys[id(asset)],
+                "name": asset.name,
+                "kind": asset.kind,
+                "description": asset.description or "",
+                "schema": _plain_json(asset.schema or {}),
+                "config": _plain_json(asset.config or {}),
+                "status": asset.status or "draft",
+            }
+            for asset in advanced_assets
+        ]
+    for kind in resources:
         resources[kind].sort(key=lambda item: str(item["key"]))
     if include_runtime_ids:
         # This map is private to the compiler.  It is never returned by export
@@ -817,6 +861,7 @@ def _build_resources(
             "rules": {rule_keys[id(item)]: item.id for item in rules},
             "events": {event_keys[id(item)]: item.id for item in events},
             "workflows": {workflow_keys[id(item)]: item.id for item in workflows},
+            "advanced_assets": {advanced_asset_keys[id(item)]: item.id for item in advanced_assets},
         }
     return redact_sensitive(resources)
 
@@ -850,7 +895,10 @@ def export_scenario_package(
             "name": redact_sensitive(scenario.name or ""),
             "description": redact_sensitive(scenario.description or ""),
             "industry": redact_sensitive(scenario.industry or ""),
-            "resource_counts": {kind: len(resources[kind]) for kind in RESOURCE_KINDS},
+            "resource_counts": {
+                kind: len(resources[kind])
+                for kind in _resource_kinds(resources)
+            },
         },
         "resources": resources,
     }
@@ -898,7 +946,7 @@ def _validate_resource_collections(
     """
     for raw_kind in resources:
         kind = str(raw_kind)
-        if kind not in RESOURCE_KINDS:
+        if kind not in PACKAGE_RESOURCE_KINDS:
             errors.append(
                 _issue(
                     "unsupported_resource_collection",
@@ -920,7 +968,7 @@ def _validate_resource_fields(
     portable-reference validation below so existing callers retain its explicit
     ``runtime_identifier_forbidden`` diagnostic.
     """
-    for kind in RESOURCE_KINDS:
+    for kind in _resource_kinds(resources):
         allowed_fields = _RESOURCE_ALLOWED_FIELDS[kind]
         for index, item in enumerate(resources[kind]):
             path = f"resources.{kind}[{index}]"
@@ -984,7 +1032,7 @@ def _validate_resource_shape(
     errors: list[dict[str, str]],
 ) -> None:
     keys_by_kind: dict[str, set[str]] = {}
-    for kind in RESOURCE_KINDS:
+    for kind in _resource_kinds(resources):
         seen: set[str] = set()
         prefix = _RESOURCE_PREFIXES[kind]
         for index, item in enumerate(resources[kind]):
@@ -1005,7 +1053,7 @@ def _validate_resource_shape(
     # References must resolve inside the package.  External data source / MCP / LLM
     # bindings are intentionally not package resources and are handled as import
     # conflicts instead of being mistaken for an internal ontology reference.
-    for kind in RESOURCE_KINDS:
+    for kind in _resource_kinds(resources):
         for index, item in enumerate(resources[kind]):
             base_path = f"resources.{kind}[{index}]"
             for collection, reference, relative_path in _walk_reference_fields(item):
@@ -1063,6 +1111,23 @@ def _normalize_function_fields(
         item.update(declaration)
 
 
+def _normalize_advanced_asset_fields(
+    resources: dict[str, list[dict[str, Any]]],
+    errors: list[dict[str, str]],
+) -> None:
+    """Validate advanced assets with the same closed-list runtime contract."""
+    for index, item in enumerate(resources.get("advanced_assets", [])):
+        path = f"resources.advanced_assets[{index}]"
+        try:
+            normalized = advanced_runtime_service.normalize_asset(
+                {key: value for key, value in item.items() if key != "key"}
+            )
+        except advanced_runtime_service.AdvancedRuntimeError as exc:
+            errors.append(_issue("invalid_advanced_asset", path, str(exc)))
+            continue
+        item.update(normalized)
+
+
 def _validate_no_runtime_identifier_fields(
     resources: dict[str, list[dict[str, Any]]],
     errors: list[dict[str, str]],
@@ -1084,7 +1149,7 @@ def _validate_no_runtime_identifier_fields(
                 )
             )
 
-    for kind in RESOURCE_KINDS:
+    for kind in _resource_kinds(resources):
         for index, item in enumerate(resources[kind]):
             root = f"resources.{kind}[{index}]"
             for raw_key in item:
@@ -1159,7 +1224,7 @@ def validate_package(package: Mapping[str, Any] | Any) -> dict[str, Any]:
         _validate_resource_collections(resources_raw, errors)
 
     normalized_resources: dict[str, list[dict[str, Any]]] = {}
-    for kind in RESOURCE_KINDS:
+    for kind in _resource_kinds(resources_raw):
         normalized_resources[kind] = _as_resource_list(resources_raw, kind, errors)
         normalized_resources[kind].sort(key=lambda item: str(item.get("key", "")))
     normalized = {
@@ -1180,6 +1245,7 @@ def validate_package(package: Mapping[str, Any] | Any) -> dict[str, Any]:
     _validate_resource_fields(normalized_resources, errors)
     _normalize_mapping_binding_fields(normalized_resources, errors)
     _normalize_function_fields(normalized_resources, errors)
+    _normalize_advanced_asset_fields(normalized_resources, errors)
     _validate_no_runtime_identifier_fields(normalized_resources, errors)
     actual_fingerprint = package_fingerprint(normalized)
     supplied_fingerprint = manifest.get("fingerprint")
@@ -1508,10 +1574,10 @@ def _resource_indexes(resources: Mapping[str, list[dict[str, Any]]]) -> tuple[
 ]:
     indexed: dict[str, dict[str, dict[str, Any]]] = {}
     base_counts: dict[str, dict[str, int]] = {}
-    for kind in RESOURCE_KINDS:
-        indexed[kind] = {str(item["key"]): item for item in resources[kind]}
+    for kind in _resource_kinds(resources):
+        indexed[kind] = {str(item["key"]): item for item in resources.get(kind, [])}
         counts: dict[str, int] = defaultdict(int)
-        for item in resources[kind]:
+        for item in resources.get(kind, []):
             counts[_strip_duplicate_suffix(str(item["key"]))] += 1
         base_counts[kind] = dict(counts)
     return indexed, base_counts
@@ -1578,7 +1644,7 @@ def plan_package_import(
     target_sources = _target_data_sources(db, target)
     desired_states: dict[tuple[str, str], str] = {}
 
-    for kind in RESOURCE_KINDS:
+    for kind in _resource_kinds(desired):
         for item in desired[kind]:
             key = str(item["key"])
             conflicts: list[dict[str, str]] = []
@@ -1999,7 +2065,7 @@ def _compile_package_overlay(
     # the package (for example an Action may refer to another Action declared
     # later in the sorted package list).
     ids_by_kind: dict[str, dict[str, str]] = {}
-    for kind in RESOURCE_KINDS:
+    for kind in _resource_kinds(desired):
         ids_by_kind[kind] = {
             str(item["key"]): current_ids[kind].get(str(item["key"]), _new_runtime_id())
             for item in desired[kind]
@@ -2022,6 +2088,7 @@ def _compile_package_overlay(
     content.setdefault("rules", [])
     content.setdefault("events", [])
     content.setdefault("workflows", [])
+    content.setdefault("advanced_assets", [])
     _overlay_connector_requirements(content, plan, environment=environment)
 
     entities_by_id = {str(item["id"]): item for item in content["entities"]}
@@ -2162,6 +2229,8 @@ def _compile_package_overlay(
                 "output_schema": copy.deepcopy(item.get("output_schema", {})),
                 "tags": copy.deepcopy(item.get("tags", [])),
                 "visibility": item.get("visibility", "scenario"),
+                "runtime_kind": item.get("runtime_kind", "contract"),
+                "runtime_config": copy.deepcopy(item.get("runtime_config", {})),
             },
         )
 
@@ -2326,6 +2395,22 @@ def _compile_package_overlay(
                 "status": item.get("status", "draft"),
                 "enabled": item.get("enabled", True),
                 "access_scope": item.get("access_scope", "tenant"),
+            },
+        )
+
+    for item in desired.get("advanced_assets", []):
+        asset_id = ids_by_kind["advanced_assets"][str(item["key"])]
+        _replace_record(
+            content["advanced_assets"],
+            asset_id,
+            {
+                "id": asset_id,
+                "name": item.get("name", ""),
+                "kind": item.get("kind", "geospatial"),
+                "description": item.get("description", ""),
+                "schema": copy.deepcopy(item.get("schema", {})),
+                "config": copy.deepcopy(item.get("config", {})),
+                "status": item.get("status", "draft"),
             },
         )
 

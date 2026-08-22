@@ -920,6 +920,30 @@ def _migrate_external_api_key_audit() -> None:
             )
 
 
+def _migrate_function_runtimes() -> None:
+    """Add the safe, closed-list runtime descriptor to legacy function rows."""
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if not inspector.has_table("function_definitions"):
+            return
+        existing = {column["name"] for column in inspector.get_columns("function_definitions")}
+        if "runtime_kind" not in existing:
+            conn.exec_driver_sql(
+                "ALTER TABLE function_definitions ADD COLUMN runtime_kind VARCHAR(40) DEFAULT 'contract'"
+            )
+        if "runtime_config" not in existing:
+            conn.exec_driver_sql(
+                "ALTER TABLE function_definitions ADD COLUMN runtime_config JSON DEFAULT '{}'"
+            )
+        conn.exec_driver_sql(
+            "UPDATE function_definitions SET runtime_kind = 'contract' "
+            "WHERE runtime_kind IS NULL OR TRIM(runtime_kind) = ''"
+        )
+        conn.exec_driver_sql(
+            "UPDATE function_definitions SET runtime_config = '{}' WHERE runtime_config IS NULL"
+        )
+
+
 def init_db() -> None:
     # Import every metadata module so direct maintenance/fixture callers get
     # the same schema as the ASGI application, which imports routers first.
@@ -950,4 +974,5 @@ def init_db() -> None:
     _migrate_workflow_run_environment()
     _migrate_workflow_run_execution_key()
     _migrate_runtime_definition_pins()
+    _migrate_function_runtimes()
     _migrate_external_api_key_audit()

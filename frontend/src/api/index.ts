@@ -1,6 +1,12 @@
 import axios from 'axios'
 import type {
   ActionExecutionLog,
+  AdvancedAsset,
+  AdvancedAssetSummary,
+  AdvancedFeedback,
+  AdvancedRecord,
+  AdvancedRecordPage,
+  AdvancedRun,
   Agent,
   AssistantAttachment,
   AssistantMessage,
@@ -309,11 +315,41 @@ export const api = {
   refreshMapping: (mid: string, limit = 50) => http.post<DataMappingRefresh>(`/scenarios/mappings/${mid}/refresh`, { limit }),
   importMapping: (mid: string, limit = 50) => http.post(`/scenarios/mappings/${mid}/import`, { limit }),
 
-  // 受治理函数（仅声明式契约；无执行入口）
+  // 受治理函数：声明式契约 + 服务端 allowlist 内置算子
   listFunctions: (sid: string) => http.get<FunctionDefinition[]>(`/scenarios/${sid}/functions`),
   createFunction: (sid: string, d: FunctionDefinition) => http.post<FunctionDefinition>(`/scenarios/${sid}/functions`, d),
   updateFunction: (id: string, d: FunctionDefinition) => http.put<FunctionDefinition>(`/scenarios/functions/${id}`, d),
   deleteFunction: (id: string) => http.delete(`/scenarios/functions/${id}`),
+  runFunction: (id: string, data: { params: Record<string, any>; idempotency_key?: string }) =>
+    http.post<AdvancedRun>(`/advanced/functions/${id}/run`, data),
+  listFunctionRuns: (id: string, limit = 100) =>
+    http.get<AdvancedRun[]>(`/advanced/functions/${id}/runs`, { params: { limit } }),
+
+  // P2 高级数据 / 模型资产：记录、实时游标、媒体、仿真与反馈均受场景 ACL 保护。
+  listAdvancedAssets: (scenarioId: string, kind?: string) =>
+    http.get<AdvancedAsset[]>(`/advanced/scenarios/${scenarioId}/assets`, { params: { kind: kind || undefined } }),
+  createAdvancedAsset: (scenarioId: string, data: Partial<AdvancedAsset>) =>
+    http.post<AdvancedAsset>(`/advanced/scenarios/${scenarioId}/assets`, data),
+  updateAdvancedAsset: (assetId: string, data: Partial<AdvancedAsset>) =>
+    http.patch<AdvancedAsset>(`/advanced/assets/${assetId}`, data),
+  deleteAdvancedAsset: (assetId: string) => http.delete(`/advanced/assets/${assetId}`),
+  getAdvancedAssetSummary: (assetId: string) => http.get<AdvancedAssetSummary>(`/advanced/assets/${assetId}/summary`),
+  listAdvancedRecords: (assetId: string, params: { after_sequence?: number; from_time?: string; to_time?: string; event_type?: string; bbox?: string; limit?: number } = {}) =>
+    http.get<AdvancedRecordPage>(`/advanced/assets/${assetId}/records`, { params }),
+  createAdvancedRecord: (assetId: string, data: Partial<AdvancedRecord>) =>
+    http.post<AdvancedRecord>(`/advanced/assets/${assetId}/records`, data),
+  uploadAdvancedMedia: (assetId: string, file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return http.post<AdvancedRecord>(`/advanced/assets/${assetId}/media`, fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+  },
+  advancedMediaUrl: (assetId: string, recordId: string) => `/api/advanced/assets/${assetId}/media/${recordId}`,
+  runAdvancedAsset: (assetId: string, runType: string, data: { params: Record<string, any>; idempotency_key?: string }) =>
+    http.post<AdvancedRun>(`/advanced/assets/${assetId}/runs`, data, { params: { run_type: runType } }),
+  listAdvancedRuns: (assetId: string, limit = 100) => http.get<AdvancedRun[]>(`/advanced/assets/${assetId}/runs`, { params: { limit } }),
+  createAdvancedFeedback: (assetId: string, data: Partial<AdvancedFeedback>) =>
+    http.post<AdvancedFeedback>(`/advanced/assets/${assetId}/feedback`, data),
+  listAdvancedFeedback: (assetId: string, limit = 100) => http.get<AdvancedFeedback[]>(`/advanced/assets/${assetId}/feedback`, { params: { limit } }),
 
   // 操作（Actions）
   createAction: (sid: string, d: any) => http.post(`/scenarios/${sid}/actions`, d),

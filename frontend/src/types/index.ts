@@ -401,8 +401,92 @@ export interface FunctionDefinition {
   output_schema?: Record<string, unknown>
   tags?: string[]
   visibility?: 'scenario' | 'tenant'
+  runtime_kind?: 'contract' | 'weighted_score' | 'threshold' | 'geo_distance' | 'timeseries_aggregate' | string
+  runtime_config?: Record<string, any>
   created_at?: string
   updated_at?: string
+}
+
+export type AdvancedAssetKind = 'geospatial' | 'timeseries' | 'media' | 'realtime' | 'ml_model' | 'simulation' | 'optimization'
+
+export interface AdvancedAsset {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  name: string
+  kind: AdvancedAssetKind | string
+  description?: string
+  schema?: Record<string, any>
+  config?: Record<string, any>
+  status: 'draft' | 'ready' | 'disabled' | string
+  version?: number
+  created_by_user_id?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface AdvancedRecord {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  asset_id: string
+  sequence: number
+  event_time?: string
+  event_type?: string
+  geometry?: Record<string, any>
+  payload?: Record<string, any>
+  source_ref?: string
+  content_type?: string
+  checksum?: string
+  created_at?: string
+}
+
+export interface AdvancedRecordPage {
+  items: AdvancedRecord[]
+  next_sequence?: number | null
+  total: number
+}
+
+export interface AdvancedRun {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  asset_id?: string
+  function_id?: string
+  run_type: string
+  status: string
+  input_payload?: Record<string, any>
+  output_payload?: Record<string, any>
+  error?: string
+  started_at?: string
+  completed_at?: string
+  created_by_user_id?: string
+  created_at?: string
+}
+
+export interface AdvancedFeedback {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  asset_id: string
+  run_id?: string
+  label?: string
+  expected_output?: Record<string, any>
+  actual_output?: Record<string, any>
+  score?: number
+  notes?: string
+  created_by_user_id?: string
+  created_at?: string
+}
+
+export interface AdvancedAssetSummary {
+  asset_id: string
+  kind: string
+  record_count: number
+  run_count: number
+  feedback_count: number
+  last_event_time?: string
+  last_sequence: number
 }
 
 export interface OntologyAction {

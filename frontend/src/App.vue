@@ -33,6 +33,7 @@
           <el-menu-item index="/lineage" title="端到端血缘"><el-icon aria-hidden="true"><Share /></el-icon><span>端到端血缘</span></el-menu-item>
           <el-menu-item index="/releases" title="发布治理"><el-icon aria-hidden="true"><SetUp /></el-icon><span>发布治理</span></el-menu-item>
           <el-menu-item index="/connectors" title="连接器与环境"><el-icon aria-hidden="true"><Connection /></el-icon><span>连接器与环境</span></el-menu-item>
+          <el-menu-item index="/advanced-assets" title="高级数据与模型"><el-icon aria-hidden="true"><DataAnalysis /></el-icon><span>高级数据与模型</span></el-menu-item>
           <el-menu-item index="/scenarios" title="业务场景"><el-icon aria-hidden="true"><OfficeBuilding /></el-icon><span>业务场景</span></el-menu-item>
           <el-menu-item index="/data-sources" title="数据源"><el-icon aria-hidden="true"><Coin /></el-icon><span>数据源</span></el-menu-item>
         </el-menu>
