@@ -20,6 +20,8 @@ export interface Property {
   data_type: string
   description?: string
   is_key?: boolean
+  /** Human-readable label property used by graphs and Agent answers. */
+  is_title?: boolean
   is_required?: boolean
   is_enum?: boolean
   enum_values?: string[]
@@ -41,7 +43,24 @@ export interface Entity {
   /** Name of the enum property used as this entity's lifecycle state. */
   state_property?: string
   properties: Property[]
+  /** Server-computed ontology readiness; concrete types require one key and one title. */
+  model_ready?: boolean
+  model_issues?: string[]
   created_at?: string
+}
+
+export interface RelationConstraints {
+  symmetric?: boolean
+  transitive?: boolean
+  irreflexive?: boolean
+  asymmetric?: boolean
+  antisymmetric?: boolean
+  acyclic?: boolean
+  inverse_relation_id?: string
+  source_min_cardinality?: number
+  source_max_cardinality?: number
+  target_min_cardinality?: number
+  target_max_cardinality?: number
 }
 
 export interface Relation {
@@ -52,6 +71,7 @@ export interface Relation {
   source_entity_id: string
   target_entity_id: string
   relation_type: string
+  constraints?: RelationConstraints
   description?: string
   source_entity_name?: string
   target_entity_name?: string
@@ -192,6 +212,7 @@ export interface DataMappingFieldPreview {
   property_name: string
   data_type: string
   is_key: boolean
+  is_title: boolean
   is_required: boolean
   source_column: string
   source_exists: boolean
@@ -202,6 +223,52 @@ export interface DataMappingFieldPreview {
     new?: string
     value?: unknown
   }>
+}
+
+export type RelationDataMappingMode = 'source_fk' | 'target_fk' | 'join_table'
+
+export interface RelationDataMappingInput {
+  relation_id: string
+  source_mapping_id: string
+  target_mapping_id: string
+  mode: RelationDataMappingMode
+  foreign_key_column: string
+  join_data_source_id: string
+  join_table_name: string
+  source_key_column: string
+  target_key_column: string
+}
+
+export interface RelationDataMapping extends Omit<RelationDataMappingInput, 'join_data_source_id' | 'join_table_name'> {
+  id: string
+  scenario_id: string
+  relation_name: string
+  source_entity_name: string
+  target_entity_name: string
+  data_source_id: string
+  data_source_name: string
+  table_name: string
+  status: string
+  last_error?: string
+  last_checked_at?: string
+  last_refreshed_at?: string
+  last_link_count: number
+  created_at?: string
+}
+
+export interface RelationDataMappingPreview {
+  ok: boolean
+  message: string
+  mode: RelationDataMappingMode
+  relation_name: string
+  source_entity_name: string
+  target_entity_name: string
+  data_source_id: string
+  data_source_name: string
+  table_name: string
+  available_columns: string[]
+  errors: string[]
+  warnings: string[]
 }
 
 export interface DataMappingPreview {
@@ -278,7 +345,7 @@ export interface GraphEdge {
   source: string
   target: string
   label?: string
-  /** '1:1' | '1:N' | 'N:M' | 'belongs' | 'rel' */
+  /** '1:1' | '1:N' | 'N:1' | 'N:M' | 'belongs' | 'rel' */
   type?: string
   relation_type?: string
 }
@@ -462,6 +529,7 @@ export interface ScenarioDetail extends Scenario {
   instances: OntologyInstance[]
   relation_instances: RelationInstance[]
   mappings: DataMapping[]
+  relation_mappings: RelationDataMapping[]
   functions: FunctionDefinition[]
   actions: OntologyAction[]
   rules: OntologyRule[]
@@ -496,6 +564,56 @@ export interface BucketFile {
   indexed_at?: string | null
   chunk_count?: number
   created_at?: string
+}
+
+export type ArtifactTemplateFormat = 'docx' | 'xlsx' | 'markdown'
+
+export interface ArtifactTemplateVersion {
+  id: string
+  version: number
+  bucket_file_id: string
+  data_source_id: string
+  filename: string
+  artifact_format: ArtifactTemplateFormat
+  mime: string
+  size: number
+  sha256: string
+  placeholder_paths: string[]
+  metadata?: Record<string, any>
+  version_note?: string
+  created_at?: string
+}
+
+export interface ArtifactTemplateReference {
+  action_id: string
+  action_name: string
+  scenario_id: string
+  scenario_name: string
+  entity_name?: string
+  uses_current: boolean
+  pinned_version?: number | null
+}
+
+export interface ArtifactTemplate {
+  id: string
+  key: string
+  scenario_id?: string | null
+  name: string
+  purpose?: string
+  description?: string
+  status: 'active' | 'deprecated' | string
+  current_version_id?: string | null
+  current_version?: ArtifactTemplateVersion | null
+  version_count: number
+  reference_count: number
+  deletable: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface ArtifactTemplateDetail extends ArtifactTemplate {
+  versions: ArtifactTemplateVersion[]
+  references: ArtifactTemplateReference[]
 }
 
 export interface TableInfo {
@@ -638,6 +756,40 @@ export interface MCPTool {
   input_schema?: Record<string, any>
 }
 
+export type AgentCapabilityCategory = 'functions' | 'actions' | 'rules' | 'events' | 'workflows'
+
+export interface AgentCapabilitySelection {
+  mode: 'all' | 'explicit'
+  selected_ids: string[]
+}
+
+export type AgentCapabilityScope = Record<AgentCapabilityCategory, AgentCapabilitySelection>
+
+export interface AgentCapabilityReadinessItem {
+  id: string
+  name: string
+  description?: string
+  executable: boolean
+  blocked_reasons: string[]
+}
+
+export interface AgentCapabilitySummary {
+  mode: 'all' | 'explicit'
+  available_count: number
+  selected_count: number
+  executable_count: number
+  blocked_count: number
+  blocked_reasons: string[]
+  items: AgentCapabilityReadinessItem[]
+}
+
+export interface AgentCapabilityCatalog {
+  scenario_id: string
+  environment: 'dev' | 'staging' | 'prod'
+  definition_hash: string
+  categories: Record<AgentCapabilityCategory, AgentCapabilityReadinessItem[]>
+}
+
 export interface Agent {
   id?: string
   name: string
@@ -646,6 +798,9 @@ export interface Agent {
   llm_config_id?: string | null
   system_prompt?: string
   data_source_ids: string[]
+  capability_scope?: AgentCapabilityScope | null
+  capability_scope_legacy?: boolean
+  capability_summary?: Partial<Record<AgentCapabilityCategory, AgentCapabilitySummary>>
   temperature?: number
   max_tokens?: number
   created_at?: string
@@ -739,6 +894,43 @@ export interface AssistantThread {
   title: string
   created_at?: string
   updated_at?: string
+}
+
+export type AssistantCompilationJobState = 'running' | 'succeeded' | 'failed'
+
+/** Public, owner-scoped state for recovering a long-running scenario compilation. */
+export interface AssistantCompilationJobStatus {
+  id: string
+  thread_id?: string | null
+  scenario_id?: string | null
+  status: AssistantCompilationJobState
+  progress: {
+    phase?: string
+    detail?: string
+    calls_used?: number
+    call_budget?: number
+    error_code?: string
+  }
+  llm_calls_used: number
+  llm_call_budget: number
+  result_ready: boolean
+  error_code: string
+  error_message: string
+  started_at: string
+  completed_at?: string | null
+  updated_at: string
+}
+
+/** Server-owned proposal locator returned only after a compilation succeeds. */
+export interface AssistantCompilationJobResult {
+  job_id: string
+  thread_id?: string | null
+  scenario_id?: string | null
+  status: 'succeeded'
+  proposal: AssistantProposal | Record<string, any>
+  proposal_thread_id?: string | null
+  proposal_message_id?: string | null
+  apply_ready: boolean
 }
 
 export interface AssistantAttachment {
@@ -841,7 +1033,7 @@ export interface DocumentReindexResult {
 }
 
 export interface AssistantProposal {
-  kind: 'scenario' | 'ontology' | 'mapping' | 'workflow'
+  kind: 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'
   proposal_id: string
   title: string
   summary?: string
@@ -851,6 +1043,10 @@ export interface AssistantProposal {
     resource: string
     name: string
     summary?: string
+    change_id?: string
+    depends_on?: string[]
+    evidence_refs?: string[]
+    confidence?: number
   }[]
   base_snapshot?: Record<string, any>
   requires_confirmation?: boolean

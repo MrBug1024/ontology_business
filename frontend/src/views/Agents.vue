@@ -37,6 +37,12 @@
             <el-tag v-for="n in a.data_source_names || []" :key="n" size="small" type="info" effect="light"><el-icon aria-hidden="true"><Coin /></el-icon>{{ n }}</el-tag>
             <span class="muted" v-if="!(a.llm_name || a.data_source_names?.length)">未配置模型与数据</span>
           </div>
+          <div class="capability-line">
+            <span>业务能力 {{ capabilityTotals(a).selected }} 项</span>
+            <span class="capability-ready">可执行 {{ capabilityTotals(a).executable }}</span>
+            <span v-if="capabilityTotals(a).blocked" class="capability-blocked">阻塞 {{ capabilityTotals(a).blocked }}</span>
+            <el-tag v-if="a.capability_scope_legacy" size="small" type="warning" effect="plain">旧版待配置</el-tag>
+          </div>
           <div class="agent-readiness" :class="{ ready: agentReady(a) }">
             <span :class="{ done: agentReadiness(a).ontology }"><el-icon><component :is="agentReadiness(a).ontology ? 'CircleCheck' : 'Warning'" /></el-icon>本体</span>
             <span :class="{ done: agentReadiness(a).source }"><el-icon><component :is="agentReadiness(a).source ? 'CircleCheck' : 'Warning'" /></el-icon>数据源</span>
@@ -62,8 +68,8 @@
     </div>
 
     <!-- 编辑对话框 -->
-    <el-dialog v-model="dlg" :title="form.id ? '编辑 Agent' : '新建 Agent'" width="760px" top="5vh">
-      <el-form :model="form" label-width="100px">
+    <el-dialog v-model="dlg" :title="form.id ? '编辑 Agent' : '新建 Agent'" width="900px" top="4vh" class="agent-dialog">
+      <el-form :model="form" label-width="100px" class="agent-form">
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：业务分析助手" /></el-form-item>
@@ -76,7 +82,7 @@
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="业务场景">
-              <el-select v-model="form.scenario_id" clearable placeholder="绑定场景（注入本体上下文）" style="width:100%">
+              <el-select v-model="form.scenario_id" clearable placeholder="绑定场景（注入本体上下文）" style="width:100%" @change="changeFormScenario">
                 <el-option v-for="s in scenarios" :key="s.id" :label="s.name" :value="s.id" />
               </el-select>
             </el-form-item>
@@ -104,6 +110,86 @@
           </el-select>
         </el-form-item>
 
+        <section class="capability-section" aria-labelledby="agent-capability-heading">
+          <div class="capability-heading">
+            <div>
+              <h3 id="agent-capability-heading">业务能力白名单</h3>
+              <p>只把完成此 Agent 职责所需的函数、操作、规则、事件和工作流交给模型。空白名单仍可查询本体与已绑定数据。</p>
+            </div>
+            <el-tag v-if="capabilityCatalog" size="small" effect="plain">{{ capabilityCatalog.environment }} 运行定义</el-tag>
+          </div>
+          <el-alert
+            v-if="editingLegacyScope"
+            type="warning"
+            :closable="false"
+            show-icon
+            title="这是旧版 Agent，未配置的业务能力已安全停用；请选择职责所需能力后保存。"
+            class="capability-alert"
+          />
+          <el-alert
+            v-if="capabilityCatalogError"
+            type="warning"
+            :closable="false"
+            show-icon
+            :title="capabilityCatalogError"
+            class="capability-alert"
+          />
+          <div v-loading="capabilityCatalogLoading" class="capability-grid">
+            <article v-for="category in capabilityCategories" :key="category.key" class="capability-card">
+              <div class="capability-card-head">
+                <div>
+                  <strong>{{ category.label }}</strong>
+                  <span>{{ category.help }}</span>
+                </div>
+                <el-radio-group
+                  :model-value="capabilityEntry(category.key).mode"
+                  size="small"
+                  :aria-label="`${category.label}授权模式`"
+                  @change="changeCapabilityMode(category.key, $event)"
+                >
+                  <el-radio-button value="explicit">指定</el-radio-button>
+                  <el-radio-button value="all">选择当前全部</el-radio-button>
+                </el-radio-group>
+              </div>
+              <el-select
+                v-if="capabilityEntry(category.key).mode === 'explicit'"
+                :model-value="capabilityEntry(category.key).selected_ids"
+                multiple
+                filterable
+                collapse-tags
+                collapse-tags-tooltip
+                :disabled="!form.scenario_id || capabilityCatalogLoading"
+                :placeholder="form.scenario_id ? `选择${category.label}` : '请先选择业务场景'"
+                style="width:100%"
+                @update:model-value="setCapabilityIds(category.key, $event)"
+              >
+                <el-option
+                  v-for="item in capabilityOptions(category.key)"
+                  :key="item.id"
+                  :label="item.name"
+                  :value="item.id"
+                >
+                  <div class="capability-option">
+                    <span>{{ item.name }}</span>
+                    <el-tag size="small" :type="item.executable ? 'success' : 'warning'" effect="plain">
+                      {{ item.executable ? '可执行' : '阻塞' }}
+                    </el-tag>
+                  </div>
+                </el-option>
+              </el-select>
+              <p v-else class="capability-all-hint">当前以及以后新增的可见{{ category.label }}都会自动授权给此 Agent。</p>
+              <div class="capability-stats" aria-live="polite">
+                <span>已选择 {{ capabilityStats(category.key).selected }}</span>
+                <span class="capability-ready">可执行 {{ capabilityStats(category.key).executable }}</span>
+                <span v-if="capabilityStats(category.key).blocked" class="capability-blocked">阻塞 {{ capabilityStats(category.key).blocked }}</span>
+              </div>
+              <ul v-if="capabilityBlockedReasons(category.key).length" class="capability-reasons">
+                <li v-for="reason in capabilityBlockedReasons(category.key)" :key="reason">{{ reason }}</li>
+              </ul>
+            </article>
+          </div>
+        </section>
+
         <el-alert
           v-if="form.scenario_id"
           :type="formAgentReady ? 'success' : 'warning'"
@@ -126,11 +212,31 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onBeforeUnmount, onMounted, watch } from 'vue'
+import { computed, ref, onBeforeUnmount, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
-import type { Agent, Scenario, ScenarioDetail, LLMConfig, DataSource } from '@/types'
+import { cloneAgentCapabilityScope, emptyAgentCapabilityScope } from '@/utils/agentCapabilities'
+import type {
+  Agent,
+  AgentCapabilityCatalog,
+  AgentCapabilityCategory,
+  AgentCapabilityReadinessItem,
+  AgentCapabilitySelection,
+  AgentCapabilitySummary,
+  Scenario,
+  ScenarioDetail,
+  LLMConfig,
+  DataSource,
+} from '@/types'
+
+const capabilityCategories: Array<{ key: AgentCapabilityCategory; label: string; help: string }> = [
+  { key: 'functions', label: '函数', help: '确定性计算与转换' },
+  { key: 'actions', label: '操作', help: '需要确认的业务变更' },
+  { key: 'rules', label: '规则', help: '业务判断与约束' },
+  { key: 'events', label: '事件', help: '业务事件发布' },
+  { key: 'workflows', label: '工作流', help: '跨步骤任务编排' },
+]
 
 const agents = ref<Agent[]>([])
 const scenarios = ref<Scenario[]>([])
@@ -148,9 +254,82 @@ const scenarioScope = ref(queryScenarioId())
 const dlg = ref(false)
 const saving = ref(false)
 const loading = ref(false)
-const form = ref<Partial<Agent>>({ data_source_ids: [] })
+const form = ref<Partial<Agent>>({ data_source_ids: [], capability_scope: emptyAgentCapabilityScope() })
+const capabilityCatalog = ref<AgentCapabilityCatalog | null>(null)
+const capabilityCatalogLoading = ref(false)
+const capabilityCatalogError = ref('')
+const editingLegacyScope = ref(false)
+const editingCapabilitySummary = ref<Partial<Record<AgentCapabilityCategory, AgentCapabilitySummary>>>({})
 let viewDisposed = false
 let loadRequest = 0
+let capabilityCatalogRequest = 0
+
+function capabilityEntry(category: AgentCapabilityCategory): AgentCapabilitySelection {
+  if (!form.value.capability_scope) form.value.capability_scope = emptyAgentCapabilityScope()
+  return form.value.capability_scope[category]
+}
+
+function changeCapabilityMode(category: AgentCapabilityCategory, value: unknown) {
+  const entry = capabilityEntry(category)
+  entry.mode = value === 'all' ? 'all' : 'explicit'
+  entry.selected_ids = []
+  editingLegacyScope.value = false
+}
+
+function setCapabilityIds(category: AgentCapabilityCategory, value: unknown) {
+  const ids = Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+  capabilityEntry(category).selected_ids = [...new Set(ids)]
+  editingLegacyScope.value = false
+}
+
+function capabilityOptions(category: AgentCapabilityCategory): AgentCapabilityReadinessItem[] {
+  const items = new Map<string, AgentCapabilityReadinessItem>()
+  for (const item of capabilityCatalog.value?.categories[category] || []) items.set(item.id, item)
+  for (const item of editingCapabilitySummary.value[category]?.items || []) {
+    if (!items.has(item.id)) items.set(item.id, item)
+  }
+  return [...items.values()]
+}
+
+function selectedCapabilityItems(category: AgentCapabilityCategory): AgentCapabilityReadinessItem[] {
+  const entry = capabilityEntry(category)
+  if (entry.mode === 'all') return capabilityCatalog.value?.categories[category] || []
+  const options = new Map(capabilityOptions(category).map((item) => [item.id, item]))
+  return entry.selected_ids.map((id) => options.get(id) || {
+    id,
+    name: `已失效能力 ${id.slice(0, 8)}`,
+    executable: false,
+    blocked_reasons: ['所选能力已不在当前运行定义中或当前账号已无读取权限'],
+  })
+}
+
+function capabilityStats(category: AgentCapabilityCategory) {
+  const items = selectedCapabilityItems(category)
+  const executable = items.filter((item) => item.executable).length
+  return { selected: items.length, executable, blocked: items.length - executable }
+}
+
+function capabilityBlockedReasons(category: AgentCapabilityCategory): string[] {
+  return selectedCapabilityItems(category)
+    .flatMap((item) => item.executable
+      ? []
+      : (item.blocked_reasons?.length ? item.blocked_reasons : ['当前不可执行'])
+        .map((reason) => `${item.name}：${reason}`))
+    .filter((reason, index, values) => values.indexOf(reason) === index)
+    .slice(0, 4)
+}
+
+function capabilityTotals(agent: Partial<Agent>) {
+  const summaries = Object.values(agent.capability_summary || {})
+  return summaries.reduce(
+    (total, summary) => ({
+      selected: total.selected + (summary?.selected_count || 0),
+      executable: total.executable + (summary?.executable_count || 0),
+      blocked: total.blocked + (summary?.blocked_count || 0),
+    }),
+    { selected: 0, executable: 0, blocked: 0 },
+  )
+}
 const formMappedSourceIds = computed(() => new Set(
   (form.value.scenario_id ? scenarioDetails.value[form.value.scenario_id]?.mappings : [])
     ?.map((mapping) => mapping.data_source_id) || [],
@@ -211,6 +390,29 @@ async function ensureScenarioDetail(scenarioId?: string | null) {
   }
 }
 
+async function loadCapabilityCatalog(scenarioId?: string | null) {
+  const request = ++capabilityCatalogRequest
+  capabilityCatalog.value = null
+  capabilityCatalogError.value = ''
+  if (!scenarioId) {
+    capabilityCatalogLoading.value = false
+    return
+  }
+  capabilityCatalogLoading.value = true
+  try {
+    const catalog = await api.getAgentCapabilityCatalog(scenarioId)
+    if (!viewDisposed && request === capabilityCatalogRequest && form.value.scenario_id === scenarioId) {
+      capabilityCatalog.value = catalog
+    }
+  } catch (e: any) {
+    if (!viewDisposed && request === capabilityCatalogRequest && form.value.scenario_id === scenarioId) {
+      capabilityCatalogError.value = `能力目录暂不可用：${e.message || '当前环境运行定义不可用'}`
+    }
+  } finally {
+    if (!viewDisposed && request === capabilityCatalogRequest) capabilityCatalogLoading.value = false
+  }
+}
+
 async function load() {
   const request = ++loadRequest
   const scope = scenarioScope.value
@@ -241,12 +443,34 @@ function openCreate() {
     description: '',
     scenario_id: scenarioScope.value || undefined,
     data_source_ids: [],
+    capability_scope: emptyAgentCapabilityScope(),
   }
+  editingLegacyScope.value = false
+  editingCapabilitySummary.value = {}
   dlg.value = true
+  void ensureScenarioDetail(form.value.scenario_id)
+  void loadCapabilityCatalog(form.value.scenario_id)
 }
 function openEdit(a: Agent) {
-  form.value = { ...a, data_source_ids: [...(a.data_source_ids || [])] }
+  form.value = {
+    ...a,
+    data_source_ids: [...(a.data_source_ids || [])],
+    capability_scope: cloneAgentCapabilityScope(a.capability_scope),
+  }
+  editingLegacyScope.value = Boolean(a.capability_scope_legacy)
+  editingCapabilitySummary.value = a.capability_summary || {}
   dlg.value = true
+  void ensureScenarioDetail(form.value.scenario_id)
+  void loadCapabilityCatalog(form.value.scenario_id)
+}
+
+function changeFormScenario(value: string | undefined) {
+  form.value.data_source_ids = []
+  form.value.capability_scope = emptyAgentCapabilityScope()
+  editingLegacyScope.value = false
+  editingCapabilitySummary.value = {}
+  void ensureScenarioDetail(value)
+  void loadCapabilityCatalog(value)
 }
 function openAgentChat(agent: Agent) {
   if (!agent.id) return
@@ -308,11 +532,6 @@ async function changeScenarioScope(value: string) {
   await router.replace({ name: 'agents', query })
   return
 }
-watch(() => form.value.scenario_id, () => {
-  void ensureScenarioDetail(form.value.scenario_id)
-  const allowedIds = new Set(availableDataSources.value.map((source) => source.id))
-  form.value.data_source_ids = (form.value.data_source_ids || []).filter((id) => allowedIds.has(id))
-})
 onMounted(() => {
   viewDisposed = false
   void load()
@@ -320,6 +539,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   viewDisposed = true
   loadRequest += 1
+  capabilityCatalogRequest += 1
 })
 </script>
 
@@ -368,10 +588,22 @@ onBeforeUnmount(() => {
 }
 .ag-desc {
   color: var(--text-2); font-size: 13px;
-  height: 38px; overflow: hidden; margin-bottom: 10px;
+  display: -webkit-box; min-height: 38px; overflow: hidden; margin-bottom: 10px;
+  -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   line-height: 1.5;
 }
 .ag-tags { min-height: 24px; margin-bottom: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+.capability-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: -2px 0 10px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.capability-ready { color: var(--success); }
+.capability-blocked { color: var(--warning); }
 .ag-actions {
   display: flex; gap: 4px;
   border-top: 1px solid var(--border); padding-top: 8px;
@@ -382,10 +614,46 @@ onBeforeUnmount(() => {
 .agent-readiness span.done { color: var(--text-2); }
 .agent-readiness span.done .el-icon { color: var(--success); }
 .setup-alert { margin-top: 4px; }
+.capability-section {
+  margin: 4px 0 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.capability-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.capability-heading h3 { margin: 0 0 3px; color: var(--text-1); font-size: 15px; }
+.capability-heading p { margin: 0; color: var(--text-3); font-size: 12px; line-height: 1.55; }
+.capability-alert { margin-bottom: 10px; }
+.capability-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; min-height: 70px; }
+.capability-card { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-1); }
+.capability-card:last-child:nth-child(odd) { grid-column: 1 / -1; }
+.capability-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.capability-card-head > div:first-child { min-width: 0; }
+.capability-card-head strong { display: block; color: var(--text-1); font-size: 13px; }
+.capability-card-head span { display: block; margin-top: 2px; color: var(--text-3); font-size: 11px; }
+.capability-option { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; }
+.capability-all-hint { margin: 0; color: var(--warning); font-size: 11px; line-height: 32px; }
+.capability-stats { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; color: var(--text-3); font-size: 11px; }
+.capability-reasons { margin: 7px 0 0; padding-left: 18px; color: var(--warning); font-size: 11px; line-height: 1.45; }
+:deep(.agent-dialog .el-dialog__body) { max-height: calc(92vh - 132px); overflow-y: auto; overscroll-behavior: contain; }
 .agent-header-actions { display: flex; align-items: center; gap: 8px; }
 .agent-header-actions :deep(.el-select) { width: min(240px, 38vw); }
 @media (max-width: 640px) {
   .agent-header-actions { width: 100%; align-items: stretch; }
   .agent-header-actions :deep(.el-select) { min-width: 0; flex: 1; width: auto; }
+  .agent-form > .el-row { margin-right: 0 !important; margin-left: 0 !important; }
+  .agent-form > .el-row > .el-col { max-width: 100%; flex: 0 0 100%; padding-right: 0 !important; padding-left: 0 !important; }
+  .agent-form :deep(.el-form-item) { display: block; }
+  .agent-form :deep(.el-form-item__label) { width: auto !important; height: auto; justify-content: flex-start; margin-bottom: 6px; padding: 0; line-height: 1.45; }
+  .agent-form :deep(.el-form-item__content) { margin-left: 0 !important; }
+  .capability-grid { grid-template-columns: 1fr; }
+  .capability-card:last-child:nth-child(odd) { grid-column: auto; }
+  .capability-card-head { align-items: stretch; flex-direction: column; }
+  .capability-card-head :deep(.el-radio-group) { align-self: flex-start; }
 }
 </style>

@@ -535,7 +535,11 @@ onBeforeUnmount(() => {
   height: 10px;
   border-radius: 50%;
 }
-@media (max-width: 768px) {
+@media (max-width: 900px) {
+  .graph-svg { touch-action: pan-y; }
   .graph-tools button { width: 44px; height: 44px; }
+  .graph-caption { right: 70px; max-width: calc(100% - 88px); }
+  .graph-caption i { display: none; }
+  .graph-legend { max-width: calc(100% - 28px); }
 }
 </style>

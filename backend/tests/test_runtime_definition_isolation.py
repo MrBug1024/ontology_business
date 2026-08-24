@@ -22,6 +22,7 @@ from app.models import (
     OntologyAction,
     OntologyBranch,
     OntologyEntity,
+    OntologyProperty,
     OntologyRelease,
     OntologySnapshot,
     OntologyWorkflow,
@@ -30,6 +31,7 @@ from app.models import (
     WorkflowRun,
 )
 from app.services import (
+    capability_readiness_service,
     operations_service,
     permission_service,
     release_service,
@@ -70,6 +72,14 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             name="运行对象",
         )
+        self.entity_key = OntologyProperty(
+            id="property-runtime-definition-id",
+            entity_id=self.entity.id,
+            name="对象ID",
+            is_key=True,
+            is_title=True,
+            is_required=True,
+        )
         # The action is intentionally a script without a body.  It gives the
         # idempotency test a safe, deterministic failure after the durable log
         # has been created; no network or host execution is involved.
@@ -93,8 +103,11 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
             trigger_type="manual",
             trigger_config={},
             steps=[],
-            nodes=[],
-            edges=[],
+            nodes=[
+                {"id": "start", "type": "start", "data": {"name": "开始"}},
+                {"id": "end", "type": "end", "data": {"name": "结束"}},
+            ],
+            edges=[{"id": "e1", "source": "start", "target": "end", "label": ""}],
             status="active",
             enabled=True,
         )
@@ -112,6 +125,7 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
                 self.owner,
                 self.scenario,
                 self.entity,
+                self.entity_key,
                 self.action,
                 self.workflow,
                 self.branch,
@@ -289,7 +303,7 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
         self.assertEqual(log.definition_hash, called_definition.definition_hash)
         self.assertEqual(log.definition_source, "release")
 
-    def test_same_dedupe_and_action_idempotency_do_not_cross_dev_and_staging(self) -> None:
+    def test_same_workflow_dedupe_does_not_cross_environments_and_unready_action_is_blocked(self) -> None:
         snapshot_a, release_a = self._release_a()
         with self._staging_settings():
             staging_definition = runtime_definition_service.resolve_active(
@@ -320,14 +334,15 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
             staging_action = runtime_definition_service.resolve_resource(
                 staging_definition, "action", self.action.id
             )
-            workflow_service.execute_action(
-                self.db,
-                staging_action,
-                {},
-                idempotency_key="same-mutation",
-                runtime_environment="staging",
-                runtime_definition=staging_definition,
-            )
+            with self.assertRaises(capability_readiness_service.CapabilityNotReady):
+                workflow_service.execute_action(
+                    self.db,
+                    staging_action,
+                    {},
+                    idempotency_key="same-mutation",
+                    runtime_environment="staging",
+                    runtime_definition=staging_definition,
+                )
 
         self.assertTrue(created)
         self.assertFalse(duplicate_created)
@@ -354,14 +369,15 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
                 runtime_definition=dev_definition,
             )
             self.db.commit()
-            workflow_service.execute_action(
-                self.db,
-                live_action,
-                {},
-                idempotency_key="same-mutation",
-                runtime_environment="dev",
-                runtime_definition=dev_definition,
-            )
+            with self.assertRaises(capability_readiness_service.CapabilityNotReady):
+                workflow_service.execute_action(
+                    self.db,
+                    live_action,
+                    {},
+                    idempotency_key="same-mutation",
+                    runtime_environment="dev",
+                    runtime_definition=dev_definition,
+                )
 
         self.assertTrue(dev_created)
         self.assertNotEqual(dev_run.id, staging_run.id)
@@ -386,15 +402,99 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
             )
             .order_by(ActionExecutionLog.environment.asc())
         ).scalars().all()
-        self.assertEqual({log.idempotency_key for log in action_logs}, {"staging:same-mutation", "dev:same-mutation"})
-        staging_log = next(log for log in action_logs if log.environment == "staging")
-        self.assertEqual(staging_log.release_id, release_a.id)
-        self.assertEqual(staging_log.definition_snapshot_id, snapshot_a.id)
-        self.assertEqual(staging_log.definition_source, "release")
-        dev_log = next(log for log in action_logs if log.environment == "dev")
-        self.assertIsNone(dev_log.release_id)
-        self.assertIsNone(dev_log.definition_snapshot_id)
-        self.assertEqual(dev_log.definition_source, "live")
+        self.assertEqual(action_logs, [])
+
+    def test_resolve_for_run_rejects_a_tampered_definition_hash(self) -> None:
+        snapshot, release = self._release_a()
+        run = WorkflowRun(
+            scenario_id=self.scenario.id,
+            workflow_id=self.workflow.id,
+            environment="staging",
+            definition_snapshot_id=snapshot.id,
+            release_id=release.id,
+            definition_hash="0" * 64,
+            definition_source="release",
+        )
+
+        with self.assertRaisesRegex(
+            runtime_definition_service.RuntimeDefinitionError,
+            "完整性校验失败",
+        ):
+            runtime_definition_service.resolve_for_run(self.db, run)
+
+    def test_resolve_for_run_uses_the_same_release_status_guard_as_resolve_pinned(self) -> None:
+        snapshot, release = self._release_a()
+        definition = runtime_definition_service.resolve_active(
+            self.db,
+            self.scenario,
+            environment="staging",
+        )
+        run = WorkflowRun(
+            scenario_id=self.scenario.id,
+            workflow_id=self.workflow.id,
+            environment="staging",
+            definition_snapshot_id=snapshot.id,
+            release_id=release.id,
+            definition_hash=definition.definition_hash,
+            definition_source="release",
+        )
+
+        for allowed_status in ("released", "superseded", "rolled_back"):
+            release.status = allowed_status
+            self.db.commit()
+            resolved_run = runtime_definition_service.resolve_for_run(self.db, run)
+            resolved_pin = runtime_definition_service.resolve_pinned(
+                self.db,
+                self.scenario,
+                environment="staging",
+                snapshot_id=snapshot.id,
+                release_id=release.id,
+                definition_hash=definition.definition_hash,
+            )
+            self.assertEqual(resolved_run.definition_hash, definition.definition_hash)
+            self.assertEqual(resolved_pin.definition_hash, definition.definition_hash)
+
+        release.status = "draft"
+        self.db.commit()
+        for resolver in (
+            lambda: runtime_definition_service.resolve_for_run(self.db, run),
+            lambda: runtime_definition_service.resolve_pinned(
+                self.db,
+                self.scenario,
+                environment="staging",
+                snapshot_id=snapshot.id,
+                release_id=release.id,
+                definition_hash=definition.definition_hash,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                runtime_definition_service.RuntimeDefinitionError,
+                "发布版本不一致",
+            ):
+                resolver()
+
+    def test_dev_run_definition_hash_is_an_optimistic_execution_pin(self) -> None:
+        definition = runtime_definition_service.resolve_active(
+            self.db,
+            self.scenario,
+            environment="dev",
+        )
+        run = WorkflowRun(
+            scenario_id=self.scenario.id,
+            workflow_id=self.workflow.id,
+            environment="dev",
+            definition_hash=definition.definition_hash,
+            definition_source="live",
+        )
+        resolved = runtime_definition_service.resolve_for_run(self.db, run)
+        self.assertEqual(resolved.definition_hash, definition.definition_hash)
+
+        run.definition_hash = "tampered"
+        with self.assertRaisesRegex(
+            runtime_definition_service.RuntimeDefinitionError,
+            "完整性校验失败",
+        ):
+            runtime_definition_service.resolve_for_run(self.db, run)
 
 
 if __name__ == "__main__":  # pragma: no cover

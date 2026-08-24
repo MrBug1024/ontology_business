@@ -49,6 +49,7 @@
         >
           <el-menu-item index="/scenarios"><el-icon aria-hidden="true"><OfficeBuilding /></el-icon><span>业务场景</span></el-menu-item>
           <el-menu-item index="/data-sources"><el-icon aria-hidden="true"><Coin /></el-icon><span>数据源</span></el-menu-item>
+          <el-menu-item index="/templates"><el-icon aria-hidden="true"><Files /></el-icon><span>模板中心</span></el-menu-item>
           <el-menu-item index="/agents"><el-icon aria-hidden="true"><Cpu /></el-icon><span>Agent</span></el-menu-item>
         </el-menu>
 
@@ -86,11 +87,16 @@
 
       <div class="side-footer">
         <span class="status-dot" aria-hidden="true" />
-        <span><b>工作区已连接</b><small>单一场景工作流</small></span>
+        <span><b>工作区已连接</b><small>业务工作区</small></span>
       </div>
     </el-aside>
 
-    <el-main id="main-content" class="main-area" tabindex="-1">
+    <el-main
+      id="main-content"
+      class="main-area"
+      :class="{ 'assistant-launcher-safe': assistantSafeArea, 'navigation-open': sidebarOpen }"
+      tabindex="-1"
+    >
       <header class="topbar" role="banner">
         <div class="topbar-leading">
           <el-button class="menu-button" text circle aria-label="打开导航" @click="sidebarOpen = true"><el-icon><Menu /></el-icon></el-button>
@@ -121,7 +127,9 @@
           </el-dropdown>
         </div>
       </header>
-      <router-view />
+      <div class="route-viewport">
+        <router-view />
+      </div>
       <GlobalAssistant :context="assistantContext" :hide-launcher="sidebarOpen" />
     </el-main>
   </el-container>
@@ -145,6 +153,8 @@ const activeRoute = computed(() => {
   return route.path
 })
 const pageTitle = computed(() => String(route.meta.title || '业务场景'))
+const assistantSafeArea = computed(() => !route.path.match(/^\/agents\/[^/]+\/chat(?:\/|$)/)
+  && !route.path.match(/^\/scenarios\/[^/]+(?:\/|$)/))
 const assistantContext = computed(() => {
   const queryScenario = Array.isArray(route.query.scenario_id)
     ? String(route.query.scenario_id[0] || '')
@@ -185,10 +195,10 @@ onBeforeUnmount(() => window.removeEventListener('ontology-theme-change', syncTh
 </script>
 
 <style scoped>
-.app-shell { min-height: 100dvh; }
+.app-shell { height: 100dvh; min-height: 0; overflow: hidden; }
 .skip-link { position: fixed; top: 8px; left: 8px; z-index: 2000; transform: translateY(-160%); padding: 9px 12px; border-radius: 9px; background: var(--primary); color: #fff; font-size: 12px; font-weight: 700; transition: transform var(--dur) var(--ease); }
 .skip-link:focus { transform: translateY(0); }
-.sidebar { position: relative; z-index: 30; display: flex; flex-direction: column; overflow: hidden; background: var(--sidebar-bg); border-right: 1px solid var(--sidebar-border); }
+.sidebar { position: relative; z-index: 30; display: flex; height: 100%; min-height: 0; flex-direction: column; overflow: hidden; background: var(--sidebar-bg); border-right: 1px solid var(--sidebar-border); }
 .sidebar::before { position: absolute; top: -150px; right: -100px; width: 290px; height: 290px; background: radial-gradient(circle, var(--sidebar-glow), transparent 70%); content: ''; pointer-events: none; }
 .brand { position: relative; z-index: 1; display: flex; align-items: center; gap: 11px; padding: 20px 17px 17px; }
 .brand-logo { display: flex; flex: 0 0 40px; width: 40px; height: 40px; align-items: center; justify-content: center; border-radius: 12px; background: var(--brand-bg); box-shadow: var(--shadow-sm); }
@@ -208,8 +218,11 @@ onBeforeUnmount(() => window.removeEventListener('ontology-theme-change', syncTh
 .side-footer b { color: var(--sidebar-text); font-size: 10.5px; font-weight: 680; }
 .side-footer small { font-size: 9px; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #34d399; box-shadow: 0 0 0 4px rgba(52, 211, 153, .12); }
-.main-area { min-width: 0; padding: 0; overflow-y: auto; background: transparent; }
-.topbar { position: sticky; top: 0; z-index: 20; display: flex; height: 64px; align-items: center; justify-content: space-between; padding: 0 26px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 94%, transparent); backdrop-filter: blur(12px); }
+.main-area { min-width: 0; height: 100%; min-height: 0; padding: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; background: transparent; }
+.main-area.navigation-open { overflow: hidden; }
+.route-viewport { position: relative; min-width: 0; }
+.main-area.assistant-launcher-safe > .route-viewport { padding-bottom: max(96px, env(safe-area-inset-bottom)); }
+.topbar { position: sticky; top: 0; z-index: 20; display: flex; height: 64px; flex: 0 0 auto; align-items: center; justify-content: space-between; padding: 0 26px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 94%, transparent); backdrop-filter: blur(12px); }
 .topbar-leading, .crumb, .top-actions, .user-trigger { display: flex; align-items: center; }
 .topbar-leading { min-width: 0; gap: 8px; }
 .crumb { min-width: 0; gap: 7px; color: var(--text-3); font-size: 12px; }
@@ -222,7 +235,8 @@ onBeforeUnmount(() => window.removeEventListener('ontology-theme-change', syncTh
 .user-avatar { display: inline-flex; width: 30px; height: 30px; align-items: center; justify-content: center; border-radius: 9px; background: var(--primary-soft); color: var(--primary); font-size: 12px; font-weight: 760; }
 .user-name { max-width: 150px; overflow: hidden; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar-scrim { display: none; }
-@media (max-width: 768px) {
+@media (max-width: 900px) {
+  .main-area { scrollbar-gutter: auto; }
   .sidebar { position: fixed; inset: 0 auto 0 0; width: min(84vw, 280px) !important; visibility: hidden; pointer-events: none; transform: translateX(-105%); transition: transform var(--dur) var(--ease), visibility 0s linear var(--dur); }
   .sidebar.open { visibility: visible; pointer-events: auto; transform: translateX(0); transition-delay: 0s; }
   .sidebar-scrim { position: fixed; inset: 0; z-index: 29; display: block; border: 0; background: rgba(8, 19, 28, .45); }

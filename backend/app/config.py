@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     max_tool_rounds: int = 20
     max_query_rows: int = 200
     llm_timeout: float = 120.0
+    scenario_model_llm_timeout: float = 600.0
+    # Hard ceiling for one compound document compilation, including malformed
+    # JSON retries, timeout fallback chunks and recursive truncation splits.
+    # A job that reaches this limit fails closed and is not retried under the
+    # same execution fingerprint.
+    scenario_model_max_llm_calls: int = 24
     max_upload_bytes: int = 50 * 1024 * 1024
     allow_unsafe_workflow_nodes: bool = False
     # HTTP Action 默认只允许公网 HTTPS 目标。开发环境如确有受控本地模拟端点，

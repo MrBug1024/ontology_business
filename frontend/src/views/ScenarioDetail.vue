@@ -32,7 +32,6 @@
       </div>
       <div class="ph-right">
         <el-tag v-if="!canWrite" type="info" effect="plain" aria-label="当前场景为只读访问">只读访问</el-tag>
-        <el-button v-else class="ai-btn" @click="openAssistantDraft"><el-icon><MagicStick /></el-icon> AI 建模助手</el-button>
       </div>
     </div>
 
@@ -64,6 +63,7 @@
             v-if="editor && canWrite"
             :editor="editor"
             :entities="detail.entities"
+            :relations="detail.relations"
             :saving="saving"
             @save="saveEditor"
             @delete="deleteEditor"
@@ -103,6 +103,7 @@
               v-if="editor && canWrite"
               :editor="editor"
               :entities="detail.entities"
+              :relations="detail.relations"
               :saving="saving"
               @save="saveEditor"
               @delete="deleteEditor"
@@ -229,7 +230,7 @@
       <!-- ═══════════ 数据映射 ═══════════ -->
       <el-tab-pane label="数据映射" name="mappings">
         <el-alert
-          v-if="!scenarioDataSources.length"
+          v-if="!databaseDataSources.length"
           class="mapping-prerequisite"
           title="请先接入并测试数据源，再配置字段映射"
           description="没有数据源结构时，系统无法知道可映射的表和字段。"
@@ -240,65 +241,96 @@
           <template #default><el-button type="primary" plain size="small" @click="goToDataSources">接入数据源</el-button></template>
         </el-alert>
         <div class="tab-toolbar">
-          <div class="tab-stats"><span class="stat">映射 <b>{{ detail.mappings.length }}</b></span></div>
-          <div v-if="canWrite" class="tab-actions">
-            <el-button size="small" type="primary" :disabled="!scenarioDataSources.length || !detail.entities.length" @click="openMapping()"><el-icon><Plus /></el-icon> 添加映射</el-button>
+          <div class="tab-stats mapping-stats">
+            <span class="stat">对象映射 <b>{{ detail.mappings.length }}</b></span>
+            <span class="stat">关系映射 <b>{{ detail.relation_mappings.length }}</b></span>
+            <span class="stat" :class="{ 'stat-warning': modelReadyCount < concreteEntityCount }">模型就绪 <b>{{ modelReadyCount }}/{{ concreteEntityCount }}</b></span>
+            <span class="stat" :class="{ 'stat-warning': titleReadyCount < concreteEntityCount }">标题就绪 <b>{{ titleReadyCount }}/{{ concreteEntityCount }}</b></span>
           </div>
         </div>
-        <div class="card map-card">
-          <el-table :data="detail.mappings" class="map-table" empty-text="暂无数据映射">
-            <el-table-column label="对象类型" min-width="120">
-              <template #default="{ row }">
-                <span class="ent-chip" :style="{ color: entColor(row.entity_id) }">
-                  <i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}
-                </span>
-              </template>
-            </el-table-column>
-            <el-table-column label="数据源 / 表" min-width="180">
-              <template #default="{ row }">
-                <div class="map-dst">
-                  <span class="mono">{{ row.table_name }}</span>
-                  <span class="muted">{{ dsName(row.data_source_id) }}</span>
-                </div>
-              </template>
-            </el-table-column>
-            <el-table-column label="列映射" min-width="220">
-              <template #default="{ row }">
-                <div class="col-maps">
-                  <span class="col-map" v-for="(v, k) in row.column_map" :key="k">{{ k }} ← {{ v }}</span>
-                  <span class="muted" v-if="!Object.keys(row.column_map || {}).length">未配置</span>
-                </div>
-              </template>
-            </el-table-column>
-            <el-table-column label="运行状态" min-width="150">
-              <template #default="{ row }">
-                <div class="mapping-status-cell">
-                  <el-tag size="small" effect="plain" :type="mappingStatusType(row.status)">
-                    {{ mappingStatusLabel(row.status) }}
-                  </el-tag>
-                  <el-tooltip v-if="row.last_error" :content="row.last_error" placement="top">
-                    <el-icon class="mapping-error-icon" aria-label="查看映射错误"><WarningFilled /></el-icon>
-                  </el-tooltip>
-                  <small v-if="mappingRefreshJob(row)" class="mapping-job-state" role="status" aria-live="polite" aria-atomic="true">
-                    {{ row.entity_name || '数据映射' }}：{{ mappingJobLabel(mappingRefreshJob(row)?.status) }}
-                    <template v-if="mappingRefreshJob(row)?.status === 'queued'">（最多 {{ mappingRefreshJob(row)?.max_attempts || 0 }} 次）</template>
-                    <template v-else> · 第 {{ mappingRefreshJob(row)?.attempt || 0 }}/{{ mappingRefreshJob(row)?.max_attempts || 0 }} 次</template>
-                  </small>
-                  <small v-if="row.last_refreshed_at" class="muted">{{ formatDate(row.last_refreshed_at) }}</small>
-                </div>
-              </template>
-            </el-table-column>
-            <el-table-column label="操作" :width="canWrite ? 340 : 82" fixed="right">
-              <template #default="{ row }">
+        <el-alert
+          v-if="unreadyConcreteEntities.length"
+          class="mapping-readiness-alert"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="先补齐对象模型，再刷新业务数据"
+        >
+          <template #default>
+            <span>{{ unreadyConcreteEntities.map((entity) => `${entity.name}：${(entity.model_issues || []).join('、') || '缺少主键或标题属性'}`).join('；') }}</span>
+          </template>
+        </el-alert>
+
+        <section class="mapping-section" aria-labelledby="object-mapping-heading">
+          <div class="mapping-section-head">
+            <div>
+              <h2 id="object-mapping-heading">对象映射</h2>
+              <p>把真实数据表字段映射为对象属性；主键保证身份稳定，标题保证 Agent 回答可读。</p>
+            </div>
+            <el-button v-if="canWrite" size="small" type="primary" :disabled="!databaseDataSources.length || !detail.entities.length" @click="openMapping()"><el-icon><Plus /></el-icon> 添加对象映射</el-button>
+          </div>
+          <div v-if="detail.mappings.length" class="mapping-card-grid">
+            <article v-for="row in detail.mappings" :key="row.id" class="mapping-item-card">
+              <header class="mapping-item-head">
+                <span class="ent-chip" :style="{ color: entColor(row.entity_id) }"><i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}</span>
+                <el-tag size="small" effect="plain" :type="mappingStatusType(row.status)">{{ mappingStatusLabel(row.status) }}</el-tag>
+              </header>
+              <div class="mapping-source"><b>{{ dsName(row.data_source_id) }}</b><span>{{ row.table_name || '未选择数据表' }}</span></div>
+              <div class="mapping-readiness-tags">
+                <el-tag size="small" effect="plain" :type="mappingIdentityCoverage(row).key ? 'success' : 'danger'">{{ mappingIdentityCoverage(row).key ? '主键已映射' : '主键未映射' }}</el-tag>
+                <el-tag size="small" effect="plain" :type="mappingIdentityCoverage(row).title ? 'success' : 'warning'">{{ mappingIdentityCoverage(row).title ? '标题已映射' : '标题未映射' }}</el-tag>
+              </div>
+              <div class="col-maps">
+                <span class="col-map" v-for="(value, key) in row.column_map" :key="key">{{ key }} ← {{ value }}</span>
+                <span v-if="!Object.keys(row.column_map || {}).length" class="muted">尚未映射字段</span>
+              </div>
+              <p v-if="row.last_error" class="mapping-inline-error"><el-icon><WarningFilled /></el-icon>{{ row.last_error }}</p>
+              <small v-if="mappingRefreshJob(row)" class="mapping-job-state" role="status" aria-live="polite" aria-atomic="true">
+                {{ mappingJobLabel(mappingRefreshJob(row)?.status) }} · 第 {{ mappingRefreshJob(row)?.attempt || 0 }}/{{ mappingRefreshJob(row)?.max_attempts || 0 }} 次
+              </small>
+              <footer class="mapping-item-actions">
                 <el-button v-if="canWrite" size="small" text @click="openMapping(row.id)">编辑</el-button>
                 <el-button size="small" text @click="doPreviewMapping(row)">预览</el-button>
-                <el-button v-if="canWrite" size="small" text :loading="row._testing" @click="doTestMapping(row)">测试</el-button>
-                <el-button v-if="canWrite" size="small" text type="primary" :loading="mappingRefreshActive(row)" :disabled="mappingRefreshActive(row)" @click="doRefreshMapping(row)">{{ mappingRefreshActive(row) ? '刷新中' : '刷新实例' }}</el-button>
-                <el-button v-if="canWrite" size="small" text type="danger" @click="removeMapping(row.id)">删除</el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-        </div>
+                <el-button v-if="canWrite" size="small" text :loading="(row as any)._testing" @click="doTestMapping(row)">测试</el-button>
+                <el-button v-if="canWrite" size="small" text type="primary" :loading="mappingRefreshActive(row)" :disabled="mappingRefreshActive(row)" @click="doRefreshMapping(row)">{{ mappingRefreshActive(row) ? '刷新中' : '刷新对象' }}</el-button>
+                <el-button v-if="canWrite && row.id" size="small" text type="danger" @click="removeMapping(row.id)">删除</el-button>
+              </footer>
+            </article>
+          </div>
+          <el-empty v-else description="暂无对象映射；请先选择对象类型、数据源、表和字段" :image-size="58" />
+        </section>
+
+        <section class="mapping-section" aria-labelledby="relation-mapping-heading">
+          <div class="mapping-section-head">
+            <div>
+              <h2 id="relation-mapping-heading">关系映射</h2>
+              <p>基于两端对象映射，从外键或中间表生成真实对象之间的链接。</p>
+            </div>
+            <el-button v-if="canWrite" size="small" type="primary" :disabled="!detail.relations.length" @click="openRelationMapping()"><el-icon><Plus /></el-icon> 添加关系映射</el-button>
+          </div>
+          <el-alert v-if="!detail.relations.length" type="info" :closable="false" show-icon title="请先在本体模型中创建关系类型" class="relation-mapping-prerequisite" />
+          <div v-if="detail.relation_mappings.length" class="mapping-card-grid relation-mapping-grid">
+            <article v-for="row in detail.relation_mappings" :key="row.id" class="mapping-item-card relation-mapping-card">
+              <header class="mapping-item-head">
+                <div class="relation-mapping-title"><b>{{ row.relation_name }}</b><span>{{ row.source_entity_name }} → {{ row.target_entity_name }}</span></div>
+                <el-tag size="small" effect="plain" :type="mappingStatusType(row.status)">{{ mappingStatusLabel(row.status) }}</el-tag>
+              </header>
+              <dl class="relation-mapping-facts">
+                <div><dt>映射方式</dt><dd>{{ relationMappingModeLabel(row.mode) }}</dd></div>
+                <div><dt>关系来源</dt><dd>{{ row.data_source_name || '—' }} / {{ row.table_name || '—' }}</dd></div>
+                <div><dt>已生成链接</dt><dd>{{ row.last_link_count || 0 }} 条</dd></div>
+                <div><dt>最近检查</dt><dd>{{ row.last_checked_at ? formatDate(row.last_checked_at) : '尚未检查' }}</dd></div>
+              </dl>
+              <p v-if="row.last_error" class="mapping-inline-error"><el-icon><WarningFilled /></el-icon>{{ row.last_error }}</p>
+              <footer class="mapping-item-actions">
+                <el-button v-if="canWrite" size="small" text @click="preflightSavedRelationMapping(row)">预检</el-button>
+                <el-button v-if="canWrite" size="small" text @click="openRelationMapping(row.id)">编辑</el-button>
+                <el-button v-if="canWrite" size="small" text type="danger" @click="removeRelationMapping(row)">删除</el-button>
+              </footer>
+            </article>
+          </div>
+          <el-empty v-else description="暂无关系映射；先完成关系两端的对象映射" :image-size="58" />
+        </section>
       </el-tab-pane>
 
       <!-- ═══════════ 业务函数（无副作用、可由 Agent 调用）═══════════ -->
@@ -590,7 +622,7 @@
         </el-form>
       </template>
       <el-divider content-position="left">已有关系实例</el-divider>
-      <el-table class="relation-instance-table" :data="detail.relation_instances" size="small" max-height="280" empty-text="暂无关系实例">
+      <el-table class="relation-instance-table" :data="detail.relation_instances" size="small" empty-text="暂无关系实例">
         <el-table-column prop="relation_name" label="关系类型" min-width="130" />
         <el-table-column prop="source_instance_name" label="来源对象" min-width="140" />
         <el-table-column label="" width="38" align="center"><template #default>→</template></el-table-column>
@@ -617,11 +649,11 @@
         </el-form-item>
         <el-form-item label="数据源">
           <el-select v-model="mappingForm.data_source_id" style="width:100%" @change="onMapDsChange">
-            <el-option v-for="d in scenarioDataSources" :key="d.id" :label="d.name" :value="d.id" />
+            <el-option v-for="d in databaseDataSources" :key="d.id" :label="d.name" :value="d.id" />
           </el-select>
         </el-form-item>
         <el-form-item label="表名">
-          <el-select v-model="mappingForm.table_name" style="width:100%" filterable allow-create placeholder="选择或输入表名">
+          <el-select v-model="mappingForm.table_name" style="width:100%" filterable placeholder="选择真实数据表">
             <el-option v-for="t in mapTables" :key="t" :label="t" :value="t" />
           </el-select>
         </el-form-item>
@@ -629,7 +661,13 @@
           <div class="colmap-list">
             <div class="mapping-property" v-for="p in (detail.entities.find((e) => e.id === mappingForm.entity_id)?.properties || [])" :key="p.name">
               <div class="colmap-row">
-                <span class="colmap-attr">{{ p.name }}</span>
+                <span class="colmap-attr">
+                  <b>{{ p.name }}</b>
+                  <span class="mapping-property-flags">
+                    <el-tag v-if="p.is_key" size="small" effect="plain">主键属性</el-tag>
+                    <el-tag v-if="p.is_title" size="small" effect="plain" type="success">标题属性</el-tag>
+                  </span>
+                </span>
                 <el-select v-model="mappingForm.column_map[p.name]" size="small" clearable placeholder="不映射">
                   <el-option v-for="c in mapCols" :key="c" :label="c" :value="c" />
                 </el-select>
@@ -659,6 +697,135 @@
       <template #footer>
         <el-button @click="mappingDlg = false">取消</el-button>
         <el-button type="primary" @click="saveMapping">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-if="canWrite"
+      v-model="relationMappingDlg"
+      :title="relationMappingEditingId ? '编辑关系映射' : '添加关系映射'"
+      width="min(760px, 94vw)"
+      class="glass-dialog relation-mapping-dialog"
+      @closed="resetRelationMappingDialog"
+    >
+      <el-steps :active="relationMappingStep" finish-status="success" simple class="relation-mapping-steps">
+        <el-step title="选择关系" />
+        <el-step title="选择真实数据列" />
+        <el-step title="预检确认" />
+      </el-steps>
+      <el-form label-position="top" class="relation-mapping-form">
+        <el-form-item label="关系类型" required>
+          <el-select v-model="relationMappingForm.relation_id" filterable style="width:100%" placeholder="选择要从数据生成的关系" @change="onRelationMappingRelationChange">
+            <el-option
+              v-for="relation in detail.relations"
+              :key="relation.id"
+              :label="`${relation.name}（${entName(relation.source_entity_id)} → ${entName(relation.target_entity_id)}）`"
+              :value="relation.id"
+            />
+          </el-select>
+        </el-form-item>
+
+        <template v-if="selectedRelationMappingRelation">
+          <div class="relation-endpoint-grid">
+            <el-form-item :label="`来源对象映射 · ${entName(selectedRelationMappingRelation.source_entity_id)}`" required>
+              <el-select v-model="relationMappingForm.source_mapping_id" style="width:100%" placeholder="选择来源对象映射" @change="onRelationMappingEndpointChange">
+                <el-option v-for="mapping in relationSourceObjectMappings" :key="mapping.id" :label="objectMappingOptionLabel(mapping)" :value="mapping.id" />
+              </el-select>
+            </el-form-item>
+            <el-form-item :label="`目标对象映射 · ${entName(selectedRelationMappingRelation.target_entity_id)}`" required>
+              <el-select v-model="relationMappingForm.target_mapping_id" style="width:100%" placeholder="选择目标对象映射" @change="onRelationMappingEndpointChange">
+                <el-option v-for="mapping in relationTargetObjectMappings" :key="mapping.id" :label="objectMappingOptionLabel(mapping)" :value="mapping.id" />
+              </el-select>
+            </el-form-item>
+          </div>
+          <el-alert
+            v-if="relationMappingMissingEndpointNames.length"
+            class="relation-mapping-prerequisite"
+            type="warning"
+            :closable="false"
+            show-icon
+            title="关系两端必须先完成对象映射"
+          >
+            <template #default>
+              <span>缺少：{{ relationMappingMissingEndpointNames.join('、') }}</span>
+              <div class="inline-guidance-actions">
+                <el-button v-if="!relationSourceObjectMappings.length" size="small" plain type="primary" @click="openMappingForEntity(selectedRelationMappingRelation.source_entity_id)">配置来源对象映射</el-button>
+                <el-button v-if="!relationTargetObjectMappings.length" size="small" plain type="primary" @click="openMappingForEntity(selectedRelationMappingRelation.target_entity_id)">配置目标对象映射</el-button>
+              </div>
+            </template>
+          </el-alert>
+
+          <el-form-item label="关系在数据中如何保存" required>
+            <el-radio-group v-model="relationMappingForm.mode" class="relation-mode-options" @change="onRelationMappingModeChange">
+              <el-radio v-for="mode in RELATION_MAPPING_MODES" :key="mode.value" :value="mode.value" class="relation-mode-option">
+                <span><b>{{ mode.label }}</b><small>{{ mode.description }}</small></span>
+              </el-radio>
+            </el-radio-group>
+          </el-form-item>
+
+          <template v-if="relationMappingForm.mode !== 'join_table'">
+            <el-alert
+              class="carrier-source-alert"
+              type="info"
+              :closable="false"
+              :title="relationMappingCarrier ? `从 ${relationMappingCarrier.data_source_name || dsName(relationMappingCarrier.data_source_id)} / ${relationMappingCarrier.table_name} 选择外键` : '请先选择两端对象映射'"
+              :description="relationMappingModeDescription(relationMappingForm.mode)"
+              show-icon
+            />
+            <el-form-item label="外键列" required>
+              <el-select v-model="relationMappingForm.foreign_key_column" filterable style="width:100%" :loading="relationMappingOptionsLoading" placeholder="选择真实数据列" @change="invalidateRelationMappingPreview">
+                <el-option v-for="column in relationMappingColumns" :key="column" :label="column" :value="column" />
+              </el-select>
+              <div v-if="relationMappingCarrier && !relationMappingColumns.length && !relationMappingOptionsLoading" class="form-help">当前表没有可用列，请检查对象映射的数据源和表是否仍然存在。</div>
+            </el-form-item>
+          </template>
+
+          <template v-else>
+            <div class="relation-endpoint-grid">
+              <el-form-item label="中间表数据源" required>
+                <el-select v-model="relationMappingForm.join_data_source_id" filterable style="width:100%" placeholder="选择已接入的数据源" @change="onRelationJoinDataSourceChange">
+                  <el-option v-for="source in databaseDataSources" :key="source.id" :label="source.name" :value="source.id" />
+                </el-select>
+              </el-form-item>
+              <el-form-item label="中间表" required>
+                <el-select v-model="relationMappingForm.join_table_name" filterable style="width:100%" :loading="relationMappingOptionsLoading" placeholder="选择真实数据表" @change="onRelationJoinTableChange">
+                  <el-option v-for="table in relationMappingTables" :key="table.name" :label="table.name" :value="table.name" />
+                </el-select>
+              </el-form-item>
+            </div>
+            <div class="relation-endpoint-grid">
+              <el-form-item :label="`指向来源对象“${selectedRelationMappingRelation.source_entity_name || entName(selectedRelationMappingRelation.source_entity_id)}”主键的列`" required>
+                <el-select v-model="relationMappingForm.source_key_column" filterable style="width:100%" placeholder="选择来源主键列" @change="invalidateRelationMappingPreview">
+                  <el-option v-for="column in relationMappingColumns" :key="`source-${column}`" :label="column" :value="column" />
+                </el-select>
+              </el-form-item>
+              <el-form-item :label="`指向目标对象“${selectedRelationMappingRelation.target_entity_name || entName(selectedRelationMappingRelation.target_entity_id)}”主键的列`" required>
+                <el-select v-model="relationMappingForm.target_key_column" filterable style="width:100%" placeholder="选择目标主键列" @change="invalidateRelationMappingPreview">
+                  <el-option v-for="column in relationMappingColumns" :key="`target-${column}`" :label="column" :value="column" />
+                </el-select>
+              </el-form-item>
+            </div>
+          </template>
+        </template>
+      </el-form>
+
+      <section v-if="relationMappingPreview" class="relation-preflight-result" aria-live="polite">
+        <header>
+          <div><b>预检结果</b><span>{{ relationMappingPreview.message }}</span></div>
+          <el-tag :type="relationMappingPreview.ok ? 'success' : 'danger'" effect="plain">{{ relationMappingPreview.ok ? '可以保存' : '需要修正' }}</el-tag>
+        </header>
+        <ul v-if="relationMappingPreview.errors.length" class="mapping-issue-list relation-preflight-errors">
+          <li v-for="error in relationMappingPreview.errors" :key="error">{{ error }}</li>
+        </ul>
+        <ul v-if="relationMappingPreview.warnings.length" class="mapping-issue-list relation-preflight-warnings">
+          <li v-for="warning in relationMappingPreview.warnings" :key="warning">{{ warning }}</li>
+        </ul>
+      </section>
+
+      <template #footer>
+        <el-button @click="relationMappingDlg = false">取消</el-button>
+        <el-button :loading="relationMappingPreflighting" :disabled="Boolean(relationMappingMissingFields.length)" @click="preflightRelationMapping">预检</el-button>
+        <el-button type="primary" :loading="relationMappingSaving" :disabled="!relationMappingCanSave" @click="saveRelationMapping">确认保存</el-button>
       </template>
     </el-dialog>
 
@@ -701,40 +868,45 @@
         <div class="mapping-preview-grid">
           <section class="mapping-coverage">
             <div class="preview-section-title">属性覆盖</div>
-            <el-table :data="mappingPreview.fields" size="small" empty-text="对象类型暂无属性">
-              <el-table-column label="对象属性" min-width="150">
-                <template #default="{ row }">
-                  <span>{{ row.property_name }}</span>
-                  <el-tag v-if="row.is_key" size="small" effect="plain" class="field-flag">主键</el-tag>
-                  <el-tag v-else-if="row.is_required" size="small" effect="plain" type="warning" class="field-flag">必填</el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="源列" min-width="150">
-                <template #default="{ row }"><span class="mono">{{ row.source_column || '未配置' }}</span></template>
-              </el-table-column>
-              <el-table-column label="状态" width="100">
-                <template #default="{ row }">
-                  <el-tag size="small" effect="plain" :type="mappingFieldType(row.status)">{{ mappingFieldLabel(row.status) }}</el-tag>
-                </template>
-              </el-table-column>
-            </el-table>
+            <div v-if="mappingPreview.fields.length" class="mapping-field-list">
+              <article v-for="field in mappingPreview.fields" :key="field.property_name" class="mapping-field-card">
+                <div class="mapping-field-name">
+                  <b>{{ field.property_name }}</b>
+                  <span>
+                    <el-tag v-if="field.is_key" size="small" effect="plain">主键</el-tag>
+                    <el-tag v-if="field.is_title" size="small" effect="plain" type="success">标题</el-tag>
+                    <el-tag v-if="field.is_required" size="small" effect="plain" type="warning">必填</el-tag>
+                  </span>
+                </div>
+                <span class="mono">{{ field.source_column || '未配置源列' }}</span>
+                <el-tag size="small" effect="plain" :type="mappingFieldType(field.status)">{{ mappingFieldLabel(field.status) }}</el-tag>
+              </article>
+            </div>
+            <el-empty v-else description="对象类型暂无属性" :image-size="48" />
           </section>
           <section class="mapping-samples">
             <div class="preview-section-title">源表样本</div>
-            <el-table :data="mappingPreviewRows" size="small" max-height="300" empty-text="暂无数据">
-              <el-table-column v-for="column in mappingPreview.columns" :key="column" :prop="column" :label="column" min-width="130">
-                <template #default="{ row }"><StructuredValueCell :value="row[column]" /></template>
-              </el-table-column>
-            </el-table>
+            <div v-if="mappingPreviewRows.length" class="mapping-sample-list">
+              <article v-for="(row, rowIndex) in mappingPreviewRows" :key="rowIndex" class="mapping-sample-card">
+                <b class="mapping-sample-index">样本 {{ rowIndex + 1 }}</b>
+                <dl>
+                  <div v-for="column in mappingPreview.columns" :key="column"><dt>{{ column }}</dt><dd><StructuredValueCell :value="row[column]" /></dd></div>
+                </dl>
+              </article>
+            </div>
+            <el-empty v-else description="暂无样本数据" :image-size="48" />
           </section>
         </div>
         <section v-if="mappingTransformedRows.length" class="mapping-transformed">
           <div class="preview-section-title">转换后的对象样本</div>
-          <el-table :data="mappingTransformedRows" size="small" max-height="300">
-            <el-table-column v-for="column in mappingTransformedColumns" :key="column" :prop="column" :label="column" min-width="130">
-              <template #default="{ row }"><StructuredValueCell :value="row[column]" /></template>
-            </el-table-column>
-          </el-table>
+          <div class="mapping-sample-list transformed-sample-list">
+            <article v-for="(row, rowIndex) in mappingTransformedRows" :key="rowIndex" class="mapping-sample-card">
+              <b class="mapping-sample-index">对象样本 {{ rowIndex + 1 }}</b>
+              <dl>
+                <div v-for="column in mappingTransformedColumns" :key="column"><dt>{{ column }}</dt><dd><StructuredValueCell :value="row[column]" /></dd></div>
+              </dl>
+            </article>
+          </div>
         </section>
         <div v-if="mappingPreview.unmapped_columns.length" class="unmapped-columns">
           未映射源列：<span v-for="column in mappingPreview.unmapped_columns" :key="column" class="col-map">{{ column }}</span>
@@ -845,7 +1017,9 @@
         <div class="form-row">
           <el-form-item label="执行方式" class="form-col">
             <el-select v-model="actionForm.executor_type" style="width:100%" @change="resetActionExecutorConfig">
+              <el-option v-if="actionForm.executor_type === 'unbound'" label="待绑定（请先选择执行方式）" value="unbound" disabled />
               <el-option label="SQL 查询" value="sql" />
+              <el-option label="按模板生成附件" value="template" />
               <el-option label="受管技能 (Skill)" value="skill" />
               <el-option label="MCP 工具" value="mcp" />
               <el-option label="HTTP 请求" value="http" />
@@ -857,24 +1031,106 @@
         </div>
         <div class="form-row">
           <el-form-item label="执行前需要确认" class="form-col">
-            <el-switch v-model="actionForm.requires_confirmation" />
+            <el-switch v-model="actionForm.requires_confirmation" :disabled="actionForm.executor_type === 'template'" />
             <div class="form-help">确认前只允许预演，不会调用执行器</div>
           </el-form-item>
           <el-form-item label="防止重复提交" class="form-col">
-            <el-switch v-model="actionForm.idempotency_required" />
+            <el-switch v-model="actionForm.idempotency_required" :disabled="actionForm.executor_type === 'template'" />
             <div class="form-help">防止同一请求重复执行</div>
           </el-form-item>
         </div>
         <template v-if="actionForm.executor_type === 'sql'">
           <el-form-item label="数据源" required>
             <el-select v-model="actionForm.executor_config.data_source_id" filterable placeholder="选择已接入的数据源" style="width:100%">
-              <el-option v-for="source in scenarioDataSources" :key="source.id" :label="source.name" :value="source.id" />
+              <el-option v-for="source in databaseDataSources" :key="source.id" :label="source.name" :value="source.id" />
             </el-select>
           </el-form-item>
           <el-form-item label="只读 SQL" required>
             <el-input v-model="actionForm.executor_config.sql" type="textarea" :rows="5" class="mono" placeholder="SELECT * FROM orders WHERE order_id = {order_id}" />
             <div class="form-help">参数用 <code>{字段名}</code> 引用；系统只允许只读查询。</div>
           </el-form-item>
+        </template>
+        <template v-else-if="actionForm.executor_type === 'template'">
+          <el-alert title="Action 绑定模板中心中的受管模板；保存时会固定所选模板的当前版本，后续模板升级不会悄悄改变既有执行结果。" type="info" :closable="false" show-icon />
+          <div class="template-binding-head">
+            <span>模板资源由模板中心统一管理，不再直接绑定文件 ID。</span>
+            <el-button text type="primary" @click="goToTemplates">打开模板中心</el-button>
+          </div>
+          <el-alert
+            v-if="hasLegacyTemplateBinding"
+            title="这是旧式文件绑定。请选择一个模板中心资源后保存，即可完成迁移；未迁移前现有 Action 仍可继续执行。"
+            type="warning"
+            :closable="false"
+            show-icon
+            class="template-legacy-alert"
+          />
+          <el-form-item label="模板资源 / 版本" required>
+            <el-select
+              v-model="actionForm.executor_config.template_id"
+              filterable
+              :loading="actionTemplatesLoading"
+              placeholder="选择当前场景或租户共享模板"
+              aria-label="选择模板资源及当前版本"
+              style="width:100%"
+              @change="onActionTemplateChanged"
+            >
+              <el-option
+                v-for="template in actionTemplates"
+                :key="template.id"
+                :value="template.id"
+                :label="`${template.name} · ${templateVersionLabel(template)}`"
+                :disabled="Boolean(templateUnavailableReason(template)) && template.id !== originalActionTemplateId"
+              >
+                <div class="template-option">
+                  <span><b>{{ template.name }}</b><small>{{ template.purpose || scenarioTemplateScope(template) }}</small></span>
+                  <span>
+                    <el-tag size="small" effect="plain">{{ templateFormatLabel(template.current_version?.artifact_format) }}</el-tag>
+                    <em>{{ templateVersionLabel(template) }}</em>
+                  </span>
+                </div>
+              </el-option>
+            </el-select>
+            <div v-if="actionTemplatesError" class="mapping-inline-error" role="status">
+              <el-icon aria-hidden="true"><WarningFilled /></el-icon><span>{{ actionTemplatesError }}</span>
+              <el-button text type="primary" size="small" @click="loadActionTemplates">重试</el-button>
+            </div>
+            <div v-else-if="!actionTemplatesLoading && !actionTemplates.length" class="form-help">当前场景没有可选模板，请先在模板中心上传并登记。</div>
+          </el-form-item>
+          <section v-if="selectedActionTemplate" class="selected-template-summary" aria-label="已选模板摘要">
+            <header>
+              <div><b>{{ selectedActionTemplate.name }}</b><span>{{ selectedActionTemplate.purpose || '未填写业务用途' }}</span></div>
+              <div class="selected-template-tags">
+                <el-tag size="small" :type="selectedActionTemplate.status === 'active' ? 'success' : 'info'">{{ selectedActionTemplate.status === 'active' ? '使用中' : '已停用' }}</el-tag>
+                <el-tag size="small" effect="plain">{{ templateFormatLabel(selectedActionTemplate.current_version?.artifact_format) }}</el-tag>
+                <el-tag size="small" effect="plain">{{ boundTemplateVersionLabel }}</el-tag>
+              </div>
+            </header>
+            <div v-if="selectedTemplateVariables.length" class="selected-template-variables">
+              <span>变量</span><code v-for="variable in selectedTemplateVariables.slice(0, 8)" :key="variable">{{ variable }}</code>
+              <span v-if="selectedTemplateVariables.length > 8">另 {{ selectedTemplateVariables.length - 8 }} 项</span>
+            </div>
+            <footer>
+              <el-button size="small" plain @click="syncActionSchemaFromTemplate">同步变量到输入参数</el-button>
+              <el-button v-if="usesOlderTemplateVersion" size="small" text type="primary" @click="useCurrentTemplateVersion">改用当前 {{ templateVersionLabel(selectedActionTemplate) }}</el-button>
+            </footer>
+            <p v-if="templateUnavailableReason(selectedActionTemplate)" class="mapping-inline-error" role="status">
+              <el-icon aria-hidden="true"><WarningFilled /></el-icon>{{ templateUnavailableReason(selectedActionTemplate) }}；既有固定版本仍可执行，但不能建立新绑定。
+            </p>
+          </section>
+          <div class="form-row">
+            <el-form-item label="生成附件保存到" class="form-col" required>
+              <el-select v-model="actionForm.executor_config.target_data_source_id" filterable placeholder="选择输出文件资料库" style="width:100%">
+                <el-option v-for="source in fileBucketSources" :key="source.id" :label="`${source.name}${source.can_write === false ? '（只读，不能保存附件）' : ''}`" :value="source.id" :disabled="source.can_write === false" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="输出文件名" class="form-col">
+              <el-input v-model.trim="actionForm.executor_config.output_filename" placeholder="可不填；自动沿用模板格式" />
+              <div class="form-help">即使不写扩展名，系统也会使用源模板的扩展名。</div>
+            </el-form-item>
+          </div>
+          <el-empty v-if="!writableFileBucketSources.length" description="当前场景没有可写文件桶，无法保存 Agent 生成的附件" :image-size="54">
+            <el-button type="primary" plain @click="goToDataSources">创建文件桶</el-button>
+          </el-empty>
         </template>
         <el-form-item v-else-if="actionForm.executor_type === 'skill'" label="本地技能" required>
           <el-select v-model="actionForm.executor_config.skill_id" filterable placeholder="选择已启用技能" style="width:100%">
@@ -898,6 +1154,27 @@
         </template>
         <el-form-item label="输入参数">
           <SchemaFieldBuilder v-model="actionForm.input_schema" empty-text="此操作不需要输入参数" />
+        </el-form-item>
+        <el-alert
+          v-if="actionLegacyConditions.length"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="旧条件只是自然语言，系统不能把它当作可靠的执行门禁"
+          class="action-condition-alert"
+        >
+          <template #default>
+            <span>请按下面的表单重新配置；如果旧说明不再需要，可明确清除后再保存。</span>
+            <el-button size="small" plain type="warning" @click="clearLegacyActionConditions">清除旧说明</el-button>
+          </template>
+        </el-alert>
+        <el-form-item label="执行前条件">
+          <RuleConditionBuilder v-model="actionPrecondition" :fields="actionInputFieldNames" />
+          <div class="form-help">只使用输入参数做可验证判断；不满足时，预演和实际执行都会被拒绝。</div>
+        </el-form-item>
+        <el-form-item label="执行后校验">
+          <RuleConditionBuilder v-model="actionPostcondition" :fields="[]" />
+          <div class="form-help">按执行器返回的字段校验结果；属性名可直接输入，校验失败会将本次执行标记为失败。</div>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -1066,7 +1343,17 @@ import StructuredValueCell from '@/components/StructuredValueCell.vue'
 import StructuredValueEditor from '@/components/StructuredValueEditor.vue'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
-import type { AssistantActionPreview, ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, WorkflowRun } from '@/types'
+import { safeInternalReturnPath } from '@/utils/navigation'
+import {
+  RELATION_MAPPING_MODES,
+  buildRelationMappingPayload,
+  missingRelationMappingFields,
+  relationMappingModeDescription,
+  relationMappingModeLabel,
+  relationMappingPayloadFingerprint,
+} from '@/utils/relationMappings'
+import type { ArtifactTemplate, AssistantActionPreview, ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, Relation, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, RelationDataMapping, RelationDataMappingInput, RelationDataMappingPreview, TableInfo, WorkflowRun } from '@/types'
+import { cleanTemplateExecutorConfig, templateFormatLabel, templatePathsToSchema, templateUnavailableReason } from '@/utils/templates'
 
 const route = useRoute()
 const router = useRouter()
@@ -1078,17 +1365,26 @@ const scenarioLoadError = ref('')
 const detail = ref<ScenarioDetail>({
   id: sid, name: '', description: '',
   entities: [], relations: [], data_sources: [],
-  instances: [], relation_instances: [], mappings: [],
+  instances: [], relation_instances: [], mappings: [], relation_mappings: [],
   functions: [],
   actions: [], rules: [], events: [], workflows: [],
 })
 // The API supplies this per current user; treat an absent value as read-only.
 const canWrite = computed(() => detail.value.can_write === true)
+const returnPath = computed(() => safeInternalReturnPath(route.query.return_to, '/scenarios'))
 const dataSources = ref<any[]>([])
 const llmConfigs = ref<any[]>([])
 const skills = ref<any[]>([])
 const mcpConfigs = ref<any[]>([])
 const scenarioDataSources = computed(() => dataSources.value.filter((source) => !source.scenario_id || source.scenario_id === sid))
+const databaseDataSources = computed(() => scenarioDataSources.value.filter((source) => source.type !== 'file_bucket'))
+const fileBucketSources = computed(() => scenarioDataSources.value.filter((source) => source.type === 'file_bucket'))
+const writableFileBucketSources = computed(() => fileBucketSources.value.filter((source) => source.can_write !== false))
+const concreteEntities = computed(() => detail.value.entities.filter((entity) => !entity.is_abstract))
+const concreteEntityCount = computed(() => concreteEntities.value.length)
+const modelReadyCount = computed(() => concreteEntities.value.filter((entity) => entity.model_ready).length)
+const titleReadyCount = computed(() => concreteEntities.value.filter((entity) => entity.properties.filter((property) => property.is_title).length === 1).length)
+const unreadyConcreteEntities = computed(() => concreteEntities.value.filter((entity) => !entity.model_ready))
 const stageNames = new Set(['ontology', 'instances', 'mappings', 'functions', 'actions', 'rules', 'events', 'workflows'])
 const requestedStage = Array.isArray(route.query.stage) ? route.query.stage[0] : route.query.stage
 const tab = ref(typeof requestedStage === 'string' && stageNames.has(requestedStage) ? requestedStage : 'ontology')
@@ -1202,15 +1498,6 @@ function entColor(id: string) {
 }
 function dsName(id: string) { return dataSources.value.find((d) => d.id === id)?.name || '—' }
 
-function openAssistantDraft() {
-  if (!canWrite.value) return
-  window.dispatchEvent(new CustomEvent('assistant-open-request', {
-    detail: {
-      mode: 'draft',
-      prompt: `请只生成或完善“${detail.value.name}”的本体模型草稿。完整提取对象类型、属性、主键、关系类型、基数和约束；逐项列出来源与不确定项。不要生成数据映射或工作流。\n\n业务描述：${detail.value.description || '暂无，请先向我询问业务目标和边界。'}`,
-    },
-  }))
-}
 // ── 对象运行时浏览 ──
 async function searchObjects() {
   const requestKey = objectSearchKey()
@@ -1353,8 +1640,8 @@ function openRelation(id?: string) {
     kind: 'relation',
     id: r?.id,
     form: r
-      ? { name: r.name, namespace: r.namespace || '', source_entity_id: r.source_entity_id, target_entity_id: r.target_entity_id, relation_type: r.relation_type, description: r.description }
-      : { name: '', namespace: '', source_entity_id: detail.value.entities[0]?.id || '', target_entity_id: detail.value.entities[1]?.id || '', relation_type: '1:N', description: '' },
+      ? { name: r.name, namespace: r.namespace || '', source_entity_id: r.source_entity_id, target_entity_id: r.target_entity_id, relation_type: r.relation_type, description: r.description, constraints: structuredClone(r.constraints || {}) }
+      : { name: '', namespace: '', source_entity_id: detail.value.entities[0]?.id || '', target_entity_id: detail.value.entities[1]?.id || detail.value.entities[0]?.id || '', relation_type: '1:N', description: '', constraints: {} },
   }
 }
 function openInstance(id?: string) {
@@ -1565,6 +1852,14 @@ function mappingStatusLabel(status?: string) {
 function mappingStatusType(status?: string) {
   return ({ unknown: 'info', ready: 'success', queued: 'warning', refreshing: 'primary', retry_waiting: 'warning', ok: 'success', error: 'danger' } as Record<string, string>)[status || 'unknown'] || 'info'
 }
+function mappingIdentityCoverage(row: DataMapping) {
+  const entity = detail.value.entities.find((item) => item.id === row.entity_id)
+  const mappedProperties = new Set(Object.entries(row.column_map || {}).filter(([, column]) => Boolean(String(column || '').trim())).map(([property]) => property))
+  return {
+    key: Boolean(entity?.properties.some((property) => property.is_key && mappedProperties.has(property.name))),
+    title: Boolean(entity?.properties.some((property) => property.is_title && mappedProperties.has(property.name))),
+  }
+}
 function mappingRefreshJob(row: DataMapping): DataMappingRefreshJob | undefined {
   return row.id ? mappingRefreshJobs.value[row.id] : undefined
 }
@@ -1662,7 +1957,7 @@ function openMapping(id?: string) {
   const m = id ? detail.value.mappings.find((x) => x.id === id) : null
   mappingForm.value = m
     ? { ...m, data_source_binding_ref: { ...(m.data_source_binding_ref || {}) }, column_map: { ...(m.column_map || {}) } }
-    : { entity_id: detail.value.entities[0]?.id, data_source_id: scenarioDataSources.value[0]?.id, data_source_binding_key: '', data_source_binding_ref: {}, table_name: '', column_map: {} }
+    : { entity_id: detail.value.entities[0]?.id, data_source_id: databaseDataSources.value[0]?.id, data_source_binding_key: '', data_source_binding_ref: {}, table_name: '', column_map: {} }
   const savedRules = ((m as unknown as { transform_rules?: Record<string, MappingTransformRule[]> } | null)?.transform_rules || {})
   mappingTransformRules.value = Object.fromEntries(Object.entries(savedRules).map(([propertyName, rules]) => [
     propertyName,
@@ -1777,6 +2072,275 @@ async function removeMapping(id: string) {
     clearMappingRefreshTracking(id)
     await load()
   } catch { /* ignore */ }
+}
+
+// ── 关系映射：结构化选择 → 服务端预检 → 保存 ──
+type SavedDataMapping = DataMapping & { id: string }
+function emptyRelationMappingForm(): RelationDataMappingInput {
+  return {
+    relation_id: '',
+    source_mapping_id: '',
+    target_mapping_id: '',
+    mode: 'source_fk',
+    foreign_key_column: '',
+    join_data_source_id: '',
+    join_table_name: '',
+    source_key_column: '',
+    target_key_column: '',
+  }
+}
+const relationMappingDlg = ref(false)
+const relationMappingEditingId = ref('')
+const relationMappingForm = ref<RelationDataMappingInput>(emptyRelationMappingForm())
+const relationMappingPreview = ref<RelationDataMappingPreview | null>(null)
+const relationMappingPreviewFingerprint = ref('')
+const relationMappingPreflighting = ref(false)
+const relationMappingSaving = ref(false)
+const relationMappingOptionsLoading = ref(false)
+const relationMappingTables = ref<TableInfo[]>([])
+const relationMappingColumns = ref<string[]>([])
+let relationMappingOptionsRequest = 0
+let relationMappingPreflightRequest = 0
+
+const selectedRelationMappingRelation = computed<Relation | undefined>(() => (
+  detail.value.relations.find((relation) => relation.id === relationMappingForm.value.relation_id)
+))
+const relationSourceObjectMappings = computed<SavedDataMapping[]>(() => {
+  const entityId = selectedRelationMappingRelation.value?.source_entity_id
+  return detail.value.mappings.filter((mapping): mapping is SavedDataMapping => Boolean(mapping.id) && mapping.entity_id === entityId)
+})
+const relationTargetObjectMappings = computed<SavedDataMapping[]>(() => {
+  const entityId = selectedRelationMappingRelation.value?.target_entity_id
+  return detail.value.mappings.filter((mapping): mapping is SavedDataMapping => Boolean(mapping.id) && mapping.entity_id === entityId)
+})
+const relationMappingMissingEndpointNames = computed(() => {
+  const relation = selectedRelationMappingRelation.value
+  if (!relation) return []
+  const missing: string[] = []
+  if (!relationSourceObjectMappings.value.length) missing.push(`来源对象“${entName(relation.source_entity_id)}”`)
+  if (!relationTargetObjectMappings.value.length) missing.push(`目标对象“${entName(relation.target_entity_id)}”`)
+  return missing
+})
+const relationMappingCarrier = computed<SavedDataMapping | undefined>(() => {
+  const mappingId = relationMappingForm.value.mode === 'source_fk'
+    ? relationMappingForm.value.source_mapping_id
+    : relationMappingForm.value.target_mapping_id
+  return detail.value.mappings.find((mapping): mapping is SavedDataMapping => mapping.id === mappingId)
+})
+const relationMappingPayload = computed(() => buildRelationMappingPayload(relationMappingForm.value))
+const relationMappingCurrentFingerprint = computed(() => relationMappingPayloadFingerprint(relationMappingForm.value))
+const relationMappingMissingFields = computed(() => missingRelationMappingFields(relationMappingPayload.value))
+const relationMappingPreviewIsCurrent = computed(() => Boolean(
+  relationMappingPreview.value
+  && relationMappingPreviewFingerprint.value
+  && relationMappingPreviewFingerprint.value === relationMappingCurrentFingerprint.value,
+))
+const relationMappingCanSave = computed(() => Boolean(
+  canWrite.value
+  && relationMappingPreviewIsCurrent.value
+  && relationMappingPreview.value?.ok
+  && !relationMappingMissingFields.value.length
+  && !relationMappingSaving.value,
+))
+const relationMappingStep = computed(() => {
+  if (!relationMappingForm.value.relation_id) return 0
+  if (relationMappingMissingFields.value.length) return 1
+  if (!relationMappingPreviewIsCurrent.value) return 2
+  return relationMappingPreview.value?.ok ? 3 : 2
+})
+
+function objectMappingOptionLabel(mapping: DataMapping) {
+  return `${mapping.data_source_name || dsName(mapping.data_source_id)} / ${mapping.table_name || '未选择表'}`
+}
+function invalidateRelationMappingPreview() {
+  relationMappingPreflightRequest += 1
+  relationMappingPreview.value = null
+  relationMappingPreviewFingerprint.value = ''
+}
+function resetRelationMappingFields() {
+  relationMappingForm.value.foreign_key_column = ''
+  relationMappingForm.value.join_data_source_id = ''
+  relationMappingForm.value.join_table_name = ''
+  relationMappingForm.value.source_key_column = ''
+  relationMappingForm.value.target_key_column = ''
+  relationMappingTables.value = []
+  relationMappingColumns.value = []
+  invalidateRelationMappingPreview()
+}
+function selectOnlyEndpointMappings() {
+  relationMappingForm.value.source_mapping_id = relationSourceObjectMappings.value.length === 1
+    ? relationSourceObjectMappings.value[0].id
+    : ''
+  relationMappingForm.value.target_mapping_id = relationTargetObjectMappings.value.length === 1
+    ? relationTargetObjectMappings.value[0].id
+    : ''
+}
+async function loadRelationMappingOptions() {
+  const request = ++relationMappingOptionsRequest
+  relationMappingOptionsLoading.value = true
+  relationMappingTables.value = []
+  relationMappingColumns.value = []
+  try {
+    if (relationMappingForm.value.mode === 'join_table') {
+      const dataSourceId = relationMappingForm.value.join_data_source_id
+      if (!dataSourceId) return
+      const tables = await api.listTables(dataSourceId)
+      if (request !== relationMappingOptionsRequest) return
+      relationMappingTables.value = tables
+      const table = tables.find((item) => item.name === relationMappingForm.value.join_table_name)
+      relationMappingColumns.value = table?.columns.map((column) => column.name) || []
+      return
+    }
+    const carrier = relationMappingCarrier.value
+    if (!carrier?.data_source_id || !carrier.table_name) return
+    const tables = await api.listTables(carrier.data_source_id)
+    if (request !== relationMappingOptionsRequest) return
+    relationMappingTables.value = tables
+    relationMappingColumns.value = tables.find((item) => item.name === carrier.table_name)?.columns.map((column) => column.name) || []
+  } catch (error: any) {
+    if (request === relationMappingOptionsRequest) ElMessage.error(error?.message || '真实数据表字段加载失败')
+  } finally {
+    if (request === relationMappingOptionsRequest) relationMappingOptionsLoading.value = false
+  }
+}
+function onRelationMappingRelationChange() {
+  selectOnlyEndpointMappings()
+  resetRelationMappingFields()
+  void loadRelationMappingOptions()
+}
+function onRelationMappingEndpointChange() {
+  resetRelationMappingFields()
+  void loadRelationMappingOptions()
+}
+function onRelationMappingModeChange() {
+  resetRelationMappingFields()
+  void loadRelationMappingOptions()
+}
+function onRelationJoinDataSourceChange() {
+  relationMappingForm.value.join_table_name = ''
+  relationMappingForm.value.source_key_column = ''
+  relationMappingForm.value.target_key_column = ''
+  invalidateRelationMappingPreview()
+  void loadRelationMappingOptions()
+}
+function onRelationJoinTableChange() {
+  relationMappingForm.value.source_key_column = ''
+  relationMappingForm.value.target_key_column = ''
+  invalidateRelationMappingPreview()
+  const table = relationMappingTables.value.find((item) => item.name === relationMappingForm.value.join_table_name)
+  relationMappingColumns.value = table?.columns.map((column) => column.name) || []
+}
+async function openRelationMapping(id?: string) {
+  if (!canWrite.value) return
+  const existing = id ? detail.value.relation_mappings.find((mapping) => mapping.id === id) : undefined
+  relationMappingEditingId.value = existing?.id || ''
+  relationMappingForm.value = existing
+    ? {
+        relation_id: existing.relation_id,
+        source_mapping_id: existing.source_mapping_id,
+        target_mapping_id: existing.target_mapping_id,
+        mode: existing.mode,
+        foreign_key_column: existing.foreign_key_column || '',
+        join_data_source_id: existing.mode === 'join_table' ? existing.data_source_id : '',
+        join_table_name: existing.mode === 'join_table' ? existing.table_name : '',
+        source_key_column: existing.source_key_column || '',
+        target_key_column: existing.target_key_column || '',
+      }
+    : emptyRelationMappingForm()
+  if (!existing) {
+    const firstUnmapped = detail.value.relations.find((relation) => (
+      relation.id && !detail.value.relation_mappings.some((mapping) => mapping.relation_id === relation.id)
+    ))
+    relationMappingForm.value.relation_id = firstUnmapped?.id || detail.value.relations[0]?.id || ''
+    selectOnlyEndpointMappings()
+  }
+  invalidateRelationMappingPreview()
+  relationMappingDlg.value = true
+  await nextTick()
+  await loadRelationMappingOptions()
+}
+function resetRelationMappingDialog() {
+  relationMappingOptionsRequest += 1
+  relationMappingPreflightRequest += 1
+  relationMappingEditingId.value = ''
+  relationMappingForm.value = emptyRelationMappingForm()
+  relationMappingPreview.value = null
+  relationMappingPreviewFingerprint.value = ''
+  relationMappingTables.value = []
+  relationMappingColumns.value = []
+  relationMappingOptionsLoading.value = false
+  relationMappingPreflighting.value = false
+}
+function openMappingForEntity(entityId: string) {
+  relationMappingDlg.value = false
+  openMapping()
+  mappingForm.value.entity_id = entityId
+  onMappingEntityChange()
+}
+async function preflightRelationMapping(): Promise<boolean> {
+  if (!canWrite.value) return false
+  const payload = relationMappingPayload.value
+  const missing = missingRelationMappingFields(payload)
+  if (missing.length) {
+    ElMessage.warning(`请先完成：${missing.join('、')}`)
+    return false
+  }
+  const fingerprint = relationMappingPayloadFingerprint(payload)
+  const request = ++relationMappingPreflightRequest
+  relationMappingPreflighting.value = true
+  try {
+    const preview = await api.preflightRelationMapping(sid, payload)
+    if (request !== relationMappingPreflightRequest || fingerprint !== relationMappingCurrentFingerprint.value) return false
+    relationMappingPreview.value = preview
+    relationMappingPreviewFingerprint.value = fingerprint
+    if (preview.ok) ElMessage.success('预检通过，可以保存关系映射')
+    else ElMessage.warning('预检发现阻塞问题，请按提示修正')
+    return preview.ok
+  } catch (error: any) {
+    if (request === relationMappingPreflightRequest) {
+      relationMappingPreview.value = null
+      relationMappingPreviewFingerprint.value = ''
+      ElMessage.error(error?.message || '关系映射预检失败')
+    }
+    return false
+  } finally {
+    if (request === relationMappingPreflightRequest) relationMappingPreflighting.value = false
+  }
+}
+async function saveRelationMapping() {
+  if (!relationMappingCanSave.value) return
+  relationMappingSaving.value = true
+  try {
+    // Re-run the server preflight immediately before the write so a stale UI
+    // success cannot bypass changed mappings, tables or columns.
+    if (!await preflightRelationMapping()) return
+    const payload = relationMappingPayload.value
+    if (relationMappingEditingId.value) await api.updateRelationMapping(relationMappingEditingId.value, payload)
+    else await api.createRelationMapping(sid, payload)
+    relationMappingDlg.value = false
+    await load()
+    ElMessage.success('关系映射已保存')
+  } catch (error: any) {
+    ElMessage.error(error?.message || '关系映射保存失败')
+  } finally {
+    relationMappingSaving.value = false
+  }
+}
+async function preflightSavedRelationMapping(row: RelationDataMapping) {
+  if (!canWrite.value) return
+  await openRelationMapping(row.id)
+  await preflightRelationMapping()
+}
+async function removeRelationMapping(row: RelationDataMapping) {
+  if (!canWrite.value) return
+  try {
+    await ElMessageBox.confirm(`删除关系“${row.relation_name}”的数据映射？系统会同时删除由该映射自动生成的关系链接，手工创建的关系不受影响。`, '确认删除', { type: 'warning' })
+    await api.deleteRelationMapping(row.id)
+    await load()
+    ElMessage.success('关系映射已删除')
+  } catch (error: any) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error?.message || '关系映射删除失败')
+  }
 }
 
 // ── 业务函数：闭集、无副作用的确定性运行方式 ──
@@ -1929,6 +2493,13 @@ async function doRunFunction(row: FunctionDefinition) {
 // ── 操作（Actions）──
 const actionDlg = ref(false)
 const actionForm = ref<any>({ executor_type: 'sql', executor_config: {}, input_schema: emptyFunctionSchema() })
+const actionPrecondition = ref<Record<string, any>>({})
+const actionPostcondition = ref<Record<string, any>>({})
+const actionLegacyConditions = ref<string[]>([])
+const actionTemplates = ref<ArtifactTemplate[]>([])
+const actionTemplatesLoading = ref(false)
+const actionTemplatesError = ref('')
+const originalActionTemplateId = ref('')
 const actionExecuteDlg = ref(false)
 const actionExecuteRow = ref<any>(null)
 const actionParamsForm = ref<Record<string, any>>({})
@@ -1948,6 +2519,10 @@ const hasPinnedActionPreview = computed(() => {
   )
 })
 
+function cloneActionJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
 function actionSchemaRoot(schema: any): { properties: Record<string, any>; required: string[] } {
   if (!schema || typeof schema !== 'object') return { properties: {}, required: [] }
   if (schema.properties && typeof schema.properties === 'object') {
@@ -1956,7 +2531,7 @@ function actionSchemaRoot(schema: any): { properties: Record<string, any>; requi
   return { properties: schema, required: [] }
 }
 function actionExecutorLabel(type?: string) {
-  return ({ sql: '数据库查询', skill: '本地技能', mcp: '外部工具', http: 'HTTPS 接口', script: '受控脚本' } as Record<string, string>)[type || ''] || '未配置'
+  return ({ unbound: '待绑定', sql: '数据库查询', template: '模板附件', skill: '本地技能', mcp: '外部工具', http: 'HTTPS 接口', script: '受控脚本' } as Record<string, string>)[type || ''] || '未配置'
 }
 const actionParameterFields = computed(() => {
   const root = actionSchemaRoot(actionExecuteRow.value?.input_schema)
@@ -1967,6 +2542,46 @@ const actionParameterFields = computed(() => {
     description: schema?.description || '',
   }))
 })
+const actionInputFieldNames = computed(() => Object.keys(actionSchemaRoot(actionForm.value?.input_schema).properties))
+const selectedActionTemplate = computed(() => actionTemplates.value.find((template) => template.id === actionForm.value?.executor_config?.template_id) || null)
+const hasLegacyTemplateBinding = computed(() => Boolean(
+  actionForm.value?.executor_type === 'template'
+  && actionForm.value?.executor_config?.template_file_id
+  && !actionForm.value?.executor_config?.template_id,
+))
+const selectedTemplateVariables = computed(() => {
+  const configPaths = actionForm.value?.executor_config?.template_variable_paths
+  if (Array.isArray(configPaths) && actionForm.value?.executor_config?.template_version) return configPaths
+  return selectedActionTemplate.value?.current_version?.placeholder_paths || []
+})
+const usesOlderTemplateVersion = computed(() => {
+  const pinned = Number(actionForm.value?.executor_config?.template_version || 0)
+  const current = Number(selectedActionTemplate.value?.current_version?.version || 0)
+  return Boolean(pinned && current && pinned !== current)
+})
+const boundTemplateVersionLabel = computed(() => {
+  const pinned = Number(actionForm.value?.executor_config?.template_version || 0)
+  if (pinned) return usesOlderTemplateVersion.value ? `固定 v${pinned}` : `v${pinned}（已固定）`
+  return templateVersionLabel(selectedActionTemplate.value)
+})
+function parseActionCondition(value: unknown, label: string): Record<string, any> {
+  if (value === null || value === undefined || value === '') return {}
+  if (typeof value === 'object' && !Array.isArray(value)) return cloneActionJson(value as Record<string, any>)
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+    } catch { /* 旧自然语言条件由下方阻塞提示处理。 */ }
+    actionLegacyConditions.value.push(`${label}：${value}`)
+  }
+  return {}
+}
+function clearLegacyActionConditions() {
+  actionLegacyConditions.value = []
+}
+function serializedActionCondition(value: Record<string, any>) {
+  return Object.keys(value || {}).length ? JSON.stringify(value) : ''
+}
 function createIdempotencyKey() {
   const cryptoApi = globalThis.crypto as Crypto | undefined
   if (cryptoApi?.randomUUID) return cryptoApi.randomUUID()
@@ -1977,10 +2592,77 @@ function emptyExecutorConfig(type: string) {
   if (type === 'skill') return { skill_id: '' }
   if (type === 'mcp') return { mcp_id: '', tool_name: '' }
   if (type === 'http') return { method: 'GET', url: '', headers: {} }
+  if (type === 'template') return { template_id: '', target_data_source_id: '', output_filename: '' }
   return {}
 }
 function resetActionExecutorConfig(type: string) {
   actionForm.value.executor_config = emptyExecutorConfig(type)
+  originalActionTemplateId.value = ''
+  if (type === 'template') {
+    actionForm.value.requires_confirmation = true
+    actionForm.value.idempotency_required = true
+    actionForm.value.executor_config.target_data_source_id = writableFileBucketSources.value[0]?.id || ''
+    void loadActionTemplates()
+  }
+}
+function templateVersionLabel(template?: ArtifactTemplate | null) {
+  return template?.current_version ? `v${template.current_version.version}（当前）` : '无可用版本'
+}
+function scenarioTemplateScope(template: ArtifactTemplate) {
+  return template.scenario_id ? '当前场景模板' : '租户共享模板'
+}
+async function loadActionTemplates() {
+  actionTemplatesLoading.value = true
+  actionTemplatesError.value = ''
+  try {
+    actionTemplates.value = await api.listTemplates({ scenario_id: sid })
+  } catch (error: any) {
+    actionTemplatesError.value = error?.message || '模板资源加载失败'
+  } finally {
+    actionTemplatesLoading.value = false
+  }
+}
+function onActionTemplateChanged(templateId: string) {
+  const template = actionTemplates.value.find((item) => item.id === templateId)
+  if (!template || templateUnavailableReason(template)) return
+  let generatedSchema: Record<string, any>
+  try {
+    generatedSchema = templatePathsToSchema(template.current_version?.placeholder_paths || [])
+  } catch (error: any) {
+    actionForm.value.executor_config.template_id = originalActionTemplateId.value || ''
+    ElMessage.error(error?.message || '模板变量路径不安全，不能绑定该模板')
+    return
+  }
+  actionForm.value.executor_config = cleanTemplateExecutorConfig(actionForm.value.executor_config, templateId)
+  if (!Object.keys(actionSchemaRoot(actionForm.value.input_schema).properties).length) {
+    actionForm.value.input_schema = generatedSchema
+  }
+}
+async function syncActionSchemaFromTemplate() {
+  if (!selectedActionTemplate.value) return
+  let generatedSchema: Record<string, any>
+  try {
+    generatedSchema = templatePathsToSchema(selectedActionTemplate.value.current_version?.placeholder_paths || [])
+  } catch (error: any) {
+    ElMessage.error(error?.message || '模板变量路径不安全，不能同步输入参数')
+    return
+  }
+  if (Object.keys(actionSchemaRoot(actionForm.value.input_schema).properties).length) {
+    try {
+      await ElMessageBox.confirm('这会用当前模板变量替换已有输入参数定义，是否继续？', '同步模板变量', {
+        type: 'warning', confirmButtonText: '替换并同步', cancelButtonText: '取消',
+      })
+    } catch { return }
+  }
+  actionForm.value.input_schema = generatedSchema
+  ElMessage.success('模板变量已同步到输入参数')
+}
+function useCurrentTemplateVersion() {
+  if (!selectedActionTemplate.value) return
+  actionForm.value.executor_config = cleanTemplateExecutorConfig(
+    actionForm.value.executor_config,
+    selectedActionTemplate.value.id,
+  )
 }
 function openAction(id?: string) {
   if (!canWrite.value) return
@@ -1988,22 +2670,53 @@ function openAction(id?: string) {
   actionForm.value = a
     ? {
         ...a,
-        executor_config: { ...emptyExecutorConfig(a.executor_type || 'sql'), ...structuredClone(a.executor_config || {}) },
-        input_schema: structuredClone(a.input_schema || emptyFunctionSchema()),
+        executor_config: { ...emptyExecutorConfig(a.executor_type || 'sql'), ...cloneActionJson(a.executor_config || {}) },
+        input_schema: cloneActionJson(a.input_schema || emptyFunctionSchema()),
       }
     : {
         entity_id: detail.value.entities[0]?.id || '', name: '', description: '', executor_type: 'sql',
         executor_config: { data_source_id: '', sql: '' }, input_schema: emptyFunctionSchema(), enabled: true,
         requires_confirmation: true, idempotency_required: true, permission_scope: 'scenario',
       }
+  actionLegacyConditions.value = []
+  actionPrecondition.value = parseActionCondition(actionForm.value.precondition, '执行前条件')
+  actionPostcondition.value = parseActionCondition(actionForm.value.postcondition, '执行后校验')
+  originalActionTemplateId.value = actionForm.value.executor_type === 'template'
+    ? String(actionForm.value.executor_config.template_id || '')
+    : ''
+  if (actionForm.value.executor_type === 'template') void loadActionTemplates()
   actionDlg.value = true
 }
 async function saveAction() {
   if (!canWrite.value) return
+  if (actionLegacyConditions.value.length) return ElMessage.warning('请先重新配置或明确清除旧的自然语言条件')
   const f = {
     ...actionForm.value,
-    executor_config: structuredClone(actionForm.value.executor_config || {}),
-    input_schema: structuredClone(actionForm.value.input_schema || emptyFunctionSchema()),
+    executor_config: cloneActionJson(actionForm.value.executor_config || {}),
+    input_schema: cloneActionJson(actionForm.value.input_schema || emptyFunctionSchema()),
+    precondition: serializedActionCondition(actionPrecondition.value),
+    postcondition: serializedActionCondition(actionPostcondition.value),
+  }
+  if (f.executor_type === 'unbound') return ElMessage.warning('请先选择并配置实际执行方式')
+  if (f.executor_type === 'template') {
+    const usesManagedTemplate = Boolean(f.executor_config.template_id)
+    const keepsLegacyBinding = Boolean(f.id && f.executor_config.template_file_id && !usesManagedTemplate)
+    if ((!usesManagedTemplate && !keepsLegacyBinding) || !f.executor_config.target_data_source_id) {
+      return ElMessage.warning('请选择模板中心资源和生成附件的保存文件桶')
+    }
+    const targetBucket = fileBucketSources.value.find((source) => source.id === f.executor_config.target_data_source_id)
+    if (targetBucket?.can_write === false) return ElMessage.warning('所选附件文件桶为只读，请改选可写文件桶')
+    const selected = actionTemplates.value.find((template) => template.id === f.executor_config.template_id)
+    if (selected && templateUnavailableReason(selected) && selected.id !== originalActionTemplateId.value) {
+      return ElMessage.warning(templateUnavailableReason(selected))
+    }
+    if (usesManagedTemplate) {
+      f.executor_config = cleanTemplateExecutorConfig(
+        f.executor_config,
+        f.executor_config.template_id,
+        Number(f.executor_config.template_version || 0) || '',
+      )
+    }
   }
   try {
     if (f.id) await api.updateAction(f.id, f)
@@ -2161,6 +2874,7 @@ function condSummary(c: any): string {
     return (c.conditions || []).map((x: any) => condSummary(x)).join(` ${c.op.toUpperCase()} `)
   }
   if (c.op === 'not') return `NOT(${condSummary(c.conditions?.[0])})`
+  if (c.value_field) return `${c.field || '?'} ${c.op || ''} 属性「${c.value_field}」`
   const value = Array.isArray(c.value)
     ? c.value.join('、')
     : c.value && typeof c.value === 'object'
@@ -2292,6 +3006,7 @@ function ruleRecordTemplate(condition: any): Record<string, any> {
   const visit = (node: any) => {
     if (!node || typeof node !== 'object') return
     if (node.field) fields.add(String(node.field))
+    if (node.value_field) fields.add(String(node.value_field))
     ;(node.conditions || []).forEach(visit)
   }
   visit(condition)
@@ -2383,6 +3098,7 @@ watch(canWrite, (allowed) => {
   if (allowed) return
   editor.value = null
   mappingDlg.value = false
+  relationMappingDlg.value = false
   functionDlg.value = false
   actionDlg.value = false
   actionExecuteDlg.value = false
@@ -2397,7 +3113,8 @@ async function load() {
   scenarioAccessDenied.value = false
   scenarioLoadError.value = ''
   try {
-    detail.value = await api.getScenario(sid)
+    const loaded = await api.getScenario(sid)
+    detail.value = { ...loaded, relation_mappings: loaded.relation_mappings || [] }
   } catch (e: any) {
     if (Number(e?.status || e?.response?.status) === 403) {
       scenarioAccessDenied.value = true
@@ -2421,9 +3138,12 @@ async function load() {
   }
   await searchObjects()
 }
-function goBack() { router.push('/scenarios') }
+function goBack() { void router.push(returnPath.value) }
 function goToDataSources() {
   router.push({ name: 'data-sources', query: { scenario_id: sid, return_to: route.fullPath } })
+}
+function goToTemplates() {
+  router.push({ name: 'templates', query: { scenario_id: sid, return_to: route.fullPath } })
 }
 function onAssistantApplied(event: Event) {
   const detail = (event as CustomEvent<{ scenario_id?: string }>).detail || {}
@@ -2431,6 +3151,10 @@ function onAssistantApplied(event: Event) {
 }
 function requestedActionId() {
   const value = route.query.action_id
+  return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
+}
+function requestedEditActionId() {
+  const value = route.query.edit_action_id
   return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
 }
 function consumeAssistantActionPreviewState(): AssistantActionPreview | undefined {
@@ -2504,7 +3228,12 @@ onMounted(async () => {
   objectSearchViewDisposed = false
   if (route.query.stage !== tab.value) void router.replace({ query: { ...route.query, stage: tab.value } })
   await load()
-  await openGovernedActionById(requestedActionId(), consumeAssistantActionPreviewState())
+  const editActionId = requestedEditActionId()
+  if (editActionId && canWrite.value && detail.value.actions.some((action) => action.id === editActionId)) {
+    openAction(editActionId)
+  } else {
+    await openGovernedActionById(requestedActionId(), consumeAssistantActionPreviewState())
+  }
   window.addEventListener('assistant-proposal-applied', onAssistantApplied)
   window.addEventListener('open-governed-action', onOpenGovernedAction)
 })
@@ -2659,10 +3388,13 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 360px;
   gap: 12px;
-  flex: 1;
+  flex: 0 0 auto;
+  height: clamp(500px, 66dvh, 760px);
   min-height: 0;
 }
 .instance-workspace .graph-stage {
+  height: 100%;
+  min-height: 0;
   min-width: 0;
 }
 .object-explorer {
@@ -2886,6 +3618,134 @@ onBeforeUnmount(() => {
 }
 
 /* ── 数据映射 ── */
+.mapping-stats {
+  flex-wrap: wrap;
+}
+.stat-warning {
+  border-color: color-mix(in srgb, var(--warning) 38%, var(--border));
+  color: var(--warning);
+}
+.mapping-readiness-alert,
+.mapping-prerequisite {
+  margin-bottom: 12px;
+}
+.mapping-section {
+  min-width: 0;
+  margin-bottom: 16px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  box-shadow: var(--shadow-xs);
+}
+.mapping-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.mapping-section-head > div {
+  min-width: 0;
+}
+.mapping-section-head h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 15px;
+}
+.mapping-section-head p {
+  margin: 4px 0 0;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.mapping-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr));
+  gap: 12px;
+}
+.mapping-item-card {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--surface-2);
+}
+.mapping-item-head {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.mapping-source,
+.relation-mapping-title {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.mapping-source b,
+.relation-mapping-title b {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.mapping-source span,
+.relation-mapping-title span {
+  color: var(--text-3);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.mapping-readiness-tags,
+.mapping-item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+.mapping-item-actions {
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.mapping-item-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+.mapping-inline-error {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.mapping-inline-error .el-icon {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+.relation-mapping-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin: 0;
+}
+.relation-mapping-facts div {
+  min-width: 0;
+}
+.relation-mapping-facts dt {
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+.relation-mapping-facts dd {
+  margin: 2px 0 0;
+  color: var(--text-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
 .map-card {
   flex: 1;
   min-height: 0;
@@ -2991,7 +3851,6 @@ onBeforeUnmount(() => {
 .mapping-samples,
 .mapping-transformed {
   min-width: 0;
-  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface-2);
@@ -3003,14 +3862,71 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 800;
 }
-.mapping-coverage :deep(.el-table),
-.mapping-samples :deep(.el-table),
-.mapping-transformed :deep(.el-table) { background: transparent; }
-.mapping-coverage :deep(.el-table__inner-wrapper::before),
-.mapping-samples :deep(.el-table__inner-wrapper::before),
-.mapping-transformed :deep(.el-table__inner-wrapper::before) { display: none; }
 .mapping-transformed { margin-top: 14px; }
-.field-flag { margin-left: 5px; transform: scale(.86); transform-origin: left center; }
+.mapping-field-list,
+.mapping-sample-list {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+.mapping-field-card {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(100px, .8fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+.mapping-field-name {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+.mapping-field-name b {
+  overflow-wrap: anywhere;
+}
+.mapping-field-name span {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.mapping-sample-card {
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+.mapping-sample-index {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--text-2);
+  font-size: 11px;
+}
+.mapping-sample-card dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 120px), 1fr));
+  gap: 7px;
+  margin: 0;
+}
+.mapping-sample-card dl div {
+  min-width: 0;
+}
+.mapping-sample-card dt {
+  color: var(--text-3);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.mapping-sample-card dd {
+  min-width: 0;
+  margin: 3px 0 0;
+  color: var(--text);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
 .unmapped-columns {
   display: flex;
   align-items: center;
@@ -3047,11 +3963,115 @@ onBeforeUnmount(() => {
 .colmap-row .el-select {
   flex: 1;
 }
+.colmap-attr b {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.mapping-property-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 3px;
+}
+.mapping-property-flags :deep(.el-tag) {
+  transform: scale(.84);
+  transform-origin: left center;
+}
 .transform-rule-list { display: grid; gap: 6px; margin: 8px 0 0 120px; padding-top: 8px; border-top: 1px dashed var(--border); }
 .transform-rule-row { display: grid; grid-template-columns: 22px minmax(150px, .8fr) minmax(120px, 1fr) minmax(120px, 1fr) 32px; align-items: center; gap: 7px; }
 .transform-rule-row > .el-select { grid-column: 2; }
 .transform-rule-hint { grid-column: 3 / 5; color: var(--text-3); font-size: 11px; line-height: 1.45; }
 .transform-order { display: inline-flex; width: 22px; height: 22px; align-items: center; justify-content: center; border-radius: 50%; background: var(--primary-soft); color: var(--primary-600); font-size: 10px; font-weight: 750; }
+
+/* ── 关系映射向导：弹窗正文是唯一滚动所有者 ── */
+.relation-mapping-steps {
+  margin-bottom: 16px;
+}
+.relation-mapping-form {
+  min-width: 0;
+}
+.relation-endpoint-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.relation-mapping-prerequisite,
+.carrier-source-alert {
+  margin-bottom: 14px;
+}
+.inline-guidance-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.relation-mode-options {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.relation-mode-option {
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  align-items: flex-start;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  white-space: normal;
+}
+.relation-mode-option.is-checked {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+.relation-mode-option :deep(.el-radio__label) {
+  min-width: 0;
+  padding-left: 7px;
+  white-space: normal;
+}
+.relation-mode-option span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.relation-mode-option b {
+  color: var(--text);
+  font-size: 12px;
+}
+.relation-mode-option small {
+  color: var(--text-3);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.relation-preflight-result {
+  min-width: 0;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+.relation-preflight-result header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.relation-preflight-result header > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.relation-preflight-result header span {
+  color: var(--text-3);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.relation-preflight-errors { color: var(--danger); }
+.relation-preflight-warnings { color: var(--warning); }
 
 /* ── AI 预览 ── */
 .ai-preview {
@@ -3195,10 +4215,51 @@ onBeforeUnmount(() => {
 }
 .action-params-form {
   margin-top: 18px;
-  max-height: 360px;
-  overflow: auto;
   padding-right: 4px;
 }
+.template-binding-head {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.template-legacy-alert { margin-bottom: 12px; }
+.template-option {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.template-option > span { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.template-option > span:first-child { flex-direction: column; align-items: flex-start; gap: 1px; }
+.template-option b { max-width: 300px; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+.template-option small { max-width: 300px; overflow: hidden; color: var(--text-3); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.template-option em { color: var(--text-3); font-size: 10px; font-style: normal; white-space: nowrap; }
+.selected-template-summary {
+  display: grid;
+  gap: 9px;
+  margin: 0 0 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface-2);
+}
+.selected-template-summary > header,
+.selected-template-summary > footer,
+.selected-template-tags,
+.selected-template-variables { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.selected-template-summary > header { justify-content: space-between; gap: 10px; }
+.selected-template-summary > header > div:first-child { min-width: 0; display: grid; gap: 2px; }
+.selected-template-summary > header b { color: var(--text); font-size: 12px; }
+.selected-template-summary > header span { color: var(--text-3); font-size: 10.5px; }
+.selected-template-summary > footer { justify-content: flex-end; padding-top: 4px; border-top: 1px solid var(--border); }
+.selected-template-summary > footer :deep(.el-button + .el-button) { margin-left: 0; }
+.selected-template-variables > span { color: var(--text-3); font-size: 10px; }
+.selected-template-variables code { max-width: 100%; padding: 2px 6px; overflow-wrap: anywhere; border-radius: 5px; background: var(--primary-soft); color: var(--primary-600); font-size: 10px; }
 .action-execution-meta {
   display: flex;
   align-items: center;
@@ -3250,8 +4311,6 @@ onBeforeUnmount(() => {
   overflow-wrap: anywhere;
 }
 .action-preview-text {
-  max-height: 150px;
-  overflow: auto;
   margin: 7px 0 0;
   color: var(--text-2);
   white-space: pre-wrap;
@@ -3281,13 +4340,15 @@ onBeforeUnmount(() => {
   border-radius: 10px;
   font-size: 12px;
   line-height: 1.6;
-  max-height: 420px;
-  overflow: auto;
   white-space: pre-wrap;
   word-break: break-all;
 }
 
 @media (max-width: 640px) {
+  .template-binding-head { align-items: flex-start; flex-direction: column; padding: 8px 0; }
+  .selected-template-summary > header { align-items: flex-start; flex-direction: column; }
+  .selected-template-summary > footer { align-items: stretch; flex-direction: column; }
+  .selected-template-summary > footer :deep(.el-button) { width: 100%; min-height: 42px; }
   .action-runtime-provenance {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -3403,9 +4464,12 @@ onBeforeUnmount(() => {
 @media (max-width: 900px) {
   .sd-page { padding: 18px 16px 22px; }
   .graph-stage { min-height: 440px; height: 58vh; }
-  .instance-workspace { grid-template-columns: 1fr; overflow: auto; }
-  .instance-workspace .graph-stage { min-height: 420px; height: 52vh; }
-  .object-explorer { min-height: 540px; }
+  .instance-workspace { grid-template-columns: 1fr; height: auto; overflow: visible; }
+  .instance-workspace .graph-stage { min-height: 360px; height: clamp(360px, 52dvh, 520px); }
+  .object-explorer { height: clamp(480px, 72dvh, 680px); min-height: 480px; overflow-y: auto; overscroll-behavior: contain; }
+  .object-list, .object-detail { flex: none; overflow: visible; }
+  .explorer-head { position: sticky; top: 0; z-index: 4; min-height: 67px; background: var(--surface); }
+  .explorer-tools { position: sticky; top: 67px; z-index: 3; border-bottom: 1px solid var(--border); background: var(--surface); }
   .mapping-preview-grid { grid-template-columns: 1fr; }
 }
 
@@ -3457,19 +4521,19 @@ onBeforeUnmount(() => {
 .map-card {
   flex: 0 0 auto;
   min-height: 420px;
-  overflow-x: auto;
-  overflow-y: visible;
+  overflow: visible;
 }
 
 @media (max-width: 900px) {
   .sd-page { padding: 12px 14px 14px; }
   .sd-header { min-height: 44px; }
   .sd-header .ph-title h1 { font-size: 17px; }
-  .graph-stage { min-height: 440px; height: 58vh; }
-  .wf-editor-stage { min-height: 520px; height: 68vh; }
+  .graph-stage { min-height: 360px; height: clamp(360px, 58dvh, 560px); }
+  .wf-editor-stage { min-height: 0; height: auto; overflow: visible; }
 }
 
 @media (max-width: 760px) {
+  .ph-sub { display: -webkit-box; max-width: 100%; overflow: hidden; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
   .sd-header :deep(.el-button) { min-height: 44px; }
   .sd-tabs :deep(.el-tabs__item) { height: 44px; }
   .colmap-row { align-items: stretch; flex-direction: column; }
@@ -3479,5 +4543,14 @@ onBeforeUnmount(() => {
   .transform-rule-row > .el-select { grid-column: 2; }
   .transform-rule-row > .el-input, .transform-rule-hint { grid-column: 2 / 4; }
   .transform-rule-row > .el-button { grid-column: 3; grid-row: 1; }
+  .mapping-section { padding: 12px; }
+  .mapping-section-head { flex-direction: column; align-items: stretch; }
+  .mapping-section-head :deep(.el-button) { width: 100%; min-height: 42px; }
+  .relation-endpoint-grid,
+  .relation-mode-options { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .relation-mode-options { gap: 7px; }
+  .relation-mapping-facts { grid-template-columns: minmax(0, 1fr); }
+  .mapping-field-card { grid-template-columns: minmax(0, 1fr); align-items: start; }
+  .relation-mapping-steps :deep(.el-step__title) { font-size: 11px; }
 }
 </style>

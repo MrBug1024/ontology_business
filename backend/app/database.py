@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from datetime import datetime, timezone
+import hashlib
 import json
 import uuid
 
 from fastapi import Request
-from sqlalchemy import MetaData, Table, create_engine, event, inspect
+from sqlalchemy import MetaData, Table, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import get_settings
@@ -210,12 +211,14 @@ def _migrate_mapping_refresh_provenance() -> None:
             for column in inspector.get_columns("data_mapping_refresh_jobs")
         }
         is_legacy = "mapping_snapshot" not in existing
+        lacks_relation_fingerprint = "relation_mapping_fingerprint" not in existing
         columns = {
             "mapping_snapshot": "JSON",
             "definition_snapshot_id": "VARCHAR(32)",
             "release_id": "VARCHAR(32)",
             "definition_hash": "VARCHAR(64)",
             "definition_source": "VARCHAR(20)",
+            "relation_mapping_fingerprint": "VARCHAR(64)",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -234,6 +237,10 @@ def _migrate_mapping_refresh_provenance() -> None:
             "UPDATE data_mapping_refresh_jobs SET definition_source = 'live' "
             "WHERE definition_source IS NULL OR TRIM(definition_source) = ''"
         )
+        conn.exec_driver_sql(
+            "UPDATE data_mapping_refresh_jobs SET relation_mapping_fingerprint = '' "
+            "WHERE relation_mapping_fingerprint IS NULL"
+        )
         if is_legacy:
             terminal_statuses = "'succeeded', 'failed', 'timed_out', 'cancelled'"
             conn.exec_driver_sql(
@@ -250,6 +257,30 @@ def _migrate_mapping_refresh_provenance() -> None:
             conn.exec_driver_sql(
                 "UPDATE data_mapping_refresh_jobs SET definition_source = 'legacy'"
             )
+        elif lacks_relation_fingerprint:
+            terminal_statuses = "'succeeded', 'failed', 'timed_out', 'cancelled'"
+            conn.exec_driver_sql(
+                "UPDATE data_mapping_refresh_jobs "
+                "SET status = 'cancelled', "
+                "error = '关系映射定义指纹缺失，部署升级后已安全取消，请重新提交', "
+                "active_key = NULL, next_retry_at = NULL, "
+                "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) "
+                f"WHERE status NOT IN ({terminal_statuses})"
+            )
+        # Intermediate deployments could already have the relation fingerprint
+        # while still leaving dev's full-definition hash empty. Such jobs cannot
+        # prove which endpoint property contract they were queued against.
+        terminal_statuses = "'succeeded', 'failed', 'timed_out', 'cancelled'"
+        conn.exec_driver_sql(
+            "UPDATE data_mapping_refresh_jobs "
+            "SET status = 'cancelled', "
+            "error = '开发环境定义指纹缺失，部署升级后已安全取消，请重新提交', "
+            "active_key = NULL, next_retry_at = NULL, "
+            "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) "
+            f"WHERE status NOT IN ({terminal_statuses}) "
+            "AND definition_source = 'live' "
+            "AND (definition_hash IS NULL OR TRIM(definition_hash) = '')"
+        )
         refreshed = inspect(conn)
         existing_indexes = {
             index["name"]
@@ -497,6 +528,12 @@ def _migrate_document_index() -> None:
             "indexed_content_hash": "VARCHAR(64)",
             "indexed_at": "TIMESTAMP",
             "chunk_count": "INTEGER",
+            "content_sha256": "VARCHAR(64)",
+            "origin_template_file_id": "VARCHAR(32)",
+            "origin_template_sha256": "VARCHAR(64)",
+            "origin_template_id": "VARCHAR(32)",
+            "origin_template_version_id": "VARCHAR(32)",
+            "generated_by_action_log_id": "VARCHAR(32)",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -511,7 +548,24 @@ def _migrate_document_index() -> None:
         conn.exec_driver_sql(
             "UPDATE bucket_files SET indexed_content_hash = '' WHERE indexed_content_hash IS NULL"
         )
+        conn.exec_driver_sql("UPDATE bucket_files SET content_sha256 = '' WHERE content_sha256 IS NULL")
+        conn.exec_driver_sql(
+            "UPDATE bucket_files SET origin_template_sha256 = '' "
+            "WHERE origin_template_sha256 IS NULL"
+        )
         conn.exec_driver_sql("UPDATE bucket_files SET chunk_count = 0 WHERE chunk_count IS NULL")
+        indexes = {index["name"] for index in inspect(conn).get_indexes("bucket_files")}
+        if "uq_bucket_files_generated_action_log" not in indexes:
+            # Multiple API workers may run startup migrations concurrently.
+            # A duplicate-index error means another worker completed this
+            # exact idempotent step first and must not abort application boot.
+            try:
+                conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX uq_bucket_files_generated_action_log "
+                    "ON bucket_files (generated_by_action_log_id)"
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _migrate_document_index_active_key() -> None:
@@ -642,7 +696,18 @@ def _migrate_message_citations() -> None:
         if "citations" not in existing:
             # SQLite、PostgreSQL 和 MySQL 都接受 JSON 类型声明；避免仅本地可用的迁移。
             conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN citations JSON")
+        if "stream_finalized" not in existing:
+            boolean_true = "1" if conn.dialect.name == "sqlite" else "TRUE"
+            conn.exec_driver_sql(
+                f"ALTER TABLE messages ADD COLUMN stream_finalized BOOLEAN DEFAULT {boolean_true}"
+            )
         conn.exec_driver_sql("UPDATE messages SET citations = '[]' WHERE citations IS NULL")
+        # Historical messages predate streaming confirmation and are already
+        # immutable transcripts, so they are safe to treat as finalized.
+        boolean_true = "1" if conn.dialect.name == "sqlite" else "TRUE"
+        conn.exec_driver_sql(
+            f"UPDATE messages SET stream_finalized = {boolean_true} WHERE stream_finalized IS NULL"
+        )
 
 
 def _migrate_permission_controls() -> None:
@@ -1041,15 +1106,22 @@ def _migrate_ontology_runtime_metadata() -> None:
         },
         "ontology_properties": {
             "constraints": "JSON",
+            "is_title": "BOOLEAN",
         },
         "ontology_relations": {
             "namespace": "VARCHAR(180)",
+            "constraints": "JSON",
         },
         "ontology_instances": {
             "state": "VARCHAR(120)",
             "valid_from": "DATETIME",
             "valid_to": "DATETIME",
             "quality": "JSON",
+        },
+        "relation_instances": {
+            "source": "VARCHAR(20)",
+            "source_ref": "VARCHAR(500)",
+            "source_metadata": "JSON",
         },
         "data_mappings": {
             "transform_rules": "JSON",
@@ -1070,6 +1142,8 @@ def _migrate_ontology_runtime_metadata() -> None:
             ("ontology_entities", "state_property", ""),
             ("ontology_relations", "namespace", "default"),
             ("ontology_instances", "state", ""),
+            ("relation_instances", "source", "manual"),
+            ("relation_instances", "source_ref", ""),
         ):
             if inspector.has_table(table):
                 conn.exec_driver_sql(
@@ -1079,12 +1153,40 @@ def _migrate_ontology_runtime_metadata() -> None:
                 )
         for table, column in (
             ("ontology_properties", "constraints"),
+            ("ontology_relations", "constraints"),
             ("ontology_instances", "quality"),
+            ("relation_instances", "source_metadata"),
             ("data_mappings", "transform_rules"),
         ):
             if inspector.has_table(table):
                 conn.exec_driver_sql(
                     f"UPDATE {table} SET {column} = '{{}}' WHERE {column} IS NULL"
+                )
+        if inspector.has_table("ontology_properties"):
+            property_columns = {
+                column["name"] for column in inspect(conn).get_columns("ontology_properties")
+            }
+            if "is_title" in property_columns:
+                conn.exec_driver_sql(
+                    "UPDATE ontology_properties SET is_title = :false_value "
+                    "WHERE is_title IS NULL",
+                    {"false_value": False},
+                )
+            if {"entity_id", "is_key", "is_title"}.issubset(property_columns):
+                # Legacy object types used their primary key as the display
+                # label. Preserve that deterministic behaviour while making
+                # title-key semantics explicit and independently editable.
+                conn.exec_driver_sql(
+                    "UPDATE ontology_properties SET is_title = :true_value "
+                    "WHERE id IN ("
+                    "SELECT MIN(candidate.id) FROM ontology_properties candidate "
+                    "WHERE candidate.is_key = :true_value AND NOT EXISTS ("
+                    "SELECT 1 FROM ontology_properties titled "
+                    "WHERE titled.entity_id = candidate.entity_id "
+                    "AND titled.is_title = :true_value"
+                    ") GROUP BY candidate.entity_id"
+                    ")",
+                    {"true_value": True},
                 )
         if inspector.has_table("ontology_instances"):
             indexes = {
@@ -1097,6 +1199,46 @@ def _migrate_ontology_runtime_metadata() -> None:
                     )
                 except Exception:  # noqa: BLE001 - tolerate startup races.
                     pass
+        if inspector.has_table("relation_instances"):
+            refreshed = inspect(conn)
+            relation_columns = {
+                column["name"] for column in refreshed.get_columns("relation_instances")
+            }
+            edge_columns = {
+                "id", "relation_id", "source_instance_id", "target_instance_id"
+            }
+            if edge_columns.issubset(relation_columns):
+                rows = conn.execute(
+                    text(
+                        "SELECT id, relation_id, source_instance_id, target_instance_id "
+                        "FROM relation_instances ORDER BY id"
+                    )
+                ).all()
+                seen_edges: set[tuple[str, str, str]] = set()
+                for row in rows:
+                    edge = (str(row[1]), str(row[2]), str(row[3]))
+                    if edge in seen_edges:
+                        conn.execute(
+                            text("DELETE FROM relation_instances WHERE id = :id"),
+                            {"id": row[0]},
+                        )
+                    else:
+                        seen_edges.add(edge)
+                unique_names = {
+                    item.get("name")
+                    for item in refreshed.get_unique_constraints("relation_instances")
+                }
+                index_names = {
+                    item.get("name") for item in refreshed.get_indexes("relation_instances")
+                }
+                if "uq_relation_instances_edge" not in unique_names | index_names:
+                    # Concurrency correctness depends on this database guard.
+                    # A failed DDL must stop startup instead of silently
+                    # downgrading relation-instance idempotency to best effort.
+                    conn.exec_driver_sql(
+                        "CREATE UNIQUE INDEX uq_relation_instances_edge ON "
+                        "relation_instances (relation_id, source_instance_id, target_instance_id)"
+                    )
 
 
 def _migrate_assistant_attachment_lifecycle() -> None:
@@ -1166,6 +1308,133 @@ def _migrate_assistant_attachment_lifecycle() -> None:
                     )
                 except Exception:  # noqa: BLE001
                     pass
+
+
+def _migrate_assistant_compilation_jobs() -> None:
+    """Install the durable compilation ledger and attachment byte hashes.
+
+    ``create_all`` creates the new job table on fresh and upgraded installs.
+    This migration is intentionally idempotent so partially upgraded SQLite
+    deployments also receive the content-hash column and database uniqueness
+    guard before an assistant request can reach a provider.
+    """
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if inspector.has_table("assistant_attachments"):
+            attachment_columns = {
+                column["name"]
+                for column in inspector.get_columns("assistant_attachments")
+            }
+            if "content_hash" not in attachment_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE assistant_attachments "
+                    "ADD COLUMN content_hash VARCHAR(64)"
+                )
+            rows = conn.exec_driver_sql(
+                "SELECT id, parsed_text FROM assistant_attachments "
+                "WHERE content_hash IS NULL OR content_hash = ''"
+            ).fetchall()
+            for attachment_id, parsed_text in rows:
+                legacy_hash = hashlib.sha256(
+                    str(parsed_text or "").encode("utf-8")
+                ).hexdigest()
+                conn.exec_driver_sql(
+                    "UPDATE assistant_attachments SET content_hash = :hash "
+                    "WHERE id = :id",
+                    {"hash": legacy_hash, "id": attachment_id},
+                )
+            attachment_indexes = {
+                index["name"]
+                for index in inspect(conn).get_indexes("assistant_attachments")
+            }
+            if "ix_assistant_attachments_content_hash" not in attachment_indexes:
+                conn.exec_driver_sql(
+                    "CREATE INDEX ix_assistant_attachments_content_hash "
+                    "ON assistant_attachments (content_hash)"
+                )
+
+        if not inspector.has_table("assistant_compilation_jobs"):
+            # ``Base.metadata.create_all`` should have created it.  Failing
+            # startup is safer than silently running without single-flight.
+            raise RuntimeError("assistant_compilation_jobs 表未创建")
+        job_columns = {
+            column["name"]
+            for column in inspect(conn).get_columns(
+                "assistant_compilation_jobs"
+            )
+        }
+        # Support an interrupted/intermediate deployment of this feature.  New
+        # rows are created only after startup completes, so nullable ALTERs are
+        # backfilled before the uniqueness guard is validated.
+        for name, definition in (
+            ("request_fingerprint", "VARCHAR(64)"),
+            ("message_hash", "VARCHAR(64)"),
+            ("attachment_content_hash", "VARCHAR(64)"),
+            ("llm_config_fingerprint", "VARCHAR(64)"),
+            ("mapping_context_fingerprint", "VARCHAR(64)"),
+            ("execution_policy_fingerprint", "VARCHAR(64)"),
+            ("compiler_version", "VARCHAR(80)"),
+            ("scenario_baseline", "VARCHAR(64)"),
+            ("progress", "JSON"),
+            ("llm_call_budget", "INTEGER"),
+            ("llm_calls_used", "INTEGER"),
+            ("error", "TEXT"),
+            ("result", "JSON"),
+            ("completed_at", "DATETIME"),
+            ("updated_at", "DATETIME"),
+        ):
+            if name not in job_columns:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE assistant_compilation_jobs "
+                    f"ADD COLUMN {name} {definition}"
+                )
+        rows = conn.exec_driver_sql(
+            "SELECT id FROM assistant_compilation_jobs "
+            "WHERE request_fingerprint IS NULL OR request_fingerprint = ''"
+        ).fetchall()
+        for (job_id,) in rows:
+            legacy_fingerprint = hashlib.sha256(
+                f"legacy-assistant-compilation-job:{job_id}".encode("utf-8")
+            ).hexdigest()
+            conn.exec_driver_sql(
+                "UPDATE assistant_compilation_jobs "
+                "SET request_fingerprint = :fingerprint WHERE id = :id",
+                {"fingerprint": legacy_fingerprint, "id": job_id},
+            )
+        conn.exec_driver_sql(
+            "UPDATE assistant_compilation_jobs SET "
+            "message_hash = COALESCE(message_hash, ''), "
+            "attachment_content_hash = COALESCE(attachment_content_hash, ''), "
+            "llm_config_fingerprint = COALESCE(llm_config_fingerprint, ''), "
+            "mapping_context_fingerprint = COALESCE(mapping_context_fingerprint, ''), "
+            "execution_policy_fingerprint = COALESCE(execution_policy_fingerprint, ''), "
+            "compiler_version = COALESCE(compiler_version, 'legacy'), "
+            "scenario_baseline = COALESCE(scenario_baseline, ''), "
+            "progress = COALESCE(progress, '{}'), "
+            "llm_call_budget = COALESCE(llm_call_budget, 1), "
+            "llm_calls_used = COALESCE(llm_calls_used, 0), "
+            "error = COALESCE(error, ''), "
+            "result = COALESCE(result, '{}'), "
+            "updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)"
+        )
+        unique_names = {
+            item.get("name")
+            for item in inspect(conn).get_unique_constraints(
+                "assistant_compilation_jobs"
+            )
+        }
+        index_names = {
+            item.get("name")
+            for item in inspect(conn).get_indexes("assistant_compilation_jobs")
+        }
+        if (
+            "uq_assistant_compilation_jobs_fingerprint"
+            not in unique_names | index_names
+        ):
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX uq_assistant_compilation_jobs_fingerprint "
+                "ON assistant_compilation_jobs (request_fingerprint)"
+            )
 
 
 def _migrate_property_default_json() -> None:
@@ -1283,6 +1552,270 @@ def _migrate_function_runtimes() -> None:
         )
 
 
+def _migrate_agent_capability_scope() -> None:
+    """Add the Agent capability contract without inventing legacy selections.
+
+    Existing NULL rows remain identifiable for the UI, but runtime interprets
+    them as explicit-empty. This prevents an upgrade from silently granting all
+    current and future business capabilities.
+    """
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if not inspector.has_table("agents"):
+            return
+        existing = {column["name"] for column in inspector.get_columns("agents")}
+        if "capability_scope" not in existing:
+            conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN capability_scope JSON")
+
+
+def _migrate_ontology_api_names() -> None:
+    """Add and deterministically backfill stable ontology/link API metadata.
+
+    ``create_all`` cannot add columns to an installed database.  Keep this
+    migration idempotent and tolerant of partial/very old schemas so an upgrade
+    can always reach the application-level repair tools.
+    """
+
+    from .services import ontology_service
+
+    column_ddl = {
+        "ontology_entities": {
+            "api_name": "VARCHAR(100) NOT NULL DEFAULT ''",
+        },
+        "ontology_properties": {
+            "api_name": "VARCHAR(100) NOT NULL DEFAULT ''",
+        },
+        "ontology_relations": {
+            "api_name": "VARCHAR(100) NOT NULL DEFAULT ''",
+            "source_display_name": "VARCHAR(200) NOT NULL DEFAULT ''",
+            "source_api_name": "VARCHAR(100) NOT NULL DEFAULT ''",
+            "target_display_name": "VARCHAR(200) NOT NULL DEFAULT ''",
+            "target_api_name": "VARCHAR(100) NOT NULL DEFAULT ''",
+            "storage_kind": "VARCHAR(32) NOT NULL DEFAULT 'none'",
+        },
+    }
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        available_tables = set(inspector.get_table_names())
+        for table_name, definitions in column_ddl.items():
+            if table_name not in available_tables:
+                continue
+            existing = {
+                column["name"] for column in inspect(conn).get_columns(table_name)
+            }
+            for column_name, ddl in definitions.items():
+                if column_name not in existing:
+                    conn.exec_driver_sql(
+                        f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {ddl}'
+                    )
+
+        def migrated_name(
+            used: set[str],
+            current: object,
+            *,
+            display_name: object,
+            prefix: str,
+            stable_key: object,
+        ) -> str:
+            candidate = ontology_service.normalize_api_name(
+                current,
+                display_name=display_name,
+                prefix=prefix,
+                stable_key=stable_key,
+            )
+            return ontology_service.reserve_api_name(
+                used,
+                candidate,
+                display_name=display_name,
+                prefix=prefix,
+                stable_key=stable_key,
+                # Existing duplicates must be repaired, not abort startup.
+                explicit=False,
+            )
+
+        if "ontology_entities" in available_tables:
+            used_by_scenario: dict[str, set[str]] = {}
+            rows = conn.execute(text(
+                "SELECT id, scenario_id, name, api_name "
+                "FROM ontology_entities ORDER BY scenario_id, id"
+            )).mappings().all()
+            for row in rows:
+                used = used_by_scenario.setdefault(str(row["scenario_id"]), set())
+                api_name = migrated_name(
+                    used,
+                    row["api_name"],
+                    display_name=row["name"],
+                    prefix="entity",
+                    stable_key=row["id"],
+                )
+                if api_name != str(row["api_name"] or ""):
+                    conn.execute(
+                        text("UPDATE ontology_entities SET api_name=:api_name WHERE id=:id"),
+                        {"api_name": api_name, "id": row["id"]},
+                    )
+
+        if "ontology_properties" in available_tables:
+            used_by_entity: dict[str, set[str]] = {}
+            rows = conn.execute(text(
+                "SELECT id, entity_id, name, api_name "
+                "FROM ontology_properties ORDER BY entity_id, id"
+            )).mappings().all()
+            for row in rows:
+                used = used_by_entity.setdefault(str(row["entity_id"]), set())
+                api_name = migrated_name(
+                    used,
+                    row["api_name"],
+                    display_name=row["name"],
+                    prefix="property",
+                    stable_key=row["id"],
+                )
+                if api_name != str(row["api_name"] or ""):
+                    conn.execute(
+                        text("UPDATE ontology_properties SET api_name=:api_name WHERE id=:id"),
+                        {"api_name": api_name, "id": row["id"]},
+                    )
+
+        if "ontology_relations" in available_tables:
+            mapped_storage: dict[str, str] = {}
+            if "relation_data_mappings" in available_tables:
+                mapping_columns = {
+                    column["name"]
+                    for column in inspect(conn).get_columns("relation_data_mappings")
+                }
+                if {"relation_id", "mode"}.issubset(mapping_columns):
+                    for mapping in conn.execute(text(
+                        "SELECT relation_id, mode FROM relation_data_mappings"
+                    )).mappings():
+                        mode = str(mapping["mode"] or "")
+                        mapped_storage[str(mapping["relation_id"])] = (
+                            "join_table" if mode == "join_table" else "foreign_key"
+                            if mode in {"source_fk", "target_fk"} else "none"
+                        )
+            used_by_scenario = {}
+            rows = conn.execute(text(
+                "SELECT id, scenario_id, name, api_name, source_display_name, "
+                "source_api_name, target_display_name, target_api_name, storage_kind "
+                "FROM ontology_relations ORDER BY scenario_id, id"
+            )).mappings().all()
+            for row in rows:
+                used = used_by_scenario.setdefault(str(row["scenario_id"]), set())
+                api_name = migrated_name(
+                    used,
+                    row["api_name"],
+                    display_name=row["name"],
+                    prefix="relation",
+                    stable_key=row["id"],
+                )
+                current = dict(row)
+                try:
+                    navigation = ontology_service.normalize_relation_navigation(
+                        relation_name=row["name"],
+                        relation_api_name=api_name,
+                        current=current,
+                    )
+                except ValueError:
+                    # Repair a legacy pair that reused one identifier for both
+                    # directions while retaining any useful display labels.
+                    navigation = ontology_service.normalize_relation_navigation(
+                        relation_name=row["name"],
+                        relation_api_name=api_name,
+                        source_display_name=row["source_display_name"],
+                        source_api_name=row["source_api_name"],
+                        target_display_name=row["target_display_name"],
+                    )
+                try:
+                    storage_kind = ontology_service.normalize_relation_storage_kind(
+                        row["storage_kind"]
+                    )
+                except ValueError:
+                    storage_kind = "none"
+                if storage_kind == "none":
+                    storage_kind = mapped_storage.get(str(row["id"]), "none")
+                values = {
+                    "id": row["id"],
+                    "api_name": api_name,
+                    **navigation,
+                    "storage_kind": storage_kind,
+                }
+                if any(
+                    str(row[field] or "") != str(values[field] or "")
+                    for field in (
+                        "api_name", "source_display_name", "source_api_name",
+                        "target_display_name", "target_api_name", "storage_kind",
+                    )
+                ):
+                    conn.execute(
+                        text(
+                            "UPDATE ontology_relations SET api_name=:api_name, "
+                            "source_display_name=:source_display_name, "
+                            "source_api_name=:source_api_name, "
+                            "target_display_name=:target_display_name, "
+                            "target_api_name=:target_api_name, storage_kind=:storage_kind "
+                            "WHERE id=:id"
+                        ),
+                        values,
+                    )
+
+        if _settings.database_url.startswith("sqlite"):
+            for ddl in (
+                "CREATE INDEX IF NOT EXISTS ix_ontology_entities_api_name "
+                "ON ontology_entities (api_name)",
+                "CREATE INDEX IF NOT EXISTS ix_ontology_properties_api_name "
+                "ON ontology_properties (api_name)",
+                "CREATE INDEX IF NOT EXISTS ix_ontology_relations_api_name "
+                "ON ontology_relations (api_name)",
+            ):
+                table_name = ddl.split(" ON ", 1)[1].split(" ", 1)[0]
+                if table_name in available_tables:
+                    conn.exec_driver_sql(ddl)
+
+
+def _migrate_ontology_entity_lifecycle() -> None:
+    """Add the non-destructive Object Type lifecycle to installed databases.
+
+    ``create_all`` only creates columns for new installations.  Existing rows
+    predate lifecycle management and therefore retain their previous visible
+    behaviour by being backfilled as ``active``.  The migration is deliberately
+    idempotent and never deletes definitions or facts.
+    """
+
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if not inspector.has_table("ontology_entities"):
+            return
+        existing = {
+            column["name"] for column in inspector.get_columns("ontology_entities")
+        }
+        if "lifecycle_status" not in existing:
+            conn.exec_driver_sql(
+                "ALTER TABLE ontology_entities ADD COLUMN lifecycle_status "
+                "VARCHAR(20) NOT NULL DEFAULT 'active'"
+            )
+        conn.exec_driver_sql(
+            "UPDATE ontology_entities SET lifecycle_status = 'active' "
+            "WHERE lifecycle_status IS NULL OR TRIM(lifecycle_status) = ''"
+        )
+
+
+def _migrate_artifact_template_catalog() -> None:
+    """Catalog and immutably pin legacy file-id based template Actions.
+
+    ``create_all`` installs the two catalog tables.  This data migration is
+    deliberately separate and idempotent so existing deployments immediately
+    gain managed AP001 and other template entries while the runtime retains a
+    legacy fallback for any damaged file that cannot be inspected.
+    """
+    from .services import template_catalog_service
+
+    with Session(bind=engine, autoflush=False, expire_on_commit=False) as db:
+        try:
+            template_catalog_service.migrate_legacy_template_actions(db)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+
 def init_db() -> None:
     # Import every metadata module so direct maintenance/fixture callers get
     # the same schema as the ASGI application, which imports routers first.
@@ -1291,6 +1824,8 @@ def init_db() -> None:
     from . import external_api_models, models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _migrate_ontology_api_names()
+    _migrate_ontology_entity_lifecycle()
     _migrate_data_sources_nullable_scenario()
     _migrate_workflows_dag()
     _migrate_data_mapping_status()
@@ -1314,8 +1849,11 @@ def init_db() -> None:
     _migrate_workflow_run_execution_key()
     _migrate_runtime_definition_pins()
     _migrate_assistant_attachment_lifecycle()
+    _migrate_assistant_compilation_jobs()
     _migrate_property_default_json()
     _migrate_ontology_runtime_metadata()
     _migrate_action_decision_chain()
     _migrate_function_runtimes()
+    _migrate_agent_capability_scope()
     _migrate_external_api_key_audit()
+    _migrate_artifact_template_catalog()

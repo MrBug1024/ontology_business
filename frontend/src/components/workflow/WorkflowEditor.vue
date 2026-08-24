@@ -170,14 +170,29 @@ function stepsToNodes(steps: any[]) {
   steps.forEach((s: any, i: number) => {
     const id = `n${i + 1}`
     const base = { id, position: { x: 280, y: (i + 1) * 120 } }
-    if (s.type === 'action') ns.push({ ...base, type: 'action', name: `操作 ${i + 1}`, data: { action_id: s.action_id, params: s.params || {} } })
-    else if (s.type === 'rule') ns.push({ ...base, type: 'rule', name: `规则 ${i + 1}`, data: { rule_id: s.rule_id, record: s.record || {} } })
-    else if (s.type === 'event') ns.push({ ...base, type: 'event', name: `事件 ${i + 1}`, data: { event_id: s.event_id, payload: s.payload || {} } })
-    es.push({ id: `e${i + 1}`, source: prev, target: id, label: '' })
+    let node: any = null
+    if (s.type === 'action') node = { ...base, type: 'action', name: `操作 ${i + 1}`, data: { action_id: s.action_id, params: s.params || {} } }
+    else if (s.type === 'rule') node = { ...base, type: 'rule', name: `规则 ${i + 1}`, data: { rule_id: s.rule_id, record: s.record || {} } }
+    else if (s.type === 'event') node = { ...base, type: 'event', name: `事件 ${i + 1}`, data: { event_id: s.event_id, payload: s.payload || {} } }
+    else if (s.type === 'approval') {
+      node = {
+        ...base,
+        type: 'approval',
+        name: `人工审批 ${i + 1}`,
+        data: {
+          instructions: s.instructions || '',
+          timeout_seconds: s.timeout_seconds || 86400,
+          on_timeout: s.on_timeout || 'reject',
+        },
+      }
+    }
+    if (!node) return
+    ns.push(node)
+    es.push({ id: `e${es.length + 1}`, source: prev, target: id, label: '' })
     prev = id
   })
   ns.push({ id: 'end', type: 'end', name: '结束', position: { x: 280, y: (steps.length + 1) * 120 }, data: {} })
-  es.push({ id: `e${steps.length + 1}`, source: prev, target: 'end', label: '' })
+  es.push({ id: `e${es.length + 1}`, source: prev, target: 'end', label: '' })
   return { nodes: ns, edges: es }
 }
 watch(
@@ -937,8 +952,6 @@ const wf = computed({
   border-radius: 10px;
   font-size: 12px;
   line-height: 1.7;
-  max-height: 420px;
-  overflow: auto;
   white-space: pre-wrap;
   word-break: break-all;
 }
@@ -952,6 +965,10 @@ const wf = computed({
   }
 }
 @media (max-width: 860px) {
+  .wfe {
+    height: auto;
+    overflow: visible;
+  }
   .wfe-topbar {
     flex-wrap: wrap;
   }
@@ -967,12 +984,15 @@ const wf = computed({
   .wfe-config-field, .wfe-config-field--event { flex: 1 1 160px; }
   .wfe-config-help { max-width: none; }
   .wfe-body {
+    flex: none;
     flex-direction: column;
+    overflow: visible;
   }
   .wfe-palette {
     width: 100%;
     flex-direction: row;
     flex-wrap: wrap;
+    overflow: visible;
   }
   .wfe-pal-title,
   .wfe-pal-tip {
@@ -980,7 +1000,11 @@ const wf = computed({
   }
   .wfe-panel {
     width: 100%;
-    max-height: 300px;
+    max-height: none;
+    overflow: visible;
   }
+  .wfe-panel-body { overflow: visible; }
+  .wfe-canvas { flex: none; height: clamp(380px, 60dvh, 520px); min-height: 380px; }
+  .wfe-toolbar :deep(.el-button) { min-height: 44px; }
 }
 </style>

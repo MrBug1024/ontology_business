@@ -30,9 +30,37 @@
             <div class="assistant-subtitle">协助建模、映射、编排与解释</div>
           </div>
         </div>
-        <el-button text circle aria-label="关闭 AI 助手" title="关闭" @click="visible = false">
-          <el-icon aria-hidden="true"><Close /></el-icon>
-        </el-button>
+        <div class="assistant-head-actions">
+          <el-popover placement="bottom-end" :width="340" trigger="click" @show="loadAssistantCapabilities">
+            <template #reference>
+              <el-button text circle aria-label="配置助手能力" title="配置助手能力">
+                <el-icon aria-hidden="true"><Setting /></el-icon>
+              </el-button>
+            </template>
+            <section class="assistant-settings" aria-label="助手能力配置">
+              <div class="assistant-settings-head">
+                <div><strong>助手能力</strong><span>本次会话使用的模型与可用能力</span></div>
+                <el-icon v-if="capabilitiesLoading" class="is-loading" aria-hidden="true"><Loading /></el-icon>
+              </div>
+              <label class="assistant-setting-label" for="assistant-llm">AI 模型</label>
+              <el-select id="assistant-llm" v-model="assistantConfig.llmConfigId" class="assistant-setting-control" clearable placeholder="自动选择默认模型" @change="persistAssistantConfig">
+                <el-option v-for="llm in assistantLLMs" :key="llm.id" :label="`${llm.name} · ${llm.model}`" :value="llm.id" />
+              </el-select>
+              <label class="assistant-setting-label" for="assistant-skills">技能</label>
+              <el-select id="assistant-skills" v-model="assistantConfig.skillIds" class="assistant-setting-control" multiple collapse-tags collapse-tags-tooltip placeholder="不指定技能" @change="persistAssistantConfig">
+                <el-option v-for="skill in assistantSkills" :key="skill.id" :label="skill.name" :value="skill.id" />
+              </el-select>
+              <label class="assistant-setting-label" for="assistant-mcps">MCP</label>
+              <el-select id="assistant-mcps" v-model="assistantConfig.mcpIds" class="assistant-setting-control" multiple collapse-tags collapse-tags-tooltip placeholder="不指定 MCP" @change="persistAssistantConfig">
+                <el-option v-for="mcp in assistantMCPs" :key="mcp.id" :label="mcp.name" :value="mcp.id" />
+              </el-select>
+              <p class="assistant-settings-note">能力配置只作用于后续请求；外部调用、写入和高风险操作仍遵循平台权限与确认流程。</p>
+            </section>
+          </el-popover>
+          <el-button text circle aria-label="关闭 AI 助手" title="关闭" @click="visible = false">
+            <el-icon aria-hidden="true"><Close /></el-icon>
+          </el-button>
+        </div>
       </header>
 
       <div class="assistant-context" aria-label="当前上下文">
@@ -56,6 +84,25 @@
           </el-button>
         </div>
       </div>
+
+      <section
+        v-if="activeCompilationJob && compilationRecoveryThreadId === threadId"
+        class="compilation-recovery"
+        :class="`is-${activeCompilationJob.status}`"
+        role="status"
+        aria-live="polite"
+      >
+        <el-icon v-if="activeCompilationJob.status !== 'failed'" class="is-loading" aria-hidden="true"><Loading /></el-icon>
+        <el-icon v-else aria-hidden="true"><WarningFilled /></el-icon>
+        <div>
+          <strong>{{ activeCompilationJob.status === 'running' ? '正在恢复完整业务模型编译' : activeCompilationJob.status === 'succeeded' ? '正在恢复完整业务模型结果' : '完整业务模型编译未完成' }}</strong>
+          <span v-if="activeCompilationJob.status !== 'failed'">{{ activeCompilationJob.status === 'succeeded' ? '服务端任务已完成，正在读取持久化变更清单并重载会话。' : (activeCompilationJob.progress?.detail || '任务仍在服务端运行；页面恢复不会重新提交聊天请求。') }}</span>
+          <span v-else>{{ activeCompilationJob.error_message || '系统已保持零写入。请修改附件或描述后显式重试。' }}</span>
+        </div>
+        <el-tag v-if="activeCompilationJob.status === 'running'" size="small" type="info" effect="plain">{{ compilationCallSummary }}</el-tag>
+        <el-tag v-else-if="activeCompilationJob.status === 'succeeded'" size="small" type="success" effect="plain">正在恢复结果</el-tag>
+        <el-button v-else size="small" text type="danger" @click="dismissCompilationFailure">知道了</el-button>
+      </section>
 
       <section v-if="historyVisible" class="assistant-history" aria-label="当前上下文的会话历史">
         <div class="history-head">
@@ -89,11 +136,8 @@
       <main v-else ref="messageRef" class="assistant-messages">
         <div v-if="!messages.length" class="assistant-empty">
           <div class="empty-mark" aria-hidden="true"><el-icon :size="28"><ChatDotRound /></el-icon></div>
-          <h3>从业务问题开始</h3>
-          <p>我会先理解当前页面和场景，再给出可检查的方案。所有修改都会先生成草稿。</p>
-          <div class="assistant-suggestions">
-            <button v-for="item in starterSuggestions" :key="item" type="button" class="suggestion-chip" @click="send(item)">{{ item }}</button>
-          </div>
+          <h3>告诉我你要完成什么</h3>
+          <p>我会结合当前页面、业务场景和你上传的资料理解问题，再协助你完成分析、建模或业务操作。</p>
         </div>
 
         <article v-for="(message, index) in messages" :key="message.id || index" class="assistant-message" :class="message.role">
@@ -148,10 +192,45 @@
                   <span>节点 {{ proposalOf(message)?.payload?.nodes?.length || 0 }}</span>
                   <span>连线 {{ proposalOf(message)?.payload?.edges?.length || 0 }}</span>
                 </template>
+                <template v-else-if="proposalOf(message)?.kind === 'scenario_model'">
+                  <span>来源段落 {{ proposalOf(message)?.payload?.coverage_summary?.total || 0 }}</span>
+                  <span>待确认 {{ blockingIssues(proposalOf(message)).length }}</span>
+                </template>
                 <span v-if="proposalOf(message)?.changes?.length">差异 {{ proposalOf(message)?.changes?.length }}</span>
-                <button type="button" class="preview-toggle" @click="toggleProposal(index)">{{ expandedProposal[index] ? '收起详情' : '查看详情' }}</button>
+                <button
+                  type="button"
+                  class="preview-toggle"
+                  :aria-expanded="Boolean(expandedProposal[index])"
+                  :aria-controls="proposalDetailId(message, index)"
+                  @click="toggleProposal(index)"
+                >{{ expandedProposal[index] ? '收起详情' : '查看详情' }}</button>
               </div>
-              <div v-if="expandedProposal[index] && proposalOf(message)?.changes?.length" class="proposal-changes" aria-label="变更清单差异">
+              <section
+                v-if="expandedProposal[index] && proposalOf(message)?.kind === 'scenario_model' && proposalOf(message)?.changes?.length"
+                class="proposal-disclosure proposal-change-disclosure"
+                aria-label="变更清单"
+              >
+                <button
+                  type="button"
+                  class="proposal-disclosure-toggle"
+                  :aria-expanded="isChangeListExpanded(message, index)"
+                  :aria-controls="proposalChangesId(message, index)"
+                  @click="toggleChangeList(message, index)"
+                >
+                  <span class="disclosure-copy"><strong>变更清单</strong><small>共 {{ proposalOf(message)?.changes?.length || 0 }} 项，默认收起以便先处理预检问题</small></span>
+                  <span class="disclosure-action">{{ isChangeListExpanded(message, index) ? '收起' : '展开全部' }}<el-icon class="disclosure-chevron" :class="{ rotated: isChangeListExpanded(message, index) }" aria-hidden="true"><ArrowDown /></el-icon></span>
+                </button>
+                <div v-show="isChangeListExpanded(message, index)" :id="proposalChangesId(message, index)" class="proposal-changes" aria-label="变更清单差异">
+                  <div v-for="(change, changeIndex) in proposalOf(message)?.changes" :key="change.change_id || `${change.resource}-${change.name}-${changeIndex}`" class="proposal-change">
+                    <el-tag size="small" effect="plain" :type="proposalOperationType(change.operation)">{{ proposalOperationLabel(change.operation) }}</el-tag>
+                    <div class="proposal-change-copy">
+                      <strong>{{ proposalResourceLabel(change.resource) }} · {{ change.name }}</strong>
+                      <span>{{ change.summary }}</span>
+                    </div>
+                  </div>
+                </div>
+              </section>
+              <div v-else-if="expandedProposal[index] && proposalOf(message)?.changes?.length" class="proposal-changes" aria-label="变更清单差异">
                 <div v-for="(change, changeIndex) in proposalOf(message)?.changes" :key="`${change.resource}-${change.name}-${changeIndex}`" class="proposal-change">
                   <el-tag size="small" effect="plain" :type="proposalOperationType(change.operation)">{{ proposalOperationLabel(change.operation) }}</el-tag>
                   <div class="proposal-change-copy">
@@ -160,7 +239,7 @@
                   </div>
                 </div>
               </div>
-              <div v-if="expandedProposal[index]" class="proposal-detail" aria-label="草稿结构化内容">
+              <div v-if="expandedProposal[index]" :id="proposalDetailId(message, index)" class="proposal-detail" aria-label="草稿结构化内容">
                 <template v-if="proposalOf(message)?.kind === 'scenario'">
                   <dl class="proposal-summary-grid">
                     <div><dt>场景名称</dt><dd>{{ proposalOf(message)?.payload?.name || '未命名场景' }}</dd></div>
@@ -199,6 +278,139 @@
                   <div class="mapping-preview-list">
                     <div v-for="(sourceColumn, propertyName) in proposalOf(message)?.payload?.column_map || {}" :key="String(propertyName)"><b>{{ propertyName }}</b><span>←</span><strong>{{ sourceColumn }}</strong></div>
                   </div>
+                </template>
+                <template v-else-if="proposalOf(message)?.kind === 'scenario_model'">
+                  <section class="proposal-section compound-overview">
+                    <h4>完整业务模型</h4>
+                    <dl class="proposal-summary-grid">
+                      <div><dt>对象类型</dt><dd>{{ proposalOf(message)?.payload?.entities?.length || 0 }}</dd></div>
+                      <div><dt>关系类型</dt><dd>{{ proposalOf(message)?.payload?.relations?.length || 0 }}</dd></div>
+                      <div><dt>函数 / 操作</dt><dd>{{ (proposalOf(message)?.payload?.functions?.length || 0) + (proposalOf(message)?.payload?.actions?.length || 0) }}</dd></div>
+                      <div><dt>规则 / 事件</dt><dd>{{ (proposalOf(message)?.payload?.rules?.length || 0) + (proposalOf(message)?.payload?.events?.length || 0) }}</dd></div>
+                      <div><dt>工作流</dt><dd>{{ proposalOf(message)?.payload?.workflows?.length || 0 }}</dd></div>
+                      <div><dt>数据映射</dt><dd>{{ proposalOf(message)?.payload?.mappings?.length || 0 }}</dd></div>
+                    </dl>
+                    <div class="coverage-summary">
+                      <span>全文 {{ proposalOf(message)?.payload?.coverage_summary?.total || 0 }} 段</span>
+                      <span>已建模 {{ proposalOf(message)?.payload?.coverage_summary?.modeled || 0 }}</span>
+                      <span>背景 {{ proposalOf(message)?.payload?.coverage_summary?.context || 0 }}</span>
+                      <span>无关 {{ proposalOf(message)?.payload?.coverage_summary?.irrelevant || 0 }}</span>
+                      <span :class="{ danger: (proposalOf(message)?.payload?.coverage_summary?.ambiguous || 0) > 0 }">歧义 {{ proposalOf(message)?.payload?.coverage_summary?.ambiguous || 0 }}</span>
+                    </div>
+                  </section>
+                  <section v-if="proposalOf(message)?.payload?.source_manifest?.length" class="proposal-section">
+                    <h4>来源文档</h4>
+                    <div class="source-manifest-list">
+                      <div v-for="source in proposalOf(message)?.payload?.source_manifest || []" :key="source.source_id">
+                        <strong>{{ source.filename }}</strong><span>{{ source.paragraph_count }} 段 · {{ source.characters }} 字符</span>
+                      </div>
+                    </div>
+                  </section>
+                  <section v-if="scenarioIssueGroups(proposalOf(message)).length" class="proposal-section unresolved-section">
+                    <header class="unresolved-head">
+                      <div><h4>预检问题</h4><p>阻塞项必须先解决；提示仅供核对，不影响应用。</p></div>
+                      <div class="unresolved-counts" aria-label="预检问题统计">
+                        <span class="is-blocking">阻塞 {{ blockingIssues(proposalOf(message)).length }}</span>
+                        <span>提示 {{ nonBlockingIssueCount(proposalOf(message)) }}</span>
+                      </div>
+                    </header>
+                    <div class="issue-groups">
+                      <div class="issue-category-head is-blocking">
+                        <strong>阻塞问题</strong>
+                        <span>{{ blockingScenarioIssueGroups(proposalOf(message)).length }} 类 · {{ blockingIssues(proposalOf(message)).length }} 项 · 当前不可应用</span>
+                      </div>
+                      <section
+                        v-for="group in blockingScenarioIssueGroups(proposalOf(message))"
+                        :key="group.key"
+                        class="issue-group"
+                        :class="group.blocking ? 'is-blocking' : 'is-notice'"
+                      >
+                        <button
+                          type="button"
+                          class="issue-group-toggle"
+                          :aria-expanded="isIssueGroupExpanded(message, index, group.key)"
+                          :aria-controls="issueGroupId(message, index, group.key)"
+                          @click="toggleIssueGroup(message, index, group.key)"
+                        >
+                          <span class="issue-severity">{{ group.blocking ? '阻塞' : '提示' }}</span>
+                          <span class="issue-group-copy">
+                            <strong>{{ scenarioModelIssueLabel(group.code) }}</strong>
+                            <small><template v-if="scenarioModelIssueLabel(group.code) === '其他预检问题'">{{ group.code }} · </template>{{ group.issues.length }} 项</small>
+                          </span>
+                          <el-icon class="disclosure-chevron" :class="{ rotated: isIssueGroupExpanded(message, index, group.key) }" aria-hidden="true"><ArrowDown /></el-icon>
+                        </button>
+                        <div
+                          v-show="isIssueGroupExpanded(message, index, group.key)"
+                          :id="issueGroupId(message, index, group.key)"
+                          class="issue-group-details"
+                          role="region"
+                          :aria-label="`${scenarioModelIssueLabel(group.code)}明细`"
+                        >
+                          <article v-for="(issue, issueIndex) in group.issues" :key="`${group.key}-${issueIndex}-${issue.message}`" class="unresolved-row">
+                            <span class="issue-number" aria-hidden="true">{{ issueIndex + 1 }}</span>
+                            <div><strong>{{ issue.message }}</strong><span v-if="issue.sourceRefs.length">来源：{{ issue.sourceRefs.join('、') }}</span></div>
+                          </article>
+                        </div>
+                      </section>
+                      <section v-if="nonBlockingScenarioIssueGroups(proposalOf(message)).length" class="issue-notice-category">
+                        <button
+                          type="button"
+                          class="issue-category-toggle"
+                          :aria-expanded="isNoticeCategoryExpanded(message, index)"
+                          :aria-controls="noticeCategoryId(message, index)"
+                          @click="toggleNoticeCategory(message, index)"
+                        >
+                          <span class="issue-severity">提示</span>
+                          <span class="issue-group-copy">
+                            <strong>非阻塞提示</strong>
+                            <small>{{ nonBlockingScenarioIssueGroups(proposalOf(message)).length }} 类 · {{ nonBlockingIssueCount(proposalOf(message)) }} 项 · 不影响应用</small>
+                          </span>
+                          <el-icon class="disclosure-chevron" :class="{ rotated: isNoticeCategoryExpanded(message, index) }" aria-hidden="true"><ArrowDown /></el-icon>
+                        </button>
+                        <div v-show="isNoticeCategoryExpanded(message, index)" :id="noticeCategoryId(message, index)" class="issue-notice-groups">
+                          <section
+                            v-for="group in nonBlockingScenarioIssueGroups(proposalOf(message))"
+                            :key="group.key"
+                            class="issue-group is-notice"
+                          >
+                            <button
+                              type="button"
+                              class="issue-group-toggle"
+                              :aria-expanded="isIssueGroupExpanded(message, index, group.key)"
+                              :aria-controls="issueGroupId(message, index, group.key)"
+                              @click="toggleIssueGroup(message, index, group.key)"
+                            >
+                              <span class="issue-severity">提示</span>
+                              <span class="issue-group-copy">
+                                <strong>{{ scenarioModelIssueLabel(group.code) }}</strong>
+                                <small><template v-if="scenarioModelIssueLabel(group.code) === '其他预检问题'">{{ group.code }} · </template>{{ group.issues.length }} 项</small>
+                              </span>
+                              <el-icon class="disclosure-chevron" :class="{ rotated: isIssueGroupExpanded(message, index, group.key) }" aria-hidden="true"><ArrowDown /></el-icon>
+                            </button>
+                            <div
+                              v-show="isIssueGroupExpanded(message, index, group.key)"
+                              :id="issueGroupId(message, index, group.key)"
+                              class="issue-group-details"
+                              role="region"
+                              :aria-label="`${scenarioModelIssueLabel(group.code)}明细`"
+                            >
+                              <article v-for="(issue, issueIndex) in group.issues" :key="`${group.key}-${issueIndex}-${issue.message}`" class="unresolved-row">
+                                <span class="issue-number" aria-hidden="true">{{ issueIndex + 1 }}</span>
+                                <div><strong>{{ issue.message }}</strong><span v-if="issue.sourceRefs.length">来源：{{ issue.sourceRefs.join('、') }}</span></div>
+                              </article>
+                            </div>
+                          </section>
+                        </div>
+                      </section>
+                    </div>
+                  </section>
+                  <el-alert
+                    v-if="!blockingIssues(proposalOf(message)).length"
+                    title="所有引用、冲突与来源段落已通过预检；确认后将在同一事务中应用，任一失败都会整体回滚。"
+                    type="success"
+                    :closable="false"
+                    show-icon
+                  />
                 </template>
                 <template v-else-if="proposalOf(message)?.kind === 'workflow'">
                   <section class="proposal-section">
@@ -306,19 +518,7 @@
             <el-icon v-else aria-hidden="true"><Paperclip /></el-icon><span>{{ uploadingFiles ? `正在解析 ${uploadingFiles} 个文件` : '添加附件' }}</span>
             <input ref="fileInput" type="file" multiple :disabled="uploadingFiles > 0" accept=".pdf,.docx,.xlsx,.xls,.pptx,.md,.txt,.csv,.json,.png,.jpg,.jpeg" @change="onFilesPicked" />
           </label>
-          <div class="assistant-mode-switch" role="group" aria-label="助手工作模式">
-            <button
-              v-for="option in modeOptions"
-              :key="option.value"
-              type="button"
-              :class="{ active: mode === option.value }"
-              :aria-pressed="mode === option.value"
-              :title="option.hint"
-              @click="mode = option.value"
-            >{{ option.label }}</button>
-          </div>
         </div>
-        <div class="composer-mode-hint" role="status"><b>{{ activeModeOption.label }}</b><span>{{ activeModeOption.hint }}</span></div>
         <div class="composer-input-row">
           <el-input
             v-model="input"
@@ -327,10 +527,10 @@
             resize="none"
             maxlength="12000"
             show-word-limit
-            :placeholder="activeModeOption.placeholder"
+            placeholder="描述你要完成的工作，助手会自动判断需要分析、建模、查询还是执行确认"
             @keydown.enter.exact.prevent="send()"
           />
-          <el-button class="send-button" type="primary" :loading="loading" :disabled="!input.trim() || uploadingFiles > 0" aria-label="发送消息" title="发送" @click="send()">
+          <el-button class="send-button" type="primary" :loading="loading || compilationBusy" :disabled="!input.trim() || uploadingFiles > 0 || compilationBusy" aria-label="发送消息" title="发送" @click="send()">
             <el-icon aria-hidden="true"><Promotion /></el-icon>
           </el-button>
         </div>
@@ -356,9 +556,25 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamAssistantChat } from '@/api'
-import type { AssistantActionPreview, AssistantAttachment, AssistantMessage, AssistantProposal, AssistantQuestion, AssistantSource, AssistantThread, AssistantThought } from '@/types'
+import { useAuthStore } from '@/stores/auth'
+import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationJobStatus, AssistantMessage, AssistantProposal, AssistantQuestion, AssistantSource, AssistantThread, AssistantThought, LLMConfig, MCPConfig, Skill } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
+import {
+  clearCompilationJobBookmark,
+  clearPendingCompilationJobBookmark,
+  compilationJobMatchesScenario,
+  compilationPollDelay,
+  readCompilationJobBookmark,
+  readPendingCompilationJobBookmark,
+  saveCompilationJobBookmark,
+  savePendingCompilationJobBookmark,
+  selectCompilationJobForRecovery,
+  type CompilationRecoveryOwnerScope,
+  type CompilationRecoveryThreadScope,
+} from '@/utils/assistantCompilationRecovery'
+import { compilationRetryDraft, retryAttachmentsForMessage } from '@/utils/assistantRetry'
+import { groupScenarioModelIssues, scenarioModelIssueLabel } from '@/utils/assistantProposalGroups'
 
 interface AssistantContext {
   page?: string
@@ -370,18 +586,14 @@ const props = withDefaults(defineProps<{ context: AssistantContext; hideLauncher
   hideLauncher: false,
 })
 const router = useRouter()
-type AssistantMode = 'explain' | 'draft' | 'apply' | 'execute'
+const auth = useAuthStore()
+type AssistantMode = 'ask' | 'explain' | 'draft' | 'apply' | 'execute'
+type AssistantDraftKind = 'auto' | 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'
 const visible = ref(false)
 const loading = ref(false)
 const input = ref('')
-const mode = ref<AssistantMode>('explain')
-const modeOptions: Array<{ value: AssistantMode; label: string; hint: string; placeholder: string }> = [
-  { value: 'explain', label: '只解释', hint: '只读取和说明，不生成或写入变更。', placeholder: '询问当前业务事实、规则、来源或不确定项…' },
-  { value: 'draft', label: '生成草稿', hint: '生成可检查的变更清单，确认前不写入。', placeholder: '描述要创建的场景、本体、映射或工作流草稿…' },
-  { value: 'apply', label: '应用修改', hint: '定位待应用草稿；写入仍需在变更清单中二次确认。', placeholder: '说明要应用哪份草稿或需要核对的变更范围…' },
-  { value: 'execute', label: '执行操作', hint: '分析影响并引导预演/审批；不会从聊天直接触发副作用。', placeholder: '描述要执行的操作、参数和期望结果，以便检查权限与影响…' },
-]
-const activeModeOption = computed(() => modeOptions.find((option) => option.value === mode.value) || modeOptions[0])
+const mode = ref<AssistantMode>('ask')
+const draftKind = ref<AssistantDraftKind>('auto')
 const messages = ref<AssistantMessage[]>([])
 const attachments = ref<AssistantAttachment[]>([])
 const threadId = ref('')
@@ -397,8 +609,29 @@ const sourcePreviewLoading = ref(false)
 const sourcePreview = ref<AssistantSource | null>(null)
 const sourcePreviewText = ref('')
 const expandedProposal = reactive<Record<number, boolean>>({})
+const expandedChangeLists = reactive<Record<string, boolean>>({})
+const expandedIssueGroups = reactive<Record<string, boolean>>({})
 const expandedThinking = reactive<Record<string, boolean>>({})
 const selection = reactive<{ label: string; kind: string; id: string }>({ label: '', kind: '', id: '' })
+const assistantConfig = reactive<{ llmConfigId: string; skillIds: string[]; mcpIds: string[] }>({
+  llmConfigId: '',
+  skillIds: [],
+  mcpIds: [],
+})
+const assistantLLMs = ref<LLMConfig[]>([])
+const assistantSkills = ref<Skill[]>([])
+const assistantMCPs = ref<MCPConfig[]>([])
+const capabilitiesLoading = ref(false)
+const capabilitiesLoaded = ref(false)
+const activeCompilationJob = ref<AssistantCompilationJobStatus | null>(null)
+const compilationRecoveryThreadId = ref('')
+let compilationPollTimer: number | null = null
+let compilationRecoveryEpoch = 0
+let compilationPollErrors = 0
+let streamGeneration = 0
+let componentDisposed = false
+
+const assistantConfigStorageKey = 'ontology-assistant-capabilities'
 
 const context = computed(() => ({
   page: props.context.page || '工作台',
@@ -409,39 +642,114 @@ const assistantScopeKey = computed(() => `${context.value.scenario_id || 'global
 const storageKey = computed(() => `ontology-assistant-thread:${encodeURIComponent(assistantScopeKey.value)}`)
 const currentThread = computed(() => threads.value.find((thread) => thread.id === threadId.value))
 const hasStreamingAssistant = computed(() => messages.value.some((message) => message.role === 'assistant' && message.streaming))
+const compilationRunning = computed(() => activeCompilationJob.value?.status === 'running'
+  && compilationRecoveryThreadId.value === threadId.value)
+const compilationBusy = computed(() => Boolean(activeCompilationJob.value)
+  && activeCompilationJob.value?.status !== 'failed'
+  && compilationRecoveryThreadId.value === threadId.value)
+const compilationCallSummary = computed(() => {
+  const job = activeCompilationJob.value
+  if (!job || job.status !== 'running') return ''
+  const used = Number(job.llm_calls_used ?? job.progress?.calls_used ?? 0)
+  const budget = Number(job.llm_call_budget ?? job.progress?.call_budget ?? 0)
+  return budget > 0 ? `模型调用 ${used}/${budget}` : '正在等待服务端进度'
+})
 // The Agent chat owns the bottom-right composer controls. A persistent global
 // launcher must not cover its primary send action or keyboard focus target.
 const showLauncher = computed(() => {
   if (props.hideLauncher) return false
   const path = context.value.path
-  // 场景建模页已有唯一的“AI 建模助手”入口；不再叠加浮动按钮遮挡编辑面板。
+  // Agent 对话页已有自己的输入区；其他业务页面统一使用全局浮动助手。
   return !/^\/agents\/[^/]+\/chat(?:\/|$|\?)/.test(path)
-    && !/^\/scenarios\/[^/?]+(?:\/|$|\?)/.test(path)
 })
-const starterSuggestions = computed(() => context.value.scenario_id
-  ? ['解释当前业务场景', '根据当前资料生成本体草稿', '根据现有对象类型和数据源生成映射草稿', '把当前业务流程编排为工作流']
-  : ['根据我的业务描述生成场景草稿', '这个平台可以帮我做什么？', '我应该先准备哪些业务资料？'])
-
 function proposalOf(message: AssistantMessage): AssistantProposal | null {
   const proposal = message.proposal as AssistantProposal | undefined
   return proposal && proposal.kind && proposal.payload ? proposal : null
 }
 
+function restoreAssistantConfig() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(assistantConfigStorageKey) || '{}') as Partial<typeof assistantConfig>
+    assistantConfig.llmConfigId = String(saved.llmConfigId || '')
+    assistantConfig.skillIds = Array.isArray(saved.skillIds) ? saved.skillIds.map(String) : []
+    assistantConfig.mcpIds = Array.isArray(saved.mcpIds) ? saved.mcpIds.map(String) : []
+  } catch {
+    assistantConfig.llmConfigId = ''
+    assistantConfig.skillIds = []
+    assistantConfig.mcpIds = []
+  }
+}
+
+function persistAssistantConfig() {
+  localStorage.setItem(assistantConfigStorageKey, JSON.stringify(assistantConfig))
+}
+
+async function loadAssistantCapabilities() {
+  if (capabilitiesLoaded.value || capabilitiesLoading.value) return
+  capabilitiesLoading.value = true
+  try {
+    const [llms, skills, mcps] = await Promise.all([api.listLLM(), api.listSkills(), api.listMCP()])
+    assistantLLMs.value = llms.filter((item) => item.enabled !== false && (!item.capabilities?.length || item.capabilities.includes('chat')))
+    assistantSkills.value = skills.filter((item) => item.enabled)
+    assistantMCPs.value = mcps.filter((item) => item.enabled !== false)
+    if (assistantConfig.llmConfigId && !assistantLLMs.value.some((item) => item.id === assistantConfig.llmConfigId)) assistantConfig.llmConfigId = ''
+    assistantConfig.skillIds = assistantConfig.skillIds.filter((id) => assistantSkills.value.some((item) => item.id === id))
+    assistantConfig.mcpIds = assistantConfig.mcpIds.filter((id) => assistantMCPs.value.some((item) => item.id === id))
+    persistAssistantConfig()
+    capabilitiesLoaded.value = true
+  } catch (error: any) {
+    ElMessage.warning(error.message || '助手能力配置加载失败，将使用平台默认配置')
+  } finally {
+    capabilitiesLoading.value = false
+  }
+}
+
 function proposalCanApply(proposal: AssistantProposal | null) {
   if (!proposal) return false
+  if (proposal.kind === 'scenario_model' && (blockingIssues(proposal).length || !hasEffectiveChanges(proposal))) return false
   return proposal.kind === 'scenario' ? !context.value.scenario_id : Boolean(context.value.scenario_id)
+}
+
+function hasEffectiveChanges(proposal: AssistantProposal | null) {
+  return Boolean(proposal?.changes?.some((change) => change.operation !== 'skip'))
+}
+
+function blockingIssues(proposal: AssistantProposal | null) {
+  if (proposal?.kind !== 'scenario_model') return []
+  const issues = proposal.payload?.unresolved
+  return Array.isArray(issues) ? issues.filter((item) => item?.blocking !== false) : []
+}
+
+function scenarioIssueGroups(proposal: AssistantProposal | null) {
+  if (proposal?.kind !== 'scenario_model') return []
+  return groupScenarioModelIssues(proposal.payload?.unresolved)
+}
+
+function blockingScenarioIssueGroups(proposal: AssistantProposal | null) {
+  return scenarioIssueGroups(proposal).filter((group) => group.blocking)
+}
+
+function nonBlockingScenarioIssueGroups(proposal: AssistantProposal | null) {
+  return scenarioIssueGroups(proposal).filter((group) => !group.blocking)
+}
+
+function nonBlockingIssueCount(proposal: AssistantProposal | null) {
+  return nonBlockingScenarioIssueGroups(proposal)
+    .reduce((total, group) => total + group.issues.length, 0)
 }
 
 function proposalApplyLabel(proposal: AssistantProposal | null) {
   if (!proposal) return '确认并应用变更'
   if (proposal.status === 'applied') return proposal.kind === 'scenario' ? '场景已创建' : '变更已应用'
-  return ({ scenario: '确认并创建场景', mapping: '确认并保存映射', ontology: '确认并应用本体', workflow: '确认并保存流程' } as Record<string, string>)[proposal.kind] || '确认并应用变更'
+  return ({ scenario: '确认并创建场景', mapping: '确认并保存映射', ontology: '确认并应用本体', workflow: '确认并保存流程', scenario_model: '确认并原子应用' } as Record<string, string>)[proposal.kind] || '确认并应用变更'
 }
 
 function proposalApplyHint(proposal: AssistantProposal | null) {
   if (!proposal?.proposal_id) return '此草稿缺少安全标识，请重新生成'
   if (proposal.kind === 'scenario' && context.value.scenario_id) return '场景草稿只能在全局工作区创建'
   if (proposal.kind !== 'scenario' && !context.value.scenario_id) return '请先打开业务场景'
+  if (proposal.kind === 'scenario_model' && blockingIssues(proposal).length) return `仍有 ${blockingIssues(proposal).length} 个阻塞项，请补充资料后重新编译`
+  if (proposal.kind === 'scenario_model' && !hasEffectiveChanges(proposal)) return '未识别到可应用的业务模型变更，请补充文档后重新编译'
   if (proposal.kind === 'mapping') return '保存后仍需预览、测试并刷新对象'
   return ''
 }
@@ -457,7 +765,7 @@ function proposalOperationType(operation: string) {
 function proposalResourceLabel(resource: string) {
   return ({
     scenario: '业务场景', entity: '对象类型', property: '属性', relation: '关系类型', mapping: '数据映射', mapping_field: '映射字段', data_mapping: '数据映射',
-    action: '操作', rule: '规则', workflow: '工作流', workflow_node: '工作流节点', workflow_edge: '工作流连线',
+    function: '函数', action: '操作', rule: '规则', event: '事件', workflow: '工作流', workflow_node: '工作流节点', workflow_edge: '工作流连线',
   } as Record<string, string>)[resource] || resource
 }
 
@@ -544,6 +852,70 @@ function toggleProposal(index: number) {
   expandedProposal[index] = !expandedProposal[index]
 }
 
+function stableDomToken(value: string) {
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(36)
+}
+
+function proposalExpansionKey(message: AssistantMessage, index: number) {
+  return messageKey(message, index)
+}
+
+function proposalDetailId(message: AssistantMessage, index: number) {
+  return `proposal-detail-${stableDomToken(proposalExpansionKey(message, index))}`
+}
+
+function proposalChangesId(message: AssistantMessage, index: number) {
+  return `proposal-changes-${stableDomToken(proposalExpansionKey(message, index))}`
+}
+
+function isChangeListExpanded(message: AssistantMessage, index: number) {
+  return Boolean(expandedChangeLists[proposalExpansionKey(message, index)])
+}
+
+function toggleChangeList(message: AssistantMessage, index: number) {
+  const key = proposalExpansionKey(message, index)
+  expandedChangeLists[key] = !expandedChangeLists[key]
+}
+
+function issueExpansionKey(message: AssistantMessage, index: number, groupKey: string) {
+  return `${proposalExpansionKey(message, index)}::${groupKey}`
+}
+
+function issueGroupId(message: AssistantMessage, index: number, groupKey: string) {
+  return `proposal-issues-${stableDomToken(issueExpansionKey(message, index, groupKey))}`
+}
+
+function noticeCategoryKey(message: AssistantMessage, index: number) {
+  return `${proposalExpansionKey(message, index)}::__notices__`
+}
+
+function noticeCategoryId(message: AssistantMessage, index: number) {
+  return `proposal-notices-${stableDomToken(noticeCategoryKey(message, index))}`
+}
+
+function isNoticeCategoryExpanded(message: AssistantMessage, index: number) {
+  return Boolean(expandedIssueGroups[noticeCategoryKey(message, index)])
+}
+
+function toggleNoticeCategory(message: AssistantMessage, index: number) {
+  const key = noticeCategoryKey(message, index)
+  expandedIssueGroups[key] = !expandedIssueGroups[key]
+}
+
+function isIssueGroupExpanded(message: AssistantMessage, index: number, groupKey: string) {
+  return Boolean(expandedIssueGroups[issueExpansionKey(message, index, groupKey)])
+}
+
+function toggleIssueGroup(message: AssistantMessage, index: number, groupKey: string) {
+  const key = issueExpansionKey(message, index, groupKey)
+  expandedIssueGroups[key] = !expandedIssueGroups[key]
+}
+
 function messageKey(message: AssistantMessage, index: number) {
   return message.id || `message-${index}`
 }
@@ -590,6 +962,341 @@ function apiContext() {
   }
 }
 
+function compilationOwnerScope(): CompilationRecoveryOwnerScope | null {
+  const tenantId = String(auth.user?.tenant_id || '').trim()
+  const userId = String(auth.user?.id || '').trim()
+  const scenarioId = String(context.value.scenario_id || '').trim()
+  return tenantId && userId && scenarioId ? { tenantId, userId, scenarioId } : null
+}
+
+function compilationThreadScope(id = threadId.value): CompilationRecoveryThreadScope | null {
+  const owner = compilationOwnerScope()
+  const normalizedThreadId = String(id || '').trim()
+  return owner && normalizedThreadId ? { ...owner, threadId: normalizedThreadId } : null
+}
+
+function clearCompilationPollTimer() {
+  if (compilationPollTimer) window.clearTimeout(compilationPollTimer)
+  compilationPollTimer = null
+}
+
+function detachCompilationRecovery(clearStatus = true) {
+  clearCompilationPollTimer()
+  compilationRecoveryEpoch += 1
+  compilationPollErrors = 0
+  compilationRecoveryThreadId.value = ''
+  if (clearStatus) activeCompilationJob.value = null
+}
+
+function compilationRecoveryIsCurrent(epoch: number, scope: CompilationRecoveryThreadScope) {
+  const owner = compilationOwnerScope()
+  return !componentDisposed
+    && epoch === compilationRecoveryEpoch
+    && Boolean(owner)
+    && owner?.tenantId === scope.tenantId
+    && owner?.userId === scope.userId
+    && owner?.scenarioId === scope.scenarioId
+    && threadId.value === scope.threadId
+    && compilationRecoveryThreadId.value === scope.threadId
+}
+
+function dismissCompilationFailure() {
+  if (activeCompilationJob.value?.status !== 'failed') return
+  activeCompilationJob.value = null
+  compilationRecoveryThreadId.value = ''
+}
+
+function compilationProgressDetail(job: AssistantCompilationJobStatus) {
+  const detail = String(job.progress?.detail || '').trim()
+  if (detail) return detail
+  if (job.status === 'running') return '任务仍在服务端运行；恢复过程只查询状态，不会重新提交聊天请求。'
+  if (job.status === 'succeeded') return '服务端任务已完成，正在恢复持久化变更清单。'
+  return job.error_message || '系统已保持零写入。请修改附件或描述后显式重试。'
+}
+
+function markCompilationMessage(job: AssistantCompilationJobStatus, scope: CompilationRecoveryThreadScope) {
+  let index = messages.value.findIndex((message) => message.context?.compilation_job_id === job.id)
+  if (index < 0 && job.status === 'running') {
+    messages.value.push({
+      id: `compilation-recovery-${job.id}`,
+      thread_id: scope.threadId,
+      role: 'assistant',
+      content: '正在恢复完整业务模型编译；不会重复提交附件或聊天请求。',
+      context: { compilation_job_id: job.id, status: 'processing' },
+      thinking: [],
+      streaming: true,
+    })
+    index = messages.value.length - 1
+  }
+  if (index < 0) return
+  const message = messages.value[index]
+  message.streaming = job.status !== 'failed'
+  message.context = {
+    ...(message.context || {}),
+    compilation_job_id: job.id,
+    status: job.status === 'running' ? 'processing' : job.status,
+  }
+  upsertThinking(message, {
+    id: 'scenario-model',
+    title: job.status === 'running' ? '编译完整业务模型' : job.status === 'succeeded' ? '完整业务模型已编译' : '完整业务模型编译未完成',
+    detail: compilationProgressDetail(job),
+    status: job.status === 'running' ? 'running' : job.status === 'succeeded' ? 'done' : 'error',
+  }, index)
+  scrollBottom()
+}
+
+function scheduleCompilationPoll(jobId: string, epoch: number, scope: CompilationRecoveryThreadScope) {
+  if (!compilationRecoveryIsCurrent(epoch, scope)) return
+  clearCompilationPollTimer()
+  compilationPollTimer = window.setTimeout(
+    () => { void pollCompilationJob(jobId, epoch, scope) },
+    compilationPollDelay(document.hidden, compilationPollErrors),
+  )
+}
+
+async function pollCompilationJob(jobId: string, epoch: number, scope: CompilationRecoveryThreadScope) {
+  if (!compilationRecoveryIsCurrent(epoch, scope)) return
+  compilationPollTimer = null
+  try {
+    const job = await api.getAssistantCompilationJob(jobId)
+    if (!compilationRecoveryIsCurrent(epoch, scope)) return
+    compilationPollErrors = 0
+    await consumeCompilationJob(job, epoch, scope)
+  } catch (error: any) {
+    if (!compilationRecoveryIsCurrent(epoch, scope)) return
+    if (error?.status === 403 || error?.status === 404) {
+      clearCompilationJobBookmark(localStorage, scope)
+      activeCompilationJob.value = null
+      compilationRecoveryThreadId.value = ''
+      ElMessage.warning('当前账号或场景已无法访问这项编译任务，已停止恢复。')
+      return
+    }
+    compilationPollErrors += 1
+    if (activeCompilationJob.value?.status === 'running') {
+      activeCompilationJob.value = {
+        ...activeCompilationJob.value,
+        progress: {
+          ...(activeCompilationJob.value.progress || {}),
+          detail: '暂时无法刷新任务进度；系统不会重新提交请求，将继续安全重试状态查询。',
+        },
+      }
+      markCompilationMessage(activeCompilationJob.value, scope)
+    }
+    scheduleCompilationPoll(jobId, epoch, scope)
+  }
+}
+
+async function recoverSucceededCompilation(
+  job: AssistantCompilationJobStatus,
+  epoch: number,
+  scope: CompilationRecoveryThreadScope,
+) {
+  clearCompilationPollTimer()
+  const result = await api.getAssistantCompilationJobResult(job.id)
+  if (!compilationRecoveryIsCurrent(epoch, scope)) return
+  if (result.job_id !== job.id || result.scenario_id !== scope.scenarioId) {
+    clearCompilationJobBookmark(localStorage, scope)
+    detachCompilationRecovery()
+    ElMessage.error('编译结果与当前业务场景不一致，已拒绝恢复。')
+    return
+  }
+
+  const proposalThreadId = String(result.proposal_thread_id || scope.threadId).trim()
+  let resultThreadId = proposalThreadId
+  let recoveredMessages: AssistantMessage[]
+  try {
+    recoveredMessages = await api.listAssistantMessages(resultThreadId, apiContext())
+  } catch {
+    // A deduplicated job can point at its original proposal thread while the
+    // current thread is merely a subscriber. Keep the current scoped thread
+    // visible and use the server result as a display-only recovery copy.
+    resultThreadId = scope.threadId
+    recoveredMessages = await api.listAssistantMessages(resultThreadId, apiContext())
+  }
+  if (!compilationRecoveryIsCurrent(epoch, scope)) return
+  const proposal = result.proposal as AssistantProposal | undefined
+  const proposalId = String(proposal?.proposal_id || '')
+  const hasProposalMessage = proposalId && recoveredMessages.some((message) => {
+    const value = message.proposal as AssistantProposal | undefined
+    return value?.proposal_id === proposalId
+  })
+  if (result.apply_ready && proposalId && !hasProposalMessage) {
+    recoveredMessages = [...recoveredMessages, {
+      id: result.proposal_message_id || `compilation-result-${job.id}`,
+      thread_id: resultThreadId,
+      role: 'assistant',
+      content: '完整业务模型已在服务端完成并恢复；请核对变更清单后再决定是否应用。',
+      context: { compilation_job_id: job.id, status: 'succeeded', proposal_thread_id: proposalThreadId },
+      proposal,
+    }]
+  }
+
+  streamGeneration += 1
+  streamController = null
+  loading.value = false
+  clearCompilationJobBookmark(localStorage, scope)
+  const owner = compilationOwnerScope()
+  if (owner) clearPendingCompilationJobBookmark(localStorage, owner)
+  if (resultThreadId !== scope.threadId) {
+    const targetScope = compilationThreadScope(resultThreadId)
+    if (targetScope) clearCompilationJobBookmark(localStorage, targetScope)
+    threadId.value = resultThreadId
+    localStorage.setItem(storageKey.value, resultThreadId)
+    syncThread(resultThreadId, '已恢复的完整业务模型')
+  }
+  messages.value = recoveredMessages
+  activeCompilationJob.value = null
+  compilationRecoveryThreadId.value = ''
+  compilationRecoveryEpoch += 1
+  scrollBottom()
+  ElMessage.success(result.apply_ready ? '完整业务模型编译已恢复，请核对变更清单' : '完整业务模型编译已完成，服务端结果已恢复')
+}
+
+async function recoverFailedCompilation(
+  job: AssistantCompilationJobStatus,
+  epoch: number,
+  scope: CompilationRecoveryThreadScope,
+) {
+  clearCompilationPollTimer()
+  try {
+    const recoveredMessages = await api.listAssistantMessages(scope.threadId, apiContext())
+    if (compilationRecoveryIsCurrent(epoch, scope)) messages.value = recoveredMessages
+  } catch {
+    // The status DTO already contains the server-sanitized failure message.
+  }
+  if (!compilationRecoveryIsCurrent(epoch, scope)) return
+  streamGeneration += 1
+  streamController = null
+  loading.value = false
+  clearCompilationJobBookmark(localStorage, scope)
+  const owner = compilationOwnerScope()
+  if (owner) clearPendingCompilationJobBookmark(localStorage, owner)
+  activeCompilationJob.value = job
+  markCompilationMessage(job, scope)
+  ElMessage.error(job.error_message || '完整业务模型编译未完成，系统已保持零写入。')
+}
+
+async function consumeCompilationJob(
+  job: AssistantCompilationJobStatus,
+  epoch: number,
+  scope: CompilationRecoveryThreadScope,
+) {
+  if (!compilationRecoveryIsCurrent(epoch, scope)) return
+  if (!compilationJobMatchesScenario(job, scope.scenarioId)) {
+    clearCompilationJobBookmark(localStorage, scope)
+    detachCompilationRecovery()
+    ElMessage.error('检测到跨场景的编译任务，已拒绝恢复。')
+    return
+  }
+  activeCompilationJob.value = job
+  markCompilationMessage(job, scope)
+  if (job.status === 'running') {
+    saveCompilationJobBookmark(localStorage, scope, job.id)
+    scheduleCompilationPoll(job.id, epoch, scope)
+    return
+  }
+  if (job.status === 'succeeded') {
+    await recoverSucceededCompilation(job, epoch, scope)
+    return
+  }
+  await recoverFailedCompilation(job, epoch, scope)
+}
+
+async function discoverCompilationForThread(id: string) {
+  const scope = compilationThreadScope(id)
+  if (!scope) return
+  clearCompilationPollTimer()
+  compilationRecoveryEpoch += 1
+  compilationPollErrors = 0
+  const epoch = compilationRecoveryEpoch
+  compilationRecoveryThreadId.value = id
+  activeCompilationJob.value = null
+  try {
+    const bookmarkedJobId = readCompilationJobBookmark(localStorage, scope)
+    const pendingJobId = readPendingCompilationJobBookmark(localStorage, scope)
+    const jobs = await api.listAssistantCompilationJobs(id, apiContext())
+    if (!compilationRecoveryIsCurrent(epoch, scope)) return
+    let job = selectCompilationJobForRecovery(jobs, scope.scenarioId, bookmarkedJobId || pendingJobId)
+    if (!job && pendingJobId) {
+      const pending = await api.getAssistantCompilationJob(pendingJobId)
+      if (!compilationRecoveryIsCurrent(epoch, scope)) return
+      if (pending.thread_id === id && compilationJobMatchesScenario(pending, scope.scenarioId)) job = pending
+    }
+    if (!job) {
+      compilationRecoveryThreadId.value = ''
+      if (pendingJobId) clearPendingCompilationJobBookmark(localStorage, scope)
+      return
+    }
+    saveCompilationJobBookmark(localStorage, scope, job.id)
+    if (pendingJobId === job.id) clearPendingCompilationJobBookmark(localStorage, scope)
+    await consumeCompilationJob(job, epoch, scope)
+  } catch (error: any) {
+    if (!compilationRecoveryIsCurrent(epoch, scope)) return
+    compilationRecoveryThreadId.value = ''
+    if (error?.status !== 404) ElMessage.warning('暂时无法恢复编译任务进度；再次打开该会话时会继续查询。')
+  }
+}
+
+async function beginCompilationRecoveryFromEvent(data: Record<string, any>) {
+  const owner = compilationOwnerScope()
+  const jobId = String(data?.job_id || '').trim()
+  if (!owner || !jobId) return
+  savePendingCompilationJobBookmark(localStorage, owner, jobId)
+  const existingScope = compilationThreadScope()
+  if (existingScope) saveCompilationJobBookmark(localStorage, existingScope, jobId)
+  clearCompilationPollTimer()
+  compilationRecoveryEpoch += 1
+  compilationPollErrors = 0
+  const lookupEpoch = compilationRecoveryEpoch
+  if (existingScope) compilationRecoveryThreadId.value = existingScope.threadId
+  try {
+    const job = await api.getAssistantCompilationJob(jobId)
+    const currentOwner = compilationOwnerScope()
+    if (lookupEpoch !== compilationRecoveryEpoch
+      || !currentOwner
+      || currentOwner.tenantId !== owner.tenantId
+      || currentOwner.userId !== owner.userId
+      || currentOwner.scenarioId !== owner.scenarioId) return
+    if (!compilationJobMatchesScenario(job, owner.scenarioId)) {
+      clearPendingCompilationJobBookmark(localStorage, owner)
+      if (existingScope) clearCompilationJobBookmark(localStorage, existingScope)
+      ElMessage.error('服务端返回了其他场景的编译任务，已拒绝关联。')
+      return
+    }
+    const targetThreadId = String(threadId.value || job.thread_id || '').trim()
+    const scope = compilationThreadScope(targetThreadId)
+    if (!scope) return
+    if (!threadId.value) {
+      threadId.value = targetThreadId
+      localStorage.setItem(storageKey.value, targetThreadId)
+      syncThread(targetThreadId, '完整业务模型编译')
+    }
+    const epoch = lookupEpoch
+    compilationRecoveryThreadId.value = targetThreadId
+    saveCompilationJobBookmark(localStorage, scope, job.id)
+    clearPendingCompilationJobBookmark(localStorage, owner)
+    await consumeCompilationJob(job, epoch, scope)
+  } catch {
+    // Keep the pending bookmark: HMR/reload can resolve it from the owner-scoped status API.
+  }
+}
+
+function settleCompilationFromStream(proposal?: AssistantProposal | Record<string, any>) {
+  if (!proposal || proposal.kind !== 'scenario_model') return
+  const scope = compilationThreadScope(compilationRecoveryThreadId.value || threadId.value)
+  if (scope) clearCompilationJobBookmark(localStorage, scope)
+  const owner = compilationOwnerScope()
+  if (owner) clearPendingCompilationJobBookmark(localStorage, owner)
+  detachCompilationRecovery()
+}
+
+function onCompilationVisibilityChange() {
+  const job = activeCompilationJob.value
+  const scope = compilationThreadScope(compilationRecoveryThreadId.value)
+  if (!job || job.status !== 'running' || !scope) return
+  scheduleCompilationPoll(job.id, compilationRecoveryEpoch, scope)
+}
+
 function formatThreadTime(value?: string) {
   if (!value) return '刚刚'
   const date = new Date(value)
@@ -607,14 +1314,19 @@ function welcomeMessage(): AssistantMessage {
 }
 
 async function loadThread(id: string, closeHistory = true) {
+  detachCompilationRecovery()
+  if (id !== threadId.value) attachments.value = []
   try {
     messages.value = await api.listAssistantMessages(id, apiContext())
     threadId.value = id
     localStorage.setItem(storageKey.value, id)
     Object.keys(expandedProposal).forEach((key) => delete expandedProposal[Number(key)])
+    Object.keys(expandedChangeLists).forEach((key) => delete expandedChangeLists[key])
+    Object.keys(expandedIssueGroups).forEach((key) => delete expandedIssueGroups[key])
     Object.keys(expandedThinking).forEach((key) => delete expandedThinking[key])
     if (closeHistory) historyVisible.value = false
     scrollBottom()
+    await discoverCompilationForThread(id)
   } catch (error: any) {
     localStorage.removeItem(storageKey.value)
     threadId.value = ''
@@ -638,7 +1350,21 @@ async function loadThreads() {
 async function loadContext() {
   await loadThreads()
   const saved = localStorage.getItem(storageKey.value) || ''
-  const candidate = threads.value.find((thread) => thread.id === saved) || threads.value[0]
+  let candidate = threads.value.find((thread) => thread.id === saved) || threads.value[0]
+  const owner = compilationOwnerScope()
+  const pendingJobId = owner ? readPendingCompilationJobBookmark(localStorage, owner) : ''
+  if (owner && pendingJobId) {
+    try {
+      const pendingJob = await api.getAssistantCompilationJob(pendingJobId)
+      if (compilationJobMatchesScenario(pendingJob, owner.scenarioId) && pendingJob.thread_id) {
+        candidate = threads.value.find((thread) => thread.id === pendingJob.thread_id) || candidate
+      } else if (!compilationJobMatchesScenario(pendingJob, owner.scenarioId)) {
+        clearPendingCompilationJobBookmark(localStorage, owner)
+      }
+    } catch {
+      // Keep the owner-scoped bookmark for a later recovery attempt.
+    }
+  }
   if (candidate) {
     await loadThread(candidate.id, false)
   } else {
@@ -650,6 +1376,7 @@ async function loadContext() {
 }
 
 async function openAssistant() {
+  if (!auth.initialized) await auth.initialize()
   visible.value = true
   await loadContext()
 }
@@ -662,6 +1389,7 @@ async function toggleHistory() {
 async function createNewThread() {
   if (loading.value || threadsLoading.value) return
   try {
+    detachCompilationRecovery()
     const thread = await api.createAssistantThread(apiContext())
     threads.value = [thread, ...threads.value.filter((item) => item.id !== thread.id)]
     threadId.value = thread.id
@@ -669,6 +1397,8 @@ async function createNewThread() {
     messages.value = [welcomeMessage()]
     attachments.value = []
     Object.keys(expandedProposal).forEach((key) => delete expandedProposal[Number(key)])
+    Object.keys(expandedChangeLists).forEach((key) => delete expandedChangeLists[key])
+    Object.keys(expandedIssueGroups).forEach((key) => delete expandedIssueGroups[key])
     Object.keys(expandedThinking).forEach((key) => delete expandedThinking[key])
     historyVisible.value = false
     scrollBottom()
@@ -698,6 +1428,9 @@ async function deleteThread(thread: AssistantThread) {
     const wasCurrent = thread.id === threadId.value
     threads.value = threads.value.filter((item) => item.id !== thread.id)
     if (wasCurrent) {
+      const scope = compilationThreadScope(thread.id)
+      if (scope) clearCompilationJobBookmark(localStorage, scope)
+      detachCompilationRecovery()
       localStorage.removeItem(storageKey.value)
       threadId.value = ''
       messages.value = threads.value[0] ? [] : [welcomeMessage()]
@@ -757,6 +1490,20 @@ function syncThread(threadIdValue: string, title: string) {
 
 function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantMessage, index: number) {
   switch (event.type) {
+    case 'compilation_job':
+      if (event.data?.job_id) {
+        // The job event arrives before the final meta event on a brand-new
+        // thread. Bind it to the already visible streaming response so the
+        // recovery poller updates that card instead of inserting a second
+        // "processing" assistant message for the same server-side job.
+        ai.context = {
+          ...(ai.context || {}),
+          compilation_job_id: String(event.data.job_id),
+          status: 'processing',
+        }
+      }
+      void beginCompilationRecoveryFromEvent(event.data || {})
+      break
     case 'progress':
       upsertThinking(ai, event.data as AssistantThought, index)
       break
@@ -765,6 +1512,7 @@ function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantM
       break
     case 'proposal':
       ai.proposal = event.data || {}
+      settleCompilationFromStream(ai.proposal)
       break
     case 'action_preview':
       ai.action_preview = event.data || undefined
@@ -778,6 +1526,7 @@ function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantM
         syncThread(data.thread_id, currentUserMessage?.content || '新的助手任务')
       }
       ai.proposal = data.proposal || ai.proposal || {}
+      settleCompilationFromStream(ai.proposal)
       ai.questions = data.questions || []
       ai.sources = data.sources || []
       ai.evidence = data.evidence || undefined
@@ -802,7 +1551,8 @@ function finishStream(ai: AssistantMessage) {
 
 function send(text?: string) {
   const content = (text ?? input.value).trim()
-  if (!content || loading.value || uploadingFiles.value > 0) return
+  if (!content || loading.value || compilationBusy.value || uploadingFiles.value > 0) return
+  if (activeCompilationJob.value?.status === 'failed') detachCompilationRecovery()
   if (messages.value.length === 1 && messages.value[0].role === 'assistant' && !messages.value[0].id) messages.value = []
   const currentAttachments = [...attachments.value]
   messages.value.push({ role: 'user', content, attachments: currentAttachments })
@@ -812,6 +1562,7 @@ function send(text?: string) {
   const ai = messages.value[aiIndex]
   input.value = ''
   loading.value = true
+  const generation = ++streamGeneration
   scrollBottom()
   streamController = streamAssistantChat(
     {
@@ -822,19 +1573,30 @@ function send(text?: string) {
       path: context.value.path,
       selection: selection.id ? { ...selection } : {},
       attachment_ids: currentAttachments.map((item) => item.id),
+      llm_config_id: assistantConfig.llmConfigId || undefined,
+      skill_ids: [...assistantConfig.skillIds],
+      mcp_ids: [...assistantConfig.mcpIds],
       mode: mode.value,
+      draft_kind: mode.value === 'draft' ? draftKind.value : 'auto',
     },
     (event) => {
+      if (generation !== streamGeneration || componentDisposed) return
       handleAssistantEvent(event, ai, aiIndex)
       if (event.type === 'meta') attachments.value = []
     },
-    () => finishStream(ai),
+    () => {
+      if (generation === streamGeneration && !componentDisposed) finishStream(ai)
+    },
     (error) => {
-      ai.content += `${ai.content ? '\n\n' : ''}这次请求没有完成：${error.message || '请求失败'}`
+      if (generation !== streamGeneration || componentDisposed) return
+      ai.content += compilationRunning.value
+        ? `${ai.content ? '\n\n' : ''}连接已中断，但完整业务模型仍由服务端任务处理；页面会继续查询任务状态，不会自动重发请求。`
+        : `${ai.content ? '\n\n' : ''}这次请求没有完成：${error.message || '请求失败'}`
       ai.streaming = false
       loading.value = false
       streamController = null
-      ElMessage.error(error.message || '助手请求失败')
+      if (compilationRunning.value) ElMessage.warning('连接已中断，正在从服务端恢复编译任务')
+      else ElMessage.error(error.message || '助手请求失败')
       scrollBottom()
     },
   )
@@ -872,6 +1634,19 @@ async function answerQuestion(
     })
     return
   }
+  if (['retry', 'revise_and_retry'].includes(String(option.value || ''))) {
+    // A failed model call must not silently turn the next attempt into an
+    // attachment-free request. Temporary attachments remain reusable inside
+    // the same thread until their server-side TTL expires, so restore the most
+    // parsed attachment set paired with this assistant response, then let the
+    // user edit the correction draft before explicitly submitting it.
+    attachments.value = retryAttachmentsForMessage(messages.value, sourceMessage, threadId.value)
+    mode.value = 'draft'
+    draftKind.value = 'scenario_model'
+    input.value = compilationRetryDraft(option.value, option.prompt)
+    scrollBottom()
+    return
+  }
   const prompt = option.prompt?.trim() || [
     question.title,
     `我的选择：${option.label}${option.value ? `（${option.value}）` : ''}`,
@@ -889,7 +1664,9 @@ async function applyProposal(message: AssistantMessage, index: number) {
     ? `将根据这份草稿创建业务场景“${proposal.payload?.name || '未命名场景'}”。附件仍只属于助手临时上下文，不会成为正式数据源。`
     : proposal.kind === 'mapping'
       ? `将把 ${effectiveChanges} 项映射差异保存到当前场景。保存不会导入数据，之后仍需预览、测试并刷新对象。`
-      : `将把 ${effectiveChanges} 项变更写入当前场景草稿。草稿状态的工作流不会立即执行。`
+      : proposal.kind === 'scenario_model'
+        ? `将把 ${effectiveChanges} 项跨资源变更在同一事务中写入当前场景；任一对象、引用、规则、流程或映射校验失败都会整体回滚。AI 生成的操作、规则、事件和工作流仍保持停用。`
+        : `将把 ${effectiveChanges} 项变更写入当前场景草稿。草稿状态的工作流不会立即执行。`
   try {
     await ElMessageBox.confirm(
       confirmation,
@@ -906,10 +1683,11 @@ async function applyProposal(message: AssistantMessage, index: number) {
   }
   applyingIndex.value = index
   try {
+    const proposalThreadId = String(message.context?.proposal_thread_id || threadId.value)
     const result = await api.applyAssistantProposal({
       kind: proposal.kind,
       scenario_id: proposal.kind === 'scenario' ? undefined : context.value.scenario_id,
-      thread_id: threadId.value,
+      thread_id: proposalThreadId,
       proposal_id: proposal.proposal_id,
       confirm: true,
     })
@@ -925,7 +1703,7 @@ async function applyProposal(message: AssistantMessage, index: number) {
     else ElMessage.success(proposal.kind === 'scenario' ? '业务场景已创建' : proposal.kind === 'mapping' ? '映射草稿已保存' : '变更已应用到场景草稿')
     if (appliedScenarioId) {
       visible.value = false
-      await router.push({ name: 'scenario-detail', params: { id: appliedScenarioId }, query: { stage: 'flow' } })
+      await router.push({ name: 'scenario-detail', params: { id: appliedScenarioId }, query: { stage: 'workflows' } })
     }
   } catch (error: any) {
     ElMessage.error(error.message || '应用变更失败')
@@ -941,25 +1719,10 @@ function onSelection(event: Event) {
   selection.id = detail.id || ''
 }
 
-async function onAssistantOpenRequest(event: Event) {
-  const detail = (event as CustomEvent<{ mode?: AssistantMode | 'ask'; prompt?: string; files?: File[] }>).detail || {}
-  if (loading.value) {
-    ElMessage.info('当前助手任务完成后可继续新的建模步骤')
-    return
-  }
-  await nextTick()
-  if (!visible.value) await openAssistant()
-  historyVisible.value = false
-  if (detail.mode) mode.value = detail.mode === 'ask' ? 'explain' : detail.mode
-  if (typeof detail.prompt === 'string') input.value = detail.prompt
-  const files = Array.isArray(detail.files) ? detail.files.filter((file): file is File => file instanceof File) : []
-  if (files.length) await uploadTemporaryFiles(files)
-  scrollBottom()
-}
-
 watch(() => storageKey.value, async () => {
-  streamController?.abort()
+  streamGeneration += 1
   streamController = null
+  detachCompilationRecovery()
   loading.value = false
   messages.value = []
   threads.value = []
@@ -967,23 +1730,32 @@ watch(() => storageKey.value, async () => {
   historyVisible.value = false
   attachments.value = []
   sourcePreviewVisible.value = false
+  Object.keys(expandedChangeLists).forEach((key) => delete expandedChangeLists[key])
+  Object.keys(expandedIssueGroups).forEach((key) => delete expandedIssueGroups[key])
   Object.keys(expandedThinking).forEach((key) => delete expandedThinking[key])
   if (visible.value) {
     await loadContext()
   }
 })
+watch(() => context.value.scenario_id, (scenarioId) => {
+  draftKind.value = scenarioId ? 'scenario_model' : 'scenario'
+}, { immediate: true })
 watch(showLauncher, (show) => {
   if (!show) visible.value = false
 })
 
 onMounted(() => {
+  restoreAssistantConfig()
   window.addEventListener('ontology-selection-change', onSelection)
-  window.addEventListener('assistant-open-request', onAssistantOpenRequest)
+  document.addEventListener('visibilitychange', onCompilationVisibilityChange)
 })
 onBeforeUnmount(() => {
-  streamController?.abort()
+  componentDisposed = true
+  streamGeneration += 1
+  streamController = null
+  clearCompilationPollTimer()
   window.removeEventListener('ontology-selection-change', onSelection)
-  window.removeEventListener('assistant-open-request', onAssistantOpenRequest)
+  document.removeEventListener('visibilitychange', onCompilationVisibilityChange)
 })
 </script>
 
@@ -1025,12 +1797,22 @@ onBeforeUnmount(() => {
 .assistant-live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 
 .assistant-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--bg); }
+:global(.assistant-drawer .el-drawer__body) { min-height: 0; padding: 0; overflow: hidden; }
 .assistant-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 18px 13px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.assistant-head-actions { display: flex; align-items: center; gap: 2px; }
 .assistant-title-wrap { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .assistant-avatar, .message-avatar { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: #fff; background: var(--grad); box-shadow: var(--shadow-sm); }
 .assistant-avatar { width: 38px; height: 38px; border-radius: 12px; }
 .assistant-title { display: flex; align-items: center; gap: 7px; font-size: 15px; font-weight: 800; color: var(--text); }
 .assistant-subtitle { margin-top: 3px; color: var(--text-3); font-size: 11px; }
+.assistant-settings { display: grid; gap: 7px; color: var(--text-2); }
+.assistant-settings-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+.assistant-settings-head div { display: flex; flex-direction: column; gap: 2px; }
+.assistant-settings-head strong { color: var(--text); font-size: 13px; }
+.assistant-settings-head span { color: var(--text-3); font-size: 10px; }
+.assistant-setting-label { margin-top: 3px; color: var(--text-2); font-size: 10.5px; font-weight: 750; }
+.assistant-setting-control { width: 100%; }
+.assistant-settings-note { margin: 2px 0 0; padding-top: 7px; border-top: 1px dashed var(--border); color: var(--text-3); font-size: 10px; line-height: 1.5; }
 .assistant-context { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 10px 18px; border-bottom: 1px solid var(--border); background: var(--surface-2); }
 .context-hint { color: var(--text-3); font-size: 11px; margin-left: auto; }
 .assistant-session-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 18px; border-bottom: 1px solid var(--border); background: var(--surface); }
@@ -1039,6 +1821,11 @@ onBeforeUnmount(() => {
 .session-label { color: var(--text-3); font-size: 10px; }
 .session-actions { display: flex; align-items: center; flex: 0 0 auto; gap: 6px; }
 .session-actions :deep(.el-button) { min-height: 32px; }
+.compilation-recovery { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 9px 18px; border-bottom: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border)); color: var(--primary-600); background: var(--primary-soft); }
+.compilation-recovery.is-failed { border-bottom-color: color-mix(in srgb, var(--danger) 35%, var(--border)); color: var(--danger); background: var(--danger-soft); }
+.compilation-recovery > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.compilation-recovery strong { color: var(--text); font-size: 11px; }
+.compilation-recovery span { overflow: hidden; color: var(--text-2); font-size: 9.5px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
 .thread-count { display: inline-flex; align-items: center; justify-content: center; min-width: 17px; height: 17px; margin-left: 4px; padding: 0 4px; border-radius: 9px; color: var(--primary-600); background: var(--primary-soft); font-size: 10px; }
 .assistant-history { flex: 1; min-height: 0; overflow: auto; padding: 18px; background: var(--bg); }
 .history-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
@@ -1062,9 +1849,6 @@ onBeforeUnmount(() => {
 .empty-mark { display: flex; align-items: center; justify-content: center; width: 64px; height: 64px; margin-bottom: 13px; border-radius: 19px; color: var(--primary-600); background: var(--grad-soft); }
 .assistant-empty h3 { margin: 0 0 6px; color: var(--text); font-size: 17px; }
 .assistant-empty p { max-width: 310px; margin: 0; font-size: 12px; line-height: 1.7; }
-.assistant-suggestions { display: flex; flex-direction: column; gap: 8px; width: min(100%, 320px); margin-top: 20px; }
-.suggestion-chip { min-height: 42px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; color: var(--text-2); background: var(--surface); cursor: pointer; font: inherit; text-align: left; transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), color var(--dur) var(--ease); }
-.suggestion-chip:hover, .suggestion-chip:focus-visible { border-color: var(--primary); color: var(--primary-600); background: var(--primary-soft); outline: none; }
 .assistant-message { display: flex; gap: 9px; margin-bottom: 16px; }
 .assistant-message.user { justify-content: flex-end; }
 .assistant-message-avatar { width: 30px; height: 30px; border-radius: 10px; margin-top: 21px; }
@@ -1099,13 +1883,25 @@ onBeforeUnmount(() => {
 .proposal-title { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 12.5px; font-weight: 800; }
 .proposal-summary { margin-top: 4px; color: var(--text-2); font-size: 11.5px; line-height: 1.5; }
 .proposal-preview { display: flex; align-items: center; gap: 10px; padding: 9px 12px; color: var(--text-2); font-size: 11.5px; }
-.preview-toggle { margin-left: auto; padding: 0; border: 0; color: var(--primary-600); background: transparent; cursor: pointer; font: inherit; }
-.proposal-changes { display: flex; flex-direction: column; gap: 7px; max-height: 190px; padding: 0 12px 10px; overflow: auto; }
+.preview-toggle { min-height: 28px; margin-left: auto; padding: 3px 0; border: 0; color: var(--primary-600); background: transparent; cursor: pointer; font: inherit; }
+.preview-toggle:hover, .preview-toggle:focus-visible { color: var(--primary); text-decoration: underline; outline: none; text-underline-offset: 3px; }
+.proposal-disclosure { margin: 0 12px 10px; overflow: hidden; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); }
+.proposal-disclosure-toggle { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 48px; padding: 8px 10px; border: 0; color: var(--text-2); background: transparent; cursor: pointer; font: inherit; text-align: left; }
+.proposal-disclosure-toggle:hover, .proposal-disclosure-toggle:focus-visible { color: var(--primary-600); background: var(--primary-soft); outline: none; }
+.disclosure-copy { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.disclosure-copy strong { color: var(--text); font-size: 11px; }
+.disclosure-copy small { color: var(--text-3); font-size: 9.5px; line-height: 1.45; }
+.disclosure-action { display: inline-flex; align-items: center; flex: 0 0 auto; gap: 4px; color: var(--primary-600); font-size: 10px; font-weight: 700; }
+.disclosure-chevron { flex: 0 0 auto; transition: transform 160ms ease; }
+.disclosure-chevron.rotated { transform: rotate(180deg); }
+.proposal-changes { display: flex; flex-direction: column; gap: 7px; padding: 0 12px 10px; }
+.proposal-disclosure .proposal-changes { padding: 0 10px 10px; border-top: 1px solid var(--border); }
+.proposal-disclosure .proposal-change:first-child { margin-top: 10px; }
 .proposal-change { display: flex; align-items: flex-start; gap: 7px; padding: 7px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
 .proposal-change-copy { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
 .proposal-change-copy strong { color: var(--text); font-size: 11px; font-weight: 750; line-height: 1.4; }
 .proposal-change-copy span { color: var(--text-3); font-size: 10.5px; line-height: 1.45; }
-.proposal-detail { display: grid; gap: 10px; max-height: 300px; margin: 0 12px 10px; padding: 10px; overflow: auto; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); }
+.proposal-detail { display: grid; gap: 10px; margin: 0 12px 10px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); }
 .proposal-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 0; }
 .proposal-summary-grid div { padding: 7px 8px; border-radius: 7px; background: var(--surface); }
 .proposal-summary-grid dt { color: var(--text-3); font-size: 9.5px; }
@@ -1124,6 +1920,43 @@ onBeforeUnmount(() => {
 .relation-preview-row { display: grid; grid-template-columns: minmax(80px, .8fr) minmax(120px, 1.2fr) auto; align-items: center; gap: 7px; padding: 7px 8px; border-radius: 7px; background: var(--surface); font-size: 10px; }
 .relation-preview-row span { color: var(--text-3); overflow-wrap: anywhere; }
 .proposal-empty { color: var(--warning); line-height: 1.5; }
+.coverage-summary { display: flex; flex-wrap: wrap; gap: 5px; }
+.coverage-summary span { padding: 4px 7px; border-radius: 999px; color: var(--text-2); background: var(--surface); font-size: 9.5px; }
+.coverage-summary span.danger { color: var(--danger); background: var(--danger-soft); }
+.source-manifest-list, .unresolved-section { display: grid; gap: 8px; }
+.source-manifest-list > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 8px; border-radius: 7px; background: var(--surface); font-size: 10px; }
+.source-manifest-list strong { min-width: 0; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+.source-manifest-list span { flex: 0 0 auto; color: var(--text-3); }
+.unresolved-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.unresolved-head h4 { margin: 0; }
+.unresolved-head p { margin: 3px 0 0; color: var(--text-3); font-size: 9.5px; line-height: 1.45; }
+.unresolved-counts { display: flex; flex: 0 0 auto; gap: 5px; }
+.unresolved-counts span { padding: 3px 6px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-2); background: var(--surface); font-size: 9px; font-weight: 700; }
+.unresolved-counts .is-blocking { border-color: color-mix(in srgb, var(--danger) 38%, var(--border)); color: var(--danger); background: var(--danger-soft); }
+.issue-groups { display: grid; gap: 6px; }
+.issue-category-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 7px; border-radius: 7px; color: var(--text-2); background: var(--surface); font-size: 9.5px; }
+.issue-category-head strong { color: var(--text); font-size: 10.5px; }
+.issue-category-head.is-blocking { color: var(--danger); background: var(--danger-soft); }
+.issue-notice-category { overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.issue-category-toggle { display: grid; width: 100%; min-height: 48px; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 7px 8px; border: 0; color: var(--text-2); background: transparent; cursor: pointer; font: inherit; text-align: left; }
+.issue-category-toggle:hover, .issue-category-toggle:focus-visible { color: var(--primary-600); background: var(--primary-soft); outline: none; }
+.issue-notice-groups { display: grid; gap: 6px; padding: 7px; border-top: 1px solid var(--border); background: var(--surface-2); }
+.issue-group { overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.issue-group.is-blocking { border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); }
+.issue-group-toggle { display: grid; width: 100%; min-height: 48px; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 7px 8px; border: 0; color: var(--text-2); background: transparent; cursor: pointer; font: inherit; text-align: left; }
+.issue-group-toggle:hover, .issue-group-toggle:focus-visible { color: var(--primary-600); background: var(--primary-soft); outline: none; }
+.issue-group.is-blocking .issue-group-toggle:hover, .issue-group.is-blocking .issue-group-toggle:focus-visible { background: var(--danger-soft); }
+.issue-severity { min-width: 34px; padding: 3px 5px; border-radius: 999px; color: var(--text-2); background: var(--surface-2); font-size: 9px; font-weight: 800; text-align: center; }
+.issue-group.is-blocking .issue-severity { color: var(--danger); background: var(--danger-soft); }
+.issue-group-copy { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.issue-group-copy strong { color: var(--text); font-size: 10.5px; }
+.issue-group-copy small { color: var(--text-3); font-size: 9px; overflow-wrap: anywhere; }
+.issue-group-details { display: grid; gap: 5px; padding: 7px; border-top: 1px solid var(--border); background: var(--surface-2); }
+.unresolved-row { display: flex; align-items: flex-start; gap: 7px; padding: 7px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
+.issue-number { display: inline-grid; width: 18px; height: 18px; flex: 0 0 auto; place-items: center; border-radius: 50%; color: var(--text-3); background: var(--surface-2); font-size: 8.5px; font-weight: 800; }
+.unresolved-row > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.unresolved-row strong { color: var(--text); font-size: 10.5px; line-height: 1.45; }
+.unresolved-row span { color: var(--text-3); font-size: 9.5px; overflow-wrap: anywhere; }
 .mapping-preview-list, .workflow-preview-list { display: grid; gap: 5px; }
 .mapping-preview-list > div, .workflow-preview-list > div { display: grid; grid-template-columns: minmax(90px, 1fr) auto minmax(90px, 1fr); align-items: center; gap: 7px; padding: 7px 8px; border-radius: 7px; background: var(--surface); font-size: 10px; }
 .mapping-preview-list > div span { color: var(--text-3); }
@@ -1174,7 +2007,7 @@ onBeforeUnmount(() => {
 .assistant-action-preview dt { color: var(--text-3); font-size: 9px; }
 .assistant-action-preview dd { margin: 2px 0 0; overflow-wrap: anywhere; color: var(--text); font-size: 10px; }
 .assistant-action-preview p { margin: 8px 0 0; line-height: 1.5; }
-.action-preview-params { max-height: 150px; margin: 8px 0 0; padding: 8px; overflow: auto; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
+.action-preview-params { margin: 8px 0 0; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
 .assistant-action-next { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
 .assistant-action-next span { min-width: 0; color: var(--text-3); line-height: 1.45; }
 .assistant-action-next .el-button { flex: 0 0 auto; }
@@ -1202,13 +2035,6 @@ onBeforeUnmount(() => {
 .tool-button:hover, .tool-button:focus-within { border-color: var(--primary); color: var(--primary-600); background: var(--primary-soft); }
 .tool-button.disabled { cursor: wait; opacity: .72; }
 .tool-button input { display: none; }
-.assistant-mode-switch { display: grid; min-width: 0; flex: 1; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 3px; padding: 3px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
-.assistant-mode-switch button { min-width: 0; min-height: 28px; padding: 3px 5px; overflow: hidden; border: 0; border-radius: 6px; background: transparent; color: var(--text-3); font: inherit; font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-.assistant-mode-switch button:hover { color: var(--text); background: var(--surface); }
-.assistant-mode-switch button.active { background: var(--primary); color: #fff; box-shadow: var(--shadow-xs); }
-.composer-mode-hint { display: flex; min-height: 22px; align-items: center; gap: 6px; margin-bottom: 5px; overflow: hidden; color: var(--text-3); font-size: 10px; }
-.composer-mode-hint b { flex: 0 0 auto; color: var(--primary-600); }
-.composer-mode-hint span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-input-row { display: flex; align-items: flex-end; gap: 8px; }
 .composer-input-row :deep(.el-textarea__inner) { min-height: 74px !important; padding-right: 12px; }
 .send-button { width: 42px; height: 42px; padding: 0; flex: 0 0 auto; }
@@ -1217,10 +2043,10 @@ onBeforeUnmount(() => {
 .source-preview-meta > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .source-preview-meta strong { overflow: hidden; color: var(--text); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .source-preview-meta span { color: var(--text-3); font-size: 10px; }
-.source-preview-text { min-height: 170px; max-height: 50vh; margin: 12px 0 0; padding: 14px; overflow: auto; border-radius: 10px; color: var(--text-2); background: var(--surface-2); font: 12px/1.75 'Cascadia Code', Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.source-preview-text { min-height: 170px; margin: 12px 0 0; padding: 14px; border-radius: 10px; color: var(--text-2); background: var(--surface-2); font: 12px/1.75 'Cascadia Code', Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 @media (prefers-reduced-motion: reduce) {
-  .thinking-chevron, .stream-cursor { transition: none; animation: none; }
+  .thinking-chevron, .disclosure-chevron, .stream-cursor { transition: none; animation: none; }
 }
 
 @media (max-width: 560px) {
@@ -1229,13 +2055,48 @@ onBeforeUnmount(() => {
   .assistant-session-bar { align-items: flex-start; flex-direction: column; }
   .session-actions { width: 100%; }
   .session-actions :deep(.el-button) { flex: 1; }
+  .compilation-recovery { grid-template-columns: auto minmax(0, 1fr); padding: 9px 14px; }
+  .compilation-recovery > :deep(.el-tag), .compilation-recovery > :deep(.el-button) { grid-column: 2; justify-self: start; }
+  .compilation-recovery > :deep(.el-button) { min-height: 44px; }
   .assistant-messages { padding: 14px; }
   .assistant-history { padding: 14px; }
   .assistant-composer { padding: 9px 10px 12px; }
-  .composer-mode-hint span { display: none; }
+  .thread-delete, .attachment-chip button, .tool-button, .send-button { min-width: 44px; min-height: 44px; }
+  .attachment-chip button { width: 44px; height: 44px; }
   .tool-button span { display: none; }
   .assistant-action-preview dl { grid-template-columns: 1fr; }
   .assistant-action-next { align-items: stretch; flex-direction: column; }
   .assistant-action-next .el-button { width: 100%; min-height: 44px; }
+  .unresolved-head { flex-direction: column; }
+}
+
+/* 低高度横屏仍保持“固定外壳 + 消息区滚动 + 输入区常驻”。 */
+@media (max-height: 480px) {
+  .assistant-head { min-height: 52px; padding: 6px 10px; }
+  .assistant-head :deep(.el-button) { min-width: 44px; min-height: 44px; }
+  .assistant-subtitle, .context-hint, .session-current { display: none; }
+  .assistant-context { min-height: 36px; padding: 5px 10px; flex-wrap: nowrap; overflow: hidden; }
+  .assistant-session-bar { min-height: 52px; padding: 4px 10px; }
+  .session-actions { width: 100%; }
+  .session-actions :deep(.el-button) { flex: 1; min-height: 44px; }
+  .assistant-messages, .assistant-history { padding: 8px 10px; }
+  .assistant-composer { flex: 0 0 auto; padding: 6px 10px 8px; }
+  .composer-tools { min-height: 44px; margin-bottom: 4px; }
+  .attachment-chip button, .tool-button, .send-button { min-width: 44px; min-height: 44px; }
+  .attachment-chip button { width: 44px; height: 44px; }
+  .composer-input-row :deep(.el-textarea__inner) { min-height: 52px !important; max-height: 64px; }
+}
+
+@media (max-height: 400px) {
+  .assistant-session-bar { display: none; }
+}
+
+/* 软键盘或超矮横屏无法同时容纳消息、附件与输入控件时，明确退化为
+   抽屉正文这一个滚动容器，避免隐藏附件或裁掉发送按钮。 */
+@media (max-height: 340px) {
+  :global(.assistant-drawer .el-drawer__body) { overflow-y: auto; }
+  .assistant-shell { height: auto; min-height: 100%; }
+  .assistant-messages, .assistant-history { flex: 0 0 auto; min-height: 96px; overflow: visible; }
+  .attachment-strip { max-height: none; overflow: visible; }
 }
 </style>

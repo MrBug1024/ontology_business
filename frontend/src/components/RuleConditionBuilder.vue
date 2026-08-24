@@ -5,8 +5,10 @@ type ConditionRow = {
   id: string
   field: string
   op: string
+  valueSource: 'literal' | 'field'
   valueType: 'text' | 'number' | 'boolean'
   value: string | number | boolean
+  valueField: string
 }
 
 const props = withDefaults(defineProps<{
@@ -50,8 +52,10 @@ function newRow(condition: Record<string, any> = {}): ConditionRow {
     id: `${Date.now()}-${Math.random()}`,
     field: String(condition.field || ''),
     op: String(condition.op || '=='),
+    valueSource: condition.value_field ? 'field' : 'literal',
     valueType: inferValueType(sourceValue),
     value: sourceValue ?? '',
+    valueField: String(condition.value_field || ''),
   }
 }
 function leafConditions(value: Record<string, any>) {
@@ -81,7 +85,13 @@ function castValue(row: ConditionRow) {
 function toCondition() {
   const conditions = rows.value
     .filter((row) => row.field.trim())
-    .map((row) => ({ field: row.field.trim(), op: row.op, value: castValue(row) }))
+    .map((row) => {
+      const condition: Record<string, any> = { field: row.field.trim(), op: row.op }
+      if (noValueOperators.has(row.op)) return condition
+      if (row.valueSource === 'field') condition.value_field = row.valueField.trim()
+      else condition.value = castValue(row)
+      return condition
+    })
   if (!conditions.length) return {}
   return conditions.length === 1 ? conditions[0] : { op: logic.value, conditions }
 }
@@ -123,16 +133,25 @@ watch([rows, logic], () => {
           <el-option v-for="operator in operators" :key="operator.value" :label="operator.label" :value="operator.value" />
         </el-select>
         <template v-if="!noValueOperators.has(row.op)">
-          <el-select v-model="row.valueType" class="value-type" aria-label="比较值类型">
-            <el-option label="文本" value="text" />
-            <el-option label="数值" value="number" />
-            <el-option label="是 / 否" value="boolean" />
+          <el-select v-model="row.valueSource" class="value-source" aria-label="比较值来源">
+            <el-option label="固定值" value="literal" />
+            <el-option label="另一个属性" value="field" />
           </el-select>
-          <el-switch v-if="row.valueType === 'boolean'" v-model="row.value" inline-prompt active-text="是" inactive-text="否" aria-label="比较值" />
-          <el-input-number v-else-if="row.valueType === 'number' && !listOperators.has(row.op)" v-model="row.value" controls-position="right" aria-label="比较数值" />
-          <el-input v-else v-model="row.value" :placeholder="listOperators.has(row.op) ? '多个值用逗号分隔' : '比较值'" aria-label="比较值" />
+          <el-select v-if="row.valueSource === 'field'" v-model="row.valueField" filterable allow-create default-first-option placeholder="选择或输入另一个属性" aria-label="用于比较的另一个属性">
+            <el-option v-for="field in fields.filter((item) => item !== row.field)" :key="field" :label="field" :value="field" />
+          </el-select>
+          <template v-else>
+            <el-select v-model="row.valueType" class="value-type" aria-label="固定值类型">
+              <el-option label="文本" value="text" />
+              <el-option label="数值" value="number" />
+              <el-option label="是 / 否" value="boolean" />
+            </el-select>
+            <el-switch v-if="row.valueType === 'boolean'" v-model="row.value" inline-prompt active-text="是" inactive-text="否" aria-label="比较值" />
+            <el-input-number v-else-if="row.valueType === 'number' && !listOperators.has(row.op)" v-model="row.value" controls-position="right" aria-label="比较数值" />
+            <el-input v-else v-model="row.value" :placeholder="listOperators.has(row.op) ? '多个值用逗号分隔' : '比较值'" aria-label="比较值" />
+          </template>
         </template>
-        <span v-else class="no-value">无需填写值</span>
+        <span v-else class="no-value">该判断无需填写比较值</span>
         <el-button text type="danger" circle aria-label="删除条件" @click="removeCondition(row.id)"><el-icon><Delete /></el-icon></el-button>
       </div>
     </div>
@@ -146,9 +165,9 @@ watch([rows, logic], () => {
 .condition-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .condition-toolbar > span { color: var(--text-3); font-size: 11px; }
 .condition-list { display: grid; gap: 8px; }
-.condition-row { display: grid; grid-template-columns: 24px minmax(130px, .8fr) minmax(120px, .7fr) 82px minmax(130px, 1fr) 36px; gap: 7px; align-items: center; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
+.condition-row { display: grid; grid-template-columns: 24px minmax(130px, .8fr) minmax(120px, .7fr) 104px 82px minmax(130px, 1fr) 36px; gap: 7px; align-items: center; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
 .condition-index { display: inline-flex; width: 22px; height: 22px; align-items: center; justify-content: center; border-radius: 50%; background: var(--primary-soft); color: var(--primary-600); font-size: 10px; font-weight: 760; }
-.no-value { grid-column: 4 / 6; color: var(--text-3); font-size: 11px; }
+.no-value { grid-column: 4 / 7; color: var(--text-3); font-size: 11px; }
 .condition-empty { padding: 17px; border: 1px dashed var(--border-strong); border-radius: 10px; color: var(--text-3); font-size: 11px; text-align: center; }
 @media (max-width: 760px) {
   .condition-toolbar { align-items: flex-start; flex-direction: column; }

@@ -558,7 +558,7 @@ onBeforeUnmount(() => {
 .detail-grid b { display: block; margin-top: 4px; color: var(--text-2); font-size: 12px; overflow-wrap: anywhere; }
 .detail-section { margin-top: 14px; }
 .detail-section h4 { margin: 0 0 7px; color: var(--text-2); font-size: 12px; }
-.detail-code { max-height: 260px; margin: 0; padding: 12px; overflow: auto; border-radius: 10px; background: #1d2930; color: #e2e8f0; font-size: 11px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+.detail-code { margin: 0; padding: 12px; overflow-x: auto; overflow-y: visible; border-radius: 10px; background: #1d2930; color: #e2e8f0; font-size: 11px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
 .task-detail-footer { position: sticky; bottom: 0; z-index: 2; display: flex; justify-content: flex-end; gap: 8px; margin: 22px -26px -26px; padding: 14px 26px max(14px, env(safe-area-inset-bottom)); border-top: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 96%, transparent); backdrop-filter: blur(12px); }
 @media (max-width: 960px) { .task-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 720px) { .task-page { padding: 18px 14px 22px; } .task-header, .workflow-context { align-items: flex-start; flex-direction: column; } .workflow-context-actions { width: 100%; justify-content: flex-start; } .task-filter { flex-wrap: wrap; } .filter-scenario, .filter-status { flex: 1 1 180px; } }

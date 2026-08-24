@@ -2,7 +2,7 @@
 
 设计原则（元模型驱动）：
 - 平台只提供"执行框架"，不预设业务语义
-- 操作（Action）通过 executor_type 绑定到具体执行器（sql/skill/mcp/http/script）
+- 操作（Action）通过 executor_type 绑定到具体执行器（sql/skill/mcp/http/script/template）
 - 规则（Rule）用 JSON 条件表达式描述，由通用规则引擎解析
 - 工作流（Workflow）支持两种形态：
   1. 旧版线性 steps（兼容保留）
@@ -10,10 +10,11 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, time as datetime_time, timezone
 import ipaddress
 import hashlib
 import json
+import math
 import re
 import socket
 import time
@@ -28,6 +29,7 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..models import (
     ActionExecutionLog,
+    BucketFile,
     BusinessScenario,
     DataSource,
     LLMConfig,
@@ -38,13 +40,17 @@ from ..models import (
     Skill,
 )
 from . import (
+    capability_readiness_service,
     datasource_service,
     skill_service,
     mcp_service,
     llm_service,
     permission_service,
+    rag_service,
     runtime_connector_service,
     runtime_definition_service,
+    template_artifact_service,
+    template_catalog_service,
     tenant_service,
 )
 from .policies import PolicyViolation, validate_action_params, validate_workflow_graph
@@ -290,11 +296,69 @@ def _assert_public_http_target(url: str) -> None:
 # {"field": "数量", "op": ">", "value": 2}
 # 支持运算符: > >= < <= == != in not_in contains not_contains is_null is_not_null
 
+
+def _ordered_pair(left: Any, right: Any) -> tuple[Any, Any] | None:
+    """Return safely comparable numeric or ISO temporal operands."""
+
+    def number(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            result = float(value)
+        elif isinstance(value, str) and value.strip():
+            try:
+                result = float(value.strip())
+            except ValueError:
+                return None
+        else:
+            return None
+        return result if math.isfinite(result) else None
+
+    left_number, right_number = number(left), number(right)
+    if left_number is not None and right_number is not None:
+        return left_number, right_number
+
+    def temporal(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime_time.min)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        token = value.strip()
+        if token.endswith("Z"):
+            token = token[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(token)
+        except ValueError:
+            return None
+
+    left_temporal, right_temporal = temporal(left), temporal(right)
+    if left_temporal is not None and right_temporal is not None:
+        return left_temporal, right_temporal
+    return None
+
+
+def _ordered_compare(left: Any, right: Any, operator: str) -> bool:
+    operands = _ordered_pair(left, right)
+    if operands is None:
+        return False
+    first, second = operands
+    try:
+        return {
+            ">": first > second,
+            ">=": first >= second,
+            "<": first < second,
+            "<=": first <= second,
+        }[operator]
+    except (KeyError, TypeError):
+        return False
+
 _OPS = {
-    ">": lambda a, b: _safe(a, 0) > _safe(b, 0),
-    ">=": lambda a, b: _safe(a, 0) >= _safe(b, 0),
-    "<": lambda a, b: _safe(a, 0) < _safe(b, 0),
-    "<=": lambda a, b: _safe(a, 0) <= _safe(b, 0),
+    ">": lambda a, b: _ordered_compare(a, b, ">"),
+    ">=": lambda a, b: _ordered_compare(a, b, ">="),
+    "<": lambda a, b: _ordered_compare(a, b, "<"),
+    "<=": lambda a, b: _ordered_compare(a, b, "<="),
     "==": lambda a, b: _norm(a) == _norm(b),
     "!=": lambda a, b: _norm(a) != _norm(b),
     "in": lambda a, b: _norm(a) in (b if isinstance(b, list) else [b]),
@@ -304,14 +368,6 @@ _OPS = {
     "is_null": lambda a, b: a is None or a == "",
     "is_not_null": lambda a, b: a is not None and a != "",
 }
-
-
-def _safe(v: Any, default: Any = 0) -> Any:
-    """尝试转 float，失败返回 default。"""
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
 
 
 def _norm(v: Any) -> Any:
@@ -336,22 +392,81 @@ def evaluate_condition(condition: dict[str, Any], record: dict[str, Any]) -> boo
         results = [evaluate_condition(c, record) for c in conds]
         return all(results) if op == "and" else any(results)
 
-    # 叶子条件：field + op + value
+    # 叶子条件：field + op + (value | value_field)
     field = condition.get("field", "")
-    value = condition.get("value")
     actual = record.get(field)
     func = _OPS.get(op)
     if not func:
         return False
+    if op in {"is_null", "is_not_null"}:
+        if "value_field" in condition:
+            return False
+        value = None
+    else:
+        has_value = "value" in condition
+        has_value_field = "value_field" in condition
+        if has_value == has_value_field:
+            return False
+        if has_value_field:
+            value_field = condition.get("value_field")
+            if (
+                not isinstance(value_field, str)
+                or not value_field.strip()
+                or value_field not in record
+            ):
+                return False
+            value = record[value_field]
+        else:
+            value = condition.get("value")
     try:
         return func(actual, value)
     except Exception:  # noqa: BLE001
         return False
 
 
-def evaluate_rule(rule: OntologyRule, record: dict[str, Any]) -> dict[str, Any]:
-    """评估单条规则对给定记录是否命中。"""
+def evaluate_rule(
+    rule: OntologyRule,
+    record: dict[str, Any],
+    *,
+    db: Session | None = None,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+) -> dict[str, Any]:
+    """Evaluate one rule and return side-effect-free Action intentions."""
+    if not isinstance(record, dict):
+        raise PolicyViolation("规则评估记录必须是对象")
+    capability_readiness_service.require_executable(
+        "rule",
+        rule,
+        definition=runtime_definition,
+        db=db,
+    )
     matched = evaluate_condition(rule.condition or {}, record)
+    trigger_actions: list[dict[str, Any]] = []
+    if matched and runtime_definition is not None:
+        for action_id in rule.trigger_action_ids or []:
+            action = runtime_definition.actions.get(str(action_id))
+            if action is None:
+                trigger_actions.append({
+                    "action_id": str(action_id),
+                    "status": "blocked",
+                    "executable": False,
+                    "blocked_reasons": ["触发操作不在当前运行定义中"],
+                })
+                continue
+            readiness = capability_readiness_service.capability_readiness(
+                "action", action, definition=runtime_definition, db=db
+            )
+            trigger_actions.append({
+                "action_id": str(action.id),
+                "action_name": str(action.name),
+                "status": "preview_required" if readiness.executable else "blocked",
+                "executable": readiness.executable,
+                "blocked_reasons": list(readiness.blocked_reasons),
+                "requires_confirmation": bool(action.requires_confirmation),
+                "input_schema": action.input_schema or {},
+                "precondition": action.precondition or "",
+                "postcondition": action.postcondition or "",
+            })
     return {
         "rule_id": rule.id,
         "rule_name": rule.name,
@@ -359,7 +474,37 @@ def evaluate_rule(rule: OntologyRule, record: dict[str, Any]) -> dict[str, Any]:
         "severity": rule.severity,
         "action_on_match": rule.action_on_match if matched else "",
         "trigger_action_ids": rule.trigger_action_ids if matched else [],
+        "trigger_actions": trigger_actions,
+        "side_effects_executed": False,
     }
+
+
+def _structured_action_condition(action: Any, field: str) -> dict[str, Any] | None:
+    label = "操作前置条件" if field == "precondition" else "操作后置条件"
+    return capability_readiness_service.normalize_structured_condition(
+        getattr(action, field, ""), label=label
+    )
+
+
+def _enforce_action_precondition(action: Any, params: dict[str, Any]) -> None:
+    condition = _structured_action_condition(action, "precondition")
+    if condition is not None and not evaluate_condition(condition, params):
+        raise PolicyViolation("操作前置条件不满足，已阻止预演和执行")
+
+
+def _enforce_action_postcondition(action: Any, result: Any) -> None:
+    condition = _structured_action_condition(action, "postcondition")
+    if condition is None:
+        return
+    if not isinstance(result, dict):
+        raise PolicyViolation("操作结果不是可验证记录，无法校验后置条件")
+    missing = sorted(
+        capability_readiness_service.condition_fields(condition) - set(result)
+    )
+    if missing:
+        raise PolicyViolation("操作结果缺少后置条件字段：" + "、".join(missing))
+    if not evaluate_condition(condition, result):
+        raise PolicyViolation("操作后置条件校验失败")
 
 
 # ──────────────────────────────────────────────
@@ -456,6 +601,24 @@ def _safe_data_context(connector_audit: list[dict[str, Any]] | None) -> dict[str
     }
 
 
+_PENDING_TEMPLATE_FILES = "pending_template_bucket_files"
+
+
+def _register_pending_template_file(db: Session, file: BucketFile) -> None:
+    pending = db.info.setdefault(_PENDING_TEMPLATE_FILES, [])
+    if isinstance(pending, list):
+        pending.append(file)
+
+
+def _clear_pending_template_files(db: Session, *, delete_files: bool) -> None:
+    pending = db.info.pop(_PENDING_TEMPLATE_FILES, [])
+    if not delete_files or not isinstance(pending, list):
+        return
+    for file in pending:
+        if isinstance(file, BucketFile):
+            datasource_service.delete_bucket_file(file)
+
+
 def _action_runtime_connector(
     db: Session,
     action: Any,
@@ -497,6 +660,10 @@ def _action_plan(
         "executor_type": action.executor_type,
         "parameter_count": len(params),
         "parameters": params,
+        "precondition": action.precondition or "",
+        "postcondition": action.postcondition or "",
+        "precondition_condition": _structured_action_condition(action, "precondition"),
+        "postcondition_condition": _structured_action_condition(action, "postcondition"),
         "side_effects_skipped": True,
     }
     if action.executor_type == "sql":
@@ -536,6 +703,30 @@ def _action_plan(
         plan["skill_id"] = str(config.get("skill_id") or "")
     elif action.executor_type == "script":
         plan["target"] = "受控脚本"
+    elif action.executor_type == "template":
+        template_file, template_source, target_source, catalog_template, catalog_version = _template_action_resources(
+            db, action, config
+        )
+        rendered = template_artifact_service.preview_bucket_artifact(
+            template_file,
+            template_source,
+            target_source,
+            params,
+            output_filename=str(config.get("output_filename") or ""),
+            expected_template_sha256=str(config.get("template_sha256") or ""),
+        )
+        plan["artifact"] = {
+            "filename": rendered.filename,
+            "format": rendered.format,
+            "mime": rendered.mime,
+            "size": rendered.size,
+            "template_file_id": template_file.id,
+            "template_sha256": rendered.template_sha256,
+            "template_id": catalog_template.id if catalog_template else None,
+            "template_version_id": catalog_version.id if catalog_version else None,
+            "template_version": catalog_version.version if catalog_version else None,
+            "target_data_source_id": target_source.id,
+        }
     return plan
 
 
@@ -585,6 +776,50 @@ def _find_idempotent_log(db: Session, action: Any, key: str) -> ActionExecutionL
     ).scalars().first()
 
 
+def _find_preview_execution(
+    db: Session,
+    action: Any,
+    parent_action_log_id: str | None,
+) -> ActionExecutionLog | None:
+    """Return the one execution already claimed by a confirmed preview."""
+    if not parent_action_log_id:
+        return None
+    return db.execute(
+        select(ActionExecutionLog)
+        .where(
+            ActionExecutionLog.scenario_id == action.scenario_id,
+            ActionExecutionLog.target_type == "action",
+            ActionExecutionLog.target_id == action.id,
+            ActionExecutionLog.parent_action_log_id == parent_action_log_id,
+            ActionExecutionLog.mode == "execute",
+        )
+        .order_by(ActionExecutionLog.created_at.desc())
+    ).scalars().first()
+
+
+def _stable_template_execution_id(
+    action: Any,
+    *,
+    parent_action_log_id: str | None,
+    scoped_idempotency_key: str | None,
+    environment: str,
+) -> str | None:
+    """Derive a retry-stable execution/file id from the confirmed request."""
+    request_identity = parent_action_log_id or scoped_idempotency_key
+    if not request_identity:
+        return None
+    material = "\x1f".join(
+        (
+            "template-action-execution-v1",
+            str(action.scenario_id),
+            str(action.id),
+            str(environment),
+            str(request_identity),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
 def _idempotent_replay(
     existing: ActionExecutionLog,
     normalized: dict[str, Any],
@@ -607,9 +842,11 @@ def preview_action(
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
 ) -> dict[str, Any]:
     """校验参数并生成 Action 预演，不触发 SQL/HTTP/脚本/MCP/Skill。"""
-    if not action.enabled:
-        raise PolicyViolation("操作已禁用")
+    capability_readiness_service.require_executable(
+        "action", action, definition=runtime_definition, db=db
+    )
     normalized = validate_action_params(action.input_schema or {}, params)
+    _enforce_action_precondition(action, normalized)
     provenance = _runtime_provenance(runtime_definition, runtime_environment)
     plan = _action_plan(
         db,
@@ -671,13 +908,15 @@ def execute_action(
             runtime_environment=runtime_environment,
             runtime_definition=runtime_definition,
         )
+    capability_readiness_service.require_executable(
+        "action", action, definition=runtime_definition, db=db
+    )
     provenance = _runtime_provenance(runtime_definition, runtime_environment)
     scoped_idempotency_key = _scoped_idempotency_key(
         idempotency_key, str(provenance["environment"])
     )
-    if not action.enabled:
-        raise PolicyViolation("操作已禁用")
     normalized = validate_action_params(action.input_schema or {}, params)
+    _enforce_action_precondition(action, normalized)
     permission = _permission_summary(db, action, confirmed=confirm)
     if not permission["allowed"]:
         raise PolicyViolation("没有执行该操作的权限")
@@ -712,13 +951,31 @@ def execute_action(
     if enforce_policy and action.idempotency_required and not idempotency_key:
         raise PolicyViolation("执行操作必须提供 idempotency_key")
 
+    decision_context = _decision_chain_context(db, permission)
+    parent_action_log_id = decision_context.get("parent_action_log_id")
+    if enforce_policy and parent_action_log_id:
+        existing = _find_preview_execution(db, action, str(parent_action_log_id))
+        if existing:
+            return _idempotent_replay(existing, normalized, permission)
+
     if enforce_policy and scoped_idempotency_key:
         existing = _find_idempotent_log(db, action, scoped_idempotency_key)
         if existing:
             return _idempotent_replay(existing, normalized, permission)
 
     start = time.time()
-    log = ActionExecutionLog(
+    transactional_template = action.executor_type == "template"
+    stable_log_id = (
+        _stable_template_execution_id(
+            action,
+            parent_action_log_id=(str(parent_action_log_id) if parent_action_log_id else None),
+            scoped_idempotency_key=scoped_idempotency_key,
+            environment=str(provenance["environment"]),
+        )
+        if transactional_template
+        else None
+    )
+    log_values = dict(
         scenario_id=action.scenario_id,
         target_type="action",
         target_id=action.id,
@@ -727,23 +984,45 @@ def execute_action(
         status="running",
         mode="execute",
         idempotency_key=scoped_idempotency_key,
-        **_decision_chain_context(db, permission),
+        **decision_context,
         **provenance,
     )
+    if stable_log_id:
+        log_values["id"] = stable_log_id
+    log = ActionExecutionLog(**log_values)
     db.add(log)
-    # 先提交 running 占位记录，再调用外部执行器；这样并发请求会在副作用前竞争同一幂等键。
-    if enforce_policy and scoped_idempotency_key:
+    # External executors need a durable claim before their side effect.  A
+    # template attachment is local and participates in the same DB transaction
+    # as BucketFile/index metadata instead: an interrupted process rolls back
+    # the claim so the same idempotency key can safely retry instead of being
+    # trapped forever behind a committed ``running`` row.
+    if enforce_policy and scoped_idempotency_key and not transactional_template:
         try:
             db.commit()
         except IntegrityError:
             db.rollback()
             existing = _find_idempotent_log(db, action, scoped_idempotency_key)
+            if existing is None:
+                existing = _find_preview_execution(db, action, str(parent_action_log_id or ""))
             if existing:
                 return _idempotent_replay(existing, normalized, permission)
             raise
         db.refresh(log)
     else:
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            existing = (
+                _find_idempotent_log(db, action, scoped_idempotency_key)
+                if scoped_idempotency_key
+                else None
+            )
+            if existing is None:
+                existing = _find_preview_execution(db, action, str(parent_action_log_id or ""))
+            if existing:
+                return _idempotent_replay(existing, normalized, permission)
+            raise
 
     try:
         result, connector_audit = _dispatch_executor(
@@ -752,7 +1031,9 @@ def execute_action(
             normalized,
             runtime_environment=runtime_environment,
             runtime_definition=runtime_definition,
+            execution_log=log,
         )
+        _enforce_action_postcondition(action, result)
         log.status = "success"
         log.result = result if isinstance(result, dict) else {"output": str(result)[:2000]}
         log.connector_audit = connector_audit
@@ -763,7 +1044,13 @@ def execute_action(
         log.result = {"error": str(exc)}
 
     log.duration_ms = int((time.time() - start) * 1000)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        _clear_pending_template_files(db, delete_files=True)
+        raise
+    _clear_pending_template_files(db, delete_files=False)
     db.refresh(log)
     response = _response_from_log(log)
     response.update({"requires_confirmation": bool(action.requires_confirmation), "permission": permission})
@@ -777,6 +1064,7 @@ def _dispatch_executor(
     *,
     runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+    execution_log: ActionExecutionLog | None = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
     """按 executor_type 分发到具体执行器。"""
     etype = action.executor_type
@@ -786,7 +1074,7 @@ def _dispatch_executor(
     # Skill/Script execution may depend on mutable host state.  Those executor
     # types are therefore not portable, frozen deployment semantics yet.  Keep
     # the runtime guard even though publish-time validation rejects new ones.
-    if runtime_definition and runtime_definition.is_frozen and etype in {"http", "skill", "script"}:
+    if runtime_definition and runtime_definition.is_frozen and etype in {"http", "skill", "script", "template"}:
         raise PolicyViolation(f"{etype} Action 不能在已冻结的发布环境执行")
 
     if etype == "sql":
@@ -820,7 +1108,251 @@ def _dispatch_executor(
         return _exec_http(cfg, params), []
     if etype == "script":
         return _exec_script(cfg, params), []
+    if etype == "template":
+        return _exec_template(
+            db,
+            action,
+            cfg,
+            params,
+            execution_log=execution_log,
+        ), []
     raise ValueError(f"未知执行器类型: {etype}")
+
+
+def _template_action_resources(
+    db: Session,
+    action: Any,
+    cfg: dict[str, Any],
+) -> tuple[BucketFile, DataSource, DataSource, Any | None, Any | None]:
+    """Resolve and re-check both file buckets at preview and execution time."""
+    target_source_id = str(cfg.get("target_data_source_id") or "")
+    target_source = tenant_service.require_owned(
+        db, DataSource, target_source_id, "附件目标资料库不存在"
+    )
+    if target_source.scenario_id not in (None, action.scenario_id):
+        raise PolicyViolation("附件目标不属于当前业务场景")
+    if target_source.type != "file_bucket":
+        raise PolicyViolation("附件目标必须是文件桶数据源")
+
+    catalog_template = None
+    catalog_version = None
+    template_id = str(cfg.get("template_id") or "")
+    if template_id:
+        # Persisted catalog Actions must always carry a numeric immutable pin;
+        # silently following current_version would change production behavior.
+        if cfg.get("template_version") is None or not str(cfg.get("template_sha256") or ""):
+            raise PolicyViolation("模板 Action 缺少固定版本或哈希，请重新保存配置")
+        try:
+            catalog_template, catalog_version, template_file, template_source = (
+                template_catalog_service.resolve_version(
+                    db,
+                    template_id=template_id,
+                    tenant_id=tenant_service.current_tenant_id(db),
+                    scenario_id=action.scenario_id,
+                    version_number=int(cfg["template_version"]),
+                    expected_sha256=str(cfg.get("template_sha256") or ""),
+                    # Deprecated blocks new bindings, not an already pinned run.
+                    require_active=False,
+                )
+            )
+        except (template_catalog_service.TemplateCatalogError, TypeError, ValueError) as exc:
+            raise PolicyViolation(str(exc)) from exc
+        for field, actual in (
+            ("template_format", catalog_version.artifact_format),
+            ("template_mime", catalog_version.mime),
+            ("template_filename", catalog_version.filename),
+        ):
+            configured = str(cfg.get(field) or "")
+            if configured and configured != str(actual):
+                raise PolicyViolation("模板 Action 固定元数据与登记版本不一致")
+        configured_paths = sorted(str(path) for path in (cfg.get("template_variable_paths") or []))
+        registered_paths = sorted(str(path) for path in (catalog_version.placeholder_paths or []))
+        if not set(registered_paths).issubset(set(configured_paths)):
+            raise PolicyViolation("模板 Action 的占位符契约与登记版本不一致")
+        return (
+            template_file,
+            template_source,
+            target_source,
+            catalog_template,
+            catalog_version,
+        )
+
+    # Legacy Actions remain executable. Startup migrates healthy files to the
+    # catalog, but this fallback avoids breaking an older/damaged deployment
+    # before an administrator can repair its registration.
+    template_file_id = str(cfg.get("template_file_id") or "")
+    template_file = db.get(BucketFile, template_file_id)
+    if not template_file:
+        raise PolicyViolation("模板文件不存在")
+    template_source = tenant_service.require_visible(
+        db, DataSource, template_file.data_source_id, "模板资料库不存在或不可见"
+    )
+    if template_source.scenario_id not in (None, action.scenario_id):
+        raise PolicyViolation("模板不属于当前业务场景")
+    if template_source.type != "file_bucket":
+        raise PolicyViolation("模板来源必须是文件桶数据源")
+    configured_source_id = str(cfg.get("template_data_source_id") or "")
+    if configured_source_id and configured_source_id != template_source.id:
+        raise PolicyViolation("模板文件已被移动到其他资料库，请重新配置操作")
+    return template_file, template_source, target_source, None, None
+
+
+def _exec_template(
+    db: Session,
+    action: Any,
+    cfg: dict[str, Any],
+    params: dict[str, Any],
+    *,
+    execution_log: ActionExecutionLog | None = None,
+) -> dict[str, Any]:
+    """Generate one same-format deliverable after Action confirmation."""
+    template_file, template_source, target_source, catalog_template, catalog_version = (
+        _template_action_resources(db, action, cfg)
+    )
+    created: BucketFile | None = None
+    try:
+        created, result = template_artifact_service.generate_bucket_artifact(
+            template_file,
+            template_source,
+            target_source,
+            params,
+            output_filename=str(cfg.get("output_filename") or ""),
+            expected_template_sha256=str(cfg.get("template_sha256") or ""),
+            generated_by_action_log_id=(execution_log.id if execution_log else None),
+            origin_template_id=(catalog_template.id if catalog_template else None),
+            origin_template_version_id=(catalog_version.id if catalog_version else None),
+            origin_template_version=(catalog_version.version if catalog_version else None),
+        )
+        db.add(created)
+        db.flush()
+        rag_service.enqueue_document_index(db, created, parse_document=True)
+        _register_pending_template_file(db, created)
+        return result
+    except Exception:
+        if created is not None:
+            pending = db.info.get(_PENDING_TEMPLATE_FILES)
+            if isinstance(pending, list) and created in pending:
+                pending.remove(created)
+        if created is not None:
+            datasource_service.delete_bucket_file(created)
+        raise
+
+
+_SQL_ACTION_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _compile_sql_action(
+    template: str,
+    params: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Compile ``{name}`` value placeholders to SQLAlchemy named binds.
+
+    Placeholders may be bare or occupy one complete single-quoted literal for
+    compatibility with older templates. They are forbidden inside identifiers,
+    longer literals and comments; dynamic table/column names are never allowed.
+    """
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError("SQL 执行器缺少查询模板")
+    if not isinstance(params, dict):
+        raise ValueError("SQL 执行参数必须是对象")
+
+    output: list[str] = []
+    names: list[str] = []
+    index = 0
+    state = "normal"
+    while index < len(template):
+        char = template[index]
+        following = template[index + 1] if index + 1 < len(template) else ""
+        if state == "normal":
+            if char == "-" and following == "-":
+                state = "line_comment"
+                output.extend((char, following))
+                index += 2
+                continue
+            if char == "/" and following == "*":
+                state = "block_comment"
+                output.extend((char, following))
+                index += 2
+                continue
+            if char == "'":
+                quoted = re.match(r"'\{([A-Za-z_][A-Za-z0-9_]*)\}'", template[index:])
+                if quoted:
+                    name = quoted.group(1)
+                    if name not in names:
+                        names.append(name)
+                    output.append(f":action_param_{names.index(name)}")
+                    index += len(quoted.group(0))
+                    continue
+                state = "single_quote"
+                output.append(char)
+                index += 1
+                continue
+            if char == '"':
+                state = "double_quote"
+                output.append(char)
+                index += 1
+                continue
+            if char == "{":
+                closing = template.find("}", index + 1)
+                if closing < 0:
+                    raise ValueError("SQL 查询模板包含未闭合占位符")
+                name = template[index + 1:closing]
+                if not _SQL_ACTION_NAME.fullmatch(name):
+                    raise ValueError("SQL 查询模板包含无效占位符")
+                if name not in names:
+                    names.append(name)
+                output.append(f":action_param_{names.index(name)}")
+                index = closing + 1
+                continue
+            if char == "}":
+                raise ValueError("SQL 查询模板包含未配对占位符")
+            output.append(char)
+            index += 1
+            continue
+
+        if char == "{":
+            raise ValueError("SQL 值占位符必须独立出现，不能位于文本、标识符或注释中")
+        output.append(char)
+        if state == "single_quote" and char == "'":
+            if following == "'":
+                output.append(following)
+                index += 2
+                continue
+            state = "normal"
+        elif state == "double_quote" and char == '"':
+            if following == '"':
+                output.append(following)
+                index += 2
+                continue
+            state = "normal"
+        elif state == "line_comment" and char in "\r\n":
+            state = "normal"
+        elif state == "block_comment" and char == "*" and following == "/":
+            output.append(following)
+            index += 2
+            state = "normal"
+            continue
+        index += 1
+
+    required = set(names)
+    supplied = set(params)
+    missing = sorted(required - supplied)
+    extra = sorted(supplied - required)
+    if missing:
+        raise ValueError("SQL 执行缺少参数：" + "、".join(missing))
+    if extra:
+        raise ValueError("SQL 执行包含模板未声明的参数：" + "、".join(extra))
+    bindings: dict[str, Any] = {}
+    unique_names: list[str] = []
+    for name in names:
+        if name in unique_names:
+            continue
+        unique_names.append(name)
+        value = params[name]
+        if isinstance(value, (dict, list, tuple, set)):
+            raise ValueError(f"SQL 参数“{name}”必须是单个值")
+        bindings[f"action_param_{len(unique_names) - 1}"] = value
+    return "".join(output), bindings
 
 
 def _exec_sql(
@@ -833,21 +1365,24 @@ def _exec_sql(
     """SQL 执行器：在指定数据源上执行 SQL。
 
     cfg: {data_source_id, sql}
-    params 中的值会替换 SQL 中的 {param_name} 占位符。
+    ``{param_name}`` 只编译为数据库绑定参数，绝不拼接到 SQL 文本。
     """
     ds_id = cfg.get("data_source_id", "")
     sql = cfg.get("sql", "")
     if not sql or (not ds_id and data_source is None):
         raise ValueError("SQL 执行器需要 data_source_id 和 sql 配置")
-    # 参数替换
-    for k, v in params.items():
-        sql = sql.replace("{%s}" % k, str(v))
+    sql, bindings = _compile_sql_action(str(sql), params)
     ds = data_source or db.get(DataSource, ds_id)
     if not ds:
         raise ValueError(f"数据源不存在: {ds_id}")
     if ds.scenario_id not in (None, cfg.get("scenario_id")) and cfg.get("scenario_id"):
         raise PolicyViolation("操作不能访问其他业务场景的数据源")
-    return datasource_service.run_query(ds, sql, limit=get_settings().max_query_rows)
+    return datasource_service.run_parameterized_query(
+        ds,
+        sql,
+        bindings,
+        limit=get_settings().max_query_rows,
+    )
 
 
 def _exec_skill(db: Session, cfg: dict, params: dict) -> Any:
@@ -1046,6 +1581,9 @@ def execute_workflow(
     执行谱系，已成功的 Action 只回放其审计结果而不再次产生副作用。显式
     人工重试会由队列生成新的 ``execution_id``。
     """
+    capability_readiness_service.require_executable(
+        "workflow", workflow, definition=runtime_definition, db=db
+    )
     status = workflow.status or ("active" if workflow.enabled else "disabled")
     if status != "active" or not workflow.enabled:
         raise PolicyViolation("工作流当前未启用")
@@ -1207,6 +1745,9 @@ def _execute_steps(
             if not rule:
                 step_result["status"] = "skipped"
                 step_result["error"] = f"规则不存在: {rule_id}"
+            elif not rule.enabled:
+                step_result["status"] = "failed"
+                step_result["error"] = f"规则已停用: {rule.name}"
             else:
                 record = step.get("record", context.get("record", {}))
                 r = evaluate_rule(rule, record)
@@ -1372,6 +1913,9 @@ def _execute_dag(
             if not rule:
                 res["status"] = "failed"
                 res["error"] = f"规则不存在或不属于当前业务场景: {data.get('rule_id', '')}"
+            elif not rule.enabled:
+                res["status"] = "failed"
+                res["error"] = f"规则已停用: {rule.name}"
             else:
                 record = render_template(data.get("record", {}) or {}, ctx)
                 if not isinstance(record, dict):

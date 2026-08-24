@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi import HTTPException
 from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -20,10 +21,12 @@ from app.models import (
     AssistantMessage,
     AssistantThread,
     BusinessScenario,
+    Conversation,
     LLMConfig,
     Message,
     DataMapping,
     DataSource,
+    FunctionDefinition,
     OntologyAction,
     OntologyEntity,
     OntologyInstance,
@@ -32,8 +35,14 @@ from app.models import (
     User,
 )
 from app.routers import agents, assistant, scenarios
-from app.schemas import AssistantChatRequest, AssistantProposalApplyRequest, ChatRequest
-from app.services import datasource_service, operations_service, permission_service, workflow_service
+from app.schemas import ActionExecuteRequest, AssistantChatRequest, AssistantProposalApplyRequest, ChatRequest
+from app.services import (
+    datasource_service,
+    operations_service,
+    permission_service,
+    scenario_model_compiler,
+    workflow_service,
+)
 
 
 class AssistantGovernedProposalTests(unittest.TestCase):
@@ -271,6 +280,111 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(OntologyInstance)),
             0,
+        )
+
+    def test_compound_scenario_model_proposal_uses_confirmed_atomic_apply_path(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="建筑项目履约",
+            namespace="construction",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        source_bundle = scenario_model_compiler.build_source_bundle(
+            "",
+            [{
+                "id": "construction-apply",
+                "filename": "建筑项目模型.md",
+                "text": "项目以项目编号唯一标识。",
+            }],
+        )
+        payload = scenario_model_compiler.normalize_scenario_model(
+            self.db,
+            scenario,
+            {
+                "schema_version": "scenario_model.v1",
+                "entities": [{
+                    "key": "entity.project",
+                    "name": "项目",
+                    "properties": [{
+                        "name": "项目编号",
+                        "data_type": "string",
+                        "is_key": True,
+                        "is_required": True,
+                    }],
+                    "evidence_refs": ["construction-apply:p0001"],
+                    "confidence": 1.0,
+                }],
+                "relations": [],
+                "functions": [],
+                "actions": [],
+                "rules": [],
+                "events": [],
+                "workflows": [],
+                "mappings": [],
+                "unresolved": [],
+                "coverage": [{
+                    "source_ref": "construction-apply:p0001",
+                    "status": "modeled",
+                    "reason": "项目对象与主键",
+                    "change_keys": ["entity.project"],
+                }],
+            },
+            source_bundle=source_bundle,
+        )
+        proposal = assistant._build_proposal("scenario_model", payload, scenario)
+        thread, _message = self._proposal_message(
+            kind="scenario_model",
+            proposal=proposal,
+            scenario=scenario,
+        )
+
+        with self.assertRaises(Exception):
+            assistant.apply_proposal(
+                AssistantProposalApplyRequest(
+                    kind="scenario_model",
+                    scenario_id=scenario.id,
+                    thread_id=thread.id,
+                    proposal_id=proposal["proposal_id"],
+                    confirm=False,
+                ),
+                self.db,
+            )
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            0,
+        )
+
+        result = assistant.apply_proposal(
+            AssistantProposalApplyRequest(
+                kind="scenario_model",
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                proposal_id=proposal["proposal_id"],
+                confirm=True,
+            ),
+            self.db,
+        )
+        self.assertEqual(result["data"]["counts"]["entities_added"], 1)
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            1,
+        )
+        replay = assistant.apply_proposal(
+            AssistantProposalApplyRequest(
+                kind="scenario_model",
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                proposal_id=proposal["proposal_id"],
+                confirm=True,
+            ),
+            self.db,
+        )
+        self.assertEqual(replay["status"], "replayed")
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            1,
         )
 
     def test_mapping_apply_rejects_stale_or_invented_columns(self) -> None:
@@ -588,6 +702,87 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.assertIsNotNone(parent)
         self.assertEqual(parent.context["action_preview"]["preview"]["log_id"], log.id)
 
+    def test_scenario_model_stream_reloads_detached_scenario_in_owned_session(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="流式复合编译",
+            status="active",
+        )
+        function = FunctionDefinition(
+            scenario=scenario,
+            name="计算风险分",
+            input_schema={"type": "object", "properties": {}},
+            output_schema={"type": "object", "properties": {}},
+        )
+        self.db.add_all([scenario, function])
+        self.db.commit()
+        tenant_id = self.tenant.id
+        user_id = self.user.id
+        factory = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
+        observed: dict[str, object] = {}
+
+        def fake_compile(db, streamed_scenario, **_kwargs):
+            # This relationship was not touched by _scenario_context.  It can
+            # only load here when the SSE turn reloaded the scenario in its
+            # explicitly-owned session.
+            observed["functions"] = [
+                item.name for item in streamed_scenario.function_definitions
+            ]
+            observed["tenant_id"] = db.info.get("tenant_id")
+            observed["user_id"] = db.info.get("user_id")
+            return {
+                "schema_version": "scenario_model.v1",
+                "source_manifest": [],
+                "entities": [],
+                "relations": [],
+                "functions": [],
+                "actions": [],
+                "rules": [],
+                "events": [],
+                "workflows": [],
+                "mappings": [],
+                "unresolved": [],
+                "coverage": [],
+                "coverage_summary": {
+                    "total": 0,
+                    "modeled": 0,
+                    "context": 0,
+                    "irrelevant": 0,
+                    "ambiguous": 0,
+                },
+                "changes": [],
+                "fingerprint": "stream-session-regression",
+            }
+
+        with (
+            patch.object(assistant, "SessionLocal", factory),
+            patch.object(
+                assistant.scenario_model_compiler,
+                "compile_scenario_model",
+                side_effect=fake_compile,
+            ),
+        ):
+            response = assistant.stream_chat(
+                AssistantChatRequest(
+                    message="编译完整业务模型",
+                    scenario_id=scenario.id,
+                    path=f"/scenarios/{scenario.id}",
+                    mode="draft",
+                    draft_kind="scenario_model",
+                ),
+                self.db,
+            )
+            # Reproduce the production lifecycle: request-scoped ORM objects
+            # are detached before StreamingResponse starts consuming its body.
+            self.db.expunge_all()
+            body = asyncio.run(self._consume_until(response))
+
+        self.assertNotIn("not bound to a Session", body)
+        self.assertIn('"type": "proposal"', body)
+        self.assertEqual(observed["functions"], ["计算风险分"])
+        self.assertEqual(observed["tenant_id"], tenant_id)
+        self.assertEqual(observed["user_id"], user_id)
+
     def test_temporary_attachment_is_bound_to_one_thread_and_expired_rows_are_purged(self) -> None:
         first = AssistantThread(
             tenant_id=self.tenant.id,
@@ -752,6 +947,13 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             llm_config=llm,
             name="FK Agent",
             data_source_ids=[source.id],
+            capability_scope={
+                "functions": {"mode": "explicit", "selected_ids": []},
+                "actions": {"mode": "explicit", "selected_ids": [action.id]},
+                "rules": {"mode": "explicit", "selected_ids": []},
+                "events": {"mode": "explicit", "selected_ids": []},
+                "workflows": {"mode": "explicit", "selected_ids": []},
+            },
         )
         self.db.add_all([scenario, entity, action, source, mapping, llm, agent])
         self.db.commit()
@@ -796,6 +998,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         parent = self.db.get(Message, log.agent_message_id)
         self.assertIsNotNone(parent)
         self.assertEqual(parent.tool_results[0]["name"], "execute_action")
+        self.assertTrue(parent.stream_finalized)
 
 
 class ActionDecisionChainTests(unittest.TestCase):
@@ -822,6 +1025,15 @@ class ActionDecisionChainTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             name="审计对象",
         )
+        source = DataSource(
+            id="source-action-audit",
+            tenant_id=tenant.id,
+            scenario_id=self.scenario.id,
+            name="Action 审计数据源",
+            type="sqlite",
+            config={"path": "not-opened-in-preview.sqlite3"},
+            status="ok",
+        )
         self.action = OntologyAction(
             id="action-audit",
             scenario_id=self.scenario.id,
@@ -834,11 +1046,14 @@ class ActionDecisionChainTests(unittest.TestCase):
                 "additionalProperties": False,
             },
             executor_type="sql",
-            executor_config={},
+            executor_config={
+                "data_source_id": source.id,
+                "sql": "SELECT '{reference}' AS reference",
+            },
             requires_confirmation=True,
             enabled=True,
         )
-        self.db.add_all([tenant, user, self.scenario, entity, self.action])
+        self.db.add_all([tenant, user, self.scenario, entity, source, self.action])
         self.db.commit()
         permission_service.ensure_organization(
             self.db,
@@ -882,3 +1097,160 @@ class ActionDecisionChainTests(unittest.TestCase):
         self.assertEqual(row.actor_type, "user")
         self.assertTrue(row.permission_decision["allowed"])
         self.assertEqual(row.data_context, {})
+
+    def test_confirmed_agent_action_replaces_dry_run_in_durable_message(self) -> None:
+        agent = Agent(
+            id="agent-action-audit",
+            tenant_id="tenant-action-audit",
+            scenario_id=self.scenario.id,
+            name="审计 Agent",
+            capability_scope={
+                "functions": {"mode": "explicit", "selected_ids": []},
+                "actions": {"mode": "explicit", "selected_ids": [self.action.id]},
+                "rules": {"mode": "explicit", "selected_ids": []},
+                "events": {"mode": "explicit", "selected_ids": []},
+                "workflows": {"mode": "explicit", "selected_ids": []},
+            },
+        )
+        conversation = Conversation(
+            id="conversation-action-audit",
+            agent=agent,
+            created_by_user_id="user-action-audit",
+            title="附件生成",
+        )
+        message = Message(
+            id="message-action-audit",
+            conversation=conversation,
+            role="assistant",
+            content="已生成安全预演。",
+            tool_calls=[{"id": "call-1", "name": "execute_action"}],
+            tool_results=[],
+        )
+        self.db.add_all([agent, conversation, message])
+        self.db.commit()
+        self.db.info["llm_trace_context"] = {"assistant_message_id": message.id}
+        self.db.info["action_audit_context"] = {
+            "agent_id": agent.id,
+            "llm_config_id": None,
+            "model_name": "test-model",
+        }
+
+        preview = scenarios.execute_action(
+            self.action.id,
+            ActionExecuteRequest(params={"reference": "REQ-AGENT"}, dry_run=True),
+            self.db,
+        )
+        message.tool_results = [{
+            "id": "call-1",
+            "name": "execute_action",
+            "result": json.dumps(preview, ensure_ascii=False),
+        }]
+        self.db.commit()
+        final_response = {
+            "status": "success",
+            "result": {
+                "artifact": {
+                    "id": "a" * 32,
+                    "filename": "项目报告.docx",
+                    "format": "docx",
+                    "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "size": 1024,
+                    "sha256": "a" * 64,
+                    "download_url": f"/api/data-sources/files/{'a' * 32}/download",
+                }
+            },
+        }
+        with patch.object(
+            scenarios.workflow_service,
+            "execute_action",
+            return_value=final_response,
+        ):
+            response = scenarios.execute_action(
+                self.action.id,
+                ActionExecuteRequest(
+                    params={"reference": "REQ-AGENT"},
+                    confirm=True,
+                    idempotency_key="agent-artifact-req-1",
+                    preview_log_id=preview["log_id"],
+                    correlation_id=preview["correlation_id"],
+                    expected_environment=preview["environment"],
+                    expected_definition_snapshot_id=preview["definition_snapshot_id"],
+                    expected_release_id=preview["release_id"],
+                    expected_definition_hash=preview["definition_hash"],
+                ),
+                self.db,
+            )
+
+        self.assertEqual(response, final_response)
+        self.db.expire_all()
+        persisted = self.db.get(Message, message.id)
+        stored = json.loads(persisted.tool_results[0]["result"])
+        self.assertEqual(stored["status"], "success")
+        self.assertEqual(stored["result"]["artifact"]["format"], "docx")
+
+    def test_confirmation_is_blocked_until_agent_sse_message_is_final(self) -> None:
+        agent = Agent(
+            id="agent-stream-race",
+            tenant_id="tenant-action-audit",
+            scenario_id=self.scenario.id,
+            name="流式确认 Agent",
+            capability_scope={
+                "functions": {"mode": "explicit", "selected_ids": []},
+                "actions": {"mode": "explicit", "selected_ids": [self.action.id]},
+                "rules": {"mode": "explicit", "selected_ids": []},
+                "events": {"mode": "explicit", "selected_ids": []},
+                "workflows": {"mode": "explicit", "selected_ids": []},
+            },
+        )
+        conversation = Conversation(
+            id="conversation-stream-race",
+            agent=agent,
+            created_by_user_id="user-action-audit",
+            title="流式竞态",
+        )
+        message = Message(
+            id="message-stream-race",
+            conversation=conversation,
+            role="assistant",
+            content="正在生成最终说明。",
+            tool_calls=[{"id": "call-race", "name": "execute_action"}],
+            tool_results=[],
+            stream_finalized=False,
+        )
+        self.db.add_all([agent, conversation, message])
+        self.db.commit()
+        self.db.info["llm_trace_context"] = {"assistant_message_id": message.id}
+        self.db.info["action_audit_context"] = {
+            "agent_id": agent.id,
+            "llm_config_id": None,
+            "model_name": "test-model",
+        }
+        preview = scenarios.execute_action(
+            self.action.id,
+            ActionExecuteRequest(params={"reference": "REQ-RACE"}, dry_run=True),
+            self.db,
+        )
+        message.tool_results = [{
+            "id": "call-race",
+            "name": "execute_action",
+            "result": json.dumps(preview, ensure_ascii=False),
+        }]
+        self.db.commit()
+
+        payload = ActionExecuteRequest(
+            params={"reference": "REQ-RACE"},
+            confirm=True,
+            idempotency_key="agent-race-1",
+            preview_log_id=preview["log_id"],
+            correlation_id=preview["correlation_id"],
+            expected_environment=preview["environment"],
+            expected_definition_snapshot_id=preview["definition_snapshot_id"],
+            expected_release_id=preview["release_id"],
+            expected_definition_hash=preview["definition_hash"],
+        )
+        with patch.object(scenarios.workflow_service, "execute_action") as execute:
+            with self.assertRaises(HTTPException) as raised:
+                scenarios.execute_action(self.action.id, payload, self.db)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("仍在生成", str(raised.exception.detail))
+        execute.assert_not_called()

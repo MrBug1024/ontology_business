@@ -1,14 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { buildSchemaFromFields, flattenSchemaFields } from '@/utils/schemaBuilder'
+import type { EditableSchemaField, SchemaObject } from '@/utils/schemaBuilder'
 
-type SchemaObject = Record<string, any>
-type FieldRow = {
+type FieldRow = EditableSchemaField & {
   id: string
-  name: string
-  type: string
-  description: string
-  required: boolean
-  enumText: string
 }
 
 const props = withDefaults(defineProps<{
@@ -25,66 +21,22 @@ const emit = defineEmits<{ (event: 'update:modelValue', value: SchemaObject): vo
 const rows = ref<FieldRow[]>([])
 let lastEmitted = ''
 
-function rowType(schema: SchemaObject) {
-  if (schema.type === 'string' && schema.format === 'date') return 'date'
-  if (schema.type === 'string' && schema.format === 'date-time') return 'datetime'
-  return String(schema.type || 'string')
-}
-function schemaRoot(value: SchemaObject) {
-  if (value?.properties && typeof value.properties === 'object') {
-    return { properties: value.properties as SchemaObject, required: Array.isArray(value.required) ? value.required : [] }
-  }
-  const properties = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
-  return { properties, required: [] as string[] }
-}
 function load(value: SchemaObject) {
   const normalized = JSON.stringify(value || {})
   if (normalized === lastEmitted) return
-  const root = schemaRoot(value || {})
-  rows.value = Object.entries(root.properties).map(([name, raw], index) => {
-    const schema = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as SchemaObject : { type: 'string' }
-    return {
-      id: `${Date.now()}-${index}-${name}`,
-      name,
-      type: rowType(schema),
-      description: String(schema.description || ''),
-      required: root.required.includes(name) || schema.required === true,
-      enumText: Array.isArray(schema.enum) ? schema.enum.join(', ') : '',
-    }
-  })
-}
-
-function castEnumValue(value: string, type: string) {
-  const trimmed = value.trim()
-  if (type === 'integer') return Number.parseInt(trimmed, 10)
-  if (type === 'number') return Number(trimmed)
-  if (type === 'boolean') return trimmed === 'true' ? true : trimmed === 'false' ? false : trimmed
-  return trimmed
+  rows.value = flattenSchemaFields(value || {}).map((field, index) => ({
+    ...field,
+    id: `${Date.now()}-${index}-${field.name}`,
+  }))
 }
 function toSchema() {
-  const properties: SchemaObject = {}
-  const required: string[] = []
-  for (const row of rows.value) {
-    const name = row.name.trim()
-    if (!name) continue
-    const schema: SchemaObject = {
-      type: row.type === 'date' || row.type === 'datetime' ? 'string' : row.type,
-    }
-    if (row.type === 'date') schema.format = 'date'
-    if (row.type === 'datetime') schema.format = 'date-time'
-    if (row.description.trim()) schema.description = row.description.trim()
-    const enumValues = row.enumText.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean)
-    if (enumValues.length) schema.enum = enumValues.map((item) => castEnumValue(item, row.type))
-    properties[name] = schema
-    if (row.required) required.push(name)
-  }
-  return { type: 'object', properties, required, additionalProperties: false }
+  return buildSchemaFromFields(rows.value)
 }
 function typeLabel(type: string) {
-  return ({ string: '文本', integer: '整数', number: '数值', boolean: '是/否', date: '日期', datetime: '日期时间', array: '列表', object: '对象' } as Record<string, string>)[type] || type
+  return ({ any: '任意值', string: '文本', integer: '整数', number: '数值', boolean: '是/否', date: '日期', datetime: '日期时间', array: '列表', object: '对象' } as Record<string, string>)[type] || type
 }
 function addField() {
-  rows.value.push({ id: `${Date.now()}-${Math.random()}`, name: '', type: 'string', description: '', required: false, enumText: '' })
+  rows.value.push({ id: `${Date.now()}-${Math.random()}`, name: '', type: 'string', description: '', required: false, enumText: '', extras: {} })
 }
 function removeField(id: string) {
   rows.value = rows.value.filter((row) => row.id !== id)
@@ -126,6 +78,7 @@ watch(rows, () => {
             <el-input v-model.trim="row.name" placeholder="如 project_id" aria-label="字段名称" />
           </el-form-item>
           <el-select v-model="row.type" aria-label="字段类型">
+            <el-option label="任意值" value="any" />
             <el-option label="文本" value="string" />
             <el-option label="整数" value="integer" />
             <el-option label="数值" value="number" />

@@ -164,6 +164,61 @@ def mapping_fingerprint(mapping: Any) -> str:
     return _mapping_snapshot_fingerprint(mapping_snapshot(mapping))
 
 
+def relation_mapping_fingerprint(
+    definition: runtime_definition_service.RuntimeDefinition,
+    mapping_id: str,
+) -> str:
+    """Pin every relation binding and endpoint definition touched by a job."""
+    related = [
+        item
+        for item in definition.relation_mappings.values()
+        if str(mapping_id) in {
+            str(getattr(item, "source_mapping_id", "") or ""),
+            str(getattr(item, "target_mapping_id", "") or ""),
+        }
+    ]
+    relation_fields = (
+        "id", "relation_id", "source_mapping_id", "target_mapping_id", "mode",
+        "data_source_id", "data_source_binding_key", "data_source_binding_ref",
+        "table_name", "foreign_key_column", "source_key_column", "target_key_column",
+    )
+    payload: list[dict[str, Any]] = []
+    for item in sorted(related, key=lambda value: str(value.id)):
+        endpoint_ids = {
+            str(item.source_mapping_id), str(item.target_mapping_id)
+        }
+        endpoints = [
+            mapping_snapshot(definition.mappings[endpoint_id])
+            for endpoint_id in sorted(endpoint_ids)
+            if endpoint_id in definition.mappings
+        ]
+        relation = definition.relations.get(str(item.relation_id))
+        payload.append(
+            {
+                "mapping": {
+                    field: copy.deepcopy(getattr(item, field, None))
+                    for field in relation_fields
+                },
+                "endpoints": endpoints,
+                "relation": {
+                    field: copy.deepcopy(getattr(relation, field, None))
+                    for field in (
+                        "id", "source_entity_id", "target_entity_id",
+                        "relation_type", "constraints",
+                    )
+                } if relation is not None else None,
+            }
+        )
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def resolve_mapping_runtime_definition(
     db: Session,
     scenario: BusinessScenario,
@@ -195,7 +250,9 @@ def resolve_mapping_runtime_definition(
     except runtime_definition_service.RuntimeDefinitionError as exc:
         raise PolicyViolation(str(exc)) from exc
     try:
-        return frozen_mapping(mapping_snapshot(released_mapping)), definition
+        frozen = frozen_mapping(mapping_snapshot(released_mapping))
+        frozen.entity = getattr(released_mapping, "entity", None)
+        return frozen, definition
     except PolicyViolation:
         raise
     except Exception as exc:  # noqa: BLE001 - snapshot JSON is untrusted at this boundary.
@@ -227,7 +284,6 @@ def _job_runtime_mapping(
             job.definition_source != "live"
             or job.definition_snapshot_id is not None
             or job.release_id is not None
-            or job.definition_hash not in (None, "")
         ):
             raise PolicyViolation("开发环境映射刷新任务的定义来源无效")
         return frozen
@@ -253,6 +309,50 @@ def _job_runtime_mapping(
     if _mapping_snapshot_fingerprint(released_snapshot) != job.mapping_fingerprint:
         raise PolicyViolation("映射刷新快照与固定发布定义不一致")
     return frozen
+
+
+def _job_runtime_definition(
+    db: Session,
+    job: DataMappingRefreshJob,
+    scenario: BusinessScenario,
+) -> runtime_definition_service.RuntimeDefinition:
+    """Resolve the complete definition pinned by a refresh job."""
+    try:
+        if job.environment == "dev":
+            definition = runtime_definition_service.resolve_active(
+                db, scenario, environment="dev"
+            )
+            if definition.is_frozen or job.definition_source != "live":
+                raise PolicyViolation("开发环境映射刷新任务的定义来源无效")
+            if (
+                not job.definition_hash
+                or definition.definition_hash != job.definition_hash
+                or
+                not job.relation_mapping_fingerprint
+                or relation_mapping_fingerprint(definition, job.mapping_id)
+                != job.relation_mapping_fingerprint
+            ):
+                raise PolicyViolation("关系映射或其端点定义已变化，请重新提交刷新")
+            return definition
+        if job.definition_source != "release":
+            raise PolicyViolation("非开发环境映射刷新缺少发布定义来源")
+        definition = runtime_definition_service.resolve_pinned(
+            db,
+            scenario,
+            environment=job.environment,
+            snapshot_id=job.definition_snapshot_id,
+            release_id=job.release_id,
+            definition_hash=job.definition_hash,
+        )
+        if (
+            not job.relation_mapping_fingerprint
+            or relation_mapping_fingerprint(definition, job.mapping_id)
+            != job.relation_mapping_fingerprint
+        ):
+            raise PolicyViolation("固定发布中的关系映射定义与刷新任务不一致")
+        return definition
+    except runtime_definition_service.RuntimeDefinitionError as exc:
+        raise PolicyViolation(str(exc)) from exc
 
 
 def _live_mapping_matches_job(mapping: DataMapping | None, job: DataMappingRefreshJob) -> bool:
@@ -480,6 +580,9 @@ def enqueue_mapping_refresh(
     )
     frozen_snapshot = mapping_snapshot(runtime_mapping)
     frozen_fingerprint = _mapping_snapshot_fingerprint(frozen_snapshot)
+    frozen_relation_fingerprint = relation_mapping_fingerprint(
+        definition, mapping.id
+    )
     active = db.execute(
         select(DataMappingRefreshJob)
         .where(
@@ -512,9 +615,13 @@ def enqueue_mapping_refresh(
         active_key=_active_key(mapping.id, environment),
         mapping_snapshot=frozen_snapshot,
         mapping_fingerprint=frozen_fingerprint,
+        relation_mapping_fingerprint=frozen_relation_fingerprint,
         definition_snapshot_id=definition.snapshot_id if definition.is_frozen else None,
         release_id=definition.release_id if definition.is_frozen else None,
-        definition_hash=definition.definition_hash if definition.is_frozen else "",
+        # Dev jobs are immutable too: endpoint key/title/type changes alter how
+        # source values become object identities and links. Pin the complete
+        # live definition hash so a queued job cannot pick up those edits.
+        definition_hash=definition.definition_hash or "",
         definition_source=definition.source,
         limit=bounded_limit(limit),
         status="queued",
@@ -640,11 +747,12 @@ def _job_context(
     scenario = db.get(BusinessScenario, job.scenario_id)
     if scenario is None or scenario.tenant_id != job.tenant_id:
         return scenario, None, "业务场景已删除或不再属于任务租户"
+    mapping = db.get(DataMapping, job.mapping_id)
     try:
         _job_runtime_mapping(db, job, scenario)
+        _job_runtime_definition(db, job, scenario)
     except PolicyViolation as exc:
-        return scenario, None, str(exc)
-    mapping = db.get(DataMapping, job.mapping_id)
+        return scenario, mapping, str(exc)
     if mapping is None or mapping.scenario_id != scenario.id:
         return scenario, mapping, "映射已删除或不再属于目标业务场景"
     return scenario, mapping, None
@@ -781,6 +889,15 @@ def process_mapping_refresh_jobs(
 
         try:
             runtime_mapping = _job_runtime_mapping(db, job, scenario)
+            definition = _job_runtime_definition(db, job, scenario)
+            definition_mapping = definition.mappings.get(job.mapping_id)
+            if (
+                definition_mapping is None
+                or _mapping_snapshot_fingerprint(mapping_snapshot(definition_mapping))
+                != job.mapping_fingerprint
+            ):
+                raise PolicyViolation("映射刷新快照与当前固定运行定义不一致")
+            runtime_mapping = definition_mapping
             with permission_service.execution_principal(
                 db,
                 scenario,
@@ -803,6 +920,56 @@ def process_mapping_refresh_jobs(
                     environment=job.environment,
                     release_id=job.release_id if job.definition_source == "release" else None,
                 )
+                relation_mappings = [
+                    relation_mapping
+                    for relation_mapping in definition.relation_mappings.values()
+                    if job.mapping_id in {
+                        str(getattr(relation_mapping, "source_mapping_id", "") or ""),
+                        str(getattr(relation_mapping, "target_mapping_id", "") or ""),
+                    }
+                ]
+                required_mapping_ids = {job.mapping_id}
+                for relation_mapping in relation_mappings:
+                    required_mapping_ids.update(
+                        {
+                            str(relation_mapping.source_mapping_id),
+                            str(relation_mapping.target_mapping_id),
+                        }
+                    )
+                mapping_data_sources: dict[str, Any] = {job.mapping_id: source}
+                mapping_connector_audits: dict[str, dict[str, Any]] = {
+                    job.mapping_id: connector_audit
+                }
+                connector_audits: list[dict[str, Any]] = [connector_audit]
+                for mapping_id in sorted(required_mapping_ids - {job.mapping_id}):
+                    endpoint_mapping = definition.mappings.get(mapping_id)
+                    if endpoint_mapping is None:
+                        raise PolicyViolation("关系映射端点不属于当前运行定义")
+                    endpoint_source, endpoint_audit = resolve_mapping_data_source(
+                        db,
+                        scenario,
+                        endpoint_mapping,
+                        environment=job.environment,
+                        release_id=job.release_id if job.definition_source == "release" else None,
+                    )
+                    mapping_data_sources[mapping_id] = endpoint_source
+                    mapping_connector_audits[mapping_id] = endpoint_audit
+                    connector_audits.append(endpoint_audit)
+                relation_data_sources: dict[str, Any] = {}
+                relation_connector_audits: dict[str, dict[str, Any]] = {}
+                for relation_mapping in relation_mappings:
+                    if str(getattr(relation_mapping, "mode", "")) != "join_table":
+                        continue
+                    join_source, join_audit = resolve_mapping_data_source(
+                        db,
+                        scenario,
+                        relation_mapping,
+                        environment=job.environment,
+                        release_id=job.release_id if job.definition_source == "release" else None,
+                    )
+                    relation_data_sources[str(relation_mapping.id)] = join_source
+                    relation_connector_audits[str(relation_mapping.id)] = join_audit
+                    connector_audits.append(join_audit)
                 result = ontology_service.import_instances_from_mapping(
                     db,
                     scenario,
@@ -811,6 +978,19 @@ def process_mapping_refresh_jobs(
                     data_source=source,
                     commit=False,
                     environment=job.environment,
+                    relation_mappings=relation_mappings,
+                    relation_data_sources=relation_data_sources,
+                    mapping_data_sources=mapping_data_sources,
+                    runtime_mappings=definition.mappings,
+                    runtime_relations=definition.relations,
+                    mapping_connector_audits=mapping_connector_audits,
+                    relation_connector_audits=relation_connector_audits,
+                    definition_provenance={
+                        "snapshot_id": definition.snapshot_id,
+                        "release_id": definition.release_id,
+                        "definition_hash": definition.definition_hash,
+                        "source": definition.source,
+                    },
                 )
 
             finished_at = utc_now()
@@ -856,7 +1036,7 @@ def process_mapping_refresh_jobs(
                 job.status = "succeeded"
                 job.active_key = None
                 job.error = ""
-                job.connector_audit = [connector_audit]
+                job.connector_audit = connector_audits
                 job.rows_scanned = int(result.get("rows_scanned", 0))
                 job.instances_created = int(result.get("instances_created", 0))
                 job.instances_updated = int(result.get("instances_updated", 0))

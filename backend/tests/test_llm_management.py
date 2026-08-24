@@ -179,6 +179,46 @@ class LLMManagementTests(unittest.TestCase):
         self.assertFalse(hasattr(trace, "prompt"))
         self.assertNotIn("secret", trace.error)
 
+    def test_chat_uses_configured_default_request_timeout(self) -> None:
+        client = _CompletionClient(_response())
+        with (
+            patch("app.services.llm_service.get_settings", return_value=SimpleNamespace(llm_timeout=47.0)),
+            patch("app.services.llm_service.OpenAI", return_value=client) as openai,
+            patch("app.database.SessionLocal", side_effect=self._trace_session),
+        ):
+            llm_service.chat(
+                self.config,
+                [{"role": "user", "content": "使用普通调用默认超时"}],
+                db=self.db,
+            )
+
+        openai.assert_called_once_with(
+            base_url=None,
+            api_key="sk-secret-value-should-not-leak",
+            timeout=47.0,
+        )
+
+    def test_chat_forwards_request_timeout_and_retry_override(self) -> None:
+        client = _CompletionClient(_response())
+        with (
+            patch("app.services.llm_service.OpenAI", return_value=client) as openai,
+            patch("app.database.SessionLocal", side_effect=self._trace_session),
+        ):
+            llm_service.chat(
+                self.config,
+                [{"role": "user", "content": "使用场景编译请求边界"}],
+                request_timeout=480.0,
+                max_retries=0,
+                db=self.db,
+            )
+
+        openai.assert_called_once_with(
+            base_url=None,
+            api_key="sk-secret-value-should-not-leak",
+            timeout=480.0,
+            max_retries=0,
+        )
+
     def test_stream_completion_and_failure_record_sanitized_traces(self) -> None:
         token_chunk = SimpleNamespace(
             choices=[SimpleNamespace(delta=SimpleNamespace(content="流式", tool_calls=None))],

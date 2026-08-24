@@ -119,6 +119,8 @@ body {
    页面骨架
    ═══════════════════════════════════════════════════════════ */
 .page {
+  width: 100%;
+  min-width: 0;
   padding: var(--space-6) var(--space-6) var(--space-8);
   max-width: 1600px;
   margin: 0 auto;
@@ -172,6 +174,10 @@ body {
 
 .card.is-interactive:hover {
   box-shadow: var(--shadow);
+}
+
+body.el-popup-parent--hidden .main-area {
+  overflow: hidden;
 }
 
 .card-title {
@@ -357,17 +363,20 @@ pre.code {
   border: 1px solid var(--border);
   box-shadow: var(--shadow-lg);
   overflow: hidden;
+  overscroll-behavior: contain;
 }
 .el-overlay-dialog {
   display: flex;
   align-items: center;
   padding: 16px;
-  overflow: auto;
+  overflow: hidden;
+  overscroll-behavior: contain;
 }
 .el-overlay-dialog > .el-dialog {
   margin: auto !important;
 }
 .el-dialog__header {
+  flex: 0 0 auto;
   border-bottom: 1px solid var(--border);
   padding: var(--space-5) var(--space-6);
   margin-right: 0;
@@ -380,10 +389,16 @@ pre.code {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   overscroll-behavior: contain;
   padding: var(--space-6);
 }
+.el-dialog__body > * {
+  max-width: 100%;
+  min-width: 0;
+}
 .el-dialog__footer {
+  flex: 0 0 auto;
   border-top: 1px solid var(--border);
   padding: var(--space-4) var(--space-6);
 }
@@ -410,6 +425,19 @@ pre.code {
 .el-tag {
   border-radius: 7px;
   font-weight: 600;
+}
+
+.el-drawer {
+  max-height: 100dvh;
+}
+.el-drawer__body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+:where(input, textarea, select, button, [tabindex]):focus-visible {
+  scroll-margin-block: 76px 24px;
 }
 .el-tag .el-icon {
   margin-right: 4px;
@@ -851,7 +879,25 @@ pre.code {
   .page-header h1,
   .page-header h2 { font-size: 21px; }
   .page-header .sub { max-width: 100%; line-height: 1.6; }
-  .el-dialog { width: calc(100vw - 28px) !important; max-width: 640px; }
+  .el-overlay-dialog { padding: max(10px, env(safe-area-inset-top)) 10px max(10px, env(safe-area-inset-bottom)); }
+  .el-dialog { width: calc(100vw - 20px) !important; max-width: 640px; max-height: calc(100dvh - max(20px, env(safe-area-inset-top) + env(safe-area-inset-bottom))); }
+  .el-dialog__header { padding: 16px 18px; }
+  .el-dialog__body { padding: 18px; }
+  .el-dialog__footer { padding: 12px 18px max(12px, env(safe-area-inset-bottom)); }
+  .el-button { min-height: 44px; }
+  .el-button.is-circle { min-width: 44px; }
+  .el-input__wrapper,
+  .el-select__wrapper { min-height: 44px; }
+  input,
+  textarea { font-size: 16px !important; }
+}
+@media (min-width: 769px) and (max-width: 900px) {
+  .el-button { min-height: 44px; }
+  .el-button.is-circle { min-width: 44px; }
+  .el-input__wrapper,
+  .el-select__wrapper { min-height: 44px; }
+  input,
+  textarea { font-size: 16px !important; }
 }
 .el-input__wrapper.is-focus,
 .el-textarea__inner:focus,

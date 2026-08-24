@@ -23,8 +23,14 @@ from .routers import (
     operations,
     scenarios,
     skills,
+    templates,
 )
-from .services import operations_service, permission_service, skill_service
+from .services import (
+    datasource_service,
+    operations_service,
+    permission_service,
+    skill_service,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +56,7 @@ async def lifespan(_: FastAPI):
     try:
         permission_service.bootstrap_authorization(db)
         operations_service.purge_expired_assistant_attachments(db)
+        datasource_service.reconcile_generated_file_orphans(db)
         db.commit()
         skill_service.sync_skills_to_db(db)
     finally:
@@ -79,6 +86,7 @@ app.include_router(auth.router, prefix=settings.api_prefix)
 app.include_router(data_sources.router, prefix=settings.api_prefix)
 app.include_router(llm_configs.router, prefix=settings.api_prefix)
 app.include_router(skills.router, prefix=settings.api_prefix)
+app.include_router(templates.router, prefix=settings.api_prefix)
 app.include_router(mcp.router, prefix=settings.api_prefix)
 app.include_router(agents.router, prefix=settings.api_prefix)
 app.include_router(assistant.router, prefix=settings.api_prefix)

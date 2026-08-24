@@ -8,7 +8,14 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..models import FunctionDefinition, FunctionRun
 from ..schemas import FunctionRunIn, FunctionRunOut
-from ..services import function_runtime_service, permission_service, tenant_service
+from ..services import (
+    capability_readiness_service,
+    function_runtime_service,
+    permission_service,
+    runtime_connector_service,
+    runtime_definition_service,
+    tenant_service,
+)
 from ..services.auth_service import get_current_user
 
 
@@ -38,7 +45,24 @@ def run_function(
     payload: FunctionRunIn,
     db: Session = Depends(get_db),
 ) -> FunctionRun:
-    function = _function(db, function_id, write=True)
+    live_function = _function(db, function_id, write=True)
+    scenario = tenant_service.require_scenario(
+        db, live_function.scenario_id, writable=True
+    )
+    try:
+        definition = runtime_definition_service.resolve_active(
+            db,
+            scenario,
+            environment=runtime_connector_service.runtime_environment(),
+        )
+        function = runtime_definition_service.resolve_resource(
+            definition, "function", function_id
+        )
+        capability_readiness_service.require_executable(
+            "function", function, definition=definition, db=db
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(409, f"函数当前不可执行: {exc}") from exc
     run = function_runtime_service.create_function_run(
         db,
         function,
@@ -47,6 +71,7 @@ def run_function(
         scenario_id=function.scenario_id,
         user_id=_user_id(db),
         idempotency_key=payload.idempotency_key,
+        definition_hash=definition.definition_hash,
     )
     db.commit()
     db.refresh(run)

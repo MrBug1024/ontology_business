@@ -19,26 +19,42 @@ from ..models import (
     DataMapping,
     DataSource,
     DocumentChunk,
-    FunctionDefinition,
     LLMConfig,
     Message,
-    OntologyAction,
     OntologyEntity,
-    OntologyRule,
-    OntologyWorkflow,
 )
 from ..schemas import (
     AgentIn,
     AgentOut,
+    AgentToolConfirmationRequest,
     ChatRequest,
     ConversationOut,
     MessageOut,
     Msg,
 )
-from ..services import agent_engine, llm_service, permission_service, tenant_service
+from ..services import (
+    agent_capability_service,
+    agent_confirmation_service,
+    agent_engine,
+    llm_service,
+    permission_service,
+    runtime_connector_service,
+    runtime_definition_service,
+    tenant_service,
+)
 from ..services.auth_service import get_tenant_db
 
 router = APIRouter(prefix="/agents", tags=["agents"])
+
+_HISTORIC_MODEL_REPLAY_PLACEHOLDER = (
+    "此前回答保留在会话记录中，但其数据快照未参与本轮推理。"
+)
+
+
+def _stream_error_content(content: str, error: object) -> str:
+    """Match the browser's durable rendering for a failed SSE turn."""
+    separator = "\n\n" if content else ""
+    return f"{content}{separator}[错误] {error}"
 
 
 def _current_user_id(db: Session) -> str:
@@ -115,6 +131,7 @@ def _agent_requires_tool_capability(
     *,
     scenario_id: str | None,
     data_source_ids: list[str] | None,
+    capability_scope: object,
 ) -> bool:
     """Mirror AgentContext.build_tools before selecting a compatible LLM."""
     # Direct Skill/MCP side-effect tools are intentionally not part of the
@@ -123,15 +140,22 @@ def _agent_requires_tool_capability(
         return True
     if not scenario_id:
         return False
-    for model in (OntologyEntity, FunctionDefinition, OntologyAction, OntologyRule, OntologyWorkflow):
+    # Ontology and mapped-data reads stay available even when the business
+    # capability allow-list is empty.
+    for model in (OntologyEntity, DataMapping):
         if db.execute(
             select(model.id).where(model.scenario_id == scenario_id).limit(1)
         ).scalar_one_or_none():
             return True
-    return False
+    return agent_capability_service.scope_has_business_tools(capability_scope)
 
 
-def _agent_readiness_missing(db: Session, agent: Agent) -> list[str]:
+def _agent_readiness_missing(
+    db: Session,
+    agent: Agent,
+    *,
+    runtime_context: agent_engine.AgentContext | None = None,
+) -> list[str]:
     """Return business-facing prerequisites that still block Agent chat.
 
     CRUD deliberately accepts incomplete Agents as drafts.  The chat endpoint
@@ -142,41 +166,66 @@ def _agent_readiness_missing(db: Session, agent: Agent) -> list[str]:
     if not agent.scenario_id:
         return ["业务场景", "对象类型", "数据源", "数据映射", "对话模型", "映射数据绑定"]
 
-    if not db.execute(
-        select(OntologyEntity.id).where(OntologyEntity.scenario_id == agent.scenario_id).limit(1)
-    ).scalar_one_or_none():
+    has_entity = (
+        bool(runtime_context.entities)
+        if runtime_context is not None
+        else bool(db.execute(
+            select(OntologyEntity.id)
+            .where(OntologyEntity.scenario_id == agent.scenario_id)
+            .limit(1)
+        ).scalar_one_or_none())
+    )
+    if not has_entity:
         missing.append("对象类型")
 
-    has_source = db.execute(
-        select(DataSource.id)
-        .where(
-            tenant_service.visible_clause(DataSource, db),
-            or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == agent.scenario_id),
-        )
-        .limit(1)
-    ).scalar_one_or_none()
+    has_source = (
+        bool(runtime_context.data_sources)
+        if runtime_context is not None
+        else bool(db.execute(
+            select(DataSource.id)
+            .where(
+                tenant_service.visible_clause(DataSource, db),
+                or_(
+                    DataSource.scenario_id.is_(None),
+                    DataSource.scenario_id == agent.scenario_id,
+                ),
+            )
+            .limit(1)
+        ).scalar_one_or_none())
+    )
     if not has_source:
         missing.append("数据源")
 
-    mapped_source_ids = set(db.scalars(
-        select(DataMapping.data_source_id).where(DataMapping.scenario_id == agent.scenario_id)
-    ).all())
-    if not mapped_source_ids:
+    if runtime_context is not None:
+        definition_mappings = (
+            runtime_context.runtime_definition.mappings
+            if runtime_context.runtime_definition is not None else {}
+        )
+        has_mapping = bool(definition_mappings)
+        has_bound_mapping = bool(runtime_context.mappings)
+    else:
+        mapped_source_ids = set(db.scalars(
+            select(DataMapping.data_source_id).where(
+                DataMapping.scenario_id == agent.scenario_id
+            )
+        ).all())
+        has_mapping = bool(mapped_source_ids)
+        has_bound_mapping = bool(mapped_source_ids.intersection(agent.data_source_ids or []))
+    if not has_mapping:
         missing.append("数据映射")
     if not agent.llm_config_id:
         missing.append("对话模型")
-    if not mapped_source_ids.intersection(agent.data_source_ids or []):
+    if not has_bound_mapping:
         missing.append("映射数据绑定")
     return missing
 
 
 def _can_read_historic_citation(db: Session, agent: Agent, citation: object) -> bool:
-    """Re-authorize persisted citations before returning a historic message.
+    """Re-authorize persisted citations before replaying them to a model.
 
-    Citation text is persisted in the message for auditability, but persistence
-    must never turn a formerly accessible source into a permanent disclosure.
-    A revoked/deleted source, removed Agent binding, missing file or a replaced
-    chunk makes the entire cited answer unavailable to the current requester.
+    The creator-owned UI transcript is an immutable answer-time record. A
+    revoked/deleted source, removed Agent binding, missing file or replaced
+    chunk only prevents its raw snapshot from being sent to a later model turn.
     """
     if not isinstance(citation, dict):
         return False
@@ -219,29 +268,137 @@ def _has_legacy_uncited_document_read(message: Message) -> bool:
             continue
         function = call.get("function") if isinstance(call.get("function"), dict) else {}
         name = str(call.get("name") or function.get("name") or "")
-        if name == "read_document":
+        if name in {"read_document", "search_documents"}:
             return True
     return False
 
 
-def _message_out(db: Session, message: Message, agent: Agent) -> MessageOut:
-    citations = message.citations if isinstance(message.citations, list) else []
-    if (
-        (citations and not all(_can_read_historic_citation(db, agent, item) for item in citations))
-        or _has_legacy_uncited_document_read(message)
-    ):
-        # Content and tool results can repeat the quoted source material, so
-        # hiding only the citation card would still leak revoked information.
-        return MessageOut(
-            id=message.id,
-            conversation_id=message.conversation_id,
-            role=message.role,
-            content="该历史回答引用的资料已不在当前访问范围，内容已隐藏。",
-            tool_calls=[],
-            tool_results=[],
-            citations=[],
-            created_at=message.created_at,
+def _tool_call_name_args(call: object) -> tuple[str, dict[str, Any]]:
+    if not isinstance(call, dict):
+        return "", {}
+    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+    name = str(call.get("name") or function.get("name") or "")
+    raw_args = call.get("args", call.get("arguments", function.get("arguments", {})))
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            return name, {}
+    return name, dict(raw_args) if isinstance(raw_args, dict) else {}
+
+
+def _authorization_context(
+    db: Session,
+    agent: Agent,
+    llm: LLMConfig | None = None,
+) -> agent_engine.AgentContext | None:
+    """Build the exact current runtime/ACL view used for historic replay."""
+    try:
+        return agent_engine.AgentContext(
+            db,
+            agent,
+            llm or LLMConfig(name="历史权限校验"),
         )
+    except Exception:  # noqa: BLE001 - missing release/binding must fail closed.
+        return None
+
+
+def _historic_tool_results_authorized(
+    message: Message,
+    context: agent_engine.AgentContext | None,
+) -> bool:
+    calls = [call for call in (message.tool_calls or []) if isinstance(call, dict)]
+    results = [result for result in (message.tool_results or []) if isinstance(result, dict)]
+    if not calls and not results:
+        return True
+    if not calls and results:
+        # Earliest citation-backed rows persisted only the retrieved text. They
+        # remain safe solely while every citation is independently current.
+        return bool(message.citations) and all(
+            not result.get("id") and not result.get("name") for result in results
+        )
+    if context is None or not calls or not results:
+        return False
+    by_id = {
+        str(result.get("id") or ""): result
+        for result in results
+        if str(result.get("id") or "")
+    }
+    if len(by_id) != len(results):
+        return False
+    seen: set[str] = set()
+    for call in calls:
+        call_id = str(call.get("id") or "")
+        if not call_id or call_id not in by_id:
+            return False
+        name, args = _tool_call_name_args(call)
+        result = by_id[call_id]
+        if not name or str(result.get("name") or name) != name:
+            return False
+        if not context.authorize_historic_tool_result(name, args, result.get("result")):
+            return False
+        seen.add(call_id)
+    return seen == set(by_id)
+
+
+def _message_out_without_tool_details(message: Message) -> MessageOut:
+    """Build a model-replay view without stale raw tool payloads.
+
+    This helper is deliberately *not* used by the message-list endpoint. The
+    creator-owned transcript must preserve its answer-time snapshot, including
+    tool cards, attachments and citations. Sending raw results to an external
+    model on a later turn is a separate trust boundary and is re-authorized.
+    """
+    return MessageOut(
+        id=message.id,
+        conversation_id=message.conversation_id,
+        role=message.role,
+        content=_HISTORIC_MODEL_REPLAY_PLACEHOLDER,
+        tool_calls=[],
+        tool_results=[],
+        citations=[],
+        created_at=message.created_at,
+    )
+
+
+def _message_out_for_model_replay(
+    db: Session,
+    message: Message,
+    agent: Agent,
+    *,
+    context: agent_engine.AgentContext | None = None,
+) -> MessageOut:
+    citations = message.citations if isinstance(message.citations, list) else []
+    authorization_context = (
+        context if context is not None else _authorization_context(db, agent)
+    )
+    runtime_source_ids = {
+        source.id for source in authorization_context.data_sources
+    } if authorization_context is not None else set()
+    if (
+        (
+            citations
+            and (
+                authorization_context is None
+                or not all(
+                    isinstance(item, dict)
+                    and str(item.get("data_source_id") or "") in runtime_source_ids
+                    and _can_read_historic_citation(db, agent, item)
+                    for item in citations
+                )
+            )
+        )
+        or _has_legacy_uncited_document_read(message)
+        or not _historic_tool_results_authorized(
+            message,
+            authorization_context,
+        )
+    ):
+        # The UI still receives the durable answer-time snapshot. The external
+        # model receives only a neutral continuity marker here: the answer body
+        # itself may repeat raw rows, so it must be withheld together with tool
+        # arguments/results and citation excerpts after authorization fails.
+        return _message_out_without_tool_details(message)
     return MessageOut.model_validate(message)
 
 
@@ -255,6 +412,39 @@ def _out(a: Agent, db: Session) -> AgentOut:
         )
     ).scalars().all()
     dss = [source for source in dss if _can_access_agent_data_source(db, a, source)]
+    definition = None
+    definition_error = ""
+    if scenario is None:
+        definition_error = "尚未绑定业务场景"
+    else:
+        try:
+            definition = runtime_definition_service.resolve_active(
+                db,
+                scenario,
+                environment=runtime_connector_service.runtime_environment(),
+            )
+        except (runtime_definition_service.RuntimeDefinitionError, ValueError) as exc:
+            definition_error = str(exc) or "当前环境运行定义不可用"
+    if a.capability_scope is None and definition is not None:
+        # Pre-scope Agents historically saw every capability that was visible
+        # in their scenario.  Project that legacy grant as the *current*
+        # explicit ids so the editor and runtime agree.  A later save persists
+        # this frozen snapshot instead of silently clearing the Agent or
+        # dynamically granting capabilities created in the future.
+        try:
+            capability_scope = agent_capability_service.validate_scope(
+                db,
+                agent_capability_service.legacy_all_scope(),
+                definition=definition,
+            )
+        except agent_capability_service.AgentCapabilityScopeError as exc:
+            capability_scope = agent_capability_service.explicit_empty_scope()
+            definition_error = definition_error or str(exc)
+    else:
+        capability_scope = agent_capability_service.normalize_scope(
+            a.capability_scope,
+            legacy_default=False,
+        )
     return AgentOut(
         id=a.id,
         name=a.name,
@@ -270,12 +460,26 @@ def _out(a: Agent, db: Session) -> AgentOut:
         scenario_name=scenario.name if scenario else "",
         llm_name=llm.name if llm else "",
         data_source_names=[d.name for d in dss],
+        capability_scope=capability_scope,
+        capability_scope_legacy=a.capability_scope is None,
+        capability_summary=agent_capability_service.capability_summary(
+            db,
+            capability_scope,
+            definition=definition,
+            definition_error=definition_error,
+        ),
     )
 
 
-def _validate_bindings(payload: AgentIn, db: Session) -> None:
+def _validate_bindings(
+    payload: AgentIn,
+    db: Session,
+    *,
+    capability_scope: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
     """保证 Agent 只能绑定存在且属于当前场景的资源。"""
     scenario_id = payload.scenario_id
+    scenario = None
     if scenario_id:
         scenario = tenant_service.require_scenario(db, scenario_id, writable=True)
         permission_service.require_scenario_permission(db, scenario, "write")
@@ -291,8 +495,35 @@ def _validate_bindings(payload: AgentIn, db: Session) -> None:
             db,
             scenario_id=scenario_id,
             data_source_ids=payload.data_source_ids,
+            capability_scope=capability_scope,
         ) and not llm_service.supports_capability(llm, "tool"):
             raise HTTPException(400, "该 Agent 需要工具调用，请绑定启用工具能力的 LLM 配置")
+
+    needs_capability_definition = agent_capability_service.scope_has_business_tools(
+        capability_scope
+    )
+    try:
+        if scenario is None:
+            capability_scope = agent_capability_service.validate_scope(
+                db,
+                capability_scope,
+                definition=None,
+            )
+        elif needs_capability_definition:
+            definition = runtime_definition_service.resolve_active(
+                db,
+                scenario,
+                environment=runtime_connector_service.runtime_environment(),
+            )
+            capability_scope = agent_capability_service.validate_scope(
+                db,
+                capability_scope,
+                definition=definition,
+            )
+    except agent_capability_service.AgentCapabilityScopeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (runtime_definition_service.RuntimeDefinitionError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
     ds_ids = set(payload.data_source_ids or [])
     if ds_ids:
@@ -314,6 +545,35 @@ def _validate_bindings(payload: AgentIn, db: Session) -> None:
                 invalid.append(source.name)
         if invalid:
             raise HTTPException(400, f"数据源不属于当前业务场景: {', '.join(invalid)}")
+    return capability_scope
+
+
+@router.get("/capability-catalog/{scenario_id}")
+def get_agent_capability_catalog(
+    scenario_id: str,
+    db: Session = Depends(get_tenant_db),
+):
+    """Return only capabilities readable by the current principal.
+
+    The client uses this governed catalog to render labels and readiness; it
+    never submits arbitrary JSON or treats a hidden resource id as selectable.
+    """
+    scenario = tenant_service.require_scenario(db, scenario_id)
+    permission_service.require_scenario_permission(db, scenario, "read")
+    try:
+        definition = runtime_definition_service.resolve_active(
+            db,
+            scenario,
+            environment=runtime_connector_service.runtime_environment(),
+        )
+    except (runtime_definition_service.RuntimeDefinitionError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "scenario_id": scenario.id,
+        "environment": definition.environment,
+        "definition_hash": definition.definition_hash,
+        "categories": agent_capability_service.catalog_summary(db, definition),
+    }
 
 
 @router.get("", response_model=list[AgentOut])
@@ -329,8 +589,19 @@ def list_agents(db: Session = Depends(get_tenant_db)):
 
 @router.post("", response_model=AgentOut)
 def create_agent(payload: AgentIn, db: Session = Depends(get_tenant_db)):
-    _validate_bindings(payload, db)
-    a = Agent(tenant_id=tenant_service.current_tenant_id(db), **payload.model_dump())
+    capability_scope = agent_capability_service.normalize_scope(
+        payload.capability_scope,
+        legacy_default=False,
+        allow_all=True,
+    )
+    capability_scope = _validate_bindings(
+        payload, db, capability_scope=capability_scope
+    )
+    a = Agent(
+        tenant_id=tenant_service.current_tenant_id(db),
+        **payload.model_dump(exclude={"capability_scope"}),
+        capability_scope=capability_scope,
+    )
     db.add(a)
     db.commit()
     db.refresh(a)
@@ -346,9 +617,40 @@ def get_agent(agent_id: str, db: Session = Depends(get_tenant_db)):
 @router.put("/{agent_id}", response_model=AgentOut)
 def update_agent(agent_id: str, payload: AgentIn, db: Session = Depends(get_tenant_db)):
     a = _agent(db, agent_id, writable=True)
-    _validate_bindings(payload, db)
-    for k, v in payload.model_dump().items():
+    scenario_changed = payload.scenario_id != a.scenario_id
+    if payload.capability_scope is not None:
+        capability_scope = agent_capability_service.normalize_scope(
+            payload.capability_scope,
+            legacy_default=False,
+            allow_all=True,
+        )
+        stored_scope: dict[str, dict[str, Any]] | None = capability_scope
+    elif scenario_changed:
+        # A capability id is meaningful only inside its original scenario.
+        # Switching scenarios without an explicit replacement always clears it.
+        capability_scope = agent_capability_service.explicit_empty_scope()
+        stored_scope = capability_scope
+    else:
+        # Preserve the behaviour of a pre-scope Agent during an unrelated
+        # edit, then freeze the current ACL-filtered catalog to explicit ids.
+        # This avoids both "edit => lose every capability" and future dynamic
+        # grants.  Agents without a scenario remain explicitly empty.
+        capability_scope = (
+            agent_capability_service.legacy_all_scope()
+            if a.capability_scope is None and a.scenario_id
+            else agent_capability_service.normalize_scope(
+                a.capability_scope,
+                legacy_default=False,
+            )
+        )
+        stored_scope = capability_scope
+    capability_scope = _validate_bindings(
+        payload, db, capability_scope=capability_scope
+    )
+    stored_scope = capability_scope
+    for k, v in payload.model_dump(exclude={"capability_scope"}).items():
         setattr(a, k, v)
+    a.capability_scope = stored_scope
     db.commit()
     db.refresh(a)
     return _out(a, db)
@@ -395,12 +697,12 @@ def create_conversation(agent_id: str, db: Session = Depends(get_tenant_db)):
 @router.get("/conversations/{conv_id}/messages", response_model=list[MessageOut])
 def list_messages(conv_id: str, db: Session = Depends(get_tenant_db)):
     conversation = _conversation(db, conv_id)
-    return [
-        _message_out(db, message, conversation.agent)
-        for message in db.execute(
-            select(Message).where(Message.conversation_id == conv_id).order_by(Message.created_at)
-        ).scalars().all()
-    ]
+    # ``_conversation`` is the authorization boundary: tenant, creator and
+    # current Agent/scenario access must all pass. Do not reinterpret an
+    # immutable transcript through today's mutable capability graph.
+    return list(db.execute(
+        select(Message).where(Message.conversation_id == conv_id).order_by(Message.created_at)
+    ).scalars().all())
 
 
 @router.delete("/conversations/{conv_id}", response_model=Msg)
@@ -414,6 +716,41 @@ def delete_conversation(conv_id: str, db: Session = Depends(get_tenant_db)):
     return Msg(message="已删除")
 
 
+@router.post("/{agent_id}/confirmations/{preview_log_id}")
+def confirm_agent_tool_preview(
+    agent_id: str,
+    preview_log_id: str,
+    payload: AgentToolConfirmationRequest,
+    db: Session = Depends(get_tenant_db),
+):
+    """Confirm one durable event/workflow preview from this user's conversation."""
+    agent = _agent(db, agent_id)
+    conversation = _conversation(db, payload.conversation_id)
+    if conversation.agent_id != agent.id:
+        raise HTTPException(409, "预演对话不属于当前 Agent")
+    try:
+        return agent_confirmation_service.confirm_preview(
+            db,
+            preview_log_id,
+            agent=agent,
+            conversation=conversation,
+            correlation_id=payload.correlation_id,
+            expected_environment=payload.expected_environment,
+            expected_definition_snapshot_id=payload.expected_definition_snapshot_id,
+            expected_release_id=payload.expected_release_id,
+            expected_definition_hash=payload.expected_definition_hash,
+        )
+    except PermissionError as exc:
+        db.rollback()
+        raise HTTPException(403, str(exc)) from exc
+    except agent_confirmation_service.AgentConfirmationError as exc:
+        db.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(409, f"确认失败：{exc}") from exc
+
+
 @router.post("/{agent_id}/chat")
 def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_db)):
     a = _agent(db, agent_id)
@@ -424,17 +761,22 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
         conv = _conversation(db, payload.conversation_id)
         if conv.agent_id != agent_id:
             raise HTTPException(400, "对话不属于当前 Agent")
-    missing = _agent_readiness_missing(db, a)
+    # Resolve exactly one definition before inspecting readiness or selecting a
+    # model.  In staging/prod those decisions must use the active release and
+    # environment-resolved connectors, never mutable live authoring rows.
+    history_context = _authorization_context(db, a)
+    if history_context is None:
+        raise HTTPException(
+            409,
+            "Agent 当前运行定义、发布快照或环境连接器不完整，已阻止对话",
+        )
+    missing = _agent_readiness_missing(db, a, runtime_context=history_context)
     if missing:
         raise HTTPException(
             409,
             "Agent 尚未就绪，请先完成：" + "、".join(missing),
         )
-    requires_tools = _agent_requires_tool_capability(
-        db,
-        scenario_id=a.scenario_id,
-        data_source_ids=a.data_source_ids,
-    )
+    requires_tools = bool(history_context.build_tools())
     if a.llm_config_id:
         llm = tenant_service.get_visible(db, LLMConfig, a.llm_config_id)
         if not llm or not llm_service.supports_capability(llm, "chat"):
@@ -446,6 +788,7 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
         llm = candidates[0] if candidates else None
     if not llm:
         raise HTTPException(400, "请先为 Agent 配置 LLM（或设置默认 LLM）")
+    history_context.llm = llm
 
     if not conv:
         conv = Conversation(
@@ -466,7 +809,17 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
         if m.role == "user":
             history.append({"role": "user", "content": m.content})
         elif m.role == "assistant":
-            if m.tool_calls and m.tool_results:
+            safe_message = _message_out_for_model_replay(
+                db,
+                m,
+                a,
+                context=history_context,
+            )
+            # Model replay is a different trust boundary from showing the
+            # creator-owned transcript. Only replay raw tool payloads that
+            # survived current authorization; never fall back to the stored
+            # (possibly stale) payloads after ``_message_out`` stripped them.
+            if safe_message.tool_calls and safe_message.tool_results:
                 calls = [
                     {
                         "id": call.get("id"),
@@ -480,12 +833,20 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
                             ),
                         },
                     }
-                    for call in m.tool_calls
+                    for call in safe_message.tool_calls
                     if call.get("id")
                 ]
-                result_map = {result.get("id"): result for result in m.tool_results if result.get("id")}
+                result_map = {
+                    result.get("id"): result
+                    for result in safe_message.tool_results
+                    if result.get("id")
+                }
                 if calls and all(call["id"] in result_map for call in calls):
-                    history.append({"role": "assistant", "content": m.content, "tool_calls": calls})
+                    history.append({
+                        "role": "assistant",
+                        "content": safe_message.content,
+                        "tool_calls": calls,
+                    })
                     for call in calls:
                         result = result_map[call["id"]]
                         history.append(
@@ -497,13 +858,13 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
                             }
                         )
                     continue
-            if m.content:
-                history.append({"role": "assistant", "content": m.content})
+            if safe_message.content:
+                history.append({"role": "assistant", "content": safe_message.content})
 
     # 场景 & 本体
     scenario = tenant_service.get_visible(db, BusinessScenario, a.scenario_id) if a.scenario_id else None
     scenario_name = scenario.name if scenario else ""
-    ontology_summary = agent_engine.ontology_summary_for(scenario)
+    ontology_summary = agent_engine.ontology_summary_for(scenario, db=db)
 
     # 保存用户消息
     db.add(Message(conversation_id=conv.id, role="user", content=payload.message))
@@ -529,6 +890,7 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
             conversation_id=conv_id,
             role="assistant",
             content="正在准备受控工具调用。",
+            stream_finalized=False,
         )
     )
     db.commit()
@@ -538,6 +900,8 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
         tool_calls: list[dict[str, Any]],
         tool_results: list[dict[str, Any]],
         citations: list[dict[str, Any]],
+        *,
+        finalized: bool = False,
     ) -> None:
         save_db = SessionLocal()
         try:
@@ -552,6 +916,8 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
             message.tool_calls = tool_calls
             message.tool_results = tool_results
             message.citations = citations
+            if finalized:
+                message.stream_finalized = True
             save_db.commit()
         finally:
             save_db.close()
@@ -572,6 +938,7 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
                 scenario_name,
                 ontology_summary,
                 trace_context=trace_context,
+                runtime_context=history_context,
             ):
                 etype = ev["type"]
                 if etype == "token":
@@ -603,21 +970,36 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
                 tool_calls_log,
                 tool_results_log,
                 citations_log,
+                finalized=True,
             )
         except GeneratorExit:
             cancelled = True
-            raise
-        except Exception as exc:  # noqa: BLE001
+            # A cancelled browser stream still has a durable partial answer.
+            # Mark it final before releasing any preview for confirmation.
             try:
                 persist_answer(
-                    assistant_content or f"这次 Agent 对话没有完成：{exc}",
+                    assistant_content or "对话已停止。",
                     tool_calls_log,
                     tool_results_log,
                     citations_log,
+                    finalized=True,
+                )
+            except Exception:  # noqa: BLE001 - preserve cancellation semantics.
+                pass
+            raise
+        except Exception as exc:  # noqa: BLE001
+            error_data = str(exc)
+            try:
+                persist_answer(
+                    _stream_error_content(assistant_content, error_data),
+                    tool_calls_log,
+                    tool_results_log,
+                    citations_log,
+                    finalized=True,
                 )
             except Exception:  # noqa: BLE001 - preserve the original SSE error.
                 pass
-            yield f"data: {json.dumps({'type': 'error', 'data': str(exc)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'data': error_data}, ensure_ascii=False)}\n\n"
         finally:
             if not cancelled:
                 yield "data: [DONE]\n\n"

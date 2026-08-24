@@ -1,20 +1,33 @@
 """Agent 引擎：基于工具调用（ReAct）循环，让 LLM 在业务场景下自主完成需求。
 
 可用工具：
+- list_ontology_model 读取对象类型、属性和关系类型
+- search_ontology     检索当前 Agent 数据范围内的对象实例
+- get_ontology_object 读取对象属性和关系实例
 - list_data_sources   列出 Agent 绑定的数据源
+- list_data_mappings  读取对象属性与源字段的映射
+- query_mapped_objects 按本体属性执行确定性的参数化映射查询
 - list_tables         列出某数据源的表结构
-- run_sql             在数据源上执行只读 SQL
+- query_business_data 按本体对象和属性执行跨表、分组和聚合业务查询
 - search_documents    在文件桶中检索相关文档片段（RAG）
 - read_document       读取某个已解析文档的全文
 - list_functions      列出场景中的无副作用业务函数
 - run_function        调用确定性业务函数
+- list_actions        发现操作，execute_action 只生成预演
+- list_rules          发现规则，evaluate_rule 只做无副作用判定
+- list_events         发现事件，prepare_event_publish 只准备确认清单
+- list_workflows      发现工作流，execute_workflow 只准备确认清单
 
 Agent 只承担读取、检索、解释和受控 Action 预演。任何外部副作用都必须由用户
 通过类型化 Action 或任务中心的显式确认入口触发，不能由模型工具调用直接执行。
 """
 from __future__ import annotations
 
+import copy
 import json
+import re
+from collections import defaultdict, deque
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 from sqlalchemy import or_, select
@@ -25,15 +38,257 @@ from ..models import (
     Agent,
     BusinessScenario,
     BucketFile,
+    DataMapping,
     DataSource,
     FunctionDefinition,
     LLMConfig,
     OntologyAction,
+    OntologyEntity,
     OntologyEvent,
+    OntologyInstance,
+    OntologyRelation,
     OntologyRule,
     OntologyWorkflow,
+    RelationInstance,
 )
-from . import datasource_service, function_runtime_service, llm_service, ontology_service, permission_service, rag_service, tenant_service, workflow_service
+from . import (
+    agent_confirmation_service,
+    agent_capability_service,
+    capability_readiness_service,
+    business_query_service,
+    datasource_service,
+    function_runtime_service,
+    llm_service,
+    mapped_query_service,
+    ontology_service,
+    permission_service,
+    rag_service,
+    runtime_connector_service,
+    runtime_definition_service,
+    tenant_service,
+    workflow_service,
+)
+from .policies import (
+    PolicyViolation,
+    validate_action_params,
+    validate_agent_sql_scope,
+    validate_read_only_sql,
+)
+
+
+class _ToolContractError(ValueError):
+    """A model-correctable error in the public Agent tool contract."""
+
+
+_SAFE_TOOL_ERROR_CODES = frozenset(
+    {
+        "CAPABILITY_NOT_READY",
+        "DIRECT_TOOL_DISABLED",
+        "FORBIDDEN",
+        "FUNCTION_EXECUTION_FAILED",
+        "INVALID_QUERY",
+        "INVALID_TOOL_ARGUMENTS",
+        "RESOURCE_NOT_FOUND",
+        "TOOL_EXECUTION_FAILED",
+        "UNKNOWN_TOOL",
+    }
+)
+_WORKFLOW_PARAM_RE = re.compile(r"\{\{\s*params\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+def _safe_message(value: Any, fallback: str) -> str:
+    """Keep typed business diagnostics useful without replaying raw internals."""
+    message = " ".join(str(value or "").split())
+    return message[:500] if message else fallback
+
+
+def _tool_error(
+    code: str,
+    message: str,
+    *,
+    retryable: bool,
+) -> str:
+    """Return the only error envelope persisted in new Agent tool results."""
+    if code not in _SAFE_TOOL_ERROR_CODES:
+        code = "TOOL_EXECUTION_FAILED"
+        message = "工具执行失败；内部异常未暴露给对话。"
+        retryable = False
+    return json.dumps(
+        {
+            "ok": False,
+            "error": {
+                "code": code,
+                "message": _safe_message(message, "工具执行失败"),
+                "retryable": bool(retryable),
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+def _is_safe_tool_error(value: Any) -> bool:
+    """Recognize only the closed, data-free error envelope generated above."""
+    if not isinstance(value, dict) or set(value) != {"ok", "error"} or value.get("ok") is not False:
+        return False
+    error = value.get("error")
+    if not isinstance(error, dict) or set(error) != {"code", "message", "retryable"}:
+        return False
+    code = error.get("code")
+    message = error.get("message")
+    retryable = error.get("retryable")
+    return (
+        code in _SAFE_TOOL_ERROR_CODES
+        and isinstance(message, str)
+        and 0 < len(message) <= 500
+        and "\n" not in message
+        and "\r" not in message
+        and isinstance(retryable, bool)
+    )
+
+
+def _resource_api_name(resource: Any) -> str:
+    return str(getattr(resource, "api_name", "") or "").strip()
+
+
+def _resource_by_reference(resources: list[Any], reference: Any, label: str) -> Any | None:
+    """Resolve a governed resource by stable id, api_name, or display name."""
+    key = str(reference or "").strip()
+    if not key:
+        return None
+    matches = [
+        resource
+        for resource in resources
+        if key
+        in {
+            str(getattr(resource, "id", "") or ""),
+            _resource_api_name(resource),
+            str(getattr(resource, "name", "") or ""),
+        }
+    ]
+    if len(matches) > 1:
+        raise _ToolContractError(f"{label}名称不唯一，请使用 list 工具返回的 id 或 api_name")
+    return matches[0] if matches else None
+
+
+def _normalized_object_schema(schema: Any) -> dict[str, Any]:
+    """Present both current JSON Schema and legacy flat field maps consistently."""
+    if not isinstance(schema, dict) or not schema:
+        return {"type": "object", "properties": {}, "required": [], "additionalProperties": True}
+    if "properties" in schema or "required" in schema or schema.get("type") == "object":
+        normalized = copy.deepcopy(schema)
+        normalized.setdefault("type", "object")
+        normalized.setdefault("properties", {})
+        normalized.setdefault("required", [])
+        return normalized
+    properties = copy.deepcopy(schema)
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": [
+            str(name)
+            for name, definition in properties.items()
+            if isinstance(definition, dict) and definition.get("required") is True
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _schema_required_fields(schema: Any) -> list[str]:
+    normalized = _normalized_object_schema(schema)
+    properties = normalized.get("properties", {})
+    declared = normalized.get("required")
+    required = {
+        str(item)
+        for item in (declared if isinstance(declared, list) else [])
+        if isinstance(item, str) and item
+    }
+    required.update(
+        str(name)
+        for name, definition in properties.items()
+        if isinstance(definition, dict) and definition.get("required") is True
+    )
+    return [str(name) for name in properties if str(name) in required]
+
+
+def _validated_schema_params(schema: Any, value: Any) -> dict[str, Any]:
+    """Translate public input-schema violations into a model-correctable error."""
+    try:
+        return validate_action_params(schema, value if value is not None else {})
+    except PolicyViolation as exc:
+        raise _ToolContractError(str(exc)) from exc
+
+
+def _workflow_parameter_schema(workflow: Any, actions: list[Any]) -> dict[str, Any]:
+    """Expose the best provable workflow input contract to the model.
+
+    Workflows currently have no dedicated schema column.  Prefer an explicitly
+    authored schema in trigger_config, otherwise infer parameters referenced as
+    ``{{params.x}}`` and copy downstream Action field schemas when possible.
+    """
+    trigger = getattr(workflow, "trigger_config", {}) or {}
+    if isinstance(trigger, dict):
+        explicit = trigger.get("input_schema") or trigger.get("params_schema")
+        if isinstance(explicit, dict):
+            return _normalized_object_schema(explicit)
+
+    properties: dict[str, Any] = {}
+    required: set[str] = set()
+
+    def remember(value: Any, *, is_required: bool = True, definition: Any = None) -> None:
+        if isinstance(value, str):
+            names = _WORKFLOW_PARAM_RE.findall(value)
+            for name in names:
+                if name not in properties:
+                    properties[name] = (
+                        copy.deepcopy(definition)
+                        if isinstance(definition, dict)
+                        else {"description": "工作流定义引用的输入参数"}
+                    )
+                if is_required:
+                    required.add(name)
+        elif isinstance(value, dict):
+            for child in value.values():
+                remember(child, is_required=is_required)
+        elif isinstance(value, list):
+            for child in value:
+                remember(child, is_required=is_required)
+
+    nodes = list(getattr(workflow, "nodes", []) or [])
+    steps = list(getattr(workflow, "steps", []) or [])
+    for entry in [*nodes, *steps]:
+        if not isinstance(entry, dict):
+            continue
+        data = entry.get("data") if isinstance(entry.get("data"), dict) else entry
+        if str(entry.get("type") or data.get("type") or "") != "action":
+            remember(data)
+            continue
+        params = data.get("params") if isinstance(data.get("params"), dict) else {}
+        action = _resource_by_reference(
+            actions,
+            data.get("action_id"),
+            "工作流引用的操作",
+        )
+        action_schema = _normalized_object_schema(
+            getattr(action, "input_schema", {}) if action is not None else {}
+        )
+        action_properties = action_schema.get("properties", {})
+        action_required = set(_schema_required_fields(action_schema))
+        for action_field, value in params.items():
+            definition = action_properties.get(action_field)
+            remember(
+                value,
+                is_required=action_field in action_required,
+                definition=definition,
+            )
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": [name for name in properties if name in required],
+        # Inferred schemas cannot prove that an unreferenced orchestration
+        # parameter is invalid. Explicit trigger schemas may close this list.
+        "additionalProperties": True,
+    }
 
 class AgentContext:
     """一次 Agent 会话的运行时上下文。"""
@@ -64,7 +319,7 @@ class AgentContext:
         self._load_bindings()
 
     def _load_bindings(self) -> None:
-        ds_ids = self.agent.data_source_ids or []
+        ds_ids = [str(item) for item in (self.agent.data_source_ids or []) if str(item)]
         if ds_ids:
             ds_scope = tenant_service.visible_clause(DataSource, self.db)
             self.data_sources = list(
@@ -76,44 +331,199 @@ class AgentContext:
                     )
                 ).scalars().all()
             )
-        # 本体扩展：函数 / 操作 / 规则 / 事件 / 工作流（按场景加载）
-        self.functions: list[FunctionDefinition] = []
-        self.actions: list[OntologyAction] = []
-        self.rules: list[OntologyRule] = []
-        self.events: list[OntologyEvent] = []
-        self.workflows: list[OntologyWorkflow] = []
+        # Every definition visible to one Agent turn comes from one resolved
+        # environment definition.  In staging/prod this is the immutable active
+        # release; mixing live authoring rows into a released runtime is unsafe.
+        self.runtime_definition: runtime_definition_service.RuntimeDefinition | None = None
+        # ``NULL`` is the pre-capability-scope format.  Existing Agents were
+        # allowed to use the scenario's visible business resources before the
+        # allow-list was introduced, so keep that behaviour for legacy rows.
+        # Newly created Agents are persisted with an explicit empty scope and
+        # remain opt-in through the configuration page.
+        raw_capability_scope = (
+            agent_capability_service.legacy_all_scope()
+            if self.agent.capability_scope is None
+            else self.agent.capability_scope
+        )
+        self.capability_scope = agent_capability_service.normalize_scope(
+            raw_capability_scope,
+            legacy_default=False,
+            allow_all=True,
+        )
+        self.entities: list[Any] = []
+        self.relations: list[Any] = []
+        self.functions: list[Any] = []
+        self.executable_functions: list[Any] = []
+        self.actions: list[Any] = []
+        self.previewable_actions: list[Any] = []
+        self.rules: list[Any] = []
+        self.events: list[Any] = []
+        self.workflows: list[Any] = []
+        self.mappings: list[Any] = []
+        self.relation_mappings: list[Any] = []
+        self.capability_readiness: dict[str, dict[str, capability_readiness_service.CapabilityReadiness]] = {
+            kind: {} for kind in ("function", "action", "rule", "event", "workflow")
+        }
+        self.evaluable_rules: list[Any] = []
+        self.publishable_events: list[Any] = []
+        self.executable_workflows: list[Any] = []
         sid = self.agent.scenario_id
-        if sid:
-            self.functions = list(
-                self.db.execute(
-                    select(FunctionDefinition).where(
-                        FunctionDefinition.scenario_id == sid,
-                        FunctionDefinition.runtime_kind != "contract",
-                    )
-                ).scalars().all()
-            )
-            candidate_actions = list(
-                self.db.execute(select(OntologyAction).where(OntologyAction.scenario_id == sid, OntologyAction.enabled == True)).scalars().all()  # noqa: E712
-            )
-            # 绑定 Agent 不能成为 Action 配置名称、说明或能力的旁路；展示与执行都
-            # 复用细粒度 ACL，执行时仍会再做一次强制检查。
-            self.actions = [
-                action for action in candidate_actions
-                if permission_service.check_action(self.db, action, "read").allowed
+        if not sid or not self.scenario:
+            return
+
+        definition = runtime_definition_service.resolve_active(
+            self.db,
+            self.scenario,
+            environment=runtime_connector_service.runtime_environment(),
+        )
+        self.runtime_definition = definition
+        self.entities = list(definition.entities.values())
+        self.relations = list(definition.relations.values())
+        # ACL filtering and the Agent task contract are applied before
+        # readiness, tool construction and prompt generation. Therefore even a
+        # forged direct tool call can only search these scoped collections.
+        visible_capabilities = agent_capability_service.visible_resources(
+            self.db, definition
+        )
+        scoped_capabilities = agent_capability_service.filter_resources(
+            visible_capabilities,
+            self.capability_scope,
+        )
+        self.functions = scoped_capabilities["functions"]
+        self.actions = scoped_capabilities["actions"]
+        self.rules = scoped_capabilities["rules"]
+        self.events = scoped_capabilities["events"]
+        self.workflows = scoped_capabilities["workflows"]
+        groups = {
+            "function": self.functions,
+            "action": self.actions,
+            "rule": self.rules,
+            "event": self.events,
+            "workflow": self.workflows,
+        }
+        for kind, resources in groups.items():
+            self.capability_readiness[kind] = {
+                str(resource.id): capability_readiness_service.capability_readiness(
+                    kind,
+                    resource,
+                    definition=definition,
+                    db=self.db,
+                )
+                for resource in resources
+            }
+        self.executable_functions = [
+            item for item in self.functions if self._capability_status("function", item).executable
+        ]
+        self.previewable_actions = [
+            item for item in self.actions if self._capability_status("action", item).executable
+        ]
+        self.evaluable_rules = [
+            item for item in self.rules if self._capability_status("rule", item).executable
+        ]
+        self.publishable_events = [
+            item for item in self.events if self._capability_status("event", item).executable
+        ]
+        self.executable_workflows = [
+            item for item in self.workflows if self._capability_status("workflow", item).executable
+        ]
+
+        configured_source_ids = set(ds_ids)
+        if definition.is_frozen:
+            # A frozen mapping selects its physical connector through the
+            # environment binding. Never use the snapshot's dev data_source_id
+            # as the staging/prod query target.
+            resolved_sources: dict[str, DataSource] = {
+                source.id: source for source in self.data_sources
+                if source.type == "file_bucket"
+            }
+            for mapping in definition.mappings.values():
+                connector, _audit = runtime_connector_service.resolve_connector(
+                    self.db,
+                    self.scenario,
+                    kind="data_source",
+                    config={
+                        "data_source_id": mapping.data_source_id,
+                        "data_source_binding_key": getattr(
+                            mapping, "data_source_binding_key", ""
+                        ),
+                        "data_source_binding_ref": getattr(
+                            mapping, "data_source_binding_ref", {}
+                        ),
+                    },
+                    environment=definition.environment,
+                    release_id=definition.release_id,
+                )
+                if (
+                    str(mapping.data_source_id) not in configured_source_ids
+                    and str(connector.id) not in configured_source_ids
+                ):
+                    continue
+                runtime_mapping = SimpleNamespace(**vars(mapping))
+                runtime_mapping.definition_data_source_id = mapping.data_source_id
+                runtime_mapping.data_source_id = connector.id
+                runtime_mapping.entity = definition.entities.get(str(mapping.entity_id))
+                self.mappings.append(runtime_mapping)
+                resolved_sources[connector.id] = connector
+            self.data_sources = list(resolved_sources.values())
+        else:
+            bound_source_ids = {source.id for source in self.data_sources}
+            self.mappings = [
+                mapping for mapping in definition.mappings.values()
+                if mapping.data_source_id in bound_source_ids
             ]
-            self.rules = list(
-                self.db.execute(select(OntologyRule).where(OntologyRule.scenario_id == sid, OntologyRule.enabled == True)).scalars().all()  # noqa: E712
-            )
-            self.events = list(
-                self.db.execute(select(OntologyEvent).where(OntologyEvent.scenario_id == sid, OntologyEvent.enabled == True)).scalars().all()  # noqa: E712
-            )
-            candidate_workflows = list(
-                self.db.execute(select(OntologyWorkflow).where(OntologyWorkflow.scenario_id == sid, OntologyWorkflow.enabled == True)).scalars().all()  # noqa: E712
-            )
-            self.workflows = [
-                workflow for workflow in candidate_workflows
-                if permission_service.check_workflow(self.db, workflow, "read").allowed
-            ]
+        visible_mapping_ids = {str(mapping.id) for mapping in self.mappings}
+        self.relation_mappings = [
+            mapping
+            for mapping in definition.relation_mappings.values()
+            if str(mapping.source_mapping_id) in visible_mapping_ids
+            and str(mapping.target_mapping_id) in visible_mapping_ids
+        ]
+
+    def _capability_status(
+        self,
+        kind: str,
+        resource: Any,
+    ) -> capability_readiness_service.CapabilityReadiness:
+        cached = self.capability_readiness.get(kind, {}).get(str(resource.id))
+        if cached is not None:
+            return cached
+        return capability_readiness_service.capability_readiness(
+            kind,
+            resource,
+            definition=self.runtime_definition,
+            db=self.db,
+        )
+
+    def _rule_fields_are_visible(self, rule: Any) -> bool:
+        """Do not expose a rule as a side door to a hidden ontology property."""
+        visible_action_ids = {str(action.id) for action in self.actions}
+        if any(
+            str(action_id) not in visible_action_ids
+            for action_id in (getattr(rule, "trigger_action_ids", []) or [])
+        ):
+            return False
+        entity = getattr(rule, "entity", None)
+        if not entity:
+            return True
+        fields: set[str] = set()
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                if value.get("field"):
+                    fields.add(str(value["field"]))
+                for nested in value.values():
+                    visit(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    visit(nested)
+
+        visit(getattr(rule, "condition", {}) or {})
+        visible = {
+            str(prop.name)
+            for prop in getattr(entity, "properties", [])
+            if permission_service.can_read_property(self.db, prop)
+        }
+        return fields.issubset(visible)
 
     def _writable_file_buckets(self) -> list[DataSource]:
         """公开绑定资源可读不可写；交付物只允许保存到当前租户自有桶。"""
@@ -179,18 +589,37 @@ class AgentContext:
     # ── 工具定义 ──────────────────────────────
     def build_tools(self) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
-        if self.scenario and self.scenario.entities:
-            tools.append(
+        if self.scenario and self.entities:
+            tools += [
+                _tool(
+                    "list_ontology_model",
+                    "读取当前业务场景的对象类型、可见属性和关系类型。"
+                    "需要理解业务术语、属性类型或关系方向时先调用。",
+                    {},
+                ),
                 _tool(
                     "search_ontology",
-                    "按实体类型和关键词检索当前业务场景中的本体实例及属性。"
+                    "按对象类型和关键词检索当前业务场景中的对象实例及属性。"
                     "用于先确认业务对象，再决定是否需要查询外部数据源。",
                     {
-                        "entity": {"type": "string", "description": "实体名称，可留空查看所有实体"},
-                        "query": {"type": "string", "description": "实例名称或属性关键词，可留空"},
+                        "entity": {"type": "string", "description": "对象类型名称，可留空查看所有类型"},
+                        "query": {"type": "string", "description": "对象名称或属性关键词，可留空"},
                     },
-                )
-            )
+                ),
+                _tool(
+                    "get_ontology_object",
+                    "读取一个对象实例的可见属性、已断言关系实例，以及由对称、传递或逆关系公理在查询期推导的只读关系。"
+                    "推导关系明确标记 inferred=true 并携带物理边 path，不会写入或冒充已物化实例。"
+                    "参数 object_id 来自 search_ontology。",
+                    {
+                        "object_id": {
+                            "type": "string",
+                            "description": "对象实例 id",
+                            "required": True,
+                        }
+                    },
+                ),
+            ]
         if self.data_sources:
             tools += [
                 _tool(
@@ -200,23 +629,15 @@ class AgentContext:
                 ),
                 _tool(
                     "list_tables",
-                    "列出指定数据库数据源中的表及其列结构。参数 data_source_id 为数据源 id。",
-                    {"data_source_id": {"type": "string", "description": "数据源 id"}},
-                ),
-                _tool(
-                    "run_sql",
-                    "在指定数据库数据源上执行只读 SQL 查询（SELECT）。参数 data_source_id、sql。",
-                    {
-                        "data_source_id": {"type": "string", "description": "数据源 id"},
-                        "sql": {"type": "string", "description": "只读 SQL 语句"},
-                    },
+                    "列出指定数据源中当前 Agent 数据映射允许读取的表及列，用于核对映射边界。",
+                    {"data_source_id": {"type": "string", "description": "数据源 id", "required": True}},
                 ),
                 _tool(
                     "search_documents",
                     "在已绑定且有权限的文件桶中执行混合向量检索，返回可引用的资料片段。"
                     "回答引用事实时必须使用结果的 citation_id（如【C1】）。",
                     {
-                        "query": {"type": "string", "description": "检索问题或关键词"},
+                        "query": {"type": "string", "description": "检索问题或关键词", "required": True},
                         "top_k": {"type": "integer", "description": "返回片段数，默认 5，最大 10"},
                     },
                 ),
@@ -230,15 +651,275 @@ class AgentContext:
                     },
                 ),
             ]
+        if self.mappings:
+            tools += [
+                _tool(
+                    "list_data_mappings",
+                    "列出当前 Agent 已绑定数据源与对象类型之间的数据映射，"
+                    "返回对象属性到源字段的对应关系和最近刷新状态。",
+                    {},
+                ),
+                _tool(
+                    "query_mapped_objects",
+                    "优先使用本工具按本体属性查询业务对象。只传对象类型、属性、结构化过滤、排序和行数；"
+                    "服务端从当前冻结/开发运行定义选择唯一映射并生成参数化只读 SQL，不能传 SQL、数据源、表或列。",
+                    {
+                        "entity_id": {
+                            "type": "string",
+                            "description": "对象类型 id；与 entity_name 至少提供一个",
+                        },
+                        "entity_name": {
+                            "type": "string",
+                            "description": "对象类型名称；重名时必须改用 entity_id",
+                        },
+                        "properties": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 50,
+                            "description": "要返回的本体属性名",
+                            "required": True,
+                        },
+                        "filters": {
+                            "type": "array",
+                            "maxItems": 20,
+                            "description": "结构化过滤条件；所有条件按 AND 组合",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "property": {"type": "string"},
+                                    "op": {
+                                        "type": "string",
+                                        "enum": sorted(mapped_query_service.FILTER_OPERATORS),
+                                    },
+                                    "value": {
+                                        "description": "比较值；in/not_in 使用标量列表，空值判断不传"
+                                    },
+                                },
+                                "required": ["property", "op"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "sort": {
+                            "type": "array",
+                            "maxItems": 5,
+                            "description": "按本体属性排序",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "property": {"type": "string"},
+                                    "direction": {
+                                        "type": "string",
+                                        "enum": ["asc", "desc"],
+                                    },
+                                },
+                                "required": ["property"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "最大返回行数，不超过平台限制",
+                        },
+                    },
+                ),
+                _tool(
+                    "query_business_data",
+                    "按对象类型和本体属性完成业务数据查询。支持多个相关对象、过滤、分组、次数/金额等聚合和排序；"
+                    "服务端根据当前运行定义和数据映射生成参数化查询。不能传 SQL、表名、列名或数据源 id。"
+                    "需要跨表明细、按业务对象统计或审计汇总时使用本工具。",
+                    {
+                        "base_entity": {
+                            "description": "主对象类型；优先传对象引用，也兼容直接传对象显示名称字符串",
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "entity_id": {"type": "string", "minLength": 1},
+                                        "entity_name": {"type": "string", "minLength": 1},
+                                    },
+                                    "anyOf": [
+                                        {"required": ["entity_id"]},
+                                        {"required": ["entity_name"]},
+                                    ],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "兼容简写：对象显示名称",
+                                },
+                            ],
+                            "required": True,
+                        },
+                        "base_properties": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 50,
+                            "description": "主对象要返回的本体属性；纯聚合查询可省略或传空数组",
+                        },
+                        "base_filters": {
+                            "type": "array",
+                            "maxItems": 20,
+                            "description": "主对象过滤条件，按 AND 组合",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "property": {"type": "string"},
+                                    "op": {"type": "string", "enum": sorted(business_query_service.mapped_query_service.FILTER_OPERATORS)},
+                                    "value": {},
+                                },
+                                "required": ["property", "op"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "related_entities": {
+                            "type": "array",
+                            "maxItems": 5,
+                            "description": "要关联的对象；未提供 join 时，服务端尝试根据数据关系映射或唯一共同字段推断关联",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "entity_id": {"type": "string", "minLength": 1},
+                                    "entity_name": {"type": "string", "minLength": 1},
+                                    "properties": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                                    "filters": {
+                                        "type": "array",
+                                        "maxItems": 20,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "property": {"type": "string"},
+                                                "op": {"type": "string", "enum": sorted(business_query_service.mapped_query_service.FILTER_OPERATORS)},
+                                                "value": {},
+                                            },
+                                            "required": ["property", "op"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
+                                    "join": {
+                                        "type": "object",
+                                        "properties": {
+                                            "base_property": {"type": "string"},
+                                            "related_property": {"type": "string"},
+                                        },
+                                        "additionalProperties": False,
+                                    },
+                                },
+                                "anyOf": [
+                                    {"required": ["entity_id"]},
+                                    {"required": ["entity_name"]},
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "group_by": {
+                            "type": "array",
+                            "maxItems": 20,
+                            "description": "按已参与查询的对象属性分组",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "entity_id": {"type": "string", "minLength": 1},
+                                    "entity_name": {"type": "string", "minLength": 1},
+                                    "property": {"type": "string", "minLength": 1},
+                                },
+                                "required": ["property"],
+                                "anyOf": [
+                                    {"required": ["entity_id"]},
+                                    {"required": ["entity_name"]},
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "aggregations": {
+                            "type": "array",
+                            "maxItems": 20,
+                            "description": "count、sum、avg、min、max 聚合；每项需要对象和唯一 alias。count 可省略 property 表示 COUNT(*)，其他函数必须提供 property",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "function": {"type": "string", "enum": ["count", "sum", "avg", "min", "max"]},
+                                    "entity_id": {"type": "string", "minLength": 1},
+                                    "entity_name": {"type": "string", "minLength": 1},
+                                    "property": {"type": "string", "minLength": 1, "description": "count 可省略；sum/avg/min/max 必填"},
+                                    "alias": {"type": "string", "minLength": 1},
+                                },
+                                "required": ["function", "alias"],
+                                "anyOf": [
+                                    {"required": ["entity_id"]},
+                                    {"required": ["entity_name"]},
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "having": {
+                            "type": "array",
+                            "maxItems": 20,
+                            "description": "对聚合 alias 做阈值筛选，例如次数大于 2；只能用于分组聚合查询",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "alias": {"type": "string"},
+                                    "op": {"type": "string", "enum": ["eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in"]},
+                                    "value": {},
+                                },
+                                "required": ["alias", "op", "value"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "sort": {
+                            "type": "array",
+                            "maxItems": 10,
+                            "description": "按对象属性或聚合 alias 排序",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "entity_id": {"type": "string", "minLength": 1},
+                                    "entity_name": {"type": "string", "minLength": 1},
+                                    "property": {"type": "string", "minLength": 1},
+                                    "alias": {"type": "string", "minLength": 1},
+                                    "direction": {"type": "string", "enum": ["asc", "desc"]},
+                                },
+                                "required": ["direction"],
+                                "anyOf": [
+                                    {"required": ["alias"]},
+                                    {
+                                        "required": ["property"],
+                                        "anyOf": [
+                                            {"required": ["entity_id"]},
+                                            {"required": ["entity_name"]},
+                                        ],
+                                    },
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "最大返回记录数，不超过平台限制",
+                        },
+                    },
+                ),
+            ]
         # 函数是闭集、确定性且无副作用的计算能力，可由 Agent 直接调用。
         if self.functions:
-            tools.append(_tool("list_functions", "列出当前业务场景中可调用的业务函数及输入输出字段。", {}))
+            tools.append(
+                _tool(
+                    "list_functions",
+                    "列出当前业务场景中的函数契约、输入输出字段和是否可直接运行。",
+                    {},
+                )
+            )
+        if self.executable_functions:
             tools.append(
                 _tool(
                     "run_function",
-                    "调用无副作用的确定性业务函数。先用 list_functions 获取函数 id 和字段。",
+                    "调用无副作用的确定性业务函数。必须先用 list_functions 获取准确 input_schema/required；function_id 可传 id、api_name 或显示名称，不要向用户索取内部 id。",
                     {
-                        "function_id": {"type": "string", "description": "业务函数 id", "required": True},
+                        "function_id": {"type": "string", "description": "业务函数 id、api_name 或显示名称", "required": True},
                         "params": {"type": "object", "description": "按函数输入字段填写的参数", "required": True},
                     },
                 )
@@ -248,16 +929,17 @@ class AgentContext:
             tools.append(
                 _tool(
                     "list_actions",
-                    "列出当前业务场景中定义的所有可执行操作，返回 id、名称、所属对象类型和执行方式。",
+                    "列出当前业务场景中定义的操作及 executable/blocked_reasons 就绪状态。",
                     {},
                 )
             )
+        if self.previewable_actions:
             tools.append(
                 _tool(
                     "execute_action",
-                    "预演场景中定义的某个操作。参数 action_id 为操作 id，params 为输入参数对象。",
+                    "预演场景中定义的某个操作。必须先调用 list_actions，并严格按其 input_schema/required 填写 params；action_id 可传 id、api_name 或显示名称，不要向用户索取内部 id。",
                     {
-                        "action_id": {"type": "string", "description": "操作 id"},
+                        "action_id": {"type": "string", "description": "操作 id、api_name 或显示名称", "required": True},
                         "params": {"type": "object", "description": "输入参数"},
                     },
                 )
@@ -270,13 +952,33 @@ class AgentContext:
                     {},
                 )
             )
+        if self.evaluable_rules:
             tools.append(
                 _tool(
                     "evaluate_rule",
-                    "用给定数据记录评估某条业务规则是否命中。参数 rule_id 为规则 id，record 为数据记录对象。",
+                    "用给定数据记录评估某条业务规则是否命中。rule_id 可传 id、api_name 或显示名称。",
                     {
-                        "rule_id": {"type": "string", "description": "规则 id"},
-                        "record": {"type": "object", "description": "待评估的数据记录"},
+                        "rule_id": {"type": "string", "description": "规则 id、api_name 或显示名称", "required": True},
+                        "record": {"type": "object", "description": "待评估的数据记录", "required": True},
+                    },
+                )
+            )
+        if self.events:
+            tools.append(
+                _tool(
+                    "list_events",
+                    "列出当前业务场景的事件类型、载荷字段、触发来源和启用状态。",
+                    {},
+                )
+            )
+        if self.publishable_events:
+            tools.append(
+                _tool(
+                    "prepare_event_publish",
+                    "生成服务端固定的事件发布预演；本工具不会发布事件，用户可在对话卡片确认。",
+                    {
+                        "event_id": {"type": "string", "description": "事件 id、api_name 或显示名称", "required": True},
+                        "payload": {"type": "object", "description": "事件载荷", "required": True},
                     },
                 )
             )
@@ -288,12 +990,13 @@ class AgentContext:
                     {},
                 )
             )
+        if self.executable_workflows:
             tools.append(
                 _tool(
                     "execute_workflow",
-                    "提交场景中定义的某个工作流到可靠运行队列。任务会在后台执行，人工审批、重试和结果请在任务中心跟踪。参数 workflow_id 为工作流 id，params 为输入参数。",
+                    "生成服务端固定的工作流运行预演；本工具不会提交任务。必须先调用 list_workflows，并严格按其 params_schema/required 填写 params；workflow_id 可传 id、api_name 或显示名称，不要向用户索取内部 id。",
                     {
-                        "workflow_id": {"type": "string", "description": "工作流 id"},
+                        "workflow_id": {"type": "string", "description": "工作流 id、api_name 或显示名称", "required": True},
                         "params": {"type": "object", "description": "输入参数"},
                     },
                 )
@@ -302,45 +1005,77 @@ class AgentContext:
 
     # ── 工具执行 ──────────────────────────────
     def execute_tool(self, name: str, args: dict[str, Any]) -> str:
+        if not isinstance(args, dict):
+            return _tool_error(
+                "INVALID_TOOL_ARGUMENTS",
+                "工具参数必须是 JSON 对象；请根据当前工具 schema 修正后重试一次。",
+                retryable=True,
+            )
         try:
+            if name == "list_ontology_model":
+                return _dump(self._ontology_model())
             if name == "search_ontology":
                 return _dump(
-                    ontology_service.search_instances(
-                        self.db,
-                        self.scenario,
-                        entity_name=args.get("entity", ""),
-                        query=args.get("query", ""),
-                        limit=get_settings().max_query_rows,
+                    self._search_ontology(
+                        str(args.get("entity") or ""),
+                        str(args.get("query") or ""),
                     )
                 )
+            if name == "get_ontology_object":
+                return _dump(self._ontology_object(str(args.get("object_id") or "")))
             if name == "list_data_sources":
                 return _dump(
                     [
-                        {"id": d.id, "name": d.name, "type": d.type, "status": d.status}
+                        {
+                            "id": d.id,
+                            "name": d.name,
+                            "type": d.type,
+                            "status": d.status,
+                            "connector_revision": int(d.connector_revision or 0),
+                        }
                         for d in self.data_sources
                     ]
                 )
             if name == "list_tables":
                 ds = self._ds(args.get("data_source_id"))
                 if not ds:
-                    return "未找到该数据源"
-                return _dump(datasource_service.list_tables(ds))
+                    return _tool_error(
+                        "RESOURCE_NOT_FOUND",
+                        "未找到所请求的数据源；请先调用 list_data_sources 刷新可用数据源。",
+                        retryable=True,
+                    )
+                allowed: dict[str, set[str]] = {}
+                for mapping in self._mapping_catalog():
+                    if mapping.get("kind") != "object":
+                        continue
+                    if mapping["data_source_id"] == ds.id and mapping["table"]:
+                        allowed.setdefault(str(mapping["table"]), set()).update(
+                            str(column)
+                            for column in mapping["column_map"].values()
+                            if column
+                        )
+                tables: list[dict[str, Any]] = []
+                for table in datasource_service.list_tables(ds):
+                    table_name = str(table.get("name") or "")
+                    if table_name not in allowed:
+                        continue
+                    item = dict(table)
+                    item["data_source_id"] = ds.id
+                    item["connector_revision"] = int(ds.connector_revision or 0)
+                    item["columns"] = [
+                        column
+                        for column in table.get("columns", [])
+                        if isinstance(column, dict)
+                        and str(column.get("name") or "") in allowed[table_name]
+                    ]
+                    tables.append(item)
+                return _dump(tables)
             if name == "run_sql":
-                ds = self._ds(args.get("data_source_id"))
-                if not ds:
-                    return "未找到该数据源"
-                limit = get_settings().max_query_rows
-                try:
-                    return _dump(datasource_service.run_query(ds, args.get("sql", ""), limit=limit))
-                except Exception as exc:  # noqa: BLE001
-                    msg = str(exc)
-                    if "no such table" in msg:
-                        try:
-                            tables = [t["name"] for t in datasource_service.list_tables(ds)]
-                            msg += f"。该数据源可用表: {', '.join(tables)}"
-                        except Exception:  # noqa: BLE001
-                            pass
-                    return f"SQL 执行出错: {msg}"
+                return _tool_error(
+                    "DIRECT_TOOL_DISABLED",
+                    "当前 Agent 对话不直接接收 SQL；请使用 query_mapped_objects 或 query_business_data 按业务对象和属性查询。",
+                    retryable=True,
+                )
             if name == "search_documents":
                 results = rag_service.search(
                     self.db,
@@ -350,7 +1085,15 @@ class AgentContext:
                 )
                 citations = self._record_citations(results)
                 if not citations:
-                    return "未检索到可引用的文档内容；请检查资料库绑定、文档解析和检索词。"
+                    return _dump(
+                        {
+                            "retrieval_mode": "hybrid-vector-keyword",
+                            "citations": [],
+                            "row_count": 0,
+                            "empty": True,
+                            "message": "未检索到可引用的文档内容。",
+                        }
+                    )
                 return _dump(
                     {
                         "retrieval_mode": "hybrid-vector-keyword",
@@ -360,10 +1103,33 @@ class AgentContext:
                 )
             if name == "read_document":
                 return self._read_doc(args.get("file_id", ""), args.get("filename", ""))
+            if name == "list_data_mappings":
+                return _dump(self._mapping_catalog())
+            if name == "query_mapped_objects":
+                return _dump(
+                    mapped_query_service.query_mapped_objects(
+                        self.db,
+                        definition=self.runtime_definition,
+                        mappings=self.mappings,
+                        data_sources=self.data_sources,
+                        args=args,
+                    )
+                )
+            if name == "query_business_data":
+                return _dump(
+                    business_query_service.query_business_data(
+                        self.db,
+                        definition=self.runtime_definition,
+                        mappings=self.mappings,
+                        data_sources=self.data_sources,
+                        args=args,
+                    )
+                )
             if name == "save_deliverable" or name == "execute_skill" or name.startswith("mcp_"):
-                return (
-                    "Agent 不直接执行本地技能、外部工具或写入文件；请将该副作用配置为场景操作，"
-                    "由用户在操作页或任务中心完成预演和显式确认。"
+                return _tool_error(
+                    "DIRECT_TOOL_DISABLED",
+                    "Agent 不直接执行本地技能、外部工具或写入文件；请使用已配置的场景操作生成预演。",
+                    retryable=True,
                 )
             # 本体扩展工具
             if name == "list_functions":
@@ -371,21 +1137,34 @@ class AgentContext:
                     [
                         {
                             "id": function.id,
+                            "api_name": _resource_api_name(function),
                             "name": function.name,
                             "description": function.description[:120],
-                            "input_schema": function.input_schema or {},
+                            "input_schema": _normalized_object_schema(function.input_schema),
+                            "required": _schema_required_fields(function.input_schema or {}),
                             "output_schema": function.output_schema or {},
                             "runtime": function.runtime_kind,
+                            "definition_hash": (
+                                self.runtime_definition.definition_hash
+                                if self.runtime_definition else ""
+                            ),
+                            **self._capability_status("function", function).as_dict(),
                         }
                         for function in self.functions
                     ]
                 )
             if name == "run_function":
                 key = str(args.get("function_id") or "")
-                function = next((item for item in self.functions if item.id == key or item.name == key), None)
+                function = _resource_by_reference(self.functions, key, "函数")
                 if not function:
-                    names = "、".join(item.name for item in self.functions)
-                    return f"未找到可调用函数: {key}（可用函数: {names}）"
+                    return _tool_error(
+                        "RESOURCE_NOT_FOUND",
+                        "未找到函数；请先调用 list_functions 刷新名称和输入字段。",
+                        retryable=True,
+                    )
+                capability_readiness_service.require_executable(
+                    "function", function, definition=self.runtime_definition, db=self.db
+                )
                 run = function_runtime_service.create_function_run(
                     self.db,
                     function,
@@ -393,89 +1172,831 @@ class AgentContext:
                     tenant_id=self.tenant_id,
                     scenario_id=function.scenario_id,
                     user_id=str(self.db.info.get("user_id")) if self.db.info.get("user_id") else None,
+                    definition_hash=(
+                        self.runtime_definition.definition_hash
+                        if self.runtime_definition else None
+                    ),
                 )
                 self.db.flush()
                 if run.status != "succeeded":
-                    return f"函数运行失败: {run.error}"
-                return _dump(run.output_payload or {})
+                    return _tool_error(
+                        "FUNCTION_EXECUTION_FAILED",
+                        "业务函数未成功完成；请用 list_functions 核对输入字段后重试一次。",
+                        retryable=True,
+                    )
+                output = run.output_payload or {}
+                if isinstance(output, dict) and self.runtime_definition is not None:
+                    output = {
+                        **output,
+                        "definition_hash": self.runtime_definition.definition_hash,
+                    }
+                return _dump(output)
             if name == "list_actions":
                 return _dump(
                     [
                         {
                             "id": a.id,
+                            "api_name": _resource_api_name(a),
                             "name": a.name,
                             "entity": a.entity.name if a.entity else "",
                             "executor_type": a.executor_type,
                             "description": a.description[:120],
+                            "precondition": a.precondition or "",
+                            "postcondition": a.postcondition or "",
+                            "enabled": bool(a.enabled),
+                            "requires_confirmation": bool(a.requires_confirmation),
+                            "input_schema": _normalized_object_schema(a.input_schema),
+                            "required": _schema_required_fields(a.input_schema or {}),
+                            "definition_hash": (
+                                self.runtime_definition.definition_hash
+                                if self.runtime_definition else ""
+                            ),
+                            **self._capability_status("action", a).as_dict(),
                         }
                         for a in self.actions
                     ]
                 )
             if name == "execute_action":
-                key = args.get("action_id") or ""
-                a = next((x for x in self.actions if x.id == key), None)
+                key = str(args.get("action_id") or "")
+                a = _resource_by_reference(self.actions, key, "操作")
                 if not a:
-                    a = next((x for x in self.actions if x.name == key), None)
-                if not a:
-                    names = "、".join(x.name for x in self.actions)
-                    return f"未找到操作: {key}（可用操作: {names}，请用 list_actions 查看 id）"
+                    return _tool_error(
+                        "RESOURCE_NOT_FOUND",
+                        "未找到操作；请先调用 list_actions 刷新名称、input_schema 和 required。",
+                        retryable=True,
+                    )
+                capability_readiness_service.require_executable(
+                    "action", a, definition=self.runtime_definition, db=self.db
+                )
                 permission_service.require_action_permission(self.db, a, "read")
                 # 对话模型只可生成 Action 预演。实际执行必须由用户在 Action/任务
                 # 界面显式确认，确保模型不能把自然语言输入直接变成外部副作用。
+                if not self.scenario:
+                    return _tool_error(
+                        "CAPABILITY_NOT_READY",
+                        "操作缺少业务场景，当前不能生成可确认预演。",
+                        retryable=False,
+                    )
+                definition = self.runtime_definition
+                if definition is None:
+                    return _tool_error(
+                        "CAPABILITY_NOT_READY",
+                        "操作缺少可验证的运行定义，当前不能生成预演。",
+                        retryable=False,
+                    )
                 r = workflow_service.execute_action(
                     self.db,
                     a,
-                    args.get("params", {}),
+                    _validated_schema_params(a.input_schema or {}, args.get("params")),
                     dry_run=True,
                     enforce_policy=True,
+                    runtime_environment=definition.environment,
+                    runtime_definition=definition,
                 )
-                r["message"] = "这是预演结果；请在操作页或任务中心确认后执行。"
+                r["definition_hash"] = definition.definition_hash
+                r["message"] = "这是已固定定义版本的预演结果；用户可在对话卡片或操作页显式确认。"
                 return _dump(r)
             if name == "list_rules":
+                scoped_action_ids = {str(action.id) for action in self.actions}
                 return _dump(
                     [
                         {
                             "id": r.id,
+                            "api_name": _resource_api_name(r),
                             "name": r.name,
                             "entity": r.entity.name if r.entity else "",
                             "severity": r.severity,
                             "condition": r.condition,
+                            "enabled": bool(r.enabled),
+                            "trigger_action_ids": [
+                                action_id for action_id in (r.trigger_action_ids or [])
+                                if str(action_id) in scoped_action_ids
+                            ],
+                            "unavailable_trigger_action_count": sum(
+                                1 for action_id in (r.trigger_action_ids or [])
+                                if str(action_id) not in scoped_action_ids
+                            ),
+                            "definition_hash": (
+                                self.runtime_definition.definition_hash
+                                if self.runtime_definition else ""
+                            ),
+                            **self._capability_status("rule", r).as_dict(),
                         }
                         for r in self.rules
                     ]
                 )
             if name == "evaluate_rule":
-                r = next((x for x in self.rules if x.id == args.get("rule_id")), None)
+                r = _resource_by_reference(self.rules, args.get("rule_id"), "规则")
                 if not r:
-                    return f"未找到规则: {args.get('rule_id')}"
-                return _dump(workflow_service.evaluate_rule(r, args.get("record", {})))
+                    return _tool_error(
+                        "RESOURCE_NOT_FOUND",
+                        "未找到规则；请先调用 list_rules 刷新可用名称。",
+                        retryable=True,
+                    )
+                capability_readiness_service.require_executable(
+                    "rule", r, definition=self.runtime_definition, db=self.db
+                )
+                evaluated = workflow_service.evaluate_rule(
+                    r,
+                    args.get("record", {}),
+                    db=self.db,
+                    runtime_definition=self.runtime_definition,
+                )
+                scoped_action_ids = {str(action.id) for action in self.actions}
+                trigger_actions = [
+                    item for item in (evaluated.get("trigger_actions") or [])
+                    if str(item.get("action_id") or "") in scoped_action_ids
+                ]
+                evaluated["unavailable_trigger_action_count"] = max(
+                    0,
+                    len(evaluated.get("trigger_actions") or []) - len(trigger_actions),
+                )
+                evaluated["trigger_actions"] = trigger_actions
+                evaluated["trigger_action_ids"] = [
+                    action_id for action_id in (evaluated.get("trigger_action_ids") or [])
+                    if str(action_id) in scoped_action_ids
+                ]
+                if self.runtime_definition is not None:
+                    evaluated["definition_hash"] = self.runtime_definition.definition_hash
+                return _dump(evaluated)
+            if name == "list_events":
+                return _dump(
+                    [
+                        {
+                            "id": event.id,
+                            "api_name": _resource_api_name(event),
+                            "name": event.name,
+                            "description": event.description[:120],
+                            "payload_schema": _normalized_object_schema(event.payload_schema),
+                            "required": _schema_required_fields(event.payload_schema or {}),
+                            "trigger_source": event.trigger_source,
+                            "enabled": bool(event.enabled),
+                            "definition_hash": (
+                                self.runtime_definition.definition_hash
+                                if self.runtime_definition else ""
+                            ),
+                            **self._capability_status("event", event).as_dict(),
+                        }
+                        for event in self.events
+                    ]
+                )
+            if name == "prepare_event_publish":
+                key = str(args.get("event_id") or "")
+                event = _resource_by_reference(self.events, key, "事件")
+                if not event:
+                    return _tool_error(
+                        "RESOURCE_NOT_FOUND",
+                        "未找到事件；请先调用 list_events 刷新名称和载荷字段。",
+                        retryable=True,
+                    )
+                capability_readiness_service.require_executable(
+                    "event", event, definition=self.runtime_definition, db=self.db
+                )
+                if self.runtime_definition is None:
+                    return _tool_error(
+                        "CAPABILITY_NOT_READY",
+                        "事件缺少可验证的运行定义，当前不能生成预演。",
+                        retryable=False,
+                    )
+                return _dump(
+                    agent_confirmation_service.preview_event_publish(
+                        self.db,
+                        event,
+                        _validated_schema_params(
+                            event.payload_schema or {},
+                            args.get("payload"),
+                        ),
+                        runtime_definition=self.runtime_definition,
+                    )
+                )
             if name == "list_workflows":
                 return _dump(
                     [
                         {
                             "id": w.id,
+                            "api_name": _resource_api_name(w),
                             "name": w.name,
                             "trigger_type": w.trigger_type,
                             "steps_count": len(w.steps or []),
+                            "nodes_count": len(w.nodes or []),
                             "description": w.description[:120],
+                            "status": w.status,
+                            "enabled": bool(w.enabled),
+                            "params_schema": _workflow_parameter_schema(w, self.actions),
+                            "required": _schema_required_fields(
+                                _workflow_parameter_schema(w, self.actions)
+                            ),
+                            "definition_hash": (
+                                self.runtime_definition.definition_hash
+                                if self.runtime_definition else ""
+                            ),
+                            **self._capability_status("workflow", w).as_dict(),
                         }
                         for w in self.workflows
                     ]
                 )
             if name == "execute_workflow":
-                w = next((x for x in self.workflows if x.id == args.get("workflow_id")), None)
-                if not w:
-                    return f"未找到工作流: {args.get('workflow_id')}"
-                return _dump(
-                    {
-                        "status": "confirmation_required",
-                        "workflow_id": w.id,
-                        "message": "Agent 不直接提交工作流；请在工作流页面或任务中心确认后运行。",
-                    }
+                w = _resource_by_reference(
+                    self.workflows,
+                    args.get("workflow_id"),
+                    "工作流",
                 )
-            return f"未知工具: {name}"
-        except Exception as exc:  # noqa: BLE001
-            return f"工具执行出错: {exc}"
+                if not w:
+                    return _tool_error(
+                        "RESOURCE_NOT_FOUND",
+                        "未找到工作流；请先调用 list_workflows 刷新名称、params_schema 和 required。",
+                        retryable=True,
+                    )
+                capability_readiness_service.require_executable(
+                    "workflow", w, definition=self.runtime_definition, db=self.db
+                )
+                if self.runtime_definition is None:
+                    return _tool_error(
+                        "CAPABILITY_NOT_READY",
+                        "工作流缺少可验证的运行定义，当前不能生成预演。",
+                        retryable=False,
+                    )
+                workflow_params = _validated_schema_params(
+                    _workflow_parameter_schema(w, self.actions),
+                    args.get("params"),
+                )
+                return _dump(
+                    agent_confirmation_service.preview_workflow_run(
+                        self.db,
+                        w,
+                        workflow_params,
+                        runtime_definition=self.runtime_definition,
+                    )
+                )
+            return _tool_error(
+                "UNKNOWN_TOOL",
+                "当前运行时未提供该工具；请只使用本轮工具定义中的名称。",
+                retryable=False,
+            )
+        except _ToolContractError as exc:
+            return _tool_error(
+                "INVALID_TOOL_ARGUMENTS",
+                _safe_message(exc, "工具参数不符合契约"),
+                retryable=True,
+            )
+        except (business_query_service.BusinessQueryError, mapped_query_service.MappedQueryError) as exc:
+            return _tool_error(
+                "INVALID_QUERY",
+                _safe_message(exc, "业务查询参数或映射不满足查询契约"),
+                retryable=True,
+            )
+        except function_runtime_service.FunctionRuntimeError as exc:
+            return _tool_error(
+                "INVALID_TOOL_ARGUMENTS",
+                _safe_message(exc, "函数参数不符合输入契约"),
+                retryable=True,
+            )
+        except (agent_confirmation_service.AgentConfirmationError, PolicyViolation) as exc:
+            return _tool_error(
+                "CAPABILITY_NOT_READY",
+                _safe_message(exc, "业务能力当前不可执行"),
+                retryable=True,
+            )
+        except PermissionError:
+            return _tool_error(
+                "FORBIDDEN",
+                "当前用户无权使用该业务能力。",
+                retryable=False,
+            )
+        except (TypeError, ValueError):
+            return _tool_error(
+                "INVALID_TOOL_ARGUMENTS",
+                "工具参数不符合当前 schema；请先调用对应的 list 工具并修正后重试一次。",
+                retryable=True,
+            )
+        except Exception:  # noqa: BLE001 - never expose arbitrary connector/runtime exceptions.
+            return _tool_error(
+                "TOOL_EXECUTION_FAILED",
+                "工具执行失败；内部异常未暴露给对话。",
+                retryable=False,
+            )
+
+    def _ontology_model(self) -> dict[str, Any]:
+        """Return the governed schema view used by this Agent, without hidden properties."""
+        if not self.scenario:
+            return {"entities": [], "relations": []}
+        visible_entity_ids = {entity.id for entity in self.entities}
+        entities: list[dict[str, Any]] = []
+        for entity in self.entities:
+            properties = [
+                prop
+                for prop in entity.properties
+                if permission_service.can_read_property(self.db, prop)
+            ]
+            entities.append(
+                {
+                    "id": entity.id,
+                    "name": entity.name,
+                    "description": entity.description,
+                    "abstract": bool(entity.is_abstract),
+                    "state_property": entity.state_property or "",
+                    "properties": [
+                        {
+                            "name": prop.name,
+                            "data_type": prop.data_type,
+                            "description": prop.description,
+                            "key": bool(prop.is_key),
+                            "title": bool(getattr(prop, "is_title", False)),
+                            "required": bool(prop.is_required),
+                            "enum_values": prop.enum_values or [],
+                        }
+                        for prop in properties
+                    ],
+                }
+            )
+        relations: list[dict[str, Any]] = []
+        for relation in self.relations:
+            if (
+                relation.source_entity_id not in visible_entity_ids
+                or relation.target_entity_id not in visible_entity_ids
+            ):
+                continue
+            constraints = ontology_service.normalize_relation_constraints(
+                getattr(relation, "constraints", {}) or {},
+                relation_type=relation.relation_type,
+            )
+            inverse_id = str(constraints.get("inverse_relation_id") or "")
+            inverse = next((item for item in self.relations if item.id == inverse_id), None)
+            relations.append({
+                "id": relation.id,
+                "name": relation.name,
+                "description": relation.description,
+                "source_entity_id": relation.source_entity_id,
+                "source_entity": relation.source_entity.name if relation.source_entity else "",
+                "target_entity_id": relation.target_entity_id,
+                "target_entity": relation.target_entity.name if relation.target_entity else "",
+                "cardinality": relation.relation_type,
+                "constraints": constraints,
+                "query_semantics": ontology_service.relation_query_semantics(
+                    constraints,
+                    inverse_relation_name=getattr(inverse, "name", ""),
+                ),
+            })
+        return {"entities": entities, "relations": relations}
+
+    def _visible_instance_attributes(
+        self,
+        instance: OntologyInstance,
+        entity: Any | None = None,
+    ) -> dict[str, Any]:
+        """Intersect runtime-version properties with today's field ACL."""
+        entity = entity or next(
+            (item for item in self.entities if item.id == instance.entity_id), None
+        )
+        if not entity:
+            return {}
+        visible_names = {
+            str(prop.name)
+            for prop in getattr(entity, "properties", [])
+            if permission_service.can_read_property(self.db, prop)
+        }
+        return {
+            str(name): value
+            for name, value in dict(instance.attributes or {}).items()
+            if str(name) in visible_names
+        }
+
+    def _search_ontology(self, entity_name: str = "", query: str = "") -> list[dict[str, Any]]:
+        """Search live object data through the one resolved runtime schema."""
+        if not self.scenario:
+            return []
+        entity_query = entity_name.strip().casefold()
+        text_query = query.strip().casefold()
+        entity_by_id = {
+            str(entity.id): entity
+            for entity in self.entities
+            if not entity_query or entity_query in str(entity.name).casefold()
+        }
+        if not entity_by_id:
+            return []
+        rows = self.db.execute(
+            select(OntologyInstance)
+            .where(
+                OntologyInstance.scenario_id == self.scenario.id,
+                OntologyInstance.entity_id.in_(set(entity_by_id)),
+            )
+            .order_by(OntologyInstance.created_at.desc())
+            .limit(200)
+        ).scalars().all()
+        results: list[dict[str, Any]] = []
+        for instance in rows:
+            if (
+                not self._object_in_data_context(instance)
+                or not permission_service.check_object(self.db, instance, "read").allowed
+            ):
+                continue
+            entity = entity_by_id.get(str(instance.entity_id))
+            attributes = self._visible_instance_attributes(instance, entity)
+            haystack = (
+                f"{instance.name} "
+                f"{json.dumps(attributes, ensure_ascii=False, default=str)}"
+            ).casefold()
+            if text_query and text_query not in haystack:
+                continue
+            results.append(
+                {
+                    "id": instance.id,
+                    "name": instance.name,
+                    "entity": entity.name if entity else "",
+                    "entity_id": instance.entity_id,
+                    "attributes": attributes,
+                    "source": instance.source,
+                    "source_ref": instance.source_ref,
+                }
+            )
+            if len(results) >= get_settings().max_query_rows:
+                break
+        return results
+
+    def _object_in_data_context(self, instance: OntologyInstance | None) -> bool:
+        """Manual objects inherit the scenario; imported objects inherit their source binding."""
+        if (
+            not instance
+            or instance.scenario_id != self.agent.scenario_id
+            or instance.entity_id not in {entity.id for entity in self.entities}
+        ):
+            return False
+        if not ontology_service.instance_in_runtime_definition(
+            instance, self.runtime_definition
+        ):
+            return False
+        if instance.source != "imported":
+            return True
+        metadata = instance.source_metadata if isinstance(instance.source_metadata, dict) else {}
+        source_id = str(metadata.get("data_source_id") or "")
+        return bool(
+            source_id
+            and source_id in {source.id for source in self.data_sources}
+        )
+
+    def _inferred_object_relations(
+        self,
+        instance: OntologyInstance,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Compute bounded query-time graph entailments over readable asserted edges."""
+        relation_by_id = {str(item.id): item for item in self.relations}
+        if not relation_by_id:
+            return [], False
+        maximum = max(1, min(get_settings().max_query_rows, 200))
+        rows = list(
+            self.db.execute(
+                select(RelationInstance)
+                .where(
+                    RelationInstance.scenario_id == self.scenario.id,
+                    RelationInstance.relation_id.in_(set(relation_by_id)),
+                )
+                .order_by(RelationInstance.created_at.asc(), RelationInstance.id.asc())
+                .limit(maximum + 1)
+            ).scalars().all()
+        )
+        rows = [
+            row
+            for row in rows
+            if ontology_service.relation_instance_in_runtime_definition(
+                row, self.runtime_definition
+            )
+        ]
+        truncated = len(rows) > maximum
+        rows = rows[:maximum]
+        object_ids = {
+            str(value)
+            for row in rows
+            for value in (row.source_instance_id, row.target_instance_id)
+        }
+        readable: dict[str, OntologyInstance] = {}
+        for object_id in object_ids:
+            candidate = self.db.get(OntologyInstance, object_id)
+            if (
+                candidate
+                and self._object_in_data_context(candidate)
+                and permission_service.check_object(self.db, candidate, "read").allowed
+            ):
+                readable[object_id] = candidate
+
+        # (relation, source, target) -> asserted path and the inference(s) that
+        # make this direct logical edge available. Asserted always wins.
+        logical: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+        def add_edge(
+            relation_id: str,
+            source_id: str,
+            target_id: str,
+            *,
+            path: list[str],
+            inference: str,
+        ) -> None:
+            if source_id not in readable or target_id not in readable:
+                return
+            key = (relation_id, source_id, target_id)
+            current = logical.get(key)
+            candidate = {"path": path, "inferences": {inference}, "asserted": inference == "asserted"}
+            if current is None:
+                logical[key] = candidate
+                return
+            current["inferences"].add(inference)
+            if candidate["asserted"] or len(path) < len(current["path"]):
+                current["path"] = path
+            current["asserted"] = current["asserted"] or candidate["asserted"]
+
+        asserted_by_relation: dict[str, list[RelationInstance]] = defaultdict(list)
+        for row in rows:
+            relation_id = str(row.relation_id)
+            asserted_by_relation[relation_id].append(row)
+            add_edge(
+                relation_id,
+                str(row.source_instance_id),
+                str(row.target_instance_id),
+                path=[str(row.id)],
+                inference="asserted",
+            )
+
+        constraints_by_relation: dict[str, dict[str, Any]] = {}
+        for relation_id, relation in relation_by_id.items():
+            constraints = ontology_service.normalize_relation_constraints(
+                getattr(relation, "constraints", {}) or {},
+                relation_type=relation.relation_type,
+            )
+            constraints_by_relation[relation_id] = constraints
+            if constraints.get("symmetric"):
+                for row in asserted_by_relation.get(relation_id, []):
+                    add_edge(
+                        relation_id,
+                        str(row.target_instance_id),
+                        str(row.source_instance_id),
+                        path=[str(row.id)],
+                        inference="symmetric",
+                    )
+
+        # An inverse declaration is bidirectional even when only one side names
+        # the other. Build query edges from asserted rows on both definitions.
+        for relation_id, constraints in constraints_by_relation.items():
+            inverse_id = str(constraints.get("inverse_relation_id") or "")
+            if inverse_id not in relation_by_id:
+                continue
+            for row in asserted_by_relation.get(relation_id, []):
+                add_edge(
+                    inverse_id,
+                    str(row.target_instance_id),
+                    str(row.source_instance_id),
+                    path=[str(row.id)],
+                    inference="inverse",
+                )
+            for row in asserted_by_relation.get(inverse_id, []):
+                add_edge(
+                    relation_id,
+                    str(row.target_instance_id),
+                    str(row.source_instance_id),
+                    path=[str(row.id)],
+                    inference="inverse",
+                )
+
+        # Transitive closure is bounded to readable logical direct edges and is
+        # returned as evidence paths; no inferred edge is persisted.
+        for relation_id, constraints in constraints_by_relation.items():
+            if not constraints.get("transitive"):
+                continue
+            adjacency: dict[str, list[tuple[str, list[str]]]] = defaultdict(list)
+            for (edge_relation_id, source_id, target_id), edge in list(logical.items()):
+                if edge_relation_id == relation_id:
+                    adjacency[source_id].append((target_id, list(edge["path"])))
+            for start in list(readable):
+                queue = deque((target, path) for target, path in adjacency.get(start, []))
+                shortest: dict[str, list[str]] = {}
+                while queue:
+                    target, path = queue.popleft()
+                    if target == start or target in shortest or len(path) > maximum:
+                        continue
+                    shortest[target] = path
+                    for next_target, next_path in adjacency.get(target, []):
+                        queue.append((next_target, [*path, *next_path]))
+                for target, path in shortest.items():
+                    if len(path) < 2:
+                        continue
+                    add_edge(
+                        relation_id,
+                        start,
+                        target,
+                        path=path,
+                        inference="transitive",
+                    )
+
+        inferred: list[dict[str, Any]] = []
+        for (relation_id, source_id, target_id), edge in logical.items():
+            if edge["asserted"]:
+                continue
+            if instance.id == source_id:
+                direction, related_id = "outgoing", target_id
+            elif instance.id == target_id:
+                direction, related_id = "incoming", source_id
+            else:
+                continue
+            related = readable.get(related_id)
+            relation = relation_by_id.get(relation_id)
+            if not related or not relation:
+                continue
+            related_entity = next(
+                (item for item in self.entities if item.id == related.entity_id), None
+            )
+            inferred.append({
+                "relation_id": relation_id,
+                "relation": relation.name,
+                "direction": direction,
+                "related_object_id": related.id,
+                "related_object_name": related.name,
+                "related_entity": related_entity.name if related_entity else "",
+                "inferred": True,
+                "materialized": False,
+                "inference": sorted(edge["inferences"] - {"asserted"}),
+                "path": list(edge["path"]),
+            })
+        inferred.sort(key=lambda item: (
+            item["relation"], item["direction"], item["related_object_name"], item["related_object_id"]
+        ))
+        if len(inferred) > maximum:
+            truncated = True
+            inferred = inferred[:maximum]
+        return inferred, truncated
+
+    def _ontology_object(self, object_id: str) -> dict[str, Any]:
+        """Read one object plus only relationships whose opposite object is readable."""
+        if not self.scenario or not object_id:
+            return {"error": "请提供对象实例 id"}
+        instance = self.db.get(OntologyInstance, object_id)
+        if not instance or instance.scenario_id != self.scenario.id:
+            return {"error": "对象实例不存在或不属于当前业务场景"}
+        if not self._object_in_data_context(instance):
+            return {"error": "对象实例不在当前 Agent 绑定的数据范围内"}
+        if not permission_service.check_object(self.db, instance, "read").allowed:
+            return {"error": "没有读取该对象实例的权限"}
+        entity = next((item for item in self.entities if item.id == instance.entity_id), None)
+        relation_rows = list(
+            self.db.execute(
+                select(RelationInstance).where(
+                    RelationInstance.scenario_id == self.scenario.id,
+                    or_(
+                        RelationInstance.source_instance_id == instance.id,
+                        RelationInstance.target_instance_id == instance.id,
+                    ),
+                ).limit(max(1, min(get_settings().max_query_rows, 200)))
+            ).scalars().all()
+        )
+        relations: list[dict[str, Any]] = []
+        for relation_instance in relation_rows:
+            if not ontology_service.relation_instance_in_runtime_definition(
+                relation_instance, self.runtime_definition
+            ):
+                continue
+            outgoing = relation_instance.source_instance_id == instance.id
+            related_id = (
+                relation_instance.target_instance_id
+                if outgoing
+                else relation_instance.source_instance_id
+            )
+            related = self.db.get(OntologyInstance, related_id)
+            if (
+                not related
+                or related.scenario_id != self.scenario.id
+                or not self._object_in_data_context(related)
+                or not permission_service.check_object(self.db, related, "read").allowed
+            ):
+                continue
+            related_entity = next(
+                (item for item in self.entities if item.id == related.entity_id), None
+            )
+            relation = next(
+                (item for item in self.relations if item.id == relation_instance.relation_id),
+                None,
+            )
+            if not relation:
+                continue
+            relations.append(
+                {
+                    "id": relation_instance.id,
+                    "relation_id": relation.id,
+                    "relation": relation.name,
+                    "direction": "outgoing" if outgoing else "incoming",
+                    "related_object_id": related.id,
+                    "related_object_name": related.name,
+                    "related_entity": related_entity.name if related_entity else "",
+                    "attributes": relation_instance.attributes or {},
+                }
+            )
+        inferred_relations, inference_truncated = self._inferred_object_relations(instance)
+        return {
+            "id": instance.id,
+            "name": instance.name,
+            "entity_id": instance.entity_id,
+            "entity": entity.name if entity else "",
+            "attributes": self._visible_instance_attributes(instance, entity),
+            "state": (
+                instance.state or ""
+                if entity
+                and getattr(entity, "state_property", "")
+                in self._visible_instance_attributes(instance, entity)
+                else ""
+            ),
+            "source": instance.source,
+            "source_ref": instance.source_ref,
+            "relations": relations,
+            "inferred_relations": inferred_relations,
+            "inference_truncated": inference_truncated,
+            "relation_semantics": "relations 仅含已断言边；inferred_relations 是受权限与行数限制的查询期推理，未写入数据库。",
+        }
+
+    def _mapping_catalog(self) -> list[dict[str, Any]]:
+        """Expose semantic-to-physical mappings, never connector credentials/config."""
+        source_by_id = {source.id: source for source in self.data_sources}
+        result: list[dict[str, Any]] = []
+        for mapping in self.mappings:
+            source = source_by_id.get(mapping.data_source_id)
+            entity = getattr(mapping, "entity", None) or next(
+                (item for item in self.entities if item.id == mapping.entity_id), None
+            )
+            if not source or not entity or entity.scenario_id != self.agent.scenario_id:
+                continue
+            visible_property_names = {
+                prop.name
+                for prop in entity.properties
+                if permission_service.can_read_property(self.db, prop)
+            }
+            column_map = {
+                str(property_name): str(column_name)
+                for property_name, column_name in (mapping.column_map or {}).items()
+                if property_name in visible_property_names
+            }
+            transform_operations = {
+                str(property_name): [
+                    str(rule.get("op") or "")
+                    for rule in rules
+                    if isinstance(rule, dict) and rule.get("op")
+                ]
+                for property_name, rules in (mapping.transform_rules or {}).items()
+                if property_name in visible_property_names and isinstance(rules, list)
+            }
+            result.append(
+                {
+                    "kind": "object",
+                    "id": mapping.id,
+                    "entity_id": entity.id,
+                    "entity": entity.name,
+                    "data_source_id": source.id,
+                    "data_source": source.name,
+                    "data_source_connector_revision": int(
+                        source.connector_revision or 0
+                    ),
+                    "definition_hash": (
+                        self.runtime_definition.definition_hash
+                        if self.runtime_definition else ""
+                    ),
+                    "table": mapping.table_name,
+                    "column_map": column_map,
+                    "transform_operations": transform_operations,
+                    "status": getattr(mapping, "status", "released"),
+                    "last_refreshed_at": getattr(mapping, "last_refreshed_at", None),
+                    "last_imported_count": getattr(mapping, "last_imported_count", 0),
+                }
+            )
+        relation_by_id = {str(item.id): item for item in self.relations}
+        object_mapping_by_id = {str(item.id): item for item in self.mappings}
+        for mapping in self.relation_mappings:
+            relation = relation_by_id.get(str(mapping.relation_id))
+            source_mapping = object_mapping_by_id.get(str(mapping.source_mapping_id))
+            target_mapping = object_mapping_by_id.get(str(mapping.target_mapping_id))
+            source = source_by_id.get(mapping.data_source_id)
+            if not relation or not source_mapping or not target_mapping or not source:
+                continue
+            result.append(
+                {
+                    "kind": "relation",
+                    "id": mapping.id,
+                    "relation_id": relation.id,
+                    "relation": relation.name,
+                    "source_mapping_id": source_mapping.id,
+                    "source_entity_id": source_mapping.entity_id,
+                    "target_mapping_id": target_mapping.id,
+                    "target_entity_id": target_mapping.entity_id,
+                    "mode": mapping.mode,
+                    "data_source_id": source.id,
+                    "data_source_connector_revision": int(
+                        source.connector_revision or 0
+                    ),
+                    "definition_hash": (
+                        self.runtime_definition.definition_hash
+                        if self.runtime_definition else ""
+                    ),
+                    "table": mapping.table_name,
+                    "foreign_key_column": getattr(mapping, "foreign_key_column", "") or "",
+                    "source_key_column": getattr(mapping, "source_key_column", "") or "",
+                    "target_key_column": getattr(mapping, "target_key_column", "") or "",
+                    "semantics": "仅按此显式映射生成关系实例；不会按列名猜测关系。",
+                }
+            )
+        return result
 
     def _ds(self, ds_id: str | None) -> DataSource | None:
         for d in self.data_sources:
@@ -483,11 +2004,311 @@ class AgentContext:
                 return d
         return None
 
+    def validate_sql_query(self, data_source_id: str | None, sql: str) -> str:
+        """Prove a query stays inside this Agent's current governed mapping scope."""
+        if not self._ds(data_source_id):
+            raise PermissionError("Agent 未绑定该数据源")
+        sql_scope: dict[str, set[str]] = {}
+        for mapping in self._mapping_catalog():
+            if mapping.get("kind") != "object":
+                continue
+            if mapping["data_source_id"] != data_source_id or not mapping["table"]:
+                continue
+            sql_scope.setdefault(str(mapping["table"]), set()).update(
+                str(column) for column in mapping["column_map"].values() if column
+            )
+        return validate_agent_sql_scope(sql, sql_scope)
+
+    @staticmethod
+    def _parsed_tool_result(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+    def authorize_historic_tool_result(
+        self,
+        name: str,
+        args: dict[str, Any],
+        raw_result: Any,
+    ) -> bool:
+        """Re-authorize one persisted result before display or LLM replay.
+
+        Tool output is a data snapshot, not an evergreen permission grant.  The
+        check is intentionally conservative: an unknown/legacy shape is hidden
+        rather than replayed after a binding or ACL may have changed.
+        """
+        result = self._parsed_tool_result(raw_result)
+        if result is None:
+            return False
+        current_definition_hash = str(
+            getattr(self.runtime_definition, "definition_hash", "") or ""
+        )
+        # A persisted failure can be replayed only when it is one of our small,
+        # server-authored envelopes and the tool is still exposed to this Agent.
+        # This lets the model see a recoverable schema error on the next turn
+        # without turning arbitrary exception text into an evergreen disclosure.
+        if _is_safe_tool_error(result):
+            current_tools = {
+                str(tool.get("function", {}).get("name") or "")
+                for tool in self.build_tools()
+                if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+            }
+            return name in current_tools
+        if name == "list_ontology_model":
+            if not isinstance(result, dict):
+                return False
+            current = self._ontology_model()
+            current_entities = {
+                str(item["id"]): {str(prop["name"]) for prop in item["properties"]}
+                for item in current["entities"]
+            }
+            for item in result.get("entities", []):
+                if not isinstance(item, dict) or str(item.get("id") or "") not in current_entities:
+                    return False
+                old_properties = {
+                    str(prop.get("name") or "")
+                    for prop in item.get("properties", [])
+                    if isinstance(prop, dict)
+                }
+                if not old_properties.issubset(current_entities[str(item["id"])]):
+                    return False
+            current_relations = {str(item["id"]) for item in current["relations"]}
+            return all(
+                isinstance(item, dict) and str(item.get("id") or "") in current_relations
+                for item in result.get("relations", [])
+            )
+        if name in {"search_ontology", "get_ontology_object"}:
+            items = result if isinstance(result, list) else [result]
+            for item in items:
+                if not isinstance(item, dict) or not item.get("id"):
+                    return False
+                current = self._ontology_object(str(item["id"]))
+                if current.get("error"):
+                    return False
+                old_attributes = item.get("attributes") or {}
+                if not isinstance(old_attributes, dict) or not set(old_attributes).issubset(
+                    set(current.get("attributes") or {})
+                ):
+                    return False
+                for relation in item.get("relations", []) or []:
+                    if not isinstance(relation, dict):
+                        return False
+                    current_relation_ids = {
+                        str(current_relation.get("id") or "")
+                        for current_relation in current.get("relations", [])
+                    }
+                    if str(relation.get("id") or "") not in current_relation_ids:
+                        return False
+                current_inferred = {
+                    (
+                        str(current_relation.get("relation_id") or ""),
+                        str(current_relation.get("direction") or ""),
+                        str(current_relation.get("related_object_id") or ""),
+                        tuple(str(value) for value in (current_relation.get("path") or [])),
+                    )
+                    for current_relation in current.get("inferred_relations", []) or []
+                    if isinstance(current_relation, dict)
+                }
+                for relation in item.get("inferred_relations", []) or []:
+                    if not isinstance(relation, dict) or not relation.get("inferred"):
+                        return False
+                    signature = (
+                        str(relation.get("relation_id") or ""),
+                        str(relation.get("direction") or ""),
+                        str(relation.get("related_object_id") or ""),
+                        tuple(str(value) for value in (relation.get("path") or [])),
+                    )
+                    if signature not in current_inferred:
+                        return False
+            return True
+        if name == "list_data_sources":
+            allowed = {
+                str(source.id): int(source.connector_revision or 0)
+                for source in self.data_sources
+            }
+            return isinstance(result, list) and all(
+                isinstance(item, dict)
+                and str(item.get("id") or "") in allowed
+                and item.get("connector_revision")
+                == allowed[str(item.get("id") or "")]
+                for item in result
+            )
+        if name == "list_tables":
+            source_id = str(args.get("data_source_id") or "")
+            source = self._ds(source_id)
+            if source is None or not isinstance(result, list):
+                return False
+            for table in result:
+                if not isinstance(table, dict) or not str(table.get("name") or ""):
+                    return False
+                if (
+                    str(table.get("data_source_id") or "") != source_id
+                    or table.get("connector_revision")
+                    != int(source.connector_revision or 0)
+                ):
+                    return False
+                if not isinstance(table.get("columns", []), list):
+                    return False
+                if not all(
+                    isinstance(column, dict) and str(column.get("name") or "")
+                    for column in table.get("columns", [])
+                ):
+                    return False
+            return True
+        if name == "query_mapped_objects":
+            try:
+                plan = mapped_query_service.prepare_query(
+                    self.db,
+                    definition=self.runtime_definition,
+                    mappings=self.mappings,
+                    data_sources=self.data_sources,
+                    args=args,
+                )
+            except Exception:  # noqa: BLE001 - authorization is fail closed.
+                return False
+            return mapped_query_service.authorize_historic_result(plan, result)
+        if name == "query_business_data":
+            if not isinstance(result, dict):
+                return False
+            scope = result.get("scope")
+            if not isinstance(scope, dict):
+                return False
+            source_id = str(scope.get("data_source_id") or "")
+            source = self._ds(source_id)
+            if source is None or source.type == "file_bucket":
+                return False
+            if (
+                not current_definition_hash
+                or str(scope.get("definition_hash") or "") != current_definition_hash
+                or scope.get("data_source_connector_revision")
+                != int(source.connector_revision or 0)
+            ):
+                return False
+            current_mapping_ids = {str(mapping.id) for mapping in self.mappings}
+            mapping_ids = scope.get("mapping_ids")
+            if (
+                not isinstance(mapping_ids, list)
+                or not mapping_ids
+                or not set(str(item) for item in mapping_ids).issubset(current_mapping_ids)
+            ):
+                return False
+            current_entity_names = {str(entity.name) for entity in self.entities}
+            entities = scope.get("entities")
+            if (
+                not isinstance(entities, list)
+                or not entities
+                or not set(str(item) for item in entities).issubset(current_entity_names)
+            ):
+                return False
+            columns = result.get("columns")
+            records = result.get("records")
+            if (
+                not isinstance(columns, list)
+                or not all(isinstance(column, str) and column for column in columns)
+                or not isinstance(records, list)
+                or len(records) > get_settings().max_query_rows
+                or any(
+                    not isinstance(record, dict) or set(record) != set(columns)
+                    for record in records
+                )
+            ):
+                return False
+            row_count = result.get("row_count")
+            return (
+                isinstance(row_count, int)
+                and not isinstance(row_count, bool)
+                and row_count == len(records)
+                and isinstance(result.get("truncated"), bool)
+            )
+        if name == "run_sql":
+            # Direct SQL is no longer an exposed Agent tool and legacy results
+            # did not persist a connector revision. The UI may show the durable
+            # transcript, but no such payload is trusted for model replay.
+            return False
+        if name == "list_data_mappings":
+            current = {str(item["id"]): item for item in self._mapping_catalog()}
+            if not isinstance(result, list):
+                return False
+            for item in result:
+                if not isinstance(item, dict) or str(item.get("id") or "") not in current:
+                    return False
+                current_item = current[str(item["id"])]
+                if (
+                    not current_definition_hash
+                    or str(item.get("definition_hash") or "")
+                    != current_definition_hash
+                    or item.get("data_source_connector_revision")
+                    != current_item.get("data_source_connector_revision")
+                ):
+                    return False
+                if str(item.get("kind") or "") != str(current_item.get("kind") or ""):
+                    return False
+                if item.get("kind") != "object":
+                    # Relation mappings carry no object-property column map.
+                    # Their definition fingerprint and connector revision above
+                    # are the replay boundary; never index a missing field.
+                    continue
+                old_map = item.get("column_map") or {}
+                if not isinstance(old_map, dict) or any(
+                    str(key) not in current_item["column_map"]
+                    or str(value) != str(current_item["column_map"][str(key)])
+                    for key, value in old_map.items()
+                ):
+                    return False
+            return True
+
+        catalogs: dict[str, set[str]] = {
+            "list_functions": {str(item.id) for item in self.functions},
+            "list_actions": {str(item.id) for item in self.actions},
+            "list_rules": {str(item.id) for item in self.rules},
+            "list_events": {str(item.id) for item in self.events},
+            "list_workflows": {str(item.id) for item in self.workflows},
+        }
+        if name in catalogs:
+            return isinstance(result, list) and all(
+                isinstance(item, dict)
+                and str(item.get("id") or "") in catalogs[name]
+                and bool(current_definition_hash)
+                and str(item.get("definition_hash") or "") == current_definition_hash
+                for item in result
+            )
+        resource_calls = {
+            "run_function": ("function_id", self.functions, "函数"),
+            "execute_action": ("action_id", self.actions, "操作"),
+            "evaluate_rule": ("rule_id", self.rules, "规则"),
+            "prepare_event_publish": ("event_id", self.events, "事件"),
+            "execute_workflow": ("workflow_id", self.workflows, "工作流"),
+        }
+        if name in resource_calls:
+            key, resources, label = resource_calls[name]
+            try:
+                resource = _resource_by_reference(resources, args.get(key), label)
+            except _ToolContractError:
+                return False
+            return (
+                resource is not None
+                and isinstance(result, dict)
+                and bool(current_definition_hash)
+                and str(result.get("definition_hash") or "")
+                == current_definition_hash
+            )
+        # Document tools require citation-level version checks in the router.
+        if name in {"search_documents", "read_document"}:
+            return isinstance(result, dict)
+        return False
+
     def _read_doc(self, file_id: str = "", filename: str = "") -> str:
         """读取资料库全文时附带可持久化引用，避免全文工具绕过引用审计。"""
         bound_ids = [d.id for d in self.data_sources if d.type == "file_bucket"]
         if not bound_ids:
-            return "当前 Agent 未绑定可检索资料库"
+            return _tool_error(
+                "CAPABILITY_NOT_READY",
+                "当前 Agent 未绑定可检索资料库。",
+                retryable=False,
+            )
         stmt = select(BucketFile).where(
             BucketFile.data_source_id.in_(bound_ids),
         )
@@ -496,16 +2317,28 @@ class AgentContext:
         elif filename:
             stmt = stmt.where(BucketFile.filename == filename)
         else:
-            return "请提供 search_documents 返回的 file_id"
+            return _tool_error(
+                "INVALID_TOOL_ARGUMENTS",
+                "请先调用 search_documents，并提供其返回的 file_id。",
+                retryable=True,
+            )
         stmt = stmt.join(DataSource, DataSource.id == BucketFile.data_source_id).where(
             tenant_service.visible_clause(DataSource, self.db)
         )
         matches = self.db.execute(stmt).scalars().all()
         if filename and len(matches) > 1:
-            return "存在同名资料，请先使用 search_documents 返回的 file_id 精确读取"
+            return _tool_error(
+                "INVALID_TOOL_ARGUMENTS",
+                "存在同名资料，请先使用 search_documents 返回的 file_id 精确读取。",
+                retryable=True,
+            )
         f = matches[0] if matches else None
         if not f:
-            return f"未找到或无权读取文件: {file_id}"
+            return _tool_error(
+                "RESOURCE_NOT_FOUND",
+                "未找到或无权读取所请求的资料文件；请重新检索后重试。",
+                retryable=True,
+            )
         content = (f.parsed_text or f"文件 {f.filename} 暂无解析内容")[:24_000]
         source = next((item for item in self.data_sources if item.id == f.data_source_id), None)
         citation = self._record_citations(
@@ -527,7 +2360,11 @@ class AgentContext:
             ]
         )
         if not citation:
-            return "资料文件当前没有可审计的引用版本，请先完成解析和索引"
+            return _tool_error(
+                "CAPABILITY_NOT_READY",
+                "资料文件当前没有可审计的引用版本，请先完成解析和索引。",
+                retryable=False,
+            )
         return _dump(
             {
                 "citation": citation[0],
@@ -539,9 +2376,10 @@ class AgentContext:
 
     def _save_deliverable(self, filename: str, content: str) -> str:
         """Legacy direct-write hook retained as a non-executing compatibility response."""
-        return (
-            "Agent 不直接写入文件桶；请通过场景操作配置文件交付，"
-            "并由用户在操作页或任务中心完成确认。"
+        return _tool_error(
+            "DIRECT_TOOL_DISABLED",
+            "Agent 不直接写入文件桶；请通过场景操作配置文件交付，并由用户在操作页或任务中心完成确认。",
+            retryable=False,
         )
 
     def _exec_skill(self, skill_name: str, args: list[str]) -> str:
@@ -553,6 +2391,10 @@ class AgentContext:
 
 def _tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, Any]:
     required = [k for k, v in properties.items() if v.get("required")]
+    normalized_properties = {
+        key: {field: value for field, value in definition.items() if field != "required"}
+        for key, definition in properties.items()
+    }
     return {
         "type": "function",
         "function": {
@@ -560,8 +2402,9 @@ def _tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, 
             "description": description,
             "parameters": {
                 "type": "object",
-                "properties": properties,
-                "required": required or list(properties.keys())[:1] if properties else [],
+                "properties": normalized_properties,
+                "required": required,
+                "additionalProperties": False,
             },
         },
     }
@@ -572,85 +2415,189 @@ def _dump(obj: Any) -> str:
 
 
 def _table_map(ctx: AgentContext) -> str:
-    """从 SQL 操作的 executor_config 中提取真实表名，映射到实体名，供 run_sql 参考。"""
-    import re
-
-    mapping: dict[str, str] = {}
-    for a in ctx.actions:
-        cfg = a.executor_config or {}
-        sql = cfg.get("sql", "") if isinstance(cfg, dict) else ""
-        if not sql:
+    """Use governed DataMapping definitions as the authoritative table map."""
+    lines: list[str] = []
+    source_by_id = {source.id: source for source in ctx.data_sources}
+    for mapping in ctx.mappings:
+        if not mapping.table_name:
             continue
-        ent = a.entity.name if a.entity else ""
-        for m in re.findall(r"(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", sql, re.IGNORECASE):
-            if m.lower() in ("select", "where", "and", "or", "set", "values"):
-                continue
-            mapping.setdefault(m, ent)
-    if not mapping:
+        entity = mapping.entity or ctx.db.get(OntologyEntity, mapping.entity_id)
+        source = source_by_id.get(mapping.data_source_id)
+        if not entity or not source:
+            continue
+        lines.append(
+            f"- 数据源「{source.name}」(id={source.id})："
+            f"对象类型「{entity.name}」→ 表 `{mapping.table_name}`"
+        )
+    if not lines:
         return ""
-    return "\n".join(f"- 实体「{ent}」→ 表 `{tbl}`" for tbl, ent in sorted(mapping.items()))
+    return "\n".join(sorted(set(lines)))
 
 
 # ──────────────────────────────────────────────
 # 系统提示词构建
 # ──────────────────────────────────────────────
+def _capability_prompt_state(ctx: AgentContext, kind: str, resource: Any) -> str:
+    readiness = ctx._capability_status(kind, resource)
+    if readiness.executable:
+        return "可执行"
+    return "不可执行；阻塞原因：" + "；".join(readiness.blocked_reasons[:3])
+
+
 def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary: str) -> str:
     base = ctx.agent.system_prompt or "你是一名专业的业务智能助手。"
+    # Some persisted Agents predate the governed runtime and still mention
+    # direct network/side-effect tools. Keep the business intent, but rewrite
+    # the old database-tool wording to the semantic query capability exposed
+    # by the current runtime.
+    base = base.replace("run_sql", "query_business_data")
+    for legacy_tool in ("save_deliverable", "search_web", "fetch_url", "execute_skill", "mcp_*"):
+        base = base.replace(legacy_tool, "当前运行时不可用的旧工具")
     parts = [base, ""]
+    if ctx.agent.description:
+        parts.append(f"【Agent 职责】{ctx.agent.description}")
     if scenario_name:
         parts.append(f"【当前业务场景】{scenario_name}")
     if ontology_summary:
         parts.append("\n【业务本体（领域模型）】\n" + ontology_summary)
+        parts.append(
+            "你可以用 list_ontology_model 查看完整可见模型，用 search_ontology 查找对象，"
+            "再用 get_ontology_object 查看对象之间的实际关系。"
+        )
     if ctx.data_sources:
         ds_lines = [f"- {d.name}（{d.type}，id={d.id}）" for d in ctx.data_sources]
         parts.append("\n【可用数据源】\n" + "\n".join(ds_lines))
-        parts.append(
-            "你可以用 list_tables 查看表结构，用 run_sql 查询数据库，用 search_documents 检索文件桶中的文档。"
-            "凡引用检索到的事实，必须在答案中标出工具结果提供的【C#】；未检索到依据时明确说明。"
-        )
+        if ctx.mappings:
+            parts.append(
+                "简单的单对象查询优先使用 query_mapped_objects，按对象类型和本体属性传入结构化条件；"
+                "涉及跨对象关联、分组、去重或聚合审计时使用 query_business_data。"
+                "所有查询参数都使用对象类型和本体属性，不要编写 SQL 或传递物理表/列名。"
+            )
+        if any(source.type == "file_bucket" for source in ctx.data_sources):
+            parts.append(
+                "用 search_documents 检索文件桶中的文档。凡引用检索到的事实，必须在答案中标出"
+                "工具结果提供的【C#】；未检索到依据时明确说明。"
+            )
         table_map = _table_map(ctx)
         if table_map:
-            parts.append("\n【实体 → 数据库表名映射】（run_sql 时请使用下列真实表名，不要臆造）\n" + table_map)
+            parts.append(
+                "\n【实体 → 数据库表名映射血缘】（由服务端固定；调用 query_mapped_objects 时无需也不得传物理名称）\n"
+                + table_map
+            )
+    if ctx.mappings:
+        parts.append(
+            "\n【数据映射】\n"
+            + "\n".join(
+                f"- {mapping.entity.name if mapping.entity else mapping.entity_id} ← "
+                f"{next((source.name for source in ctx.data_sources if source.id == mapping.data_source_id), mapping.data_source_id)}"
+                f" / {mapping.table_name or '未指定表'}（{len(mapping.column_map or {})} 个字段，"
+                f"状态 {getattr(mapping, 'status', 'released')}）"
+                for mapping in ctx.mappings
+            )
+            + "\n优先用 query_mapped_objects 或 query_business_data 按本体属性查询；list_data_mappings 仅用于查看映射血缘。"
+        )
     if ctx.functions:
         parts.append(
-            "\n【业务函数（无副作用计算）】\n"
-            + "\n".join(f"- {function.name}（id={function.id}，{function.runtime_kind}）: {function.description[:60]}" for function in ctx.functions)
-            + "\n你可以用 list_functions 查看输入输出字段，用 run_function 直接完成确定性计算。"
+            "\n【业务函数】\n"
+            + "\n".join(
+                f"- {function.name}（id={function.id}，{function.runtime_kind}，"
+                f"{_capability_prompt_state(ctx, 'function', function)}）: "
+                f"{function.description[:60]}"
+                for function in ctx.functions
+            )
+            + "\n用 list_functions 查看输入输出字段；只有标记为可运行的确定性函数才能用 run_function 调用。"
         )
     if ctx.actions:
         parts.append(
-            "\n【可执行操作】\n"
-            + "\n".join(f"- {a.name}（id={a.id}，{a.entity.name if a.entity else '?'}，{a.executor_type}）: {a.description[:60]}" for a in ctx.actions)
-            + "\n你可以用 list_actions 查看操作列表，用 execute_action 生成预演；实际执行须由用户在操作页或任务中心确认。"
+            "\n【操作能力（包含未就绪定义）】\n"
+            + "\n".join(
+                f"- {a.name}（id={a.id}，{a.entity.name if a.entity else '?'}，{a.executor_type}，"
+                f"{_capability_prompt_state(ctx, 'action', a)}）: {a.description[:60]}"
+                + (f"；前置条件：{a.precondition[:100]}" if a.precondition else "")
+                + (f"；完成后：{a.postcondition[:100]}" if a.postcondition else "")
+                for a in ctx.actions
+            )
+            + "\n用 list_actions 查看就绪状态及前置/后置条件；只有 executable=true 的操作才能生成服务端固定预演，实际执行仍须用户确认。"
         )
     if ctx.rules:
         parts.append(
             "\n【业务规则（Rules）】\n"
-            + "\n".join(f"- {r.name}（{r.severity}）: {r.description[:60]}" for r in ctx.rules)
-            + "\n你可以用 list_rules 查看规则列表，用 evaluate_rule 评估规则是否命中。"
+            + "\n".join(
+                f"- {r.name}（{r.severity}，{_capability_prompt_state(ctx, 'rule', r)}）: {r.description[:60]}"
+                for r in ctx.rules
+            )
+            + "\n用 list_rules 查看规则就绪状态；命中规则只产生待预演/待确认的操作清单，不会自动产生副作用。"
+        )
+    if ctx.events:
+        parts.append(
+            "\n【业务事件（Events）】\n"
+            + "\n".join(
+                f"- {event.name}（id={event.id}，{_capability_prompt_state(ctx, 'event', event)}）: "
+                f"{event.description[:60]}"
+                for event in ctx.events
+            )
+            + "\n用 list_events 查看事件载荷与就绪状态；prepare_event_publish 生成服务端固定预演，不会发布事件，用户可在对话卡片确认。"
         )
     if ctx.workflows:
         parts.append(
             "\n【工作流（Workflows）】\n"
-            + "\n".join(f"- {w.name}（id={w.id}，{w.trigger_type}，{len(w.steps or [])}步）: {w.description[:60]}" for w in ctx.workflows)
-            + "\n你可以用 list_workflows 查看工作流列表；实际运行须由用户在工作流页面或任务中心确认。"
+            + "\n".join(
+                f"- {w.name}（id={w.id}，{w.trigger_type}，{w.status}，"
+                f"{len(w.nodes or []) or len(w.steps or [])}节点，"
+                f"{_capability_prompt_state(ctx, 'workflow', w)}）: {w.description[:60]}"
+                for w in ctx.workflows
+            )
+            + "\n用 list_workflows 查看工作流就绪状态；execute_workflow 生成服务端固定预演，不会提交任务，用户可在对话卡片确认。"
         )
     parts.append(
         "\n【工作方式】请根据用户问题，自主调用合适的工具获取数据，然后给出准确、结构化的回答。"
         "涉及数据时务必基于工具返回的真实数据，不要编造；无法确认时明确说明数据缺口。"
-        "如果场景定义了本体、函数、操作、规则或工作流，优先使用这些业务抽象来完成任务。"
+        "如果场景定义了本体、映射、函数、操作、规则、事件或工作流，优先使用这些业务抽象来完成任务。"
+        "用户在当前请求中明确给出的对象、范围、条件和阈值，就是本次审计的有效规则；"
+        "可以用规则目录补充解释，但不能因为目录中没有同名规则而拒绝按用户条件查询。"
+    )
+    parts.append(
+        "\n【业务查询策略】遇到‘超过次数/合计金额/重复记录/按对象统计’等复合问题时，"
+        "先用 query_business_data 做只返回分组属性和聚合值的汇总查询；有明确阈值时用 having 筛掉不满足阈值的分组，"
+        "再用得到的对象标识查询明细；"
+        "不要把明细属性和聚合混在一个不完整的分组查询里。跨对象查询优先使用已配置的数据关系映射，"
+        "没有可验证的关系或用户要求的维度未映射时，明确指出配置缺口并停止猜测。"
+        "查询成功且 row_count=0（或 empty=true）表示该数据范围内没有命中记录：必须明确回答‘在该范围内未发现违规’，"
+        "不得把合法的零行结果说成缺少数据、缺少规则或执行失败；只有结构化 error 才表示工具失败。"
+    )
+    parts.append(
+        "\n【运行时工具与交付约束（优先级高于旧提示）】\n"
+        "只使用本轮工具定义中实际提供的工具。数据库查询只能通过本轮提供的 query_mapped_objects 或"
+        "query_business_data；不要调用或声称调用本轮未提供的网络爬虫或外部服务工具；如果用户要求的能力当前不可用，"
+        "要明确说明阻塞点，不要反复尝试。\n"
+        "工具调用阶段不要向用户输出“让我继续查询”“我现在查看”等过程性文字；完成必要查询后，"
+        "只输出一份最终结果。不要重复调用同一个工具和同一组参数，达到足够证据后立即结束工具调用。\n"
+        "id 是运行时内部细节。调用函数、操作、规则、事件或工作流时，先用对应的 list_* 工具按名称/API 名称"
+        "发现资源和准确 schema，再把 list 返回的 id、api_name 或 name 传给执行工具；不得向用户索要内部 ID。\n"
+        "若工具返回 retryable=true 的结构化 schema/参数错误，应依据 error.message 或 list_* 返回的 schema 修正参数，"
+        "最多重试一次且不得原样重复；retryable=false 时停止重试并说明阻塞点。\n"
+        "凡用户要求报告、附注、财务报表或其他附件交付，必须先调用 list_actions，找到相应的模板执行器操作，"
+        "再按每个操作的 input_schema 实际调用 execute_action 生成可确认预演；不得只写一段 Markdown、伪造下载链接或声称附件已生成。"
+        "如果没有已就绪的模板操作，要明确指出缺少哪类模板操作。\n"
+        "涉及审计、排查或核验时，最终结果必须包含：判断依据、数据范围、明细或明确的无结果说明、"
+        "统计汇总、证据引用、数据限制和结论。若无法完成，必须明确指出缺少哪个字段、映射或能力，"
+        "并停止继续猜测。"
     )
     return "\n".join(parts)
 
 
-def ontology_summary_for(scenario) -> str:
+def ontology_summary_for(scenario, *, db: Session | None = None) -> str:
     """把本体（实体/属性/关系）序列化为给 LLM 的领域模型描述。"""
     if not scenario or not scenario.entities:
         return ""
     lines = []
     for e in scenario.entities:
         props = ", ".join(
-            f"{p.name}:{p.data_type}" + ("(主键)" if p.is_key else "") for p in e.properties
+            f"{p.name}:{p.data_type}"
+            + ("(主键)" if p.is_key else "")
+            + ("(标题)" if getattr(p, "is_title", False) else "")
+            for p in e.properties
+            if db is None or permission_service.can_read_property(db, p)
         )
         lines.append(f"- 实体「{e.name}」: {props or '无属性'}")
         if e.description:
@@ -658,7 +2605,26 @@ def ontology_summary_for(scenario) -> str:
     for r in scenario.relations:
         src = next((e.name for e in scenario.entities if e.id == r.source_entity_id), "?")
         tgt = next((e.name for e in scenario.entities if e.id == r.target_entity_id), "?")
-        lines.append(f"- 关系: {src} --[{r.name}]--({r.relation_type})--> {tgt}")
+        constraints = ontology_service.normalize_relation_constraints(
+            getattr(r, "constraints", {}) or {}, relation_type=r.relation_type
+        )
+        constraint_names = [
+            label for key, label in (
+                ("symmetric", "对称"), ("transitive", "传递"),
+                ("irreflexive", "反自反"), ("asymmetric", "非对称"),
+                ("antisymmetric", "反对称"), ("acyclic", "无环"),
+            ) if constraints.get(key)
+        ]
+        suffix = f"；约束：{'、'.join(constraint_names)}" if constraint_names else ""
+        if constraints.get("inverse_relation_id"):
+            inverse = next(
+                (item for item in scenario.relations if item.id == constraints["inverse_relation_id"]),
+                None,
+            )
+            suffix += f"；逆关系：{getattr(inverse, 'name', constraints['inverse_relation_id'])}"
+        lines.append(f"- 关系: {src} --[{r.name}]--({r.relation_type})--> {tgt}{suffix}")
+        if constraints.get("symmetric") or constraints.get("transitive") or constraints.get("inverse_relation_id"):
+            lines.append("  查询语义：推理边只在查询时解释，不会自动创建反向边、逆关系实例或传递闭包。")
     # 本体扩展维度
     if getattr(scenario, "function_definitions", None):
         executable = [function for function in scenario.function_definitions if function.runtime_kind != "contract"]
@@ -669,8 +2635,13 @@ def ontology_summary_for(scenario) -> str:
     if getattr(scenario, "actions", None):
         lines.append("\n【操作】")
         for a in scenario.actions:
+            if db is not None and not permission_service.check_action(db, a, "read").allowed:
+                continue
             ent = next((e.name for e in scenario.entities if e.id == a.entity_id), "?")
-            lines.append(f"- 操作「{a.name}」(实体:{ent}, 执行:{a.executor_type}): {a.description[:60]}")
+            lines.append(
+                f"- 操作「{a.name}」(实体:{ent}, 执行:{a.executor_type}, "
+                f"{'已启用' if a.enabled else '已停用'}): {a.description[:60]}"
+            )
     if getattr(scenario, "rules", None):
         lines.append("\n【规则（Rules）】")
         for r in scenario.rules:
@@ -678,11 +2649,18 @@ def ontology_summary_for(scenario) -> str:
     if getattr(scenario, "events", None):
         lines.append("\n【事件（Events）】")
         for e in scenario.events:
-            lines.append(f"- 事件「{e.name}」: {e.description[:60]}")
+            lines.append(
+                f"- 事件「{e.name}」({'已启用' if e.enabled else '已停用'}): {e.description[:60]}"
+            )
     if getattr(scenario, "workflows", None):
         lines.append("\n【工作流（Workflows）】")
         for w in scenario.workflows:
-            lines.append(f"- 工作流「{w.name}」({w.trigger_type}, {len(w.steps or [])}步): {w.description[:60]}")
+            if db is not None and not permission_service.check_workflow(db, w, "read").allowed:
+                continue
+            lines.append(
+                f"- 工作流「{w.name}」({w.trigger_type}, {w.status}, "
+                f"{len(w.nodes or []) or len(w.steps or [])}节点): {w.description[:60]}"
+            )
     return "\n".join(lines)
 
 
@@ -697,20 +2675,70 @@ def _run_agent(
     user_message: str,
     scenario_name: str,
     ontology_summary: str,
+    *,
+    runtime_context: AgentContext | None = None,
 ) -> Iterator[dict[str, Any]]:
     """执行 Agent 工具循环，逐事件 yield。
 
     事件类型: status / tool_call / tool_result / token / citations / done / error
     """
-    ctx = AgentContext(db, agent, llm)
-    system_prompt = build_system_prompt(ctx, scenario_name, ontology_summary)
+    # The router uses this same context to re-authorize historic tool output.
+    # Rebuilding it here would introduce a TOCTOU window: an active release
+    # could switch after history was approved but before that history reached
+    # the model.  One turn must therefore use exactly one resolved definition.
+    ctx = runtime_context or AgentContext(db, agent, llm)
+    if ctx.db is not db or ctx.agent.id != agent.id:
+        raise RuntimeError("Agent 运行上下文与当前对话不匹配")
+    ctx.llm = llm
+    # The router's summary is a presentation optimisation only. The actual
+    # prompt must be rebuilt from this turn's resolved runtime definition so a
+    # staging/prod Agent cannot inherit mutable live ontology text.
+    runtime_model = ctx._ontology_model()
+    runtime_summary_lines: list[str] = []
+    for entity in runtime_model["entities"]:
+        properties = ", ".join(
+            f"{prop['name']}:{prop['data_type']}" + ("(主键)" if prop["key"] else "")
+            for prop in entity["properties"]
+        )
+        runtime_summary_lines.append(
+            f"- 实体「{entity['name']}」: {properties or '无属性'}"
+        )
+        if entity.get("description"):
+            runtime_summary_lines.append(f"  说明: {entity['description']}")
+    for relation in runtime_model["relations"]:
+        runtime_summary_lines.append(
+            f"- 关系: {relation['source_entity']} --[{relation['name']}]--"
+            f"({relation['cardinality']})--> {relation['target_entity']}"
+        )
+        constraints = relation.get("constraints") or {}
+        if constraints:
+            runtime_summary_lines.append(
+                "  约束: " + json.dumps(constraints, ensure_ascii=False, sort_keys=True)
+            )
+        for semantic in relation.get("query_semantics") or []:
+            runtime_summary_lines.append(f"  查询语义: {semantic}")
+    runtime_scenario_name = (
+        ctx.runtime_definition.scenario_name
+        if ctx.runtime_definition is not None
+        else scenario_name
+    )
+    system_prompt = build_system_prompt(
+        ctx,
+        runtime_scenario_name,
+        "\n".join(runtime_summary_lines),
+    )
     tools = ctx.build_tools()
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     messages += history
     messages.append({"role": "user", "content": user_message})
 
-    max_rounds = get_settings().max_tool_rounds
+    # A useful audit normally needs a handful of calls.  Cap pathological
+    # provider loops even when an environment has a larger global setting;
+    # the final summarization below still turns partial evidence into a
+    # truthful answer instead of leaking a long chain of retries to the user.
+    max_rounds = max(1, min(get_settings().max_tool_rounds, 12))
+    tool_call_counts: defaultdict[str, int] = defaultdict(int)
     for _round in range(max_rounds):
         # 流式获取本轮 LLM 输出
         content_parts: list[str] = []
@@ -725,7 +2753,6 @@ def _run_agent(
         ):
             if ev["type"] == "token":
                 content_parts.append(ev["content"])
-                yield {"type": "token", "data": ev["content"]}
             elif ev["type"] == "tool_calls":
                 tool_calls = ev["tool_calls"]
 
@@ -735,6 +2762,8 @@ def _run_agent(
             # 最终回答
             if ctx.citations:
                 yield {"type": "citations", "data": ctx.citation_snapshot()}
+            for part in content_parts:
+                yield {"type": "token", "data": part}
             yield {"type": "done", "data": content}
             return
 
@@ -755,19 +2784,72 @@ def _run_agent(
         )
 
         # 执行每个工具
+        repeated_tool_call = False
         for tc in tool_calls:
             fname = tc["function"]["name"]
             fargs = tc["function"]["arguments"] or {}
             yield {"type": "tool_call", "data": {"id": tc["id"], "name": fname, "arguments": fargs}}
-            result = ctx.execute_tool(fname, fargs)
+            signature = json.dumps(
+                {"name": fname, "arguments": fargs},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if tool_call_counts[signature]:
+                repeated_tool_call = True
+                result = "本轮已经用相同参数执行过该工具。请直接基于已有结果给出最终回答，不要重复调用。"
+            else:
+                result = ctx.execute_tool(fname, fargs)
+            tool_call_counts[signature] += 1
             yield {"type": "tool_result", "data": {"id": tc["id"], "name": fname, "result": result[:8000]}}
             messages.append(
                 {"role": "tool", "tool_call_id": tc["id"], "name": fname, "content": result[:8000]}
             )
+        if repeated_tool_call:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "检测到重复工具调用。请立即停止工具调用，只基于当前已有证据输出最终结果。",
+                }
+            )
 
     if ctx.citations:
         yield {"type": "citations", "data": ctx.citation_snapshot()}
-    yield {"type": "done", "data": "（已达到最大工具调用轮数，回答可能不完整）"}
+    # 工具轮次耗尽时再请求一次“只总结、不调用工具”的最终回答，避免把内部
+    # 重试过程直接交给用户，也避免仅返回一句无法交付的兜底提示。
+    final_messages = messages + [
+        {
+            "role": "user",
+            "content": (
+                "工具调用轮次已达到上限。请只基于已经返回的工具结果，立即生成最终可交付的回答；"
+                "不要再调用工具，不要描述内部过程。明确给出结论、证据、汇总和仍存在的数据限制。"
+            ),
+        }
+    ]
+    final_parts: list[str] = []
+    try:
+        for ev in llm_service.chat_stream(
+            llm,
+            final_messages,
+            tools=None,
+            temperature=agent.temperature,
+            max_tokens=agent.max_tokens,
+            db=db,
+        ):
+            if ev["type"] == "token":
+                final_parts.append(ev["content"])
+    except Exception:
+        final_parts = []
+
+    final_content = "".join(final_parts).strip()
+    if not final_content:
+        final_content = (
+            "已完成当前可用工具查询，但在工具调用上限内未能形成完整结论。"
+            "请根据已展示的工具结果补充查询条件，或检查场景的数据映射与可用能力。"
+        )
+    for part in final_parts:
+        yield {"type": "token", "data": part}
+    yield {"type": "done", "data": final_content}
 
 
 def run_agent(
@@ -780,6 +2862,7 @@ def run_agent(
     ontology_summary: str,
     *,
     trace_context: dict[str, Any] | None = None,
+    runtime_context: AgentContext | None = None,
 ) -> Iterator[dict[str, Any]]:
     """执行 Agent 并在每个真实模型 trace 中保留最小可审计回链。"""
     previous = db.info.get("llm_trace_context")
@@ -805,6 +2888,7 @@ def run_agent(
             user_message,
             scenario_name,
             ontology_summary,
+            runtime_context=runtime_context,
         )
     finally:
         if previous is None:

@@ -1,26 +1,27 @@
 import axios from 'axios'
 import type {
-  ActionExecutionLog,
   FunctionRun,
   Agent,
+  AgentCapabilityCatalog,
   AssistantAttachment,
+  AssistantCompilationJobResult,
+  AssistantCompilationJobStatus,
   AssistantMessage,
-  AssistantReply,
   AssistantThread,
   AuthMessage,
   BucketFile,
+  ArtifactTemplate,
+  ArtifactTemplateDetail,
   ChatMessage,
   Conversation,
   DataMapping,
   DataMappingPreview,
   DataMappingRefreshJob,
-  DataMappingRefresh,
   DocumentReindexResult,
   DocumentSearchResult,
   DataSource,
   EventEnvelope,
   FunctionDefinition,
-  GraphData,
   LLMConfig,
   LLMEvaluation,
   LLMEvaluationSummary,
@@ -30,6 +31,9 @@ import type {
   MCPTool,
   OntologyInstance,
   RelationInstance,
+  RelationDataMapping,
+  RelationDataMappingInput,
+  RelationDataMappingPreview,
   ObjectDetail,
   ObjectSearchResult,
   Scenario,
@@ -114,17 +118,17 @@ export const api = {
     })
   },
   deleteAssistantAttachment: (id: string) => http.delete(`/assistant/attachments/${id}`),
-  assistantChat: (d: {
-    message: string
-    thread_id?: string
-    scenario_id?: string
-    page?: string
-    path?: string
-    selection?: Record<string, any>
-    attachment_ids?: string[]
-    mode?: 'ask' | 'explain' | 'draft' | 'apply' | 'execute'
-  }) => http.post<AssistantReply>('/assistant/chat', d),
-  applyAssistantProposal: (d: { kind: 'scenario' | 'ontology' | 'mapping' | 'workflow'; scenario_id?: string; thread_id: string; proposal_id: string; confirm: boolean }) =>
+  listAssistantCompilationJobs: (threadId: string, context: { scenario_id?: string; page?: string; path?: string } = {}) =>
+    http.get<AssistantCompilationJobStatus[]>(`/assistant/threads/${threadId}/compilation-jobs`, { params: {
+      scenario_id: context.scenario_id || undefined,
+      page: context.page || undefined,
+      path: context.path || undefined,
+    } }),
+  getAssistantCompilationJob: (jobId: string) =>
+    http.get<AssistantCompilationJobStatus>(`/assistant/compilation-jobs/${jobId}`),
+  getAssistantCompilationJobResult: (jobId: string) =>
+    http.get<AssistantCompilationJobResult>(`/assistant/compilation-jobs/${jobId}/result`),
+  applyAssistantProposal: (d: { kind: 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'; scenario_id?: string; thread_id: string; proposal_id: string; confirm: boolean }) =>
     http.post('/assistant/proposals/apply', d),
 
   // 场景
@@ -143,16 +147,6 @@ export const api = {
   createRelation: (sid: string, d: any) => http.post(`/scenarios/${sid}/relations`, d),
   updateRelation: (rid: string, d: any) => http.put(`/scenarios/relations/${rid}`, d),
   deleteRelation: (rid: string) => http.delete(`/scenarios/relations/${rid}`),
-
-  // 图谱
-  getGraph: (sid: string, mode: 'schema' | 'instance' = 'schema') =>
-    http.get<GraphData>(`/scenarios/${sid}/graph`, { params: { mode } }),
-
-  // AI 生成本体
-  generateOntology: (sid: string, description: string) =>
-    http.post<{ entities: any[]; relations: any[] }>(`/scenarios/${sid}/generate-ontology`, { description }),
-  applyOntology: (sid: string, data: { entities: any[]; relations: any[] }) =>
-    http.post(`/scenarios/${sid}/apply-ontology`, data),
 
   // 实例
   createInstance: (sid: string, d: Partial<OntologyInstance>) => http.post(`/scenarios/${sid}/instances`, d),
@@ -177,19 +171,19 @@ export const api = {
   testMapping: (mid: string, limit = 20) => http.post<DataMappingPreview>(`/scenarios/mappings/${mid}/test`, { limit }),
   enqueueMappingRefresh: (mid: string, limit = 50) => http.post<DataMappingRefreshJob>(`/scenarios/mappings/${mid}/refresh-jobs`, { limit }),
   getMappingRefreshJob: (jobId: string) => http.get<DataMappingRefreshJob>(`/scenarios/mappings/refresh-jobs/${jobId}`),
-  refreshMapping: (mid: string, limit = 50) => http.post<DataMappingRefresh>(`/scenarios/mappings/${mid}/refresh`, { limit }),
-  importMapping: (mid: string, limit = 50) => http.post(`/scenarios/mappings/${mid}/import`, { limit }),
-
+  preflightRelationMapping: (sid: string, d: RelationDataMappingInput) =>
+    http.post<RelationDataMappingPreview>(`/scenarios/${sid}/relation-mappings/preflight`, d),
+  createRelationMapping: (sid: string, d: RelationDataMappingInput) =>
+    http.post<RelationDataMapping>(`/scenarios/${sid}/relation-mappings`, d),
+  updateRelationMapping: (id: string, d: RelationDataMappingInput) =>
+    http.put<RelationDataMapping>(`/scenarios/relation-mappings/${id}`, d),
+  deleteRelationMapping: (id: string) => http.delete(`/scenarios/relation-mappings/${id}`),
   // 受治理函数：声明式契约 + 服务端 allowlist 内置算子
-  listFunctions: (sid: string) => http.get<FunctionDefinition[]>(`/scenarios/${sid}/functions`),
   createFunction: (sid: string, d: FunctionDefinition) => http.post<FunctionDefinition>(`/scenarios/${sid}/functions`, d),
   updateFunction: (id: string, d: FunctionDefinition) => http.put<FunctionDefinition>(`/scenarios/functions/${id}`, d),
   deleteFunction: (id: string) => http.delete(`/scenarios/functions/${id}`),
   runFunction: (id: string, data: { params: Record<string, any>; idempotency_key?: string }) =>
     http.post<FunctionRun>(`/functions/${id}/run`, data),
-  listFunctionRuns: (id: string, limit = 100) =>
-    http.get<FunctionRun[]>(`/functions/${id}/runs`, { params: { limit } }),
-
   // 操作（Actions）
   createAction: (sid: string, d: any) => http.post(`/scenarios/${sid}/actions`, d),
   updateAction: (id: string, d: any) => http.put(`/scenarios/actions/${id}`, d),
@@ -225,7 +219,6 @@ export const api = {
   createWorkflow: (sid: string, d: any) => http.post(`/scenarios/${sid}/workflows`, d),
   updateWorkflow: (id: string, d: any) => http.put(`/scenarios/workflows/${id}`, d),
   deleteWorkflow: (id: string) => http.delete(`/scenarios/workflows/${id}`),
-  executeWorkflow: (id: string, params: any) => http.post(`/scenarios/workflows/${id}/execute`, { params }),
   submitWorkflowRun: (id: string, params: Record<string, any> = {}) =>
     http.post<WorkflowRun>(`/scenarios/workflows/${id}/runs`, { params }),
   generateWorkflow: (sid: string, description: string) =>
@@ -245,10 +238,6 @@ export const api = {
   retryTask: (id: string) => http.post<WorkflowRun>(`/tasks/${id}/retry`),
   cancelTask: (id: string) => http.post<WorkflowRun>(`/operations/runs/${id}/cancel`),
 
-  // 执行日志（P0 兼容）
-  listExecutionLogs: (sid: string, limit = 50) =>
-    http.get<ActionExecutionLog[]>(`/scenarios/${sid}/execution-logs`, { params: { limit } }),
-
   // 数据源
   listDataSources: (sid?: string) =>
     http.get<DataSource[]>('/data-sources', { params: sid ? { scenario_id: sid } : {} }),
@@ -257,7 +246,6 @@ export const api = {
   deleteDataSource: (id: string) => http.delete(`/data-sources/${id}`),
   testDataSource: (id: string) => http.post(`/data-sources/${id}/test`),
   listTables: (id: string) => http.get<TableInfo[]>(`/data-sources/${id}/tables`),
-  query: (id: string, sql: string) => http.post(`/data-sources/${id}/query`, { sql }),
   listFiles: (id: string) => http.get<BucketFile[]>(`/data-sources/${id}/files`),
   searchDocuments: (d: { query: string; data_source_ids?: string[]; scenario_id?: string; top_k?: number }) =>
     http.post<DocumentSearchResult>('/data-sources/search', d),
@@ -272,6 +260,73 @@ export const api = {
   reparseFile: (fid: string) => http.post(`/data-sources/files/${fid}/reparse`),
   fileText: (fid: string) => http.get<{ filename: string; text: string }>(`/data-sources/files/${fid}/text`),
   deleteFile: (fid: string) => http.delete(`/data-sources/files/${fid}`),
+
+  // 统一附件模板中心
+  listTemplates: (params: { scenario_id?: string; status?: string; artifact_format?: string; q?: string } = {}) =>
+    http.get<ArtifactTemplate[]>('/templates', { params }),
+  getTemplate: (id: string) => http.get<ArtifactTemplateDetail>(`/templates/${id}`),
+  registerTemplate: (d: {
+    file_id: string
+    scenario_id?: string | null
+    name: string
+    purpose?: string
+    description?: string
+    key?: string
+    version_note?: string
+  }) => http.post<ArtifactTemplate>('/templates/register', d),
+  uploadTemplate: (d: {
+    file: File
+    data_source_id: string
+    scenario_id?: string | null
+    name: string
+    purpose?: string
+    description?: string
+    key?: string
+    version_note?: string
+    onProgress?: (percent: number) => void
+  }) => {
+    const fd = new FormData()
+    fd.append('file', d.file)
+    fd.append('data_source_id', d.data_source_id)
+    fd.append('name', d.name)
+    if (d.scenario_id) fd.append('scenario_id', d.scenario_id)
+    if (d.purpose) fd.append('purpose', d.purpose)
+    if (d.description) fd.append('description', d.description)
+    if (d.key) fd.append('key', d.key)
+    if (d.version_note) fd.append('version_note', d.version_note)
+    return http.post<ArtifactTemplate>('/templates/upload', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (event: { loaded: number; total?: number }) => {
+        if (event.total) d.onProgress?.(Math.round((event.loaded / event.total) * 100))
+      },
+    })
+  },
+  registerTemplateVersion: (id: string, d: { file_id: string; version_note?: string; set_current?: boolean }) =>
+    http.post<ArtifactTemplateDetail>(`/templates/${id}/versions/register`, d),
+  uploadTemplateVersion: (id: string, d: { file: File; data_source_id: string; version_note?: string; set_current?: boolean; onProgress?: (percent: number) => void }) => {
+    const fd = new FormData()
+    fd.append('file', d.file)
+    fd.append('data_source_id', d.data_source_id)
+    fd.append('set_current', d.set_current === false ? 'false' : 'true')
+    if (d.version_note) fd.append('version_note', d.version_note)
+    return http.post<ArtifactTemplateDetail>(`/templates/${id}/versions/upload`, fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (event: { loaded: number; total?: number }) => {
+        if (event.total) d.onProgress?.(Math.round((event.loaded / event.total) * 100))
+      },
+    })
+  },
+  updateTemplate: (id: string, d: {
+    name?: string
+    purpose?: string
+    description?: string
+    key?: string
+    scenario_id?: string | null
+    current_version_id?: string
+  }) => http.put<ArtifactTemplateDetail>(`/templates/${id}`, d),
+  deprecateTemplate: (id: string) => http.post<ArtifactTemplateDetail>(`/templates/${id}/deprecate`),
+  activateTemplate: (id: string) => http.post<ArtifactTemplateDetail>(`/templates/${id}/activate`),
+  deleteTemplate: (id: string) => http.delete(`/templates/${id}`),
 
   // LLM
   listLLM: () => http.get<LLMConfig[]>('/llm-configs'),
@@ -303,13 +358,21 @@ export const api = {
   // Agent
   listAgents: () => http.get<Agent[]>('/agents'),
   getAgent: (id: string) => http.get<Agent>(`/agents/${id}`),
+  getAgentCapabilityCatalog: (scenarioId: string) => http.get<AgentCapabilityCatalog>(`/agents/capability-catalog/${scenarioId}`),
   createAgent: (d: Partial<Agent>) => http.post<Agent>('/agents', d),
   updateAgent: (id: string, d: Partial<Agent>) => http.put<Agent>(`/agents/${id}`, d),
   deleteAgent: (id: string) => http.delete(`/agents/${id}`),
   listConversations: (agentId: string) => http.get<Conversation[]>(`/agents/${agentId}/conversations`),
-  createConversation: (agentId: string) => http.post<Conversation>(`/agents/${agentId}/conversations`),
   deleteConversation: (cid: string) => http.delete(`/agents/conversations/${cid}`),
   listMessages: (cid: string) => http.get<ChatMessage[]>(`/agents/conversations/${cid}/messages`),
+  confirmAgentToolPreview: (agentId: string, previewLogId: string, d: {
+    conversation_id: string
+    correlation_id: string
+    expected_environment: 'dev' | 'staging' | 'prod'
+    expected_definition_snapshot_id?: string
+    expected_release_id?: string
+    expected_definition_hash: string
+  }) => http.post(`/agents/${agentId}/confirmations/${previewLogId}`, d),
 }
 
 // SSE 流式对话
@@ -372,7 +435,11 @@ export function streamAssistantChat(
     path?: string
     selection?: Record<string, any>
     attachment_ids?: string[]
+    llm_config_id?: string
+    skill_ids?: string[]
+    mcp_ids?: string[]
     mode?: 'ask' | 'explain' | 'draft' | 'apply' | 'execute'
+    draft_kind?: 'auto' | 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'
   },
   onEvent: (ev: { type: string; data: any }) => void,
   onDone: () => void,

@@ -34,7 +34,7 @@
         <div v-if="!messages.length" class="empty-chat">
           <div class="empty-icon"><el-icon :size="40"><ChatDotRound /></el-icon></div>
           <div class="empty-title">{{ agent?.name }} 已就绪</div>
-          <div class="muted">基于「{{ agent?.scenario_name || '通用' }}」场景本体，可查询数据、检索文档并生成操作预演</div>
+          <div class="muted">基于「{{ agent?.scenario_name || '通用' }}」场景本体，可查询数据、检索文档，并安全预演及确认业务操作</div>
           <div class="suggestions">
             <button class="sug" type="button" v-for="q in suggestions" :key="q" @click="send(q)">{{ q }}</button>
           </div>
@@ -61,6 +61,41 @@
                   <StructuredValueViewer :value="tc.args" empty-text="无需参数" class="tool-structured-value" />
                   <div v-if="tc.result !== undefined" class="muted" style="margin:8px 0 4px">结果</div>
                   <StructuredValueViewer v-if="tc.result !== undefined" :value="tc.result" empty-text="暂无返回结果" class="tool-structured-value" />
+                  <section v-if="actionPreviewOf(tc)" class="agent-action-confirm" aria-label="操作预演确认">
+                    <div>
+                      <strong>{{ actionPreviewOf(tc)?.result?.plan?.action_name || '业务操作' }}</strong>
+                      <span v-if="actionPreviewOf(tc)?.result?.plan?.artifact">将生成 {{ actionPreviewOf(tc)?.result?.plan?.artifact?.filename }}</span>
+                      <span v-else>预演已固定操作定义和参数，确认前没有产生副作用。</span>
+                    </div>
+                    <el-button type="primary" size="small" :loading="tc._confirming" :disabled="m.streaming" @click="confirmActionPreview(tc)">确认执行</el-button>
+                  </section>
+                  <section v-else-if="confirmationPreviewOf(tc)" class="agent-action-confirm" :aria-label="`${confirmationLabel(confirmationPreviewOf(tc))}预演确认`">
+                    <div>
+                      <strong>{{ confirmationTitle(confirmationPreviewOf(tc)) }}</strong>
+                      <span>{{ confirmationDescription(confirmationPreviewOf(tc)) }}</span>
+                    </div>
+                    <el-button
+                      type="primary"
+                      size="small"
+                      :loading="tc._confirming"
+                      :disabled="m.streaming || !curConv?.id"
+                      :aria-busy="tc._confirming ? 'true' : 'false'"
+                      @click="confirmAgentPreview(tc)"
+                    >确认{{ confirmationLabel(confirmationPreviewOf(tc)) }}</el-button>
+                  </section>
+                  <section v-if="confirmationOutcomeOf(tc)" class="agent-confirm-outcome" aria-live="polite">
+                    <div>
+                      <strong>{{ confirmationOutcomeTitle(confirmationOutcomeOf(tc)) }}</strong>
+                      <span>{{ confirmationOutcomeDescription(confirmationOutcomeOf(tc)) }}</span>
+                    </div>
+                    <el-button
+                      v-if="confirmationTaskId(confirmationOutcomeOf(tc))"
+                      type="primary"
+                      plain
+                      size="small"
+                      @click="openConfirmationTask(confirmationOutcomeOf(tc))"
+                    >查看任务</el-button>
+                  </section>
                 </div>
               </div>
             </template>
@@ -81,7 +116,7 @@
                   <span class="citation-id">{{ citation.citation_id }}</span>
                   <div class="citation-info">
                     <strong>{{ citation.filename }}</strong>
-                    <small>{{ citation.data_source_name }} · 字符 {{ citation.char_start }}–{{ citation.char_end }} · 片段 {{ citation.chunk_ordinal + 1 }}</small>
+                    <small>{{ citation.data_source_name }} · 字符 {{ citation.char_start }}–{{ citation.char_end }} · 片段 {{ citationOrdinal(citation) }}</small>
                   </div>
                   <el-button
                     size="small"
@@ -95,12 +130,12 @@
               </article>
             </section>
             <!-- 附件卡片 -->
-            <div class="attach-list" v-if="extractAttachments(m.content).length">
-              <div class="attach-card" v-for="a in extractAttachments(m.content)" :key="a.id">
+            <div class="attach-list" v-if="extractMessageAttachments(m).length">
+              <div class="attach-card" v-for="a in extractMessageAttachments(m)" :key="a.id">
                 <div class="attach-icon"><el-icon :size="22"><Document /></el-icon></div>
                 <div class="attach-info">
                   <button class="attach-name" type="button" :aria-label="`预览附件：${a.filename}`" @click="preview(a)">{{ a.filename }}</button>
-                  <div class="muted attach-sub">点击预览</div>
+                  <div class="muted attach-sub">{{ artifactFormatLabel(a.format) }}<template v-if="a.size"> · {{ formatFileSize(a.size) }}</template></div>
                 </div>
                 <div class="attach-actions">
                   <el-button size="small" text type="primary" @click="preview(a)"><el-icon><View /></el-icon> 预览</el-button>
@@ -155,13 +190,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onBeforeUnmount, onMounted, nextTick } from 'vue'
+import { ref, onBeforeUnmount, onMounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamChat } from '@/api'
 import type { Agent, ChatMessage, Conversation, RagCitation } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
+import { actionArtifactAttachment } from '@/utils/artifactAttachments'
+import type { ArtifactAttachment } from '@/utils/artifactAttachments'
 
 const route = useRoute()
 const router = useRouter()
@@ -183,6 +220,8 @@ const input = ref('')
 const streaming = ref(false)
 const msgRef = ref<HTMLElement>()
 let ctrl: AbortController | null = null
+let viewDisposed = false
+let agentLoadRequest = 0
 
 const suggestions = [
   '请介绍当前业务场景和可用能力',
@@ -214,12 +253,12 @@ function goBack() {
   void router.push({ name: 'agents', query: { scenario_id: scenarioId || undefined } })
 }
 
-// ── 附件：从消息内容中提取 save_deliverable 生成的下载链接 ──
+// ── 附件：优先读取工具结果中的结构化 artifact，旧消息再回退到下载链接 ──
 const ATTACH_RE = /\/api\/data-sources\/files\/([a-f0-9]{32})\/download/g
-function extractAttachments(content: string): { id: string; filename: string; url: string }[] {
+function extractAttachments(content: string): ArtifactAttachment[] {
   if (!content) return []
   const seen = new Set<string>()
-  const out: { id: string; filename: string; url: string }[] = []
+  const out: ArtifactAttachment[] = []
   let m: RegExpExecArray | null
   ATTACH_RE.lastIndex = 0
   while ((m = ATTACH_RE.exec(content))) {
@@ -231,21 +270,230 @@ function extractAttachments(content: string): { id: string; filename: string; ur
     let filename = linkMatch ? linkMatch[1].replace(/^[📎📄\s]+/, '') : ''
     if (!filename) {
       const before = content.slice(0, m.index)
-      const nameMatch = before.match(/([^\s\[\]()（）]+\.md|([^\s\[\]()（）]+\.txt))\s*\]\(\s*$/)
+      const nameMatch = before.match(/([^\s\[\]()（）]+\.(?:docx|xlsx|md|markdown|txt|csv|pdf))\s*\]\(\s*$/i)
       filename = nameMatch ? nameMatch[1] : `附件-${id.slice(0, 8)}`
     }
-    out.push({ id, filename, url: `/api/data-sources/files/${id}/download` })
+    out.push({ id, filename, format: filename.split('.').pop()?.toLowerCase(), url: `/api/data-sources/files/${id}/download` })
   }
   return out
+}
+
+function parsedToolResult(value: unknown): any {
+  if (typeof value !== 'string') return value
+  try { return JSON.parse(value) } catch { return value }
+}
+
+function extractMessageAttachments(message: ChatViewMessage): ArtifactAttachment[] {
+  const structured = (message.tool_calls || [])
+    .map((tool: any) => actionArtifactAttachment(tool))
+    .filter((item): item is ArtifactAttachment => Boolean(item))
+  const legacy = extractAttachments(message.content || '')
+  const unique = new Map<string, ArtifactAttachment>()
+  for (const item of [...structured, ...legacy]) if (!unique.has(item.id)) unique.set(item.id, item)
+  return [...unique.values()]
+}
+
+function actionPreviewOf(toolCall: any): any | null {
+  const result = parsedToolResult(toolCall?.result)
+  if (
+    result && typeof result === 'object'
+    && result.status === 'dry_run'
+    && result.log_id
+    && result.correlation_id
+    && result.definition_hash
+    && result.result?.plan?.action_id
+  ) return result
+  return null
+}
+
+function confirmationPreviewOf(toolCall: any): any | null {
+  const result = parsedToolResult(toolCall?.result)
+  if (
+    result && typeof result === 'object'
+    && result.status === 'confirmation_required'
+    && ['event', 'workflow'].includes(result.confirmation_type)
+    && result.log_id
+    && result.correlation_id
+    && result.environment
+    && result.definition_hash
+    && result.result?.plan?.confirmation_type === result.confirmation_type
+  ) return result
+  return null
+}
+
+function confirmationOutcomeOf(toolCall: any): any | null {
+  const result = parsedToolResult(toolCall?.result)
+  const succeeded = result?.status === 'success'
+    || (result?.status === 'idempotent_replay' && result?.original_status === 'success')
+  if (
+    succeeded
+    && ['event', 'workflow'].includes(result?.confirmation_type)
+    && result?.log_id
+    && result?.parent_preview_log_id
+  ) return result
+  return null
+}
+
+function confirmationLabel(preview: any) {
+  return preview?.confirmation_type === 'event' ? '发布事件' : '提交工作流'
+}
+
+function confirmationTitle(preview: any) {
+  const plan = preview?.result?.plan || {}
+  return preview?.confirmation_type === 'event'
+    ? plan.event_name || '业务事件'
+    : plan.workflow_name || '业务工作流'
+}
+
+function confirmationDescription(preview: any) {
+  return preview?.confirmation_type === 'event'
+    ? '定义与载荷已固定；确认后将发布事件，并可能触发订阅工作流。'
+    : '定义与参数已固定；确认后将提交到任务队列，由任务中心跟踪。'
+}
+
+function confirmationTaskId(outcome: any) {
+  return outcome?.result?.workflow_run?.id
+    || outcome?.result?.queued_workflow_run_ids?.[0]
+    || ''
+}
+
+function confirmationOutcomeTitle(outcome: any) {
+  return outcome?.confirmation_type === 'event' ? '事件已发布' : '工作流任务已提交'
+}
+
+function confirmationOutcomeDescription(outcome: any) {
+  if (outcome?.confirmation_type === 'workflow') {
+    const run = outcome?.result?.workflow_run || {}
+    return `${run.workflow_name || '工作流'} · ${run.status === 'queued' ? '已进入队列' : run.status || '已提交'}`
+  }
+  const envelope = outcome?.result?.event_envelope || {}
+  const queued = outcome?.result?.queued_workflow_run_ids || []
+  return `${envelope.name || '业务事件'} · ${queued.length ? `已排队 ${queued.length} 个订阅工作流任务` : '没有命中需排队的订阅工作流'}`
+}
+
+function openConfirmationTask(outcome: any) {
+  const taskId = confirmationTaskId(outcome)
+  if (!taskId) return
+  void router.push({
+    name: 'tasks',
+    query: {
+      task: taskId,
+      scenario_id: agent.value?.scenario_id || undefined,
+      return_to: route.fullPath,
+    },
+  })
+}
+
+function artifactFormatLabel(format?: string) {
+  return ({ docx: 'Word 文档', xlsx: 'Excel 工作簿', markdown: 'Markdown', md: 'Markdown' } as Record<string, string>)[String(format || '').toLowerCase()] || '业务附件'
+}
+
+function formatFileSize(size = 0) {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
+function actionIdempotencyKey() {
+  return globalThis.crypto?.randomUUID?.() || `agent-action-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+async function confirmActionPreview(toolCall: any) {
+  const previewResult = actionPreviewOf(toolCall)
+  if (!previewResult || toolCall._confirming) return
+  const plan = previewResult.result.plan
+  const artifactName = plan.artifact?.filename
+  try {
+    await ElMessageBox.confirm(
+      artifactName
+        ? `确认执行“${plan.action_name}”并生成附件“${artifactName}”？文件会保存到已配置的业务资料库。`
+        : `确认执行“${plan.action_name}”？系统将严格使用预演时固定的定义和参数。`,
+      '确认执行业务操作',
+      { type: 'warning', confirmButtonText: '确认执行', cancelButtonText: '取消' },
+    )
+  } catch { return }
+  toolCall._confirming = true
+  try {
+    const result: any = await api.executeAction(plan.action_id, {
+      params: plan.parameters || {},
+      dry_run: false,
+      confirm: true,
+      idempotency_key: actionIdempotencyKey(),
+      preview_log_id: previewResult.log_id,
+      correlation_id: previewResult.correlation_id,
+      expected_environment: previewResult.environment,
+      expected_definition_snapshot_id: previewResult.definition_snapshot_id || undefined,
+      expected_release_id: previewResult.release_id || undefined,
+      expected_definition_hash: previewResult.definition_hash,
+    })
+    toolCall.result = result
+    toolCall._open = true
+    if (result.status === 'success' || (result.status === 'idempotent_replay' && result.original_status === 'success')) {
+      ElMessage.success(result.result?.artifact ? '附件已按源模板格式生成' : '业务操作已完成')
+    } else {
+      ElMessage.error(result.error || '业务操作未成功完成')
+    }
+  } catch (error: any) {
+    ElMessage.error(error?.message || '确认执行失败，请重新预演')
+  } finally {
+    toolCall._confirming = false
+  }
+}
+
+async function confirmAgentPreview(toolCall: any) {
+  const preview = confirmationPreviewOf(toolCall)
+  const currentAgent = agent.value
+  const conversation = curConv.value
+  if (!preview || toolCall._confirming) return
+  if (!currentAgent?.id || !conversation?.id) {
+    ElMessage.warning('请等待对话保存完成后再确认')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      preview.confirmation_type === 'event'
+        ? `确认发布事件“${confirmationTitle(preview)}”？系统将使用预演时固定的事件定义和载荷，并可能触发订阅工作流。`
+        : `确认提交工作流“${confirmationTitle(preview)}”？系统将使用预演时固定的定义和参数创建任务。`,
+      preview.confirmation_type === 'event' ? '确认发布业务事件' : '确认提交工作流任务',
+      {
+        type: 'warning',
+        confirmButtonText: confirmationLabel(preview),
+        cancelButtonText: '取消',
+      },
+    )
+  } catch { return }
+
+  toolCall._confirming = true
+  try {
+    const result: any = await api.confirmAgentToolPreview(currentAgent.id, preview.log_id, {
+      conversation_id: conversation.id,
+      correlation_id: preview.correlation_id,
+      expected_environment: preview.environment as 'dev' | 'staging' | 'prod',
+      expected_definition_snapshot_id: preview.definition_snapshot_id || undefined,
+      expected_release_id: preview.release_id || undefined,
+      expected_definition_hash: preview.definition_hash,
+    })
+    toolCall.result = result
+    toolCall._open = true
+    if (confirmationOutcomeOf(toolCall)) {
+      ElMessage.success(result.confirmation_type === 'event' ? '事件已发布' : '工作流任务已提交')
+    } else {
+      ElMessage.error(result.error || '确认未成功完成')
+    }
+  } catch (error: any) {
+    ElMessage.error(error?.message || '确认失败，请重新预演')
+  } finally {
+    toolCall._confirming = false
+  }
 }
 
 const previewVisible = ref(false)
 const previewLoading = ref(false)
 const previewText = ref('')
-const previewFile = ref<{ id: string; filename: string; url: string }>({ id: '', filename: '', url: '' })
+const previewFile = ref<ArtifactAttachment>({ id: '', filename: '', url: '' })
 const citationPreview = ref<CitationPreview | null>(null)
 
-async function preview(a: { id: string; filename: string; url: string }) {
+async function preview(a: ArtifactAttachment) {
   previewFile.value = a
   previewVisible.value = true
   previewLoading.value = true
@@ -328,7 +576,7 @@ async function previewCitation(citation: RagCitation) {
   }
 }
 
-async function download(a: { id: string; filename: string; url: string }) {
+async function download(a: ArtifactAttachment) {
   try {
     const resp = await fetch(a.url)
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
@@ -359,6 +607,11 @@ function citationsOf(value: unknown): RagCitation[] {
   ))
 }
 
+function citationOrdinal(citation: RagCitation) {
+  const ordinal = Number(citation.chunk_ordinal)
+  return Number.isInteger(ordinal) && ordinal >= 0 ? ordinal + 1 : 1
+}
+
 function scrollBottom() {
   nextTick(() => {
     if (msgRef.value) msgRef.value.scrollTop = msgRef.value.scrollHeight
@@ -366,7 +619,10 @@ function scrollBottom() {
 }
 
 async function loadAgent() {
-  const loadedAgent = await api.getAgent(route.params.id as string)
+  const requestedId = String(route.params.id || '')
+  const requestId = ++agentLoadRequest
+  const loadedAgent = await api.getAgent(requestedId)
+  if (viewDisposed || requestId !== agentLoadRequest || String(route.params.id || '') !== requestedId) return
   const agentScenarioId = loadedAgent.scenario_id || ''
   if (agentScenarioId && queryValue(route.query.scenario_id) !== agentScenarioId) {
     await router.replace({
@@ -374,14 +630,27 @@ async function loadAgent() {
       params: { id: loadedAgent.id || route.params.id },
       query: { ...route.query, scenario_id: agentScenarioId },
     })
-    return
+    if (viewDisposed || requestId !== agentLoadRequest || String(route.params.id || '') !== requestedId) return
   }
   agent.value = loadedAgent
   void loadConvs()
 }
+
+function streamErrorContent(content: string, error: unknown) {
+  const separator = content ? '\n\n' : ''
+  return `${content}${separator}[错误] ${String(error)}`
+}
 async function loadConvs() {
-  if (!agent.value) return
-  conversations.value = await api.listConversations(agent.value.id!)
+  const currentAgentId = agent.value?.id
+  const requestId = agentLoadRequest
+  if (!currentAgentId) return
+  const loaded = await api.listConversations(currentAgentId)
+  if (
+    viewDisposed
+    || requestId !== agentLoadRequest
+    || agent.value?.id !== currentAgentId
+  ) return
+  conversations.value = loaded
 }
 async function newConv() {
   curConv.value = null
@@ -475,7 +744,7 @@ function handleEvent(ev: { type: string; data: any }, ai: ChatViewMessage) {
       break
     case 'error':
       ai.status = ''
-      ai.content += `\n\n[错误] ${ev.data}`
+      ai.content = streamErrorContent(ai.content, ev.data)
       break
   }
   scrollBottom()
@@ -502,7 +771,20 @@ onMounted(() => {
   document.getElementById('main-content')?.classList.add('agent-chat-active')
   void loadAgent()
 })
+watch(() => route.params.id, (nextId, previousId) => {
+  if (!previousId || nextId === previousId) return
+  ctrl?.abort()
+  ctrl = null
+  agent.value = null
+  conversations.value = []
+  curConv.value = null
+  messages.value = []
+  void loadAgent()
+})
 onBeforeUnmount(() => {
+  viewDisposed = true
+  agentLoadRequest += 1
+  ctrl?.abort()
   document.getElementById('main-content')?.classList.remove('agent-chat-active')
 })
 </script>
@@ -627,7 +909,17 @@ onBeforeUnmount(() => {
   margin-bottom: 4px;
 }
 .tool-card .head { min-height: 44px; }
-.tool-structured-value { max-height: 220px; padding: 8px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.tool-structured-value { padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.agent-action-confirm { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 9px; padding: 9px 10px; border: 1px solid color-mix(in srgb, var(--warning) 38%, var(--border)); border-radius: 9px; background: var(--warning-soft); }
+.agent-action-confirm > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.agent-action-confirm strong { color: var(--text); font-size: 12px; }
+.agent-action-confirm span { color: var(--text-2); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.agent-action-confirm :deep(.el-button) { flex: 0 0 auto; }
+.agent-confirm-outcome { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 9px; padding: 9px 10px; border: 1px solid color-mix(in srgb, var(--success) 34%, var(--border)); border-radius: 9px; background: var(--success-soft); }
+.agent-confirm-outcome > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.agent-confirm-outcome strong { color: var(--text); font-size: 12px; }
+.agent-confirm-outcome span { color: var(--text-2); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.agent-confirm-outcome :deep(.el-button) { flex: 0 0 auto; }
 .citation-sources {
   margin-top: 12px;
   padding: 11px;
@@ -771,8 +1063,6 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
 }
 .preview-box {
-  max-height: 68vh;
-  overflow-y: auto;
   padding: 4px 2px;
 }
 
@@ -788,5 +1078,7 @@ onBeforeUnmount(() => {
   .attach-actions { width: 100%; justify-content: flex-end; }
   .citation-card-head { flex-wrap: wrap; }
   .citation-info { min-width: calc(100% - 42px); }
+  .agent-action-confirm, .agent-confirm-outcome { align-items: stretch; flex-direction: column; }
+  .agent-action-confirm :deep(.el-button), .agent-confirm-outcome :deep(.el-button) { width: 100%; }
 }
 </style>

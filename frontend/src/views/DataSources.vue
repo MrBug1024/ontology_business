@@ -6,6 +6,7 @@
         <div class="sub">接入数据库（MySQL / PostgreSQL / SQLite）或文件桶（Excel / Word / PDF / 图片…）</div>
       </div>
       <div class="data-source-header-actions">
+        <el-button v-if="returnPath" @click="returnToPreviousFlow"><el-icon><ArrowLeft /></el-icon> 返回上一步</el-button>
         <el-select
           v-model="scenarioScope"
           clearable
@@ -61,42 +62,28 @@
             </div>
           </div>
 
-          <!-- 数据库：表 + SQL -->
+          <!-- 数据库表结构；原始 SQL 仅保留为后端管理诊断能力，不向普通业务用户开放。 -->
           <template v-if="selected.type !== 'file_bucket'">
-            <el-tabs v-model="dbTab">
-              <el-tab-pane label="数据表" name="tables">
-                <el-table :data="tables" size="small" max-height="520">
-                  <el-table-column prop="name" label="表名" min-width="160">
-                    <template #default="{ row }"><button type="button" class="table-open mono" @click="openTable(row)">{{ row.name }}</button></template>
-                  </el-table-column>
-                  <el-table-column prop="row_count" label="行数" width="90" align="right" />
-                  <el-table-column label="字段" min-width="220">
-                    <template #default="{ row }">
-                      <el-tag v-for="c in row.columns.slice(0, 5)" :key="c.name" size="small" effect="plain" style="margin:2px">
-                        {{ c.name }}<el-icon v-if="c.pk" class="pk-icon" aria-label="主键" title="主键"><Key /></el-icon>
-                      </el-tag>
-                      <span class="muted" v-if="row.columns.length > 5">+{{ row.columns.length - 5 }}</span>
-                    </template>
-                  </el-table-column>
-                </el-table>
-                <el-button size="small" style="margin-top:10px" @click="loadTables" :loading="loadingTables">
-                  <el-icon><Refresh /></el-icon> 刷新表列表
-                </el-button>
-              </el-tab-pane>
-              <el-tab-pane label="SQL 查询" name="sql">
-                <div style="display:flex;gap:8px;margin-bottom:10px">
-                  <el-input v-model="sql" placeholder="SELECT * FROM orders LIMIT 10" class="mono" @keyup.enter="runSql" />
-                  <el-button type="primary" @click="runSql" :loading="runningSql">执行</el-button>
-                </div>
-                <el-alert v-if="sqlError" :title="sqlError" type="error" :closable="false" style="margin-bottom:10px" />
-                <el-table v-if="sqlResult" :data="sqlRows" size="small" max-height="380" border>
-                  <el-table-column v-for="c in sqlResult.columns" :key="c" :prop="c" :label="c" min-width="110">
-                    <template #default="{ row }"><StructuredValueCell :value="row[c]" /></template>
-                  </el-table-column>
-                </el-table>
-                <div class="muted" v-if="sqlResult" style="margin-top:8px">{{ sqlResult.row_count }} 行 · 只读查询（SELECT）</div>
-              </el-tab-pane>
-            </el-tabs>
+            <section class="database-tables" aria-labelledby="database-tables-title">
+              <h3 id="database-tables-title">数据表</h3>
+              <el-table :data="tables" size="small" max-height="520">
+                <el-table-column prop="name" label="表名" min-width="160">
+                  <template #default="{ row }"><button type="button" class="table-open mono" @click="openTable(row)">{{ row.name }}</button></template>
+                </el-table-column>
+                <el-table-column prop="row_count" label="行数" width="90" align="right" />
+                <el-table-column label="字段" min-width="220">
+                  <template #default="{ row }">
+                    <el-tag v-for="c in row.columns.slice(0, 5)" :key="c.name" size="small" effect="plain" style="margin:2px">
+                      {{ c.name }}<el-icon v-if="c.pk" class="pk-icon" aria-label="主键" title="主键"><Key /></el-icon>
+                    </el-tag>
+                    <span class="muted" v-if="row.columns.length > 5">+{{ row.columns.length - 5 }}</span>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <el-button size="small" style="margin-top:10px" @click="loadTables" :loading="loadingTables">
+                <el-icon><Refresh /></el-icon> 刷新表列表
+              </el-button>
+            </section>
           </template>
 
           <!-- 文件桶 -->
@@ -199,7 +186,7 @@
 
     <!-- 新建/编辑对话框 -->
     <el-dialog v-model="dlg" :title="form.id ? '编辑数据源' : '新建数据源'" width="560px">
-      <el-form :model="form" label-width="90px">
+      <el-form :model="form" label-width="90px" class="data-source-form">
         <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：业务数据库、业务文档桶" /></el-form-item>
         <el-form-item label="所属场景">
           <el-select v-model="form.scenario_id" clearable placeholder="可选" style="width:100%">
@@ -257,19 +244,18 @@
 
     <!-- 文件文本 -->
     <el-dialog v-model="textDlg" :title="textFile" width="720px" top="6vh">
-      <pre class="code" style="max-height:60vh">{{ textContent }}</pre>
+      <pre class="code text-file-preview">{{ textContent }}</pre>
     </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onBeforeUnmount, onMounted, watch } from 'vue'
+import { ref, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { api } from '@/api'
 import type { DataSource, Scenario, TableInfo, BucketFile, RagCitation } from '@/types'
-import StructuredValueCell from '@/components/StructuredValueCell.vue'
 
 const dataSources = ref<DataSource[]>([])
 const scenarios = ref<Scenario[]>([])
@@ -281,31 +267,21 @@ const routeScenarioId = () => {
   const value = route.query.scenario_id
   return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
 }
+function safeReturnPath(value: unknown): string {
+  const candidate = Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
+  if (!candidate.startsWith('/') || candidate.startsWith('//') || candidate.includes('\\')) return ''
+  return candidate
+}
 const scenarioScope = ref(routeScenarioId())
+const returnPath = ref(safeReturnPath(route.query.return_to))
 
 const dlg = ref(false)
 const saving = ref(false)
 const form = ref<Partial<DataSource> & { config: Record<string, any> }>({ type: 'mysql', config: {} })
 
-const dbTab = ref('tables')
 const testing = ref(false)
 const tables = ref<TableInfo[]>([])
 const loadingTables = ref(false)
-const sql = ref('')
-const runningSql = ref(false)
-const sqlError = ref('')
-const sqlResult = ref<{ columns: string[]; rows: any[]; row_count: number } | null>(null)
-const sqlRows = computed<Record<string, unknown>[]>(() => {
-  const result = sqlResult.value
-  if (!result) return []
-  return result.rows.map((row) => {
-    if (Array.isArray(row)) {
-      return Object.fromEntries(result.columns.map((column, index) => [column, row[index]]))
-    }
-    if (row && typeof row === 'object') return row as Record<string, unknown>
-    return { [result.columns[0] || 'value']: row }
-  })
-})
 const tableDlg = ref(false)
 const curTable = ref<TableInfo | null>(null)
 
@@ -328,7 +304,6 @@ let viewDisposed = false
 let loadRequest = 0
 let tableRequest = 0
 let fileRequest = 0
-let sqlRequest = 0
 let searchRequest = 0
 let testRequest = 0
 let textRequest = 0
@@ -379,13 +354,11 @@ async function load() {
 function invalidateDetailRequests() {
   tableRequest += 1
   fileRequest += 1
-  sqlRequest += 1
   searchRequest += 1
   testRequest += 1
   textRequest += 1
   loadingTables.value = false
   loadingFiles.value = false
-  runningSql.value = false
   searching.value = false
   testing.value = false
   tableDlg.value = false
@@ -407,8 +380,6 @@ function select(ds: DataSource, syncRoute = true) {
   selected.value = ds
   tables.value = []
   files.value = []
-  sqlResult.value = null
-  sqlError.value = ''
   searchResults.value = []
   searched.value = false
   searchError.value = ''
@@ -434,24 +405,6 @@ async function loadTables() {
     }
   } finally {
     if (!viewDisposed && request === tableRequest) loadingTables.value = false
-  }
-}
-async function runSql() {
-  const sourceId = selected.value?.id
-  const statement = sql.value.trim()
-  if (!sourceId || !statement) return
-  const request = ++sqlRequest
-  runningSql.value = true
-  sqlError.value = ''
-  sqlResult.value = null
-  try {
-    const result = await api.query(sourceId, statement)
-    if (viewDisposed || request !== sqlRequest || selected.value?.id !== sourceId) return
-    sqlResult.value = result
-  } catch (e: any) {
-    if (!viewDisposed && request === sqlRequest && selected.value?.id === sourceId) sqlError.value = e.message
-  } finally {
-    if (!viewDisposed && request === sqlRequest) runningSql.value = false
   }
 }
 function openTable(t: TableInfo) {
@@ -682,6 +635,10 @@ async function changeScenarioScope(value: string) {
   return
 }
 
+async function returnToPreviousFlow() {
+  if (returnPath.value) await router.push(returnPath.value)
+}
+
 onMounted(() => {
   viewDisposed = false
   void load()
@@ -691,6 +648,9 @@ watch(() => route.query.source_id, (value) => {
   if (!id || id === selected.value?.id) return
   const source = dataSources.value.find((item) => item.id === id)
   if (source) select(source, false)
+})
+watch(() => route.query.return_to, (value) => {
+  returnPath.value = safeReturnPath(value)
 })
 onBeforeUnmount(() => {
   viewDisposed = true
@@ -735,6 +695,7 @@ onBeforeUnmount(() => {
 }
 .ds-icon.file_bucket { background: var(--warning-soft); color: var(--warning); }
 .ds-info { flex: 1; min-width: 0; }
+.ds-info .muted { overflow-wrap: anywhere; }
 .ds-name {
   font-weight: 600;
   margin-bottom: 2px;
@@ -765,9 +726,7 @@ onBeforeUnmount(() => {
 .data-source-detail-card > .card-title {
   flex-wrap: wrap;
 }
-.data-source-detail-card :deep(.el-tabs__content) {
-  overflow: visible;
-}
+.database-tables h3 { margin: 2px 0 12px; color: var(--text); font-size: 14px; }
 .bucket-detail {
   min-width: 0;
 }
@@ -810,6 +769,7 @@ onBeforeUnmount(() => {
 .readonly-note { margin-bottom: 12px; }
 .bucket-empty { padding: 18px 0 24px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.text-file-preview { max-height: none; overflow-x: auto; overflow-y: visible; }
 
 @media (max-width: 767px) {
   .data-sources-page {
@@ -839,5 +799,10 @@ onBeforeUnmount(() => {
   .retrieval-query :deep(.el-button) { min-height: 44px; }
   .data-source-header-actions { width: 100%; align-items: stretch; }
   .data-source-header-actions :deep(.el-select) { min-width: 0; flex: 1; width: auto; }
+  .data-source-form > .el-row { margin-right: 0 !important; margin-left: 0 !important; }
+  .data-source-form > .el-row > .el-col { max-width: 100%; flex: 0 0 100%; padding-right: 0 !important; padding-left: 0 !important; }
+  .data-source-form :deep(.el-form-item) { display: block; }
+  .data-source-form :deep(.el-form-item__label) { width: auto !important; height: auto; justify-content: flex-start; margin-bottom: 6px; padding: 0; line-height: 1.45; }
+  .data-source-form :deep(.el-form-item__content) { margin-left: 0 !important; }
 }
 </style>

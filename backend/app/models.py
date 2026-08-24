@@ -276,6 +276,9 @@ class BusinessScenario(Base):
     data_mappings: Mapped[list[DataMapping]] = relationship(
         back_populates="scenario", cascade="all, delete-orphan"
     )
+    relation_data_mappings: Mapped[list["RelationDataMapping"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
     function_definitions: Mapped[list["FunctionDefinition"]] = relationship(
         back_populates="scenario", cascade="all, delete-orphan"
     )
@@ -331,6 +334,17 @@ class OntologyEntity(Base):
         ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Immutable, machine-facing identity.  ``name`` remains editable display
+    # metadata; compiled definitions and integrations must not key off it.
+    api_name: Mapped[str] = mapped_column(
+        String(100), default=lambda: f"entity_{_uuid()[:12]}", index=True
+    )
+    # Object types are retired non-destructively.  Deprecated definitions and
+    # their historical facts remain in storage, but authoring/read runtimes
+    # exclude them from the active ontology surface.
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", index=True
+    )
     namespace: Mapped[str] = mapped_column(String(180), default="default")
     description: Mapped[str] = mapped_column(Text, default="")
     icon: Mapped[str] = mapped_column(String(50), default="box")
@@ -367,9 +381,16 @@ class OntologyProperty(Base):
         ForeignKey("ontology_entities.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    api_name: Mapped[str] = mapped_column(
+        String(100), default=lambda: f"property_{_uuid()[:12]}", index=True
+    )
     data_type: Mapped[str] = mapped_column(String(50), default="string")
     description: Mapped[str] = mapped_column(Text, default="")
     is_key: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Human-readable object label (Palantir-style title key).  Identity and
+    # display are deliberately separate: a stable code can be the primary key
+    # while a business name is the title shown in graphs and Agent answers.
+    is_title: Mapped[bool] = mapped_column(Boolean, default=False)
     is_required: Mapped[bool] = mapped_column(Boolean, default=False)
     is_enum: Mapped[bool] = mapped_column(Boolean, default=False)
     enum_values: Mapped[list] = mapped_column(JSON, default=list)
@@ -393,6 +414,9 @@ class OntologyRelation(Base):
         ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    api_name: Mapped[str] = mapped_column(
+        String(100), default=lambda: f"relation_{_uuid()[:12]}", index=True
+    )
     namespace: Mapped[str] = mapped_column(String(180), default="default")
     source_entity_id: Mapped[str] = mapped_column(
         ForeignKey("ontology_entities.id", ondelete="CASCADE"), index=True
@@ -400,7 +424,19 @@ class OntologyRelation(Base):
     target_entity_id: Mapped[str] = mapped_column(
         ForeignKey("ontology_entities.id", ondelete="CASCADE"), index=True
     )
-    relation_type: Mapped[str] = mapped_column(String(10), default="1:N")  # 1:1 / 1:N / N:M
+    # A link is navigable from both endpoints.  Display labels can evolve,
+    # while the two API names remain stable integration contracts.
+    source_display_name: Mapped[str] = mapped_column(String(200), default="")
+    source_api_name: Mapped[str] = mapped_column(String(100), default="")
+    target_display_name: Mapped[str] = mapped_column(String(200), default="")
+    target_api_name: Mapped[str] = mapped_column(String(100), default="")
+    # ``none`` is explicit for legacy/manual links with no declared physical
+    # backing. Other values describe the canonical link storage strategy.
+    storage_kind: Mapped[str] = mapped_column(String(32), default="none")
+    relation_type: Mapped[str] = mapped_column(String(10), default="1:N")  # 1:1 / 1:N / N:1 / N:M
+    # Closed, server-normalised relation axioms/cardinality constraints.  The
+    # UI edits these through named fields; arbitrary JSON is never executed.
+    constraints: Mapped[dict] = mapped_column(JSON, default=dict)
     description: Mapped[str] = mapped_column(Text, default="")
 
     scenario: Mapped[BusinessScenario] = relationship(back_populates="relations")
@@ -408,6 +444,9 @@ class OntologyRelation(Base):
     target_entity: Mapped[OntologyEntity] = relationship(foreign_keys=[target_entity_id])
     relation_instances: Mapped[list["RelationInstance"]] = relationship(
         back_populates="relation", cascade="all, delete-orphan"
+    )
+    data_mapping: Mapped["RelationDataMapping | None"] = relationship(
+        back_populates="relation", cascade="all, delete-orphan", uselist=False
     )
 
 
@@ -451,6 +490,14 @@ class RelationInstance(Base):
     """关系实例（Link）：两个实例之间的一条真实关系记录。"""
 
     __tablename__ = "relation_instances"
+    __table_args__ = (
+        UniqueConstraint(
+            "relation_id",
+            "source_instance_id",
+            "target_instance_id",
+            name="uq_relation_instances_edge",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     scenario_id: Mapped[str] = mapped_column(
@@ -466,6 +513,9 @@ class RelationInstance(Base):
         ForeignKey("ontology_instances.id", ondelete="CASCADE"), index=True
     )
     attributes: Mapped[dict] = mapped_column(JSON, default=dict)
+    source: Mapped[str] = mapped_column(String(20), default="manual")
+    source_ref: Mapped[str] = mapped_column(String(500), default="")
+    source_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship(back_populates="relation_instances")
@@ -514,6 +564,16 @@ class DataMapping(Base):
     scenario: Mapped[BusinessScenario] = relationship(back_populates="data_mappings")
     entity: Mapped[OntologyEntity] = relationship()
     data_source: Mapped[DataSource] = relationship()
+    source_relation_mappings: Mapped[list["RelationDataMapping"]] = relationship(
+        foreign_keys="RelationDataMapping.source_mapping_id",
+        back_populates="source_mapping",
+        passive_deletes=True,
+    )
+    target_relation_mappings: Mapped[list["RelationDataMapping"]] = relationship(
+        foreign_keys="RelationDataMapping.target_mapping_id",
+        back_populates="target_mapping",
+        passive_deletes=True,
+    )
 
 
 # ──────────────────────────────────────────────
@@ -562,6 +622,13 @@ class BucketFile(Base):
     """文件桶中的业务文件、解析结果和可追溯检索索引状态。"""
 
     __tablename__ = "bucket_files"
+    __table_args__ = (
+        Index(
+            "uq_bucket_files_generated_action_log",
+            "generated_by_action_log_id",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     data_source_id: Mapped[str] = mapped_column(
@@ -571,6 +638,21 @@ class BucketFile(Base):
     stored_path: Mapped[str] = mapped_column(String(1000), nullable=False)
     size: Mapped[int] = mapped_column(Integer, default=0)
     mime: Mapped[str] = mapped_column(String(200), default="")
+    # Raw-file integrity and generation lineage are durable BucketFile facts,
+    # not merely transient fields in an Action response.  Legacy uploads keep
+    # empty lineage values and are validated compatibly.
+    content_sha256: Mapped[str] = mapped_column(String(64), default="")
+    origin_template_file_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    origin_template_sha256: Mapped[str] = mapped_column(String(64), default="")
+    # Catalog lineage is stored in addition to the legacy source-file lineage.
+    # These identifiers intentionally do not cascade: generated deliverables
+    # remain auditable even after an unreferenced catalog entry is removed.
+    origin_template_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    origin_template_version_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    generated_by_action_log_id: Mapped[str | None] = mapped_column(
+        ForeignKey("action_execution_logs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / parsed / error
     error: Mapped[str] = mapped_column(Text, default="")
     parsed_text: Mapped[str] = mapped_column(Text, default="")
@@ -587,6 +669,93 @@ class BucketFile(Base):
     document_chunks: Mapped[list["DocumentChunk"]] = relationship(
         back_populates="bucket_file", cascade="all, delete-orphan"
     )
+
+
+class ArtifactTemplate(Base):
+    """Tenant-owned, optionally scenario-scoped business artifact template.
+
+    The logical template has a stable identity while every binary revision is
+    immutable and represented by :class:`ArtifactTemplateVersion`.  Actions
+    pin an explicit version and digest instead of following ``current_version``
+    at execution time.
+    """
+
+    __tablename__ = "artifact_templates"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "key", name="uq_artifact_templates_tenant_key"),
+        Index("ix_artifact_templates_tenant_scenario_status", "tenant_id", "scenario_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    scenario_id: Mapped[str | None] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    key: Mapped[str] = mapped_column(String(120), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(500), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
+    current_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("artifact_template_versions.id", ondelete="SET NULL"), nullable=True
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    versions: Mapped[list["ArtifactTemplateVersion"]] = relationship(
+        back_populates="template",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        foreign_keys="ArtifactTemplateVersion.template_id",
+        order_by="ArtifactTemplateVersion.version",
+    )
+    current_version: Mapped["ArtifactTemplateVersion | None"] = relationship(
+        foreign_keys=[current_version_id], post_update=True
+    )
+
+
+class ArtifactTemplateVersion(Base):
+    """Immutable, inspected binary revision of an artifact template."""
+
+    __tablename__ = "artifact_template_versions"
+    __table_args__ = (
+        UniqueConstraint("template_id", "version", name="uq_artifact_template_versions_number"),
+        UniqueConstraint("template_id", "content_sha256", name="uq_artifact_template_versions_hash"),
+        Index("ix_artifact_template_versions_bucket_file", "bucket_file_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    template_id: Mapped[str] = mapped_column(
+        ForeignKey("artifact_templates.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    bucket_file_id: Mapped[str] = mapped_column(
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"), nullable=False
+    )
+    filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    artifact_format: Mapped[str] = mapped_column(String(20), nullable=False)
+    mime: Mapped[str] = mapped_column(String(200), nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    placeholder_paths: Mapped[list] = mapped_column(JSON, default=list)
+    template_metadata: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    version_note: Mapped[str] = mapped_column(String(500), default="")
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    template: Mapped[ArtifactTemplate] = relationship(
+        back_populates="versions", foreign_keys=[template_id]
+    )
+    bucket_file: Mapped[BucketFile] = relationship()
 
 
 class DocumentChunk(Base):
@@ -626,6 +795,58 @@ class DocumentChunk(Base):
     data_source: Mapped[DataSource] = relationship()
 
 
+class RelationDataMapping(Base):
+    """Explicit Link Type data binding; SQL and arbitrary JSON are not accepted."""
+
+    __tablename__ = "relation_data_mappings"
+    __table_args__ = (
+        UniqueConstraint("relation_id", name="uq_relation_data_mappings_relation"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    relation_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_relations.id", ondelete="CASCADE"), index=True
+    )
+    source_mapping_id: Mapped[str] = mapped_column(
+        ForeignKey("data_mappings.id", ondelete="CASCADE"), index=True
+    )
+    target_mapping_id: Mapped[str] = mapped_column(
+        ForeignKey("data_mappings.id", ondelete="CASCADE"), index=True
+    )
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    # For FK modes the server derives these three fields from the carrier
+    # object mapping. For join_table the user selects them from inspected
+    # connector metadata and the server validates them before persistence.
+    data_source_id: Mapped[str] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="CASCADE"), index=True
+    )
+    data_source_binding_key: Mapped[str] = mapped_column(String(180), default="")
+    data_source_binding_ref: Mapped[dict] = mapped_column(JSON, default=dict)
+    table_name: Mapped[str] = mapped_column(String(300), default="")
+    foreign_key_column: Mapped[str] = mapped_column(String(300), default="")
+    source_key_column: Mapped[str] = mapped_column(String(300), default="")
+    target_key_column: Mapped[str] = mapped_column(String(300), default="")
+    status: Mapped[str] = mapped_column(String(20), default="unknown")
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_link_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    scenario: Mapped[BusinessScenario] = relationship(back_populates="relation_data_mappings")
+    relation: Mapped[OntologyRelation] = relationship(back_populates="data_mapping")
+    source_mapping: Mapped[DataMapping] = relationship(
+        foreign_keys=[source_mapping_id], back_populates="source_relation_mappings"
+    )
+    target_mapping: Mapped[DataMapping] = relationship(
+        foreign_keys=[target_mapping_id], back_populates="target_relation_mappings"
+    )
+    data_source: Mapped[DataSource] = relationship()
+
+
 class DataMappingRefreshJob(Base):
     """持久化的数据映射单批刷新任务。
 
@@ -658,6 +879,7 @@ class DataMappingRefreshJob(Base):
     # fields after a release has been selected.
     mapping_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     mapping_fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    relation_mapping_fingerprint: Mapped[str] = mapped_column(String(64), default="")
     # Release provenance for a frozen mapping job.  ``dev`` jobs explicitly
     # retain ``live`` as their source while still carrying mapping_snapshot so
     # queue/retry work cannot drift with later edits.
@@ -1003,6 +1225,9 @@ class Agent(Base):
     )
     system_prompt: Mapped[str] = mapped_column(Text, default="")
     data_source_ids: Mapped[list] = mapped_column(JSON, default=list)
+    # Legacy NULL remains representable for old databases but is interpreted as
+    # explicit-empty. Only an explicitly configured scope may grant tools.
+    capability_scope: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     temperature: Mapped[float] = mapped_column(Float, default=0.2)
     max_tokens: Mapped[int] = mapped_column(Integer, default=4096)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -1049,6 +1274,10 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, default="")
     tool_calls: Mapped[list] = mapped_column(JSON, default=list)
     tool_results: Mapped[list] = mapped_column(JSON, default=list)
+    # A dry-run tool result may be persisted before its SSE answer finishes.
+    # Confirmation is allowed only after this flag becomes true, preventing a
+    # later stream flush from overwriting the confirmed artifact metadata.
+    stream_finalized: Mapped[bool] = mapped_column(Boolean, default=True)
     # Agent 检索到的稳定资料引用。保留 file/chunk/字符偏移，令历史消息仍可追溯原文。
     citations: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -1138,6 +1367,80 @@ class AssistantProposalApplication(Base):
     )
 
 
+class AssistantCompilationJob(Base):
+    """Durable, replayable ownership for one compound model compilation.
+
+    The fingerprint is a hash of the authorised principal and every input that
+    can change compiler output.  Its unique constraint is the cross-worker
+    single-flight boundary: a duplicate request can observe/replay this row but
+    cannot start another provider call chain.
+    """
+
+    __tablename__ = "assistant_compilation_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "request_fingerprint",
+            name="uq_assistant_compilation_jobs_fingerprint",
+        ),
+        Index(
+            "ix_assistant_compilation_jobs_scope_status",
+            "tenant_id",
+            "created_by_user_id",
+            "scenario_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    scenario_id: Mapped[str | None] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    thread_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assistant_threads.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assistant_messages.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Only hashes/versions are retained here.  Raw user text and parsed
+    # attachment text remain in their existing access-controlled records.
+    message_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    attachment_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    llm_config_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    mapping_context_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    execution_policy_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    compiler_version: Mapped[str] = mapped_column(String(80), nullable=False)
+    scenario_baseline: Mapped[str] = mapped_column(String(64), nullable=False)
+    # running / succeeded / failed.  Failed rows remain terminal; a retry must
+    # change a fingerprint input instead of silently spending the same budget.
+    status: Mapped[str] = mapped_column(String(20), default="running", index=True)
+    progress: Mapped[dict] = mapped_column(JSON, default=dict)
+    llm_call_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    llm_calls_used: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
 class AssistantAttachment(Base):
     """助手临时附件：只保存解析后的文本，用户确认后再提升为正式数据源。"""
 
@@ -1157,6 +1460,9 @@ class AssistantAttachment(Base):
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
     mime: Mapped[str] = mapped_column(String(200), default="")
     size: Mapped[int] = mapped_column(Integer, default=0)
+    # Hash the uploaded bytes before parsing so retries key off the actual
+    # attachment content without copying the binary into the job ledger.
+    content_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / parsed / error
     parsed_text: Mapped[str] = mapped_column(Text, default="")
     error: Mapped[str] = mapped_column(Text, default="")
@@ -1273,9 +1579,9 @@ class OntologyAction(Base):
 
     类 Palantir Ontology 的 Action 概念：
     - 输入参数（input_schema）
-    - 执行方式（executor_type: sql / skill / mcp / http / script）
+    - 执行方式（executor_type: sql / skill / mcp / http / script / template）
     - 执行配置（executor_config）
-    - 前置条件 / 后置效果（描述性，供 LLM 理解）
+    - 前置条件 / 后置效果（结构化规则门禁；自然语言遗留值不可执行）
     """
 
     __tablename__ = "ontology_actions"
@@ -1291,13 +1597,14 @@ class OntologyAction(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     # 输入参数 JSON Schema（OpenAI function calling 格式）
     input_schema: Mapped[dict] = mapped_column(JSON, default=dict)
-    # 执行方式: sql / skill / mcp / http / script
+    # 执行方式: sql / skill / mcp / http / script / template
     executor_type: Mapped[str] = mapped_column(String(30), default="sql")
     # 执行配置（按 executor_type 不同结构不同）
     executor_config: Mapped[dict] = mapped_column(JSON, default=dict)
-    # 前置条件（描述性文本，供 LLM 判断）
+    # 可执行前置条件：空值或规则 DSL 的 JSON 字符串。遗留自然语言仅可展示，
+    # capability readiness 会阻止其被当作可执行门禁。
     precondition: Mapped[str] = mapped_column(Text, default="")
-    # 后置效果（描述性文本）
+    # 可验证后置条件使用同一规则 DSL；执行器结果无法验证时 fail closed。
     postcondition: Mapped[str] = mapped_column(Text, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # 执行安全策略：当前权限边界以场景所有权为准，确认和幂等由服务端强制执行。

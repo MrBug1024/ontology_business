@@ -1316,6 +1316,16 @@ def main() -> None:
         _ensure_agent(db, scenario, ds_sqlite, ds_bucket)
         print("  ✅ Agent 已就绪")
 
+        # Keep the reusable demo seed and the current production-style Agent
+        # contract in one idempotent path.  The upgrade adds the AP001 audit
+        # object/link model and native DOCX/XLSX template Actions without
+        # weakening the governed semantic-query boundary.
+        from examples import upgrade_bookkeeping_audit
+
+        print("📎 配置年度审计本体与正式附件模板...")
+        upgrade_bookkeeping_audit.upgrade(db)
+        print("  ✅ AP001 年审查询与附件动作已就绪")
+
         print(f"\n✅ 代理记账业务场景已就绪！")
         print(f"   场景 ID: {scenario.id}")
         print(f"   数据源: {ds_sqlite.name} + {ds_bucket.name}")

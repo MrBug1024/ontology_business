@@ -12,12 +12,14 @@ from sqlalchemy.orm import Session
 
 from app.database import Base
 from app.models import (
+    ActionExecutionLog,
     Agent,
     BusinessScenario,
     LLMConfig,
     OntologyAction,
     OntologyEntity,
     OntologyEvent,
+    OntologyRule,
     OntologyWorkflow,
     Skill,
     Tenant,
@@ -178,6 +180,13 @@ class OperationsRuntimeTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="运营助手",
+            capability_scope={
+                "functions": {"mode": "explicit", "selected_ids": []},
+                "actions": {"mode": "explicit", "selected_ids": []},
+                "rules": {"mode": "explicit", "selected_ids": []},
+                "events": {"mode": "explicit", "selected_ids": []},
+                "workflows": {"mode": "explicit", "selected_ids": [workflow.id]},
+            },
         )
         context = AgentContext(self.db, agent, LLMConfig(name="测试模型"))
 
@@ -373,7 +382,7 @@ class OperationsRuntimeTests(unittest.TestCase):
         operations_service.retry_run(self.db, run)
         self.assertEqual(run.created_by_user_id, retry_user.id)
 
-    def test_automatic_retry_reuses_execution_key_and_does_not_replay_successful_action(self) -> None:
+    def test_unresolved_workflow_action_is_rejected_before_any_side_effect(self) -> None:
         entity = OntologyEntity(id="entity-retry", scenario_id=self.scenario.id, name="订单")
         action = OntologyAction(
             id="action-retry",
@@ -381,6 +390,7 @@ class OperationsRuntimeTests(unittest.TestCase):
             entity_id=entity.id,
             name="外部写入",
             executor_type="http",
+            executor_config={"url": "https://example.test/write", "method": "POST"},
             requires_confirmation=False,
             idempotency_required=True,
         )
@@ -415,30 +425,10 @@ class OperationsRuntimeTests(unittest.TestCase):
         )
         self.db.add_all([entity, action, workflow])
         self.db.commit()
-        run, _ = operations_service.enqueue_workflow_run(self.db, workflow)
-        self.db.commit()
-
-        calls: list[str] = []
-
-        def dispatch(*_args, **_kwargs):
-            calls.append("external-write")
-            return {"ok": True}, []
-
-        first_now = operations_service.utc_now() + timedelta(seconds=1)
-        with patch("app.services.workflow_service._dispatch_executor", side_effect=dispatch):
-            operations_service.process_available_runs(self.db, now=first_now)
-            self.db.refresh(run)
-            self.assertEqual(run.status, "retry_waiting")
-            self.assertEqual(run.execution_key, run.id)
-            retry_at = operations_service._aware(run.available_at)
-            assert retry_at is not None
-            operations_service.process_available_runs(self.db, now=retry_at + timedelta(seconds=1))
-
-        self.db.refresh(run)
-        self.assertEqual(run.status, "failed")
-        # First Action is a durable success; the automatic retry reuses its key
-        # and returns the idempotent record instead of invoking external work.
-        self.assertEqual(calls, ["external-write"])
+        with self.assertRaises(PolicyViolation):
+            operations_service.enqueue_workflow_run(self.db, workflow)
+        self.assertEqual(self.db.query(WorkflowRun).count(), 0)
+        self.assertEqual(self.db.query(ActionExecutionLog).count(), 0)
 
     def test_event_cycle_is_rejected_and_legacy_cycle_is_suppressed_at_runtime(self) -> None:
         event = OntologyEvent(id="event-cycle", scenario_id=self.scenario.id, name="状态已变更")
@@ -538,6 +528,47 @@ class OperationsRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "failed")
         self.assertIn("超时", result["error"])
+
+    def test_workflow_fails_closed_when_referenced_rule_is_disabled(self) -> None:
+        rule = OntologyRule(
+            id="rule-disabled",
+            scenario_id=self.scenario.id,
+            name="停用的业务规则",
+            condition={"field": "risk", "op": ">=", "value": 80},
+            enabled=False,
+        )
+        workflow = OntologyWorkflow(
+            id="workflow-disabled-rule",
+            scenario_id=self.scenario.id,
+            name="不得绕过停用规则",
+            nodes=[
+                {"id": "start", "type": "start", "data": {}},
+                {
+                    "id": "check",
+                    "type": "rule",
+                    "data": {"rule_id": rule.id, "record": {"risk": 90}},
+                },
+                {"id": "end", "type": "end", "data": {}},
+            ],
+            edges=[
+                {"id": "e1", "source": "start", "target": "check", "label": ""},
+                {"id": "e2", "source": "check", "target": "end", "label": "true"},
+                {"id": "e3", "source": "check", "target": "end", "label": "false"},
+            ],
+            status="active",
+            enabled=True,
+        )
+        self.db.add_all([rule, workflow])
+        self.db.commit()
+
+        result = workflow_service.execute_workflow(
+            self.db,
+            workflow,
+            {"risk": 90},
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("规则已停用", result["error"])
 
     def test_native_http_workflow_nodes_are_rejected_and_never_dispatched_by_default(self) -> None:
         nodes, edges = _workflow_nodes("http")

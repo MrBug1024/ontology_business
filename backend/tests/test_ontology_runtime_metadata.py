@@ -158,6 +158,21 @@ class OntologyDefinitionAndRuntimeMetadataTests(unittest.TestCase):
             )["pattern"],
             r"^(ab|cd)-[0-9]+$",
         )
+        fixed = ontology_service.normalize_property_constraints(
+            "string", {"const": "欠薪风险"}
+        )
+        self.assertEqual(fixed, {"const": "欠薪风险"})
+        fixed_property = SimpleNamespace(
+            name="风险类型",
+            data_type="string",
+            is_required=True,
+            is_enum=False,
+            enum_values=[],
+            constraints=fixed,
+        )
+        ontology_service._validate_property_value(fixed_property, "欠薪风险")
+        with self.assertRaisesRegex(ValueError, "必须等于固定值"):
+            ontology_service._validate_property_value(fixed_property, "成本风险")
 
     def test_typed_defaults_are_normalized_and_cannot_bypass_constraints(self) -> None:
         definition = EntityIn(
@@ -376,6 +391,10 @@ class SQLiteMigrationIdempotenceTests(unittest.TestCase):
             {column["name"] for column in inspector.get_columns("data_mappings")},
         )
         self.assertIn(
+            "constraints",
+            {column["name"] for column in inspector.get_columns("ontology_relations")},
+        )
+        self.assertIn(
             "permission_decision",
             {
                 column["name"]
@@ -393,11 +412,15 @@ class SQLiteMigrationIdempotenceTests(unittest.TestCase):
             entity_row = connection.exec_driver_sql(
                 "SELECT name, namespace, state_property FROM ontology_entities WHERE id = 'e-1'"
             ).one()
+            relation_row = connection.exec_driver_sql(
+                "SELECT name, constraints FROM ontology_relations WHERE id = 'r-1'"
+            ).one()
             action_row = connection.exec_driver_sql(
                 "SELECT parameters, result, actor_type, actor_user_id FROM action_execution_logs WHERE id = 'a-1'"
             ).one()
         self.assertEqual(scenario_row, ("不得覆盖", "default"))
         self.assertEqual(entity_row, ("对象", "default", ""))
+        self.assertEqual(relation_row, ("关联", "{}"))
         self.assertEqual(action_row[0], '{"sentinel": 1}')
         self.assertEqual(action_row[1], '{"ok": true}')
         self.assertEqual(action_row[2], "unknown")

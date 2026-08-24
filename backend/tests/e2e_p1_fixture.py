@@ -514,6 +514,16 @@ def main() -> None:
             llm_config_id=llm.id,
             system_prompt="优先引用资料库；只预演操作，绝不直接执行外部副作用。",
             data_source_ids=[bucket_source.id, sql_source.id],
+            capability_scope={
+                "functions": {"mode": "explicit", "selected_ids": []},
+                "actions": {"mode": "explicit", "selected_ids": [action.id]},
+                "rules": {"mode": "explicit", "selected_ids": []},
+                "events": {"mode": "explicit", "selected_ids": [event.id]},
+                "workflows": {
+                    "mode": "explicit",
+                    "selected_ids": [approval_workflow.id, event_workflow.id],
+                },
+            },
             temperature=0.1,
             max_tokens=1024,
         )

@@ -8,7 +8,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.database import Base
-from app.models import BusinessScenario, DataMapping, DataSource, OntologyEntity, Tenant, User
+from app.models import (
+    BusinessScenario,
+    DataMapping,
+    DataSource,
+    OntologyEntity,
+    OntologyProperty,
+    Tenant,
+    User,
+)
 from app.services import connector_service, permission_service, release_service
 
 
@@ -35,7 +43,17 @@ class MappingReleaseBindingTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             name="订单",
         )
-        self.db.add_all([self.tenant, self.user, self.scenario, self.entity])
+        self.key = OntologyProperty(
+            id="property-mapping-release-key",
+            entity_id=self.entity.id,
+            name="订单编号",
+            is_key=True,
+            is_title=True,
+            is_required=True,
+        )
+        self.db.add_all(
+            [self.tenant, self.user, self.scenario, self.entity, self.key]
+        )
         self.db.commit()
         permission_service.ensure_organization(
             self.db, self.tenant.id, owner_user_id=self.user.id

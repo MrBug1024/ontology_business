@@ -1,12 +1,10 @@
 """数据源路由：数据库连接 + 文件桶上传/解析。"""
 from __future__ import annotations
 
-from pathlib import Path
-from urllib.parse import quote
-
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models import BucketFile, DataSource
@@ -26,6 +24,7 @@ from ..services import (
     datasource_service,
     permission_service,
     rag_service,
+    template_catalog_service,
     tenant_service,
 )
 from ..config import get_settings
@@ -110,7 +109,17 @@ def _can_access_data_source(db: Session, ds: DataSource, *, writable: bool = Fal
 
 def _data_source(db: Session, ds_id: str, writable: bool = False) -> DataSource:
     if writable:
-        ds = tenant_service.require_owned(db, DataSource, ds_id, "数据源不存在")
+        ds = db.scalar(
+            select(DataSource)
+            .where(
+                DataSource.id == ds_id,
+                DataSource.tenant_id == tenant_service.current_tenant_id(db),
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if not ds:
+            raise HTTPException(404, "数据源不存在")
     else:
         ds = tenant_service.require_visible(db, DataSource, ds_id, "数据源不存在")
     return _require_data_source_access(db, ds, writable=writable)
@@ -138,6 +147,14 @@ def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_d
         permission_service.require_scenario_permission(db, scenario, "write")
     else:
         permission_service.require_tenant_permission(db, "write")
+    try:
+        template_catalog_service.lock_scenarios_for_template_write(
+            db,
+            tenant_id=tenant_service.current_tenant_id(db),
+            scenario_ids=[payload.scenario_id],
+        )
+    except template_catalog_service.TemplateCatalogError as exc:
+        raise HTTPException(409, str(exc)) from exc
     ds = DataSource(tenant_id=tenant_service.current_tenant_id(db), **payload.model_dump())
     db.add(ds)
     db.commit()
@@ -147,12 +164,35 @@ def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_d
 
 @router.put("/{ds_id}", response_model=DataSourceOut)
 def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(get_tenant_db)):
-    ds = _data_source(db, ds_id, writable=True)
+    observed = tenant_service.require_visible(
+        db, DataSource, ds_id, "数据源不存在"
+    )
+    _require_data_source_access(db, observed, writable=True)
     if payload.scenario_id:
         scenario = tenant_service.require_scenario(db, payload.scenario_id, writable=True)
         permission_service.require_scenario_permission(db, scenario, "write")
     else:
         permission_service.require_tenant_permission(db, "write")
+    try:
+        template_catalog_service.lock_scenarios_for_template_write(
+            db,
+            tenant_id=tenant_service.current_tenant_id(db),
+            scenario_ids=[observed.scenario_id, payload.scenario_id],
+        )
+    except template_catalog_service.TemplateCatalogError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    observed_scope = observed.scenario_id
+    ds = _data_source(db, ds_id, writable=True)
+    if ds.scenario_id != observed_scope:
+        raise HTTPException(409, "数据源场景归属在更新期间已变化，请刷新后重试")
+    if payload.type != ds.type or payload.scenario_id != ds.scenario_id:
+        try:
+            template_catalog_service.assert_data_source_not_registered(db, ds.id)
+        except template_catalog_service.TemplateCatalogError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="已登记模板所在文件桶不能变更类型或场景归属，请先在模板中心解除引用并删除模板",
+            ) from exc
     values = payload.model_dump()
     values["config"] = _merge_config(ds.config or {}, values.get("config", {}))
     for k, v in values.items():
@@ -172,11 +212,22 @@ def delete_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
         connector_service.assert_connector_not_bound(db, "data_source", ds.id)
     except connector_service.ConnectorBindingConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    for f in list(ds.files):
-        datasource_service.delete_bucket_file(f)
+    try:
+        template_catalog_service.assert_data_source_not_registered(db, ds.id)
+    except template_catalog_service.TemplateCatalogError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    stored_paths = [f.stored_path for f in list(ds.files)]
     datasource_service.invalidate_engine(ds)
     db.delete(ds)
-    db.commit()
+    try:
+        # Commit metadata first. FK RESTRICT on registered versions prevents a
+        # concurrent registration from leaving catalog rows with missing bytes.
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "数据源在删除期间被业务资源引用，请刷新后重试") from exc
+    for stored_path in stored_paths:
+        datasource_service.delete_bucket_file_path(stored_path)
     return Msg(message="已删除")
 
 
@@ -299,7 +350,10 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
         content = await uf.read(max_upload_bytes + 1)
         if len(content) > max_upload_bytes:
             raise HTTPException(413, f"文件超过大小限制（{max_upload_bytes // (1024 * 1024)} MB）")
-        bf = datasource_service.save_bucket_file(ds, uf.filename or "file", content)
+        try:
+            bf = datasource_service.save_bucket_file(ds, uf.filename or "file", content)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         db.add(bf)
         db.flush()
         # 文件已可靠落盘；解析与 embedding 由可恢复的后台任务处理，避免阻塞请求。
@@ -340,25 +394,47 @@ def file_download(file_id: str, db: Session = Depends(get_tenant_db)):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
-    _data_source(db, bf.data_source_id)
-    p = Path(bf.stored_path)
-    if not p.exists():
-        raise HTTPException(404, "文件已丢失")
+    ds = _data_source(db, bf.data_source_id)
+    try:
+        p, _actual_size, media_type = datasource_service.validate_bucket_file_for_download(bf, ds)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "文件已丢失") from exc
+    except ValueError as exc:
+        raise HTTPException(409, f"附件完整性校验失败: {exc}") from exc
     return FileResponse(
         p,
-        media_type=bf.mime or "application/octet-stream",
+        media_type=media_type,
         filename=bf.filename,
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(bf.filename)}"},
     )
 
 
 @router.delete("/files/{file_id}", response_model=Msg)
 def delete_file(file_id: str, db: Session = Depends(get_tenant_db)):
-    bf = db.get(BucketFile, file_id)
+    observed = db.get(BucketFile, file_id)
+    if not observed:
+        raise HTTPException(404, "文件不存在")
+    source = _data_source(db, observed.data_source_id, writable=True)
+    bf = db.scalar(
+        select(BucketFile)
+        .where(
+            BucketFile.id == file_id,
+            BucketFile.data_source_id == source.id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
     if not bf:
         raise HTTPException(404, "文件不存在")
-    _data_source(db, bf.data_source_id, writable=True)
-    datasource_service.delete_bucket_file(bf)
+    try:
+        template_catalog_service.assert_bucket_files_not_registered(db, [bf.id])
+    except template_catalog_service.TemplateCatalogError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    stored_path = bf.stored_path
     db.delete(bf)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "文件在删除期间被登记为模板，请刷新后重试") from exc
+    datasource_service.delete_bucket_file_path(stored_path)
     return Msg(message="已删除")

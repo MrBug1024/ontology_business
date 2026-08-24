@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import FunctionDefinition, FunctionRun
+from . import capability_readiness_service
 
 
 class FunctionRuntimeError(ValueError):
@@ -77,6 +78,7 @@ def _coordinates(value: Any) -> tuple[float, float]:
 
 def execute_function(function: FunctionDefinition, params: Mapping[str, Any]) -> dict[str, Any]:
     """Evaluate one allowlisted built-in runtime without external side effects."""
+    capability_readiness_service.require_executable("function", function)
     if not isinstance(params, Mapping):
         raise FunctionRuntimeError("函数参数必须是对象")
     _required_input(function.input_schema or {}, params)
@@ -156,9 +158,14 @@ def create_function_run(
     scenario_id: str,
     user_id: str | None,
     idempotency_key: str | None = None,
+    definition_hash: str | None = None,
 ) -> FunctionRun:
     """Persist one invocation and replay an existing idempotent result."""
-    scope = f"function:{function.id}:{function.updated_at.isoformat()}"
+    version = str(definition_hash or "").strip()
+    if not version:
+        updated_at = getattr(function, "updated_at", None)
+        version = updated_at.isoformat() if updated_at is not None else "unversioned"
+    scope = f"function:{function.id}:{version}"[:80]
     if idempotency_key:
         existing = db.execute(
             select(FunctionRun).where(

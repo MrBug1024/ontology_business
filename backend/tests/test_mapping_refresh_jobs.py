@@ -13,6 +13,7 @@ from app import database
 from app.database import Base
 from app.models import (
     BusinessScenario,
+    ConnectorBinding,
     DataMapping,
     DataMappingRefreshJob,
     DataSource,
@@ -194,7 +195,7 @@ class MappingRefreshJobTests(unittest.TestCase):
         self.assertEqual(stored.instances_created, 0)
         self.assertEqual(self.mapping.status, "ok")
 
-    def test_worker_uses_frozen_job_mapping_when_live_definition_drifts(self) -> None:
+    def test_dev_worker_cancels_when_live_definition_drifts(self) -> None:
         job = self._enqueue()
         self.mapping.column_map = {"id": "id"}
         self.db.commit()
@@ -205,14 +206,13 @@ class MappingRefreshJobTests(unittest.TestCase):
             mapping_refresh_service.process_mapping_refresh_jobs(self.db)
         stored = self.db.get(DataMappingRefreshJob, job.id)
         assert stored is not None
-        self.assertEqual(stored.status, "succeeded")
+        self.assertEqual(stored.status, "cancelled")
         self.assertEqual(self.mapping.status, "unknown")
-        self.assertIn('"orders"', query.call_args.args[1])
+        query.assert_not_called()
         imported = self.db.scalar(
             select(OntologyInstance).where(OntologyInstance.entity_id == self.entity.id)
         )
-        assert imported is not None
-        self.assertEqual(imported.attributes, {"id": "ORD-FROZEN", "amount": 42})
+        self.assertIsNone(imported)
 
     def test_staging_job_and_preview_use_frozen_release_mapping_and_connector_pin(self) -> None:
         release = self._publish_mapping_to_staging()
@@ -443,6 +443,18 @@ class MappingRefreshJobTests(unittest.TestCase):
             self.db,
         )
         self.assertEqual(saved.id, self.mapping.id)
+        self.assertTrue(saved.data_source_binding_key)
+        dev_binding = self.db.scalar(
+            select(ConnectorBinding).where(
+                ConnectorBinding.scenario_id == self.scenario.id,
+                ConnectorBinding.environment == "dev",
+                ConnectorBinding.binding_key == saved.data_source_binding_key,
+            )
+        )
+        self.assertIsNotNone(dev_binding)
+        assert dev_binding is not None
+        self.assertEqual(dev_binding.connector_id, self.source.id)
+        self.assertEqual(dev_binding.health_status, "healthy")
         self.assertEqual(
             len(
                 self.db.scalars(
@@ -461,6 +473,9 @@ class MappingRefreshJobTests(unittest.TestCase):
             mapping_refresh_service.process_mapping_refresh_jobs(self.db)
 
         self.assertEqual(self.db.get(DataMappingRefreshJob, refreshed.id).status, "succeeded")
+        self.assertTrue(
+            self.db.get(DataMappingRefreshJob, refreshed.id).connector_audit[0]["managed"]
+        )
         instances = self.db.scalars(
             select(OntologyInstance).where(OntologyInstance.entity_id == self.entity.id)
         ).all()
@@ -575,6 +590,42 @@ class MappingRefreshJobTests(unittest.TestCase):
         assert stored is not None
         self.assertEqual(stored.status, "cancelled")
         self.assertIsNone(self.db.get(OntologyInstance, "instance-cancelled-after-import"))
+
+    def test_post_import_definition_drift_is_rechecked_before_commit(self) -> None:
+        job = self._enqueue()
+
+        def write_then_change_definition(*_args, **_kwargs):
+            self.db.add(
+                OntologyInstance(
+                    id="instance-definition-drift",
+                    scenario_id=self.scenario.id,
+                    entity_id=self.entity.id,
+                    name="不应提交",
+                    attributes={"id": "ORD-DRIFT"},
+                    source="imported",
+                )
+            )
+            self.key.is_title = True
+            self.db.flush()
+            return {
+                "instances_created": 1,
+                "instances_updated": 0,
+                "relations_created": 0,
+                "rows_scanned": 1,
+            }
+
+        with patch(
+            "app.services.mapping_refresh_service.ontology_service.import_instances_from_mapping",
+            side_effect=write_then_change_definition,
+        ):
+            mapping_refresh_service.process_mapping_refresh_jobs(self.db)
+
+        stored = self.db.get(DataMappingRefreshJob, job.id)
+        assert stored is not None
+        self.assertEqual(stored.status, "cancelled")
+        self.assertIsNone(
+            self.db.get(OntologyInstance, "instance-definition-drift")
+        )
 
     def test_disabled_requester_cancels_job_without_owner_fallback(self) -> None:
         job = self._enqueue()

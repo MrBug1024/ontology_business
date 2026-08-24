@@ -29,6 +29,7 @@ const router = createRouter({
     { path: '/scenarios', name: 'scenarios', component: () => import('@/views/Scenarios.vue'), meta: { title: '业务场景' } },
     { path: '/scenarios/:id', name: 'scenario-detail', component: () => import('@/views/ScenarioDetail.vue'), meta: { title: '场景建模' } },
     { path: '/data-sources', name: 'data-sources', component: () => import('@/views/DataSources.vue'), meta: { title: '数据源接入' } },
+    { path: '/templates', name: 'templates', component: () => import('@/views/Templates.vue'), meta: { title: '模板中心' } },
     { path: '/agents', name: 'agents', component: () => import('@/views/Agents.vue'), meta: { title: 'Agent' } },
     { path: '/agents/:id/chat', name: 'agent-chat', component: () => import('@/views/AgentChat.vue'), meta: { title: 'AI 对话' } },
     { path: '/tasks', name: 'tasks', component: () => import('@/views/Tasks.vue'), meta: { title: '任务中心' } },

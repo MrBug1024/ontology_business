@@ -264,6 +264,13 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
                 name="订单助手",
                 scenario_id=self.scenario.id,
                 data_source_ids=[],
+                capability_scope={
+                    "functions": {"mode": "explicit", "selected_ids": [created.json()["id"]]},
+                    "actions": {"mode": "explicit", "selected_ids": []},
+                    "rules": {"mode": "explicit", "selected_ids": []},
+                    "events": {"mode": "explicit", "selected_ids": []},
+                    "workflows": {"mode": "explicit", "selected_ids": []},
+                },
             )
             db.add(agent)
             db.flush()

@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ──────────────────────────────────────────────
@@ -68,9 +68,11 @@ class AuthMessage(Msg):
 # ──────────────────────────────────────────────
 class PropertyIn(BaseModel):
     name: str
+    api_name: str = Field(default="", max_length=100)
     data_type: str = "string"
     description: str = ""
     is_key: bool = False
+    is_title: bool = False
     is_required: bool = False
     is_enum: bool = False
     enum_values: list[str] = []
@@ -81,6 +83,8 @@ class PropertyIn(BaseModel):
 
 class EntityIn(BaseModel):
     name: str
+    api_name: str = Field(default="", max_length=100)
+    lifecycle_status: Literal["active", "deprecated"] = "active"
     namespace: str = Field(default="", max_length=180)
     description: str = ""
     icon: str = "box"
@@ -94,16 +98,45 @@ class EntityOut(EntityIn):
     id: str
     scenario_id: str
     created_at: datetime
+    model_ready: bool = False
+    model_issues: list[str] = []
 
     model_config = {"from_attributes": True}
 
 
+class RelationConstraintsIn(BaseModel):
+    """Closed relation-axiom vocabulary exposed as ordinary form fields."""
+
+    symmetric: bool = False
+    transitive: bool = False
+    irreflexive: bool = False
+    asymmetric: bool = False
+    antisymmetric: bool = False
+    acyclic: bool = False
+    inverse_relation_id: str = Field(default="", max_length=32)
+    source_min_cardinality: int | None = Field(default=None, ge=0)
+    source_max_cardinality: int | None = Field(default=None, ge=0)
+    target_min_cardinality: int | None = Field(default=None, ge=0)
+    target_max_cardinality: int | None = Field(default=None, ge=0)
+
+    model_config = {"extra": "forbid"}
+
+
 class RelationIn(BaseModel):
     name: str
+    api_name: str = Field(default="", max_length=100)
     namespace: str = Field(default="", max_length=180)
     source_entity_id: str
     target_entity_id: str
+    source_display_name: str = Field(default="", max_length=200)
+    source_api_name: str = Field(default="", max_length=100)
+    target_display_name: str = Field(default="", max_length=200)
+    target_api_name: str = Field(default="", max_length=100)
+    # ``None`` means an older client omitted the field.  Creation resolves it
+    # to ``none``; update preserves the persisted strategy.
+    storage_kind: Literal["foreign_key", "join_table", "object_backed", "none"] | None = None
     relation_type: str = "1:N"
+    constraints: RelationConstraintsIn = Field(default_factory=RelationConstraintsIn)
     description: str = ""
 
 
@@ -173,6 +206,9 @@ class RelationInstanceOut(RelationInstanceIn):
     relation_name: str = ""
     source_instance_name: str = ""
     target_instance_name: str = ""
+    source: str = "manual"
+    source_ref: str = ""
+    source_metadata: dict = Field(default_factory=dict)
     created_at: datetime
 
 
@@ -264,6 +300,7 @@ class DataMappingFieldPreviewOut(BaseModel):
     property_name: str
     data_type: str = "string"
     is_key: bool = False
+    is_title: bool = False
     is_required: bool = False
     source_column: str = ""
     source_exists: bool = False
@@ -293,6 +330,59 @@ class DataMappingPreviewOut(BaseModel):
 class DataMappingTestOut(DataMappingPreviewOut):
     status: str = "unknown"
     checked_at: datetime
+
+
+class RelationDataMappingIn(BaseModel):
+    relation_id: str
+    source_mapping_id: str
+    target_mapping_id: str
+    mode: Literal["source_fk", "target_fk", "join_table"]
+    foreign_key_column: str = Field(default="", max_length=300)
+    join_data_source_id: str = Field(default="", max_length=32)
+    join_table_name: str = Field(default="", max_length=300)
+    source_key_column: str = Field(default="", max_length=300)
+    target_key_column: str = Field(default="", max_length=300)
+
+    model_config = {"extra": "forbid"}
+
+
+class RelationDataMappingOut(BaseModel):
+    id: str
+    scenario_id: str
+    relation_id: str
+    relation_name: str = ""
+    source_mapping_id: str
+    source_entity_name: str = ""
+    target_mapping_id: str
+    target_entity_name: str = ""
+    mode: Literal["source_fk", "target_fk", "join_table"]
+    data_source_id: str
+    data_source_name: str = ""
+    table_name: str
+    foreign_key_column: str = ""
+    source_key_column: str = ""
+    target_key_column: str = ""
+    status: str = "unknown"
+    last_error: str = ""
+    last_checked_at: datetime | None = None
+    last_refreshed_at: datetime | None = None
+    last_link_count: int = 0
+    created_at: datetime
+
+
+class RelationDataMappingPreviewOut(BaseModel):
+    ok: bool
+    message: str
+    mode: Literal["source_fk", "target_fk", "join_table"]
+    relation_name: str = ""
+    source_entity_name: str = ""
+    target_entity_name: str = ""
+    data_source_id: str = ""
+    data_source_name: str = ""
+    table_name: str = ""
+    available_columns: list[str] = []
+    errors: list[str] = []
+    warnings: list[str] = []
 
 
 class DataMappingRefreshOut(BaseModel):
@@ -333,6 +423,7 @@ class DataMappingRefreshJobOut(BaseModel):
     release_id: str | None = None
     definition_hash: str = ""
     definition_source: str = "live"
+    relation_mapping_fingerprint: str = ""
     error: str = ""
     created_at: datetime
     updated_at: datetime
@@ -406,6 +497,7 @@ class ScenarioDetail(ScenarioOut):
     instances: list[InstanceOut] = []
     relation_instances: list[RelationInstanceOut] = []
     mappings: list[DataMappingOut] = []
+    relation_mappings: list[RelationDataMappingOut] = []
     functions: list[FunctionDefinitionOut] = []
     actions: list["ActionOut"] = []
     rules: list["RuleOut"] = []
@@ -442,6 +534,12 @@ class BucketFileOut(BaseModel):
     filename: str
     size: int
     mime: str
+    content_sha256: str = ""
+    origin_template_file_id: str | None = None
+    origin_template_sha256: str = ""
+    origin_template_id: str | None = None
+    origin_template_version_id: str | None = None
+    generated_by_action_log_id: str | None = None
     status: str
     error: str = ""
     index_status: str = "pending"
@@ -452,6 +550,81 @@ class BucketFileOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class ArtifactTemplateRegisterIn(BaseModel):
+    """Register an existing file-bucket object as version 1 of a template."""
+
+    file_id: str = Field(min_length=1, max_length=32)
+    scenario_id: str | None = Field(default=None, max_length=32)
+    name: str = Field(min_length=1, max_length=200)
+    purpose: str = Field(default="", max_length=500)
+    description: str = ""
+    key: str = Field(default="", max_length=120)
+    version_note: str = Field(default="", max_length=500)
+
+
+class ArtifactTemplateVersionRegisterIn(BaseModel):
+    file_id: str = Field(min_length=1, max_length=32)
+    version_note: str = Field(default="", max_length=500)
+    set_current: bool = True
+
+
+class ArtifactTemplateUpdateIn(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    purpose: str | None = Field(default=None, max_length=500)
+    description: str | None = None
+    key: str | None = Field(default=None, min_length=1, max_length=120)
+    scenario_id: str | None = Field(default=None, max_length=32)
+    current_version_id: str | None = Field(default=None, max_length=32)
+
+
+class ArtifactTemplateVersionOut(BaseModel):
+    id: str
+    version: int
+    bucket_file_id: str
+    data_source_id: str
+    filename: str
+    artifact_format: Literal["docx", "xlsx", "markdown"]
+    mime: str
+    size: int
+    sha256: str
+    placeholder_paths: list[str] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
+    version_note: str = ""
+    created_at: datetime
+
+
+class ArtifactTemplateReferenceOut(BaseModel):
+    action_id: str
+    action_name: str
+    scenario_id: str
+    scenario_name: str = ""
+    entity_name: str = ""
+    uses_current: bool = False
+    pinned_version: int | None = None
+
+
+class ArtifactTemplateSummaryOut(BaseModel):
+    id: str
+    key: str
+    scenario_id: str | None = None
+    name: str
+    purpose: str = ""
+    description: str = ""
+    status: Literal["active", "deprecated"]
+    current_version_id: str | None = None
+    current_version: ArtifactTemplateVersionOut | None = None
+    version_count: int = 0
+    reference_count: int = 0
+    deletable: bool = True
+    created_at: datetime
+    updated_at: datetime
+
+
+class ArtifactTemplateDetailOut(ArtifactTemplateSummaryOut):
+    versions: list[ArtifactTemplateVersionOut] = Field(default_factory=list)
+    references: list[ArtifactTemplateReferenceOut] = Field(default_factory=list)
 
 
 class TableInfo(BaseModel):
@@ -656,13 +829,70 @@ class MCPToolInfo(BaseModel):
 # ──────────────────────────────────────────────
 # Agent
 # ──────────────────────────────────────────────
+class AgentCapabilitySelection(BaseModel):
+    mode: Literal["all", "explicit"] = "explicit"
+    selected_ids: list[str] = Field(default_factory=list, max_length=500)
+
+    @field_validator("selected_ids")
+    @classmethod
+    def validate_selected_ids(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for item in value:
+            resource_id = str(item).strip()
+            if not resource_id or len(resource_id) > 32:
+                raise ValueError("能力 id 必须是 1 到 32 个字符")
+            if resource_id not in normalized:
+                normalized.append(resource_id)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_mode_contract(self):
+        if self.mode == "all" and self.selected_ids:
+            raise ValueError("全部模式不能同时提交 selected_ids")
+        return self
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentCapabilityScope(BaseModel):
+    functions: AgentCapabilitySelection = Field(default_factory=AgentCapabilitySelection)
+    actions: AgentCapabilitySelection = Field(default_factory=AgentCapabilitySelection)
+    rules: AgentCapabilitySelection = Field(default_factory=AgentCapabilitySelection)
+    events: AgentCapabilitySelection = Field(default_factory=AgentCapabilitySelection)
+    workflows: AgentCapabilitySelection = Field(default_factory=AgentCapabilitySelection)
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentCapabilityReadinessItem(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    executable: bool = False
+    blocked_reasons: list[str] = Field(default_factory=list)
+
+
+class AgentCapabilitySummary(BaseModel):
+    mode: Literal["all", "explicit"] = "explicit"
+    available_count: int = 0
+    selected_count: int = 0
+    executable_count: int = 0
+    blocked_count: int = 0
+    blocked_reasons: list[str] = Field(default_factory=list)
+    items: list[AgentCapabilityReadinessItem] = Field(default_factory=list)
+
+
 class AgentIn(BaseModel):
     name: str
     description: str = ""
     scenario_id: Optional[str] = None
     llm_config_id: Optional[str] = None
     system_prompt: str = ""
-    data_source_ids: list[str] = []
+    data_source_ids: list[str] = Field(default_factory=list)
+    # None is accepted only for update compatibility. The create route turns
+    # omission into an explicit empty scope; legacy database NULL is never
+    # produced by a new API request.
+    capability_scope: AgentCapabilityScope | None = None
     temperature: float = Field(default=0.2, ge=0, le=2)
     max_tokens: int = Field(default=4096, ge=256, le=32768)
 
@@ -674,6 +904,8 @@ class AgentOut(AgentIn):
     scenario_name: str = ""
     llm_name: str = ""
     data_source_names: list[str] = []
+    capability_scope_legacy: bool = False
+    capability_summary: dict[str, AgentCapabilitySummary] = Field(default_factory=dict)
 
     model_config = {"from_attributes": True}
 
@@ -807,6 +1039,12 @@ class AssistantChatRequest(BaseModel):
     path: str = ""
     selection: dict = Field(default_factory=dict)
     attachment_ids: list[str] = Field(default_factory=list)
+    # Per-request routing is optional; an empty value keeps the platform's
+    # configured default.  Skills/MCPs are selected by stable IDs and are
+    # re-checked against the current tenant before being added to context.
+    llm_config_id: str | None = None
+    skill_ids: list[str] = Field(default_factory=list, max_length=50)
+    mcp_ids: list[str] = Field(default_factory=list, max_length=50)
     # The assistant may answer or prepare a reviewed change set. Effects are
     # deliberately executed only through the explicit Action/task flows.
     # ``ask`` is kept for existing clients.  The four explicit modes make the
@@ -814,10 +1052,15 @@ class AssistantChatRequest(BaseModel):
     # draft may only prepare a Change Set, and apply/execute in chat merely
     # guide the user to the separately governed confirmation/execution flows.
     mode: Literal["ask", "explain", "draft", "apply", "execute"] = "ask"
+    # Draft routing is explicit so a full implementation document cannot be
+    # accidentally reduced to a single ontology/workflow draft by keywords.
+    draft_kind: Literal[
+        "auto", "scenario", "ontology", "mapping", "workflow", "scenario_model"
+    ] = "auto"
 
 
 class AssistantProposalApplyRequest(BaseModel):
-    kind: Literal["scenario", "ontology", "mapping", "workflow"]
+    kind: Literal["scenario", "ontology", "mapping", "workflow", "scenario_model"]
     # ``scenario`` proposals originate from a global assistant thread and do
     # not have a scenario id until they are explicitly applied.  Every other
     # proposal kind remains scenario-bound and is checked at the write edge.
@@ -861,6 +1104,37 @@ class AssistantReplyOut(BaseModel):
     action_preview: dict = Field(default_factory=dict)
 
 
+class AssistantCompilationJobStatusOut(BaseModel):
+    """Public recovery status without execution fingerprints or raw errors."""
+
+    id: str
+    thread_id: str | None = None
+    scenario_id: str | None = None
+    status: Literal["running", "succeeded", "failed"]
+    progress: dict = Field(default_factory=dict)
+    llm_calls_used: int = 0
+    llm_call_budget: int = 0
+    result_ready: bool = False
+    error_code: str = ""
+    error_message: str = ""
+    started_at: datetime
+    completed_at: datetime | None = None
+    updated_at: datetime
+
+
+class AssistantCompilationJobResultOut(BaseModel):
+    """Server-owned proposal recovery descriptor for a succeeded job."""
+
+    job_id: str
+    thread_id: str | None = None
+    scenario_id: str | None = None
+    status: Literal["succeeded"] = "succeeded"
+    proposal: dict = Field(default_factory=dict)
+    proposal_thread_id: str | None = None
+    proposal_message_id: str | None = None
+    apply_ready: bool = False
+
+
 # ──────────────────────────────────────────────
 # 本体扩展：操作 / 规则 / 事件 / 工作流
 # ──────────────────────────────────────────────
@@ -869,7 +1143,7 @@ class ActionIn(BaseModel):
     name: str
     description: str = ""
     input_schema: dict = Field(default_factory=dict)
-    executor_type: Literal["sql", "skill", "mcp", "http", "script"] = "sql"
+    executor_type: Literal["unbound", "sql", "skill", "mcp", "http", "script", "template"] = "sql"
     executor_config: dict = Field(default_factory=dict)
     precondition: str = ""
     postcondition: str = ""
@@ -1001,6 +1275,21 @@ class ActionExecuteRequest(BaseModel):
     expected_definition_snapshot_id: str | None = Field(default=None, max_length=32)
     expected_release_id: str | None = Field(default=None, max_length=32)
     expected_definition_hash: str | None = Field(default=None, max_length=64)
+
+
+class AgentToolConfirmationRequest(BaseModel):
+    """Confirm one server-issued Agent preview without accepting its parameters."""
+
+    conversation_id: str = Field(min_length=1, max_length=32)
+    correlation_id: str = Field(min_length=1, max_length=64)
+    expected_environment: Literal["dev", "staging", "prod"]
+    expected_definition_snapshot_id: str | None = Field(default=None, max_length=32)
+    expected_release_id: str | None = Field(default=None, max_length=32)
+    expected_definition_hash: str = Field(min_length=1, max_length=64)
+
+    # In particular, reject browser-supplied params/payload/target ids.  The
+    # confirmation service reads all effect-bearing values from the preview.
+    model_config = {"extra": "forbid"}
 
 
 class WorkflowExecuteRequest(BaseModel):

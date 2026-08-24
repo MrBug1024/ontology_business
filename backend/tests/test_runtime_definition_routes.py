@@ -7,6 +7,7 @@ definition fields and durable provenance must come from the released snapshot.
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -27,6 +28,7 @@ from app.models import (
     OntologyBranch,
     OntologyEntity,
     OntologyEvent,
+    OntologyProperty,
     OntologyRelation,
     OntologyRelease,
     OntologyRule,
@@ -37,7 +39,7 @@ from app.models import (
     WorkflowRun,
 )
 from app.routers import scenarios as scenarios_router
-from app.services import permission_service, release_service
+from app.services import connector_service, permission_service, release_service
 from app.services.auth_service import get_current_user
 
 
@@ -78,6 +80,14 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 scenario_id=self.scenario.id,
                 name="订单",
             )
+            self.key = OntologyProperty(
+                id="property-runtime-key",
+                entity_id=self.entity.id,
+                name="订单编号",
+                is_key=True,
+                is_title=True,
+                is_required=True,
+            )
             self.source = DataSource(
                 id="source-runtime",
                 tenant_id=self.tenant.id,
@@ -91,6 +101,8 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 scenario_id=self.scenario.id,
                 entity_id=self.entity.id,
                 data_source_id=self.source.id,
+                data_source_binding_key="runtime-orders",
+                data_source_binding_ref={"adapter": "sqlite"},
                 table_name="orders",
                 column_map={},
             )
@@ -107,9 +119,13 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 entity_id=self.entity.id,
                 name="发布版操作 A",
                 executor_type="sql",
-                # A dry run with no direct data-source configuration has no
-                # external side effect, while still exercising action planning.
-                executor_config={"sql": "SELECT 'release-a'"},
+                # Staging execution must use the governed logical binding even
+                # for a side-effect-free dry run.
+                executor_config={
+                    "sql": "SELECT 'release-a'",
+                    "data_source_binding_key": "runtime-orders",
+                    "data_source_binding_ref": {"adapter": "sqlite"},
+                },
                 requires_confirmation=False,
                 idempotency_required=False,
             )
@@ -131,6 +147,11 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 scenario_id=self.scenario.id,
                 name="发布版工作流 A",
                 trigger_type="manual",
+                nodes=[
+                    {"id": "start", "type": "start", "data": {"label": "开始"}},
+                    {"id": "end", "type": "end", "data": {"label": "结束"}},
+                ],
+                edges=[{"id": "start-end", "source": "start", "target": "end"}],
                 status="active",
                 enabled=True,
             )
@@ -140,6 +161,11 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 name="发布版事件订阅工作流 A",
                 trigger_type="event",
                 trigger_config={"event_id": self.event.id},
+                nodes=[
+                    {"id": "start", "type": "start", "data": {"label": "开始"}},
+                    {"id": "end", "type": "end", "data": {"label": "结束"}},
+                ],
+                edges=[{"id": "start-end", "source": "start", "target": "end"}],
                 status="active",
                 enabled=True,
             )
@@ -149,6 +175,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                     self.user,
                     self.scenario,
                     self.entity,
+                    self.key,
                     self.source,
                     self.mapping,
                     self.relation,
@@ -162,6 +189,24 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
             db.commit()
             permission_service.ensure_organization(
                 db, self.tenant.id, owner_user_id=self.user.id
+            )
+            binding = connector_service.upsert_binding(
+                db,
+                self.scenario,
+                environment="staging",
+                binding_key_value="runtime-orders",
+                kind="data_source",
+                connector_id=self.source.id,
+                created_by_user_id=self.user.id,
+            )
+            # This route test exercises immutable release resolution, not an
+            # external connection probe.  Persist the same checked state a
+            # successful health check would create.
+            binding.health_status = "healthy"
+            binding.health_message = ""
+            binding.checked_at = datetime.now(timezone.utc)
+            binding.connector_signature = connector_service.connector_signature(
+                "data_source", self.source
             )
             db.commit()
         finally:
@@ -212,6 +257,12 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
             db.add(branch)
             db.flush()
             content = release_service.capture_snapshot_content(db, scenario)
+            connector_audit = release_service._require_snapshot_connectors(
+                db,
+                scenario,
+                content,
+                environment="staging",
+            )
             snapshot = OntologySnapshot(
                 id="snapshot-runtime-a",
                 tenant_id=self.tenant.id,
@@ -233,6 +284,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 snapshot_id=snapshot.id,
                 environment="staging",
                 status="released",
+                connector_audit=connector_audit,
                 created_by_user_id=self.user.id,
             )
             db.add(release)

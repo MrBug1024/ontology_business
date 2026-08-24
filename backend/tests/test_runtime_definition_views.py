@@ -14,6 +14,7 @@ from app.models import (
     OntologyAction,
     OntologyBranch,
     OntologyEntity,
+    OntologyProperty,
     OntologyRelease,
     OntologySnapshot,
     OntologyWorkflow,
@@ -52,6 +53,16 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             name="发布对象",
         )
+        self.entity.properties = [
+            OntologyProperty(
+                id="property-runtime-view-key",
+                name="对象编号",
+                data_type="string",
+                is_key=True,
+                is_title=True,
+                is_required=True,
+            )
+        ]
         self.action = OntologyAction(
             id="action-runtime-view",
             scenario_id=self.scenario.id,

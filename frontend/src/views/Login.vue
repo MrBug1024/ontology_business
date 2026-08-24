@@ -232,7 +232,7 @@ async function resend() {
   .intro-copy { margin: 42px 0 0; }
   .intro-copy h1 { font-size: 34px; }
   .intro-copy p, .intro-foot { display: none; }
-  .auth-panel { min-height: calc(100vh - 250px); padding: 30px 18px; }
+  .auth-panel { min-height: calc(100dvh - 250px); padding: 30px 18px max(30px, env(safe-area-inset-bottom)); }
   .auth-card { padding: 32px 24px 28px; }
   .auth-theme { top: 18px; right: 18px; }
 }

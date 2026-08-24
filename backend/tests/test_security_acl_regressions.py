@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
@@ -112,7 +113,8 @@ class SecurityAclRegressionTests(unittest.TestCase):
                 parsed_text="场景机密资料。",
             )
             # A legacy Agent may have been bound while a foreign source was
-            # public.  Once revoked, its historical cited answer must redact.
+            # public. Once revoked, its owner-visible transcript stays fixed,
+            # while the snapshot is excluded from later model replay.
             self.foreign_public_source = DataSource(
                 id="source-security-public",
                 tenant_id=self.foreign_tenant.id,
@@ -450,7 +452,7 @@ class SecurityAclRegressionTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_historic_citation_is_redacted_after_source_revocation(self) -> None:
+    def test_historic_citation_snapshot_persists_after_source_revocation(self) -> None:
         before = self.client.get(f"/api/agents/conversations/{self.conversation.id}/messages")
         self.assertEqual(before.status_code, 200, before.text)
         self.assertIn("REVOKED_SECRET_EXCERPT", before.json()[0]["content"])
@@ -466,18 +468,291 @@ class SecurityAclRegressionTests(unittest.TestCase):
         after = self.client.get(f"/api/agents/conversations/{self.conversation.id}/messages")
         self.assertEqual(after.status_code, 200, after.text)
         message = after.json()[0]
-        self.assertNotIn("REVOKED_SECRET_EXCERPT", after.text)
-        self.assertNotIn("REVOKED_SECRET_EXCERPT", message["content"])
-        self.assertEqual(message["citations"], [])
-        self.assertEqual(message["tool_results"], [])
+        self.assertEqual(message, before.json()[0])
+        self.assertIn("REVOKED_SECRET_EXCERPT", message["content"])
+        self.assertEqual(message["citations"], self.cited_message.citations)
+        self.assertEqual(message["tool_results"], self.cited_message.tool_results)
 
-    def test_legacy_uncited_document_tool_result_is_fail_closed(self) -> None:
+    def test_legacy_uncited_document_snapshot_remains_visible_to_owner(self) -> None:
         response = self.client.get(f"/api/agents/conversations/{self.conversation.id}/messages")
         self.assertEqual(response.status_code, 200, response.text)
         message = next(item for item in response.json() if item["id"] == self.legacy_read_message.id)
-        self.assertNotIn("REVOKED_LEGACY_SECRET", response.text)
+        self.assertIn("REVOKED_LEGACY_SECRET", message["content"])
         self.assertEqual(message["citations"], [])
-        self.assertEqual(message["tool_results"], [])
+        self.assertEqual(message["tool_calls"], self.legacy_read_message.tool_calls)
+        self.assertEqual(message["tool_results"], self.legacy_read_message.tool_results)
+
+    def test_error_answer_is_identical_after_refresh_without_runtime_reauthorization(self) -> None:
+        error_text = "[错误] 年度审计动作执行失败：缺少项目编号。"
+        error_result = json.dumps({
+            "ok": False,
+            "error": {
+                "code": "MISSING_PARAMETER",
+                "message": "缺少项目编号",
+                "retryable": True,
+            },
+        }, ensure_ascii=False)
+        message = Message(
+            id="message-security-durable-error",
+            conversation_id=self.conversation.id,
+            role="assistant",
+            content=error_text,
+            tool_calls=[{
+                "id": "removed-rule-call",
+                "name": "execute_rule",
+                "arguments": {"rule_name": "已删除的年度审计规则"},
+            }],
+            tool_results=[{
+                "id": "removed-rule-call",
+                "name": "execute_rule",
+                "result": error_result,
+            }],
+        )
+        db = self.Session()
+        try:
+            db.add(message)
+            db.commit()
+        finally:
+            db.close()
+
+        # Listing a transcript must not even construct today's mutable runtime
+        # definition. This models both a browser refresh and reopening the
+        # conversation after its Rule/Action was removed.
+        with patch.object(
+            agents,
+            "_authorization_context",
+            side_effect=AssertionError("message listing must not re-authorize runtime resources"),
+        ):
+            first = self.client.get(
+                f"/api/agents/conversations/{self.conversation.id}/messages"
+            )
+            second = self.client.get(
+                f"/api/agents/conversations/{self.conversation.id}/messages"
+            )
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        first_message = next(item for item in first.json() if item["id"] == message.id)
+        second_message = next(item for item in second.json() if item["id"] == message.id)
+        self.assertEqual(first_message, second_message)
+        self.assertEqual(first_message["content"], error_text)
+        self.assertEqual(first_message["tool_calls"], message.tool_calls)
+        self.assertEqual(first_message["tool_results"], message.tool_results)
+
+    def test_stream_exception_persists_exactly_what_the_browser_rendered(self) -> None:
+        partial_content = "已完成年度审计数据汇总。"
+        error_data = "生成审计附件时失败"
+        expected_content = agents._stream_error_content(partial_content, error_data)
+        db = self.Session()
+        try:
+            llm = LLMConfig(
+                id="llm-security-stream-error",
+                tenant_id=self.tenant.id,
+                name="流式错误测试模型",
+                provider="openai",
+                model="test-model",
+                capabilities=["chat", "tool"],
+                enabled=True,
+            )
+            db.get(Agent, self.agent.id).llm_config_id = llm.id
+            db.add(llm)
+            db.commit()
+        finally:
+            db.close()
+
+        def failing_run_agent(*_args, **_kwargs):
+            yield {"type": "token", "data": partial_content}
+            raise RuntimeError(error_data)
+
+        with (
+            patch.object(agents, "SessionLocal", self.Session),
+            patch.object(agents.agent_engine, "run_agent", failing_run_agent),
+        ):
+            streamed = self.client.post(
+                f"/api/agents/{self.agent.id}/chat",
+                json={
+                    "message": "请生成年度审计附件",
+                    "conversation_id": self.conversation.id,
+                },
+            )
+
+        self.assertEqual(streamed.status_code, 200, streamed.text)
+        self.assertIn(partial_content, streamed.text)
+        self.assertIn(error_data, streamed.text)
+
+        first = self.client.get(
+            f"/api/agents/conversations/{self.conversation.id}/messages"
+        )
+        second = self.client.get(
+            f"/api/agents/conversations/{self.conversation.id}/messages"
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        persisted = [
+            item for item in first.json()
+            if item["role"] == "assistant" and item["content"] == expected_content
+        ]
+        self.assertEqual(len(persisted), 1)
+        refreshed = next(item for item in second.json() if item["id"] == persisted[0]["id"])
+        self.assertEqual(refreshed["content"], expected_content)
+        self.assertEqual(refreshed, persisted[0])
+        self.assertEqual(agents._stream_error_content("", error_data), f"[错误] {error_data}")
+
+    def test_revoked_agent_binding_preserves_snapshot_but_filters_llm_replay(self) -> None:
+        visible_marker = "VISIBLE_DURABLE_ANSWER"
+        raw_result_marker = "STALE_BOUND_SOURCE_TOOL_RESULT"
+        db = self.Session()
+        try:
+            llm = LLMConfig(
+                id="llm-security-history",
+                tenant_id=self.tenant.id,
+                name="历史再授权模型",
+                provider="openai",
+                model="test-model",
+                capabilities=["chat", "tool"],
+                enabled=True,
+            )
+            stale = Message(
+                id="message-security-stale-binding",
+                conversation_id=self.conversation.id,
+                role="assistant",
+                content=f"旧回答仍应显示：{visible_marker}",
+                tool_calls=[{
+                    "id": "stale-source-call",
+                    "name": "list_data_sources",
+                    "arguments": {},
+                }],
+                tool_results=[{
+                    "id": "stale-source-call",
+                    "name": "list_data_sources",
+                    "result": json.dumps([{
+                        "id": self.foreign_public_source.id,
+                        "name": raw_result_marker,
+                        "type": "file_bucket",
+                    }]),
+                }],
+            )
+            artifact_payload = {
+                "status": "success",
+                "result": {
+                    "artifact": {
+                        "id": "a" * 32,
+                        "filename": "AP001年度审计报告.docx",
+                        "format": "docx",
+                        "mime": (
+                            "application/vnd.openxmlformats-officedocument."
+                            "wordprocessingml.document"
+                        ),
+                        "size": 4096,
+                        "sha256": "b" * 64,
+                        "download_url": f"/api/data-sources/files/{'a' * 32}/download",
+                    }
+                },
+            }
+            attachment = Message(
+                id="message-security-durable-attachment",
+                conversation_id=self.conversation.id,
+                role="assistant",
+                content="年度审计报告已生成。",
+                tool_calls=[{
+                    "id": "removed-action-call",
+                    "name": "execute_action",
+                    "arguments": {
+                        "action_name": "已删除的审计报告动作",
+                        "parameters": {"project_id": "AP001"},
+                    },
+                }],
+                tool_results=[{
+                    "id": "removed-action-call",
+                    "name": "execute_action",
+                    "result": json.dumps(artifact_payload, ensure_ascii=False),
+                }],
+            )
+            agent = db.get(Agent, self.agent.id)
+            agent.llm_config_id = llm.id
+            # Both results were legitimate when produced; the source binding
+            # was narrowed and the attachment-producing Action no longer
+            # exists. The UI snapshot remains durable, while later model
+            # replay must not receive either stale raw payload.
+            agent.data_source_ids = [self.scoped_source.id]
+            db.add_all([llm, stale, attachment])
+            db.commit()
+        finally:
+            db.close()
+
+        listed = self.client.get(
+            f"/api/agents/conversations/{self.conversation.id}/messages"
+        )
+        self.assertEqual(listed.status_code, 200, listed.text)
+        stale_out = next(
+            item for item in listed.json()
+            if item["id"] == "message-security-stale-binding"
+        )
+        self.assertIn(visible_marker, stale_out["content"])
+        self.assertIn(raw_result_marker, json.dumps(stale_out["tool_results"], ensure_ascii=False))
+        self.assertEqual(stale_out["tool_calls"], stale.tool_calls)
+
+        attachment_out = next(
+            item for item in listed.json()
+            if item["id"] == "message-security-durable-attachment"
+        )
+        self.assertEqual(attachment_out["content"], attachment.content)
+        self.assertEqual(attachment_out["tool_calls"], attachment.tool_calls)
+        self.assertEqual(attachment_out["tool_results"], attachment.tool_results)
+        self.assertIn("AP001年度审计报告.docx", json.dumps(
+            attachment_out["tool_results"], ensure_ascii=False
+        ))
+
+        captured_history: list[dict] = []
+        captured_runtime_context: list[object] = []
+        authorization_contexts: list[object] = []
+        real_authorization_context = agents._authorization_context
+
+        def capture_authorization_context(*args, **kwargs):
+            context = real_authorization_context(*args, **kwargs)
+            authorization_contexts.append(context)
+            return context
+
+        def fake_run_agent(
+            _db,
+            _agent,
+            _llm,
+            history,
+            _message,
+            _scenario_name,
+            _ontology_summary,
+            **kwargs,
+        ):
+            captured_history.extend(history)
+            captured_runtime_context.append(kwargs.get("runtime_context"))
+            yield {"type": "done", "data": "已安全处理"}
+
+        with (
+            patch.object(agents, "SessionLocal", self.Session),
+            patch.object(agents, "_authorization_context", capture_authorization_context),
+            patch.object(agents.agent_engine, "run_agent", fake_run_agent),
+        ):
+            response = self.client.post(
+                f"/api/agents/{self.agent.id}/chat",
+                json={
+                    "message": "继续",
+                    "conversation_id": self.conversation.id,
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        replayed = json.dumps(captured_history, ensure_ascii=False)
+        self.assertNotIn(visible_marker, replayed)
+        self.assertNotIn(attachment.content, replayed)
+        self.assertNotIn(raw_result_marker, replayed)
+        self.assertNotIn("AP001年度审计报告.docx", replayed)
+        self.assertIn(agents._HISTORIC_MODEL_REPLAY_PLACEHOLDER, replayed)
+        self.assertEqual(len(captured_runtime_context), 1)
+        self.assertEqual(len(authorization_contexts), 1)
+        self.assertIs(captured_runtime_context[0], authorization_contexts[0])
+        self.assertEqual(
+            {source.id for source in captured_runtime_context[0].data_sources},
+            {self.scoped_source.id},
+        )
 
     def test_agent_rejects_incompatible_model_bindings_and_disabled_bound_chat_model(self) -> None:
         create = self.client.post(
@@ -608,6 +883,13 @@ class SecurityAclRegressionTests(unittest.TestCase):
             self.assertEqual(conversation.created_by_user_id, self.viewer.id)
         finally:
             db.close()
+
+        self.current_user_id = self.foreign_owner.id
+        self.current_tenant_id = self.foreign_tenant.id
+        cross_tenant = self.client.get(
+            f"/api/agents/conversations/{self.conversation.id}/messages"
+        )
+        self.assertEqual(cross_tenant.status_code, 404, cross_tenant.text)
 
     def test_assistant_threads_are_owner_scoped(self) -> None:
         self._as_viewer()

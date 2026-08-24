@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -20,6 +20,7 @@ from ..database import SessionLocal
 from ..models import (
     AssistantAttachment,
     AssistantAuditLog,
+    AssistantCompilationJob,
     AssistantMessage,
     AssistantProposalApplication,
     AssistantThread,
@@ -29,12 +30,16 @@ from ..models import (
     DataSource,
     DocumentChunk,
     LLMConfig,
+    MCPConfig,
     OntologyEntity,
     OntologyWorkflow,
+    Skill,
 )
 from ..schemas import (
     AssistantAttachmentOut,
     AssistantChatRequest,
+    AssistantCompilationJobResultOut,
+    AssistantCompilationJobStatusOut,
     AssistantMessageOut,
     AssistantProposalApplyRequest,
     AssistantReplyOut,
@@ -44,6 +49,7 @@ from ..schemas import (
     ScenarioIn,
 )
 from ..services import (
+    assistant_compilation_job_service,
     doc_parser,
     datasource_service,
     llm_service,
@@ -53,6 +59,7 @@ from ..services import (
     rag_service,
     runtime_connector_service,
     runtime_definition_service,
+    scenario_model_compiler,
     tenant_service,
     workflow_service,
 )
@@ -131,7 +138,69 @@ def _scenario(db: Session, scenario_id: str | None, writable: bool = False) -> B
 
 def _llm(db: Session) -> LLMConfig | None:
     candidates = llm_service.routable_configs(db, "chat")
+    selected_id = str(db.info.get("assistant_llm_config_id") or "")
+    if selected_id:
+        return next((candidate for candidate in candidates if candidate.id == selected_id), None)
     return candidates[0] if candidates else None
+
+
+def _configure_assistant_runtime(db: Session, payload: AssistantChatRequest) -> None:
+    """Resolve optional assistant capabilities once for this request.
+
+    The selected model is still subject to the normal tenant visibility and
+    routing checks.  Skills/MCP entries only become prompt context here; they
+    never bypass the governed runtime tool registry.
+    """
+    if payload.llm_config_id:
+        selected = next(
+            (item for item in llm_service.routable_configs(db, "chat") if item.id == payload.llm_config_id),
+            None,
+        )
+        if not selected:
+            raise HTTPException(409, "所选 AI 模型不可用或未启用 chat 能力")
+        db.info["assistant_llm_config_id"] = selected.id
+
+
+def _assistant_capability_context(db: Session, payload: AssistantChatRequest) -> str:
+    selected_skills = []
+    if payload.skill_ids:
+        selected_skills = db.execute(
+            select(Skill)
+            .where(
+                Skill.id.in_(payload.skill_ids),
+                Skill.enabled.is_(True),
+                tenant_service.visible_clause(Skill, db),
+            )
+            .order_by(Skill.name)
+        ).scalars().all()
+    selected_mcps = []
+    if payload.mcp_ids:
+        selected_mcps = db.execute(
+            select(MCPConfig)
+            .where(
+                MCPConfig.id.in_(payload.mcp_ids),
+                MCPConfig.enabled.is_(True),
+                tenant_service.visible_clause(MCPConfig, db),
+            )
+            .order_by(MCPConfig.name)
+        ).scalars().all()
+    lines = ["\n\n【本次助手能力配置】"]
+    lines.append(
+        "模型："
+        + ("已按本次请求选择专用模型。" if payload.llm_config_id else "使用平台默认可用模型。")
+    )
+    lines.append(
+        "技能："
+        + ("、".join(item.name for item in selected_skills) if selected_skills else "未指定")
+    )
+    lines.append(
+        "MCP："
+        + ("、".join(item.name for item in selected_mcps) if selected_mcps else "未指定")
+    )
+    lines.append(
+        "技能和 MCP 只能在本轮工具定义明确提供时调用；配置本身不会绕过权限、确认或平台受控执行流程。"
+    )
+    return "\n".join(lines)
 
 
 def _scenario_context(scenario: BusinessScenario | None) -> str:
@@ -148,15 +217,40 @@ def _scenario_context(scenario: BusinessScenario | None) -> str:
     if scenario.relations:
         lines.append("已有关系：")
         for relation in scenario.relations[:30]:
-            lines.append(f"- {relation.name}（{relation.relation_type}）")
+            constraints = ontology_service.normalize_relation_constraints(
+                relation.constraints or {}, relation_type=relation.relation_type
+            )
+            axiom_labels = [
+                label for key, label in (
+                    ("symmetric", "对称"), ("transitive", "传递"),
+                    ("irreflexive", "反自反"), ("asymmetric", "非对称"),
+                    ("antisymmetric", "反对称"), ("acyclic", "无环"),
+                ) if constraints.get(key)
+            ]
+            suffix = f"；约束：{'、'.join(axiom_labels)}" if axiom_labels else ""
+            lines.append(f"- {relation.name}（{relation.relation_type}{suffix}）")
     return "\n".join(lines)
 
 
 def _scenario_revision(scenario: BusinessScenario) -> str:
     """Hash complete mutable definitions without persisting their raw secrets."""
 
+    def stable(value: Any) -> Any:
+        if isinstance(value, datetime):
+            normalized = (
+                value.replace(tzinfo=timezone.utc)
+                if value.tzinfo is None
+                else value.astimezone(timezone.utc)
+            )
+            return normalized.isoformat()
+        if isinstance(value, dict):
+            return {str(key): stable(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [stable(item) for item in value]
+        return value
+
     def fields(item: Any, names: tuple[str, ...]) -> dict[str, Any]:
-        return {name: getattr(item, name, None) for name in names}
+        return {name: stable(getattr(item, name, None)) for name in names}
 
     entities = []
     for entity in sorted(
@@ -171,7 +265,7 @@ def _scenario_revision(scenario: BusinessScenario) -> str:
             fields(
                 prop,
                 (
-                    "id", "name", "data_type", "description", "is_key", "is_required",
+                    "id", "name", "data_type", "description", "is_key", "is_title", "is_required",
                     "is_enum", "enum_values", "default_value", "constraints", "is_sensitive",
                 ),
             )
@@ -188,12 +282,27 @@ def _scenario_revision(scenario: BusinessScenario) -> str:
         ),
         "entities": entities,
         "relations": [
-            fields(item, ("id", "name", "namespace", "source_entity_id", "target_entity_id", "relation_type", "description"))
+            fields(item, ("id", "name", "namespace", "source_entity_id", "target_entity_id", "relation_type", "constraints", "description"))
             for item in sorted(list(getattr(scenario, "relations", []) or []), key=lambda value: str(getattr(value, "id", "")))
+        ],
+        "data_sources": [
+            # connector_revision is the governed, non-secret marker for every
+            # runtime-relevant configuration change.  Do not copy credentials
+            # into a proposal/job fingerprint.
+            fields(item, ("id", "name", "type", "connector_revision", "status"))
+            for item in sorted(list(getattr(scenario, "data_sources", []) or []), key=lambda value: str(getattr(value, "id", "")))
         ],
         "mappings": [
             fields(item, ("id", "entity_id", "data_source_id", "data_source_binding_key", "data_source_binding_ref", "table_name", "column_map", "transform_rules"))
             for item in sorted(list(getattr(scenario, "data_mappings", []) or []), key=lambda value: str(getattr(value, "id", "")))
+        ],
+        "relation_mappings": [
+            fields(item, ("id", "relation_id", "source_mapping_id", "target_mapping_id", "mode", "data_source_id", "data_source_binding_key", "data_source_binding_ref", "table_name", "foreign_key_column", "source_key_column", "target_key_column"))
+            for item in sorted(list(getattr(scenario, "relation_data_mappings", []) or []), key=lambda value: str(getattr(value, "id", "")))
+        ],
+        "functions": [
+            fields(item, ("id", "name", "description", "input_schema", "output_schema", "tags", "visibility", "runtime_kind", "runtime_config"))
+            for item in sorted(list(getattr(scenario, "function_definitions", []) or []), key=lambda value: str(getattr(value, "id", "")))
         ],
         "actions": [
             fields(item, ("id", "entity_id", "name", "description", "input_schema", "executor_type", "executor_config", "precondition", "postcondition", "enabled", "requires_confirmation", "idempotency_required", "permission_scope", "access_scope"))
@@ -229,6 +338,7 @@ def _scenario_snapshot(scenario: BusinessScenario) -> dict[str, Any]:
         "entity_names": sorted(str(entity.name) for entity in getattr(scenario, "entities", []) or []),
         "relation_names": sorted(str(relation.name) for relation in getattr(scenario, "relations", []) or []),
         "workflow_names": sorted(str(workflow.name) for workflow in getattr(scenario, "workflows", []) or []),
+        "function_names": sorted(str(item.name) for item in getattr(scenario, "function_definitions", []) or []),
         "mapping_keys": sorted(
             f"{mapping.entity_id}:{mapping.data_source_id}:{mapping.table_name}"
             for mapping in getattr(scenario, "data_mappings", [])
@@ -439,6 +549,25 @@ def _build_proposal(
             )
         title = "工作流编排变更草稿"
         summary = f"建议生成 {len(data.get('nodes') or [])} 个节点和 {len(data.get('edges') or [])} 条连线。"
+    elif kind == "scenario_model":
+        if not scenario:
+            raise ValueError("复合业务模型必须绑定业务场景")
+        changes = list(data.get("changes") or [])
+        blocking = [
+            item for item in (data.get("unresolved") or [])
+            if item.get("blocking", True)
+        ]
+        coverage = data.get("coverage_summary") or {}
+        title = "完整业务模型编译草稿"
+        summary = (
+            f"已从 {len(data.get('source_manifest') or [])} 份文档编译 "
+            f"{len(changes)} 项变更，覆盖 {coverage.get('total', 0)} 个来源段落；"
+            + (
+                f"仍有 {len(blocking)} 个阻塞项，当前不可应用。"
+                if blocking
+                else "引用、冲突和来源覆盖已通过预检，可在确认后原子应用。"
+            )
+        )
     else:
         raise ValueError("不支持的助手草稿类型")
     return {
@@ -469,6 +598,346 @@ def _find_saved_proposal(db: Session, thread_id: str, proposal_id: str) -> tuple
                 raise HTTPException(409, "变更草稿引用的资料已不在当前访问范围，请重新生成")
             return thread, message, proposal
     raise HTTPException(404, "变更草稿不存在或已过期，请重新生成")
+
+
+def _owned_compilation_job(db: Session, job_id: str) -> AssistantCompilationJob:
+    """Resolve a job through both principal ownership and current scenario ACL."""
+    job = db.execute(
+        select(AssistantCompilationJob).where(
+            AssistantCompilationJob.id == job_id,
+            AssistantCompilationJob.tenant_id == _tenant(db),
+            AssistantCompilationJob.created_by_user_id == _current_user_id(db),
+        )
+    ).scalars().first()
+    if not job:
+        # Keep missing and foreign jobs indistinguishable to prevent ID probing.
+        raise HTTPException(404, "编译任务不存在")
+    if job.thread_id:
+        thread = _thread(db, job.thread_id)
+        if thread.scenario_id != job.scenario_id:
+            raise HTTPException(404, "编译任务不存在")
+    elif job.scenario_id:
+        _scenario(db, job.scenario_id)
+    else:
+        permission_service.require_tenant_permission(db, "read")
+    return job
+
+
+def _public_compilation_progress(job: AssistantCompilationJob) -> dict[str, Any]:
+    raw = job.progress if isinstance(job.progress, dict) else {}
+    result = {
+        "phase": str(raw.get("phase") or job.status),
+        "detail": str(raw.get("detail") or "")[:500],
+        "calls_used": int(raw.get("calls_used", job.llm_calls_used) or 0),
+        "call_budget": int(raw.get("call_budget", job.llm_call_budget) or 0),
+    }
+    if job.status == "failed":
+        public_error = assistant_compilation_job_service.public_compilation_error(
+            job.error or "编译失败"
+        )
+        # Treat historic progress JSON as untrusted.  Earlier deployments may
+        # have stored provider/parser details in ``detail``.
+        result["detail"] = public_error.message[:500]
+        result["error_code"] = public_error.code[:100]
+    return result
+
+
+def _compilation_status_out(
+    job: AssistantCompilationJob,
+) -> AssistantCompilationJobStatusOut:
+    progress = _public_compilation_progress(job)
+    return AssistantCompilationJobStatusOut(
+        id=job.id,
+        thread_id=job.thread_id,
+        scenario_id=job.scenario_id,
+        status=job.status,
+        progress=progress,
+        llm_calls_used=job.llm_calls_used,
+        llm_call_budget=job.llm_call_budget,
+        result_ready=job.status == "succeeded" and bool(job.result),
+        error_code=str(progress.get("error_code") or ""),
+        error_message=(
+            str(progress.get("detail") or "") if job.status == "failed" else ""
+        ),
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+        updated_at=job.updated_at,
+    )
+
+
+def _public_recovery_proposal(value: Any) -> Any:
+    """Remove execution identities from the display copy of a proposal.
+
+    Confirmation ignores client proposal payloads and resolves the exact,
+    unsanitized proposal from its server-owned assistant message.
+    """
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = str(key).casefold()
+            if (
+                normalized == "fingerprint"
+                or "fingerprint" in normalized
+                or normalized == "hash"
+                or normalized.endswith("_hash")
+                or normalized in {"api_key", "raw_provider_error"}
+            ):
+                continue
+            result[str(key)] = _public_recovery_proposal(item)
+        return result
+    if isinstance(value, list):
+        return [_public_recovery_proposal(item) for item in value]
+    return value
+
+
+def _matching_compilation_proposal_message(
+    db: Session,
+    job: AssistantCompilationJob,
+) -> tuple[AssistantThread | None, AssistantMessage | None]:
+    result = job.result if isinstance(job.result, dict) else {}
+    proposal_id = str(result.get("proposal_id") or "")
+    if not proposal_id:
+        return None, None
+    rows = db.execute(
+        select(AssistantThread, AssistantMessage)
+        .join(AssistantMessage, AssistantMessage.thread_id == AssistantThread.id)
+        .where(
+            AssistantThread.tenant_id == job.tenant_id,
+            AssistantThread.created_by_user_id == job.created_by_user_id,
+            AssistantThread.scenario_id == job.scenario_id,
+            AssistantMessage.role == "assistant",
+        )
+        .order_by(AssistantMessage.created_at.desc())
+    ).all()
+    for thread, message in rows:
+        proposal = message.proposal if isinstance(message.proposal, dict) else {}
+        if proposal.get("proposal_id") == proposal_id and proposal == result:
+            return thread, message
+    return None, None
+
+
+def _link_compilation_placeholder(
+    *,
+    tenant_id: str,
+    user_id: str,
+    thread_id: str,
+    assistant_message_id: str,
+    job_id: str,
+    context: dict[str, Any],
+) -> None:
+    """Persist each duplicate request's recoverable subscription placeholder."""
+    link_db = SessionLocal()
+    link_db.info["tenant_id"] = tenant_id
+    link_db.info["user_id"] = user_id
+    try:
+        thread = link_db.execute(
+            select(AssistantThread).where(
+                AssistantThread.id == thread_id,
+                AssistantThread.tenant_id == tenant_id,
+                AssistantThread.created_by_user_id == user_id,
+            )
+        ).scalars().first()
+        message = link_db.get(AssistantMessage, assistant_message_id)
+        if not thread or not message or message.thread_id != thread.id or message.role != "assistant":
+            raise RuntimeError("编译任务恢复占位消息不存在或不属于当前会话")
+        message.context = {
+            **context,
+            "status": "processing",
+            "compilation_job_id": job_id,
+        }
+        link_db.commit()
+    finally:
+        link_db.close()
+
+
+def _record_compilation_progress(
+    *,
+    tenant_id: str,
+    user_id: str,
+    job_id: str,
+    used: int,
+    budget: int,
+    phase: str,
+) -> None:
+    progress_db = SessionLocal()
+    progress_db.info["tenant_id"] = tenant_id
+    progress_db.info["user_id"] = user_id
+    try:
+        assistant_compilation_job_service.record_provider_call(
+            progress_db,
+            job_id,
+            used=used,
+            budget=budget,
+            phase=phase,
+        )
+    finally:
+        progress_db.close()
+
+
+def _fail_compilation_job(
+    *,
+    tenant_id: str,
+    user_id: str,
+    job_id: str,
+    error: BaseException | str,
+) -> None:
+    failure_db = SessionLocal()
+    failure_db.info["tenant_id"] = tenant_id
+    failure_db.info["user_id"] = user_id
+    try:
+        job = failure_db.get(AssistantCompilationJob, job_id)
+        if not job:
+            return
+        # Never let a late transport/persistence exception replace the
+        # server-owned message of an already successful terminal job.
+        if job.status == "succeeded":
+            return
+        public_error = assistant_compilation_job_service.public_compilation_error(
+            error
+        )
+        message = (
+            failure_db.get(AssistantMessage, job.message_id)
+            if job.message_id
+            else None
+        )
+        if message and message.role == "assistant" and message.thread_id == job.thread_id:
+            message.content = public_error.message
+            message.context = {
+                **(message.context if isinstance(message.context, dict) else {}),
+                "status": "error",
+                "compilation_job_id": job.id,
+                "error_code": public_error.code,
+            }
+            message.proposal = {}
+        assistant_compilation_job_service.mark_failed(
+            failure_db,
+            job_id,
+            error=error,
+            commit=False,
+        )
+        failure_db.commit()
+    finally:
+        failure_db.close()
+
+
+def _finalize_compilation_success(
+    *,
+    tenant_id: str,
+    user_id: str,
+    job_id: str,
+    thread_id: str,
+    assistant_message_id: str,
+    scenario_id: str,
+    data: dict[str, Any],
+    reply: str,
+    context: dict[str, Any],
+    sources: list[dict[str, Any]],
+    thinking: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Atomically bind the recoverable message and terminal job result."""
+    finish_db = SessionLocal()
+    finish_db.info["tenant_id"] = tenant_id
+    finish_db.info["user_id"] = user_id
+    try:
+        job = finish_db.execute(
+            select(AssistantCompilationJob).where(
+                AssistantCompilationJob.id == job_id,
+                AssistantCompilationJob.tenant_id == tenant_id,
+                AssistantCompilationJob.created_by_user_id == user_id,
+                AssistantCompilationJob.scenario_id == scenario_id,
+            )
+        ).scalars().first()
+        if not job:
+            raise RuntimeError("编译任务不存在")
+        if job.status == "succeeded":
+            return dict(job.result or {})
+        if job.status != "running":
+            raise RuntimeError("非运行中的编译任务不能标记成功")
+        authorized_scenario = _scenario(finish_db, scenario_id)
+        assert authorized_scenario is not None
+        # Serialize with governed scenario writers where the database supports
+        # row locks, then reload every definition collection used by the
+        # baseline.  SQLite safely treats FOR UPDATE as a no-op; the later
+        # proposal base_snapshot still protects confirmation on every backend.
+        scenario = finish_db.execute(
+            select(BusinessScenario)
+            .where(
+                BusinessScenario.id == scenario_id,
+                BusinessScenario.tenant_id == tenant_id,
+            )
+            .with_for_update()
+        ).scalars().first()
+        if not scenario:
+            raise RuntimeError("编译任务所属业务场景不存在")
+        finish_db.expire(
+            scenario,
+            [
+                "entities",
+                "relations",
+                "data_sources",
+                "data_mappings",
+                "relation_data_mappings",
+                "function_definitions",
+                "actions",
+                "rules",
+                "events",
+                "workflows",
+            ],
+        )
+        current_baseline = _scenario_revision(scenario)
+        if current_baseline != job.scenario_baseline:
+            changed = assistant_compilation_job_service.CompilationBaselineChanged(
+                "业务场景基线在编译期间发生变化"
+            )
+            assistant_compilation_job_service.mark_failed(
+                finish_db,
+                job.id,
+                error=changed,
+                commit=False,
+            )
+            finish_db.commit()
+            raise changed
+        thread = finish_db.execute(
+            select(AssistantThread).where(
+                AssistantThread.id == thread_id,
+                AssistantThread.tenant_id == tenant_id,
+                AssistantThread.created_by_user_id == user_id,
+                AssistantThread.scenario_id == scenario_id,
+            )
+        ).scalars().first()
+        if not thread:
+            raise RuntimeError("编译任务所属助手会话不存在")
+        proposal = _build_proposal("scenario_model", data, scenario)
+        _save_message(
+            finish_db,
+            thread,
+            "assistant",
+            reply,
+            {
+                **context,
+                "status": "success",
+                "compilation_job_id": job.id,
+            },
+            sources,
+            proposal,
+            thinking,
+            message_id=assistant_message_id,
+        )
+        job.thread_id = thread.id
+        job.message_id = assistant_message_id
+        assistant_compilation_job_service.mark_succeeded(
+            finish_db,
+            job.id,
+            result=proposal,
+            commit=False,
+        )
+        finish_db.commit()
+        return proposal
+    except Exception:
+        finish_db.rollback()
+        raise
+    finally:
+        finish_db.close()
 
 
 def _attachment_context(attachments: list[AssistantAttachment]) -> tuple[str, list[dict[str, Any]]]:
@@ -674,12 +1143,41 @@ def _assistant_message_out(
         )
     result = AssistantMessageOut.model_validate(message)
     context = message.context if isinstance(message.context, dict) else {}
-    result.evidence = dict(context.get("evidence") or {})
+    evidence = context.get("evidence") if isinstance(context.get("evidence"), dict) else {}
+    uncertainties = evidence.get("uncertainties") if isinstance(evidence, dict) else []
+    if (
+        message.role == "assistant"
+        and context.get("draft_kind") == "scenario_model"
+        and not (message.proposal if isinstance(message.proposal, dict) else {})
+        and isinstance(uncertainties, list)
+        and uncertainties
+    ):
+        # Historic deployments echoed parser/provider details into failed
+        # assistant messages.  Preserve the server-side row for diagnosis but
+        # redact it whenever history is serialized after this upgrade.
+        public_error = assistant_compilation_job_service.public_compilation_error(
+            str(uncertainties[0] or message.content or "编译失败")
+        )
+        safe_evidence = {
+            **evidence,
+            "uncertainties": [public_error.message],
+        }
+        result.content = public_error.message
+        result.context = {
+            key: value
+            for key, value in context.items()
+            if key not in {"evidence", "raw_error", "provider_error"}
+        }
+        result.context["error_code"] = public_error.code
+        result.evidence = safe_evidence
+        result.action_preview = {}
+        return result
+    result.evidence = dict(evidence or {})
     result.action_preview = dict(context.get("action_preview") or {})
     return result
 
 
-def _intent(message: str, mode: str) -> str:
+def _intent(message: str, mode: str, draft_kind: str = "auto") -> str:
     # Explicit modes take precedence over words in the prompt.  In particular,
     # an ``explain`` request that happens to mention “创建/映射/执行” must never
     # be routed into a proposal generator, and chat-level apply/execute never
@@ -690,6 +1188,8 @@ def _intent(message: str, mode: str) -> str:
         return "apply_guidance"
     if mode == "execute":
         return "execute_guidance"
+    if mode == "draft" and draft_kind != "auto":
+        return draft_kind
     text = message.lower()
     if any(k in text for k in ("创建场景", "新建场景", "建立场景", "业务场景草稿")):
         return "scenario"
@@ -749,7 +1249,8 @@ def _assistant_evidence(
         "ontology": ("ontology_validation", "实体、属性、关系和约束在应用边界重新校验"),
         "mapping": ("mapping_reference_validation", "实体、数据源、表、列、主键和必填字段必须真实存在"),
         "workflow": ("workflow_dag_validation", "节点、连线和操作引用在应用边界重新校验"),
-        "apply_guidance": ("explicit_confirmation", "聊天不写入，只有已保存提案的 confirm=true 可应用"),
+        "scenario_model": ("compound_model_validation", "全文来源覆盖、跨资源引用和冲突通过后才允许同一事务应用"),
+        "apply_guidance": ("explicit_confirmation", "聊天不会写入正式业务模型，只有已保存提案的 confirm=true 可应用"),
         "execute_guidance": ("typed_action_only", "聊天只预演，真实执行必须进入场景中已配置的操作或任务审批"),
         "explain": ("read_only", "解释模式只读取已授权上下文"),
         "chat": ("read_only", "问答不直接修改或执行平台资源"),
@@ -1124,6 +1625,7 @@ def _generate_mapping_draft(
                     "name": prop.name,
                     "data_type": prop.data_type,
                     "is_key": bool(prop.is_key),
+                    "is_title": bool(getattr(prop, "is_title", False)),
                     "is_required": bool(prop.is_required),
                 }
                 for prop in entity.properties
@@ -1275,6 +1777,8 @@ def _fallback_reply(intent: str, scenario: BusinessScenario | None) -> str:
         return "我可以根据业务描述生成本体草稿。请先配置一个默认 LLM，并补充业务目标、核心对象、关键关系或上传业务资料。"
     if intent == "workflow":
         return "我可以根据业务描述生成工作流草稿。请先配置一个默认 LLM，并说明触发条件、判断规则、动作和最终结果。"
+    if intent == "scenario_model":
+        return "我可以逐段编译完整业务文档，并生成带来源、冲突和引用校验的复合变更清单。请先配置默认 LLM。"
     if scenario:
         return f"当前上下文是「{scenario.name}」。我可以协助你查询本体、解释对象关系，或生成建模与流程草稿。请先配置默认 LLM 以启用自然语言推理。"
     return "我可以协助你理解平台、设计业务场景和生成本体草稿。打开一个业务场景或配置默认 LLM 后，我可以提供更具体的帮助。"
@@ -1471,6 +1975,100 @@ def list_thread_messages(
     return [_assistant_message_out(db, thread, message) for message in messages]
 
 
+@router.get(
+    "/threads/{thread_id}/compilation-jobs",
+    response_model=list[AssistantCompilationJobStatusOut],
+)
+def list_thread_compilation_jobs(
+    thread_id: str,
+    response: Response,
+    scenario_id: str | None = None,
+    page: str = "",
+    path: str = "",
+    db: Session = Depends(get_tenant_db),
+):
+    thread = _thread(db, thread_id)
+    _assert_thread_scope(thread, scenario_id, page, path)
+    response.headers["Cache-Control"] = "no-store"
+    linked_job_ids = {
+        str(context.get("compilation_job_id"))
+        for context in db.execute(
+            select(AssistantMessage.context).where(
+                AssistantMessage.thread_id == thread.id,
+                AssistantMessage.role == "assistant",
+            )
+        ).scalars().all()
+        if isinstance(context, dict) and context.get("compilation_job_id")
+    }
+    stmt = select(AssistantCompilationJob).where(
+        AssistantCompilationJob.tenant_id == _tenant(db),
+        AssistantCompilationJob.created_by_user_id == _current_user_id(db),
+        AssistantCompilationJob.scenario_id == thread.scenario_id,
+    )
+    if linked_job_ids:
+        stmt = stmt.where(
+            or_(
+                AssistantCompilationJob.thread_id == thread.id,
+                AssistantCompilationJob.id.in_(linked_job_ids),
+            )
+        )
+    else:
+        stmt = stmt.where(AssistantCompilationJob.thread_id == thread.id)
+    jobs = db.execute(
+        stmt.order_by(AssistantCompilationJob.created_at.desc())
+    ).scalars().all()
+    return [_compilation_status_out(job) for job in jobs]
+
+
+@router.get(
+    "/compilation-jobs/{job_id}",
+    response_model=AssistantCompilationJobStatusOut,
+)
+def get_compilation_job(
+    job_id: str,
+    response: Response,
+    db: Session = Depends(get_tenant_db),
+):
+    response.headers["Cache-Control"] = "no-store"
+    return _compilation_status_out(_owned_compilation_job(db, job_id))
+
+
+@router.get(
+    "/compilation-jobs/{job_id}/result",
+    response_model=AssistantCompilationJobResultOut,
+)
+def get_compilation_job_result(
+    job_id: str,
+    response: Response,
+    db: Session = Depends(get_tenant_db),
+):
+    response.headers["Cache-Control"] = "no-store"
+    job = _owned_compilation_job(db, job_id)
+    if job.status != "succeeded" or not isinstance(job.result, dict) or not job.result:
+        if job.status == "failed":
+            progress = _public_compilation_progress(job)
+            raise HTTPException(
+                409,
+                {
+                    "error_code": progress.get("error_code") or "compilation_failed",
+                    "message": progress.get("detail") or "编译任务未成功完成",
+                },
+            )
+        raise HTTPException(409, "编译任务尚未完成")
+    proposal_thread, proposal_message = _matching_compilation_proposal_message(
+        db, job
+    )
+    return AssistantCompilationJobResultOut(
+        job_id=job.id,
+        thread_id=job.thread_id,
+        scenario_id=job.scenario_id,
+        proposal=_public_recovery_proposal(job.result),
+        proposal_thread_id=proposal_thread.id if proposal_thread else None,
+        proposal_message_id=proposal_message.id if proposal_message else None,
+        apply_ready=bool(proposal_thread and proposal_message),
+    )
+
+
 @router.delete("/threads/{thread_id}", response_model=Msg)
 def delete_thread(
     thread_id: str,
@@ -1502,6 +2100,7 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
         filename=filename,
         mime=file.content_type or "application/octet-stream",
         size=len(content),
+        content_hash=hashlib.sha256(content).hexdigest(),
         status="pending",
     )
     db.add(attachment)
@@ -1553,6 +2152,8 @@ def delete_attachment(attachment_id: str, db: Session = Depends(get_tenant_db)):
 def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     """全局助手 SSE：流式回答，同时发送可展开的安全处理摘要。"""
     scenario = _scenario(db, payload.scenario_id)
+    _configure_assistant_runtime(db, payload)
+    capability_context = _assistant_capability_context(db, payload)
     thread = _thread(db, payload.thread_id) if payload.thread_id else None
     scope_key = _context_scope(payload.scenario_id, payload.path)
     if thread:
@@ -1580,19 +2181,27 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         "scenario_id": payload.scenario_id,
         "selection": payload.selection,
         "mode": payload.mode,
+        "draft_kind": payload.draft_kind,
+        "llm_config_id": payload.llm_config_id,
+        "skill_ids": payload.skill_ids,
+        "mcp_ids": payload.mcp_ids,
     }
     attachment_meta = [{"id": x.id, "filename": x.filename, "status": x.status} for x in attachments]
     user_message = _save_message(db, thread, "user", payload.message, context, attachment_meta)
     db.flush()
     thread_id = thread.id
     assistant_message_id = uuid.uuid4().hex
-    intent = _intent(payload.message, payload.mode)
-    if intent == "execute_guidance":
+    intent = _intent(payload.message, payload.mode, payload.draft_kind)
+    if intent in {"execute_guidance", "scenario_model"}:
         _save_message(
             db,
             thread,
             "assistant",
-            "正在准备操作安全预演。",
+            (
+                "正在准备操作安全预演。"
+                if intent == "execute_guidance"
+                else "正在编译完整业务模型；结果写入前将再次核对场景基线。"
+            ),
             {**context, "status": "processing"},
             message_id=assistant_message_id,
         )
@@ -1614,6 +2223,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 + _scenario_context(scenario)
                 + (f"\n\n当前页面：{payload.page}（{payload.path}）" if payload.page else "")
                 + (f"\n当前选择：{payload.selection}" if payload.selection else "")
+                + capability_context
                 + (f"\n\n{attachment_text}" if attachment_text else "")
                 + (f"\n\n{rag_context}" if rag_context else "")
             ),
@@ -1676,6 +2286,18 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
             save_db.close()
 
     def event_stream():
+        # FastAPI may finalize ``get_tenant_db`` before an SSE generator starts
+        # iterating.  Reusing ORM objects captured from the request therefore
+        # leaves unloaded relationships detached (for example
+        # ``scenario.function_definitions`` during a compound compilation).
+        # Give the whole streamed turn one explicitly-owned session and reload
+        # its security-scoped resources instead of relying on request-session
+        # lifetime details.
+        db = SessionLocal()
+        db.info["tenant_id"] = tenant_id
+        db.info["user_id"] = user_id
+        scenario: BusinessScenario | None = None
+        llm: LLMConfig | None = None
         cancelled = False
         reply = ""
         proposal: dict[str, Any] = {}
@@ -1683,13 +2305,18 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         questions: list[dict[str, Any]] = []
         evidence: dict[str, Any] = {}
         action_preview: dict[str, Any] = {}
-        suggestions = (
-            ["创建业务场景草稿", "说明建模所需资料"]
-            if not scenario
-            else ["解释当前场景", "生成本体草稿", "生成数据映射草稿", "根据当前本体设计工作流"]
-        )
+        suggestions: list[str] = []
         saved_status = "success"
+        compilation_job_id = ""
+        owns_compilation_job = False
         try:
+            scenario = _scenario(db, payload.scenario_id)
+            llm = _llm(db)
+            suggestions = (
+                ["创建业务场景草稿", "说明建模所需资料"]
+                if not scenario
+                else ["解释当前场景", "编译完整业务模型", "生成本体草稿", "生成数据映射草稿", "根据当前本体设计工作流"]
+            )
             def progress(step: dict[str, Any]):
                 existing = next((item for item in thinking if item["id"] == step["id"]), None)
                 if existing:
@@ -1744,7 +2371,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield done_event
                 yield _sse("action_preview", action_preview)
                 yield _sse("token", reply)
-            elif intent in ("ontology", "mapping", "workflow") and not scenario:
+            elif intent in ("ontology", "mapping", "workflow", "scenario_model") and not scenario:
                 questions.append({
                     "id": "scenario",
                     "title": "需要一个业务场景",
@@ -1781,6 +2408,202 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield progress({"id": "scenario", "title": "生成业务场景草稿", "detail": "场景名称、目标与边界已整理完成。", "status": "done"})
                 yield _sse("proposal", proposal)
                 yield _sse("token", reply)
+            elif intent == "scenario_model" and scenario:
+                yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "正在逐段识别对象、关系、能力、规则、事件、流程和映射。", "status": "running"})
+                baseline = _scenario_revision(scenario)
+                compiler_message = (
+                    assistant_compilation_job_service.normalize_message(
+                        payload.message
+                    )
+                )
+                compiler_documents = (
+                    assistant_compilation_job_service.canonical_compiler_documents(
+                        attachments
+                    )
+                )
+                prepared_context = (
+                    scenario_model_compiler.prepare_compilation_context(
+                        db, scenario
+                    )
+                )
+                compilation_settings = get_settings()
+                identity = assistant_compilation_job_service.build_compilation_identity(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    scenario_id=scenario.id,
+                    message=compiler_message,
+                    attachments=attachments,
+                    llm=llm,
+                    compiler_version=scenario_model_compiler.COMPILER_VERSION,
+                    scenario_baseline=baseline,
+                    mapping_context_fingerprint=prepared_context["fingerprint"],
+                    execution_policy={
+                        "llm_call_budget": compilation_settings.scenario_model_max_llm_calls,
+                        "request_timeout": compilation_settings.scenario_model_llm_timeout,
+                    },
+                )
+                job, owns_compilation_job = (
+                    assistant_compilation_job_service.claim_compilation(
+                        db,
+                        identity=identity,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        scenario_id=scenario.id,
+                        thread_id=thread_id,
+                        message_id=assistant_message_id,
+                        compiler_version=scenario_model_compiler.COMPILER_VERSION,
+                        scenario_baseline=baseline,
+                        llm_call_budget=compilation_settings.scenario_model_max_llm_calls,
+                    )
+                )
+                compilation_job_id = job.id
+                context["compilation_job_id"] = job.id
+                _link_compilation_placeholder(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    assistant_message_id=assistant_message_id,
+                    job_id=job.id,
+                    context=context,
+                )
+                yield _sse("compilation_job", {
+                    "job_id": job.id,
+                    "status": job.status,
+                    "progress": _public_compilation_progress(job),
+                    "llm_calls_used": job.llm_calls_used,
+                    "llm_call_budget": job.llm_call_budget,
+                    "replayed": not owns_compilation_job,
+                })
+                if not owns_compilation_job and job.status == "succeeded":
+                    proposal = dict(job.result or {})
+                    if proposal.get("kind") != "scenario_model":
+                        raise RuntimeError("已完成编译任务缺少可重放的复合变更清单")
+                    data = proposal.get("payload") or {}
+                    blocking = sum(
+                        1 for item in (data.get("unresolved") or [])
+                        if item.get("blocking", True)
+                    )
+                    reply = (
+                        "已重放相同输入此前完成的完整业务模型；没有再次调用模型。"
+                        if not blocking
+                        else f"已重放相同输入此前完成的完整业务模型，其中仍有 {blocking} 个阻塞项；没有再次调用模型，也不会写入。"
+                    )
+                    yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "已重放同一执行指纹的复合变更清单。", "status": "done"})
+                    yield _sse("proposal", proposal)
+                    yield _sse("token", reply)
+                elif not owns_compilation_job and job.status == "failed":
+                    saved_status = "error"
+                    public_failure = _public_compilation_progress(job)
+                    reply = (
+                        "相同输入此前已编译失败，系统没有自动再次调用模型。"
+                        f"{public_failure.get('detail') or '系统已保持零写入，请显式重试。'}"
+                    )
+                    questions.append({
+                        "id": "failed-compilation",
+                        "title": "编译任务已失败",
+                        "message": "相同执行指纹不会自动重跑；请先改变导致失败的输入。",
+                        "options": [
+                            {"label": "修改输入后重试", "value": "revise_and_retry", "impact": "形成新的执行指纹和独立调用预算。", "recommended": True},
+                            {"label": "保留失败记录", "value": "keep_failed", "impact": "不调用模型、不生成或应用任何变更。"},
+                        ],
+                    })
+                    yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "相同执行指纹已失败，未自动重跑。", "status": "error"})
+                    yield _sse("token", reply)
+                elif not owns_compilation_job:
+                    saved_status = "processing"
+                    reply = (
+                        "相同输入的完整业务模型正在由已有任务编译；"
+                        "本次请求没有启动第二套模型调用。完成后再次提交相同请求即可直接重放结果。"
+                    )
+                    yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "已连接到持久任务状态；已有任务仍在运行。", "status": "running"})
+                    yield _sse("token", reply)
+                else:
+                    job_id = job.id
+
+                    def record_compilation_call(
+                        used: int,
+                        total: int,
+                        phase: str,
+                    ) -> None:
+                        # A provider progress commit must never accidentally
+                        # commit compiler-created ontology rows.  Compilation
+                        # is proposal-only; any pending mutation is a contract
+                        # violation and aborts the job before the next call.
+                        if db.new or db.dirty or db.deleted:
+                            db.rollback()
+                            raise RuntimeError(
+                                "完整业务模型编译器产生了未授权数据库变更；"
+                                "任务已中止且正式模型保持零写入"
+                            )
+                        _record_compilation_progress(
+                            tenant_id=tenant_id,
+                            user_id=user_id,
+                            job_id=job_id,
+                            used=used,
+                            budget=total,
+                            phase=phase,
+                        )
+
+                    budget = scenario_model_compiler.LLMCallBudget(
+                        job.llm_call_budget,
+                        on_consume=record_compilation_call,
+                    )
+                    try:
+                        data = scenario_model_compiler.compile_scenario_model(
+                            db,
+                            scenario,
+                            message=compiler_message,
+                            documents=compiler_documents,
+                            llm=llm,
+                            call_budget=budget,
+                            prepared_context=prepared_context,
+                        )
+                        # End the read transaction and discard any direct or
+                        # accidental pending compiler mutation before saving
+                        # only the replay artifact in the job ledger.
+                        if db.new or db.dirty or db.deleted:
+                            db.rollback()
+                            raise RuntimeError(
+                                "完整业务模型编译器产生了未授权数据库变更；"
+                                "任务已中止且正式模型保持零写入"
+                            )
+                        db.rollback()
+                        blocking = sum(
+                            1 for item in (data.get("unresolved") or [])
+                            if item.get("blocking", True)
+                        )
+                        reply = (
+                            "完整业务模型已编译并通过来源覆盖与引用预检，请核对后原子应用。"
+                            if not blocking
+                            else f"完整业务模型已编译，但还有 {blocking} 个阻塞项；当前不会写入，请先按清单补充资料后重新编译。"
+                        )
+                        proposal = _finalize_compilation_success(
+                            tenant_id=tenant_id,
+                            user_id=user_id,
+                            job_id=job_id,
+                            thread_id=thread_id,
+                            assistant_message_id=assistant_message_id,
+                            scenario_id=scenario.id,
+                            data=data,
+                            reply=reply,
+                            context=context,
+                            sources=sources,
+                            thinking=thinking,
+                        )
+                        owns_compilation_job = False
+                    except Exception as exc:
+                        db.rollback()
+                        _fail_compilation_job(
+                            tenant_id=tenant_id,
+                            user_id=user_id,
+                            job_id=job_id,
+                            error=exc,
+                        )
+                        owns_compilation_job = False
+                        raise
+                    yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "复合变更清单、来源覆盖和待确认项已生成并持久化。", "status": "done"})
+                    yield _sse("proposal", proposal)
+                    yield _sse("token", reply)
             elif intent == "ontology" and scenario:
                 yield progress({"id": "ontology", "title": "生成本体草稿", "detail": "正在整理实体、属性和关系建议。", "status": "running"})
                 description = (
@@ -1854,23 +2677,59 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
             yield _sse("done", {"thread_id": thread_id})
         except GeneratorExit:
             cancelled = True
+            if owns_compilation_job and compilation_job_id:
+                try:
+                    db.rollback()
+                    _fail_compilation_job(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        job_id=compilation_job_id,
+                        error="客户端在模型调用开始前断开，编译任务已安全终止",
+                    )
+                    owns_compilation_job = False
+                except Exception:
+                    db.rollback()
             raise
         except Exception as exc:  # noqa: BLE001
             saved_status = "error"
-            error_message = f"这次助手任务没有完成：{exc}"
+            if owns_compilation_job and compilation_job_id:
+                try:
+                    db.rollback()
+                    _fail_compilation_job(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        job_id=compilation_job_id,
+                        error=exc,
+                    )
+                except Exception:
+                    db.rollback()
+            if intent == "scenario_model":
+                public_error = (
+                    assistant_compilation_job_service.public_compilation_error(
+                        exc
+                    )
+                )
+            else:
+                public_error = (
+                    assistant_compilation_job_service.PublicCompilationError(
+                        "assistant_request_failed",
+                        "这次助手请求未完成，系统未执行任何变更；服务端已保留诊断记录，请稍后重试。",
+                    )
+                )
+            error_message = public_error.message
             questions.append({
                 "id": "retry",
-                "title": "需要补充或重试",
-                "message": "请检查默认 LLM 配置、业务场景和附件解析状态后重试。",
+                "title": "任务未完成",
+                "message": public_error.message,
                 "options": [
-                    {"label": "补充配置后重试", "value": "retry", "impact": "保留当前会话和附件，修正缺失配置后再次处理。", "recommended": True},
+                    {"label": "显式重试", "value": "retry", "impact": "保留当前会话；完整业务模型仍保持零写入。", "recommended": True},
                     {"label": "仅保留说明", "value": "keep_read_only", "impact": "不生成或应用任何变更，只保留当前错误记录。"},
                 ],
             })
             if not reply:
                 reply = error_message
-            yield _sse("progress", {"id": "error", "title": "处理未完成", "detail": "助手遇到问题，已保留当前会话。", "status": "error"})
-            yield _sse("error", str(exc))
+            yield _sse("progress", {"id": "error", "title": "处理未完成", "detail": public_error.message, "status": "error", "error_code": public_error.code})
+            yield _sse("error", public_error.message)
             try:
                 evidence = _assistant_evidence(
                     intent,
@@ -1878,7 +2737,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     sources=sources,
                     llm_used=bool(llm),
                     preview=action_preview,
-                    uncertainties=[str(exc)],
+                    uncertainties=[public_error.message],
                 )
                 persist_result(reply, proposal, thinking, saved_status, evidence, action_preview)
                 yield _sse("meta", {
@@ -1894,6 +2753,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
             except Exception:
                 pass
         finally:
+            db.close()
             if not cancelled:
                 yield "data: [DONE]\n\n"
 
@@ -1907,6 +2767,8 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
 @router.post("/chat", response_model=AssistantReplyOut)
 def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     scenario = _scenario(db, payload.scenario_id)
+    _configure_assistant_runtime(db, payload)
+    capability_context = _assistant_capability_context(db, payload)
     thread = _thread(db, payload.thread_id) if payload.thread_id else None
     scope_key = _context_scope(payload.scenario_id, payload.path)
     if thread:
@@ -1934,23 +2796,34 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         "scenario_id": payload.scenario_id,
         "selection": payload.selection,
         "mode": payload.mode,
+        "draft_kind": payload.draft_kind,
+        "llm_config_id": payload.llm_config_id,
+        "skill_ids": payload.skill_ids,
+        "mcp_ids": payload.mcp_ids,
     }
     attachment_meta = [{"id": x.id, "filename": x.filename, "status": x.status} for x in attachments]
     user_message = _save_message(db, thread, "user", payload.message, context, attachment_meta)
     db.flush()
 
-    intent = _intent(payload.message, payload.mode)
+    intent = _intent(payload.message, payload.mode, payload.draft_kind)
     reply = ""
     proposal: dict[str, Any] = {}
     questions: list[dict[str, Any]] = []
     action_preview: dict[str, Any] = {}
+    error_uncertainties: list[str] = []
     assistant_message_id = uuid.uuid4().hex
-    if intent == "execute_guidance":
+    tenant_id = _tenant(db)
+    user_id = _current_user_id(db)
+    if intent in {"execute_guidance", "scenario_model"}:
         _save_message(
             db,
             thread,
             "assistant",
-            "正在准备操作安全预演。",
+            (
+                "正在准备操作安全预演。"
+                if intent == "execute_guidance"
+                else "正在编译完整业务模型；结果写入前将再次核对场景基线。"
+            ),
             {**context, "status": "processing"},
             message_id=assistant_message_id,
         )
@@ -1958,7 +2831,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     suggestions = (
         ["创建业务场景草稿", "说明建模所需资料"]
         if not scenario
-        else ["解释当前场景", "生成本体草稿", "生成数据映射草稿", "根据当前本体设计工作流"]
+        else ["解释当前场景", "编译完整业务模型", "生成本体草稿", "生成数据映射草稿", "根据当前本体设计工作流"]
     )
 
     try:
@@ -1974,7 +2847,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             )
             if question:
                 questions.append(question)
-        elif intent in ("ontology", "mapping", "workflow") and not scenario:
+        elif intent in ("ontology", "mapping", "workflow", "scenario_model") and not scenario:
             questions.append({
                 "id": "scenario",
                 "title": "需要一个业务场景",
@@ -2003,6 +2876,172 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             data = _generate_scenario_draft(db, description)
             proposal = _build_proposal("scenario", data)
             reply = "我已生成业务场景草稿。确认前不会创建场景，附件也不会进入正式数据源。"
+        elif intent == "scenario_model" and scenario:
+            # Persist the conversation parent before the unique job insert.
+            # A duplicate fingerprint intentionally rolls back its failed
+            # insert; it must not roll back this request's thread/message too.
+            db.commit()
+            llm = _llm(db)
+            baseline = _scenario_revision(scenario)
+            compiler_message = (
+                assistant_compilation_job_service.normalize_message(
+                    payload.message
+                )
+            )
+            compiler_documents = (
+                assistant_compilation_job_service.canonical_compiler_documents(
+                    attachments
+                )
+            )
+            prepared_context = (
+                scenario_model_compiler.prepare_compilation_context(db, scenario)
+            )
+            compilation_settings = get_settings()
+            identity = assistant_compilation_job_service.build_compilation_identity(
+                tenant_id=_tenant(db),
+                user_id=_current_user_id(db),
+                scenario_id=scenario.id,
+                message=compiler_message,
+                attachments=attachments,
+                llm=llm,
+                compiler_version=scenario_model_compiler.COMPILER_VERSION,
+                scenario_baseline=baseline,
+                mapping_context_fingerprint=prepared_context["fingerprint"],
+                execution_policy={
+                    "llm_call_budget": compilation_settings.scenario_model_max_llm_calls,
+                    "request_timeout": compilation_settings.scenario_model_llm_timeout,
+                },
+            )
+            job, acquired = assistant_compilation_job_service.claim_compilation(
+                db,
+                identity=identity,
+                tenant_id=_tenant(db),
+                user_id=_current_user_id(db),
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                message_id=assistant_message_id,
+                compiler_version=scenario_model_compiler.COMPILER_VERSION,
+                scenario_baseline=baseline,
+                llm_call_budget=compilation_settings.scenario_model_max_llm_calls,
+            )
+            context["compilation_job_id"] = job.id
+            _link_compilation_placeholder(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                thread_id=thread.id,
+                assistant_message_id=assistant_message_id,
+                job_id=job.id,
+                context=context,
+            )
+            if not acquired and job.status == "succeeded":
+                proposal = dict(job.result or {})
+                if proposal.get("kind") != "scenario_model":
+                    raise RuntimeError("已完成编译任务缺少可重放的复合变更清单")
+                data = proposal.get("payload") or {}
+                blocking = sum(
+                    1 for item in (data.get("unresolved") or [])
+                    if item.get("blocking", True)
+                )
+                reply = (
+                    "已重放相同输入此前完成的完整业务模型；没有再次调用模型。"
+                    if not blocking
+                    else f"已重放相同输入此前完成的完整业务模型，其中仍有 {blocking} 个阻塞项；没有再次调用模型，也不会写入。"
+                )
+            elif not acquired and job.status == "failed":
+                public_failure = _public_compilation_progress(job)
+                reply = (
+                    "相同输入此前已编译失败，系统没有自动再次调用模型。"
+                    f"{public_failure.get('detail') or '系统已保持零写入，请显式重试。'}"
+                )
+                questions.append({
+                    "id": "failed-compilation",
+                    "title": "编译任务已失败",
+                    "message": "相同执行指纹不会自动重跑；请先改变导致失败的输入。",
+                    "options": [
+                        {"label": "修改输入后重试", "value": "revise_and_retry", "impact": "形成新的执行指纹和独立调用预算。", "recommended": True},
+                        {"label": "保留失败记录", "value": "keep_failed", "impact": "不调用模型、不生成或应用任何变更。"},
+                    ],
+                })
+            elif not acquired:
+                reply = (
+                    "相同输入的完整业务模型正在由已有任务编译；"
+                    "本次请求没有启动第二套模型调用。完成后再次提交相同请求即可直接重放结果。"
+                )
+            else:
+                job_id = job.id
+
+                def record_sync_compilation_call(
+                    used: int,
+                    total: int,
+                    phase: str,
+                ) -> None:
+                    if db.new or db.dirty or db.deleted:
+                        db.rollback()
+                        raise RuntimeError(
+                            "完整业务模型编译器产生了未授权数据库变更；"
+                            "任务已中止且正式模型保持零写入"
+                        )
+                    _record_compilation_progress(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        job_id=job_id,
+                        used=used,
+                        budget=total,
+                        phase=phase,
+                    )
+
+                budget = scenario_model_compiler.LLMCallBudget(
+                    job.llm_call_budget,
+                    on_consume=record_sync_compilation_call,
+                )
+                try:
+                    data = scenario_model_compiler.compile_scenario_model(
+                        db,
+                        scenario,
+                        message=compiler_message,
+                        documents=compiler_documents,
+                        llm=llm,
+                        call_budget=budget,
+                        prepared_context=prepared_context,
+                    )
+                    if db.new or db.dirty or db.deleted:
+                        db.rollback()
+                        raise RuntimeError(
+                            "完整业务模型编译器产生了未授权数据库变更；"
+                            "任务已中止且正式模型保持零写入"
+                        )
+                    db.rollback()
+                    blocking = sum(
+                        1 for item in (data.get("unresolved") or [])
+                        if item.get("blocking", True)
+                    )
+                    reply = (
+                        "完整业务模型已编译并通过来源覆盖与引用预检，请核对后原子应用。"
+                        if not blocking
+                        else f"完整业务模型已编译，但还有 {blocking} 个阻塞项；当前不会写入，请先按清单补充资料后重新编译。"
+                    )
+                    proposal = _finalize_compilation_success(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        job_id=job_id,
+                        thread_id=thread.id,
+                        assistant_message_id=assistant_message_id,
+                        scenario_id=scenario.id,
+                        data=data,
+                        reply=reply,
+                        context=context,
+                        sources=sources,
+                        thinking=[],
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    _fail_compilation_job(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        job_id=job_id,
+                        error=exc,
+                    )
+                    raise
         elif intent == "ontology" and scenario:
             description = payload.message
             if attachment_text:
@@ -2042,6 +3081,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                             + _scenario_context(scenario)
                             + (f"\n\n当前页面：{payload.page}（{payload.path}）" if payload.page else "")
                             + (f"\n当前选择：{payload.selection}" if payload.selection else "")
+                            + capability_context
                             + (f"\n\n{attachment_text}" if attachment_text else "")
                             + (f"\n\n{rag_context}" if rag_context else "")
                         ),
@@ -2057,13 +3097,23 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             else:
                 reply = _fallback_reply(intent, scenario)
     except Exception as exc:  # noqa: BLE001
-        reply = f"这次助手任务没有完成：{exc}"
+        if intent == "scenario_model":
+            public_error = (
+                assistant_compilation_job_service.public_compilation_error(exc)
+            )
+        else:
+            public_error = assistant_compilation_job_service.PublicCompilationError(
+                "assistant_request_failed",
+                "这次助手请求未完成，系统未执行任何变更；服务端已保留诊断记录，请稍后重试。",
+            )
+        reply = public_error.message
+        error_uncertainties = [public_error.message]
         questions.append({
             "id": "retry",
-            "title": "需要补充或重试",
-            "message": "请检查默认 LLM 配置、业务场景和附件解析状态后重试。",
+            "title": "任务未完成",
+            "message": public_error.message,
             "options": [
-                {"label": "补充配置后重试", "value": "retry", "impact": "保留上下文并在修正后重新处理。", "recommended": True},
+                {"label": "显式重试", "value": "retry", "impact": "保留当前会话；完整业务模型仍保持零写入。", "recommended": True},
                 {"label": "仅保留说明", "value": "keep_read_only", "impact": "不生成或应用任何变更。"},
             ],
         })
@@ -2074,11 +3124,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         sources=sources,
         llm_used=bool(locals().get("llm")),
         preview=action_preview,
-        uncertainties=(
-            [reply.removeprefix("这次助手任务没有完成：")]
-            if reply.startswith("这次助手任务没有完成：")
-            else []
-        ),
+        uncertainties=error_uncertainties,
     )
     assistant_context = {
         **context,
@@ -2192,7 +3238,7 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             scenario = locked
             relationship_names = (
                 "entities", "relations", "data_mappings", "actions",
-                "rules", "events", "workflows",
+                "function_definitions", "rules", "events", "workflows",
             )
             db.expire(scenario, relationship_names)
             if expected_snapshot and not _snapshot_matches(
@@ -2277,6 +3323,9 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             db.add(workflow)
             db.flush()
             result = {"kind": kind, "workflow_id": workflow.id, "nodes": len(nodes), "edges": len(edges)}
+        elif kind == "scenario_model":
+            assert scenario is not None
+            result = scenario_model_compiler.apply_scenario_model(db, scenario, data)
         else:  # Defensive guard for legacy rows bypassing current schema.
             raise PolicyViolation("不支持的变更草稿类型")
     except Exception:

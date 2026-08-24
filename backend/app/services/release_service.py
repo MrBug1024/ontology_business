@@ -41,6 +41,7 @@ from ..models import (
     OntologyWorkflow,
     OntologyProperty,
     RelationInstance,
+    RelationDataMapping,
     WorkflowRun,
 )
 from . import (
@@ -48,6 +49,7 @@ from . import (
     function_definition_service,
     ontology_service,
     permission_service,
+    template_catalog_service,
 )
 from .policies import validate_workflow_graph
 
@@ -298,6 +300,14 @@ def _bool(value: Any, label: str, *, default: bool = False) -> bool:
 def _normalize_property(raw: Any) -> dict:
     if not isinstance(raw, dict):
         raise ReleaseValidationError("属性必须是对象")
+    property_id = _required_id(raw.get("id"), "属性 id")
+    property_name = _string(raw.get("name"), "属性名称", maximum=200)
+    property_api_name = ontology_service.normalize_api_name(
+        raw.get("api_name"),
+        display_name=property_name,
+        prefix="property",
+        stable_key=property_id,
+    )
     data_type = _string(raw.get("data_type"), "属性类型", default="string", maximum=50)
     try:
         constraints = ontology_service.normalize_property_constraints(
@@ -320,11 +330,13 @@ def _normalize_property(raw: Any) -> dict:
     except ValueError as exc:
         raise ReleaseValidationError(str(exc)) from exc
     return {
-        "id": _required_id(raw.get("id"), "属性 id"),
-        "name": _string(raw.get("name"), "属性名称", maximum=200),
+        "id": property_id,
+        "name": property_name,
+        "api_name": property_api_name,
         "data_type": data_type,
         "description": _string(raw.get("description"), "属性说明"),
         "is_key": _bool(raw.get("is_key"), "属性 is_key"),
+        "is_title": _bool(raw.get("is_title"), "属性 is_title"),
         "is_required": default_probe.is_required,
         "is_enum": default_probe.is_enum,
         "enum_values": default_probe.enum_values,
@@ -337,10 +349,43 @@ def _normalize_property(raw: Any) -> dict:
 def _normalize_entity(raw: Any) -> dict:
     if not isinstance(raw, dict):
         raise ReleaseValidationError("实体必须是对象")
+    entity_id = _required_id(raw.get("id"), "实体 id")
+    entity_name = _string(raw.get("name"), "实体名称", maximum=200)
+    entity_api_name = ontology_service.normalize_api_name(
+        raw.get("api_name"),
+        display_name=entity_name,
+        prefix="entity",
+        stable_key=entity_id,
+    )
+    lifecycle_status = _string(
+        raw.get("lifecycle_status"),
+        "实体生命周期状态",
+        default="active",
+        maximum=20,
+    )
+    if lifecycle_status not in {"active", "deprecated"}:
+        raise ReleaseValidationError("实体生命周期状态必须为 active 或 deprecated")
     properties = [_normalize_property(item) for item in _list(raw.get("properties"), "实体属性")]
     property_ids = [item["id"] for item in properties]
     if len(set(property_ids)) != len(property_ids):
         raise ReleaseValidationError("同一实体中不能重复属性 id")
+    property_api_names = [item["api_name"] for item in properties]
+    if len(set(property_api_names)) != len(property_api_names):
+        raise ReleaseValidationError("同一实体中不能重复属性 api_name")
+    is_abstract = _bool(raw.get("is_abstract"), "实体 is_abstract")
+    if not is_abstract:
+        keys = [item for item in properties if item["is_key"]]
+        if len(keys) != 1:
+            raise ReleaseValidationError("具体对象类型必须且只能有一个主键属性")
+        titles = [item for item in properties if item["is_title"]]
+        if not titles:
+            # Deterministic compatibility normalisation: legacy definitions
+            # already used the unique primary key as their object label. The
+            # normalised snapshot is still strict (exactly one title).
+            keys[0]["is_title"] = True
+            titles = [keys[0]]
+        if len(titles) != 1:
+            raise ReleaseValidationError("具体对象类型必须且只能有一个标题属性")
     state_property = _string(
         raw.get("state_property"), "实体状态属性", maximum=200
     )
@@ -358,13 +403,15 @@ def _normalize_entity(raw: Any) -> dict:
     except ValueError as exc:
         raise ReleaseValidationError(str(exc)) from exc
     return {
-        "id": _required_id(raw.get("id"), "实体 id"),
-        "name": _string(raw.get("name"), "实体名称", maximum=200),
+        "id": entity_id,
+        "name": entity_name,
+        "api_name": entity_api_name,
+        "lifecycle_status": lifecycle_status,
         "namespace": namespace,
         "description": _string(raw.get("description"), "实体说明"),
         "icon": _string(raw.get("icon"), "实体图标", default="box", maximum=50),
         "color": _string(raw.get("color"), "实体颜色", default="#4f46e5", maximum=20),
-        "is_abstract": _bool(raw.get("is_abstract"), "实体 is_abstract"),
+        "is_abstract": is_abstract,
         "state_property": state_property,
         "properties": properties,
     }
@@ -373,6 +420,14 @@ def _normalize_entity(raw: Any) -> dict:
 def _normalize_relation(raw: Any) -> dict:
     if not isinstance(raw, dict):
         raise ReleaseValidationError("关系必须是对象")
+    relation_id = _required_id(raw.get("id"), "关系 id")
+    relation_name = _string(raw.get("name"), "关系名称", maximum=200)
+    relation_api_name = ontology_service.normalize_api_name(
+        raw.get("api_name"),
+        display_name=relation_name,
+        prefix="relation",
+        stable_key=relation_id,
+    )
     relation_type = _string(raw.get("relation_type"), "关系类型", default="1:N", maximum=10)
     if relation_type not in {"1:1", "1:N", "N:1", "N:M"}:
         raise ReleaseValidationError("关系类型必须为 1:1、1:N、N:1 或 N:M")
@@ -382,13 +437,39 @@ def _normalize_relation(raw: Any) -> dict:
         )
     except ValueError as exc:
         raise ReleaseValidationError(str(exc)) from exc
+    try:
+        constraints = ontology_service.normalize_relation_constraints(
+            _dict(raw.get("constraints"), "关系约束"), relation_type=relation_type
+        )
+        ontology_service.validate_relation_constraint_endpoints(
+            constraints,
+            source_entity_id=_required_id(raw.get("source_entity_id"), "关系源实体 id"),
+            target_entity_id=_required_id(raw.get("target_entity_id"), "关系目标实体 id"),
+        )
+    except ValueError as exc:
+        raise ReleaseValidationError(str(exc)) from exc
+    try:
+        navigation = ontology_service.normalize_relation_navigation(
+            relation_name=relation_name,
+            relation_api_name=relation_api_name,
+            current=raw,
+        )
+        storage_kind = ontology_service.normalize_relation_storage_kind(
+            raw.get("storage_kind")
+        )
+    except ValueError as exc:
+        raise ReleaseValidationError(str(exc)) from exc
     return {
-        "id": _required_id(raw.get("id"), "关系 id"),
-        "name": _string(raw.get("name"), "关系名称", maximum=200),
+        "id": relation_id,
+        "name": relation_name,
+        "api_name": relation_api_name,
         "namespace": namespace,
         "source_entity_id": _required_id(raw.get("source_entity_id"), "关系源实体 id"),
         "target_entity_id": _required_id(raw.get("target_entity_id"), "关系目标实体 id"),
+        **navigation,
+        "storage_kind": storage_kind,
         "relation_type": relation_type,
+        "constraints": constraints,
         "description": _string(raw.get("description"), "关系说明"),
     }
 
@@ -430,6 +511,49 @@ def _normalize_mapping(raw: Any) -> dict:
     return normalized
 
 
+def _normalize_relation_mapping(raw: Any) -> dict:
+    if not isinstance(raw, dict):
+        raise ReleaseValidationError("关系数据映射必须是对象")
+    mode = _string(raw.get("mode"), "关系映射模式", maximum=20)
+    if mode not in {"source_fk", "target_fk", "join_table"}:
+        raise ReleaseValidationError("关系映射模式无效")
+    normalized = {
+        "id": _required_id(raw.get("id"), "关系映射 id"),
+        "relation_id": _required_id(raw.get("relation_id"), "关系映射关系 id"),
+        "source_mapping_id": _required_id(raw.get("source_mapping_id"), "关系映射源映射 id"),
+        "target_mapping_id": _required_id(raw.get("target_mapping_id"), "关系映射目标映射 id"),
+        "mode": mode,
+        "data_source_id": _required_id(raw.get("data_source_id"), "关系映射数据源 id"),
+        "data_source_binding_key": "",
+        "data_source_binding_ref": {},
+        "table_name": _string(raw.get("table_name"), "关系映射表名", maximum=300),
+        "foreign_key_column": _string(raw.get("foreign_key_column"), "关系映射外键列", maximum=300),
+        "source_key_column": _string(raw.get("source_key_column"), "关系映射源键列", maximum=300),
+        "target_key_column": _string(raw.get("target_key_column"), "关系映射目标键列", maximum=300),
+    }
+    if mode in {"source_fk", "target_fk"}:
+        if not normalized["foreign_key_column"]:
+            raise ReleaseValidationError("外键关系映射必须指定外键列")
+        if normalized["source_key_column"] or normalized["target_key_column"]:
+            raise ReleaseValidationError("外键关系映射不能携带中间表键列")
+    else:
+        if not normalized["source_key_column"] or not normalized["target_key_column"]:
+            raise ReleaseValidationError("中间表关系映射必须指定源键列和目标键列")
+        if normalized["foreign_key_column"]:
+            raise ReleaseValidationError("中间表关系映射不能携带外键列")
+    try:
+        binding = connector_service.runtime_binding_from_config(raw, "data_source")
+    except connector_service.ConnectorBindingError as exc:
+        raise ReleaseValidationError(f"关系映射运行时绑定配置无效：{exc}") from exc
+    if binding is not None:
+        key_field, ref_field = connector_service.runtime_binding_fields("data_source")
+        normalized[key_field] = binding["binding_key"]
+        normalized[ref_field] = connector_service.with_required_capabilities(
+            binding["reference"], "sql_read"
+        )
+    return normalized
+
+
 def _normalize_function(raw: Any) -> dict:
     """Normalize a typed function plus its safe built-in runtime descriptor."""
     if not isinstance(raw, dict):
@@ -450,7 +574,7 @@ def _normalize_action(raw: Any) -> dict:
     if not isinstance(raw, dict):
         raise ReleaseValidationError("Action 必须是对象")
     executor_type = _string(raw.get("executor_type"), "Action 执行器类型", default="sql", maximum=30)
-    if executor_type not in {"sql", "skill", "mcp", "http", "script"}:
+    if executor_type not in {"unbound", "sql", "skill", "mcp", "http", "script", "template"}:
         raise ReleaseValidationError("Action 执行器类型无效")
     access_scope = _string(raw.get("access_scope"), "Action 访问范围", default="tenant", maximum=20)
     if access_scope not in {"tenant", "restricted"}:
@@ -549,7 +673,7 @@ def _normalize_workflow(raw: Any) -> dict:
 
 
 def _runtime_binding_requirements(
-    mappings: list[dict], actions: list[dict], workflows: list[dict]
+    mappings: list[dict], relation_mappings: list[dict], actions: list[dict], workflows: list[dict]
 ) -> list[dict[str, str]]:
     """Promote declarative runtime keys into release-gated dependencies.
 
@@ -596,6 +720,13 @@ def _runtime_binding_requirements(
                 "data_source_binding_ref": mapping.get("data_source_binding_ref"),
             }
         )
+    for mapping in relation_mappings:
+        visit(
+            {
+                "data_source_binding_key": mapping.get("data_source_binding_key"),
+                "data_source_binding_ref": mapping.get("data_source_binding_ref"),
+            }
+        )
     for action in actions:
         visit(action.get("executor_config") or {})
     for workflow in workflows:
@@ -622,6 +753,14 @@ def normalize_snapshot_content(content: Any) -> dict:
         _normalize_mapping(item)
         for item in _list(content.get("mappings") if mappings_present else [], "数据映射列表")
     ]
+    relation_mappings_present = "relation_mappings" in content
+    relation_mappings = [
+        _normalize_relation_mapping(item)
+        for item in _list(
+            content.get("relation_mappings") if relation_mappings_present else [],
+            "关系数据映射列表",
+        )
+    ]
     # Functions were added after the initial release-governance rollout.  As
     # with mappings, an omitted legacy collection means "leave live functions
     # unchanged" during a merge, never "delete every function".
@@ -634,7 +773,9 @@ def normalize_snapshot_content(content: Any) -> dict:
     rules = [_normalize_rule(item) for item in _list(content.get("rules"), "规则列表")]
     events = [_normalize_event(item) for item in _list(content.get("events"), "事件列表")]
     workflows = [_normalize_workflow(item) for item in _list(content.get("workflows"), "工作流列表")]
-    runtime_requirements = _runtime_binding_requirements(mappings, actions, workflows)
+    runtime_requirements = _runtime_binding_requirements(
+        mappings, relation_mappings, actions, workflows
+    )
     connector_bindings_present = "connector_bindings" in content or bool(runtime_requirements)
     raw_requirements = content.get("connector_bindings") if "connector_bindings" in content else []
     if raw_requirements is None:
@@ -667,11 +808,18 @@ def normalize_snapshot_content(content: Any) -> dict:
     entity_ids = [item["id"] for item in entities]
     if len(set(entity_ids)) != len(entity_ids):
         raise ReleaseValidationError("实体 id 不能重复")
+    entity_api_names = [item["api_name"] for item in entities]
+    if len(set(entity_api_names)) != len(entity_api_names):
+        raise ReleaseValidationError("实体 api_name 不能重复")
     all_property_ids = [prop["id"] for entity in entities for prop in entity["properties"]]
     if len(set(all_property_ids)) != len(all_property_ids):
         raise ReleaseValidationError("属性 id 不能跨实体重复")
+    relation_api_names = [item["api_name"] for item in relations]
+    if len(set(relation_api_names)) != len(relation_api_names):
+        raise ReleaseValidationError("关系 api_name 不能重复")
     for label, items in {
         "数据映射": mappings,
+        "关系数据映射": relation_mappings,
         "函数": functions,
         "关系": relations,
         "Action": actions,
@@ -684,12 +832,24 @@ def normalize_snapshot_content(content: Any) -> dict:
             raise ReleaseValidationError(f"{label} id 不能重复")
 
     entity_id_set = set(entity_ids)
+    relation_id_set = {item["id"] for item in relations}
+    mapping_by_id = {item["id"]: item for item in mappings}
     action_id_set = {item["id"] for item in actions}
     rule_id_set = {item["id"] for item in rules}
     event_id_set = {item["id"] for item in events}
     for relation in relations:
         if relation["source_entity_id"] not in entity_id_set or relation["target_entity_id"] not in entity_id_set:
             raise ReleaseValidationError("关系引用了不存在的实体")
+        inverse_id = str((relation.get("constraints") or {}).get("inverse_relation_id") or "")
+        if inverse_id and inverse_id not in relation_id_set:
+            raise ReleaseValidationError("关系约束引用了不存在的逆关系")
+        if inverse_id:
+            inverse = next(item for item in relations if item["id"] == inverse_id)
+            if (
+                inverse["source_entity_id"] != relation["target_entity_id"]
+                or inverse["target_entity_id"] != relation["source_entity_id"]
+            ):
+                raise ReleaseValidationError("逆关系的源/目标对象类型必须与当前关系相反")
     for mapping in mappings:
         if mapping["entity_id"] not in entity_id_set:
             raise ReleaseValidationError("数据映射引用了不存在的实体")
@@ -706,6 +866,49 @@ def normalize_snapshot_content(content: Any) -> dict:
             )
         except ValueError as exc:
             raise ReleaseValidationError(str(exc)) from exc
+    mapped_relations: set[str] = set()
+    relations_by_id = {item["id"]: item for item in relations}
+    entities_by_id = {item["id"]: item for item in entities}
+    for relation_mapping in relation_mappings:
+        relation = relations_by_id.get(relation_mapping["relation_id"])
+        source_mapping = mapping_by_id.get(relation_mapping["source_mapping_id"])
+        target_mapping = mapping_by_id.get(relation_mapping["target_mapping_id"])
+        if not relation or not source_mapping or not target_mapping:
+            raise ReleaseValidationError("关系数据映射引用了不存在的关系或对象映射")
+        if relation["id"] in mapped_relations:
+            raise ReleaseValidationError("同一关系只能配置一个关系数据映射")
+        mapped_relations.add(relation["id"])
+        if source_mapping["entity_id"] != relation["source_entity_id"]:
+            raise ReleaseValidationError("关系数据映射的源对象映射与关系端点不一致")
+        if target_mapping["entity_id"] != relation["target_entity_id"]:
+            raise ReleaseValidationError("关系数据映射的目标对象映射与关系端点不一致")
+        for label, endpoint_mapping in (
+            ("源对象", source_mapping), ("目标对象", target_mapping)
+        ):
+            endpoint_entity = entities_by_id[endpoint_mapping["entity_id"]]
+            keys = [prop for prop in endpoint_entity["properties"] if prop["is_key"]]
+            if len(keys) != 1 or not str(
+                (endpoint_mapping.get("column_map") or {}).get(keys[0]["name"]) or ""
+            ):
+                raise ReleaseValidationError(f"{label}映射必须包含唯一主键属性的源列")
+        if relation_mapping["mode"] == "source_fk":
+            carrier = source_mapping
+        elif relation_mapping["mode"] == "target_fk":
+            carrier = target_mapping
+        else:
+            carrier = None
+        if carrier and (
+            relation_mapping["data_source_id"] != carrier["data_source_id"]
+            or relation_mapping["table_name"] != carrier["table_name"]
+        ):
+            raise ReleaseValidationError("外键关系映射的数据源和表必须由承载侧对象映射推导")
+        if carrier and (
+            relation_mapping.get("data_source_binding_key")
+            != carrier.get("data_source_binding_key")
+            or relation_mapping.get("data_source_binding_ref")
+            != carrier.get("data_source_binding_ref")
+        ):
+            raise ReleaseValidationError("外键关系映射的运行时绑定必须与承载侧对象映射一致")
     for action in actions:
         if action["entity_id"] not in entity_id_set:
             raise ReleaseValidationError("Action 引用了不存在的实体")
@@ -751,6 +954,8 @@ def normalize_snapshot_content(content: Any) -> dict:
     }
     if mappings_present:
         normalized["mappings"] = mappings
+    if relation_mappings_present:
+        normalized["relation_mappings"] = relation_mappings
     if functions_present:
         normalized["functions"] = functions
     if connector_bindings_present:
@@ -782,6 +987,87 @@ def _validate_workflow_references(
             raise ReleaseValidationError(f"工作流引用了不存在的 {kind}")
 
 
+def active_snapshot_content(content: Mapping[str, Any]) -> dict:
+    """Project a normalised snapshot onto its executable, active Object Types.
+
+    Lifecycle retirement is a visibility operation, never a deletion.  This
+    projection removes dependent resources only from the in-memory/new-release
+    definition so a deprecated type cannot leak back through a relation,
+    mapping, Action, Rule, or Workflow reference.
+    """
+
+    projected = copy.deepcopy(dict(content))
+    entities = [
+        item
+        for item in projected.get("entities", [])
+        if str(item.get("lifecycle_status") or "active") == "active"
+    ]
+    entity_ids = {str(item["id"]) for item in entities}
+    relations = [
+        item
+        for item in projected.get("relations", [])
+        if str(item.get("source_entity_id") or "") in entity_ids
+        and str(item.get("target_entity_id") or "") in entity_ids
+    ]
+    relation_ids = {str(item["id"]) for item in relations}
+    mappings = [
+        item
+        for item in projected.get("mappings", [])
+        if str(item.get("entity_id") or "") in entity_ids
+    ]
+    mapping_ids = {str(item["id"]) for item in mappings}
+    relation_mappings = [
+        item
+        for item in projected.get("relation_mappings", [])
+        if str(item.get("relation_id") or "") in relation_ids
+        and str(item.get("source_mapping_id") or "") in mapping_ids
+        and str(item.get("target_mapping_id") or "") in mapping_ids
+    ]
+    actions = [
+        item
+        for item in projected.get("actions", [])
+        if str(item.get("entity_id") or "") in entity_ids
+    ]
+    action_ids = {str(item["id"]) for item in actions}
+    rules = [
+        item
+        for item in projected.get("rules", [])
+        if (
+            not str(item.get("entity_id") or "")
+            or str(item.get("entity_id") or "") in entity_ids
+        )
+        and {
+            str(action_id)
+            for action_id in item.get("trigger_action_ids", [])
+        }.issubset(action_ids)
+    ]
+    rule_ids = {str(item["id"]) for item in rules}
+    event_ids = {
+        str(item["id"])
+        for item in projected.get("events", [])
+    }
+    workflows = []
+    for workflow in projected.get("workflows", []):
+        refs = _workflow_reference_ids(workflow)
+        if (
+            refs["action"].issubset(action_ids)
+            and refs["rule"].issubset(rule_ids)
+            and refs["event"].issubset(event_ids)
+        ):
+            workflows.append(workflow)
+
+    projected["entities"] = entities
+    projected["relations"] = relations
+    if "mappings" in projected:
+        projected["mappings"] = mappings
+    if "relation_mappings" in projected:
+        projected["relation_mappings"] = relation_mappings
+    projected["actions"] = actions
+    projected["rules"] = rules
+    projected["workflows"] = workflows
+    return projected
+
+
 def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
     """捕获当前可发布的本体定义，且在内存中即去敏。"""
     entities = db.execute(
@@ -802,6 +1088,8 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
             {
                 "id": entity.id,
                 "name": entity.name,
+                "api_name": entity.api_name,
+                "lifecycle_status": entity.lifecycle_status or "active",
                 "namespace": entity.namespace or scenario.namespace or "default",
                 "description": entity.description or "",
                 "icon": entity.icon or "box",
@@ -812,9 +1100,11 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
                     {
                         "id": prop.id,
                         "name": prop.name,
+                        "api_name": prop.api_name,
                         "data_type": prop.data_type or "string",
                         "description": prop.description or "",
                         "is_key": bool(prop.is_key),
+                        "is_title": bool(getattr(prop, "is_title", False)),
                         "is_required": bool(prop.is_required),
                         "is_enum": bool(prop.is_enum),
                         "enum_values": prop.enum_values or [],
@@ -831,10 +1121,17 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
             {
                 "id": relation.id,
                 "name": relation.name,
+                "api_name": relation.api_name,
                 "namespace": relation.namespace or scenario.namespace or "default",
                 "source_entity_id": relation.source_entity_id,
                 "target_entity_id": relation.target_entity_id,
+                "source_display_name": relation.source_display_name,
+                "source_api_name": relation.source_api_name,
+                "target_display_name": relation.target_display_name,
+                "target_api_name": relation.target_api_name,
+                "storage_kind": relation.storage_kind or "none",
                 "relation_type": relation.relation_type or "1:N",
+                "constraints": copy.deepcopy(relation.constraints or {}),
                 "description": relation.description or "",
             }
             for relation in db.execute(
@@ -862,6 +1159,29 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
                 select(DataMapping)
                 .where(DataMapping.scenario_id == scenario.id)
                 .order_by(DataMapping.id.asc())
+            ).scalars().all()
+        ],
+        "relation_mappings": [
+            {
+                "id": mapping.id,
+                "relation_id": mapping.relation_id,
+                "source_mapping_id": mapping.source_mapping_id,
+                "target_mapping_id": mapping.target_mapping_id,
+                "mode": mapping.mode,
+                "data_source_id": mapping.data_source_id,
+                "data_source_binding_key": mapping.data_source_binding_key or "",
+                "data_source_binding_ref": _sanitize_secret_values(
+                    mapping.data_source_binding_ref or {}
+                ),
+                "table_name": mapping.table_name or "",
+                "foreign_key_column": mapping.foreign_key_column or "",
+                "source_key_column": mapping.source_key_column or "",
+                "target_key_column": mapping.target_key_column or "",
+            }
+            for mapping in db.execute(
+                select(RelationDataMapping)
+                .where(RelationDataMapping.scenario_id == scenario.id)
+                .order_by(RelationDataMapping.id.asc())
             ).scalars().all()
         ],
         # Function definitions are typed, declarative contracts.  There is no
@@ -961,7 +1281,11 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
             ).scalars().all()
         ],
     }
-    return normalize_snapshot_content(content)
+    # Retired legacy/meta Object Types may not satisfy today's stricter active
+    # modeling contract.  Remove their entire dependency closure before schema
+    # validation so deprecation is a viable migration path, not a release
+    # blocker; the rows themselves remain untouched in the database.
+    return normalize_snapshot_content(active_snapshot_content(content))
 
 
 def _scenario_for_read(db: Session, scenario_id: str) -> tuple[BusinessScenario, permission_service.Principal]:
@@ -1129,6 +1453,19 @@ def _assert_non_dev_runtime_bindings(content: Mapping[str, Any], *, environment:
             kind="data_source",
             label=f"数据映射「{mapping_label}」",
         )
+    relation_mappings = content.get("relation_mappings") or []
+    for mapping in relation_mappings if isinstance(relation_mappings, list) else []:
+        if not isinstance(mapping, Mapping):
+            continue
+        mapping_label = str(mapping.get("id") or "未命名关系映射")[:160]
+        require_binding(
+            {
+                "data_source_binding_key": mapping.get("data_source_binding_key"),
+                "data_source_binding_ref": mapping.get("data_source_binding_ref"),
+            },
+            kind="data_source",
+            label=f"关系数据映射「{mapping_label}」",
+        )
 
     actions = content.get("actions") or []
     for action in actions if isinstance(actions, list) else []:
@@ -1142,7 +1479,7 @@ def _assert_non_dev_runtime_bindings(content: Mapping[str, Any], *, environment:
         # scripts depend on host/process state outside that boundary, so they
         # are deliberately dev-only until they have an equivalent governed
         # connector implementation.
-        if executor_type in {"http", "skill", "script"}:
+        if executor_type in {"unbound", "http", "skill", "script", "template"}:
             prohibited_actions.append(f"Action「{action_label}」使用 {executor_type}")
         elif executor_type == "sql":
             require_binding(config, kind="data_source", label=f"Action「{action_label}」")
@@ -1170,7 +1507,7 @@ def _assert_non_dev_runtime_bindings(content: Mapping[str, Any], *, environment:
 
     if prohibited_actions:
         raise ReleaseConflictError(
-            "非开发环境禁止 http、skill、script Action 执行器："
+            "非开发环境禁止待绑定、http、skill、script、template Action 执行器："
             + "；".join(prohibited_actions[:12])
         )
     if missing:
@@ -1206,6 +1543,14 @@ def _require_snapshot_connectors(
             ):
                 raise ReleaseConflictError(
                     "该历史快照未声明数据映射；请先基于当前定义创建并合并新的快照后再发布"
+                )
+            if "relation_mappings" not in content and db.scalar(
+                select(RelationDataMapping.id)
+                .where(RelationDataMapping.scenario_id == scenario.id)
+                .limit(1)
+            ):
+                raise ReleaseConflictError(
+                    "该历史快照未声明关系数据映射；请先基于当前定义创建并合并新的快照后再发布"
                 )
             _assert_non_dev_runtime_bindings(normalized, environment=environment)
         requirements = connector_service.normalize_snapshot_binding_requirements(
@@ -1274,6 +1619,29 @@ def _require_mapping_sql_bindings(
                 metadata["reference"], "sql_read"
             ),
         )
+    relation_mappings = content.get("relation_mappings") or []
+    for mapping in relation_mappings if isinstance(relation_mappings, list) else []:
+        if not isinstance(mapping, Mapping):
+            continue
+        metadata = connector_service.runtime_binding_from_config(
+            {
+                "data_source_binding_key": mapping.get("data_source_binding_key"),
+                "data_source_binding_ref": mapping.get("data_source_binding_ref"),
+            },
+            "data_source",
+        )
+        if metadata is None:
+            continue
+        connector_service.require_ready_binding(
+            db,
+            scenario,
+            environment=environment,
+            binding_key_value=str(metadata["binding_key"]),
+            kind="data_source",
+            reference=connector_service.with_required_capabilities(
+                metadata["reference"], "sql_read"
+            ),
+        )
 
 
 def _ensure_live_matches_head(db: Session, scenario: BusinessScenario, branch: OntologyBranch) -> None:
@@ -1311,6 +1679,76 @@ def _validate_mapping_sources(
             raise ReleaseValidationError("数据映射不能引用其他租户的数据源")
         if source.scenario_id not in {None, scenario.id}:
             raise ReleaseValidationError("数据映射只能引用当前场景或租户级数据源")
+    for mapping in content.get("relation_mappings", []):
+        source = db.get(DataSource, mapping["data_source_id"])
+        if not source:
+            raise ReleaseValidationError("关系数据映射引用的数据源不存在")
+        if source.tenant_id != scenario.tenant_id:
+            raise ReleaseValidationError("关系数据映射不能引用其他租户的数据源")
+        if source.scenario_id not in {None, scenario.id}:
+            raise ReleaseValidationError("关系数据映射只能引用当前场景或租户级数据源")
+        live = db.get(RelationDataMapping, mapping["id"])
+        if live and live.scenario_id == scenario.id:
+            try:
+                ontology_service.validate_relation_data_mapping(
+                    db,
+                    scenario,
+                    {
+                        "relation_id": mapping["relation_id"],
+                        "source_mapping_id": mapping["source_mapping_id"],
+                        "target_mapping_id": mapping["target_mapping_id"],
+                        "mode": mapping["mode"],
+                        "foreign_key_column": mapping["foreign_key_column"],
+                        "join_data_source_id": mapping["data_source_id"],
+                        "join_table_name": mapping["table_name"],
+                        "source_key_column": mapping["source_key_column"],
+                        "target_key_column": mapping["target_key_column"],
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise ReleaseValidationError(f"关系数据映射预检失败：{exc}") from exc
+
+
+def _validate_snapshot_template_actions(
+    db: Session,
+    scenario: BusinessScenario,
+    content: Mapping[str, Any],
+    *,
+    previous_content: Mapping[str, Any] | None = None,
+    authorize_changes: bool = False,
+) -> None:
+    """Close catalog/file-bucket references before persisting or applying JSON."""
+    try:
+        template_catalog_service.lock_scenarios_for_template_write(
+            db,
+            tenant_id=str(scenario.tenant_id),
+            scenario_ids=[scenario.id],
+        )
+        template_catalog_service.validate_snapshot_template_actions(
+            db,
+            tenant_id=str(scenario.tenant_id),
+            scenario_id=scenario.id,
+            actions=content.get("actions") or [],
+            previous_actions=(previous_content or {}).get("actions") or [],
+            authorize_changes=authorize_changes,
+        )
+    except template_catalog_service.TemplateCatalogError as exc:
+        raise ReleaseValidationError(f"治理快照中的模板 Action 无效：{exc}") from exc
+
+
+def _lock_template_governance_scenario(
+    db: Session, scenario: BusinessScenario
+) -> BusinessScenario:
+    """Establish S before branch/template locks in governance write paths."""
+    try:
+        locked = template_catalog_service.lock_scenarios_for_template_write(
+            db,
+            tenant_id=str(scenario.tenant_id),
+            scenario_ids=[scenario.id],
+        )
+    except template_catalog_service.TemplateCatalogError as exc:
+        raise ReleaseConflictError(str(exc)) from exc
+    return locked[scenario.id]
 
 
 def _workflow_reference_ids(workflow: dict) -> dict[str, set[str]]:
@@ -1428,6 +1866,7 @@ _ACTIVE_RELEASE_RESOURCE_COLLECTIONS: dict[str, tuple[str, str]] = {
     "entity": ("entities", "实体"),
     "relation": ("relations", "关系"),
     "mapping": ("mappings", "数据映射"),
+    "relation_mapping": ("relation_mappings", "关系数据映射"),
     "function": ("functions", "函数定义"),
     "action": ("actions", "Action"),
     "rule": ("rules", "规则"),
@@ -1501,7 +1940,7 @@ def assert_resource_deletion_allowed(
             # Historic snapshots that predate governed mappings cannot prove
             # that a live mapping is absent.  A non-dev deployment with such
             # evidence must not lose a potential runtime anchor by CRUD.
-            if normalized_kind in {"mapping", "function"} and collection not in (snapshot.content or {}):
+            if normalized_kind in {"mapping", "relation_mapping", "function"} and collection not in (snapshot.content or {}):
                 raise ReleaseConflictError(f"活动环境发布快照缺少{label}，拒绝删除")
             snapshot_content = normalize_snapshot_content(snapshot.content or {})
         except ReleaseConflictError:
@@ -1604,6 +2043,10 @@ def _guard_safe_removals(
     ).scalars().all():
         if entity.id in desired_entities:
             continue
+        if not ontology_service.entity_is_active(entity):
+            # Deprecated Object Types are intentionally absent from active
+            # snapshots; absence must never be interpreted as physical delete.
+            continue
         if db.execute(select(OntologyInstance.id).where(OntologyInstance.entity_id == entity.id).limit(1)).scalar_one_or_none():
             raise ReleaseValidationError("不能删除仍包含运行时对象的实体")
         if db.execute(select(DataMapping.id).where(DataMapping.entity_id == entity.id).limit(1)).scalar_one_or_none():
@@ -1641,13 +2084,30 @@ def _guard_safe_removals(
     for relation in db.execute(
         select(OntologyRelation).where(OntologyRelation.scenario_id == scenario.id)
     ).scalars().all():
-        if relation.id not in desired_relations and db.execute(
+        endpoint_is_deprecated = any(
+            entity is not None and not ontology_service.entity_is_active(entity)
+            for entity in (
+                db.get(OntologyEntity, relation.source_entity_id),
+                db.get(OntologyEntity, relation.target_entity_id),
+            )
+        )
+        if relation.id not in desired_relations and not endpoint_is_deprecated and db.execute(
             select(RelationInstance.id).where(RelationInstance.relation_id == relation.id).limit(1)
         ).scalar_one_or_none():
             raise ReleaseValidationError("不能删除仍包含关系实例的关系")
     for action in db.execute(
         select(OntologyAction).where(OntologyAction.scenario_id == scenario.id)
     ).scalars().all():
+        if action.entity_id in {
+            entity.id
+            for entity in db.execute(
+                select(OntologyEntity).where(
+                    OntologyEntity.scenario_id == scenario.id,
+                    OntologyEntity.lifecycle_status == "deprecated",
+                )
+            ).scalars().all()
+        }:
+            continue
         if action.id not in desired_actions and db.execute(
             select(ActionExecutionLog.id)
             .where(
@@ -1675,6 +2135,58 @@ def _guard_safe_removals(
 
 def _delete_missing(db: Session, scenario: BusinessScenario, content: dict) -> None:
     """按依赖由外向内移除无运行时引用的定义资源。"""
+    deprecated_entity_ids = {
+        entity.id
+        for entity in db.execute(
+            select(OntologyEntity).where(OntologyEntity.scenario_id == scenario.id)
+        ).scalars().all()
+        if not ontology_service.entity_is_active(entity)
+    }
+    deprecated_relation_ids = {
+        relation.id
+        for relation in db.execute(
+            select(OntologyRelation).where(OntologyRelation.scenario_id == scenario.id)
+        ).scalars().all()
+        if relation.source_entity_id in deprecated_entity_ids
+        or relation.target_entity_id in deprecated_entity_ids
+    }
+    deprecated_action_ids = {
+        action.id
+        for action in db.execute(
+            select(OntologyAction).where(OntologyAction.scenario_id == scenario.id)
+        ).scalars().all()
+        if action.entity_id in deprecated_entity_ids
+    }
+    deprecated_rule_ids = {
+        rule.id
+        for rule in db.execute(
+            select(OntologyRule).where(OntologyRule.scenario_id == scenario.id)
+        ).scalars().all()
+        if rule.entity_id in deprecated_entity_ids
+        or any(
+            str(action_id) in deprecated_action_ids
+            for action_id in (rule.trigger_action_ids or [])
+        )
+    }
+    deprecated_workflow_ids: set[str] = set()
+    for workflow in db.execute(
+        select(OntologyWorkflow).where(OntologyWorkflow.scenario_id == scenario.id)
+    ).scalars().all():
+        refs = _workflow_reference_ids({
+            "trigger_type": workflow.trigger_type,
+            "trigger_config": workflow.trigger_config or {},
+            "steps": workflow.steps or [],
+            "nodes": workflow.nodes or [],
+        })
+        if refs["action"] & deprecated_action_ids or refs["rule"] & deprecated_rule_ids:
+            deprecated_workflow_ids.add(workflow.id)
+    preserved_ids = {
+        OntologyWorkflow: deprecated_workflow_ids,
+        OntologyRule: deprecated_rule_ids,
+        OntologyAction: deprecated_action_ids,
+        OntologyRelation: deprecated_relation_ids,
+        OntologyEntity: deprecated_entity_ids,
+    }
     desired = {
         OntologyWorkflow: {item["id"] for item in content["workflows"]},
         OntologyEvent: {item["id"] for item in content["events"]},
@@ -1687,7 +2199,7 @@ def _delete_missing(db: Session, scenario: BusinessScenario, content: dict) -> N
         desired[FunctionDefinition] = {item["id"] for item in content["functions"]}
     for model, ids in desired.items():
         for item in db.execute(select(model).where(model.scenario_id == scenario.id)).scalars().all():
-            if item.id not in ids:
+            if item.id not in ids and item.id not in preserved_ids.get(model, set()):
                 db.delete(item)
     db.flush()
 
@@ -1696,6 +2208,7 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
     """将已规范化快照应用到实时本体，调用方必须包在同一事务内。"""
     content = normalize_snapshot_content(content)
     _validate_mapping_sources(db, scenario, content)
+    _validate_snapshot_template_actions(db, scenario, content)
     _guard_safe_removals(db, scenario, content)
     _delete_missing(db, scenario, content)
 
@@ -1713,6 +2226,8 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
             db.add(entity)
         for key in (
             "name",
+            "api_name",
+            "lifecycle_status",
             "namespace",
             "description",
             "icon",
@@ -1742,9 +2257,11 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
                 db.add(prop)
             for key in (
                 "name",
+                "api_name",
                 "data_type",
                 "description",
                 "is_key",
+                "is_title",
                 "is_required",
                 "is_enum",
                 "enum_values",
@@ -1762,10 +2279,17 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
             db.add(relation)
         for key in (
             "name",
+            "api_name",
             "namespace",
             "source_entity_id",
             "target_entity_id",
+            "source_display_name",
+            "source_api_name",
+            "target_display_name",
+            "target_api_name",
+            "storage_kind",
             "relation_type",
+            "constraints",
             "description",
         ):
             setattr(relation, key, relation_data[key])
@@ -1807,6 +2331,79 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
                 mapping.id,
                 reason="映射定义已由治理发布更新",
             )
+    db.flush()
+
+    if "relation_mappings" in content:
+        desired_relation_mapping_ids = {
+            item["id"] for item in content.get("relation_mappings", [])
+        }
+        for stale in db.execute(
+            select(RelationDataMapping).where(
+                RelationDataMapping.scenario_id == scenario.id
+            )
+        ).scalars().all():
+            if stale.id not in desired_relation_mapping_ids:
+                mapping_refresh_service.cancel_active_mapping_refresh_jobs(
+                    db, stale.source_mapping_id,
+                    reason="治理发布已删除关系映射，请重新提交刷新",
+                )
+                mapping_refresh_service.cancel_active_mapping_refresh_jobs(
+                    db, stale.target_mapping_id,
+                    reason="治理发布已删除关系映射，请重新提交刷新",
+                )
+                ontology_service.purge_relation_mapping_instances(db, stale.id)
+                db.delete(stale)
+        for mapping_data in content.get("relation_mappings", []):
+            mapping = _assert_id_scope(
+                db, RelationDataMapping, mapping_data["id"], scenario.id, "关系数据映射"
+            )
+            before = None
+            if mapping:
+                before = tuple(
+                    getattr(mapping, field)
+                    for field in (
+                        "relation_id", "source_mapping_id", "target_mapping_id", "mode",
+                        "data_source_id", "data_source_binding_key", "data_source_binding_ref",
+                        "table_name", "foreign_key_column",
+                        "source_key_column", "target_key_column",
+                    )
+                )
+            else:
+                mapping = RelationDataMapping(
+                    id=mapping_data["id"], scenario_id=scenario.id
+                )
+                db.add(mapping)
+            for key in (
+                "relation_id", "source_mapping_id", "target_mapping_id", "mode",
+                "data_source_id", "data_source_binding_key", "data_source_binding_ref",
+                "table_name", "foreign_key_column", "source_key_column", "target_key_column",
+            ):
+                setattr(mapping, key, copy.deepcopy(mapping_data[key]))
+            after = tuple(
+                getattr(mapping, field)
+                for field in (
+                    "relation_id", "source_mapping_id", "target_mapping_id", "mode",
+                    "data_source_id", "data_source_binding_key", "data_source_binding_ref",
+                    "table_name", "foreign_key_column",
+                    "source_key_column", "target_key_column",
+                )
+            )
+            if before != after:
+                if before is not None:
+                    ontology_service.purge_relation_mapping_instances(db, mapping.id)
+                mapping_refresh_service.cancel_active_mapping_refresh_jobs(
+                    db, mapping.source_mapping_id,
+                    reason="治理发布已更新关系映射，请重新提交刷新",
+                )
+                mapping_refresh_service.cancel_active_mapping_refresh_jobs(
+                    db, mapping.target_mapping_id,
+                    reason="治理发布已更新关系映射，请重新提交刷新",
+                )
+            mapping.status = "unknown"
+            mapping.last_error = "发布定义已更新，请重新刷新对象映射"
+            mapping.last_checked_at = None
+            mapping.last_refreshed_at = None
+            mapping.last_link_count = 0
 
     for function_data in content.get("functions", []):
         function = _assert_id_scope(
@@ -1913,6 +2510,7 @@ def create_branch(
     description: str = "",
 ) -> OntologyBranch:
     scenario, principal = _scenario_for_manage(db, scenario_id)
+    scenario = _lock_template_governance_scenario(db, scenario)
     branch_name = _string(name, "分支名称", maximum=120).strip()
     if not branch_name:
         raise ReleaseValidationError("分支名称不能为空")
@@ -1934,13 +2532,15 @@ def create_branch(
         )
         db.add(branch)
         db.flush()
+        baseline_content = capture_snapshot_content(db, scenario)
+        _validate_snapshot_template_actions(db, scenario, baseline_content)
         baseline = _create_snapshot(
             db,
             scenario,
             branch_id=branch.id,
             parent_snapshot_id=None,
             kind="baseline",
-            content=capture_snapshot_content(db, scenario),
+            content=baseline_content,
             created_by_user_id=principal.user_id,
         )
         branch.base_snapshot_id = baseline.id
@@ -1991,12 +2591,28 @@ def create_proposal(
     expected_base_snapshot_id: str | None = None,
 ) -> OntologyProposal:
     branch, scenario, principal = _branch_for_manage(db, branch_id)
+    scenario = _lock_template_governance_scenario(db, scenario)
+    branch = _lock_branch(db, branch.id)
+    if (
+        not branch
+        or branch.scenario_id != scenario.id
+        or branch.tenant_id != scenario.tenant_id
+    ):
+        raise ReleaseConflictError("提案分支在创建期间已变化")
     if branch.status != "active" or not branch.head_snapshot_id:
         raise ReleaseConflictError("分支不是可提交状态")
     if expected_base_snapshot_id and branch.head_snapshot_id != expected_base_snapshot_id:
         raise ReleaseConflictError("发布分支基线已变化，请刷新后重新创建提案")
     normalized = normalize_snapshot_content(content)
     _validate_mapping_sources(db, scenario, normalized)
+    base_snapshot = _snapshot_for_scenario(db, scenario, branch.head_snapshot_id)
+    _validate_snapshot_template_actions(
+        db,
+        scenario,
+        normalized,
+        previous_content=base_snapshot.content or {},
+        authorize_changes=True,
+    )
     try:
         proposal_snapshot = _create_snapshot(
             db,
@@ -2129,6 +2745,7 @@ def merge_proposal(
     if proposal.status != "approved":
         raise ReleaseConflictError("只有已批准提案可以合并")
     try:
+        scenario = _lock_template_governance_scenario(db, scenario)
         branch = _lock_branch(db, proposal.branch_id)
         if not branch or branch.scenario_id != scenario.id or branch.status != "active":
             raise ReleaseConflictError("提案分支不可合并")
@@ -2241,6 +2858,7 @@ def publish_snapshot(
     if environment not in ENVIRONMENTS:
         raise ReleaseValidationError("发布环境必须为 dev、staging 或 prod")
     scenario, principal = _scenario_for_manage(db, scenario_id)
+    scenario = _lock_template_governance_scenario(db, scenario)
     branch, snapshot, proposal = _resolve_publish_snapshot(
         db,
         scenario,
@@ -2249,6 +2867,7 @@ def publish_snapshot(
         snapshot_id=snapshot_id,
     )
     try:
+        _validate_snapshot_template_actions(db, scenario, snapshot.content or {})
         connector_audit = _require_snapshot_connectors(
             db, scenario, snapshot.content or {}, environment=environment
         )
@@ -2323,6 +2942,7 @@ def rollback_snapshot(
     if target.branch_id != branch.id:
         raise ReleaseValidationError("回滚目标必须属于当前分支")
     try:
+        scenario = _lock_template_governance_scenario(db, scenario)
         branch = _lock_branch(db, branch.id)
         if not branch or branch.scenario_id != scenario.id or branch.tenant_id != scenario.tenant_id:
             raise HTTPException(status_code=404, detail="本体分支不存在")
@@ -2330,6 +2950,7 @@ def rollback_snapshot(
             raise ReleaseValidationError("回滚目标必须属于当前分支")
         if not branch.head_snapshot_id:
             raise ReleaseConflictError("分支没有当前快照")
+        _validate_snapshot_template_actions(db, scenario, target.content or {})
         # A staging/prod rollback is an environment deployment transition, not
         # a mutation of the shared dev authoring definition.  In particular it
         # must remain possible when dev has moved on from the branch head; the

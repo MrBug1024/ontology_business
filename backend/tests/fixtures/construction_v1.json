@@ -1,0 +1,195 @@
+{
+  "fixture_version": "construction_v1",
+  "description": "建筑项目、承包商、关系约束与风险规则的确定性黄金样本",
+  "documents": [
+    {
+      "id": "construction_v1",
+      "filename": "建筑项目风险管控规范.md",
+      "text": "项目以项目编号唯一标识，项目名称必填。风险分为 0 到 100 的浮点数。项目状态必填，可取施工中、停工、已完工，并作为项目生命周期状态。\n\n承包商以承包商编号唯一标识，名称必填。信用等级可取 A、B、C。\n\n一个承包商可承建多个项目，一个项目也可由多个承包商承建。项目可以包含多个子项目。\n\n项目风险分大于等于 80 时认定为高风险，严重级别为 critical。项目状态为停工时命中停工规则，严重级别为 warning。"
+    }
+  ],
+  "gold_model": {
+    "schema_version": "scenario_model.v1",
+    "entities": [
+      {
+        "key": "entity.project",
+        "name": "项目",
+        "description": "建筑项目",
+        "state_property": "状态",
+        "properties": [
+          {"name": "项目编号", "data_type": "string", "is_key": true, "is_required": true},
+          {"name": "项目名称", "data_type": "string", "is_title": true, "is_required": true},
+          {"name": "风险分", "data_type": "float", "constraints": {"minimum": 0, "maximum": 100}},
+          {"name": "状态", "data_type": "string", "is_required": true, "is_enum": true, "enum_values": ["施工中", "停工", "已完工"]}
+        ],
+        "evidence_refs": ["construction_v1:p0001"],
+        "confidence": 1.0
+      },
+      {
+        "key": "entity.contractor",
+        "name": "承包商",
+        "description": "承担项目施工的组织",
+        "properties": [
+          {"name": "承包商编号", "data_type": "string", "is_key": true, "is_required": true},
+          {"name": "名称", "data_type": "string", "is_title": true, "is_required": true},
+          {"name": "信用等级", "data_type": "string", "is_enum": true, "enum_values": ["A", "B", "C"]}
+        ],
+        "evidence_refs": ["construction_v1:p0002"],
+        "confidence": 1.0
+      }
+    ],
+    "relations": [
+      {
+        "key": "relation.contractor_projects",
+        "name": "承建",
+        "source_ref": "entity.contractor",
+        "target_ref": "entity.project",
+        "relation_type": "N:M",
+        "evidence_refs": ["construction_v1:p0003"],
+        "confidence": 1.0
+      },
+      {
+        "key": "relation.project_children",
+        "name": "包含子项目",
+        "source_ref": "entity.project",
+        "target_ref": "entity.project",
+        "relation_type": "1:N",
+        "evidence_refs": ["construction_v1:p0003"],
+        "confidence": 1.0
+      }
+    ],
+    "functions": [],
+    "actions": [],
+    "rules": [
+      {
+        "key": "rule.high_risk",
+        "name": "高风险项目",
+        "entity_ref": "entity.project",
+        "condition": {"field": "风险分", "op": ">=", "value": 80},
+        "severity": "critical",
+        "evidence_refs": ["construction_v1:p0004"],
+        "confidence": 1.0
+      },
+      {
+        "key": "rule.suspended",
+        "name": "停工项目",
+        "entity_ref": "entity.project",
+        "condition": {"field": "状态", "op": "==", "value": "停工"},
+        "severity": "warning",
+        "evidence_refs": ["construction_v1:p0004"],
+        "confidence": 1.0
+      }
+    ],
+    "events": [],
+    "workflows": [],
+    "mappings": [],
+    "relation_mappings": [],
+    "unresolved": [],
+    "coverage": [
+      {"source_ref": "construction_v1:p0001", "status": "modeled", "reason": "项目属性和约束", "change_keys": ["entity.project"]},
+      {"source_ref": "construction_v1:p0002", "status": "modeled", "reason": "承包商属性和约束", "change_keys": ["entity.contractor"]},
+      {"source_ref": "construction_v1:p0003", "status": "modeled", "reason": "承建与项目层级关系", "change_keys": ["relation.contractor_projects", "relation.project_children"]},
+      {"source_ref": "construction_v1:p0004", "status": "modeled", "reason": "风险与停工规则", "change_keys": ["rule.high_risk", "rule.suspended"]}
+    ]
+  },
+  "benchmark_candidate": {
+    "schema_version": "scenario_model.v1",
+    "entities": [
+      {
+        "key": "entity.project",
+        "name": "项目",
+        "description": "建筑项目",
+        "state_property": "状态",
+        "properties": [
+          {"name": "项目编号", "data_type": "string", "is_key": true, "is_title": true, "is_required": true},
+          {"name": "风险分", "data_type": "float", "constraints": {"minimum": 0, "maximum": 90}},
+          {"name": "状态", "data_type": "string", "is_required": true, "is_enum": true, "enum_values": ["施工中", "停工"]}
+        ],
+        "evidence_refs": ["construction_v1:p0001"],
+        "confidence": 0.9
+      },
+      {
+        "key": "entity.contractor",
+        "name": "承包商",
+        "description": "承担项目施工的组织",
+        "properties": [
+          {"name": "承包商编号", "data_type": "string", "is_key": true, "is_required": true},
+          {"name": "名称", "data_type": "string", "is_title": true, "is_required": true},
+          {"name": "信用等级", "data_type": "string", "is_enum": true, "enum_values": ["A", "B", "C"]}
+        ],
+        "evidence_refs": ["construction_v1:p0002"],
+        "confidence": 0.95
+      },
+      {
+        "key": "entity.equipment",
+        "name": "设备",
+        "description": "黄金文档没有定义的额外对象",
+        "properties": [
+          {"name": "设备编号", "data_type": "string", "is_key": true, "is_title": true, "is_required": true}
+        ],
+        "evidence_refs": ["construction_v1:p0002"],
+        "confidence": 0.5
+      }
+    ],
+    "relations": [
+      {
+        "key": "relation.contractor_projects",
+        "name": "承建",
+        "source_ref": "entity.contractor",
+        "target_ref": "entity.project",
+        "relation_type": "N:M",
+        "evidence_refs": ["construction_v1:p0003"],
+        "confidence": 0.95
+      },
+      {
+        "key": "relation.project_children",
+        "name": "包含子项目",
+        "source_ref": "entity.project",
+        "target_ref": "entity.project",
+        "relation_type": "1:1",
+        "evidence_refs": ["construction_v1:p0003"],
+        "confidence": 0.7
+      }
+    ],
+    "functions": [],
+    "actions": [],
+    "rules": [
+      {
+        "key": "rule.high_risk",
+        "name": "高风险项目",
+        "entity_ref": "entity.project",
+        "condition": {"field": "风险分", "op": ">=", "value": 90},
+        "severity": "critical",
+        "evidence_refs": ["construction_v1:p0004"],
+        "confidence": 0.8
+      },
+      {
+        "key": "rule.suspended",
+        "name": "停工项目",
+        "entity_ref": "entity.project",
+        "condition": {"field": "状态", "op": "==", "value": "停工"},
+        "severity": "warning",
+        "evidence_refs": ["construction_v1:p0004"],
+        "confidence": 0.95
+      }
+    ],
+    "events": [],
+    "workflows": [],
+    "mappings": [],
+    "relation_mappings": [],
+    "unresolved": [],
+    "coverage": [
+      {"source_ref": "construction_v1:p0001", "status": "modeled", "reason": "项目属性和约束", "change_keys": ["entity.project"]},
+      {"source_ref": "construction_v1:p0002", "status": "modeled", "reason": "承包商和额外设备", "change_keys": ["entity.contractor", "entity.equipment"]},
+      {"source_ref": "construction_v1:p0003", "status": "modeled", "reason": "关系", "change_keys": ["relation.contractor_projects", "relation.project_children"]},
+      {"source_ref": "construction_v1:p0004", "status": "modeled", "reason": "规则", "change_keys": ["rule.high_risk", "rule.suspended"]}
+    ]
+  },
+  "expected_metrics": {
+    "object": {"precision": 0.6666666666666666, "recall": 1.0, "f1": 0.8, "tp": 2, "fp": 1, "fn": 0},
+    "property": {"precision": 0.8571428571428571, "recall": 0.8571428571428571, "f1": 0.8571428571428571, "tp": 6, "fp": 1, "fn": 1},
+    "relation": {"precision": 0.5, "recall": 0.5, "f1": 0.5, "tp": 1, "fp": 1, "fn": 1},
+    "constraint": {"precision": 0.84, "recall": 0.84, "f1": 0.84, "tp": 21, "fp": 4, "fn": 4},
+    "rule": {"precision": 0.5, "recall": 0.5, "f1": 0.5, "tp": 1, "fp": 1, "fn": 1}
+  }
+}

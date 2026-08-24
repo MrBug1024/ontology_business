@@ -330,6 +330,54 @@ class RagRuntimeTests(unittest.TestCase):
         self.assertEqual(restored.citations, citations)
         self.assertEqual(MessageOut.model_validate(restored).citations, citations)
 
+    def test_agent_hides_intermediate_tool_narration(self) -> None:
+        agent = Agent(
+            id="agent-final-answer",
+            tenant_id=self.tenant_a.id,
+            name="最终结果助手",
+        )
+        responses = iter(
+            [
+                iter(
+                    [
+                        {"type": "token", "content": "让我继续查询相关数据。"},
+                        {
+                            "type": "tool_calls",
+                            "tool_calls": [
+                                {
+                                    "id": "tables-1",
+                                    "function": {
+                                        "name": "list_tables",
+                                        "arguments": {},
+                                    },
+                                }
+                            ],
+                        },
+                    ]
+                ),
+                iter([{"type": "token", "content": "最终结论：当前没有可用数据表。"}]),
+            ]
+        )
+        with patch(
+            "app.services.agent_engine.llm_service.chat_stream",
+            side_effect=lambda *args, **kwargs: next(responses),
+        ):
+            events = list(
+                run_agent(
+                    self.db,
+                    agent,
+                    LLMConfig(name="测试模型"),
+                    [],
+                    "请给出审计结论",
+                    "",
+                    "",
+                )
+            )
+
+        token_text = "".join(event["data"] for event in events if event["type"] == "token")
+        self.assertNotIn("让我继续查询", token_text)
+        self.assertIn("最终结论：当前没有可用数据表", token_text)
+
     def test_read_document_emits_a_file_versioned_citation(self) -> None:
         rag_service.index_file(self.db, self.private_file)
         self.db.commit()

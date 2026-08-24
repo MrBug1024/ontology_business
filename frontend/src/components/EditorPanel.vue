@@ -12,6 +12,20 @@
     <div class="ep-body">
       <!-- ══ 实体编辑 ══ -->
       <template v-if="editor.kind === 'entity'">
+        <el-alert
+          v-if="editor.id && editedEntity"
+          class="model-readiness-alert"
+          :type="editedEntity.model_ready ? 'success' : 'warning'"
+          :title="editedEntity.model_ready ? '对象模型已就绪' : '对象模型尚未就绪'"
+          :closable="false"
+          show-icon
+        >
+          <template v-if="!editedEntity.model_ready" #default>
+            <ul class="model-issue-list">
+              <li v-for="issue in editedEntity.model_issues || []" :key="issue">{{ issue }}</li>
+            </ul>
+          </template>
+        </el-alert>
         <div class="ep-field">
           <label>名称</label>
           <el-input v-model="editor.form.name" placeholder="如：业务对象、资源、事项" />
@@ -47,14 +61,39 @@
           <span>属性（{{ editor.form.properties.length }}）</span>
           <el-button size="small" text type="primary" @click="addProp"><el-icon><Plus /></el-icon> 添加</el-button>
         </div>
+        <div class="identity-selectors" aria-label="对象标识属性">
+          <div class="ep-field">
+            <label>主键属性</label>
+            <el-select v-model="keyPropertyIndex" clearable style="width:100%" placeholder="选择稳定唯一标识">
+              <el-option v-for="(property, index) in editor.form.properties" :key="`key-${index}`" :label="propertyOptionLabel(property, index)" :value="index" />
+            </el-select>
+            <small class="field-help">用于稳定识别和更新同一个业务对象。</small>
+          </div>
+          <div class="ep-field">
+            <label>标题属性</label>
+            <el-select v-model="titlePropertyIndex" clearable style="width:100%" placeholder="选择对人可读的名称">
+              <el-option v-for="(property, index) in editor.form.properties" :key="`title-${index}`" :label="propertyOptionLabel(property, index)" :value="index" />
+            </el-select>
+            <small class="field-help">用于图谱展示和 Agent 回答；可与主键属性相同。</small>
+          </div>
+        </div>
+        <el-alert
+          v-if="!editor.form.is_abstract && (!hasKeyProperty || !hasTitleProperty)"
+          class="draft-readiness-alert"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="保存草稿后仍不能发布或用于可靠数据映射"
+        >
+          <template #default>具体对象类型需要各选择一个主键属性和标题属性；同一属性可以兼任。</template>
+        </el-alert>
         <div class="ep-props">
           <div class="prop-row" v-for="(p, i) in editor.form.properties" :key="i">
             <el-input v-model="p.name" size="small" placeholder="属性名" />
-            <el-select v-model="p.data_type" size="small" class="prop-type">
+            <el-select v-model="p.data_type" size="small" class="prop-type" @change="handlePropertyTypeChange(i)">
               <el-option v-for="t in DATA_TYPES" :key="t.value" :label="t.label" :value="t.value" />
             </el-select>
             <div class="prop-flags">
-              <el-checkbox v-model="p.is_key" label="主键" />
               <el-checkbox v-model="p.is_required" label="必填" />
               <el-checkbox v-model="p.is_enum" label="枚举" />
               <el-checkbox v-model="p.is_sensitive" label="敏感" />
@@ -83,8 +122,8 @@
               <label>数值范围</label>
               <el-input-number v-model="constraintForms[i].minimum" controls-position="right" placeholder="最小值" />
               <el-input-number v-model="constraintForms[i].maximum" controls-position="right" placeholder="最大值" />
-              <el-checkbox v-model="constraintForms[i].exclusive_minimum" label="不含最小值" />
-              <el-checkbox v-model="constraintForms[i].exclusive_maximum" label="不含最大值" />
+              <el-input-number v-model="constraintForms[i].exclusive_minimum" controls-position="right" placeholder="必须大于" />
+              <el-input-number v-model="constraintForms[i].exclusive_maximum" controls-position="right" placeholder="必须小于" />
             </div>
             <div v-else-if="textProperty(p.data_type)" class="prop-detail constraint-grid">
               <label>文本约束</label>
@@ -98,6 +137,47 @@
                 <el-option label="日期时间" value="date-time" />
               </el-select>
               <el-input v-model="constraintForms[i].pattern" placeholder="匹配规则（可选）" />
+            </div>
+            <div class="prop-detail fixed-value-field">
+              <div class="fixed-value-head">
+                <label>固定值（可选）</label>
+                <el-switch
+                  :model-value="hasFixedValue(i)"
+                  inline-prompt
+                  active-text="启用"
+                  inactive-text="关闭"
+                  @change="toggleFixedValue(i, p.data_type, $event)"
+                />
+              </div>
+              <template v-if="hasFixedValue(i)">
+                <el-select v-if="p.data_type === 'boolean'" v-model="constraintForms[i].const" style="width:100%">
+                  <el-option label="是" :value="true" />
+                  <el-option label="否" :value="false" />
+                </el-select>
+                <el-input-number
+                  v-else-if="numericProperty(p.data_type)"
+                  v-model="constraintForms[i].const"
+                  :precision="p.data_type === 'integer' ? 0 : undefined"
+                  controls-position="right"
+                  style="width:100%"
+                  placeholder="该属性唯一允许的数值"
+                />
+                <StructuredValueEditor
+                  v-else-if="p.data_type === 'json'"
+                  v-model="constraintForms[i].const"
+                  root
+                />
+                <el-date-picker
+                  v-else-if="p.data_type === 'date' || p.data_type === 'datetime'"
+                  v-model="constraintForms[i].const"
+                  :type="p.data_type === 'date' ? 'date' : 'datetime'"
+                  :value-format="p.data_type === 'date' ? 'YYYY-MM-DD' : 'YYYY-MM-DDTHH:mm:ssZ'"
+                  style="width:100%"
+                  placeholder="选择固定日期"
+                />
+                <el-input v-else v-model="constraintForms[i].const" placeholder="该属性唯一允许的值" />
+                <small class="field-help">启用后，每个对象实例的该属性都必须等于这里的值。</small>
+              </template>
             </div>
           </div>
           <div class="muted" v-if="!editor.form.properties.length" style="padding:6px 2px">暂无属性，点击「添加」</div>
@@ -137,6 +217,59 @@
           <label>描述</label>
           <el-input v-model="editor.form.description" type="textarea" :rows="2" placeholder="关系说明" />
         </div>
+        <div class="ep-sec"><span>关系约束（本体公理）</span></div>
+        <el-alert class="relation-semantics" type="info" :closable="false" show-icon>
+          <template #title>普通关系默认可从两端遍历</template>
+          同一条已保存关系可从源对象或目标对象查询，不需要再建一条“反向关系”。对称、传递和显式逆关系只在查询时推理，不会偷偷新增关系实例。
+        </el-alert>
+        <div class="axiom-grid" aria-label="关系本体公理">
+          <div class="axiom-option">
+            <span><b>对称</b><small>A→B 时，查询也解释为 B→A</small></span>
+            <el-switch v-model="relationConstraints.symmetric" aria-label="对称关系" />
+          </div>
+          <div class="axiom-option">
+            <span><b>传递</b><small>A→B 且 B→C 时，查询可得到 A→C</small></span>
+            <el-switch v-model="relationConstraints.transitive" aria-label="传递关系" />
+          </div>
+          <div class="axiom-option">
+            <span><b>反自反</b><small>禁止对象连接自身</small></span>
+            <el-switch v-model="relationConstraints.irreflexive" aria-label="反自反关系" />
+          </div>
+          <div class="axiom-option">
+            <span><b>非对称</b><small>A→B 后严格禁止 B→A，也禁止自连接</small></span>
+            <el-switch v-model="relationConstraints.asymmetric" aria-label="非对称关系" />
+          </div>
+          <div class="axiom-option">
+            <span><b>反对称</b><small>不同对象间不能同时存在 A→B 与 B→A</small></span>
+            <el-switch v-model="relationConstraints.antisymmetric" aria-label="反对称关系" />
+          </div>
+          <div class="axiom-option">
+            <span><b>无环</b><small>禁止新增边形成有向环</small></span>
+            <el-switch v-model="relationConstraints.acyclic" aria-label="无环关系" />
+          </div>
+        </div>
+        <div class="ep-field inverse-field">
+          <label>显式逆关系（可选）</label>
+          <el-select v-model="relationConstraints.inverse_relation_id" clearable filterable style="width:100%" placeholder="仅选择不同命名的反向谓词">
+            <el-option v-for="relation in inverseRelationOptions" :key="relation.id" :label="relation.name" :value="relation.id" />
+          </el-select>
+          <small class="field-help">仅当业务文档明确给出两个不同命名谓词（如“包含”与“属于”或 OWL inverseOf）时配置；普通反向查看无需配置。</small>
+        </div>
+        <div class="cardinality-card">
+          <b>每个源对象可连接的目标对象数</b>
+          <div class="cardinality-row">
+            <div><label>最小</label><el-input-number v-model="relationConstraints.source_min_cardinality" :min="0" :precision="0" controls-position="right" aria-label="每个源对象连接目标对象的最小数量" /></div>
+            <div><label>最大</label><el-input-number v-model="relationConstraints.source_max_cardinality" :min="0" :precision="0" controls-position="right" aria-label="每个源对象连接目标对象的最大数量" /></div>
+          </div>
+        </div>
+        <div class="cardinality-card">
+          <b>每个目标对象可被源对象连接数</b>
+          <div class="cardinality-row">
+            <div><label>最小</label><el-input-number v-model="relationConstraints.target_min_cardinality" :min="0" :precision="0" controls-position="right" aria-label="每个目标对象被源对象连接的最小数量" /></div>
+            <div><label>最大</label><el-input-number v-model="relationConstraints.target_max_cardinality" :min="0" :precision="0" controls-position="right" aria-label="每个目标对象被源对象连接的最大数量" /></div>
+          </div>
+        </div>
+        <small class="field-help cardinality-help">最大基数在新建关系实例时硬校验；最小基数在删除已有边时保护，不会自动补边。</small>
       </template>
 
       <!-- ══ 实例编辑 ══ -->
@@ -260,7 +393,12 @@
 import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
-import type { Entity, Property } from '@/types'
+import type { Entity, Property, Relation } from '@/types'
+import {
+  buildRelationConstraints,
+  relationConstraintForm,
+  type RelationConstraintForm,
+} from '@/utils/relationConstraints'
 import StructuredValueEditor from '@/components/StructuredValueEditor.vue'
 
 const DATA_TYPES = [
@@ -284,6 +422,7 @@ const REL_TYPES = [
 const props = defineProps<{
   editor: { kind: 'entity' | 'relation' | 'instance'; id?: string; form: any }
   entities: Entity[]
+  relations?: Relation[]
   saving?: boolean
 }>()
 const emit = defineEmits<{
@@ -293,6 +432,7 @@ const emit = defineEmits<{
 }>()
 
 const constraintForms = ref<Array<Record<string, any>>>([])
+const relationConstraints = ref<RelationConstraintForm>(relationConstraintForm(undefined))
 const qualityForm = ref<Record<string, any>>({ score: undefined, status: '', issues: [], checked_at: '', source: '' })
 const runtimeLoading = ref(false)
 const runtimeHydrationError = ref('')
@@ -323,10 +463,49 @@ const accent = computed(() => {
 
 function addProp() {
   props.editor.form.properties.push({
-    name: '', data_type: 'string', is_key: false, is_required: false,
+    name: '', data_type: 'string', is_key: false, is_title: false, is_required: false,
     is_enum: false, enum_values: [], constraints: {}, description: '', is_sensitive: false,
   })
   constraintForms.value.push({})
+}
+
+const editedEntity = computed(() => (
+  props.editor.kind === 'entity' && props.editor.id
+    ? props.entities.find((entity) => entity.id === props.editor.id)
+    : undefined
+))
+const hasKeyProperty = computed(() => (
+  props.editor.kind === 'entity' && (props.editor.form.properties || []).filter((property: Property) => property.is_key).length === 1
+))
+const hasTitleProperty = computed(() => (
+  props.editor.kind === 'entity' && (props.editor.form.properties || []).filter((property: Property) => property.is_title).length === 1
+))
+const keyPropertyIndex = computed<number | undefined>({
+  get: () => {
+    const indexes = (props.editor.form.properties || []).flatMap((property: Property, index: number) => property.is_key ? [index] : [])
+    return indexes.length === 1 ? indexes[0] : undefined
+  },
+  set: (selected) => {
+    const selectedIndex = selected == null ? -1 : Number(selected)
+    ;(props.editor.form.properties || []).forEach((property: Property, index: number) => {
+      property.is_key = index === selectedIndex
+    })
+  },
+})
+const titlePropertyIndex = computed<number | undefined>({
+  get: () => {
+    const indexes = (props.editor.form.properties || []).flatMap((property: Property, index: number) => property.is_title ? [index] : [])
+    return indexes.length === 1 ? indexes[0] : undefined
+  },
+  set: (selected) => {
+    const selectedIndex = selected == null ? -1 : Number(selected)
+    ;(props.editor.form.properties || []).forEach((property: Property, index: number) => {
+      property.is_title = index === selectedIndex
+    })
+  },
+})
+function propertyOptionLabel(property: Property, index: number) {
+  return property.name?.trim() || `未命名属性 ${index + 1}`
 }
 
 function removeProp(index: number) {
@@ -337,11 +516,46 @@ function removeProp(index: number) {
 function numericProperty(type: string) { return ['integer', 'float', 'number'].includes(type) }
 function textProperty(type: string) { return ['string', 'text', 'date', 'datetime'].includes(type) }
 
+function hasFixedValue(index: number) {
+  return Object.prototype.hasOwnProperty.call(constraintForms.value[index] || {}, 'const')
+}
+
+function defaultFixedValue(type: string): unknown {
+  if (type === 'boolean') return true
+  if (type === 'integer' || type === 'float' || type === 'number') return 0
+  if (type === 'json') return {}
+  return ''
+}
+
+function toggleFixedValue(index: number, type: string, enabled: string | number | boolean) {
+  constraintForms.value[index] ||= {}
+  if (Boolean(enabled)) constraintForms.value[index].const = defaultFixedValue(type)
+  else delete constraintForms.value[index].const
+}
+
+function handlePropertyTypeChange(index: number) {
+  // 每种属性类型支持的约束不同；切换类型时清空旧约束，避免把旧类型的
+  // 范围或固定值悄悄带入新类型。
+  constraintForms.value[index] = {}
+}
+
 const statePropertyOptions = computed(() => (
   props.editor.kind === 'entity'
     ? (props.editor.form.properties || []).filter((property: Property) => property.is_enum && property.name && property.enum_values?.length)
     : []
 ))
+
+const inverseRelationOptions = computed(() => {
+  if (props.editor.kind !== 'relation') return []
+  const sourceId = String(props.editor.form.source_entity_id || '')
+  const targetId = String(props.editor.form.target_entity_id || '')
+  return (props.relations || []).filter((relation) => (
+    Boolean(relation.id)
+    && relation.source_entity_id === targetId
+    && relation.target_entity_id === sourceId
+    && (relation.id !== props.editor.id || sourceId === targetId)
+  ))
+})
 
 const currentEntity = computed(() => props.entities.find((entity) => entity.id === props.editor.form.entity_id))
 const instanceStateProperty = computed(() => {
@@ -362,6 +576,8 @@ function initializeDrafts() {
     if (props.editor.form.namespace === undefined) props.editor.form.namespace = original?.namespace || ''
     if (props.editor.form.state_property === undefined) props.editor.form.state_property = original?.state_property || ''
     for (const property of props.editor.form.properties || []) {
+      property.is_key = Boolean(property.is_key)
+      property.is_title = Boolean(property.is_title)
       if (!Array.isArray(property.enum_values)) property.enum_values = []
       if (!property.constraints || typeof property.constraints !== 'object' || Array.isArray(property.constraints)) property.constraints = {}
       constraintForms.value.push(structuredClone(property.constraints))
@@ -371,6 +587,7 @@ function initializeDrafts() {
 
   if (props.editor.kind === 'relation') {
     props.editor.form.namespace ??= ''
+    relationConstraints.value = relationConstraintForm(props.editor.form.constraints)
     return
   }
 
@@ -478,7 +695,7 @@ function prepareAndSave() {
         throw new Error('生命周期状态属性必须是包含枚举值的枚举属性')
       }
       for (const [index, property] of (props.editor.form.properties || []).entries()) {
-        property.constraints = Object.fromEntries(Object.entries(constraintForms.value[index] || {}).filter(([, value]) => value !== '' && value !== null && value !== undefined && value !== false))
+        property.constraints = Object.fromEntries(Object.entries(constraintForms.value[index] || {}).filter(([key, value]) => value !== '' && value !== null && value !== undefined && (key === 'const' || value !== false)))
         property.enum_values = property.is_enum
           ? [...new Set((property.enum_values || []).map((value: unknown) => String(value).trim()).filter(Boolean))]
           : []
@@ -486,6 +703,17 @@ function prepareAndSave() {
       }
     } else if (props.editor.kind === 'relation') {
       props.editor.form.namespace = validateNamespace(props.editor.form.namespace)
+      if (
+        relationConstraints.value.inverse_relation_id
+        && !inverseRelationOptions.value.some((relation) => relation.id === relationConstraints.value.inverse_relation_id)
+      ) {
+        throw new Error('所选逆关系的源/目标对象类型必须与当前关系反向对应')
+      }
+      props.editor.form.constraints = buildRelationConstraints(relationConstraints.value, {
+        relationType: props.editor.form.relation_type,
+        sourceEntityId: props.editor.form.source_entity_id,
+        targetEntityId: props.editor.form.target_entity_id,
+      })
     } else if (props.editor.kind === 'instance') {
       props.editor.form.quality = Object.fromEntries(Object.entries(qualityForm.value).filter(([, value]) => value !== '' && value !== null && value !== undefined && (!Array.isArray(value) || value.length)))
       for (const property of currentEntity.value?.properties || []) {
@@ -590,6 +818,87 @@ function prepareAndSave() {
 .runtime-alert {
   margin-bottom: 12px;
 }
+.model-readiness-alert,
+.draft-readiness-alert {
+  margin-bottom: 12px;
+}
+.model-issue-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  line-height: 1.55;
+}
+.identity-selectors {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.relation-semantics {
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+.axiom-grid {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 12px;
+}
+.axiom-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.axiom-option span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.axiom-option b {
+  color: var(--text);
+  font-size: 12px;
+}
+.axiom-option small {
+  color: var(--text-3);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+.inverse-field {
+  margin-top: 4px;
+}
+.cardinality-card {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.cardinality-card > b {
+  color: var(--text-2);
+  font-size: 11.5px;
+}
+.cardinality-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.cardinality-row > div {
+  display: grid;
+  gap: 4px;
+}
+.cardinality-row label {
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+.cardinality-row :deep(.el-input-number) {
+  width: 100%;
+}
+.cardinality-help {
+  margin-bottom: 12px;
+}
 .mono-input :deep(textarea) {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
@@ -651,6 +960,20 @@ function prepareAndSave() {
 .constraint-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .constraint-grid > label { grid-column: 1 / -1; }
 .constraint-grid :deep(.el-input-number), .quality-fields :deep(.el-input-number), .quality-fields :deep(.el-date-editor) { width: 100%; }
+.fixed-value-field {
+  display: grid;
+  gap: 6px;
+}
+.fixed-value-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.fixed-value-head > label {
+  color: var(--text-3);
+  font-size: 11px;
+}
 .quality-fields { display: grid; gap: 7px; }
 .attr-row {
   display: flex;
@@ -679,12 +1002,16 @@ function prepareAndSave() {
     top: auto;
     left: 10px;
     right: 10px;
-    bottom: 10px;
+    bottom: max(10px, env(safe-area-inset-bottom));
     width: auto;
-    max-height: 70%;
+    max-height: min(72dvh, 640px);
   }
   .validity-row {
     display: block;
+  }
+  .identity-selectors {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
   }
 }
 </style>

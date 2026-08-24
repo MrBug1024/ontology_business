@@ -117,7 +117,7 @@
           </section>
           <el-tabs v-model="operationsTab">
             <el-tab-pane label="调用追踪" name="traces">
-              <el-table :data="traces" size="small" max-height="360" empty-text="尚无调用追踪">
+              <el-table :data="traces" size="small" empty-text="尚无调用追踪">
                 <el-table-column prop="created_at" label="时间" min-width="145"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
                 <el-table-column prop="capability" label="能力" width="90"><template #default="{ row }"><el-tag size="small">{{ capabilityLabel(row.capability) }}</el-tag></template></el-table-column>
                 <el-table-column prop="status" label="状态" width="90"><template #default="{ row }"><el-tag size="small" :type="row.status === 'succeeded' ? 'success' : row.status === 'failed' ? 'danger' : 'info'">{{ traceStatus(row.status) }}</el-tag></template></el-table-column>
@@ -128,7 +128,7 @@
             </el-tab-pane>
             <el-tab-pane label="基础评测" name="evaluations">
               <div class="evaluation-actions"><span>记录人工或外部评测的非敏感摘要。</span><el-button v-if="canManage" size="small" type="primary" @click="evaluationDialog = true"><el-icon><Plus /></el-icon> 记录评测</el-button></div>
-              <el-table :data="evaluations" size="small" max-height="300" empty-text="尚无评测记录">
+              <el-table :data="evaluations" size="small" empty-text="尚无评测记录">
                 <el-table-column prop="name" label="评测" min-width="160" />
                 <el-table-column prop="capability" label="能力" width="92"><template #default="{ row }">{{ capabilityLabel(row.capability) }}</template></el-table-column>
                 <el-table-column prop="score" label="得分" width="88"><template #default="{ row }">{{ Number(row.score || 0).toFixed(2) }}</template></el-table-column>

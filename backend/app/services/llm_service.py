@@ -6,12 +6,13 @@ import math
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from openai import OpenAI
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from ..config import get_settings
 from ..models import LLMConfig, LLMInvocationTrace
 from . import tenant_service
 
@@ -63,11 +64,23 @@ class TracePayload:
     error: str = ""
 
 
-def _client(cfg: LLMConfig) -> OpenAI:
+def _client(
+    cfg: LLMConfig,
+    *,
+    timeout: float | None = None,
+    max_retries: int | None = None,
+) -> OpenAI:
+    kwargs: dict[str, Any] = {
+        "base_url": cfg.base_url or None,
+        "api_key": cfg.api_key or "sk-placeholder",
+        "timeout": get_settings().llm_timeout if timeout is None else timeout,
+    }
+    # Omit this option for ordinary calls so the SDK keeps its existing retry
+    # policy. Long-running callers can opt out to bound their wall-clock time.
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
     return OpenAI(
-        base_url=cfg.base_url or None,
-        api_key=cfg.api_key or "sk-placeholder",
-        timeout=120.0,
+        **kwargs,
     )
 
 
@@ -361,8 +374,11 @@ def chat(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     *,
+    request_timeout: float | None = None,
+    max_retries: int | None = None,
     db: Session | None = None,
     operation: str = "chat",
+    before_provider_call: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """非流式对话，并为每次真实 provider 调用持久化脱敏 trace。"""
     input_estimate = _estimate_tokens(_message_text(messages))
@@ -389,7 +405,17 @@ def chat(
             output_tokens=reserved_output,
         )
         try:
-            client = _client(cfg)
+            client = _client(
+                cfg,
+                timeout=request_timeout,
+                max_retries=max_retries,
+            )
+            # Some callers impose a whole-job call-count ceiling in addition
+            # to the monetary budget above.  Invoke that guard immediately
+            # before *every* real provider request, including this function's
+            # adaptive length retry, so an outer wrapper cannot undercount.
+            if before_provider_call is not None:
+                before_provider_call()
             resp = client.chat.completions.create(**kwargs)
             response_choice = resp.choices[0]
             choice = response_choice.message

@@ -24,9 +24,12 @@ from sqlalchemy.orm import Session
 from ..models import (
     BusinessScenario,
     DataMapping,
+    RelationDataMapping,
     FunctionDefinition,
     OntologyAction,
+    OntologyEntity,
     OntologyEvent,
+    OntologyRelation,
     OntologyRelease,
     OntologyRule,
     OntologySnapshot,
@@ -50,9 +53,13 @@ class RuntimeDefinition:
     snapshot_id: str | None
     release_id: str | None
     definition_hash: str
+    scenario_name: str
+    entities: dict[str, Any]
+    relations: dict[str, Any]
     actions: dict[str, Any]
     functions: dict[str, Any]
     mappings: dict[str, Any]
+    relation_mappings: dict[str, Any]
     rules: dict[str, Any]
     events: dict[str, Any]
     workflows: dict[str, Any]
@@ -83,6 +90,24 @@ def _runtime_resource(raw: dict[str, Any], scenario: BusinessScenario) -> Simple
 
 
 def _live_definition(scenario: BusinessScenario, environment: str, db: Session) -> RuntimeDefinition:
+    entities = {
+        item.id: item
+        for item in db.execute(
+            select(OntologyEntity).where(
+                OntologyEntity.scenario_id == scenario.id,
+                OntologyEntity.lifecycle_status == "active",
+            )
+        ).scalars().all()
+    }
+    entity_ids = set(entities)
+    relations = {
+        item.id: item
+        for item in db.execute(
+            select(OntologyRelation).where(OntologyRelation.scenario_id == scenario.id)
+        ).scalars().all()
+        if item.source_entity_id in entity_ids and item.target_entity_id in entity_ids
+    }
+    relation_ids = set(relations)
     functions = {
         item.id: item
         for item in db.execute(
@@ -94,19 +119,37 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
         for item in db.execute(
             select(DataMapping).where(DataMapping.scenario_id == scenario.id)
         ).scalars().all()
+        if item.entity_id in entity_ids
+    }
+    mapping_ids = set(mappings)
+    relation_mappings = {
+        item.id: item
+        for item in db.execute(
+            select(RelationDataMapping).where(RelationDataMapping.scenario_id == scenario.id)
+        ).scalars().all()
+        if item.relation_id in relation_ids
+        and item.source_mapping_id in mapping_ids
+        and item.target_mapping_id in mapping_ids
     }
     actions = {
         item.id: item
         for item in db.execute(
             select(OntologyAction).where(OntologyAction.scenario_id == scenario.id)
         ).scalars().all()
+        if item.entity_id in entity_ids
     }
+    action_ids = set(actions)
     rules = {
         item.id: item
         for item in db.execute(
             select(OntologyRule).where(OntologyRule.scenario_id == scenario.id)
         ).scalars().all()
+        if (not item.entity_id or item.entity_id in entity_ids)
+        and {
+            str(action_id) for action_id in (item.trigger_action_ids or [])
+        }.issubset(action_ids)
     }
+    rule_ids = set(rules)
     events = {
         item.id: item
         for item in db.execute(
@@ -118,10 +161,25 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
         for item in db.execute(
             select(OntologyWorkflow).where(OntologyWorkflow.scenario_id == scenario.id)
         ).scalars().all()
+        if (
+            lambda refs: refs["action"].issubset(action_ids)
+            and refs["rule"].issubset(rule_ids)
+            and refs["event"].issubset(set(events))
+        )(
+            release_service._workflow_reference_ids({
+                "trigger_type": item.trigger_type,
+                "trigger_config": item.trigger_config or {},
+                "steps": item.steps or [],
+                "nodes": item.nodes or [],
+            })
+        )
     }
     definition_groups = {
+        "entities": entities,
+        "relations": relations,
         "functions": functions,
         "mappings": mappings,
+        "relation_mappings": relation_mappings,
         "actions": actions,
         "rules": rules,
         "events": events,
@@ -132,8 +190,23 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
     # pin.  Hash only definition columns (not refresh/error/runtime state) so a
     # confirmed action is rejected when its meaning changed after preview.
     definition_fields = {
+        "entities": (
+            "id", "name", "api_name", "namespace", "description", "icon", "color",
+            "lifecycle_status", "is_abstract", "state_property",
+        ),
+        "relations": (
+            "id", "name", "api_name", "namespace", "source_entity_id",
+            "target_entity_id", "source_display_name", "source_api_name",
+            "target_display_name", "target_api_name", "storage_kind",
+            "relation_type", "constraints", "description",
+        ),
         "functions": ("id", "name", "description", "input_schema", "output_schema", "tags", "visibility", "runtime_kind", "runtime_config"),
         "mappings": ("id", "entity_id", "data_source_id", "data_source_binding_key", "data_source_binding_ref", "table_name", "column_map", "transform_rules"),
+        "relation_mappings": (
+            "id", "relation_id", "source_mapping_id", "target_mapping_id", "mode",
+            "data_source_id", "data_source_binding_key", "data_source_binding_ref",
+            "table_name", "foreign_key_column", "source_key_column", "target_key_column",
+        ),
         "actions": ("id", "entity_id", "name", "description", "input_schema", "executor_type", "executor_config", "precondition", "postcondition", "enabled", "requires_confirmation", "idempotency_required", "permission_scope", "access_scope"),
         "rules": ("id", "entity_id", "name", "description", "condition", "action_on_match", "trigger_action_ids", "severity", "enabled"),
         "events": ("id", "name", "description", "payload_schema", "trigger_source", "enabled"),
@@ -146,6 +219,26 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
         ]
         for group, resources in definition_groups.items()
     }
+    # Properties are nested ORM resources and therefore need an explicit,
+    # deterministic projection in the live definition hash.  Without this, a
+    # property edit would leave an Agent/Action optimistic pin unchanged.
+    digest_payload["entities"] = [
+        {
+            **{field: getattr(entity, field, None) for field in definition_fields["entities"]},
+            "properties": [
+                {
+                    field: getattr(prop, field, None)
+                    for field in (
+                        "id", "name", "api_name", "data_type", "description", "is_key", "is_title",
+                        "is_required", "is_enum", "enum_values", "default_value",
+                        "constraints", "is_sensitive",
+                    )
+                }
+                for prop in sorted(entity.properties, key=lambda item: item.id)
+            ],
+        }
+        for _resource_id, entity in sorted(entities.items())
+    ]
     canonical = json.dumps(
         digest_payload,
         ensure_ascii=False,
@@ -162,9 +255,13 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
         snapshot_id=None,
         release_id=None,
         definition_hash=live_hash,
+        scenario_name=scenario.name,
+        entities=entities,
+        relations=relations,
         actions=actions,
         functions=functions,
         mappings=mappings,
+        relation_mappings=relation_mappings,
         rules=rules,
         events=events,
         workflows=workflows,
@@ -180,6 +277,17 @@ def _from_snapshot(
 ) -> RuntimeDefinition:
     if snapshot.scenario_id != scenario.id or snapshot.tenant_id != scenario.tenant_id:
         raise RuntimeDefinitionError("发布快照不属于当前业务场景")
+    required_collections = {
+        "entities", "relations", "mappings", "functions", "actions",
+        "rules", "events", "workflows",
+    }
+    missing_collections = sorted(
+        key for key in required_collections if key not in (snapshot.content or {})
+    )
+    if missing_collections:
+        raise RuntimeDefinitionError(
+            "发布快照缺少 Agent 运行资源：" + "、".join(missing_collections)
+        )
     try:
         content = release_service.normalize_snapshot_content(snapshot.content or {})
     except Exception as exc:  # noqa: BLE001 - unsafe historic data must fail closed.
@@ -191,6 +299,66 @@ def _from_snapshot(
     content_hash = release_service.snapshot_hash(content)
     if not snapshot.content_hash or snapshot.content_hash != content_hash:
         raise RuntimeDefinitionError("发布快照校验失败，已阻止运行")
+    runtime_content = release_service.active_snapshot_content(content)
+    entities = {
+        str(item["id"]): _runtime_resource(item, scenario)
+        for item in runtime_content.get("entities", [])
+    }
+    for entity in entities.values():
+        entity.lifecycle_status = str(
+            getattr(entity, "lifecycle_status", "active") or "active"
+        )
+        entity.properties = [
+            _runtime_resource(
+                {**property_data, "entity_id": entity.id}, scenario
+            )
+            for property_data in list(getattr(entity, "properties", []) or [])
+        ]
+        for prop in entity.properties:
+            prop.entity = entity
+    relations = {
+        str(item["id"]): _runtime_resource(item, scenario)
+        for item in runtime_content.get("relations", [])
+    }
+    for relation in relations.values():
+        relation.source_entity = entities.get(str(relation.source_entity_id))
+        relation.target_entity = entities.get(str(relation.target_entity_id))
+
+    mappings = {
+        str(item["id"]): _runtime_resource(item, scenario)
+        for item in runtime_content.get("mappings", [])
+    }
+    relation_mappings = {
+        str(item["id"]): _runtime_resource(item, scenario)
+        for item in runtime_content.get("relation_mappings", [])
+    }
+    functions = {
+        str(item["id"]): _runtime_resource(item, scenario)
+        for item in runtime_content.get("functions", [])
+    }
+    actions = {
+        str(item["id"]): _runtime_resource(item, scenario)
+        for item in runtime_content.get("actions", [])
+    }
+    rules = {
+        str(item["id"]): _runtime_resource(item, scenario)
+        for item in runtime_content.get("rules", [])
+    }
+    events = {
+        str(item["id"]): _runtime_resource(item, scenario)
+        for item in runtime_content.get("events", [])
+    }
+    workflows = {
+        str(item["id"]): _runtime_resource(item, scenario)
+        for item in runtime_content.get("workflows", [])
+    }
+    for resource in [*mappings.values(), *actions.values(), *rules.values()]:
+        resource.entity = entities.get(str(getattr(resource, "entity_id", "") or ""))
+    for relation_mapping in relation_mappings.values():
+        relation_mapping.relation = relations.get(str(relation_mapping.relation_id))
+        relation_mapping.source_mapping = mappings.get(str(relation_mapping.source_mapping_id))
+        relation_mapping.target_mapping = mappings.get(str(relation_mapping.target_mapping_id))
+
     return RuntimeDefinition(
         scenario=scenario,
         environment=environment,
@@ -198,30 +366,16 @@ def _from_snapshot(
         snapshot_id=snapshot.id,
         release_id=release.id if release else None,
         definition_hash=content_hash,
-        actions={
-            str(item["id"]): _runtime_resource(item, scenario)
-            for item in content.get("actions", [])
-        },
-        functions={
-            str(item["id"]): _runtime_resource(item, scenario)
-            for item in content.get("functions", [])
-        },
-        mappings={
-            str(item["id"]): _runtime_resource(item, scenario)
-            for item in content.get("mappings", [])
-        },
-        rules={
-            str(item["id"]): _runtime_resource(item, scenario)
-            for item in content.get("rules", [])
-        },
-        events={
-            str(item["id"]): _runtime_resource(item, scenario)
-            for item in content.get("events", [])
-        },
-        workflows={
-            str(item["id"]): _runtime_resource(item, scenario)
-            for item in content.get("workflows", [])
-        },
+        scenario_name=str(content["scenario"]["name"]),
+        entities=entities,
+        relations=relations,
+        actions=actions,
+        functions=functions,
+        mappings=mappings,
+        relation_mappings=relation_mappings,
+        rules=rules,
+        events=events,
+        workflows=workflows,
     )
 
 
@@ -285,6 +439,26 @@ def resolve_pinned(
     normalized_environment = _normalize_environment(environment)
     if normalized_environment == "dev":
         raise RuntimeDefinitionError("开发环境不应携带发布定义固定版本")
+    return _resolve_pinned_release(
+        db,
+        scenario,
+        environment=normalized_environment,
+        snapshot_id=snapshot_id,
+        release_id=release_id,
+        definition_hash=definition_hash,
+    )
+
+
+def _resolve_pinned_release(
+    db: Session,
+    scenario: BusinessScenario,
+    *,
+    environment: str,
+    snapshot_id: str | None,
+    release_id: str | None,
+    definition_hash: str | None,
+) -> RuntimeDefinition:
+    """Resolve and integrity-check one immutable release pin."""
     if not snapshot_id or not release_id or not definition_hash:
         raise RuntimeDefinitionError("运行定义快照缺失，已阻止执行")
     release = db.get(OntologyRelease, release_id)
@@ -294,12 +468,12 @@ def resolve_pinned(
     if (
         release.scenario_id != scenario.id
         or release.tenant_id != scenario.tenant_id
-        or release.environment != normalized_environment
+        or release.environment != environment
         or release.snapshot_id != snapshot.id
         or release.status not in {"released", "superseded", "rolled_back"}
     ):
         raise RuntimeDefinitionError("运行固定的发布版本不一致，已阻止执行")
-    definition = _from_snapshot(scenario, normalized_environment, snapshot, release=release)
+    definition = _from_snapshot(scenario, environment, snapshot, release=release)
     if definition.definition_hash != definition_hash:
         raise RuntimeDefinitionError("运行定义快照完整性校验失败")
     return definition
@@ -316,22 +490,23 @@ def resolve_for_run(db: Session, run: WorkflowRun) -> RuntimeDefinition:
     if not scenario:
         raise RuntimeDefinitionError("工作流所属场景不存在")
     environment = _normalize_environment(run.environment)
-    if environment == "dev" and not run.definition_snapshot_id and not run.release_id:
-        return _live_definition(scenario, environment, db)
-    if not run.definition_snapshot_id or not run.release_id:
-        raise RuntimeDefinitionError("运行定义快照缺失，已阻止执行")
-    release = db.get(OntologyRelease, run.release_id)
-    snapshot = db.get(OntologySnapshot, run.definition_snapshot_id)
-    if not release or not snapshot:
-        raise RuntimeDefinitionError("运行固定的发布版本已不可用")
-    if (
-        release.scenario_id != scenario.id
-        or release.tenant_id != scenario.tenant_id
-        or release.environment != environment
-        or release.snapshot_id != snapshot.id
-    ):
-        raise RuntimeDefinitionError("运行固定的发布版本不一致，已阻止执行")
-    return _from_snapshot(scenario, environment, snapshot, release=release)
+    if environment == "dev":
+        if run.definition_snapshot_id or run.release_id:
+            raise RuntimeDefinitionError("开发环境不应携带发布定义固定版本")
+        if not run.definition_hash:
+            raise RuntimeDefinitionError("运行定义哈希缺失，已阻止执行")
+        definition = _live_definition(scenario, environment, db)
+        if definition.definition_hash != run.definition_hash:
+            raise RuntimeDefinitionError("运行定义快照完整性校验失败")
+        return definition
+    return _resolve_pinned_release(
+        db,
+        scenario,
+        environment=environment,
+        snapshot_id=run.definition_snapshot_id,
+        release_id=run.release_id,
+        definition_hash=run.definition_hash,
+    )
 
 
 def resolve_resource(
@@ -343,6 +518,7 @@ def resolve_resource(
         "action": definition.actions,
         "function": definition.functions,
         "mapping": definition.mappings,
+        "relation_mapping": definition.relation_mappings,
         "rule": definition.rules,
         "event": definition.events,
         "workflow": definition.workflows,

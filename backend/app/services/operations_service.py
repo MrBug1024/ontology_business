@@ -22,7 +22,12 @@ from ..models import (
     WorkflowApprovalRequest,
     WorkflowRun,
 )
-from . import permission_service, runtime_connector_service, runtime_definition_service
+from . import (
+    capability_readiness_service,
+    permission_service,
+    runtime_connector_service,
+    runtime_definition_service,
+)
 from .policies import PolicyViolation, validate_action_params
 
 
@@ -522,8 +527,9 @@ def enqueue_workflow_run(
     definition, workflow = _definition_for_workflow(
         db, workflow, definition=runtime_definition
     )
-    if not _is_active(workflow):
-        raise PolicyViolation("工作流当前未启用，不能提交任务")
+    capability_readiness_service.require_executable(
+        "workflow", workflow, definition=definition, db=db
+    )
     if trigger_source in {"manual", "retry"}:
         decision = permission_service.check_workflow(db, workflow, "execute")
         if not decision.allowed:
@@ -598,8 +604,9 @@ def publish_event(
         event = runtime_definition_service.resolve_resource(definition, "event", event.id)
     except runtime_definition_service.RuntimeDefinitionError as exc:
         raise PolicyViolation("事件不存在于当前运行定义") from exc
-    if not event.enabled:
-        raise PolicyViolation("事件已停用，不能发布")
+    capability_readiness_service.require_executable(
+        "event", event, definition=definition, db=db
+    )
     creator_id = _event_creator(
         db,
         event,
