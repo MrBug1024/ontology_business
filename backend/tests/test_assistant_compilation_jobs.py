@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -241,7 +242,33 @@ class AssistantCompilationJobTests(unittest.TestCase):
             ),
             self.db,
         )
-        return asyncio.run(self._consume(response))
+        body = asyncio.run(self._consume(response))
+        # Compound compilation is intentionally asynchronous now. Keep the
+        # fixture deterministic by waiting on the same durable job API that a
+        # browser uses, then append the terminal event for legacy assertions.
+        job = self._wait_for_terminal_job()
+        if job.status == "succeeded":
+            message_row = self.db.get(AssistantMessage, job.message_id)
+            body += assistant._sse("proposal", message_row.proposal)
+        else:
+            body += assistant._sse(
+                "error",
+                (job.progress or {}).get("detail") or "任务失败",
+            )
+        return body
+
+    def _wait_for_terminal_job(self, timeout: float = 10.0) -> AssistantCompilationJob:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.db.expire_all()
+            job = self.db.execute(
+                select(AssistantCompilationJob)
+                .order_by(AssistantCompilationJob.created_at.desc())
+            ).scalars().first()
+            if job and job.status in {"succeeded", "failed"}:
+                return job
+            time.sleep(0.01)
+        self.fail("后台编译任务未在测试超时内进入终态")
 
     def test_concurrent_claim_has_exactly_one_owner(self) -> None:
         identity = self._identity()
@@ -498,7 +525,13 @@ class AssistantCompilationJobTests(unittest.TestCase):
 
         self.assertEqual(provider_calls, 1)
         self.assertIn("没有启动第二套模型调用", sync_reply.reply)
-        self.assertIn('"type": "proposal"', stream_body)
+        self.assertIn('"type": "compilation_job"', stream_body)
+        job = self._wait_for_terminal_job()
+        self.assertEqual(job.status, "succeeded")
+        self.assertEqual(
+            self.db.get(AssistantMessage, job.message_id).proposal.get("kind"),
+            "scenario_model",
+        )
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(AssistantCompilationJob)),
             1,

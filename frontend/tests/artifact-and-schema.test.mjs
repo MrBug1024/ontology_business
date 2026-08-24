@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import { actionArtifactAttachment } from '../src/utils/artifactAttachments.ts'
@@ -15,6 +16,7 @@ import {
 } from '../src/utils/assistantCompilationRecovery.ts'
 import { buildRelationConstraints, relationConstraintForm } from '../src/utils/relationConstraints.ts'
 import { safeInternalReturnPath } from '../src/utils/navigation.ts'
+import { parseStandardMCPConfig } from '../src/utils/mcpConfig.ts'
 import {
   buildRelationMappingPayload,
   missingRelationMappingFields,
@@ -39,6 +41,17 @@ function memoryStorage() {
     removeItem: (key) => values.delete(key),
   }
 }
+
+test('global assistant shows safe reference names and makes capability updates read-only', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  assert.match(source, /reference\.display_name/)
+  assert.match(source, /修改或删除将切换为只读指导/)
+  assert.match(source, /新增业务能力/)
+  assert.doesNotMatch(source, /return '场景已有定义'/)
+})
 
 test('successful Action artifacts ignore a forged download URL', () => {
   const id = 'a'.repeat(32)
@@ -103,6 +116,44 @@ test('native DOCX, XLSX and Markdown artifacts keep matching format and MIME met
     assert.equal(attachment?.format, format)
     assert.equal(attachment?.mime, mime)
   }
+})
+
+test('standard mcpServers HTTP config is normalized for a safe preview', () => {
+  const parsed = parseStandardMCPConfig(JSON.stringify({
+    mcpServers: {
+      search: {
+        type: 'http',
+        url: 'https://example.test/mcp',
+        headers: { Authorization: 'Bearer test-only' },
+      },
+    },
+  }))
+  assert.equal(parsed.preview[0].name, 'search')
+  assert.equal(parsed.preview[0].transport, 'streamable_http')
+  assert.deepEqual(parsed.preview[0].headerKeys, ['Authorization'])
+  assert.equal(JSON.stringify(parsed.preview).includes('test-only'), false)
+})
+
+test('standard MCP config rejects missing wrappers and non-string header values', () => {
+  assert.throws(() => parseStandardMCPConfig('{"service":{}}'), /mcpServers/)
+  assert.throws(() => parseStandardMCPConfig(JSON.stringify({
+    mcpServers: { search: { type: 'http', url: 'https://example.test/mcp', headers: { Authorization: 1 } } },
+  })), /必须是文本/)
+  assert.throws(() => parseStandardMCPConfig(JSON.stringify({
+    mcpServers: { search: { type: 'http', url: 'https://user:password@example.test/mcp' } },
+  })), /用户凭据/)
+  assert.throws(() => parseStandardMCPConfig(JSON.stringify({
+    mcpServers: { search: { type: 'http', url: 'https://example.test/mcp?access_token=test-only' } },
+  })), /查询参数不能携带凭据/)
+  assert.throws(() => parseStandardMCPConfig(JSON.stringify({
+    mcpServers: {
+      search: {
+        type: 'http',
+        url: 'https://example.test/mcp',
+        headers: { Authorization: 'one', authorization: 'two' },
+      },
+    },
+  })), /重复键名/)
 })
 
 test('nested object and array schema survives no-JSON editor round trip', () => {

@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from app.models import (
     ActionExecutionLog,
     Agent,
     AssistantAttachment,
+    AssistantCompilationJob,
     AssistantMessage,
     AssistantThread,
     BusinessScenario,
@@ -387,6 +389,127 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             1,
         )
 
+    def test_compound_scenario_model_can_apply_safe_subset_and_keep_blocker(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="农民工欠薪预警",
+            namespace="wage-warning",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        source_bundle = scenario_model_compiler.build_source_bundle(
+            "",
+            [{
+                "id": "wage-apply",
+                "filename": "欠薪预警业务说明.md",
+                "text": "项目以项目编号唯一标识。\n\n人员需要补充唯一编号后才能建模。",
+            }],
+        )
+        payload = scenario_model_compiler.normalize_scenario_model(
+            self.db,
+            scenario,
+            {
+                "schema_version": "scenario_model.v1",
+                "entities": [
+                    {
+                        "key": "entity.project",
+                        "name": "项目",
+                        "properties": [{
+                            "name": "项目编号",
+                            "data_type": "string",
+                            "is_key": True,
+                            "is_title": True,
+                            "is_required": True,
+                        }],
+                        "evidence_refs": ["wage-apply:p0001"],
+                        "confidence": 1.0,
+                    },
+                    {
+                        "key": "entity.worker",
+                        "name": "人员",
+                        "properties": [{
+                            "name": "姓名",
+                            "data_type": "string",
+                            "is_title": True,
+                            "is_required": True,
+                        }],
+                        "evidence_refs": ["wage-apply:p0002"],
+                        "confidence": 0.8,
+                    },
+                ],
+                "relations": [],
+                "functions": [],
+                "actions": [],
+                "rules": [],
+                "events": [],
+                "workflows": [],
+                "mappings": [],
+                "unresolved": [],
+                "coverage": [
+                    {
+                        "source_ref": "wage-apply:p0001",
+                        "status": "modeled",
+                        "reason": "项目对象与主键",
+                        "change_keys": ["entity.project"],
+                    },
+                    {
+                        "source_ref": "wage-apply:p0002",
+                        "status": "modeled",
+                        "reason": "人员对象缺少唯一编号",
+                        "change_keys": ["entity.worker"],
+                    },
+                ],
+            },
+            source_bundle=source_bundle,
+        )
+        proposal = assistant._build_proposal("scenario_model", payload, scenario)
+        self.assertIn("entity.project", payload["applyability"]["safe_change_keys"])
+        self.assertNotIn("entity.worker", payload["applyability"]["safe_change_keys"])
+        self.assertIn("entity.worker", payload["applyability"]["blocked_change_keys"])
+        thread, _message = self._proposal_message(
+            kind="scenario_model",
+            proposal=proposal,
+            scenario=scenario,
+        )
+
+        with self.assertRaises(Exception):
+            assistant.apply_proposal(
+                AssistantProposalApplyRequest(
+                    kind="scenario_model",
+                    scenario_id=scenario.id,
+                    thread_id=thread.id,
+                    proposal_id=proposal["proposal_id"],
+                    confirm=True,
+                ),
+                self.db,
+            )
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            0,
+        )
+
+        result = assistant.apply_proposal(
+            AssistantProposalApplyRequest(
+                kind="scenario_model",
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                proposal_id=proposal["proposal_id"],
+                confirm=True,
+                allow_partial=True,
+            ),
+            self.db,
+        )
+        self.assertTrue(result["data"]["partial"])
+        self.assertEqual(result["data"]["safe_change_count"], 2)
+        self.assertEqual(result["data"]["blocked_issue_count"], 1)
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            1,
+        )
+        saved = self.db.get(AssistantMessage, _message.id)
+        self.assertEqual(saved.proposal["status"], "partially_applied")
+
     def test_mapping_apply_rejects_stale_or_invented_columns(self) -> None:
         scenario = BusinessScenario(
             tenant_id=self.tenant.id,
@@ -714,7 +837,16 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             input_schema={"type": "object", "properties": {}},
             output_schema={"type": "object", "properties": {}},
         )
-        self.db.add_all([scenario, function])
+        llm = LLMConfig(
+            tenant_id=self.tenant.id,
+            name="测试模型",
+            provider="openai",
+            model="test-model",
+            api_key="test-key",
+            enabled=True,
+            is_default=True,
+        )
+        self.db.add_all([scenario, function, llm])
         self.db.commit()
         tenant_id = self.tenant.id
         user_id = self.user.id
@@ -777,8 +909,29 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             self.db.expunge_all()
             body = asyncio.run(self._consume_until(response))
 
+            # Keep the compiler patch active while the background worker
+            # reaches the provider call; the request returns the job handle
+            # before this durable result exists.
+            deadline = time.monotonic() + 10
+            job = None
+            while time.monotonic() < deadline:
+                self.db.expire_all()
+                job = self.db.execute(
+                    select(AssistantCompilationJob)
+                    .order_by(AssistantCompilationJob.created_at.desc())
+                ).scalars().first()
+                if job and job.status in {"succeeded", "failed"}:
+                    break
+                time.sleep(0.01)
+
         self.assertNotIn("not bound to a Session", body)
-        self.assertIn('"type": "proposal"', body)
+        self.assertIn('"type": "compilation_job"', body)
+
+        self.assertIsNotNone(job)
+        self.assertEqual(job.status, "succeeded", job.error)
+        message = self.db.get(AssistantMessage, job.message_id)
+        self.assertIsNotNone(message)
+        self.assertEqual(message.proposal.get("kind"), "scenario_model")
         self.assertEqual(observed["functions"], ["计算风险分"])
         self.assertEqual(observed["tenant_id"], tenant_id)
         self.assertEqual(observed["user_id"], user_id)

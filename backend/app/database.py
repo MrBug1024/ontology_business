@@ -8,7 +8,7 @@ import json
 import uuid
 
 from fastapi import Request
-from sqlalchemy import MetaData, Table, create_engine, event, inspect, text
+from sqlalchemy import Index, MetaData, Table, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import get_settings
@@ -816,6 +816,74 @@ def _migrate_connector_governance() -> None:
                 f"UPDATE {table} SET connector_revision = 1 "
                 "WHERE connector_revision IS NULL OR connector_revision < 1"
             )
+
+
+def _migrate_mcp_name_identity() -> None:
+    """Install one Unicode-normalized MCP name identity per tenant.
+
+    Application-side conflict checks are useful for friendly errors but cannot
+    close a concurrent check-then-insert race.  Existing duplicates are never
+    renamed or deleted automatically: startup fails with the exact row ids so
+    an operator can resolve the ambiguity deliberately.
+    """
+    from .models import normalize_mcp_name_key
+
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if not inspector.has_table("mcp_configs"):
+            return
+        existing = {
+            column["name"] for column in inspector.get_columns("mcp_configs")
+        }
+        if "name_key" not in existing:
+            conn.exec_driver_sql(
+                "ALTER TABLE mcp_configs ADD COLUMN name_key VARCHAR(600)"
+            )
+
+        rows = conn.execute(text(
+            "SELECT id, tenant_id, name FROM mcp_configs ORDER BY tenant_id, id"
+        )).mappings().all()
+        identities: dict[tuple[str, str], list[str]] = {}
+        updates: list[dict[str, str]] = []
+        for row in rows:
+            key = normalize_mcp_name_key(str(row["name"] or ""))
+            tenant_id = str(row["tenant_id"] or "")
+            if tenant_id:
+                identities.setdefault((tenant_id, key), []).append(str(row["id"]))
+            updates.append({"id": str(row["id"]), "name_key": key})
+        duplicates = [
+            (tenant_id, key, ids)
+            for (tenant_id, key), ids in identities.items()
+            if len(ids) > 1
+        ]
+        if duplicates:
+            tenant_id, key, ids = duplicates[0]
+            raise RuntimeError(
+                "MCP 名称规范化后存在租户内重复，无法安全建立唯一约束："
+                f"tenant={tenant_id}, name_key={key!r}, ids={','.join(ids)}"
+            )
+        if updates:
+            conn.execute(
+                text("UPDATE mcp_configs SET name_key=:name_key WHERE id=:id"),
+                updates,
+            )
+
+        refreshed = inspect(conn)
+        identity_names = {
+            item.get("name") for item in refreshed.get_unique_constraints("mcp_configs")
+        } | {
+            item.get("name") for item in refreshed.get_indexes("mcp_configs")
+            if item.get("unique")
+        }
+        if "uq_mcp_configs_tenant_name_key" not in identity_names:
+            metadata = MetaData()
+            table = Table("mcp_configs", metadata, autoload_with=conn)
+            Index(
+                "uq_mcp_configs_tenant_name_key",
+                table.c.tenant_id,
+                table.c.name_key,
+                unique=True,
+            ).create(conn)
 
 
 def _migrate_workflow_run_environment() -> None:
@@ -1845,6 +1913,7 @@ def init_db() -> None:
     _migrate_permission_controls()
     _migrate_release_governance()
     _migrate_connector_governance()
+    _migrate_mcp_name_identity()
     _migrate_workflow_run_environment()
     _migrate_workflow_run_execution_key()
     _migrate_runtime_definition_pins()

@@ -750,6 +750,25 @@ export interface MCPConfig {
   created_at?: string
 }
 
+export interface MCPImportItem {
+  name: string
+  transport: 'stdio' | 'sse' | 'streamable_http'
+  endpoint: string
+  env_keys: string[]
+  header_keys: string[]
+  enabled: boolean
+  action: 'create' | 'replace' | 'skip'
+}
+
+export interface MCPImportResult {
+  dry_run: boolean
+  created: number
+  replaced: number
+  skipped: number
+  items: MCPImportItem[]
+  configs: MCPConfig[]
+}
+
 export interface MCPTool {
   name: string
   description?: string

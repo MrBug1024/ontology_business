@@ -1950,8 +1950,8 @@ class AgentContext:
                         source.connector_revision or 0
                     ),
                     "definition_hash": (
-                        self.runtime_definition.definition_hash
-                        if self.runtime_definition else ""
+                        getattr(self, "runtime_definition", None).definition_hash
+                        if getattr(self, "runtime_definition", None) else ""
                     ),
                     "table": mapping.table_name,
                     "column_map": column_map,
@@ -1986,8 +1986,8 @@ class AgentContext:
                         source.connector_revision or 0
                     ),
                     "definition_hash": (
-                        self.runtime_definition.definition_hash
-                        if self.runtime_definition else ""
+                        getattr(self, "runtime_definition", None).definition_hash
+                        if getattr(self, "runtime_definition", None) else ""
                     ),
                     "table": mapping.table_name,
                     "foreign_key_column": getattr(mapping, "foreign_key_column", "") or "",
@@ -2043,8 +2043,12 @@ class AgentContext:
         result = self._parsed_tool_result(raw_result)
         if result is None:
             return False
+        # Some persisted-history and migration tests construct a lightweight
+        # AgentContext without the optional runtime definition. Treat that as
+        # an unavailable binding and keep the authorization check fail-closed.
+        runtime_definition = getattr(self, "runtime_definition", None)
         current_definition_hash = str(
-            getattr(self.runtime_definition, "definition_hash", "") or ""
+            getattr(runtime_definition, "definition_hash", "") or ""
         )
         # A persisted failure can be replayed only when it is one of our small,
         # server-authored envelopes and the tool is still exposed to this Agent.
@@ -2162,7 +2166,7 @@ class AgentContext:
             try:
                 plan = mapped_query_service.prepare_query(
                     self.db,
-                    definition=self.runtime_definition,
+                    definition=runtime_definition,
                     mappings=self.mappings,
                     data_sources=self.data_sources,
                     args=args,

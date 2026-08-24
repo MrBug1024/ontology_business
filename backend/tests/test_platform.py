@@ -153,9 +153,43 @@ class AssistantIntentTests(unittest.TestCase):
         self.assertEqual(_intent("把异常处理编排成审批工作流", "ask"), "workflow")
         self.assertEqual(
             _intent("请按文档完成本体建模，文档中还包含规则、事件和工作流", "ask"),
-            "ontology",
+            "scenario_model",
         )
+        self.assertEqual(
+            _intent("根据附件完成对象、关系、映射、函数、操作、规则、事件和工作流", "ask"),
+            "scenario_model",
+        )
+        self.assertEqual(_intent("请创建合同到期提醒规则", "ask"), "scenario_model")
+        self.assertEqual(_intent("请完成当前场景的完整建模", "ask"), "scenario_model")
+        self.assertEqual(_intent("请开展当前场景建模", "ask"), "scenario_model")
         self.assertEqual(_intent("基于已有本体编排审批工作流", "ask"), "workflow")
+        self.assertEqual(_intent("场景建模是什么", "ask"), "chat")
+        self.assertEqual(_intent("如何创建合同到期提醒规则", "ask"), "chat")
+        self.assertEqual(
+            _intent("更新现有合同到期提醒规则", "ask"),
+            "capability_update_guidance",
+        )
+        self.assertEqual(
+            _intent("更新现有合同到期提醒规则", "draft", "scenario_model"),
+            "capability_update_guidance",
+        )
+        self.assertEqual(
+            _intent("更新合同规则并创建合同到期事件", "ask"),
+            "capability_update_guidance",
+        )
+        self.assertEqual(
+            _intent("根据更新后的文档创建合同到期规则", "ask"),
+            "scenario_model",
+        )
+        self.assertEqual(
+            _intent("请设计订单规则，收到订单事件后更新库存", "draft", "scenario_model"),
+            "scenario_model",
+        )
+        self.assertEqual(
+            _intent("请创建合同事件并更新现有提醒规则", "draft", "scenario_model"),
+            "capability_update_guidance",
+        )
+        self.assertEqual(_intent("完成这个操作", "ask"), "chat")
         self.assertEqual(_intent("帮我看看当前页面", "ask"), "chat")
         self.assertEqual(_intent("继续分析", "draft"), "ontology")
         self.assertEqual(_intent("帮我创建场景", "explain"), "explain")

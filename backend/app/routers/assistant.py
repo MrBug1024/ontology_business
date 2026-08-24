@@ -5,6 +5,7 @@ import json
 import hashlib
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,7 @@ from ..services import (
     ontology_service,
     permission_service,
     rag_service,
+    release_service,
     runtime_connector_service,
     runtime_definition_service,
     scenario_model_compiler,
@@ -76,6 +78,16 @@ router = APIRouter(prefix="/assistant", tags=["assistant"])
 # the user's message and authorised RAG excerpts around this attachment body.
 ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS = 80_000
 ASSISTANT_ATTACHMENT_CONTEXT_MAX_CHARS = 80_000
+
+# Compound compilation is proposal-only and each job has a durable single-
+# flight claim. A small process-local pool lets the HTTP/SSE request return
+# immediately while the existing status/result endpoints remain the recovery
+# boundary. Production deployments can replace this executor with a queue
+# worker without changing the job or proposal contract.
+_COMPILATION_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="assistant-compilation",
+)
 
 
 def _tenant(db: Session) -> str:
@@ -203,20 +215,84 @@ def _assistant_capability_context(db: Session, payload: AssistantChatRequest) ->
     return "\n".join(lines)
 
 
-def _scenario_context(scenario: BusinessScenario | None) -> str:
+def _scenario_context(db: Session, scenario: BusinessScenario | None) -> str:
     if not scenario:
         return "当前未打开具体业务场景。"
-    lines = [f"业务场景：{scenario.name}", f"场景说明：{scenario.description or '暂无'}"]
+
+    def safe_value(value: Any) -> Any:
+        return release_service.safe_snapshot_content({"value": value}).get("value")
+
+    def short(value: Any, maximum: int = 500) -> str:
+        sanitized = safe_value(value)
+        if isinstance(sanitized, (dict, list)):
+            text = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"))
+        else:
+            text = str(sanitized or "")
+        return text if len(text) <= maximum else text[:maximum] + "…"
+
+    def schema_fields(value: Any) -> str:
+        sanitized = safe_value(value)
+        schema = sanitized if isinstance(sanitized, dict) else {}
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        names = [short(name, 120) for name in properties]
+        return "、".join(names[:12]) + (f" 等 {len(names)} 项" if len(names) > 12 else "") if names else "无字段"
+
+    entities = list(getattr(scenario, "entities", []) or [])
+    relations = list(getattr(scenario, "relations", []) or [])
+    entity_names = {str(item.id): short(item.name, 200) for item in entities}
+    visible_properties = {
+        str(entity.id): [
+            prop for prop in list(entity.properties)
+            if permission_service.can_read_property(db, prop)
+        ]
+        for entity in entities
+    }
+    visible_property_names = {
+        entity_id: {str(prop.name) for prop in properties}
+        for entity_id, properties in visible_properties.items()
+    }
+    actions = [
+        item for item in list(getattr(scenario, "actions", []) or [])
+        if permission_service.check_action(db, item, "read").allowed
+    ]
+    action_names = {str(item.id): short(item.name, 200) for item in actions}
+    rule_names = {str(item.id): short(item.name, 200) for item in list(getattr(scenario, "rules", []) or [])}
+    event_names = {str(item.id): short(item.name, 200) for item in list(getattr(scenario, "events", []) or [])}
+    lines = [
+        f"业务场景：{short(scenario.name, 200)}",
+        f"场景说明：{short(scenario.description, 1_000) or '暂无'}",
+    ]
     if scenario.industry:
-        lines.append(f"所属行业：{scenario.industry}")
-    if scenario.entities:
+        lines.append(f"所属行业：{short(scenario.industry, 200)}")
+    lines.append(
+        "当前资源统计："
+        f"对象 {len(entities)}，关系 {len(relations)}，"
+        f"函数 {len(list(getattr(scenario, 'function_definitions', []) or []))}，"
+        f"操作 {len(action_names)}，规则 {len(rule_names)}，事件 {len(event_names)}，"
+        f"工作流 {len([item for item in list(getattr(scenario, 'workflows', []) or []) if permission_service.check_workflow(db, item, 'read').allowed])}，"
+        f"对象映射 {len(list(getattr(scenario, 'data_mappings', []) or []))}，"
+        f"关系映射 {len(list(getattr(scenario, 'relation_data_mappings', []) or []))}。"
+    )
+    if entities:
         lines.append("已有本体实体：")
-        for entity in scenario.entities[:30]:
-            props = "、".join(p.name for p in entity.properties[:12]) or "暂无属性"
-            lines.append(f"- {entity.name}：{props}")
-    if scenario.relations:
+        for entity in entities[:40]:
+            props = "、".join(
+                f"{short(prop.name, 200)}({short(prop.data_type, 80)}{'/主键' if prop.is_key else ''}{'/标题' if prop.is_title else ''})"
+                for prop in visible_properties.get(str(entity.id), [])[:20]
+            ) or "暂无属性"
+            state_property = (
+                short(entity.state_property, 200)
+                if str(entity.state_property or "")
+                in visible_property_names.get(str(entity.id), set())
+                else ""
+            )
+            lines.append(
+                f"- {short(entity.name, 200)}{'（抽象）' if entity.is_abstract else ''}：{props}；"
+                f"状态属性：{state_property or '无或已受限'}"
+            )
+    if relations:
         lines.append("已有关系：")
-        for relation in scenario.relations[:30]:
+        for relation in relations[:40]:
             constraints = ontology_service.normalize_relation_constraints(
                 relation.constraints or {}, relation_type=relation.relation_type
             )
@@ -228,7 +304,113 @@ def _scenario_context(scenario: BusinessScenario | None) -> str:
                 ) if constraints.get(key)
             ]
             suffix = f"；约束：{'、'.join(axiom_labels)}" if axiom_labels else ""
-            lines.append(f"- {relation.name}（{relation.relation_type}{suffix}）")
+            lines.append(
+                f"- {short(relation.name, 200)}：{entity_names.get(str(relation.source_entity_id), '未知对象')}"
+                f" → {entity_names.get(str(relation.target_entity_id), '未知对象')}"
+                f"（{short(relation.relation_type, 80)}{suffix}）"
+            )
+    functions = list(getattr(scenario, "function_definitions", []) or [])
+    if functions:
+        lines.append("已有函数：")
+        for item in functions[:30]:
+            lines.append(
+                f"- {short(item.name, 200)}：{short(item.description, 500) or '暂无说明'}；"
+                f"运行方式 {short(item.runtime_kind, 80)}；"
+                f"输入 {schema_fields(item.input_schema)}；输出 {schema_fields(item.output_schema)}"
+            )
+    if actions:
+        lines.append("已有操作：")
+        for item in actions[:30]:
+            lines.append(
+                f"- {short(item.name, 200)}：对象 {entity_names.get(str(item.entity_id), '未知对象')}；"
+                f"执行器 {short(item.executor_type, 80)}；{'已启用' if item.enabled else '已停用'}；"
+                f"输入 {schema_fields(item.input_schema)}；前置 {short(item.precondition, 240) or '无'}；"
+                f"后置 {short(item.postcondition, 240) or '无'}"
+            )
+    rules = list(getattr(scenario, "rules", []) or [])
+    if rules:
+        lines.append("已有规则：")
+        for item in rules[:30]:
+            lines.append(
+                f"- {short(item.name, 200)}：对象 {entity_names.get(str(item.entity_id), '场景级')}；"
+                f"级别 {short(item.severity, 80)}；{'已启用' if item.enabled else '已停用'}；"
+                f"条件 {short(item.condition)}；命中结果 {short(item.action_on_match, 240) or '无'}；"
+                f"触发操作 {'、'.join(action_names.get(str(value), '受限或未知操作') for value in (item.trigger_action_ids or [])) or '无'}"
+            )
+    events = list(getattr(scenario, "events", []) or [])
+    if events:
+        lines.append("已有事件：")
+        for item in events[:30]:
+            lines.append(
+                f"- {short(item.name, 200)}：{'已启用' if item.enabled else '已停用'}；"
+                f"载荷 {schema_fields(item.payload_schema)}；触发来源 {short(item.trigger_source, 240) or '无'}"
+            )
+    workflows = [
+        item for item in list(getattr(scenario, "workflows", []) or [])
+        if permission_service.check_workflow(db, item, "read").allowed
+    ]
+    if workflows:
+        lines.append("已有工作流：")
+        for item in workflows[:30]:
+            referenced: list[str] = []
+            for node in item.nodes or []:
+                data = node.get("data") if isinstance(node, dict) and isinstance(node.get("data"), dict) else {}
+                node_type = str(node.get("type") or "") if isinstance(node, dict) else ""
+                resource_id = str(data.get(f"{node_type}_id") or "")
+                names = {"action": action_names, "rule": rule_names, "event": event_names}.get(node_type, {})
+                if resource_id:
+                    referenced.append(names.get(resource_id, "受限或未知引用"))
+            lines.append(
+                f"- {short(item.name, 200)}：{short(item.trigger_type, 80)} 触发；"
+                f"状态 {short(item.status, 80)}；"
+                f"{'已启用' if item.enabled else '已停用'}；{len(item.nodes or [])} 个节点；"
+                f"引用 {'、'.join(dict.fromkeys(referenced)) or '无'}"
+            )
+    tenant_id = tenant_service.current_tenant_id(db)
+    data_sources = [
+        item for item in list(getattr(scenario, "data_sources", []) or [])
+        if item.tenant_id == tenant_id or item.is_public
+    ]
+    visible_source_ids = {str(item.id) for item in data_sources}
+    if data_sources:
+        lines.append("当前场景数据源（不含连接密钥）：")
+        for item in data_sources[:20]:
+            lines.append(
+                f"- {short(item.name, 200)}：{short(item.type, 80)}；"
+                f"状态 {short(item.status, 80)}"
+            )
+    mappings = [
+        item for item in list(getattr(scenario, "data_mappings", []) or [])
+        if str(item.data_source_id) in visible_source_ids
+    ]
+    if mappings:
+        lines.append("已有对象数据映射：")
+        for item in mappings[:40]:
+            source = getattr(item, "data_source", None)
+            safe_column_map = {
+                str(property_name): column_name
+                for property_name, column_name in (item.column_map or {}).items()
+                if str(property_name) in visible_property_names.get(str(item.entity_id), set())
+            }
+            lines.append(
+                f"- {entity_names.get(str(item.entity_id), '未知对象')} ← "
+                f"{short(getattr(source, 'name', ''), 200) or '未知数据源'}."
+                f"{short(item.table_name, 300)}；字段 {short(safe_column_map, 700)}；"
+                f"状态 {short(item.status, 80)}"
+            )
+    relation_mappings = [
+        item for item in list(getattr(scenario, "relation_data_mappings", []) or [])
+        if not item.data_source_id or str(item.data_source_id) in visible_source_ids
+    ]
+    if relation_mappings:
+        relation_names = {str(item.id): str(item.name) for item in relations}
+        lines.append("已有关系数据映射：")
+        for item in relation_mappings[:40]:
+            lines.append(
+                f"- {short(relation_names.get(str(item.relation_id), '未知关系'), 200)}："
+                f"{short(item.mode, 80)}；表 {short(item.table_name, 300) or '沿用对象映射'}；"
+                f"状态 {short(item.status, 80)}"
+            )
     return "\n".join(lines)
 
 
@@ -563,7 +745,8 @@ def _build_proposal(
             f"已从 {len(data.get('source_manifest') or [])} 份文档编译 "
             f"{len(changes)} 项变更，覆盖 {coverage.get('total', 0)} 个来源段落；"
             + (
-                f"仍有 {len(blocking)} 个阻塞项，当前不可应用。"
+                f"仍有 {len(blocking)} 个阻塞项；确认后只应用可独立通过校验的安全部分，"
+                "阻塞定义会保留并标明解决建议。"
                 if blocking
                 else "引用、冲突和来源覆盖已通过预检，可在确认后原子应用。"
             )
@@ -940,6 +1123,116 @@ def _finalize_compilation_success(
         finish_db.close()
 
 
+def _run_compilation_job_in_background(
+    *,
+    tenant_id: str,
+    user_id: str,
+    job_id: str,
+    thread_id: str,
+    assistant_message_id: str,
+    scenario_id: str,
+    compiler_message: str,
+    compiler_documents: list[dict[str, str]],
+    prepared_context: dict[str, Any],
+    llm_config_id: str,
+    context: dict[str, Any],
+    sources: list[dict[str, Any]],
+) -> None:
+    """Run one claimed compilation without holding the HTTP request open."""
+    worker_db = SessionLocal()
+    worker_db.info["tenant_id"] = tenant_id
+    worker_db.info["user_id"] = user_id
+    if llm_config_id:
+        worker_db.info["assistant_llm_config_id"] = llm_config_id
+    try:
+        scenario = _scenario(worker_db, scenario_id, writable=True)
+        llm = _llm(worker_db)
+        if not scenario or llm is None:
+            raise ValueError("完整业务模型编译需要一个仍可用的 AI 模型和业务场景")
+        job = worker_db.get(AssistantCompilationJob, job_id)
+        if not job or job.status != "running":
+            return
+
+        def record_compilation_call(used: int, total: int, phase: str) -> None:
+            if worker_db.new or worker_db.dirty or worker_db.deleted:
+                worker_db.rollback()
+                raise RuntimeError(
+                    "完整业务模型编译器产生了未授权数据库变更；"
+                    "任务已中止且正式模型保持零写入"
+                )
+            _record_compilation_progress(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                job_id=job_id,
+                used=used,
+                budget=total,
+                phase=phase,
+            )
+
+        budget = scenario_model_compiler.LLMCallBudget(
+            job.llm_call_budget,
+            on_consume=record_compilation_call,
+        )
+        data = scenario_model_compiler.compile_scenario_model(
+            worker_db,
+            scenario,
+            message=compiler_message,
+            documents=compiler_documents,
+            llm=llm,
+            call_budget=budget,
+            prepared_context=prepared_context,
+        )
+        if worker_db.new or worker_db.dirty or worker_db.deleted:
+            worker_db.rollback()
+            raise RuntimeError(
+                "完整业务模型编译器产生了未授权数据库变更；"
+                "任务已中止且正式模型保持零写入"
+            )
+        worker_db.rollback()
+        blocking = sum(
+            1 for item in (data.get("unresolved") or [])
+            if item.get("blocking", True)
+        )
+        reply = (
+            "完整业务模型已编译并通过来源覆盖与引用预检，请核对后原子应用。"
+            if not blocking
+            else f"完整业务模型已编译，但还有 {blocking} 个阻塞项；你可以先应用安全部分，阻塞项会保留并标明解决建议。"
+        )
+        _finalize_compilation_success(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            job_id=job_id,
+            thread_id=thread_id,
+            assistant_message_id=assistant_message_id,
+            scenario_id=scenario_id,
+            data=data,
+            reply=reply,
+            context=context,
+            sources=sources,
+            thinking=[{
+                "id": "scenario-model",
+                "title": "编译完整业务模型",
+                "detail": "复合变更清单、来源覆盖和待确认项已生成并持久化。",
+                "status": "done",
+            }],
+        )
+    except Exception as exc:  # noqa: BLE001 - terminal job state is persisted.
+        worker_db.rollback()
+        _fail_compilation_job(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            job_id=job_id,
+            error=exc,
+        )
+    finally:
+        worker_db.close()
+
+
+def _submit_compilation_job(**kwargs: Any) -> None:
+    """Submit a claimed job; the durable ledger is the source of truth."""
+    _COMPILATION_EXECUTOR.submit(_run_compilation_job_in_background, **kwargs)
+
+
 def _attachment_context(attachments: list[AssistantAttachment]) -> tuple[str, list[dict[str, Any]]]:
     if not attachments:
         return "", []
@@ -1177,6 +1470,61 @@ def _assistant_message_out(
     return result
 
 
+def _requests_existing_capability_change(message: str) -> bool:
+    """Conservatively detect edits/deletes that the add-only compiler cannot apply."""
+
+    text = str(message or "").lower()
+    update_terms = ("修改", "更新", "修正", "删除", "补充", "替换", "移除")
+    capability_terms = ("函数", "操作", "规则", "事件", "业务能力")
+    creation_terms = ("创建", "建立", "建设", "生成", "设计", "配置", "新增", "定义")
+    existing_terms = ("已有", "现有", "原有", "当前", "已存在")
+    definition_terms = ("定义", "配置", "名称", "描述", "条件", "逻辑", "契约")
+    update_positions = [
+        (index, term)
+        for term in update_terms
+        for index in range(len(text))
+        if text.startswith(term, index)
+    ]
+    capability_positions = [
+        (index, term)
+        for term in capability_terms
+        for index in range(len(text))
+        if text.startswith(term, index)
+    ]
+    for update_index, update_term in update_positions:
+        for capability_index, capability_term in capability_positions:
+            if update_index <= capability_index:
+                between = text[
+                    update_index + len(update_term):capability_index
+                ]
+                if len(between) > 30 or any(term in between for term in creation_terms):
+                    continue
+                clause_start = max(
+                    text.rfind(mark, 0, update_index) for mark in ("。", "；", ";", "\n")
+                ) + 1
+                clause_prefix = text[clause_start:update_index]
+                # “创建自动更新库存的规则” describes a new rule; it is not a
+                # request to overwrite a rule merely because the business verb
+                # 更新 appears before the resource noun.
+                if (
+                    any(term in clause_prefix for term in creation_terms)
+                    and not any(term in between for term in existing_terms)
+                    and not any(term in clause_prefix for term in capability_terms)
+                ):
+                    continue
+                return True
+            between = text[
+                capability_index + len(capability_term):update_index
+            ]
+            nearby = text[max(0, capability_index - 12):update_index]
+            if len(between) <= 30 and (
+                any(term in nearby for term in existing_terms)
+                or any(term in between for term in definition_terms)
+            ):
+                return True
+    return False
+
+
 def _intent(message: str, mode: str, draft_kind: str = "auto") -> str:
     # Explicit modes take precedence over words in the prompt.  In particular,
     # an ``explain`` request that happens to mention “创建/映射/执行” must never
@@ -1188,9 +1536,81 @@ def _intent(message: str, mode: str, draft_kind: str = "auto") -> str:
         return "apply_guidance"
     if mode == "execute":
         return "execute_guidance"
+    text = message.lower()
+    if _requests_existing_capability_change(text):
+        # Functions/actions/rules/events are deliberately add-only in the
+        # compound compiler.  This guard also precedes explicit draft presets,
+        # so the visible "capabilities" task cannot spend a model call on a
+        # proposal that deterministic preflight must reject.
+        return "capability_update_guidance"
     if mode == "draft" and draft_kind != "auto":
         return draft_kind
-    text = message.lower()
+    stripped = text.strip()
+    pure_explanation = stripped.startswith((
+        "什么是", "请解释", "解释一下", "请介绍", "介绍一下", "如何", "怎么",
+        "为什么", "有哪些", "请说明什么", "请说明如何", "请说明怎么",
+    )) or any(marker in stripped for marker in ("是什么", "有什么区别", "有哪些步骤", "如何理解"))
+    # Route compound authoring requests to the already-governed full model
+    # compiler.  Previously this intent was reachable only through an internal
+    # request field that the UI never exposed, so a document mentioning an
+    # ontology plus rules/workflows was silently reduced to one ontology draft.
+    compound_markers = (
+        "完整场景建模", "完整业务模型", "完整建模", "全量建模", "全部建模",
+        "端到端建模", "一体化建模", "场景整体建模", "场景建模",
+    )
+    authoring_verbs = (
+        "创建", "建立", "建设", "生成", "设计", "配置", "编排", "实现", "完成",
+        "编译", "修改", "更新", "修正", "进行", "开展", "搭建", "补充", "新增",
+    )
+    capability_creation_verbs = (
+        "创建", "建立", "建设", "生成", "设计", "配置", "实现", "搭建", "新增", "定义",
+    )
+    resource_groups = (
+        ("本体", "实体", "对象类型", "属性", "关系类型", "数据模型"),
+        ("数据映射", "字段映射", "关系映射", "列映射"),
+        ("函数", "操作", "规则", "事件", "业务能力"),
+        ("工作流", "审批流", "流程", "自动化"),
+    )
+    matched_groups = sum(any(term in text for term in group) for group in resource_groups)
+    ontology_is_context_only = (
+        any(term in text for term in ("基于已有本体", "根据已有本体", "结合已有本体", "使用已有本体"))
+        and not any(term in text for term in (
+            "本体建模", "建立本体", "构建本体", "创建本体", "生成本体", "设计本体",
+            "修改本体", "更新本体",
+        ))
+    )
+    if ontology_is_context_only and any(term in text for term in resource_groups[0]):
+        matched_groups = max(0, matched_groups - 1)
+    mapping_is_context_only = (
+        any(term in text for term in (
+            "后续数据映射", "后续字段映射", "数据映射所需", "字段映射所需",
+            "便于数据映射", "为数据映射准备",
+        ))
+        and not any(term in text for term in (
+            "创建数据映射", "建立数据映射", "生成数据映射", "配置数据映射",
+            "创建字段映射", "建立字段映射", "生成字段映射", "配置字段映射",
+        ))
+    )
+    if mapping_is_context_only and any(term in text for term in resource_groups[1]):
+        matched_groups = max(0, matched_groups - 1)
+    has_authoring_verb = any(term in text for term in authoring_verbs)
+    capability_terms_present = any(
+        term in text for term in ("函数", "操作", "规则", "事件", "业务能力")
+    )
+    capability_authoring = capability_terms_present and any(
+        term in text for term in capability_creation_verbs
+    )
+    compound_marker_requested = any(marker in text for marker in compound_markers) and (
+        has_authoring_verb or stripped in compound_markers
+    )
+    if not pure_explanation and (
+        compound_marker_requested
+        or (matched_groups >= 2 and has_authoring_verb)
+        or capability_authoring
+    ):
+        return "scenario_model"
+    if pure_explanation:
+        return "chat"
     if any(k in text for k in ("创建场景", "新建场景", "建立场景", "业务场景草稿")):
         return "scenario"
     ontology_requested = any(k in text for k in ("本体", "实体", "关系", "建模", "数据模型", "对象类型"))
@@ -1252,6 +1672,10 @@ def _assistant_evidence(
         "scenario_model": ("compound_model_validation", "全文来源覆盖、跨资源引用和冲突通过后才允许同一事务应用"),
         "apply_guidance": ("explicit_confirmation", "聊天不会写入正式业务模型，只有已保存提案的 confirm=true 可应用"),
         "execute_guidance": ("typed_action_only", "聊天只预演，真实执行必须进入场景中已配置的操作或任务审批"),
+        "capability_update_guidance": (
+            "unsupported_capability_update_read_only",
+            "已有函数、操作、规则和事件的修改或删除不进入只支持新增的复合编译器",
+        ),
         "explain": ("read_only", "解释模式只读取已授权上下文"),
         "chat": ("read_only", "问答不直接修改或执行平台资源"),
     }
@@ -1762,6 +2186,15 @@ def _fallback_reply(intent: str, scenario: BusinessScenario | None) -> str:
             "核对目标对象、参数、影响范围、权限决策和预演结果；真正执行仍需进入场景中已配置的操作"
             "或任务审批流程。"
         )
+    if intent == "capability_update_guidance":
+        return (
+            "当前完整模型编译器只会新增函数、操作、规则和事件，"
+            "不会覆盖或删除已有定义。为避免生成必然阻塞的变更清单，"
+            "本次已统一降级为只读指导，没有启动完整模型编译、"
+            "生成可应用提案或写入数据。"
+            "请在场景建模页的对应资源编辑入口修改已有定义；"
+            "若要创建新能力，请明确使用“新增”或“创建”后重新提交。"
+        )
     if intent == "explain":
         if scenario:
             return (
@@ -2192,6 +2625,10 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
     thread_id = thread.id
     assistant_message_id = uuid.uuid4().hex
     intent = _intent(payload.message, payload.mode, payload.draft_kind)
+    if intent == "scenario_model" and scenario:
+        permission_service.require_scenario_permission(
+            db, scenario, "write", message="完整场景建模需要当前场景的编辑权限"
+        )
     if intent in {"execute_guidance", "scenario_model"}:
         _save_message(
             db,
@@ -2220,7 +2657,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 "不直接修改数据，不绕过权限，不把 SQL 当作业务本体。回答简洁、可执行，"
                 "必要时用问题卡片澄清。\n\n"
                 + _mode_safety_context(payload.mode)
-                + _scenario_context(scenario)
+                + _scenario_context(db, scenario)
                 + (f"\n\n当前页面：{payload.page}（{payload.path}）" if payload.page else "")
                 + (f"\n当前选择：{payload.selection}" if payload.selection else "")
                 + capability_context
@@ -2307,10 +2744,15 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         action_preview: dict[str, Any] = {}
         suggestions: list[str] = []
         saved_status = "success"
+        compilation_queued = False
         compilation_job_id = ""
         owns_compilation_job = False
         try:
-            scenario = _scenario(db, payload.scenario_id)
+            scenario = _scenario(
+                db,
+                payload.scenario_id,
+                writable=intent == "scenario_model",
+            )
             llm = _llm(db)
             suggestions = (
                 ["创建业务场景草稿", "说明建模所需资料"]
@@ -2328,12 +2770,16 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
             yield progress({"id": "context", "title": "理解当前上下文", "detail": "正在读取当前页面、业务场景和选中对象。", "status": "running"})
             yield progress({"id": "context", "title": "理解当前上下文", "detail": "当前上下文已准备完成。", "status": "done"})
 
-            if intent == "apply_guidance":
+            if intent in {"apply_guidance", "capability_update_guidance"}:
                 reply = _fallback_reply(intent, scenario)
                 yield progress({
                     "id": "governance",
                     "title": "确认安全边界",
-                    "detail": "已提供变更确认或执行预演的受控入口说明。",
+                    "detail": (
+                        "已转为已有业务能力的只读修改指导，未生成可应用提案。"
+                        if intent == "capability_update_guidance"
+                        else "已提供变更确认或执行预演的受控入口说明。"
+                    ),
                     "status": "done",
                 })
                 yield _sse("token", reply)
@@ -2486,7 +2932,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     reply = (
                         "已重放相同输入此前完成的完整业务模型；没有再次调用模型。"
                         if not blocking
-                        else f"已重放相同输入此前完成的完整业务模型，其中仍有 {blocking} 个阻塞项；没有再次调用模型，也不会写入。"
+                        else f"已重放相同输入此前完成的完整业务模型，其中仍有 {blocking} 个阻塞项；没有再次调用模型，可确认应用安全部分。"
                     )
                     yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "已重放同一执行指纹的复合变更清单。", "status": "done"})
                     yield _sse("proposal", proposal)
@@ -2519,90 +2965,41 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     yield _sse("token", reply)
                 else:
                     job_id = job.id
-
-                    def record_compilation_call(
-                        used: int,
-                        total: int,
-                        phase: str,
-                    ) -> None:
-                        # A provider progress commit must never accidentally
-                        # commit compiler-created ontology rows.  Compilation
-                        # is proposal-only; any pending mutation is a contract
-                        # violation and aborts the job before the next call.
-                        if db.new or db.dirty or db.deleted:
-                            db.rollback()
-                            raise RuntimeError(
-                                "完整业务模型编译器产生了未授权数据库变更；"
-                                "任务已中止且正式模型保持零写入"
-                            )
-                        _record_compilation_progress(
-                            tenant_id=tenant_id,
-                            user_id=user_id,
-                            job_id=job_id,
-                            used=used,
-                            budget=total,
-                            phase=phase,
-                        )
-
-                    budget = scenario_model_compiler.LLMCallBudget(
-                        job.llm_call_budget,
-                        on_consume=record_compilation_call,
+                    # The request now only claims and queues the durable job.
+                    # The browser immediately receives a recoverable task id;
+                    # the worker later persists the exact proposal and the
+                    # existing poller loads it from the result endpoint.
+                    saved_status = "processing"
+                    reply = "完整业务模型编译任务已提交；你可以继续浏览当前场景，完成后会自动恢复变更清单。"
+                    # Persist the placeholder before the worker can finish;
+                    # otherwise a fast test/mock provider could race the
+                    # common stream finalizer and overwrite the proposal.
+                    persist_result(
+                        reply,
+                        proposal,
+                        thinking,
+                        saved_status,
+                        {},
+                        {},
+                        write_audit=False,
                     )
-                    try:
-                        data = scenario_model_compiler.compile_scenario_model(
-                            db,
-                            scenario,
-                            message=compiler_message,
-                            documents=compiler_documents,
-                            llm=llm,
-                            call_budget=budget,
-                            prepared_context=prepared_context,
-                        )
-                        # End the read transaction and discard any direct or
-                        # accidental pending compiler mutation before saving
-                        # only the replay artifact in the job ledger.
-                        if db.new or db.dirty or db.deleted:
-                            db.rollback()
-                            raise RuntimeError(
-                                "完整业务模型编译器产生了未授权数据库变更；"
-                                "任务已中止且正式模型保持零写入"
-                            )
-                        db.rollback()
-                        blocking = sum(
-                            1 for item in (data.get("unresolved") or [])
-                            if item.get("blocking", True)
-                        )
-                        reply = (
-                            "完整业务模型已编译并通过来源覆盖与引用预检，请核对后原子应用。"
-                            if not blocking
-                            else f"完整业务模型已编译，但还有 {blocking} 个阻塞项；当前不会写入，请先按清单补充资料后重新编译。"
-                        )
-                        proposal = _finalize_compilation_success(
-                            tenant_id=tenant_id,
-                            user_id=user_id,
-                            job_id=job_id,
-                            thread_id=thread_id,
-                            assistant_message_id=assistant_message_id,
-                            scenario_id=scenario.id,
-                            data=data,
-                            reply=reply,
-                            context=context,
-                            sources=sources,
-                            thinking=thinking,
-                        )
-                        owns_compilation_job = False
-                    except Exception as exc:
-                        db.rollback()
-                        _fail_compilation_job(
-                            tenant_id=tenant_id,
-                            user_id=user_id,
-                            job_id=job_id,
-                            error=exc,
-                        )
-                        owns_compilation_job = False
-                        raise
-                    yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "复合变更清单、来源覆盖和待确认项已生成并持久化。", "status": "done"})
-                    yield _sse("proposal", proposal)
+                    compilation_queued = True
+                    _submit_compilation_job(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        job_id=job_id,
+                        thread_id=thread_id,
+                        assistant_message_id=assistant_message_id,
+                        scenario_id=scenario.id,
+                        compiler_message=compiler_message,
+                        compiler_documents=compiler_documents,
+                        prepared_context=prepared_context,
+                        llm_config_id=str(getattr(llm, "id", "") or ""),
+                        context=context,
+                        sources=sources,
+                    )
+                    owns_compilation_job = False
+                    yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "任务已进入后台编译，页面无需持续等待；完成后会自动恢复结果。", "status": "running"})
                     yield _sse("token", reply)
             elif intent == "ontology" and scenario:
                 yield progress({"id": "ontology", "title": "生成本体草稿", "detail": "正在整理实体、属性和关系建议。", "status": "running"})
@@ -2660,10 +3057,19 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 intent,
                 proposal=proposal,
                 sources=sources,
-                llm_used=bool(llm and intent not in ("apply_guidance", "execute_guidance")),
+                llm_used=bool(
+                    llm
+                    and not compilation_queued
+                    and intent not in (
+                        "apply_guidance",
+                        "execute_guidance",
+                        "capability_update_guidance",
+                    )
+                ),
                 preview=action_preview,
             )
-            persist_result(reply, proposal, thinking, saved_status, evidence, action_preview)
+            if not compilation_queued:
+                persist_result(reply, proposal, thinking, saved_status, evidence, action_preview)
             yield _sse("meta", {
                 "thread_id": thread_id,
                 "proposal": proposal,
@@ -2806,6 +3212,10 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     db.flush()
 
     intent = _intent(payload.message, payload.mode, payload.draft_kind)
+    if intent == "scenario_model" and scenario:
+        permission_service.require_scenario_permission(
+            db, scenario, "write", message="完整场景建模需要当前场景的编辑权限"
+        )
     reply = ""
     proposal: dict[str, Any] = {}
     questions: list[dict[str, Any]] = []
@@ -2835,7 +3245,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     )
 
     try:
-        if intent == "apply_guidance":
+        if intent in {"apply_guidance", "capability_update_guidance"}:
             reply = _fallback_reply(intent, scenario)
         elif intent == "execute_guidance":
             action_preview, question, reply = _assistant_action_preview(
@@ -2945,7 +3355,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 reply = (
                     "已重放相同输入此前完成的完整业务模型；没有再次调用模型。"
                     if not blocking
-                    else f"已重放相同输入此前完成的完整业务模型，其中仍有 {blocking} 个阻塞项；没有再次调用模型，也不会写入。"
+                    else f"已重放相同输入此前完成的完整业务模型，其中仍有 {blocking} 个阻塞项；没有再次调用模型，可确认应用安全部分。"
                 )
             elif not acquired and job.status == "failed":
                 public_failure = _public_compilation_progress(job)
@@ -3078,7 +3488,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                             "不直接修改数据，不绕过权限，不把 SQL 当作业务本体。回答简洁、可执行，"
                             "必要时用问题卡片澄清。\n\n"
                             + _mode_safety_context(payload.mode)
-                            + _scenario_context(scenario)
+                            + _scenario_context(db, scenario)
                             + (f"\n\n当前页面：{payload.page}（{payload.path}）" if payload.page else "")
                             + (f"\n当前选择：{payload.selection}" if payload.selection else "")
                             + capability_context
@@ -3122,7 +3532,14 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         intent,
         proposal=proposal,
         sources=sources,
-        llm_used=bool(locals().get("llm")),
+        llm_used=bool(
+            locals().get("llm")
+            and intent not in {
+                "apply_guidance",
+                "execute_guidance",
+                "capability_update_guidance",
+            }
+        ),
         preview=action_preview,
         uncertainties=error_uncertainties,
     )
@@ -3174,7 +3591,7 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
     thread, proposal_message, saved_proposal = _find_saved_proposal(db, payload.thread_id, payload.proposal_id)
     if saved_proposal.get("kind") != payload.kind:
         raise HTTPException(409, "变更草稿类型与请求不一致")
-    if saved_proposal.get("status") == "applied":
+    if saved_proposal.get("status") in {"applied", "partially_applied"}:
         return {
             "ok": True,
             "status": "replayed",
@@ -3325,7 +3742,37 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             result = {"kind": kind, "workflow_id": workflow.id, "nodes": len(nodes), "edges": len(edges)}
         elif kind == "scenario_model":
             assert scenario is not None
-            result = scenario_model_compiler.apply_scenario_model(db, scenario, data)
+            blocking = [
+                item for item in (data.get("unresolved") or [])
+                if item.get("blocking", True)
+            ]
+            apply_payload = data
+            partial_result: dict[str, Any] = {}
+            if blocking:
+                if not payload.allow_partial:
+                    raise PolicyViolation(
+                        f"复合业务模型仍有 {len(blocking)} 个阻塞项；请确认应用可用部分，或先重新编译"
+                    )
+                apply_payload, partial_result = (
+                    scenario_model_compiler.partial_scenario_model_payload(data)
+                )
+                if not partial_result.get("safe_change_count"):
+                    raise PolicyViolation(
+                        "当前没有可独立应用且通过安全预检的变更；请先按阻塞项补充资料后重新编译"
+                    )
+            result = scenario_model_compiler.apply_scenario_model(
+                db, scenario, apply_payload
+            )
+            if blocking:
+                result = {
+                    **result,
+                    "partial": True,
+                    "blocked_issue_count": len(blocking),
+                    "safe_change_count": partial_result.get("safe_change_count", 0),
+                    "blocked_change_count": partial_result.get("blocked_change_count", 0),
+                    "blocked_change_keys": partial_result.get("blocked_change_keys", []),
+                    "remaining_blockers": partial_result.get("unresolved", blocking),
+                }
         else:  # Defensive guard for legacy rows bypassing current schema.
             raise PolicyViolation("不支持的变更草稿类型")
     except Exception:
@@ -3333,7 +3780,11 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
         raise
 
     updated_proposal = dict(saved_proposal)
-    updated_proposal["status"] = "applied"
+    updated_proposal["status"] = (
+        "partially_applied"
+        if kind == "scenario_model" and result.get("partial")
+        else "applied"
+    )
     updated_proposal["applied_at"] = datetime.now(timezone.utc).isoformat()
     updated_proposal["apply_result"] = result
     proposal_message.proposal = updated_proposal

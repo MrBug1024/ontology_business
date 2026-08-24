@@ -27,7 +27,7 @@
           <div class="assistant-avatar" aria-hidden="true"><el-icon :size="19"><MagicStick /></el-icon></div>
           <div>
             <div class="assistant-title">全局 AI 助手 <el-tag size="small" type="success" effect="plain">上下文感知</el-tag></div>
-            <div class="assistant-subtitle">协助建模、映射、编排与解释</div>
+            <div class="assistant-subtitle">理解业务资料，生成完整模型并受控执行</div>
           </div>
         </div>
         <div class="assistant-head-actions">
@@ -39,22 +39,22 @@
             </template>
             <section class="assistant-settings" aria-label="助手能力配置">
               <div class="assistant-settings-head">
-                <div><strong>助手能力</strong><span>本次会话使用的模型与可用能力</span></div>
+                <div><strong>模型与参考配置</strong><span>选择本次请求使用的模型及可参考能力</span></div>
                 <el-icon v-if="capabilitiesLoading" class="is-loading" aria-hidden="true"><Loading /></el-icon>
               </div>
               <label class="assistant-setting-label" for="assistant-llm">AI 模型</label>
               <el-select id="assistant-llm" v-model="assistantConfig.llmConfigId" class="assistant-setting-control" clearable placeholder="自动选择默认模型" @change="persistAssistantConfig">
                 <el-option v-for="llm in assistantLLMs" :key="llm.id" :label="`${llm.name} · ${llm.model}`" :value="llm.id" />
               </el-select>
-              <label class="assistant-setting-label" for="assistant-skills">技能</label>
+              <label class="assistant-setting-label" for="assistant-skills">参考技能</label>
               <el-select id="assistant-skills" v-model="assistantConfig.skillIds" class="assistant-setting-control" multiple collapse-tags collapse-tags-tooltip placeholder="不指定技能" @change="persistAssistantConfig">
                 <el-option v-for="skill in assistantSkills" :key="skill.id" :label="skill.name" :value="skill.id" />
               </el-select>
-              <label class="assistant-setting-label" for="assistant-mcps">MCP</label>
+              <label class="assistant-setting-label" for="assistant-mcps">参考 MCP</label>
               <el-select id="assistant-mcps" v-model="assistantConfig.mcpIds" class="assistant-setting-control" multiple collapse-tags collapse-tags-tooltip placeholder="不指定 MCP" @change="persistAssistantConfig">
                 <el-option v-for="mcp in assistantMCPs" :key="mcp.id" :label="mcp.name" :value="mcp.id" />
               </el-select>
-              <p class="assistant-settings-note">能力配置只作用于后续请求；外部调用、写入和高风险操作仍遵循平台权限与确认流程。</p>
+              <p class="assistant-settings-note">这里选择的是模型参考配置；只有平台为本轮明确注册工具时才会调用。外部调用、写入和高风险操作仍遵循权限、预演与确认流程。</p>
             </section>
           </el-popover>
           <el-button text circle aria-label="关闭 AI 助手" title="关闭" @click="visible = false">
@@ -134,10 +134,16 @@
       </section>
 
       <main v-else ref="messageRef" class="assistant-messages">
-        <div v-if="!messages.length" class="assistant-empty">
+        <div v-if="showQuickStarts" class="assistant-empty">
           <div class="empty-mark" aria-hidden="true"><el-icon :size="28"><ChatDotRound /></el-icon></div>
-          <h3>告诉我你要完成什么</h3>
-          <p>我会结合当前页面、业务场景和你上传的资料理解问题，再协助你完成分析、建模或业务操作。</p>
+          <h3>告诉我你要建设什么业务场景</h3>
+          <p>我会结合当前本体、业务说明和附件，生成带来源证据、冲突检查与变更清单的建模结果。</p>
+          <div v-if="context.scenario_id" class="assistant-quick-start" aria-label="常用建模任务">
+            <button type="button" @click="chooseTask('scenario_model')"><strong>完整场景建模</strong><span>对象、关系、映射、函数、操作、规则、事件和工作流</span></button>
+            <button type="button" @click="chooseTask('ontology')"><strong>本体模型</strong><span>对象类型、属性、关系与约束</span></button>
+            <button type="button" @click="chooseTask('capabilities')"><strong>新增业务能力</strong><span>新增函数、操作、规则和事件；修改已有定义时仅提供只读指导</span></button>
+            <button type="button" @click="chooseTask('workflow')"><strong>工作流</strong><span>触发条件、节点、分支与审批</span></button>
+          </div>
         </div>
 
         <article v-for="(message, index) in messages" :key="message.id || index" class="assistant-message" :class="message.role">
@@ -171,8 +177,8 @@
                   <div class="proposal-title"><el-icon aria-hidden="true"><DocumentChecked /></el-icon>{{ proposalOf(message)?.title }}</div>
                   <div class="proposal-summary">{{ proposalOf(message)?.summary }}</div>
                 </div>
-                <el-tag size="small" :type="proposalOf(message)?.status === 'applied' ? 'success' : 'warning'" effect="plain">
-                  {{ proposalOf(message)?.status === 'applied' ? '已应用' : '待确认' }}
+                <el-tag size="small" :type="proposalOf(message)?.status === 'applied' || proposalOf(message)?.status === 'partially_applied' ? 'success' : 'warning'" effect="plain">
+                  {{ proposalOf(message)?.status === 'applied' ? '已应用' : proposalOf(message)?.status === 'partially_applied' ? '已应用可用部分' : '待确认' }}
                 </el-tag>
               </div>
               <div class="proposal-preview">
@@ -194,7 +200,7 @@
                 </template>
                 <template v-else-if="proposalOf(message)?.kind === 'scenario_model'">
                   <span>来源段落 {{ proposalOf(message)?.payload?.coverage_summary?.total || 0 }}</span>
-                  <span>待确认 {{ blockingIssues(proposalOf(message)).length }}</span>
+                      <span>阻塞 {{ blockingIssues(proposalOf(message)).length }}</span>
                 </template>
                 <span v-if="proposalOf(message)?.changes?.length">差异 {{ proposalOf(message)?.changes?.length }}</span>
                 <button
@@ -298,6 +304,22 @@
                       <span :class="{ danger: (proposalOf(message)?.payload?.coverage_summary?.ambiguous || 0) > 0 }">歧义 {{ proposalOf(message)?.payload?.coverage_summary?.ambiguous || 0 }}</span>
                     </div>
                   </section>
+                  <section v-for="group in compoundReviewGroups(proposalOf(message))" :key="group.key" class="proposal-section compound-resource-group">
+                    <h4>{{ group.label }} <span>{{ group.items.length }}</span></h4>
+                    <div class="compound-resource-list">
+                      <article v-for="item in group.items" :key="item.key || item.name" class="compound-resource-card">
+                        <header>
+                          <strong>{{ item.name || item.key || '未命名定义' }}</strong>
+                          <div>
+                            <el-tag size="small" effect="plain" :type="compoundOperationType(item, proposalOf(message))">{{ compoundOperationLabel(item, proposalOf(message)) }}</el-tag>
+                            <el-tag size="small" effect="plain">置信度 {{ confidencePercent(item.confidence) }}</el-tag>
+                          </div>
+                        </header>
+                        <p>{{ compoundResourceSummary(group.key, item) }}</p>
+                        <footer v-if="item.evidence_refs?.length"><span>来源</span><b>{{ item.evidence_refs.join('、') }}</b></footer>
+                      </article>
+                    </div>
+                  </section>
                   <section v-if="proposalOf(message)?.payload?.source_manifest?.length" class="proposal-section">
                     <h4>来源文档</h4>
                     <div class="source-manifest-list">
@@ -308,7 +330,7 @@
                   </section>
                   <section v-if="scenarioIssueGroups(proposalOf(message)).length" class="proposal-section unresolved-section">
                     <header class="unresolved-head">
-                      <div><h4>预检问题</h4><p>阻塞项必须先解决；提示仅供核对，不影响应用。</p></div>
+                      <div><h4>预检问题</h4><p>阻塞定义会跳过不写入；解决建议已列在明细中，后续补充资料后重新编译即可补齐。</p></div>
                       <div class="unresolved-counts" aria-label="预检问题统计">
                         <span class="is-blocking">阻塞 {{ blockingIssues(proposalOf(message)).length }}</span>
                         <span>提示 {{ nonBlockingIssueCount(proposalOf(message)) }}</span>
@@ -317,7 +339,7 @@
                     <div class="issue-groups">
                       <div class="issue-category-head is-blocking">
                         <strong>阻塞问题</strong>
-                        <span>{{ blockingScenarioIssueGroups(proposalOf(message)).length }} 类 · {{ blockingIssues(proposalOf(message)).length }} 项 · 当前不可应用</span>
+                        <span>{{ blockingScenarioIssueGroups(proposalOf(message)).length }} 类 · {{ blockingIssues(proposalOf(message)).length }} 项 · 本次将跳过</span>
                       </div>
                       <section
                         v-for="group in blockingScenarioIssueGroups(proposalOf(message))"
@@ -346,9 +368,9 @@
                           role="region"
                           :aria-label="`${scenarioModelIssueLabel(group.code)}明细`"
                         >
-                          <article v-for="(issue, issueIndex) in group.issues" :key="`${group.key}-${issueIndex}-${issue.message}`" class="unresolved-row">
-                            <span class="issue-number" aria-hidden="true">{{ issueIndex + 1 }}</span>
-                            <div><strong>{{ issue.message }}</strong><span v-if="issue.sourceRefs.length">来源：{{ issue.sourceRefs.join('、') }}</span></div>
+                            <article v-for="(issue, issueIndex) in group.issues" :key="`${group.key}-${issueIndex}-${issue.message}`" class="unresolved-row">
+                              <span class="issue-number" aria-hidden="true">{{ issueIndex + 1 }}</span>
+                            <div><strong>{{ issue.message }}</strong><span v-if="issue.sourceRefs.length">来源：{{ issue.sourceRefs.join('、') }}</span><span v-if="issue.resolutionHint" class="issue-resolution">解决：{{ issue.resolutionHint }}</span></div>
                           </article>
                         </div>
                       </section>
@@ -396,7 +418,7 @@
                             >
                               <article v-for="(issue, issueIndex) in group.issues" :key="`${group.key}-${issueIndex}-${issue.message}`" class="unresolved-row">
                                 <span class="issue-number" aria-hidden="true">{{ issueIndex + 1 }}</span>
-                                <div><strong>{{ issue.message }}</strong><span v-if="issue.sourceRefs.length">来源：{{ issue.sourceRefs.join('、') }}</span></div>
+                                <div><strong>{{ issue.message }}</strong><span v-if="issue.sourceRefs.length">来源：{{ issue.sourceRefs.join('、') }}</span><span v-if="issue.resolutionHint" class="issue-resolution">解决：{{ issue.resolutionHint }}</span></div>
                               </article>
                             </div>
                           </section>
@@ -405,7 +427,14 @@
                     </div>
                   </section>
                   <el-alert
-                    v-if="!blockingIssues(proposalOf(message)).length"
+                    v-if="blockingIssues(proposalOf(message)).length"
+                    title="确认后只会原子写入通过依赖与结构预检的可用部分；阻塞项会保留在清单中，不会被强行写入。"
+                    type="warning"
+                    :closable="false"
+                    show-icon
+                  />
+                  <el-alert
+                    v-else
                     title="所有引用、冲突与来源段落已通过预检；确认后将在同一事务中应用，任一失败都会整体回滚。"
                     type="success"
                     :closable="false"
@@ -422,7 +451,7 @@
                 </template>
               </div>
               <div class="proposal-actions">
-                <el-button size="small" type="primary" :loading="applyingIndex === index" :disabled="!proposalCanApply(proposalOf(message)) || proposalOf(message)?.status === 'applied' || !proposalOf(message)?.proposal_id" @click="applyProposal(message, index)">
+                <el-button size="small" type="primary" :loading="applyingIndex === index" :disabled="!proposalCanApply(proposalOf(message)) || ['applied', 'partially_applied'].includes(proposalOf(message)?.status || '') || !proposalOf(message)?.proposal_id" @click="applyProposal(message, index)">
                   <el-icon aria-hidden="true"><Check /></el-icon>{{ proposalApplyLabel(proposalOf(message)) }}
                 </el-button>
                 <span v-if="proposalApplyHint(proposalOf(message))" class="proposal-hint">{{ proposalApplyHint(proposalOf(message)) }}</span>
@@ -518,6 +547,21 @@
             <el-icon v-else aria-hidden="true"><Paperclip /></el-icon><span>{{ uploadingFiles ? `正在解析 ${uploadingFiles} 个文件` : '添加附件' }}</span>
             <input ref="fileInput" type="file" multiple :disabled="uploadingFiles > 0" accept=".pdf,.docx,.xlsx,.xls,.pptx,.md,.txt,.csv,.json,.png,.jpg,.jpeg" @change="onFilesPicked" />
           </label>
+          <div class="task-preset-control">
+            <label for="assistant-task-preset">任务</label>
+            <el-select id="assistant-task-preset" v-model="taskPreset" size="small" aria-label="选择助手任务" @change="onTaskPresetChange">
+              <el-option label="智能协助" value="smart" />
+              <el-option v-if="!context.scenario_id" label="创建业务场景" value="scenario" />
+              <el-option v-if="context.scenario_id" label="完整场景建模" value="scenario_model" />
+              <el-option v-if="context.scenario_id" label="本体模型" value="ontology" />
+              <el-option v-if="context.scenario_id" label="数据映射" value="mapping" />
+              <el-option v-if="context.scenario_id" label="新增业务能力" value="capabilities" />
+              <el-option v-if="context.scenario_id" label="工作流" value="workflow" />
+              <el-option label="只读解释" value="explain" />
+              <el-option v-if="context.scenario_id" label="操作安全预演" value="execute" />
+            </el-select>
+          </div>
+          <span class="task-preset-hint">{{ taskPresetHint }}</span>
         </div>
         <div class="composer-input-row">
           <el-input
@@ -527,10 +571,10 @@
             resize="none"
             maxlength="12000"
             show-word-limit
-            placeholder="描述你要完成的工作，助手会自动判断需要分析、建模、查询还是执行确认"
+            :placeholder="composerPlaceholder"
             @keydown.enter.exact.prevent="send()"
           />
-          <el-button class="send-button" type="primary" :loading="loading || compilationBusy" :disabled="!input.trim() || uploadingFiles > 0 || compilationBusy" aria-label="发送消息" title="发送" @click="send()">
+          <el-button class="send-button" type="primary" :loading="loading || compilationBusy" :disabled="!canSend || uploadingFiles > 0 || compilationBusy" aria-label="发送消息" title="发送" @click="send()">
             <el-icon aria-hidden="true"><Promotion /></el-icon>
           </el-button>
         </div>
@@ -589,11 +633,13 @@ const router = useRouter()
 const auth = useAuthStore()
 type AssistantMode = 'ask' | 'explain' | 'draft' | 'apply' | 'execute'
 type AssistantDraftKind = 'auto' | 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'
+type AssistantTaskPreset = 'smart' | 'scenario' | 'scenario_model' | 'ontology' | 'mapping' | 'capabilities' | 'workflow' | 'explain' | 'execute'
 const visible = ref(false)
 const loading = ref(false)
 const input = ref('')
 const mode = ref<AssistantMode>('ask')
 const draftKind = ref<AssistantDraftKind>('auto')
+const taskPreset = ref<AssistantTaskPreset>('smart')
 const messages = ref<AssistantMessage[]>([])
 const attachments = ref<AssistantAttachment[]>([])
 const threadId = ref('')
@@ -638,9 +684,44 @@ const context = computed(() => ({
   path: props.context.path || '',
   scenario_id: props.context.scenario_id || '',
 }))
+const taskPresetHint = computed(() => ({
+  smart: '自动判断问答或建模任务',
+  scenario: '生成待确认的场景草稿',
+  scenario_model: '一次生成跨资源原子变更清单',
+  ontology: '只处理对象、属性、关系与约束',
+  mapping: '只使用已检查的真实表和字段',
+  capabilities: '仅新增业务能力；修改或删除将切换为只读指导',
+  workflow: '生成可审核的流程草稿',
+  explain: '只读分析，不生成变更',
+  execute: '仅做权限与副作用预演',
+} as Record<AssistantTaskPreset, string>)[taskPreset.value])
+const composerPlaceholder = computed(() => ({
+  scenario_model: '介绍业务目标、范围与关键规则，或直接添加业务文档后发送',
+  capabilities: '描述要新增的计算、业务动作、判断规则和业务事件',
+  ontology: '描述核心对象、属性、关系、基数和业务约束',
+  mapping: '说明目标对象及期望映射；系统只会选择真实存在的表和字段',
+  workflow: '描述触发条件、处理步骤、判断分支、动作与最终结果',
+  explain: '询问当前业务、本体、映射或流程，我只做只读解释',
+  execute: '说明要预演的已配置操作及参数，不会直接产生副作用',
+  scenario: '描述场景名称、行业、业务目标和边界',
+  smart: '描述你要完成的工作，助手会结合当前业务上下文自动判断',
+} as Record<AssistantTaskPreset, string>)[taskPreset.value])
+const canSend = computed(() => Boolean(
+  input.value.trim()
+  || (
+    ['scenario', 'scenario_model', 'ontology', 'mapping', 'capabilities', 'workflow'].includes(taskPreset.value)
+    && attachments.value.length
+    && attachments.value.every((item) => item.status === 'parsed')
+  )
+))
 const assistantScopeKey = computed(() => `${context.value.scenario_id || 'global'}|${(context.value.path || '/').split('?', 1)[0] || '/'}`)
 const storageKey = computed(() => `ontology-assistant-thread:${encodeURIComponent(assistantScopeKey.value)}`)
 const currentThread = computed(() => threads.value.find((thread) => thread.id === threadId.value))
+const showQuickStarts = computed(() => !messages.value.length || (
+  messages.value.length === 1
+  && messages.value[0].role === 'assistant'
+  && !messages.value[0].id
+))
 const hasStreamingAssistant = computed(() => messages.value.some((message) => message.role === 'assistant' && message.streaming))
 const compilationRunning = computed(() => activeCompilationJob.value?.status === 'running'
   && compilationRecoveryThreadId.value === threadId.value)
@@ -665,6 +746,42 @@ const showLauncher = computed(() => {
 function proposalOf(message: AssistantMessage): AssistantProposal | null {
   const proposal = message.proposal as AssistantProposal | undefined
   return proposal && proposal.kind && proposal.payload ? proposal : null
+}
+
+function applyTaskPreset(preset: AssistantTaskPreset) {
+  if (preset === 'explain') {
+    mode.value = 'explain'
+    draftKind.value = 'auto'
+    return
+  }
+  if (preset === 'execute') {
+    mode.value = 'execute'
+    draftKind.value = 'auto'
+    return
+  }
+  if (preset === 'smart') {
+    mode.value = 'ask'
+    draftKind.value = 'auto'
+    return
+  }
+  mode.value = 'draft'
+  draftKind.value = preset === 'capabilities' ? 'scenario_model' : preset
+}
+
+function onTaskPresetChange(value: AssistantTaskPreset) {
+  applyTaskPreset(value)
+}
+
+function chooseTask(preset: AssistantTaskPreset) {
+  taskPreset.value = preset
+  applyTaskPreset(preset)
+  if (input.value.trim()) return
+  input.value = ({
+    scenario_model: '请根据以下业务介绍和附件，完成当前场景的完整建模，并列出所有未识别、歧义和冲突项。\n\n业务介绍：',
+    ontology: '请根据以下业务描述和附件，建立对象类型、属性、关系及约束。\n\n业务描述：',
+    capabilities: '请根据以下业务描述和附件，新增所需函数、操作、规则和事件，并保持待审核状态。\n\n业务描述：',
+    workflow: '请根据以下业务描述和附件，设计触发条件、处理节点、判断分支和审批流程。\n\n业务描述：',
+  } as Partial<Record<AssistantTaskPreset, string>>)[preset] || ''
 }
 
 function restoreAssistantConfig() {
@@ -706,12 +823,23 @@ async function loadAssistantCapabilities() {
 
 function proposalCanApply(proposal: AssistantProposal | null) {
   if (!proposal) return false
-  if (proposal.kind === 'scenario_model' && (blockingIssues(proposal).length || !hasEffectiveChanges(proposal))) return false
+  if (proposal.kind === 'scenario_model' && !hasApplyableChanges(proposal)) return false
   return proposal.kind === 'scenario' ? !context.value.scenario_id : Boolean(context.value.scenario_id)
 }
 
 function hasEffectiveChanges(proposal: AssistantProposal | null) {
   return Boolean(proposal?.changes?.some((change) => change.operation !== 'skip'))
+}
+
+function hasApplyableChanges(proposal: AssistantProposal | null) {
+  if (!proposal || proposal.kind !== 'scenario_model') return hasEffectiveChanges(proposal)
+  const safeKeys = proposal.payload?.applyability?.safe_change_keys
+  return Boolean(proposal.changes?.some((change) => {
+    if (change.operation === 'skip') return false
+    if (!Array.isArray(safeKeys)) return true
+    const id = String(change.change_id || '')
+    return safeKeys.some((key: unknown) => id === String(key) || id.startsWith(`${String(key)}:`))
+  }))
 }
 
 function blockingIssues(proposal: AssistantProposal | null) {
@@ -741,6 +869,8 @@ function nonBlockingIssueCount(proposal: AssistantProposal | null) {
 function proposalApplyLabel(proposal: AssistantProposal | null) {
   if (!proposal) return '确认并应用变更'
   if (proposal.status === 'applied') return proposal.kind === 'scenario' ? '场景已创建' : '变更已应用'
+  if (proposal.status === 'partially_applied') return '已应用可用部分'
+  if (proposal.kind === 'scenario_model' && blockingIssues(proposal).length) return '确认并应用可用部分'
   return ({ scenario: '确认并创建场景', mapping: '确认并保存映射', ontology: '确认并应用本体', workflow: '确认并保存流程', scenario_model: '确认并原子应用' } as Record<string, string>)[proposal.kind] || '确认并应用变更'
 }
 
@@ -748,8 +878,12 @@ function proposalApplyHint(proposal: AssistantProposal | null) {
   if (!proposal?.proposal_id) return '此草稿缺少安全标识，请重新生成'
   if (proposal.kind === 'scenario' && context.value.scenario_id) return '场景草稿只能在全局工作区创建'
   if (proposal.kind !== 'scenario' && !context.value.scenario_id) return '请先打开业务场景'
-  if (proposal.kind === 'scenario_model' && blockingIssues(proposal).length) return `仍有 ${blockingIssues(proposal).length} 个阻塞项，请补充资料后重新编译`
-  if (proposal.kind === 'scenario_model' && !hasEffectiveChanges(proposal)) return '未识别到可应用的业务模型变更，请补充文档后重新编译'
+  if (proposal.kind === 'scenario_model' && blockingIssues(proposal).length) {
+    const safeCount = proposal.payload?.applyability?.safe_change_count
+    const countText = typeof safeCount === 'number' ? `，当前可应用 ${safeCount} 项` : ''
+    return `仍有 ${blockingIssues(proposal).length} 个阻塞项；确认后将跳过受影响定义，只写入安全部分${countText}。解决阻塞项后重新编译即可补齐`
+  }
+  if (proposal.kind === 'scenario_model' && !hasApplyableChanges(proposal)) return '当前没有可独立应用的业务模型变更，请先补充文档后重新编译'
   if (proposal.kind === 'mapping') return '保存后仍需预览、测试并刷新对象'
   return ''
 }
@@ -767,6 +901,72 @@ function proposalResourceLabel(resource: string) {
     scenario: '业务场景', entity: '对象类型', property: '属性', relation: '关系类型', mapping: '数据映射', mapping_field: '映射字段', data_mapping: '数据映射',
     function: '函数', action: '操作', rule: '规则', event: '事件', workflow: '工作流', workflow_node: '工作流节点', workflow_edge: '工作流连线',
   } as Record<string, string>)[resource] || resource
+}
+
+function compoundReviewGroups(proposal: AssistantProposal | null) {
+  if (proposal?.kind !== 'scenario_model') return []
+  const payload = proposal.payload || {}
+  return [
+    ['entities', '对象类型'], ['relations', '关系类型'], ['functions', '函数'],
+    ['actions', '操作'], ['rules', '规则'], ['events', '事件'],
+    ['workflows', '工作流'], ['mappings', '对象数据映射'],
+    ['relation_mappings', '关系数据映射'],
+  ].map(([key, label]) => ({ key, label, items: Array.isArray(payload[key]) ? payload[key] : [] }))
+    .filter((group) => group.items.length)
+}
+
+function compoundReferenceLabel(reference: any) {
+  if (!reference || typeof reference !== 'object') return '待确认定义'
+  const displayName = String(reference.display_name || '').trim()
+  if (displayName) return displayName
+  if (reference.kind === 'generated') return String(reference.key || '本次生成定义')
+  return String(reference.id || '场景已有定义')
+}
+
+function compoundOperation(item: any) {
+  return String(item?.operation || (item?.existing_id ? 'update' : 'add'))
+}
+
+function compoundOperationLabel(item: any, proposal: AssistantProposal | null) {
+  if (proposal?.kind === 'scenario_model' && isCompoundItemBlocked(item, proposal)) return '待补全后应用'
+  return proposalOperationLabel(compoundOperation(item))
+}
+
+function compoundOperationType(item: any, proposal: AssistantProposal | null) {
+  if (proposal?.kind === 'scenario_model' && isCompoundItemBlocked(item, proposal)) return 'warning'
+  return proposalOperationType(compoundOperation(item))
+}
+
+function isCompoundItemBlocked(item: any, proposal: AssistantProposal | null) {
+  if (proposal?.kind !== 'scenario_model') return false
+  const blockedKeys = proposal.payload?.applyability?.blocked_change_keys
+  if (!Array.isArray(blockedKeys)) return false
+  const key = String(item?.key || '')
+  return blockedKeys.some((value: unknown) => {
+    const candidate = String(value)
+    return candidate === key || candidate.startsWith(`${key}:`)
+  })
+}
+
+function schemaFieldNames(schema: any) {
+  const names = Object.keys(schema?.properties || {})
+  return names.length ? names.slice(0, 8).join('、') + (names.length > 8 ? ` 等 ${names.length} 项` : '') : '无字段'
+}
+
+function compoundResourceSummary(section: string, item: any) {
+  if (section === 'entities') {
+    const properties = (item.properties || []).map((property: any) => property.name).filter(Boolean)
+    return `${item.is_abstract ? '抽象对象' : '业务对象'}；属性：${properties.slice(0, 10).join('、') || '无'}${properties.length > 10 ? ` 等 ${properties.length} 项` : ''}`
+  }
+  if (section === 'relations') return `${compoundReferenceLabel(item.source)} → ${compoundReferenceLabel(item.target)}；基数 ${item.relation_type || '待确认'}`
+  if (section === 'functions') return `输入：${schemaFieldNames(item.input_schema)}；输出：${schemaFieldNames(item.output_schema)}`
+  if (section === 'actions') return `作用对象：${compoundReferenceLabel(item.entity)}；输入：${schemaFieldNames(item.input_schema)}；保存后保持待绑定和停用`
+  if (section === 'rules') return `作用对象：${item.entity ? compoundReferenceLabel(item.entity) : '场景级'}；级别 ${item.severity || 'info'}；保存后保持停用`
+  if (section === 'events') return `载荷：${schemaFieldNames(item.payload_schema)}；来源：${item.trigger_source || '待确认'}`
+  if (section === 'workflows') return `${item.trigger_type || 'manual'} 触发；${item.nodes?.length || 0} 个节点，${item.edges?.length || 0} 条连线；保存后为停用草稿`
+  if (section === 'mappings') return `${compoundReferenceLabel(item.entity)} ← ${item.table_name || '待确认表'}；${Object.keys(item.column_map || {}).length} 个字段映射`
+  if (section === 'relation_mappings') return `${item.mode || '待确认模式'}；关联两端对象映射与关系定义`
+  return item.description || '待审核业务定义'
 }
 
 function scenarioStatusLabel(status?: string) {
@@ -1308,8 +1508,8 @@ function welcomeMessage(): AssistantMessage {
   return {
     role: 'assistant',
     content: context.value.scenario_id
-      ? `我已进入「${context.value.page}」工作区。你可以让我解释当前本体、根据附件生成模型，或把业务描述编排成工作流。`
-      : '我可以协助你设计业务场景、本体模型、数据映射和工作流。打开具体场景后，我还能直接携带当前页面上下文。',
+      ? `我已进入「${context.value.page}」工作区。选择“完整场景建模”并提供业务介绍或附件，我可以一次生成本体、映射、函数、操作、规则、事件和工作流的待审核变更清单。`
+      : '我可以先根据业务介绍创建场景草稿；打开具体场景后，可继续完成完整业务模型建设。',
   }
 }
 
@@ -1550,7 +1750,20 @@ function finishStream(ai: AssistantMessage) {
 }
 
 function send(text?: string) {
-  const content = (text ?? input.value).trim()
+  const attachmentOnlyPrompt = ({
+    scenario: '请根据本次上传的业务文档生成一个待确认的业务场景草稿，并标明无法确定的信息。',
+    scenario_model: '请逐段编译本次上传的完整业务文档，生成完整业务模型，并列出所有未识别、歧义和冲突项。',
+    ontology: '请根据本次上传的业务文档建立对象类型、属性、关系与约束，并列出无法从原文确定的信息。',
+    mapping: '请把本次上传文档作为业务语义参考，只根据当前场景中已经检查的真实数据源表和字段生成映射草稿。',
+    capabilities: '请根据本次上传的完整业务文档，新增其中明确描述的函数、操作、规则和事件，并列出所有未识别、歧义和冲突项。',
+    workflow: '请根据本次上传的业务文档生成待审核的工作流，明确触发条件、处理节点、分支和引用资源。',
+  } as Partial<Record<AssistantTaskPreset, string>>)[taskPreset.value] || ''
+  const providedContent = text !== undefined ? text : input.value.trim()
+  const content = (providedContent || (
+    attachmentOnlyPrompt && attachments.value.length
+      ? attachmentOnlyPrompt
+      : ''
+  )).trim()
   if (!content || loading.value || compilationBusy.value || uploadingFiles.value > 0) return
   if (activeCompilationJob.value?.status === 'failed') detachCompilationRecovery()
   if (messages.value.length === 1 && messages.value[0].role === 'assistant' && !messages.value[0].id) messages.value = []
@@ -1617,7 +1830,9 @@ async function answerQuestion(
     return
   }
   if (option.value === 'draft_scenario') {
+    taskPreset.value = 'scenario'
     mode.value = 'draft'
+    draftKind.value = 'scenario'
     input.value = '请根据以下业务目标创建业务场景草稿：\n'
     return
   }
@@ -1641,6 +1856,7 @@ async function answerQuestion(
     // parsed attachment set paired with this assistant response, then let the
     // user edit the correction draft before explicitly submitting it.
     attachments.value = retryAttachmentsForMessage(messages.value, sourceMessage, threadId.value)
+    taskPreset.value = 'scenario_model'
     mode.value = 'draft'
     draftKind.value = 'scenario_model'
     input.value = compilationRetryDraft(option.value, option.prompt)
@@ -1658,14 +1874,18 @@ async function answerQuestion(
 
 async function applyProposal(message: AssistantMessage, index: number) {
   const proposal = proposalOf(message)
-  if (!proposal || proposal.status === 'applied' || !proposalCanApply(proposal) || !threadId.value || !proposal.proposal_id || applyingIndex.value !== null) return
+  if (!proposal || ['applied', 'partially_applied'].includes(proposal.status || '') || !proposalCanApply(proposal) || !threadId.value || !proposal.proposal_id || applyingIndex.value !== null) return
   const effectiveChanges = proposal.changes?.filter((change) => change.operation !== 'skip').length || 0
+  const blockerCount = blockingIssues(proposal).length
+  const partialApply = proposal.kind === 'scenario_model' && blockerCount > 0
   const confirmation = proposal.kind === 'scenario'
     ? `将根据这份草稿创建业务场景“${proposal.payload?.name || '未命名场景'}”。附件仍只属于助手临时上下文，不会成为正式数据源。`
     : proposal.kind === 'mapping'
       ? `将把 ${effectiveChanges} 项映射差异保存到当前场景。保存不会导入数据，之后仍需预览、测试并刷新对象。`
       : proposal.kind === 'scenario_model'
-        ? `将把 ${effectiveChanges} 项跨资源变更在同一事务中写入当前场景；任一对象、引用、规则、流程或映射校验失败都会整体回滚。AI 生成的操作、规则、事件和工作流仍保持停用。`
+        ? partialApply
+          ? `当前有 ${blockerCount} 个阻塞项。确认后只会把通过依赖、引用和结构预检的可用变更在同一事务中写入；受阻定义会跳过并保留解决建议，不会被强行写入。`
+          : `将把 ${effectiveChanges} 项跨资源变更在同一事务中写入当前场景；任一对象、引用、规则、流程或映射校验失败都会整体回滚。AI 生成的操作、规则、事件和工作流仍保持停用。`
         : `将把 ${effectiveChanges} 项变更写入当前场景草稿。草稿状态的工作流不会立即执行。`
   try {
     await ElMessageBox.confirm(
@@ -1690,17 +1910,21 @@ async function applyProposal(message: AssistantMessage, index: number) {
       thread_id: proposalThreadId,
       proposal_id: proposal.proposal_id,
       confirm: true,
+      allow_partial: partialApply,
     })
     const appliedScenarioId = proposal.kind === 'scenario' ? result?.data?.scenario_id : ''
+    const partiallyApplied = proposal.kind === 'scenario_model' && result?.data?.partial === true
     message.content += proposal.kind === 'scenario'
       ? '\n\n业务场景已创建，正在进入场景建设。'
       : proposal.kind === 'mapping'
         ? '\n\n映射草稿已保存。下一步请预览、测试并刷新对象。'
-        : '\n\n变更已应用到当前场景草稿。'
-    message.proposal = { ...proposal, status: 'applied', apply_result: result?.data || {} }
+        : partiallyApplied
+          ? `\n\n可用部分已应用；仍有 ${result?.data?.blocked_issue_count || blockerCount} 个阻塞项，请按清单补充资料后重新编译。`
+          : '\n\n变更已应用到当前场景草稿。'
+    message.proposal = { ...proposal, status: partiallyApplied ? 'partially_applied' : 'applied', apply_result: result?.data || {} }
     window.dispatchEvent(new CustomEvent('assistant-proposal-applied', { detail: { scenario_id: appliedScenarioId || context.value.scenario_id, kind: proposal.kind } }))
     if (result?.status === 'replayed') ElMessage.info('该变更已应用过，已恢复应用结果')
-    else ElMessage.success(proposal.kind === 'scenario' ? '业务场景已创建' : proposal.kind === 'mapping' ? '映射草稿已保存' : '变更已应用到场景草稿')
+    else ElMessage.success(partiallyApplied ? '可用模型已应用，阻塞项已保留' : proposal.kind === 'scenario' ? '业务场景已创建' : proposal.kind === 'mapping' ? '映射草稿已保存' : '变更已应用到场景草稿')
     if (appliedScenarioId) {
       visible.value = false
       await router.push({ name: 'scenario-detail', params: { id: appliedScenarioId }, query: { stage: 'workflows' } })
@@ -1737,8 +1961,10 @@ watch(() => storageKey.value, async () => {
     await loadContext()
   }
 })
-watch(() => context.value.scenario_id, (scenarioId) => {
-  draftKind.value = scenarioId ? 'scenario_model' : 'scenario'
+watch(() => context.value.scenario_id, () => {
+  taskPreset.value = 'smart'
+  mode.value = 'ask'
+  draftKind.value = 'auto'
 }, { immediate: true })
 watch(showLauncher, (show) => {
   if (!show) visible.value = false
@@ -1849,6 +2075,11 @@ onBeforeUnmount(() => {
 .empty-mark { display: flex; align-items: center; justify-content: center; width: 64px; height: 64px; margin-bottom: 13px; border-radius: 19px; color: var(--primary-600); background: var(--grad-soft); }
 .assistant-empty h3 { margin: 0 0 6px; color: var(--text); font-size: 17px; }
 .assistant-empty p { max-width: 310px; margin: 0; font-size: 12px; line-height: 1.7; }
+.assistant-quick-start { display: grid; width: min(100%, 390px); grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 16px; }
+.assistant-quick-start button { display: flex; min-height: 64px; flex-direction: column; justify-content: center; gap: 3px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; color: var(--text-2); background: var(--surface); cursor: pointer; font: inherit; text-align: left; transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease; }
+.assistant-quick-start button:hover, .assistant-quick-start button:focus-visible { border-color: var(--primary); background: var(--primary-soft); box-shadow: var(--shadow-sm); outline: none; }
+.assistant-quick-start strong { color: var(--text); font-size: 11.5px; }
+.assistant-quick-start span { color: var(--text-3); font-size: 9.5px; line-height: 1.4; }
 .assistant-message { display: flex; gap: 9px; margin-bottom: 16px; }
 .assistant-message.user { justify-content: flex-end; }
 .assistant-message-avatar { width: 30px; height: 30px; border-radius: 10px; margin-top: 21px; }
@@ -1909,6 +2140,17 @@ onBeforeUnmount(() => {
 .proposal-description { margin: 0; color: var(--text-2); font-size: 11px; line-height: 1.6; }
 .proposal-section { display: grid; gap: 7px; }
 .proposal-section h4 { margin: 0; color: var(--text); font-size: 11px; }
+.compound-resource-group > h4 { display: flex; align-items: center; justify-content: space-between; }
+.compound-resource-group > h4 span { display: inline-grid; min-width: 20px; height: 20px; place-items: center; border-radius: 999px; color: var(--primary-600); background: var(--primary-soft); font-size: 9px; }
+.compound-resource-list { display: grid; gap: 6px; }
+.compound-resource-card { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.compound-resource-card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.compound-resource-card header strong { color: var(--text); font-size: 10.5px; line-height: 1.45; }
+.compound-resource-card header > div { display: flex; flex: 0 0 auto; gap: 4px; }
+.compound-resource-card p { margin: 0; color: var(--text-3); font-size: 9.5px; line-height: 1.5; }
+.compound-resource-card footer { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 5px; padding-top: 5px; border-top: 1px dashed var(--border); font-size: 9px; }
+.compound-resource-card footer span { color: var(--text-3); }
+.compound-resource-card footer b { overflow-wrap: anywhere; color: var(--text-2); font-weight: 600; }
 .ontology-preview-card { display: grid; gap: 7px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .ontology-preview-card > div:first-child { display: flex; flex-direction: column; gap: 2px; }
 .ontology-preview-card > div:first-child strong { color: var(--text); font-size: 11px; }
@@ -1957,6 +2199,7 @@ onBeforeUnmount(() => {
 .unresolved-row > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
 .unresolved-row strong { color: var(--text); font-size: 10.5px; line-height: 1.45; }
 .unresolved-row span { color: var(--text-3); font-size: 9.5px; overflow-wrap: anywhere; }
+.unresolved-row .issue-resolution { color: var(--warning); line-height: 1.5; }
 .mapping-preview-list, .workflow-preview-list { display: grid; gap: 5px; }
 .mapping-preview-list > div, .workflow-preview-list > div { display: grid; grid-template-columns: minmax(90px, 1fr) auto minmax(90px, 1fr); align-items: center; gap: 7px; padding: 7px 8px; border-radius: 7px; background: var(--surface); font-size: 10px; }
 .mapping-preview-list > div span { color: var(--text-3); }
@@ -2035,6 +2278,10 @@ onBeforeUnmount(() => {
 .tool-button:hover, .tool-button:focus-within { border-color: var(--primary); color: var(--primary-600); background: var(--primary-soft); }
 .tool-button.disabled { cursor: wait; opacity: .72; }
 .tool-button input { display: none; }
+.task-preset-control { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.task-preset-control > label { color: var(--text-3); font-size: 10px; font-weight: 700; }
+.task-preset-control :deep(.el-select) { width: 150px; }
+.task-preset-hint { min-width: 0; overflow: hidden; color: var(--text-3); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
 .composer-input-row { display: flex; align-items: flex-end; gap: 8px; }
 .composer-input-row :deep(.el-textarea__inner) { min-height: 74px !important; padding-right: 12px; }
 .send-button { width: 42px; height: 42px; padding: 0; flex: 0 0 auto; }
@@ -2064,6 +2311,11 @@ onBeforeUnmount(() => {
   .thread-delete, .attachment-chip button, .tool-button, .send-button { min-width: 44px; min-height: 44px; }
   .attachment-chip button { width: 44px; height: 44px; }
   .tool-button span { display: none; }
+  .composer-tools { flex-wrap: wrap; }
+  .task-preset-control { flex: 1; }
+  .task-preset-control :deep(.el-select) { width: 100%; }
+  .task-preset-hint { width: 100%; padding-left: 1px; }
+  .assistant-quick-start { grid-template-columns: 1fr; }
   .assistant-action-preview dl { grid-template-columns: 1fr; }
   .assistant-action-next { align-items: stretch; flex-direction: column; }
   .assistant-action-next .el-button { width: 100%; min-height: 44px; }

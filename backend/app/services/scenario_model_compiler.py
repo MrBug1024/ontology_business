@@ -43,6 +43,8 @@ from . import (
     mapping_refresh_service,
     ontology_service,
     operations_service,
+    permission_service,
+    release_service,
     tenant_service,
     workflow_service,
 )
@@ -53,8 +55,11 @@ SCHEMA_VERSION = "scenario_model.v1"
 # This version participates in the persistent assistant execution fingerprint.
 # Bump it whenever extraction/prompt semantics change in a way that should
 # permit recompiling otherwise identical inputs.
-COMPILER_VERSION = "scenario_model.compiler.v5"
+COMPILER_VERSION = "scenario_model.compiler.v6"
 MAX_SOURCE_CHARS = 100_000
+MAX_EXISTING_CATALOG_CHARS = 60_000
+MAX_MAPPING_CATALOG_CHARS = 60_000
+MAX_COMPILER_PROMPT_CHARS = 140_000
 MAX_OUTPUT_TOKENS = 20_000
 FALLBACK_SOURCE_CHARS = 12_000
 # Chunked extraction uses the same provider-supported response budget as the
@@ -910,6 +915,12 @@ def prepare_compilation_context(
     scenario: BusinessScenario,
 ) -> dict[str, Any]:
     """Freeze the exact credential-free physical schema used by one job."""
+    permission_service.require_scenario_permission(
+        db,
+        scenario,
+        "write",
+        message="完整场景建模需要当前场景的编辑权限",
+    )
     mapping_catalog, columns = _mapping_catalog(db, scenario)
     canonical = json.dumps(
         mapping_catalog,
@@ -917,6 +928,12 @@ def prepare_compilation_context(
         sort_keys=True,
         separators=(",", ":"),
     )
+    if len(canonical) > MAX_MAPPING_CATALOG_CHARS:
+        raise ValueError(
+            f"当前可用数据源表结构目录共 {len(canonical)} 个字符，"
+            f"超过单次编译的 {MAX_MAPPING_CATALOG_CHARS} 字符边界；"
+            "请缩小数据源或表范围后重试"
+        )
     return {
         "mapping_catalog": mapping_catalog,
         "columns_by_table": columns,
@@ -924,14 +941,56 @@ def prepare_compilation_context(
     }
 
 
-def _existing_catalog(scenario: BusinessScenario) -> dict[str, Any]:
-    return {
+def _existing_catalog(
+    scenario: BusinessScenario,
+    db: Session | None = None,
+) -> dict[str, Any]:
+    """Return the least-privilege, credential-free catalog sent to the LLM."""
+    visible_source_ids: set[str] | None = None
+    if db is not None:
+        visible_source_ids = {
+            str(value)
+            for value in db.execute(
+                select(DataSource.id).where(tenant_service.visible_clause(DataSource, db))
+            ).scalars().all()
+        }
+
+    def readable_property(prop: OntologyProperty) -> bool:
+        return db is None or permission_service.can_read_property(db, prop)
+
+    def readable_action(action: OntologyAction) -> bool:
+        return db is None or permission_service.check_action(db, action, "read").allowed
+
+    def readable_workflow(workflow: OntologyWorkflow) -> bool:
+        return db is None or permission_service.check_workflow(db, workflow, "read").allowed
+
+    visible_property_names = {
+        str(entity.id): {
+            str(prop.name) for prop in entity.properties if readable_property(prop)
+        }
+        for entity in scenario.entities
+    }
+
+    catalog = {
+        "scenario": {
+            "id": scenario.id,
+            "name": scenario.name,
+            "description": scenario.description,
+            "industry": scenario.industry,
+            "namespace": scenario.namespace,
+            "status": scenario.status,
+        },
         "entities": [
             {
                 "id": entity.id,
                 "name": entity.name,
                 "is_abstract": bool(entity.is_abstract),
-                "state_property": entity.state_property,
+                "state_property": (
+                    entity.state_property
+                    if str(entity.state_property or "")
+                    in visible_property_names.get(str(entity.id), set())
+                    else ""
+                ),
                 "properties": [
                     {
                         "name": prop.name,
@@ -943,6 +1002,7 @@ def _existing_catalog(scenario: BusinessScenario) -> dict[str, Any]:
                         "enum_values": prop.enum_values or [],
                     }
                     for prop in entity.properties
+                    if readable_property(prop)
                 ],
             }
             for entity in scenario.entities
@@ -958,11 +1018,73 @@ def _existing_catalog(scenario: BusinessScenario) -> dict[str, Any]:
             }
             for item in scenario.relations
         ],
-        "functions": [{"id": item.id, "name": item.name} for item in scenario.function_definitions],
-        "actions": [{"id": item.id, "name": item.name, "entity_id": item.entity_id} for item in scenario.actions],
-        "rules": [{"id": item.id, "name": item.name, "entity_id": item.entity_id} for item in scenario.rules],
-        "events": [{"id": item.id, "name": item.name} for item in scenario.events],
-        "workflows": [{"id": item.id, "name": item.name} for item in scenario.workflows],
+        "functions": [
+            {
+                "id": item.id,
+                "name": item.name,
+                "description": item.description,
+                "input_schema": item.input_schema or {},
+                "output_schema": item.output_schema or {},
+                "tags": item.tags or [],
+                "runtime_kind": item.runtime_kind,
+            }
+            for item in scenario.function_definitions
+        ],
+        "actions": [
+            {
+                "id": item.id,
+                "name": item.name,
+                "entity_id": item.entity_id,
+                "description": item.description,
+                "input_schema": item.input_schema or {},
+                "precondition": item.precondition,
+                "postcondition": item.postcondition,
+                "executor_type": item.executor_type,
+                "enabled": bool(item.enabled),
+            }
+            for item in scenario.actions
+            if readable_action(item)
+        ],
+        "rules": [
+            {
+                "id": item.id,
+                "name": item.name,
+                "entity_id": item.entity_id,
+                "description": item.description,
+                "condition": item.condition or {},
+                "action_on_match": item.action_on_match,
+                "trigger_action_ids": item.trigger_action_ids or [],
+                "severity": item.severity,
+                "enabled": bool(item.enabled),
+            }
+            for item in scenario.rules
+        ],
+        "events": [
+            {
+                "id": item.id,
+                "name": item.name,
+                "description": item.description,
+                "payload_schema": item.payload_schema or {},
+                "trigger_source": item.trigger_source,
+                "enabled": bool(item.enabled),
+            }
+            for item in scenario.events
+        ],
+        "workflows": [
+            {
+                "id": item.id,
+                "name": item.name,
+                "description": item.description,
+                "trigger_type": item.trigger_type,
+                "trigger_config": item.trigger_config or {},
+                "nodes": item.nodes or [],
+                "edges": item.edges or [],
+                "status": item.status,
+                "enabled": bool(item.enabled),
+            }
+            for item in scenario.workflows
+            if readable_workflow(item)
+        ],
         "mappings": [
             {
                 "id": item.id,
@@ -970,9 +1092,14 @@ def _existing_catalog(scenario: BusinessScenario) -> dict[str, Any]:
                 "entity_name": item.entity.name if item.entity else "",
                 "data_source_id": item.data_source_id,
                 "table_name": item.table_name,
-                "column_map": item.column_map or {},
+                "column_map": {
+                    str(property_name): column_name
+                    for property_name, column_name in (item.column_map or {}).items()
+                    if str(property_name) in visible_property_names.get(str(item.entity_id), set())
+                },
             }
             for item in scenario.data_mappings
+            if visible_source_ids is None or str(item.data_source_id) in visible_source_ids
         ],
         "relation_mappings": [
             {
@@ -988,8 +1115,18 @@ def _existing_catalog(scenario: BusinessScenario) -> dict[str, Any]:
                 "target_key_column": item.target_key_column or "",
             }
             for item in getattr(scenario, "relation_data_mappings", [])
+            if (
+                visible_source_ids is None
+                or not item.data_source_id
+                or str(item.data_source_id) in visible_source_ids
+            )
         ],
     }
+    # Apply one defensive recursive pass to the complete structure.  Schemas,
+    # descriptions, conditions and trigger sources can all contain defaults or
+    # examples; sanitising only connector/workflow fields would still disclose
+    # credentials embedded in otherwise declarative business definitions.
+    return release_service.safe_snapshot_content(catalog)
 
 
 _PROMPT = """你是业务本体文档编译器。只输出一个 JSON 对象，不输出 Markdown。
@@ -1043,6 +1180,7 @@ def _compiler_prompt(
     message: str,
     paragraphs: list[dict[str, str]],
     mapping_catalog: list[dict[str, Any]],
+    db: Session | None = None,
     chunk_index: int | str | None = None,
     chunk_count: int | None = None,
 ) -> str:
@@ -1071,18 +1209,46 @@ def _compiler_prompt(
         )
     else:
         task_instruction = _text(raw_message, maximum=12_000)
-    return (
+    existing_catalog = json.dumps(
+        _existing_catalog(scenario, db),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(existing_catalog) > MAX_EXISTING_CATALOG_CHARS:
+        raise ValueError(
+            f"当前场景业务定义目录共 {len(existing_catalog)} 个字符，超过单次编译的 "
+            f"{MAX_EXISTING_CATALOG_CHARS} 字符边界；请按业务域拆分场景后重试"
+        )
+    mapping_catalog_json = json.dumps(
+        mapping_catalog,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(mapping_catalog_json) > MAX_MAPPING_CATALOG_CHARS:
+        raise ValueError(
+            f"当前可用数据源表结构目录共 {len(mapping_catalog_json)} 个字符，"
+            f"超过单次编译的 {MAX_MAPPING_CATALOG_CHARS} 字符边界；"
+            "请缩小数据源或表范围后重试"
+        )
+    prompt = (
         _PROMPT
         + chunk_instruction
         + "\n当前场景：\n"
-        + json.dumps(_existing_catalog(scenario), ensure_ascii=False)
+        + existing_catalog
         + "\n可用数据源表结构：\n"
-        + json.dumps(mapping_catalog, ensure_ascii=False)
+        + mapping_catalog_json
         + "\n编译控制说明（不可作为业务证据）：\n"
         + task_instruction
         + "\n待逐段编译的业务语义来源：\n"
-        + json.dumps(paragraphs, ensure_ascii=False)
+        + json.dumps(paragraphs, ensure_ascii=False, separators=(",", ":"))
     )
+    if len(prompt) > MAX_COMPILER_PROMPT_CHARS:
+        raise ValueError(
+            f"完整编译提示共 {len(prompt)} 个字符，超过单次 "
+            f"{MAX_COMPILER_PROMPT_CHARS} 字符边界；"
+            "请缩小场景目录、数据源表结构或本次文档范围后重试"
+        )
+    return prompt
 
 
 def _paragraph_record_size(paragraph: dict[str, str]) -> int:
@@ -1940,6 +2106,7 @@ def _extract_chunk_models_recursively(
         message=message,
         paragraphs=paragraphs,
         mapping_catalog=mapping_catalog,
+        db=db,
         chunk_index=chunk_label,
         chunk_count=chunk_count,
     )
@@ -2036,6 +2203,12 @@ def compile_scenario_model(
     prepared_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compile and normalize one full document without writing scenario definitions."""
+    permission_service.require_scenario_permission(
+        db,
+        scenario,
+        "write",
+        message="完整场景建模需要当前场景的编辑权限",
+    )
     if llm is None:
         raise ValueError("请先配置并启用一个默认 LLM")
     source_bundle = build_source_bundle(message, documents)
@@ -2070,6 +2243,7 @@ def compile_scenario_model(
         message=message,
         paragraphs=source_bundle["paragraphs"],
         mapping_catalog=mapping_catalog,
+        db=db,
     )
     last_error: Exception | None = None
     for attempt_index in range(3):
@@ -2212,6 +2386,220 @@ def _issue(
         unresolved.append(candidate)
 
 
+_ISSUE_RESOLUTION_HINTS = {
+    "missing_evidence": "回到原文或补充说明，为该定义提供可定位的段落依据后重新编译。",
+    "invalid_evidence_reference": "检查引用的段落是否来自本次上传文档，删除失效引用或重新上传完整文档。",
+    "source_conflict": "明确以哪一条资料为准，并在描述中使用“以……为准/修正为……”重新编译。",
+    "ambiguous_source": "补充该段业务含义或选择唯一口径，消除歧义后重新编译。",
+    "missing_source_coverage": "补充该段落的业务含义，或明确说明它只是背景/无关内容后重新编译。",
+    "inconsistent_source_coverage": "检查段落的 coverage 与资源 evidence 是否一致，补充或修正文档后重新编译。",
+    "chunk_resource_conflict": "检查分段文档中同一资源的重复定义，统一名称、字段和约束后重新编译。",
+    "chunk_resource_identity_conflict": "统一该资源的 key 与名称映射，避免同一 key 指向多个定义后重新编译。",
+    "invalid_entity": "补齐对象名称、属性类型、主键和标题属性，并确保定义之间不冲突后重新编译。",
+    "missing_primary_key": "为对象类型补充唯一主键属性（is_key=true）后重新编译。",
+    "multiple_primary_keys": "只保留一个主键属性，其他候选属性取消主键标记后重新编译。",
+    "missing_title_property": "为对象类型补充一个标题属性（is_title=true）后重新编译。",
+    "multiple_title_properties": "只保留一个标题属性，其他属性取消标题标记后重新编译。",
+    "existing_property_conflict": "核对已有属性的数据类型、必填和约束；选择保留现状或明确修改后重新编译。",
+    "missing_reference": "补充被引用的对象、关系或业务能力的明确名称/ID，避免悬空引用后重新编译。",
+    "ambiguous_reference": "把引用改为唯一的资源名称或现有资源 ID 后重新编译。",
+    "invalid_relation_constraints": "明确关系基数和本体约束，删除不支持或互相冲突的约束后重新编译。",
+    "invalid_relation_constraint_endpoints": "核对关系两端对象类型与约束是否匹配，修正端点或约束后重新编译。",
+    "invalid_rule_condition": "把规则条件改成受支持的 field/value/op 结构，并确认字段属于目标对象后重新编译。",
+    "unknown_rule_field": "把规则字段改为目标对象已有属性，或先补充该属性后重新编译。",
+    "invalid_workflow": "补齐工作流的开始/结束节点、分支、可达性和无环结构后重新编译。",
+    "missing_workflow_resource_refs": "为工作流节点绑定真实的操作、规则或事件资源后重新编译。",
+    "invalid_workflow_trigger": "将触发配置改为平台支持的 manual、event 或 interval_seconds 定时触发后重新编译。",
+    "missing_mapping_table": "补充或修正数据源、表名，并确保数据源已配置且可读取后重新编译。",
+    "missing_mapping_column": "检查数据源表结构，修正为真实存在的列名后重新编译。",
+    "empty_mapping": "至少补充一个字段映射，并覆盖主键和必填属性后重新编译。",
+    "relation_mapping_missing_endpoint": "先补齐关系两端的对象映射，再重新编译关系映射。",
+    "relation_mapping_invalid": "补齐关系映射模式、外键/中间表及键列，并确认它们来自真实表结构后重新编译。",
+    "document_reported_issue": "根据该提示补充业务资料或在用户描述中明确最终口径后重新编译。",
+}
+
+
+def _issue_resolution_hint(issue: dict[str, Any]) -> str:
+    code = str(issue.get("code") or "").strip()
+    if code in _ISSUE_RESOLUTION_HINTS:
+        return _ISSUE_RESOLUTION_HINTS[code]
+    if code == "title_fallback_to_primary_key":
+        return "如接受主键作为标题，可保留当前提示；否则补充明确的标题属性后重新编译。"
+    return "按问题详情补充资料或修正定义后重新编译；该项不会被写入正式模型。"
+
+
+def _resource_items_by_key(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("key")): item
+        for section in _RESOURCE_SECTIONS
+        for item in (payload.get(section) or [])
+        if isinstance(item, dict) and str(item.get("key") or "")
+    }
+
+
+def _generated_reference_keys(value: Any) -> set[str]:
+    """Collect generated resource references without trusting free-form text."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        if value.get("kind") == "generated" and value.get("key"):
+            found.add(str(value["key"]))
+        for child in value.values():
+            found.update(_generated_reference_keys(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.update(_generated_reference_keys(child))
+    return found
+
+
+def _change_matches_resource(change_id: str, resource_keys: set[str]) -> bool:
+    return any(
+        change_id == key or change_id.startswith(f"{key}:")
+        for key in resource_keys
+    )
+
+
+def _issue_affected_resource_keys(
+    payload: dict[str, Any],
+    issue: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> set[str]:
+    """Map a blocker to conservative resource keys for partial application.
+
+    Source evidence is the only trustworthy join between an issue and a model
+    resource.  A blocker without evidence is global and therefore disables the
+    whole change set.  This deliberately skips too much rather than risking a
+    partially persisted invalid dependency.
+    """
+    source_refs = {
+        str(value) for value in (issue.get("source_refs") or []) if str(value)
+    }
+    if not source_refs:
+        return set(resources)
+    affected = {
+        key
+        for key, item in resources.items()
+        if source_refs.intersection(str(ref) for ref in (item.get("evidence_refs") or []))
+    }
+    for coverage in payload.get("coverage") or []:
+        if str(coverage.get("source_ref") or "") in source_refs:
+            affected.update(
+                str(key) for key in (coverage.get("change_keys") or [])
+                if str(key) in resources
+            )
+    return affected
+
+
+def _applyability_for_scenario_model(
+    payload: dict[str, Any],
+) -> tuple[set[str], set[str], list[dict[str, Any]]]:
+    resources = _resource_items_by_key(payload)
+    all_keys = set(resources)
+    blockers = [
+        item for item in (payload.get("unresolved") or [])
+        if item.get("blocking", True)
+    ]
+    blocked: set[str] = set()
+    for issue in blockers:
+        blocked.update(_issue_affected_resource_keys(payload, issue, resources))
+
+    # A valid resource cannot be applied if it depends on a resource that is
+    # being skipped. Repeat until the dependency closure is stable.
+    changed = True
+    while changed:
+        changed = False
+        for key, item in resources.items():
+            if key in blocked:
+                continue
+            if _generated_reference_keys(item).intersection(blocked):
+                blocked.add(key)
+                changed = True
+
+    safe = all_keys - blocked
+    annotated: list[dict[str, Any]] = []
+    for raw_issue in (payload.get("unresolved") or []):
+        issue = dict(raw_issue)
+        affected = _issue_affected_resource_keys(payload, issue, resources)
+        issue["affected_change_keys"] = sorted(affected)
+        issue["resolution_hint"] = _issue_resolution_hint(issue)
+        annotated.append(issue)
+    return safe, blocked, annotated
+
+
+def partial_scenario_model_payload(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the independently valid subset requested by partial apply.
+
+    The returned payload is still passed through the normal full preflight and
+    one transaction.  Partial means selecting a smaller safe change set, not
+    weakening any schema, reference, mapping or workflow validation.
+    """
+    safe_keys, blocked_keys, annotated_issues = _applyability_for_scenario_model(payload)
+    changes = list(payload.get("changes") or [])
+    safe_changes = [
+        item for item in changes
+        if _change_matches_resource(str(item.get("change_id") or ""), safe_keys)
+    ]
+    effective_safe_changes = [
+        item for item in safe_changes
+        if item.get("operation") in {"add", "update", "delete"}
+    ]
+    effective_blocked_changes = [
+        item for item in changes
+        if item.get("operation") in {"add", "update", "delete"}
+        and not _change_matches_resource(str(item.get("change_id") or ""), safe_keys)
+    ]
+    partial = copy.deepcopy(payload)
+    for section in _RESOURCE_SECTIONS:
+        partial[section] = [
+            item for item in (partial.get(section) or [])
+            if str(item.get("key") or "") in safe_keys
+        ]
+    partial["changes"] = safe_changes
+    partial["unresolved"] = []
+    coverage = []
+    for original in payload.get("coverage") or []:
+        item = copy.deepcopy(original)
+        item["change_keys"] = [
+            str(key) for key in (item.get("change_keys") or [])
+            if str(key) in safe_keys
+        ]
+        if item.get("status") == "modeled" and not item["change_keys"]:
+            item["status"] = "context"
+            item["reason"] = "该来源段落对应的定义包含阻塞项，本次仅应用其他可独立校验的模型。"
+        elif item.get("status") not in {"modeled", "context", "irrelevant"}:
+            item["status"] = "context"
+            item["reason"] = "该来源段落存在阻塞项，本次未将其写入正式模型。"
+        coverage.append(item)
+    partial["coverage"] = coverage
+    partial["coverage_summary"] = {
+        "total": len(coverage),
+        "modeled": sum(item.get("status") == "modeled" for item in coverage),
+        "context": sum(item.get("status") == "context" for item in coverage),
+        "irrelevant": sum(item.get("status") == "irrelevant" for item in coverage),
+        "ambiguous": 0,
+    }
+    metadata = {
+        "partial": bool(blocked_keys),
+        "safe_change_keys": sorted(
+            str(item.get("change_id") or "") for item in safe_changes
+        ),
+        "blocked_change_keys": sorted(
+            str(item.get("change_id") or "") for item in changes
+            if not _change_matches_resource(str(item.get("change_id") or ""), safe_keys)
+        ),
+        "safe_change_count": len(effective_safe_changes),
+        "blocked_change_count": len(effective_blocked_changes),
+        "blocked_issue_count": len(
+            [item for item in annotated_issues if item.get("blocking", True)]
+        ),
+    }
+    return partial, {
+        **metadata,
+        "unresolved": annotated_issues,
+    }
+
+
 def _normalize_reported_issue_code(value: Any) -> str:
     """Canonicalize an untrusted model issue code without widening policy."""
     return _text(value or "DOCUMENT_AMBIGUITY", maximum=100).upper()
@@ -2328,6 +2716,53 @@ def _reference_token_variants(value: Any) -> set[str]:
     return {item for item in variants if item}
 
 
+def _reference_is_readable(db: Session | None, item: Any) -> bool:
+    if db is None:
+        return True
+    if isinstance(item, OntologyProperty):
+        return permission_service.can_read_property(db, item)
+    if isinstance(item, OntologyAction):
+        return permission_service.check_action(db, item, "read").allowed
+    if isinstance(item, OntologyWorkflow):
+        return permission_service.check_workflow(db, item, "read").allowed
+    if isinstance(item, DataSource):
+        return bool(
+            item.tenant_id == tenant_service.current_tenant_id(db)
+            or item.is_public
+        )
+    if isinstance(item, (DataMapping, RelationDataMapping)):
+        source_id = str(getattr(item, "data_source_id", "") or "")
+        if not source_id:
+            return True
+        source = db.get(DataSource, source_id)
+        return bool(source and _reference_is_readable(db, source))
+    return True
+
+
+def _reference_display_name(item: Any) -> str:
+    if isinstance(item, dict):
+        raw = item.get("name") or item.get("key") or item.get("id") or ""
+    else:
+        raw = getattr(item, "name", "") or ""
+        if not raw and isinstance(item, DataMapping):
+            entity_name = getattr(getattr(item, "entity", None), "name", "")
+            raw = " ← ".join(
+                value
+                for value in (str(entity_name or ""), str(item.table_name or ""))
+                if value
+            )
+        if not raw and isinstance(item, RelationDataMapping):
+            raw = f"关系映射 {item.id}"
+        if not raw:
+            raw = getattr(item, "id", "") or ""
+    sanitized = release_service.safe_snapshot_content(
+        {"display_name": str(raw)}
+    ).get("display_name")
+    if isinstance(sanitized, str) and sanitized.strip():
+        return _text(sanitized, maximum=300)
+    return "已授权的已有定义"
+
+
 def _resolve_ref(
     ref: Any,
     *,
@@ -2336,6 +2771,7 @@ def _resolve_ref(
     resource_label: str,
     unresolved: list[dict[str, Any]],
     source_refs: Iterable[str],
+    db: Session | None = None,
 ) -> dict[str, str] | None:
     token = _text(ref, maximum=300)
     token_variants = _reference_token_variants(token)
@@ -2347,7 +2783,10 @@ def _resolve_ref(
             str(item.get("name") or "").strip(),
         }
     ]
-    by_id, by_name = _resource_index(existing)
+    readable_existing = [
+        item for item in existing if _reference_is_readable(db, item)
+    ]
+    by_id, by_name = _resource_index(readable_existing)
     existing_matches = [
         item
         for variant in token_variants
@@ -2359,7 +2798,11 @@ def _resolve_ref(
     # Generated entity entries that extend an existing object resolve directly
     # to that existing id and must not count as an ambiguous second match.
     if len(generated_matches) == 1 and generated_matches[0].get("existing_id"):
-        return {"kind": "existing", "id": str(generated_matches[0]["existing_id"])}
+        return {
+            "kind": "existing",
+            "id": str(generated_matches[0]["existing_id"]),
+            "display_name": _reference_display_name(generated_matches[0]),
+        }
     candidates = [*(('generated', item) for item in generated_matches), *(('existing', item) for item in existing_matches)]
     dedup: dict[tuple[str, str], tuple[str, Any]] = {}
     for kind, item in candidates:
@@ -2378,7 +2821,11 @@ def _resolve_ref(
     kind, item = candidates[0]
     if kind == "generated":
         return {"kind": "generated", "key": str(item["key"])}
-    return {"kind": "existing", "id": str(item.id)}
+    return {
+        "kind": "existing",
+        "id": str(item.id),
+        "display_name": _reference_display_name(item),
+    }
 
 
 def _canonical_rule_operator(value: Any) -> str:
@@ -3906,11 +4353,13 @@ def normalize_scenario_model(
             value.get("source_ref") or value.get("source"), generated=entities,
             existing=scenario.entities, resource_label=f"关系 {key} 的来源对象", unresolved=unresolved,
             source_refs=meta["evidence_refs"],
+            db=db,
         )
         target = _resolve_ref(
             value.get("target_ref") or value.get("target"), generated=entities,
             existing=scenario.entities, resource_label=f"关系 {key} 的目标对象", unresolved=unresolved,
             source_refs=meta["evidence_refs"],
+            db=db,
         )
         if value.get("properties") or value.get("attributes"):
             _issue(
@@ -4077,6 +4526,7 @@ def normalize_scenario_model(
                 resource_label=f"关系 {item['key']} 的逆关系",
                 unresolved=unresolved,
                 source_refs=item["evidence_refs"],
+                db=db,
             )
             if inverse_ref
             else None
@@ -4152,6 +4602,7 @@ def normalize_scenario_model(
             value.get("entity_ref"), generated=entities, existing=scenario.entities,
             resource_label=f"操作 {key} 的对象类型", unresolved=unresolved,
             source_refs=meta["evidence_refs"],
+            db=db,
         )
         try:
             input_schema = _object_schema(value.get("input_schema"))
@@ -4181,6 +4632,7 @@ def normalize_scenario_model(
             value.get("entity_ref"), generated=entities, existing=scenario.entities,
             resource_label=f"规则 {key} 的对象类型", unresolved=unresolved,
             source_refs=meta["evidence_refs"],
+            db=db,
         )
         try:
             condition = _normalize_rule_condition(value.get("condition"))
@@ -4240,6 +4692,7 @@ def normalize_scenario_model(
                 ref, generated=actions, existing=scenario.actions,
                 resource_label=f"规则 {key} 的触发操作", unresolved=unresolved,
                 source_refs=meta["evidence_refs"],
+                db=db,
             )
             for ref in (value.get("trigger_action_refs") or [])
         ]
@@ -4323,6 +4776,7 @@ def normalize_scenario_model(
                         generated=generated, existing=existing,
                         resource_label=f"工作流 {key} 的 {node_type} 节点", unresolved=unresolved,
                         source_refs=meta["evidence_refs"],
+                        db=db,
                     )
                 else:
                     resolved = None
@@ -4487,6 +4941,7 @@ def normalize_scenario_model(
                     resource_label=f"工作流 {key} 的触发事件",
                     unresolved=unresolved,
                     source_refs=meta["evidence_refs"],
+                    db=db,
                 )
             validation_config = dict(trigger_config)
             if trigger_type == "event" and trigger_event:
@@ -4532,11 +4987,13 @@ def normalize_scenario_model(
             value.get("entity_ref"), generated=entities, existing=scenario.entities,
             resource_label=f"映射 {key} 的对象类型", unresolved=unresolved,
             source_refs=meta["evidence_refs"],
+            db=db,
         )
         source_ref = _resolve_ref(
             value.get("data_source_ref"), generated=[], existing=data_sources,
             resource_label=f"映射 {key} 的数据源", unresolved=unresolved,
             source_refs=meta["evidence_refs"],
+            db=db,
         )
         table_name = _text(value.get("table_name"), maximum=300)
         source_id = (source_ref or {}).get("id", "")
@@ -4605,18 +5062,21 @@ def normalize_scenario_model(
             existing=scenario.relations,
             resource_label=f"关系映射 {key} 的关系",
             unresolved=unresolved, source_refs=meta["evidence_refs"],
+            db=db,
         )
         source_mapping_ref = _resolve_ref(
             value.get("source_mapping_ref"), generated=mappings,
             existing=scenario.data_mappings,
             resource_label=f"关系映射 {key} 的源对象映射",
             unresolved=unresolved, source_refs=meta["evidence_refs"],
+            db=db,
         )
         target_mapping_ref = _resolve_ref(
             value.get("target_mapping_ref"), generated=mappings,
             existing=scenario.data_mappings,
             resource_label=f"关系映射 {key} 的目标对象映射",
             unresolved=unresolved, source_refs=meta["evidence_refs"],
+            db=db,
         )
         expected_source, expected_target = _relation_endpoints_for_ref(
             scenario, relations, relation_ref
@@ -4723,6 +5183,7 @@ def normalize_scenario_model(
                 value.get("join_data_source_ref"), generated=[], existing=data_sources,
                 resource_label=f"关系映射 {key} 的中间表数据源",
                 unresolved=unresolved, source_refs=meta["evidence_refs"],
+                db=db,
             )
             if not join_table_name or not source_key_column or not target_key_column:
                 _issue(
@@ -5069,6 +5530,33 @@ def normalize_scenario_model(
             "irrelevant": sum(item["status"] == "irrelevant" for item in coverage),
             "ambiguous": sum(item["status"] == "ambiguous" for item in coverage),
         },
+    }
+    _safe_keys, _blocked_keys, annotated_issues = _applyability_for_scenario_model(payload)
+    payload["unresolved"] = annotated_issues
+    safe_change_ids = {
+        str(item.get("change_id") or "")
+        for item in (payload.get("changes") or [])
+        if _change_matches_resource(str(item.get("change_id") or ""), _safe_keys)
+    }
+    blocked_change_ids = {
+        str(item.get("change_id") or "")
+        for item in (payload.get("changes") or [])
+        if str(item.get("change_id") or "") not in safe_change_ids
+    }
+    payload["applyability"] = {
+        "partial_supported": True,
+        "safe_change_keys": sorted(safe_change_ids),
+        "blocked_change_keys": sorted(blocked_change_ids),
+        "safe_change_count": sum(
+            item.get("operation") in {"add", "update", "delete"}
+            for item in (payload.get("changes") or [])
+            if str(item.get("change_id") or "") in safe_change_ids
+        ),
+        "blocked_change_count": sum(
+            item.get("operation") in {"add", "update", "delete"}
+            for item in (payload.get("changes") or [])
+            if str(item.get("change_id") or "") in blocked_change_ids
+        ),
     }
     return payload
 

@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     # HTTP Action 默认只允许公网 HTTPS 目标。开发环境如确有受控本地模拟端点，
     # 必须由部署配置显式开启，不能由 API 请求覆盖。
     allow_insecure_http_actions: bool = False
+    # Tenant-supplied stdio commands execute on the API host, so they remain
+    # disabled unless a trusted single-tenant deployment opts in explicitly.
+    allow_mcp_stdio: bool = False
+    # Remote MCP defaults to public HTTPS.  Controlled development deployments
+    # may opt into HTTP and explicitly allow exact/private host names.
+    allow_insecure_mcp_http: bool = False
+    mcp_private_host_allowlist: str = ""
+    mcp_operation_timeout_seconds: float = 90.0
 
     # A process is deployed to exactly one governed runtime environment.  This
     # value is deliberately server-side: callers cannot select prod/staging by

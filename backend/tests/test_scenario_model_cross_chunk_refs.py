@@ -447,7 +447,14 @@ class ScenarioModelCrossChunkReferenceTests(unittest.TestCase):
             unresolved=unresolved,
             source_refs=["synthetic:p0001"],
         )
-        self.assertEqual(resolved, {"kind": "existing", "id": "resource-id"})
+        self.assertEqual(
+            resolved,
+            {
+                "kind": "existing",
+                "id": "resource-id",
+                "display_name": "建筑资源",
+            },
+        )
         self.assertFalse(unresolved)
 
         # If the stripped exact name and the original exact key point to

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+import unicodedata
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -41,6 +42,11 @@ def _assistant_attachment_expiry() -> datetime:
 def _runtime_environment_default() -> str:
     """Keep direct ORM-created runs aligned with this server deployment."""
     return get_settings().runtime_environment
+
+
+def normalize_mcp_name_key(value: str) -> str:
+    """Return the database identity used for tenant-local MCP names."""
+    return unicodedata.normalize("NFKC", str(value or "").strip()).casefold()
 
 
 # ──────────────────────────────────────────────
@@ -1127,6 +1133,9 @@ class Skill(Base):
 
 class MCPConfig(Base):
     __tablename__ = "mcp_configs"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name_key", name="uq_mcp_configs_tenant_name_key"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str | None] = mapped_column(
@@ -1134,6 +1143,10 @@ class MCPConfig(Base):
     )
     is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # A materialized, Unicode-normalized identity keeps SQLite, PostgreSQL and
+    # MySQL conflict behaviour identical and lets the database close the
+    # create/import check-then-write race.
+    name_key: Mapped[str] = mapped_column(String(600), nullable=False, default="")
     transport: Mapped[str] = mapped_column(String(20), default="stdio")  # stdio / sse / streamable_http
     command: Mapped[str] = mapped_column(String(500), default="")
     args: Mapped[list] = mapped_column(JSON, default=list)
@@ -1149,6 +1162,14 @@ class MCPConfig(Base):
         "version_id_col": connector_revision,
         "version_id_generator": False,
     }
+
+
+def _sync_mcp_name_key(_mapper, _connection, target: MCPConfig) -> None:
+    target.name_key = normalize_mcp_name_key(target.name)
+
+
+event.listen(MCPConfig, "before_insert", _sync_mcp_name_key)
+event.listen(MCPConfig, "before_update", _sync_mcp_name_key)
 
 
 # Connector configurations are runtime authority.  A public-shape signature

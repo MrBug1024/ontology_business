@@ -28,6 +28,7 @@ import type {
   LLMTrace,
   LLMUsageSummary,
   MCPConfig,
+  MCPImportResult,
   MCPTool,
   OntologyInstance,
   RelationInstance,
@@ -128,7 +129,7 @@ export const api = {
     http.get<AssistantCompilationJobStatus>(`/assistant/compilation-jobs/${jobId}`),
   getAssistantCompilationJobResult: (jobId: string) =>
     http.get<AssistantCompilationJobResult>(`/assistant/compilation-jobs/${jobId}/result`),
-  applyAssistantProposal: (d: { kind: 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'; scenario_id?: string; thread_id: string; proposal_id: string; confirm: boolean }) =>
+  applyAssistantProposal: (d: { kind: 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'; scenario_id?: string; thread_id: string; proposal_id: string; confirm: boolean; allow_partial?: boolean }) =>
     http.post('/assistant/proposals/apply', d),
 
   // 场景
@@ -351,6 +352,11 @@ export const api = {
   listMCP: () => http.get<MCPConfig[]>('/mcp'),
   createMCP: (d: Partial<MCPConfig>) => http.post<MCPConfig>('/mcp', d),
   updateMCP: (id: string, d: Partial<MCPConfig>) => http.put<MCPConfig>(`/mcp/${id}`, d),
+  importMCP: (d: { mcpServers: Record<string, unknown> }, options: { dryRun?: boolean; conflictPolicy?: 'error' | 'skip' | 'replace' } = {}) =>
+    http.post<MCPImportResult>('/mcp/import', d, { params: {
+      dry_run: options.dryRun || undefined,
+      conflict_policy: options.conflictPolicy || 'error',
+    } }),
   deleteMCP: (id: string) => http.delete(`/mcp/${id}`),
   testMCP: (id: string) => http.post(`/mcp/${id}/test`),
   mcpTools: (id: string) => http.get<MCPTool[]>(`/mcp/${id}/tools`),

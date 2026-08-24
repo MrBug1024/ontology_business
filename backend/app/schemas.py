@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+import ipaddress
+import re
+import unicodedata
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -802,19 +805,269 @@ class SkillToggle(BaseModel):
     enabled: bool
 
 
+MCPTransport = Literal["stdio", "sse", "streamable_http"]
+
+
+def _mcp_string_map(value: Any, *, label: str) -> dict[str, str]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} 必须是键和值均为文本的对象")
+    if len(value) > 100:
+        raise ValueError(f"{label} 最多允许 100 项")
+    result: dict[str, str] = {}
+    seen: set[str] = set()
+    for raw_key, raw_value in value.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise ValueError(f"{label} 的键不能为空")
+        if not isinstance(raw_value, str):
+            raise ValueError(f"{label}.{raw_key} 的值必须是文本")
+        key = raw_key.strip()
+        identity = key.casefold() if label == "headers" else key
+        if identity in seen:
+            raise ValueError(f"{label} 中存在重复键名：{key}")
+        seen.add(identity)
+        if len(key) > 200:
+            raise ValueError(f"{label}.{key[:40]} 的键名过长")
+        if label == "headers" and not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key):
+            raise ValueError(f"headers.{key} 不是合法的 HTTP 请求头名称")
+        if "\r" in key or "\n" in key or "\r" in raw_value or "\n" in raw_value:
+            raise ValueError(f"{label}.{key} 不能包含换行符")
+        if label == "headers" and key.lower() in {
+            "connection", "content-length", "host", "keep-alive",
+            "proxy-authorization", "proxy-connection", "te", "trailer",
+            "transfer-encoding", "upgrade",
+        }:
+            raise ValueError(f"headers.{key} 是受控请求头，不能手动设置")
+        if len(raw_value) > 8_000:
+            raise ValueError(f"{label}.{key} 的值过长")
+        result[key] = raw_value
+    return result
+
+
 class MCPConfigIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    transport: MCPTransport = "stdio"
+    command: str = Field(default="", max_length=500)
+    args: list[str] = Field(default_factory=list, max_length=200)
+    url: str = Field(default="", max_length=500)
+    env: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def validate_mcp_name(cls, value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value or "").strip())
+        if not normalized:
+            raise ValueError("MCP 服务名称不能为空")
+        if len(normalized) > 200:
+            raise ValueError("MCP 服务名称不能超过 200 个字符")
+        return normalized
+
+    @field_validator("command", "url")
+    @classmethod
+    def normalize_mcp_text(cls, value: str) -> str:
+        return str(value or "").strip()
+
+    @field_validator("args", mode="before")
+    @classmethod
+    def validate_mcp_args(cls, value: Any) -> list[str]:
+        if value in (None, ""):
+            return []
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise ValueError("MCP 启动参数必须是文本数组")
+        result = [item for item in value if item]
+        if any(len(item) > 2_000 for item in result):
+            raise ValueError("MCP 单个启动参数不能超过 2000 个字符")
+        if any(
+            marker in item.casefold()
+            for item in result
+            for marker in (
+                "--api-key", "--apikey", "--access-token", "--token",
+                "--password", "--secret", "authorization=", "password=", "token=",
+            )
+        ):
+            raise ValueError("MCP 启动参数不能携带凭据，请改用 env")
+        return result
+
+    @field_validator("env", mode="before")
+    @classmethod
+    def validate_mcp_env(cls, value: Any) -> dict[str, str]:
+        return _mcp_string_map(value, label="env")
+
+    @field_validator("headers", mode="before")
+    @classmethod
+    def validate_mcp_headers(cls, value: Any) -> dict[str, str]:
+        return _mcp_string_map(value, label="headers")
+
+    @model_validator(mode="after")
+    def validate_transport_contract(self):
+        if self.transport == "stdio":
+            if self.enabled and not self.command:
+                raise ValueError("stdio MCP 必须填写 command")
+            if self.url or self.headers:
+                raise ValueError("stdio MCP 不能同时配置 url 或 headers")
+        else:
+            if not self.url:
+                raise ValueError("远程 MCP 必须填写 url")
+            from urllib.parse import parse_qsl, urlsplit
+
+            parsed = urlsplit(self.url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("MCP url 必须是完整的 HTTP 或 HTTPS 地址")
+            from .config import get_settings
+
+            settings = get_settings()
+            if parsed.scheme == "http" and not settings.allow_insecure_mcp_http:
+                raise ValueError("远程 MCP 默认只允许 HTTPS；受控开发环境需由部署配置显式开启 HTTP")
+            if parsed.username or parsed.password:
+                raise ValueError("MCP url 不能包含用户凭据，请改用 headers")
+            hostname = parsed.hostname.rstrip(".").casefold()
+            allowlist = {
+                value.strip().rstrip(".").casefold()
+                for value in settings.mcp_private_host_allowlist.split(",")
+                if value.strip()
+            }
+            if hostname not in allowlist:
+                if hostname == "localhost" or hostname.endswith(".localhost"):
+                    raise ValueError("MCP url 不允许访问本机或内网主机")
+                try:
+                    literal = ipaddress.ip_address(hostname)
+                except ValueError:
+                    literal = None
+                if literal is not None and not literal.is_global:
+                    raise ValueError("MCP url 不允许访问本机、私网、链路本地或保留地址")
+            sensitive_query_keys = []
+            for key, _value in parse_qsl(parsed.query, keep_blank_values=True):
+                collapsed = "".join(char for char in key.casefold() if char.isalnum())
+                if any(token in collapsed for token in (
+                    "apikey", "accesstoken", "authorization", "password", "secret", "token",
+                )):
+                    sensitive_query_keys.append(key)
+            if sensitive_query_keys:
+                raise ValueError("MCP url 查询参数不能携带凭据，请改用 headers")
+            if self.command or self.args or self.env:
+                raise ValueError("远程 MCP 不能同时配置 command、args 或 env")
+        return self
+
+    model_config = {"extra": "forbid"}
+
+
+class MCPStandardServerIn(BaseModel):
+    """Common ``mcpServers`` entry accepted from MCP-capable clients."""
+
+    type: str | None = None
+    command: str = Field(default="", max_length=500)
+    args: list[str] = Field(default_factory=list, max_length=200)
+    url: str = Field(default="", max_length=500)
+    env: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+    disabled: bool | None = None
+
+    @field_validator("args", mode="before")
+    @classmethod
+    def validate_standard_args(cls, value: Any) -> list[str]:
+        return MCPConfigIn.validate_mcp_args(value)
+
+    @field_validator("env", mode="before")
+    @classmethod
+    def validate_standard_env(cls, value: Any) -> dict[str, str]:
+        return _mcp_string_map(value, label="env")
+
+    @field_validator("headers", mode="before")
+    @classmethod
+    def validate_standard_headers(cls, value: Any) -> dict[str, str]:
+        return _mcp_string_map(value, label="headers")
+
+    def to_internal(self, name: str) -> MCPConfigIn:
+        aliases = {
+            "http": "streamable_http",
+            "streamable-http": "streamable_http",
+            "streamable_http": "streamable_http",
+            "sse": "sse",
+            "stdio": "stdio",
+        }
+        raw_type = str(self.type or ("stdio" if self.command else "http")).strip().lower()
+        transport = aliases.get(raw_type)
+        if not transport:
+            raise ValueError(f"MCP 服务“{name}”的 type 不受支持：{raw_type or '空值'}")
+        return MCPConfigIn(
+            name=name,
+            transport=transport,
+            command=self.command,
+            args=self.args,
+            url=self.url,
+            env=self.env,
+            headers=self.headers,
+            enabled=bool(self.enabled and self.disabled is not True),
+        )
+
+    model_config = {"extra": "forbid"}
+
+
+class MCPStandardImportIn(BaseModel):
+    # Keep the common client wrapper as the actual model field.  Using a
+    # Pydantic alias here makes current FastAPI versions re-wrap the nested
+    # FieldInfo and emit a misleading unsupported-alias warning on every call.
+    mcpServers: dict[str, MCPStandardServerIn] = Field(min_length=1, max_length=50)
+
+    @field_validator("mcpServers")
+    @classmethod
+    def validate_server_names(
+        cls, value: dict[str, MCPStandardServerIn]
+    ) -> dict[str, MCPStandardServerIn]:
+        normalized: dict[str, MCPStandardServerIn] = {}
+        seen: set[str] = set()
+        for raw_name, config in value.items():
+            name = unicodedata.normalize("NFKC", str(raw_name or "").strip())
+            if not name or len(name) > 200:
+                raise ValueError("mcpServers 中的服务名称必须是 1 到 200 个字符")
+            identity = name.casefold()
+            if identity in seen:
+                raise ValueError(f"mcpServers 中存在重复服务名称：{name}")
+            seen.add(identity)
+            # Validate the cross-field transport contract during request parsing.
+            config.to_internal(name)
+            normalized[name] = config
+        return normalized
+
+    def internal_configs(self) -> list[MCPConfigIn]:
+        return [config.to_internal(name) for name, config in self.mcpServers.items()]
+
+    model_config = {"extra": "forbid"}
+
+
+class MCPImportItemOut(BaseModel):
+    name: str
+    transport: MCPTransport
+    endpoint: str = ""
+    env_keys: list[str] = Field(default_factory=list)
+    header_keys: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    action: Literal["create", "replace", "skip"] = "create"
+
+
+class MCPImportResultOut(BaseModel):
+    dry_run: bool = False
+    created: int = 0
+    replaced: int = 0
+    skipped: int = 0
+    items: list[MCPImportItemOut] = Field(default_factory=list)
+    configs: list["MCPConfigOut"] = Field(default_factory=list)
+
+
+class MCPConfigOut(BaseModel):
+    id: str
     name: str
     transport: str = "stdio"
     command: str = ""
-    args: list[str] = []
+    args: list[str] = Field(default_factory=list)
     url: str = ""
-    env: dict = {}
-    headers: dict = {}
+    env: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
     enabled: bool = True
-
-
-class MCPConfigOut(MCPConfigIn):
-    id: str
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -1068,6 +1321,10 @@ class AssistantProposalApplyRequest(BaseModel):
     thread_id: str = Field(min_length=1)
     proposal_id: str = Field(min_length=1, max_length=64)
     confirm: bool = False
+    # A compound model may contain quality blockers.  Partial application is
+    # opt-in and only selects a dependency-safe subset; the normal preflight
+    # still runs unchanged on that subset.
+    allow_partial: bool = False
     # 兼容旧客户端字段；服务端应用时始终以已保存消息中的 payload 为准。
     payload: dict = Field(default_factory=dict)
 

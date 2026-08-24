@@ -21,11 +21,11 @@
   - 关系型数据库：MySQL / PostgreSQL / SQLite（表浏览 + SQL 查询）。
   - 文件桶（file bucket）：上传 Excel / Word / Markdown / PDF / 图片，自动解析入库用于 RAG 检索。
 - **技能（Skill）**：安装受控的本地能力，供已配置的操作或工作流调用；内置 `ocr-parser`（OCR 文档解析）与 `data-analyzer`。
-- **MCP 服务**：接入 Model Context Protocol 工具服务（stdio / SSE / streamable_http），供已配置的操作或工作流连接外部工具。
+- **MCP 服务**：接入 Model Context Protocol 工具服务（SSE / Streamable HTTP，以及由运维显式开启的 stdio）；支持表单配置请求头，也支持批量导入常见客户端的 `mcpServers` JSON。
 - **LLM 配置**：OpenAI 兼容协议（OpenAI / DeepSeek / 通义 / Ollama / vLLM…），多配置、可设默认、可测试连通性。
 - **业务能力**：用结构化表单配置无副作用函数、可预演操作、规则、事件和可视化工作流，无需手写 JSON。
 - **Agent 管理**：绑定场景、LLM 与已映射数据；只有本体、数据源、映射、模型和 Agent 数据绑定均完成后才开放对话。
-- **AI 对话**：ReAct 工具循环可查询对象与数据、检索文档、调用确定性函数、评估规则、生成操作预演并协助提交工作流。
+- **AI 对话**：场景内可选择完整建模、本体、映射、业务能力、工作流、只读解释或操作预演；完整建模会生成带来源证据、冲突检查和原子确认的跨资源变更清单。Agent 对话的 ReAct 工具循环可查询对象与数据、检索文档、调用确定性函数、评估规则、生成操作预演并协助提交工作流。
 - **任务中心**：集中处理工作流状态、重试和人工审批；运行时内部保留权限、连接解析和定义快照等安全内核，但不作为独立业务菜单暴露。
 
 ## 技术栈
@@ -134,6 +134,42 @@ OCR_API_KEY=你的密钥
 种子数据默认创建了一个 `gpt-4o-mini` 配置（占位 API Key）。
 请在 **大模型** 页面编辑或新建，填入真实的 `Base URL` / `API Key` / `模型`，
 并勾选「设为默认」。支持任意 OpenAI 兼容服务（DeepSeek、通义、Ollama、vLLM 等）。
+
+### 常见 MCP 客户端配置导入（前端「能力配置 → MCP 服务」）
+
+页面支持逐项填写 stdio、SSE、Streamable HTTP，也可以粘贴常见客户端使用的 `mcpServers` JSON：
+
+```json
+{
+  "mcpServers": {
+    "firecrawl": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+`type: "http"` 会规范化为 Streamable HTTP。导入时先做无副作用预检并隐藏请求头、环境变量的值，
+确认服务数量、传输类型以及重名处理策略（报错、跳过或替换）后再原子写入；保存不会自动连接外部服务，
+请再使用卡片上的「测试连接」。编辑已有密钥时留空表示保留，删除整行才表示移除。
+
+远程 MCP 默认只允许公网 HTTPS，拒绝 URL 凭据、明显的凭据查询参数、本机/私网/链路本地地址和自动重定向；
+连接时会固定到已校验的 DNS 解析结果，同时保留原始 Host 与 TLS SNI，避免连接阶段再次解析到未授权地址。
+stdio 会在 API 宿主机启动进程，因此默认关闭；仅可信的单租户、低权限沙箱部署可在 `backend/.env` 中显式设置：
+
+```ini
+ALLOW_MCP_STDIO=false
+ALLOW_INSECURE_MCP_HTTP=false
+MCP_PRIVATE_HOST_ALLOWLIST=
+MCP_OPERATION_TIMEOUT_SECONDS=90
+```
+
+请求头和环境变量在 API 中按只写值处理，但当前仓库不内置数据库静态加密或外部 Secret Manager。
+生产部署应启用数据库/磁盘加密并限制备份访问；安全基线要求更高时，应在连接器密钥服务中统一实施信封加密和密钥轮换。
 
 ### 邮箱认证（`backend/.env`）
 

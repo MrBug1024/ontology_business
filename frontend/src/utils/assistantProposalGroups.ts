@@ -3,6 +3,7 @@ export interface ScenarioModelIssue {
   message: string
   blocking: boolean
   sourceRefs: string[]
+  resolutionHint?: string
 }
 
 export interface ScenarioModelIssueGroup {
@@ -77,6 +78,9 @@ export function groupScenarioModelIssues(value: unknown): ScenarioModelIssueGrou
       message: normalizedMessage(issueRecord.message),
       blocking,
       sourceRefs: normalizedSourceRefs(issueRecord.source_refs),
+      resolutionHint: typeof issueRecord.resolution_hint === 'string'
+        ? issueRecord.resolution_hint.trim()
+        : '',
     }
     const existing = groups.get(key)
     if (existing) existing.issues.push(issue)
