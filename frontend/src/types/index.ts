@@ -16,7 +16,9 @@ export interface AuthMessage {
 }
 
 export interface Property {
+  id?: string
   name: string
+  api_name?: string
   data_type: string
   description?: string
   is_key?: boolean
@@ -348,6 +350,7 @@ export interface GraphEdge {
   /** '1:1' | '1:N' | 'N:1' | 'N:M' | 'belongs' | 'rel' */
   type?: string
   relation_type?: string
+  meta?: Record<string, any>
 }
 
 export interface GraphData {
@@ -535,6 +538,100 @@ export interface ScenarioDetail extends Scenario {
   rules: OntologyRule[]
   events: OntologyEvent[]
   workflows: OntologyWorkflow[]
+}
+
+export type ScenarioModelDraftStatus =
+  | 'generated'
+  | 'needs_revision'
+  | 'needs_attention'
+  | 'needs_binding'
+  | 'needs_validation'
+  | 'blocked'
+  | 'ready_for_review'
+  | 'deferred'
+  | 'applied'
+  | 'promoted'
+  | 'partially_promoted'
+  | 'resolved'
+  | 'superseded'
+  | 'discarded'
+  | string
+
+export type ScenarioModelDraftResourceKind =
+  | 'entity'
+  | 'property'
+  | 'relation'
+  | 'instance'
+  | 'mapping'
+  | 'conceptual_mapping'
+  | 'relation_mapping'
+  | 'function'
+  | 'action'
+  | 'rule'
+  | 'event'
+  | 'workflow'
+  | string
+
+export interface ScenarioModelDraftIssue {
+  code?: string
+  message: string
+  field?: string
+  path?: string
+  blocking?: boolean
+  resolution_hint?: string
+  source_refs?: string[]
+}
+
+/**
+ * An AI-authored draft resource. It is projected into the regular scenario
+ * canvas and tabs while staying inactive until the user corrects/promotes it.
+ */
+export interface ScenarioModelDraftResource {
+  id: string
+  revision: number
+  scenario_id?: string
+  proposal_id: string
+  task_id: string
+  resource_kind: ScenarioModelDraftResourceKind
+  resource_key: string
+  title?: string
+  payload: Record<string, any>
+  validation_issues: ScenarioModelDraftIssue[]
+  issues_count?: number
+  blocking_issue_count?: number
+  draft_status: ScenarioModelDraftStatus
+  source?: 'assistant' | 'ai' | string
+  source_thread_id?: string | null
+  source_message_id?: string | null
+  compilation_job_id?: string | null
+  source_refs?: string[]
+  resolved_resource_id?: string
+  enabled: false
+  publishable: false
+  created_at?: string
+  updated_at?: string
+}
+
+export interface ScenarioModelDraftListResponse {
+  items?: ScenarioModelDraftResource[]
+  drafts?: ScenarioModelDraftResource[]
+  total?: number
+  has_more?: boolean
+  next_offset?: number | null
+  issues_count?: number
+  blocking_issue_count?: number
+  summary?: Record<string, any>
+  page_summary?: Record<string, any>
+}
+
+export interface ScenarioModelDraftUpdate {
+  expected_revision: number
+  payload: Record<string, any>
+}
+
+export interface ScenarioModelDraftResolve {
+  expected_revision: number
+  resolved_resource_id: string
 }
 
 export interface DataSource {
@@ -917,6 +1014,18 @@ export interface AssistantThread {
 
 export type AssistantCompilationJobState = 'running' | 'succeeded' | 'failed'
 
+export interface AssistantCompilationStep {
+  id: string
+  title: string
+  detail: string
+  status: 'pending' | 'running' | 'done' | 'error'
+}
+
+export interface AssistantCompilationStageResult {
+  step_id: string
+  summary: string
+}
+
 /** Public, owner-scoped state for recovering a long-running scenario compilation. */
 export interface AssistantCompilationJobStatus {
   id: string
@@ -929,6 +1038,9 @@ export interface AssistantCompilationJobStatus {
     calls_used?: number
     call_budget?: number
     error_code?: string
+    current_step?: string
+    steps?: AssistantCompilationStep[]
+    results?: AssistantCompilationStageResult[]
   }
   llm_calls_used: number
   llm_call_budget: number
@@ -949,6 +1061,7 @@ export interface AssistantCompilationJobResult {
   proposal: AssistantProposal | Record<string, any>
   proposal_thread_id?: string | null
   proposal_message_id?: string | null
+  proposal_scope_key?: string | null
   apply_ready: boolean
 }
 
@@ -1069,16 +1182,101 @@ export interface AssistantProposal {
   }[]
   base_snapshot?: Record<string, any>
   requires_confirmation?: boolean
-  status?: 'pending' | 'applied' | string
+  status?: 'pending' | 'in_progress' | 'completed_with_gaps' | 'partially_applied' | 'applied' | string
+  run_revision?: number
   applied_at?: string
   apply_result?: Record<string, any>
+}
+
+export interface AssistantModelTask {
+  id: string
+  order: number
+  title: string
+  description: string
+  sections: string[]
+  depends_on: string[]
+  status: 'empty' | 'ready' | 'blocked' | 'waiting' | 'applied' | 'partially_applied' | 'deferred' | 'drafted_with_gaps' | 'skipped' | string
+  waiting_for?: string[]
+  change_keys: string[]
+  safe_change_keys: string[]
+  change_count: number
+  output_count?: number
+  draft_output_count?: number
+  draft_candidate_count?: number
+  issue_count?: number
+  safe_change_count: number
+  blocked_issue_count: number
+  compiled_safe_change_count?: number
+  compiled_blocked_issue_count?: number
+  draft_status?: 'generated' | 'empty' | string
+  issues?: Array<{
+    code: string
+    message: string
+    source_refs?: string[]
+    blocking?: boolean
+    resolution_hint?: string
+    affected_change_keys?: string[]
+  }>
+  apply_result?: Record<string, any>
+  applied_at?: string
+  completed_at?: string
+}
+
+export interface AssistantModelExecutionSummary {
+  final: boolean
+  status: 'running' | 'waiting_for_confirmation' | 'completed' | 'completed_with_gaps' | 'state_error' | string
+  message: string
+  total_task_count: number
+  completed_task_count: number
+  applied_task_count: number
+  partially_applied_task_count: number
+  draft_only_task_count: number
+  empty_task_count: number
+  current_task_id: string
+  current_task_title: string
+  remaining_issue_count: number
+  remaining_issue_group_count?: number
+  blocking_issue_count: number
+  issue_groups?: Array<{
+    cause: string
+    code: string
+    message: string
+    count: number
+    blocking_count: number
+    affected_count: number
+    resolution_hint?: string
+  }>
+  remaining_issues?: Array<Record<string, any>>
+  resolution_hints?: string[]
+}
+
+export interface AssistantModelNextAction {
+  type: 'confirm_task' | 'refine_model' | 'rebuild_plan' | string
+  task_id?: string
+  task_title?: string
+  requires_confirmation?: boolean
+  can_apply?: boolean
+  can_apply_partial?: boolean
+  can_defer?: boolean
+  message?: string
+}
+
+export interface AssistantProposalApplyResult {
+  ok?: boolean
+  status?: 'applied' | 'partially_applied' | 'replayed' | string
+  message?: string
+  data?: Record<string, any>
+  proposal?: AssistantProposal
+  task_update_text?: string
+  execution_summary?: AssistantModelExecutionSummary
+  next_action?: AssistantModelNextAction
 }
 
 export interface AssistantThought {
   id: string
   title: string
   detail?: string
-  status?: 'running' | 'done' | 'error'
+  status?: 'pending' | 'running' | 'done' | 'error'
 }
 
 export interface AssistantMessage {

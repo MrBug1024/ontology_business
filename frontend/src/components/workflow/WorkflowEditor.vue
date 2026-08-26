@@ -13,6 +13,7 @@ import WFNode from './WFNode.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import { api } from '@/api'
 import type { WorkflowRun } from '@/types'
+import { cloneForForm } from '@/utils/clone'
 import '@vue-flow/core/dist/style.css'
 import '@vue-flow/core/dist/theme-default.css'
 import '@vue-flow/controls/dist/style.css'
@@ -421,7 +422,7 @@ async function confirmExecute() {
   if (!props.modelValue.id) return
   executing.value = true
   try {
-    const run = await api.submitWorkflowRun(props.modelValue.id, structuredClone(runParams.value))
+    const run = await api.submitWorkflowRun(props.modelValue.id, cloneForForm(runParams.value, {}))
     emit('run-created', run)
     runParamsDlg.value = false
     ElMessage.success(run.status === 'awaiting_approval' ? '任务已提交，正在等待审批' : '任务已提交到运行队列')

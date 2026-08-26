@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     event,
     Float,
@@ -325,6 +326,9 @@ class BusinessScenario(Base):
         back_populates="scenario", cascade="all, delete-orphan"
     )
     mapping_refresh_jobs: Mapped[list["DataMappingRefreshJob"]] = relationship(
+        back_populates="scenario", cascade="all, delete-orphan"
+    )
+    scenario_model_draft_resources: Mapped[list["ScenarioModelDraftResource"]] = relationship(
         back_populates="scenario", cascade="all, delete-orphan"
     )
     tenant: Mapped[Tenant | None] = relationship()
@@ -1410,6 +1414,11 @@ class AssistantCompilationJob(Base):
             "scenario_id",
             "status",
         ),
+        Index(
+            "ix_assistant_compilation_jobs_status_lease_expiry",
+            "status",
+            "lease_expires_at",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -1435,8 +1444,9 @@ class AssistantCompilationJob(Base):
         nullable=True,
         index=True,
     )
-    # Only hashes/versions are retained here.  Raw user text and parsed
-    # attachment text remain in their existing access-controlled records.
+    # Hashes remain the replay identity.  The exact restart input is persisted
+    # separately and is never part of public job projections; service access is
+    # restricted to this owner or to the current fenced execution lease.
     message_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     attachment_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     llm_config_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -1444,12 +1454,18 @@ class AssistantCompilationJob(Base):
     execution_policy_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     compiler_version: Mapped[str] = mapped_column(String(80), nullable=False)
     scenario_baseline: Mapped[str] = mapped_column(String(64), nullable=False)
+    execution_input: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     # running / succeeded / failed.  Failed rows remain terminal; a retry must
     # change a fingerprint input instead of silently spending the same budget.
     status: Mapped[str] = mapped_column(String(20), default="running", index=True)
     progress: Mapped[dict] = mapped_column(JSON, default=dict)
     llm_call_budget: Mapped[int] = mapped_column(Integer, nullable=False)
     llm_calls_used: Mapped[int] = mapped_column(Integer, default=0)
+    lease_token: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str] = mapped_column(Text, default="")
     result: Mapped[dict] = mapped_column(JSON, default=dict)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -1459,6 +1475,109 @@ class AssistantCompilationJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class ScenarioModelDraftResource(Base):
+    """An inert, editable resource candidate produced by model compilation.
+
+    Invalid or incomplete generated definitions cannot safely be inserted into
+    the live ontology tables: several of those tables are read directly by the
+    runtime and release snapshot services, while others require foreign keys
+    that an incomplete candidate cannot satisfy.  This staging table therefore
+    stores the candidate as JSON and deliberately has no relationship to a
+    runtime definition row.
+    """
+
+    __tablename__ = "scenario_model_draft_resources"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "scenario_id",
+            "proposal_id",
+            "resource_identity",
+            name="uq_scenario_model_draft_resource_identity",
+        ),
+        Index(
+            "ix_scenario_model_drafts_scenario_status",
+            "tenant_id",
+            "scenario_id",
+            "draft_status",
+            "updated_at",
+        ),
+        Index(
+            "ix_scenario_model_drafts_lineage_started_at",
+            "lineage_started_at",
+        ),
+        Index(
+            "ix_scenario_model_drafts_predecessor",
+            "tenant_id",
+            "scenario_id",
+            "predecessor_draft_id",
+        ),
+        Index(
+            "ix_scenario_model_drafts_superseded_by_proposal_id",
+            "superseded_by_proposal_id",
+        ),
+        CheckConstraint(
+            "enabled = false AND publishable = false",
+            name="ck_scenario_model_drafts_inert",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Source identifiers are provenance only.  They intentionally remain after
+    # an assistant thread is deleted so the scene-level draft does not vanish.
+    source_thread_id: Mapped[str] = mapped_column(String(32), default="", index=True)
+    source_message_id: Mapped[str] = mapped_column(String(32), default="", index=True)
+    compilation_job_id: Mapped[str] = mapped_column(String(32), default="", index=True)
+    proposal_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # Compilation start time, rather than finalize time, orders concurrent
+    # successor runs.  An older job that finishes late must not hide a newer
+    # working lineage.
+    lineage_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now
+    )
+    predecessor_draft_id: Mapped[str] = mapped_column(String(32), default="")
+    predecessor_revision: Mapped[int] = mapped_column(Integer, default=-1)
+    superseded_by_proposal_id: Mapped[str] = mapped_column(
+        String(64), default=""
+    )
+    task_id: Mapped[str] = mapped_column(String(80), default="", index=True)
+    resource_kind: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    resource_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    resource_identity: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(300), default="")
+    # source_payload is immutable compiler provenance; payload is the editable
+    # working copy.  Replays may enrich issues but never overwrite user edits.
+    source_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    validation_issues: Mapped[list] = mapped_column(JSON, default=list)
+    source_refs: Mapped[list] = mapped_column(JSON, default=list)
+    materialization_source: Mapped[str] = mapped_column(String(30), default="compiler")
+    # ready_for_review / needs_attention / needs_validation / deferred /
+    # applied / resolved / superseded
+    draft_status: Mapped[str] = mapped_column(String(30), default="needs_attention", index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    publishable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    resolved_resource_id: Mapped[str] = mapped_column(String(64), default="")
+    revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(
+        back_populates="scenario_model_draft_resources"
     )
 
 

@@ -134,6 +134,52 @@
       </section>
 
       <main v-else ref="messageRef" class="assistant-messages">
+        <section
+          v-if="activeCompilationJob && compilationRecoveryThreadId === threadId"
+          class="compilation-plan-card"
+          :class="`is-${activeCompilationJob.status}`"
+          aria-label="AI 建模执行计划"
+        >
+          <header class="compilation-plan-head">
+            <div class="compilation-plan-heading">
+              <span class="compilation-plan-kicker"><el-icon aria-hidden="true"><List /></el-icon>AI 正在按计划执行</span>
+              <strong>{{ compilationPlanHeadline }}</strong>
+              <span>{{ compilationProgressDetail(activeCompilationJob) }}</span>
+            </div>
+            <div class="compilation-plan-count" aria-live="polite">
+              <b>{{ compilationCompletedSteps }}</b><span>/ {{ compilationPlanSteps.length }} 项</span>
+            </div>
+          </header>
+          <div v-if="planExpanded" class="compilation-plan-steps" role="list">
+            <div v-for="step in compilationPlanSteps" :key="step.id" class="compilation-plan-step" :class="`is-${step.status}`" role="listitem">
+              <span class="compilation-plan-step-icon" aria-hidden="true">
+                <el-icon v-if="step.status === 'done'"><CircleCheckFilled /></el-icon>
+                <el-icon v-else-if="step.status === 'error'"><CircleCloseFilled /></el-icon>
+                <el-icon v-else-if="step.status === 'running'" class="is-loading"><Loading /></el-icon>
+                <span v-else>{{ compilationStepIndex(step.id) }}</span>
+              </span>
+              <div class="compilation-plan-step-copy">
+                <strong>{{ step.title }}</strong>
+                <span>{{ step.detail }}</span>
+              </div>
+              <el-tag v-if="step.status === 'done'" size="small" type="success" effect="plain">完成</el-tag>
+              <el-tag v-else-if="step.status === 'error'" size="small" type="danger" effect="plain">需处理</el-tag>
+              <el-tag v-else-if="step.status === 'running'" size="small" type="primary" effect="plain">执行中</el-tag>
+            </div>
+          </div>
+          <div v-if="compilationStageResults.length" class="compilation-stage-results" aria-label="已完成阶段结果">
+            <div class="compilation-stage-results-label">已完成的阶段结果</div>
+            <div v-for="result in compilationStageResults" :key="result.step_id" class="compilation-stage-result">
+              <el-icon aria-hidden="true"><CircleCheckFilled /></el-icon><span>{{ result.summary }}</span>
+            </div>
+          </div>
+          <footer class="compilation-plan-footer">
+            <span>{{ compilationCallSummary }} · 结果会持续追加到当前会话</span>
+            <button type="button" class="compilation-plan-toggle" :aria-expanded="planExpanded" @click="planExpanded = !planExpanded">
+              {{ planExpanded ? '收起计划' : '展开计划' }}<el-icon aria-hidden="true"><ArrowDown /></el-icon>
+            </button>
+          </footer>
+        </section>
         <div v-if="showQuickStarts" class="assistant-empty">
           <div class="empty-mark" aria-hidden="true"><el-icon :size="28"><ChatDotRound /></el-icon></div>
           <h3>告诉我你要建设什么业务场景</h3>
@@ -158,7 +204,7 @@
                 <el-icon class="thinking-chevron" :class="{ rotated: isThinkingExpanded(message, index) }" aria-hidden="true"><ArrowDown /></el-icon>
               </button>
               <div v-show="isThinkingExpanded(message, index)" class="thinking-body">
-                <div v-for="step in message.thinking" :key="step.id" class="thinking-step" :class="`is-${step.status || 'done'}`">
+                <div v-for="step in message.thinking" :key="step.id" class="thinking-step" :class="`is-${step.status || 'pending'}`">
                   <span class="thinking-step-dot" aria-hidden="true"></span>
                   <div><strong>{{ step.title }}</strong><span>{{ step.detail }}</span></div>
                 </div>
@@ -177,8 +223,8 @@
                   <div class="proposal-title"><el-icon aria-hidden="true"><DocumentChecked /></el-icon>{{ proposalOf(message)?.title }}</div>
                   <div class="proposal-summary">{{ proposalOf(message)?.summary }}</div>
                 </div>
-                <el-tag size="small" :type="proposalOf(message)?.status === 'applied' || proposalOf(message)?.status === 'partially_applied' ? 'success' : 'warning'" effect="plain">
-                  {{ proposalOf(message)?.status === 'applied' ? '已应用' : proposalOf(message)?.status === 'partially_applied' ? '已应用可用部分' : '待确认' }}
+                <el-tag size="small" :type="['applied', 'completed'].includes(proposalOf(message)?.status || '') ? 'success' : proposalOf(message)?.status === 'completed_with_gaps' || proposalOf(message)?.status === 'partially_applied' ? 'warning' : 'primary'" effect="plain">
+                  {{ ['applied', 'completed'].includes(proposalOf(message)?.status || '') ? '已完成' : proposalOf(message)?.status === 'completed_with_gaps' ? '已完成草稿，待补全' : proposalOf(message)?.status === 'partially_applied' ? '已应用可用部分' : proposalOf(message)?.status === 'in_progress' ? '计划进行中 · 等待确认' : '待确认' }}
                 </el-tag>
               </div>
               <div class="proposal-preview">
@@ -200,7 +246,7 @@
                 </template>
                 <template v-else-if="proposalOf(message)?.kind === 'scenario_model'">
                   <span>来源段落 {{ proposalOf(message)?.payload?.coverage_summary?.total || 0 }}</span>
-                      <span>阻塞 {{ blockingIssues(proposalOf(message)).length }}</span>
+                  <span>待补全原因 {{ scenarioIssueGroups(proposalOf(message)).length }}</span>
                 </template>
                 <span v-if="proposalOf(message)?.changes?.length">差异 {{ proposalOf(message)?.changes?.length }}</span>
                 <button
@@ -211,6 +257,65 @@
                   @click="toggleProposal(index)"
                 >{{ expandedProposal[index] ? '收起详情' : '查看详情' }}</button>
               </div>
+              <section
+                v-if="modelTasks(proposalOf(message)).length"
+                class="model-task-board"
+                aria-label="完整场景建模任务"
+              >
+                <header class="model-task-board-head">
+                  <div>
+                    <strong>持续执行计划</strong>
+                    <span v-if="!modelExecutionSummary(proposalOf(message))?.final">草稿生成阶段结束不代表计划结束；需要确认时会停留等待，确认后继续下一项。</span>
+                    <span v-else>所有任务都已推进，下面保留了完成结果、缺失项、阻塞原因和解决建议。</span>
+                  </div>
+                  <el-tag size="small" effect="plain" :type="modelExecutionSummary(proposalOf(message))?.final ? 'success' : 'primary'">
+                    {{ modelTaskProgress(proposalOf(message)) }}
+                  </el-tag>
+                </header>
+                <div class="model-task-list">
+                  <article v-for="task in modelTasks(proposalOf(message))" :key="task.id" class="model-task" :class="[`is-${task.status}`, { 'is-current': isCurrentModelTask(proposalOf(message), task) }]">
+                    <div class="model-task-head">
+                      <span class="model-task-index">{{ task.order }}</span>
+                      <div class="model-task-title"><strong>{{ task.title }}</strong><small>{{ modelTaskOutputCount(task) }} 项资源 · {{ task.description }}</small></div>
+                      <el-tag size="small" effect="plain" :type="modelTaskStatusType(task.status)">{{ modelTaskStatusLabel(task.status) }}</el-tag>
+                    </div>
+                    <div v-if="['blocked', 'drafted_with_gaps', 'deferred', 'skipped'].includes(task.status) && task.issues?.length" class="model-task-blocker">
+                      <strong>草稿已落位：</strong><span>确认后会把本任务定义写入对应画布或模块。</span>
+                      <small>{{ taskIssueCount(task) }} 项待补全内容只在助手最终汇总中展示。</small>
+                    </div>
+                    <div v-else-if="task.status === 'waiting'" class="model-task-waiting">等待当前任务：{{ waitingTaskTitles(proposalOf(message), task).join('、') }}</div>
+                    <div v-else-if="task.status === 'partially_applied'" class="model-task-note">本任务已确认并写入；暂不能正式运行的定义仍以草稿形式保留。</div>
+                    <div v-else-if="['deferred', 'drafted_with_gaps', 'skipped'].includes(task.status)" class="model-task-note">本任务草稿已经生成并保留；缺失与解决建议只在助手会话中汇总。</div>
+                    <div v-if="blockedModelProposalId !== proposalOf(message)?.proposal_id && isActiveModelRun(message) && isCurrentModelTask(proposalOf(message), task) && modelNextAction(proposalOf(message))?.type === 'confirm_task'" class="model-task-actions">
+                      <el-button v-if="modelNextAction(proposalOf(message))?.can_apply" size="small" type="primary" :loading="applyingIndex === index || recoveringModelProposalId === proposalOf(message)?.proposal_id" @click="applyModelTask(message, index, task, 'apply')">
+                        <el-icon aria-hidden="true"><Check /></el-icon>应用本任务并继续
+                      </el-button>
+                    </div>
+                  </article>
+                </div>
+                <div v-if="!modelExecutionSummary(proposalOf(message))?.final && modelExecutionSummary(proposalOf(message))?.current_task_title" class="model-run-waiting" aria-live="polite">
+                  <strong>计划未结束</strong>
+                  <span>当前停留在「{{ modelExecutionSummary(proposalOf(message))?.current_task_title }}」等待确认。确认后会写入本任务的正式资源和可见草稿，再继续下一项。</span>
+                </div>
+                <section v-if="modelExecutionSummary(proposalOf(message))?.final" class="model-run-summary" aria-live="polite">
+                  <header><strong>{{ modelExecutionSummary(proposalOf(message))?.status === 'completed' ? '全部任务已完成' : '全部任务已推进，存在待补全项' }}</strong><el-tag size="small" effect="plain" :type="modelExecutionSummary(proposalOf(message))?.status === 'completed' ? 'success' : 'warning'">最终总结</el-tag></header>
+                  <p>{{ modelExecutionSummary(proposalOf(message))?.message }}</p>
+                  <div class="model-run-summary-counts">
+                    <span>正式定义 {{ modelExecutionSummary(proposalOf(message))?.applied_task_count || 0 }}</span>
+                    <span>已写入待补全 {{ modelExecutionSummary(proposalOf(message))?.partially_applied_task_count || 0 }}</span>
+                    <span>已写入可见草稿 {{ modelExecutionSummary(proposalOf(message))?.draft_only_task_count || 0 }}</span>
+                    <span>问题/说明 {{ modelExecutionSummary(proposalOf(message))?.remaining_issue_count || 0 }}</span>
+                  </div>
+                  <div v-if="scenarioIssueGroups(proposalOf(message)).length" class="model-run-root-causes">
+                    <article v-for="group in scenarioIssueGroups(proposalOf(message))" :key="group.key">
+                      <strong>{{ scenarioModelIssueLabel(group.code) }}</strong>
+                      <span>{{ group.affectedCount || group.count }} 项资源受此原因影响</span>
+                      <small>{{ group.resolutionHint || group.message }}</small>
+                    </article>
+                  </div>
+                  <small>你可以直接在下方继续补充资料或修正要求，AI 会基于当前已实现草稿开启下一轮优化。</small>
+                </section>
+              </section>
               <section
                 v-if="expandedProposal[index] && proposalOf(message)?.kind === 'scenario_model' && proposalOf(message)?.changes?.length"
                 class="proposal-disclosure proposal-change-disclosure"
@@ -328,111 +433,26 @@
                       </div>
                     </div>
                   </section>
-                  <section v-if="scenarioIssueGroups(proposalOf(message)).length" class="proposal-section unresolved-section">
+                  <section v-if="scenarioIssueGroups(proposalOf(message)).length && !modelExecutionSummary(proposalOf(message))?.final" class="proposal-section unresolved-section">
                     <header class="unresolved-head">
-                      <div><h4>预检问题</h4><p>阻塞定义会跳过不写入；解决建议已列在明细中，后续补充资料后重新编译即可补齐。</p></div>
+                      <div><h4>待补全汇总</h4><p>相同原因已合并；草稿已经写入对应画布或模块，缺口不会阻止其他任务继续。</p></div>
                       <div class="unresolved-counts" aria-label="预检问题统计">
-                        <span class="is-blocking">阻塞 {{ blockingIssues(proposalOf(message)).length }}</span>
-                        <span>提示 {{ nonBlockingIssueCount(proposalOf(message)) }}</span>
+                        <span class="is-blocking">{{ blockingScenarioIssueGroups(proposalOf(message)).length }} 类阻塞</span>
+                        <span>{{ nonBlockingScenarioIssueGroups(proposalOf(message)).length }} 类提示</span>
                       </div>
                     </header>
                     <div class="issue-groups">
-                      <div class="issue-category-head is-blocking">
-                        <strong>阻塞问题</strong>
-                        <span>{{ blockingScenarioIssueGroups(proposalOf(message)).length }} 类 · {{ blockingIssues(proposalOf(message)).length }} 项 · 本次将跳过</span>
-                      </div>
-                      <section
-                        v-for="group in blockingScenarioIssueGroups(proposalOf(message))"
-                        :key="group.key"
-                        class="issue-group"
-                        :class="group.blocking ? 'is-blocking' : 'is-notice'"
-                      >
-                        <button
-                          type="button"
-                          class="issue-group-toggle"
-                          :aria-expanded="isIssueGroupExpanded(message, index, group.key)"
-                          :aria-controls="issueGroupId(message, index, group.key)"
-                          @click="toggleIssueGroup(message, index, group.key)"
-                        >
-                          <span class="issue-severity">{{ group.blocking ? '阻塞' : '提示' }}</span>
-                          <span class="issue-group-copy">
-                            <strong>{{ scenarioModelIssueLabel(group.code) }}</strong>
-                            <small><template v-if="scenarioModelIssueLabel(group.code) === '其他预检问题'">{{ group.code }} · </template>{{ group.issues.length }} 项</small>
-                          </span>
-                          <el-icon class="disclosure-chevron" :class="{ rotated: isIssueGroupExpanded(message, index, group.key) }" aria-hidden="true"><ArrowDown /></el-icon>
-                        </button>
-                        <div
-                          v-show="isIssueGroupExpanded(message, index, group.key)"
-                          :id="issueGroupId(message, index, group.key)"
-                          class="issue-group-details"
-                          role="region"
-                          :aria-label="`${scenarioModelIssueLabel(group.code)}明细`"
-                        >
-                            <article v-for="(issue, issueIndex) in group.issues" :key="`${group.key}-${issueIndex}-${issue.message}`" class="unresolved-row">
-                              <span class="issue-number" aria-hidden="true">{{ issueIndex + 1 }}</span>
-                            <div><strong>{{ issue.message }}</strong><span v-if="issue.sourceRefs.length">来源：{{ issue.sourceRefs.join('、') }}</span><span v-if="issue.resolutionHint" class="issue-resolution">解决：{{ issue.resolutionHint }}</span></div>
-                          </article>
+                      <article v-for="group in scenarioIssueGroups(proposalOf(message))" :key="group.key" class="issue-group-summary" :class="group.blocking ? 'is-blocking' : 'is-notice'">
+                        <span class="issue-severity">{{ group.blocking ? '阻塞' : '提示' }}</span>
+                        <div>
+                          <strong>{{ scenarioModelIssueLabel(group.code) }}</strong>
+                          <p>{{ group.message }}</p>
+                          <small>{{ group.count }} 项受此原因影响<span v-if="group.affectedCount && group.affectedCount !== group.count"> · 涉及 {{ group.affectedCount }} 个资源</span></small>
+                          <span v-if="group.resolutionHint" class="issue-resolution">解决：{{ group.resolutionHint }}</span>
                         </div>
-                      </section>
-                      <section v-if="nonBlockingScenarioIssueGroups(proposalOf(message)).length" class="issue-notice-category">
-                        <button
-                          type="button"
-                          class="issue-category-toggle"
-                          :aria-expanded="isNoticeCategoryExpanded(message, index)"
-                          :aria-controls="noticeCategoryId(message, index)"
-                          @click="toggleNoticeCategory(message, index)"
-                        >
-                          <span class="issue-severity">提示</span>
-                          <span class="issue-group-copy">
-                            <strong>非阻塞提示</strong>
-                            <small>{{ nonBlockingScenarioIssueGroups(proposalOf(message)).length }} 类 · {{ nonBlockingIssueCount(proposalOf(message)) }} 项 · 不影响应用</small>
-                          </span>
-                          <el-icon class="disclosure-chevron" :class="{ rotated: isNoticeCategoryExpanded(message, index) }" aria-hidden="true"><ArrowDown /></el-icon>
-                        </button>
-                        <div v-show="isNoticeCategoryExpanded(message, index)" :id="noticeCategoryId(message, index)" class="issue-notice-groups">
-                          <section
-                            v-for="group in nonBlockingScenarioIssueGroups(proposalOf(message))"
-                            :key="group.key"
-                            class="issue-group is-notice"
-                          >
-                            <button
-                              type="button"
-                              class="issue-group-toggle"
-                              :aria-expanded="isIssueGroupExpanded(message, index, group.key)"
-                              :aria-controls="issueGroupId(message, index, group.key)"
-                              @click="toggleIssueGroup(message, index, group.key)"
-                            >
-                              <span class="issue-severity">提示</span>
-                              <span class="issue-group-copy">
-                                <strong>{{ scenarioModelIssueLabel(group.code) }}</strong>
-                                <small><template v-if="scenarioModelIssueLabel(group.code) === '其他预检问题'">{{ group.code }} · </template>{{ group.issues.length }} 项</small>
-                              </span>
-                              <el-icon class="disclosure-chevron" :class="{ rotated: isIssueGroupExpanded(message, index, group.key) }" aria-hidden="true"><ArrowDown /></el-icon>
-                            </button>
-                            <div
-                              v-show="isIssueGroupExpanded(message, index, group.key)"
-                              :id="issueGroupId(message, index, group.key)"
-                              class="issue-group-details"
-                              role="region"
-                              :aria-label="`${scenarioModelIssueLabel(group.code)}明细`"
-                            >
-                              <article v-for="(issue, issueIndex) in group.issues" :key="`${group.key}-${issueIndex}-${issue.message}`" class="unresolved-row">
-                                <span class="issue-number" aria-hidden="true">{{ issueIndex + 1 }}</span>
-                                <div><strong>{{ issue.message }}</strong><span v-if="issue.sourceRefs.length">来源：{{ issue.sourceRefs.join('、') }}</span><span v-if="issue.resolutionHint" class="issue-resolution">解决：{{ issue.resolutionHint }}</span></div>
-                              </article>
-                            </div>
-                          </section>
-                        </div>
-                      </section>
+                      </article>
                     </div>
                   </section>
-                  <el-alert
-                    v-if="blockingIssues(proposalOf(message)).length"
-                    title="确认后只会原子写入通过依赖与结构预检的可用部分；阻塞项会保留在清单中，不会被强行写入。"
-                    type="warning"
-                    :closable="false"
-                    show-icon
-                  />
                   <el-alert
                     v-else
                     title="所有引用、冲突与来源段落已通过预检；确认后将在同一事务中应用，任一失败都会整体回滚。"
@@ -450,7 +470,7 @@
                   </section>
                 </template>
               </div>
-              <div class="proposal-actions">
+              <div v-if="proposalOf(message)?.kind !== 'scenario_model' && !modelTasks(proposalOf(message)).length" class="proposal-actions">
                 <el-button size="small" type="primary" :loading="applyingIndex === index" :disabled="!proposalCanApply(proposalOf(message)) || ['applied', 'partially_applied'].includes(proposalOf(message)?.status || '') || !proposalOf(message)?.proposal_id" @click="applyProposal(message, index)">
                   <el-icon aria-hidden="true"><Check /></el-icon>{{ proposalApplyLabel(proposalOf(message)) }}
                 </el-button>
@@ -531,6 +551,12 @@
       </main>
 
       <footer class="assistant-composer">
+        <div v-if="modelRunAwaitingConfirmation || modelTaskRecoveryBusy || modelTaskRecoveryFailure" class="model-run-composer-wait" role="status">
+          <el-icon aria-hidden="true"><Clock /></el-icon>
+          <span v-if="modelTaskRecoveryBusy"><strong>当前任务已提交，正在恢复最新进度</strong>系统会持续读取持久化任务计划；不会重复应用，也不需要你手工刷新或重开会话。</span>
+          <span v-else-if="modelTaskRecoveryFailure"><strong>当前计划的持久化状态已无法访问</strong>{{ modelTaskRecoveryFailure }} 你仍可在下方发起新的建模轮次；系统不会继续重复提交旧任务。</span>
+          <span v-else><strong>当前持续任务停在确认点</strong>确认后会把本任务定义写入场景并继续；你也可以直接在下方说明修正、新增或删除要求，助手会基于已保存草稿开启下一轮优化。</span>
+        </div>
         <div v-if="attachments.length" class="attachment-strip" aria-label="待发送附件">
           <div v-for="item in attachments" :key="item.id" class="attachment-chip">
             <el-icon aria-hidden="true"><Document /></el-icon>
@@ -571,10 +597,11 @@
             resize="none"
             maxlength="12000"
             show-word-limit
-            :placeholder="composerPlaceholder"
+            :placeholder="modelTaskRecoveryBusy ? '正在恢复已提交任务的最新进度' : modelRunAwaitingConfirmation ? '说明要修正或新增的内容，助手会基于当前草稿继续' : composerPlaceholder"
+            :disabled="modelTaskRecoveryBusy"
             @keydown.enter.exact.prevent="send()"
           />
-          <el-button class="send-button" type="primary" :loading="loading || compilationBusy" :disabled="!canSend || uploadingFiles > 0 || compilationBusy" aria-label="发送消息" title="发送" @click="send()">
+          <el-button class="send-button" type="primary" :loading="loading || compilationBusy || modelTaskRecoveryBusy" :disabled="!canSend || uploadingFiles > 0 || compilationBusy || modelTaskRecoveryBusy" aria-label="发送消息" title="发送" @click="send()">
             <el-icon aria-hidden="true"><Promotion /></el-icon>
           </el-button>
         </div>
@@ -597,11 +624,11 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { isNavigationFailure, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamAssistantChat } from '@/api'
 import { useAuthStore } from '@/stores/auth'
-import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationJobStatus, AssistantMessage, AssistantProposal, AssistantQuestion, AssistantSource, AssistantThread, AssistantThought, LLMConfig, MCPConfig, Skill } from '@/types'
+import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationJobStatus, AssistantCompilationStageResult, AssistantCompilationStep, AssistantMessage, AssistantModelExecutionSummary, AssistantModelNextAction, AssistantModelTask, AssistantProposal, AssistantProposalApplyResult, AssistantQuestion, AssistantSource, AssistantThread, AssistantThought, LLMConfig, MCPConfig, Skill } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import {
@@ -670,10 +697,17 @@ const assistantMCPs = ref<MCPConfig[]>([])
 const capabilitiesLoading = ref(false)
 const capabilitiesLoaded = ref(false)
 const activeCompilationJob = ref<AssistantCompilationJobStatus | null>(null)
+const planExpanded = ref(true)
 const compilationRecoveryThreadId = ref('')
+const recoveringModelProposalId = ref('')
+const blockedModelProposalId = ref('')
+const modelTaskRecoveryFailure = ref('')
 let compilationPollTimer: number | null = null
+let modelTaskRecoveryTimer: number | null = null
 let compilationRecoveryEpoch = 0
 let compilationPollErrors = 0
+let modelTaskRecoveryErrors = 0
+let modelTaskRecoveryGeneration = 0
 let streamGeneration = 0
 let componentDisposed = false
 
@@ -687,7 +721,7 @@ const context = computed(() => ({
 const taskPresetHint = computed(() => ({
   smart: '自动判断问答或建模任务',
   scenario: '生成待确认的场景草稿',
-  scenario_model: '一次生成跨资源原子变更清单',
+  scenario_model: '按计划逐项生成跨资源变更清单',
   ontology: '只处理对象、属性、关系与约束',
   mapping: '只使用已检查的真实表和字段',
   capabilities: '仅新增业务能力；修改或删除将切换为只读指导',
@@ -714,7 +748,7 @@ const canSend = computed(() => Boolean(
     && attachments.value.every((item) => item.status === 'parsed')
   )
 ))
-const assistantScopeKey = computed(() => `${context.value.scenario_id || 'global'}|${(context.value.path || '/').split('?', 1)[0] || '/'}`)
+const assistantScopeKey = computed(() => `${context.value.scenario_id || 'global'}|${normalizedAssistantPath(context.value.path)}`)
 const storageKey = computed(() => `ontology-assistant-thread:${encodeURIComponent(assistantScopeKey.value)}`)
 const currentThread = computed(() => threads.value.find((thread) => thread.id === threadId.value))
 const showQuickStarts = computed(() => !messages.value.length || (
@@ -728,12 +762,48 @@ const compilationRunning = computed(() => activeCompilationJob.value?.status ===
 const compilationBusy = computed(() => Boolean(activeCompilationJob.value)
   && activeCompilationJob.value?.status !== 'failed'
   && compilationRecoveryThreadId.value === threadId.value)
+const latestModelRunMessage = computed(() => [...messages.value].reverse().find(
+  (message) => proposalOf(message)?.kind === 'scenario_model',
+))
+const activeModelRunMessage = computed(() => {
+  const message = latestModelRunMessage.value
+  const proposal = message ? proposalOf(message) : null
+  return proposal?.status === 'in_progress'
+    && modelExecutionSummary(proposal)?.final !== true
+    ? message
+    : undefined
+})
+const modelRunAwaitingConfirmation = computed(() => Boolean(activeModelRunMessage.value)
+  && blockedModelProposalId.value !== proposalOf(activeModelRunMessage.value as AssistantMessage)?.proposal_id
+  && modelNextAction(proposalOf(activeModelRunMessage.value as AssistantMessage))?.type === 'confirm_task')
+const modelTaskRecoveryBusy = computed(() => Boolean(recoveringModelProposalId.value))
 const compilationCallSummary = computed(() => {
   const job = activeCompilationJob.value
   if (!job || job.status !== 'running') return ''
   const used = Number(job.llm_calls_used ?? job.progress?.calls_used ?? 0)
   const budget = Number(job.llm_call_budget ?? job.progress?.call_budget ?? 0)
   return budget > 0 ? `模型调用 ${used}/${budget}` : '正在等待服务端进度'
+})
+const fallbackCompilationSteps: AssistantCompilationStep[] = [
+  { id: 'analyze', title: '分析业务资料', detail: '正在读取附件和用户补充描述。', status: 'running' },
+  { id: 'plan', title: '制定建模任务', detail: '正在拆解建模范围和执行顺序。', status: 'pending' },
+  { id: 'ontology', title: '建立本体与业务能力', detail: '等待执行。', status: 'pending' },
+  { id: 'mapping', title: '整理数据映射', detail: '等待执行。', status: 'pending' },
+  { id: 'rules', title: '校验规则、事件与工作流', detail: '等待执行。', status: 'pending' },
+  { id: 'review', title: '生成待审核变更清单', detail: '等待执行。', status: 'pending' },
+  { id: 'result', title: '汇总执行结果', detail: '等待执行。', status: 'pending' },
+]
+const compilationPlanSteps = computed<AssistantCompilationStep[]>(() => {
+  const steps = activeCompilationJob.value?.progress?.steps
+  return steps?.length ? steps : fallbackCompilationSteps
+})
+const compilationCompletedSteps = computed(() => compilationPlanSteps.value.filter((step) => step.status === 'done').length)
+const compilationStageResults = computed<AssistantCompilationStageResult[]>(() => activeCompilationJob.value?.progress?.results || [])
+const compilationPlanHeadline = computed(() => {
+  const current = compilationPlanSteps.value.find((step) => step.status === 'running')
+  if (activeCompilationJob.value?.status === 'failed') return '任务在当前步骤停止，未写入正式模型'
+  if (current) return `${current.title}（第 ${compilationStepIndex(current.id) }/${compilationPlanSteps.value.length} 项）`
+  return activeCompilationJob.value?.status === 'succeeded' ? '草稿生成阶段完成，正在进入任务确认' : '准备执行任务'
 })
 // The Agent chat owns the bottom-right composer controls. A persistent global
 // launcher must not cover its primary send action or keyboard focus target.
@@ -746,6 +816,139 @@ const showLauncher = computed(() => {
 function proposalOf(message: AssistantMessage): AssistantProposal | null {
   const proposal = message.proposal as AssistantProposal | undefined
   return proposal && proposal.kind && proposal.payload ? proposal : null
+}
+
+function isActiveModelRun(message: AssistantMessage) {
+  const active = activeModelRunMessage.value
+  if (!active) return false
+  if (active === message) return true
+  const activeMessageId = String(active.id || '')
+  const messageId = String(message.id || '')
+  return Boolean(activeMessageId && messageId && activeMessageId === messageId)
+}
+
+function modelTasks(proposal: AssistantProposal | null): AssistantModelTask[] {
+  if (proposal?.kind !== 'scenario_model') return []
+  return Array.isArray(proposal.payload?.tasks)
+    ? proposal.payload.tasks as AssistantModelTask[]
+    : []
+}
+
+function modelExecutionSummary(proposal: AssistantProposal | null): AssistantModelExecutionSummary | null {
+  if (proposal?.kind !== 'scenario_model') return null
+  const summary = proposal.payload?.execution_summary
+  return summary && typeof summary === 'object'
+    ? summary as AssistantModelExecutionSummary
+    : null
+}
+
+function modelNextAction(proposal: AssistantProposal | null): AssistantModelNextAction | null {
+  if (proposal?.kind !== 'scenario_model') return null
+  const action = proposal.payload?.next_action
+  return action && typeof action === 'object'
+    ? action as AssistantModelNextAction
+    : null
+}
+
+function modelRunRevision(proposal: AssistantProposal | null) {
+  const revisions = [
+    Number(proposal?.run_revision || 0),
+    Number(proposal?.payload?.execution_revision || 0),
+  ].filter((revision) => Number.isFinite(revision) && revision >= 0)
+  return Math.trunc(Math.max(0, ...revisions))
+}
+
+function latestProposalMessage(items: AssistantMessage[], proposalId: string) {
+  let latest: AssistantMessage | null = null
+  let latestRevision = -1
+  for (const item of items) {
+    const candidate = proposalOf(item)
+    if (String(candidate?.proposal_id || '') !== proposalId) continue
+    const revision = modelRunRevision(candidate)
+    if (!latest || revision >= latestRevision) {
+      latest = item
+      latestRevision = revision
+    }
+  }
+  return latest
+}
+
+function modelTaskWasProcessed(proposal: AssistantProposal | null, taskId: string) {
+  const task = modelTasks(proposal).find((item) => item.id === taskId)
+  return Boolean(task && ['applied', 'partially_applied', 'deferred', 'drafted_with_gaps', 'skipped', 'empty'].includes(task.status))
+}
+
+function isCurrentModelTask(proposal: AssistantProposal | null, task: AssistantModelTask) {
+  return String(proposal?.payload?.current_task_id || '') === task.id
+}
+
+function waitingTaskTitles(proposal: AssistantProposal | null, task: AssistantModelTask) {
+  const tasks = modelTasks(proposal)
+  const waitingFor = task.waiting_for?.length ? task.waiting_for : task.depends_on
+  const titles = waitingFor.map((id) => tasks.find((item) => item.id === id)?.title || id)
+  return titles.length ? titles : ['前一项任务']
+}
+
+function modelTaskProgress(proposal: AssistantProposal | null) {
+  const tasks = modelTasks(proposal)
+  if (!tasks.length) return ''
+  const summary = modelExecutionSummary(proposal)
+  const completed = summary?.completed_task_count
+    ?? tasks.filter((task) => ['applied', 'partially_applied', 'deferred', 'drafted_with_gaps', 'skipped', 'empty'].includes(task.status)).length
+  return summary?.final
+    ? `${completed}/${tasks.length} 项已推进`
+    : `${completed}/${tasks.length} 项 · 计划进行中`
+}
+
+function modelTaskStatusLabel(status: string) {
+  return ({
+    empty: '无此类变更',
+    ready: '等待确认',
+    blocked: '有缺口，等待确认',
+    waiting: '等待当前任务',
+    applied: '已应用',
+    partially_applied: '已应用安全部分',
+    deferred: '草稿已保留',
+    drafted_with_gaps: '草稿已建，待补全',
+    skipped: '草稿已保留',
+  } as Record<string, string>)[status] || '待处理'
+}
+
+function modelTaskStatusType(status: string) {
+  return ({
+    empty: 'info',
+    ready: 'warning',
+    blocked: 'warning',
+    waiting: 'info',
+    applied: 'success',
+    partially_applied: 'warning',
+    deferred: 'info',
+    drafted_with_gaps: 'warning',
+    skipped: 'info',
+  } as Record<string, string>)[status] || 'info'
+}
+
+function taskIssueCount(task: AssistantModelTask) {
+  const groupedCount = (task.issues || []).reduce((total, issue: any) => {
+    const count = Number(issue?.count)
+    return total + (Number.isFinite(count) && count > 0 ? Math.trunc(count) : 1)
+  }, 0)
+  const persistedCount = Number((task as any).issue_count)
+  return Math.max(
+    groupedCount,
+    Number.isFinite(persistedCount) && persistedCount >= 0
+      ? Math.trunc(persistedCount)
+      : 0,
+  )
+}
+
+function modelTaskOutputCount(task: AssistantModelTask) {
+  const values = [
+    Number((task as any).output_count),
+    Number((task as any).draft_candidate_count),
+    Number(task.change_count),
+  ].filter((value) => Number.isFinite(value) && value >= 0)
+  return Math.trunc(Math.max(0, ...values))
 }
 
 function applyTaskPreset(preset: AssistantTaskPreset) {
@@ -869,8 +1072,7 @@ function nonBlockingIssueCount(proposal: AssistantProposal | null) {
 function proposalApplyLabel(proposal: AssistantProposal | null) {
   if (!proposal) return '确认并应用变更'
   if (proposal.status === 'applied') return proposal.kind === 'scenario' ? '场景已创建' : '变更已应用'
-  if (proposal.status === 'partially_applied') return '已应用可用部分'
-  if (proposal.kind === 'scenario_model' && blockingIssues(proposal).length) return '确认并应用可用部分'
+  if (proposal.status === 'partially_applied') return '已确认并写入'
   return ({ scenario: '确认并创建场景', mapping: '确认并保存映射', ontology: '确认并应用本体', workflow: '确认并保存流程', scenario_model: '确认并原子应用' } as Record<string, string>)[proposal.kind] || '确认并应用变更'
 }
 
@@ -879,11 +1081,9 @@ function proposalApplyHint(proposal: AssistantProposal | null) {
   if (proposal.kind === 'scenario' && context.value.scenario_id) return '场景草稿只能在全局工作区创建'
   if (proposal.kind !== 'scenario' && !context.value.scenario_id) return '请先打开业务场景'
   if (proposal.kind === 'scenario_model' && blockingIssues(proposal).length) {
-    const safeCount = proposal.payload?.applyability?.safe_change_count
-    const countText = typeof safeCount === 'number' ? `，当前可应用 ${safeCount} 项` : ''
-    return `仍有 ${blockingIssues(proposal).length} 个阻塞项；确认后将跳过受影响定义，只写入安全部分${countText}。解决阻塞项后重新编译即可补齐`
+    return `当前有 ${blockingIssues(proposal).length} 类待补全内容；确认后仍会把本任务定义写入画布，问题只在助手会话中汇总`
   }
-  if (proposal.kind === 'scenario_model' && !hasApplyableChanges(proposal)) return '当前没有可独立应用的业务模型变更，请先补充文档后重新编译'
+  if (proposal.kind === 'scenario_model' && !hasApplyableChanges(proposal)) return '当前任务没有可写入的定义；请继续补充附件或描述后重新编译'
   if (proposal.kind === 'mapping') return '保存后仍需预览、测试并刷新对象'
   return ''
 }
@@ -1135,6 +1335,8 @@ function thinkingSummary(message: AssistantMessage) {
   if (running) return running.title
   const error = steps.find((step) => step.status === 'error')
   if (error) return error.title
+  const pending = steps.find((step) => step.status === 'pending')
+  if (pending) return `等待执行：${pending.title}`
   return message.streaming ? '正在处理当前请求' : `已完成 ${steps.length} 个处理步骤`
 }
 
@@ -1173,6 +1375,24 @@ function compilationThreadScope(id = threadId.value): CompilationRecoveryThreadS
   const owner = compilationOwnerScope()
   const normalizedThreadId = String(id || '').trim()
   return owner && normalizedThreadId ? { ...owner, threadId: normalizedThreadId } : null
+}
+
+function compilationPathFromScopeKey(scopeKey: string | null | undefined, scenarioId: string) {
+  const prefix = `scenario:${scenarioId}|path:`
+  const value = String(scopeKey || '')
+  if (!value.startsWith(prefix)) return ''
+  const path = value.slice(prefix.length).trim()
+  return safeScenarioAssistantPath(path, scenarioId)
+}
+
+function normalizedAssistantPath(path: string | null | undefined) {
+  return (String(path || '/') || '/').split('?', 1)[0].split('#', 1)[0] || '/'
+}
+
+function safeScenarioAssistantPath(path: string | null | undefined, scenarioId: string) {
+  const normalized = normalizedAssistantPath(path)
+  if (!/^\/(?!\/)[^\\\u0000-\u001f\u007f]*$/.test(normalized)) return ''
+  return normalized === `/scenarios/${encodeURIComponent(scenarioId)}` ? normalized : ''
 }
 
 function clearCompilationPollTimer() {
@@ -1214,6 +1434,11 @@ function compilationProgressDetail(job: AssistantCompilationJobStatus) {
   return job.error_message || '系统已保持零写入。请修改附件或描述后显式重试。'
 }
 
+function compilationStepIndex(stepId: string) {
+  const index = compilationPlanSteps.value.findIndex((step) => step.id === stepId)
+  return index >= 0 ? index + 1 : 1
+}
+
 function markCompilationMessage(job: AssistantCompilationJobStatus, scope: CompilationRecoveryThreadScope) {
   let index = messages.value.findIndex((message) => message.context?.compilation_job_id === job.id)
   if (index < 0 && job.status === 'running') {
@@ -1236,12 +1461,22 @@ function markCompilationMessage(job: AssistantCompilationJobStatus, scope: Compi
     compilation_job_id: job.id,
     status: job.status === 'running' ? 'processing' : job.status,
   }
-  upsertThinking(message, {
-    id: 'scenario-model',
-    title: job.status === 'running' ? '编译完整业务模型' : job.status === 'succeeded' ? '完整业务模型已编译' : '完整业务模型编译未完成',
-    detail: compilationProgressDetail(job),
-    status: job.status === 'running' ? 'running' : job.status === 'succeeded' ? 'done' : 'error',
-  }, index)
+  const steps = job.progress?.steps || []
+  if (steps.length) {
+    steps.forEach((step) => upsertThinking(message, {
+      id: step.id,
+      title: step.title,
+      detail: step.detail,
+      status: step.status,
+    }, index))
+  } else {
+    upsertThinking(message, {
+      id: 'scenario-model',
+      title: job.status === 'running' ? '执行完整场景建模' : job.status === 'succeeded' ? '完整场景建模已完成' : '完整场景建模未完成',
+      detail: compilationProgressDetail(job),
+      status: job.status === 'running' ? 'running' : job.status === 'succeeded' ? 'done' : 'error',
+    }, index)
+  }
   scrollBottom()
 }
 
@@ -1302,35 +1537,64 @@ async function recoverSucceededCompilation(
   }
 
   const proposalThreadId = String(result.proposal_thread_id || scope.threadId).trim()
-  let resultThreadId = proposalThreadId
-  let recoveredMessages: AssistantMessage[]
-  try {
-    recoveredMessages = await api.listAssistantMessages(resultThreadId, apiContext())
-  } catch {
-    // A deduplicated job can point at its original proposal thread while the
-    // current thread is merely a subscriber. Keep the current scoped thread
-    // visible and use the server result as a display-only recovery copy.
-    resultThreadId = scope.threadId
-    recoveredMessages = await api.listAssistantMessages(resultThreadId, apiContext())
+  const resultThreadId = proposalThreadId
+  const canonicalPath = compilationPathFromScopeKey(result.proposal_scope_key, scope.scenarioId)
+    || (resultThreadId === scope.threadId
+      ? safeScenarioAssistantPath(context.value.path, scope.scenarioId)
+      : '')
+  if (!canonicalPath) {
+    throw new Error('编译结果缺少权威会话范围，系统将继续重试，避免恢复到错误页面。')
   }
+  const recoveryContext = { scenario_id: scope.scenarioId, path: canonicalPath }
+  let recoveredMessages = await api.listAssistantMessages(resultThreadId, recoveryContext)
   if (!compilationRecoveryIsCurrent(epoch, scope)) return
   const proposal = result.proposal as AssistantProposal | undefined
   const proposalId = String(proposal?.proposal_id || '')
-  const hasProposalMessage = proposalId && recoveredMessages.some((message) => {
-    const value = message.proposal as AssistantProposal | undefined
-    return value?.proposal_id === proposalId
-  })
+  if (result.apply_ready && !proposalId) {
+    throw new Error('编译结果缺少可恢复的持久化计划，系统将继续重试。')
+  }
+  let hasProposalMessage = Boolean(proposalId && latestProposalMessage(recoveredMessages, proposalId))
   if (result.apply_ready && proposalId && !hasProposalMessage) {
-    recoveredMessages = [...recoveredMessages, {
-      id: result.proposal_message_id || `compilation-result-${job.id}`,
-      thread_id: resultThreadId,
-      role: 'assistant',
-      content: '完整业务模型已在服务端完成并恢复；请核对变更清单后再决定是否应用。',
-      context: { compilation_job_id: job.id, status: 'succeeded', proposal_thread_id: proposalThreadId },
-      proposal,
-    }]
+    // The result endpoint guarantees a durable canonical message. A list/read
+    // race must converge by reading that row again, never by inventing a
+    // browser-only proposal that disappears on refresh.
+    recoveredMessages = await api.listAssistantMessages(resultThreadId, recoveryContext)
+    if (!compilationRecoveryIsCurrent(epoch, scope)) return
+    hasProposalMessage = Boolean(latestProposalMessage(recoveredMessages, proposalId))
+    if (!hasProposalMessage) {
+      throw new Error('编译结果已完成，但持久化任务计划暂未可见；系统将继续重试恢复。')
+    }
+  }
+  const durableMessage = proposalId
+    ? latestProposalMessage(recoveredMessages, proposalId)
+    : null
+  const durableProposal = durableMessage ? proposalOf(durableMessage) : null
+  if (result.apply_ready && modelRunRevision(durableProposal) < modelRunRevision(proposal || null)) {
+    throw new Error('持久化任务计划仍是旧版本，系统将继续重试直至恢复最新进度。')
   }
 
+  const currentPath = normalizedAssistantPath(context.value.path)
+  if (canonicalPath !== currentPath) {
+    const canonicalStorageKey = `ontology-assistant-thread:${encodeURIComponent(`${scope.scenarioId}|${canonicalPath}`)}`
+    const previousCanonicalThreadId = localStorage.getItem(canonicalStorageKey)
+    localStorage.setItem(canonicalStorageKey, resultThreadId)
+    const navigationResult = await router.push(canonicalPath)
+    await nextTick()
+    const reachedCanonicalPath = normalizedAssistantPath(router.currentRoute.value.path) === canonicalPath
+    if (isNavigationFailure(navigationResult) && !reachedCanonicalPath) {
+      if (previousCanonicalThreadId === null) localStorage.removeItem(canonicalStorageKey)
+      else localStorage.setItem(canonicalStorageKey, previousCanonicalThreadId)
+      throw new Error('计划所属页面暂时无法打开；系统会保留当前恢复任务并继续重试。')
+    }
+    clearCompilationJobBookmark(localStorage, scope)
+    const owner = compilationOwnerScope()
+    if (owner) clearPendingCompilationJobBookmark(localStorage, owner)
+    streamGeneration += 1
+    streamController = null
+    loading.value = false
+    ElMessage.success('持续建模计划已恢复，已返回该计划所属页面。')
+    return
+  }
   streamGeneration += 1
   streamController = null
   loading.value = false
@@ -1345,11 +1609,14 @@ async function recoverSucceededCompilation(
     syncThread(resultThreadId, '已恢复的完整业务模型')
   }
   messages.value = recoveredMessages
+  window.dispatchEvent(new CustomEvent('assistant-scenario-drafts-updated', {
+    detail: { scenario_id: scope.scenarioId, proposal_id: proposalId },
+  }))
   activeCompilationJob.value = null
   compilationRecoveryThreadId.value = ''
   compilationRecoveryEpoch += 1
   scrollBottom()
-  ElMessage.success(result.apply_ready ? '完整业务模型编译已恢复，请核对变更清单' : '完整业务模型编译已完成，服务端结果已恢复')
+  ElMessage.success(result.apply_ready ? '持续建模计划已恢复，并停留在当前确认点' : '建模草稿已恢复')
 }
 
 async function recoverFailedCompilation(
@@ -1402,28 +1669,50 @@ async function consumeCompilationJob(
   await recoverFailedCompilation(job, epoch, scope)
 }
 
-async function discoverCompilationForThread(id: string) {
+async function discoverCompilationForThread(id: string, retry = false) {
   const scope = compilationThreadScope(id)
   if (!scope) return
   clearCompilationPollTimer()
   compilationRecoveryEpoch += 1
-  compilationPollErrors = 0
+  if (!retry) compilationPollErrors = 0
   const epoch = compilationRecoveryEpoch
   compilationRecoveryThreadId.value = id
-  activeCompilationJob.value = null
+  const bookmarkedJobId = readCompilationJobBookmark(localStorage, scope)
+  const pendingJobId = readPendingCompilationJobBookmark(localStorage, scope)
+  const placeholderJobId = String(
+    [...messages.value].reverse().find((message) => (
+      message.thread_id === id
+      && message.context?.compilation_job_id
+      && ['processing', 'running'].includes(String(message.context?.status || ''))
+    ))?.context?.compilation_job_id || '',
+  ).trim()
+  const knownJobId = bookmarkedJobId || pendingJobId || placeholderJobId
+  if (knownJobId && (!activeCompilationJob.value || activeCompilationJob.value.id !== knownJobId)) {
+    activeCompilationJob.value = optimisticCompilationJob({
+      job_id: knownJobId,
+      thread_id: id,
+      progress: {
+        phase: 'recovering',
+        detail: '正在从服务端恢复持续建模计划；不会重复提交建模请求。',
+        steps: fallbackCompilationSteps,
+      },
+    })
+  } else if (!retry) {
+    activeCompilationJob.value = null
+  }
   try {
-    const bookmarkedJobId = readCompilationJobBookmark(localStorage, scope)
-    const pendingJobId = readPendingCompilationJobBookmark(localStorage, scope)
     const jobs = await api.listAssistantCompilationJobs(id, apiContext())
     if (!compilationRecoveryIsCurrent(epoch, scope)) return
-    let job = selectCompilationJobForRecovery(jobs, scope.scenarioId, bookmarkedJobId || pendingJobId)
-    if (!job && pendingJobId) {
-      const pending = await api.getAssistantCompilationJob(pendingJobId)
+    let job = selectCompilationJobForRecovery(jobs, scope.scenarioId, knownJobId)
+    if (!job && knownJobId) {
+      const pending = await api.getAssistantCompilationJob(knownJobId)
       if (!compilationRecoveryIsCurrent(epoch, scope)) return
       if (pending.thread_id === id && compilationJobMatchesScenario(pending, scope.scenarioId)) job = pending
     }
     if (!job) {
+      activeCompilationJob.value = null
       compilationRecoveryThreadId.value = ''
+      if (bookmarkedJobId) clearCompilationJobBookmark(localStorage, scope)
       if (pendingJobId) clearPendingCompilationJobBookmark(localStorage, scope)
       return
     }
@@ -1432,8 +1721,36 @@ async function discoverCompilationForThread(id: string) {
     await consumeCompilationJob(job, epoch, scope)
   } catch (error: any) {
     if (!compilationRecoveryIsCurrent(epoch, scope)) return
-    compilationRecoveryThreadId.value = ''
-    if (error?.status !== 404) ElMessage.warning('暂时无法恢复编译任务进度；再次打开该会话时会继续查询。')
+    if (error?.status === 403 || error?.status === 404) {
+      clearCompilationJobBookmark(localStorage, scope)
+      if (pendingJobId) clearPendingCompilationJobBookmark(localStorage, scope)
+      activeCompilationJob.value = null
+      compilationRecoveryThreadId.value = ''
+      ElMessage.warning('当前账号或场景已无法访问编译任务，已停止恢复。')
+      return
+    }
+    compilationPollErrors += 1
+    const recoveryJobId = knownJobId
+    activeCompilationJob.value = optimisticCompilationJob({
+      job_id: recoveryJobId || `discover-${id}`,
+      thread_id: id,
+      progress: {
+        phase: 'recovering',
+        detail: '暂时无法读取编译任务列表；计划仍保留，系统将继续重试，不会重复提交建模请求。',
+        steps: fallbackCompilationSteps,
+      },
+    })
+    if (compilationPollErrors === 1) ElMessage.warning('暂时无法恢复编译任务进度；系统会保留计划并自动重试。')
+    if (recoveryJobId) {
+      scheduleCompilationPoll(recoveryJobId, epoch, scope)
+    } else {
+      compilationPollTimer = window.setTimeout(
+        () => {
+          if (compilationRecoveryIsCurrent(epoch, scope)) void discoverCompilationForThread(id, true)
+        },
+        compilationPollDelay(document.hidden, compilationPollErrors),
+      )
+    }
   }
 }
 
@@ -1442,13 +1759,21 @@ async function beginCompilationRecoveryFromEvent(data: Record<string, any>) {
   const jobId = String(data?.job_id || '').trim()
   if (!owner || !jobId) return
   savePendingCompilationJobBookmark(localStorage, owner, jobId)
-  const existingScope = compilationThreadScope()
-  if (existingScope) saveCompilationJobBookmark(localStorage, existingScope, jobId)
+  const eventThreadId = String(data?.thread_id || threadId.value || '').trim()
+  if (eventThreadId && !threadId.value) {
+    threadId.value = eventThreadId
+    localStorage.setItem(storageKey.value, eventThreadId)
+    syncThread(eventThreadId, '完整业务模型持续任务')
+  }
+  const existingScope = compilationThreadScope(eventThreadId || threadId.value)
+  if (existingScope) {
+    compilationRecoveryThreadId.value = existingScope.threadId
+    saveCompilationJobBookmark(localStorage, existingScope, jobId)
+  }
   clearCompilationPollTimer()
   compilationRecoveryEpoch += 1
   compilationPollErrors = 0
   const lookupEpoch = compilationRecoveryEpoch
-  if (existingScope) compilationRecoveryThreadId.value = existingScope.threadId
   try {
     const job = await api.getAssistantCompilationJob(jobId)
     const currentOwner = compilationOwnerScope()
@@ -1463,7 +1788,7 @@ async function beginCompilationRecoveryFromEvent(data: Record<string, any>) {
       ElMessage.error('服务端返回了其他场景的编译任务，已拒绝关联。')
       return
     }
-    const targetThreadId = String(threadId.value || job.thread_id || '').trim()
+    const targetThreadId = String(data?.thread_id || threadId.value || job.thread_id || '').trim()
     const scope = compilationThreadScope(targetThreadId)
     if (!scope) return
     if (!threadId.value) {
@@ -1477,12 +1802,20 @@ async function beginCompilationRecoveryFromEvent(data: Record<string, any>) {
     clearPendingCompilationJobBookmark(localStorage, owner)
     await consumeCompilationJob(job, epoch, scope)
   } catch {
-    // Keep the pending bookmark: HMR/reload can resolve it from the owner-scoped status API.
+    // Keep the optimistic plan visible and retry the status lookup.  A slow
+    // first GET must not make a newly-created task appear to end immediately.
+    if (existingScope && lookupEpoch === compilationRecoveryEpoch) {
+      compilationRecoveryThreadId.value = existingScope.threadId
+      scheduleCompilationPoll(jobId, lookupEpoch, existingScope)
+    }
   }
 }
 
 function settleCompilationFromStream(proposal?: AssistantProposal | Record<string, any>) {
   if (!proposal || proposal.kind !== 'scenario_model') return
+  window.dispatchEvent(new CustomEvent('assistant-scenario-drafts-updated', {
+    detail: { scenario_id: context.value.scenario_id, proposal_id: proposal.proposal_id },
+  }))
   const scope = compilationThreadScope(compilationRecoveryThreadId.value || threadId.value)
   if (scope) clearCompilationJobBookmark(localStorage, scope)
   const owner = compilationOwnerScope()
@@ -1494,6 +1827,19 @@ function onCompilationVisibilityChange() {
   const job = activeCompilationJob.value
   const scope = compilationThreadScope(compilationRecoveryThreadId.value)
   if (!job || job.status !== 'running' || !scope) return
+  if (job.id === `discover-${scope.threadId}`) {
+    clearCompilationPollTimer()
+    const epoch = compilationRecoveryEpoch
+    compilationPollTimer = window.setTimeout(
+      () => {
+        if (compilationRecoveryIsCurrent(epoch, scope)) {
+          void discoverCompilationForThread(scope.threadId, true)
+        }
+      },
+      compilationPollDelay(document.hidden, compilationPollErrors),
+    )
+    return
+  }
   scheduleCompilationPoll(job.id, compilationRecoveryEpoch, scope)
 }
 
@@ -1508,13 +1854,14 @@ function welcomeMessage(): AssistantMessage {
   return {
     role: 'assistant',
     content: context.value.scenario_id
-      ? `我已进入「${context.value.page}」工作区。选择“完整场景建模”并提供业务介绍或附件，我可以一次生成本体、映射、函数、操作、规则、事件和工作流的待审核变更清单。`
+      ? `我已进入「${context.value.page}」工作区。选择“完整场景建模”并提供业务介绍或附件，我会先分析资料、列出任务计划，再逐项生成对象、映射、函数、操作、规则、事件和工作流的待审核变更清单。`
       : '我可以先根据业务介绍创建场景草稿；打开具体场景后，可继续完成完整业务模型建设。',
   }
 }
 
 async function loadThread(id: string, closeHistory = true) {
   detachCompilationRecovery()
+  clearModelTaskRecovery()
   if (id !== threadId.value) attachments.value = []
   try {
     messages.value = await api.listAssistantMessages(id, apiContext())
@@ -1590,6 +1937,7 @@ async function createNewThread() {
   if (loading.value || threadsLoading.value) return
   try {
     detachCompilationRecovery()
+    clearModelTaskRecovery()
     const thread = await api.createAssistantThread(apiContext())
     threads.value = [thread, ...threads.value.filter((item) => item.id !== thread.id)]
     threadId.value = thread.id
@@ -1631,6 +1979,7 @@ async function deleteThread(thread: AssistantThread) {
       const scope = compilationThreadScope(thread.id)
       if (scope) clearCompilationJobBookmark(localStorage, scope)
       detachCompilationRecovery()
+      clearModelTaskRecovery()
       localStorage.removeItem(storageKey.value)
       threadId.value = ''
       messages.value = threads.value[0] ? [] : [welcomeMessage()]
@@ -1688,10 +2037,48 @@ function syncThread(threadIdValue: string, title: string) {
   })
 }
 
+function optimisticCompilationJob(data: Record<string, any>): AssistantCompilationJobStatus {
+  const now = new Date().toISOString()
+  const status = ['running', 'succeeded', 'failed'].includes(String(data.status))
+    ? String(data.status) as AssistantCompilationJobStatus['status']
+    : 'running'
+  const progress = data.progress && typeof data.progress === 'object'
+    ? data.progress
+    : { phase: 'queued', detail: '已取得编译任务，正在等待服务端进度。', steps: fallbackCompilationSteps }
+  return {
+    id: String(data.job_id || ''),
+    thread_id: data.thread_id || threadId.value || null,
+    scenario_id: context.value.scenario_id || null,
+    status,
+    progress,
+    llm_calls_used: Number(data.llm_calls_used || progress.calls_used || 0),
+    llm_call_budget: Number(data.llm_call_budget || progress.call_budget || 0),
+    result_ready: status === 'succeeded',
+    error_code: String(data.error_code || ''),
+    error_message: String(data.error_message || ''),
+    started_at: String(data.started_at || now),
+    completed_at: data.completed_at || null,
+    updated_at: String(data.updated_at || now),
+  }
+}
+
 function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantMessage, index: number) {
   switch (event.type) {
     case 'compilation_job':
       if (event.data?.job_id) {
+        // Render the durable task immediately.  Recovery still re-reads the
+        // server DTO below, but the user must see that a real compilation was
+        // accepted even when that follow-up GET is slower than the SSE stream.
+        activeCompilationJob.value = optimisticCompilationJob(event.data)
+        const eventThreadId = String(event.data.thread_id || threadId.value || '').trim()
+        if (eventThreadId) {
+          if (!threadId.value) {
+            threadId.value = eventThreadId
+            localStorage.setItem(storageKey.value, eventThreadId)
+            syncThread(eventThreadId, '完整业务模型持续任务')
+          }
+          compilationRecoveryThreadId.value = eventThreadId
+        }
         // The job event arrives before the final meta event on a brand-new
         // thread. Bind it to the already visible streaming response so the
         // recovery poller updates that card instead of inserting a second
@@ -1764,7 +2151,8 @@ function send(text?: string) {
       ? attachmentOnlyPrompt
       : ''
   )).trim()
-  if (!content || loading.value || compilationBusy.value || uploadingFiles.value > 0) return
+  if (!content || loading.value || compilationBusy.value || modelTaskRecoveryBusy.value || uploadingFiles.value > 0) return
+  clearModelTaskRecovery()
   if (activeCompilationJob.value?.status === 'failed') detachCompilationRecovery()
   if (messages.value.length === 1 && messages.value[0].role === 'assistant' && !messages.value[0].id) messages.value = []
   const currentAttachments = [...attachments.value]
@@ -1780,6 +2168,9 @@ function send(text?: string) {
   streamController = streamAssistantChat(
     {
       message: content,
+      request_id: typeof crypto?.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `assistant-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       thread_id: threadId.value || undefined,
       scenario_id: context.value.scenario_id || undefined,
       page: context.value.page,
@@ -1872,21 +2263,229 @@ async function answerQuestion(
   send(prompt)
 }
 
+function clearModelTaskRecovery(clearFailure = true) {
+  if (modelTaskRecoveryTimer) window.clearTimeout(modelTaskRecoveryTimer)
+  modelTaskRecoveryTimer = null
+  modelTaskRecoveryErrors = 0
+  modelTaskRecoveryGeneration += 1
+  recoveringModelProposalId.value = ''
+  if (clearFailure) {
+    blockedModelProposalId.value = ''
+    modelTaskRecoveryFailure.value = ''
+  }
+}
+
+function beginModelTaskRecovery(
+  message: AssistantMessage,
+  proposalThreadId: string,
+  proposalId: string,
+  taskId: string,
+  minimumRevision: number,
+  retryRequest: () => Promise<AssistantProposalApplyResult>,
+) {
+  clearModelTaskRecovery()
+  const generation = modelTaskRecoveryGeneration
+  const ownerThreadId = threadId.value
+  const ownerScopeKey = assistantScopeKey.value
+  const recoveryContext = apiContext()
+  recoveringModelProposalId.value = proposalId
+  const isCurrent = () => (
+    !componentDisposed
+    && generation === modelTaskRecoveryGeneration
+    && recoveringModelProposalId.value === proposalId
+    && threadId.value === ownerThreadId
+    && assistantScopeKey.value === ownerScopeKey
+  )
+  const recover = async () => {
+    if (!isCurrent()) return
+    try {
+      const recoveredMessages = await api.listAssistantMessages(proposalThreadId, recoveryContext)
+      if (!isCurrent()) return
+      const recoveredMessage = latestProposalMessage(recoveredMessages, proposalId)
+      const recoveredProposal = recoveredMessage ? proposalOf(recoveredMessage) : null
+      if (
+        recoveredMessage
+        && recoveredProposal
+        && modelTaskWasProcessed(recoveredProposal, taskId)
+        && modelRunRevision(recoveredProposal) >= minimumRevision
+      ) {
+        Object.assign(message, recoveredMessage, { streaming: false })
+        message.context = {
+          ...(message.context || {}),
+          status: modelExecutionSummary(recoveredProposal)?.final ? 'success' : 'waiting_confirmation',
+          run_revision: modelRunRevision(recoveredProposal),
+        }
+        clearModelTaskRecovery()
+        window.dispatchEvent(new CustomEvent('assistant-proposal-applied', {
+          detail: { scenario_id: context.value.scenario_id, kind: 'scenario_model', task_id: taskId },
+        }))
+        scrollBottom()
+        ElMessage.success('已从持久化计划恢复任务结果，计划将从下一确认点继续')
+        return
+      }
+    } catch (error: any) {
+      // The confirmation may already be committed. A temporary read failure
+      // must keep the task recovering instead of re-enabling the old action.
+      if (!isCurrent()) return
+      const status = Number(error?.status || 0)
+      if ([403, 404, 409].includes(status)) {
+        clearModelTaskRecovery(false)
+        blockedModelProposalId.value = proposalId
+        modelTaskRecoveryFailure.value = String(error?.message || '会话、权限或页面范围已失效。')
+        ElMessage.error('当前任务状态已无法恢复；系统已停止重试旧任务。')
+        return
+      }
+    }
+    if (!isCurrent()) return
+    if (modelTaskRecoveryErrors > 0 && modelTaskRecoveryErrors % 3 === 0) {
+      try {
+        // The user already confirmed this exact task. The server-side claim is
+        // idempotent, so retrying the same request safely resolves ambiguous
+        // timeout/5xx outcomes without asking the user to click twice.
+        await retryRequest()
+      } catch {
+        // Continue reading the durable message; another request may own the claim.
+      }
+      if (!isCurrent()) return
+    }
+    modelTaskRecoveryErrors += 1
+    modelTaskRecoveryTimer = window.setTimeout(
+      () => { if (isCurrent()) void recover() },
+      compilationPollDelay(document.hidden, modelTaskRecoveryErrors),
+    )
+  }
+  void recover()
+}
+
+async function applyModelTask(
+  message: AssistantMessage,
+  index: number,
+  task: AssistantModelTask,
+  action: 'apply' | 'defer',
+) {
+  const proposal = proposalOf(message)
+  if (
+    !proposal
+    || proposal.kind !== 'scenario_model'
+    || !proposal.proposal_id
+    || !threadId.value
+    || applyingIndex.value !== null
+    || recoveringModelProposalId.value
+    || blockedModelProposalId.value === proposal.proposal_id
+    || !isActiveModelRun(message)
+    || !['ready', 'blocked'].includes(task.status)
+    || !isCurrentModelTask(proposal, task)
+  ) return
+  const confirmation = action === 'defer'
+    ? `本次不会写入“${task.title}”。已生成草稿、缺失项和解决建议都会保留，计划将继续推进其他任务。`
+    : `确认后会把“${task.title}”产生的正式资源和不完整定义一并写入场景；不影响画布展示的草稿也会落位，问题汇总只保留在助手会话，完成后再继续下一项任务。`
+  try {
+    await ElMessageBox.confirm(
+      confirmation,
+      action === 'defer' ? '确认保留草稿并继续' : '确认应用当前任务',
+      {
+        type: action === 'defer' ? 'warning' : 'info',
+        confirmButtonText: action === 'defer' ? '保留草稿并继续' : '确认应用并继续',
+        cancelButtonText: '返回查看',
+        distinguishCancelAndClose: true,
+      },
+    )
+  } catch {
+    return
+  }
+  applyingIndex.value = index
+  const proposalThreadId = String(message.context?.proposal_thread_id || threadId.value)
+  const localRevision = modelRunRevision(proposal)
+  const submitModelTask = () => api.applyAssistantProposal({
+    kind: 'scenario_model',
+    scenario_id: context.value.scenario_id,
+    thread_id: proposalThreadId,
+    proposal_id: proposal.proposal_id,
+    confirm: true,
+    allow_partial: action === 'apply',
+    task_id: task.id,
+    task_action: action,
+  })
+  try {
+    const result = await submitModelTask()
+    const responseProposal = result?.proposal || null
+    const responseRevision = modelRunRevision(responseProposal)
+    let recoveredMessage: AssistantMessage | null = null
+    try {
+      const recoveredMessages = await api.listAssistantMessages(proposalThreadId, apiContext())
+      recoveredMessage = latestProposalMessage(recoveredMessages, proposal.proposal_id)
+    } catch {
+      // A successful POST is authoritative. If neither response nor this read
+      // contains the advanced task, the durable recovery loop below takes over.
+    }
+    const recoveredProposal = recoveredMessage ? proposalOf(recoveredMessage) : null
+    const recoveredRevision = modelRunRevision(recoveredProposal)
+    if (recoveredMessage && recoveredProposal && modelTaskWasProcessed(recoveredProposal, task.id) && recoveredRevision >= localRevision && recoveredRevision >= responseRevision) {
+      Object.assign(message, recoveredMessage, { streaming: false })
+    } else if (responseProposal && modelTaskWasProcessed(responseProposal, task.id) && responseRevision >= localRevision) {
+      message.proposal = responseProposal
+    } else {
+      beginModelTaskRecovery(
+        message,
+        proposalThreadId,
+        proposal.proposal_id,
+        task.id,
+        Math.max(localRevision, responseRevision),
+        submitModelTask,
+      )
+      ElMessage.warning('任务已提交，正在自动恢复服务端最新计划；不会重复应用。')
+      return
+    }
+    const taskResult = result?.data || {}
+    const nextTask = (message.proposal as AssistantProposal)?.payload?.tasks?.find((item: AssistantModelTask) => ['ready', 'blocked'].includes(item.status))
+    const durableUpdate = String(result?.task_update_text || '').trim()
+    if (durableUpdate && !message.content.includes(durableUpdate)) message.content += `\n\n${durableUpdate}`
+    else if (!durableUpdate) {
+      message.content += action === 'defer'
+        ? `\n\n「${task.title}」已保留为草稿，计划继续推进。`
+        : `\n\n「${task.title}」已确认并写入当前场景；暂不能正式运行的定义已作为草稿落位。`
+      if (nextTask) message.content += ` 下一步已停留在「${nextTask.title}」等待确认。`
+    }
+    message.context = {
+      ...(message.context || {}),
+      status: modelExecutionSummary(message.proposal as AssistantProposal)?.final ? 'success' : 'waiting_confirmation',
+      run_revision: modelRunRevision(message.proposal as AssistantProposal),
+    }
+    window.dispatchEvent(new CustomEvent('assistant-proposal-applied', { detail: { scenario_id: context.value.scenario_id, kind: 'scenario_model', task_id: task.id } }))
+    if (result?.status === 'replayed') ElMessage.info('该任务已处理过，已恢复任务结果')
+    else ElMessage.success(action === 'defer' ? '草稿已保留，计划已继续推进' : '本任务已确认并写入，计划已继续')
+  } catch (error: any) {
+    const status = Number(error?.status || 0)
+    const ambiguousOutcome = !status
+      || status >= 500
+      || (status === 409 && /正在应用|处理中/.test(String(error?.message || '')))
+    if (ambiguousOutcome) {
+      beginModelTaskRecovery(
+        message,
+        proposalThreadId,
+        proposal.proposal_id,
+        task.id,
+        localRevision,
+        submitModelTask,
+      )
+      ElMessage.warning('确认请求结果暂不明确，系统会持续核对持久化状态并安全重试，无需再次点击。')
+    } else {
+      ElMessage.error(error.message || '处理当前建模任务失败')
+    }
+  } finally {
+    applyingIndex.value = null
+  }
+}
+
 async function applyProposal(message: AssistantMessage, index: number) {
   const proposal = proposalOf(message)
-  if (!proposal || ['applied', 'partially_applied'].includes(proposal.status || '') || !proposalCanApply(proposal) || !threadId.value || !proposal.proposal_id || applyingIndex.value !== null) return
+  if (!proposal || proposal.kind === 'scenario_model' || ['applied', 'partially_applied'].includes(proposal.status || '') || !proposalCanApply(proposal) || !threadId.value || !proposal.proposal_id || applyingIndex.value !== null) return
   const effectiveChanges = proposal.changes?.filter((change) => change.operation !== 'skip').length || 0
-  const blockerCount = blockingIssues(proposal).length
-  const partialApply = proposal.kind === 'scenario_model' && blockerCount > 0
   const confirmation = proposal.kind === 'scenario'
     ? `将根据这份草稿创建业务场景“${proposal.payload?.name || '未命名场景'}”。附件仍只属于助手临时上下文，不会成为正式数据源。`
     : proposal.kind === 'mapping'
       ? `将把 ${effectiveChanges} 项映射差异保存到当前场景。保存不会导入数据，之后仍需预览、测试并刷新对象。`
-      : proposal.kind === 'scenario_model'
-        ? partialApply
-          ? `当前有 ${blockerCount} 个阻塞项。确认后只会把通过依赖、引用和结构预检的可用变更在同一事务中写入；受阻定义会跳过并保留解决建议，不会被强行写入。`
-          : `将把 ${effectiveChanges} 项跨资源变更在同一事务中写入当前场景；任一对象、引用、规则、流程或映射校验失败都会整体回滚。AI 生成的操作、规则、事件和工作流仍保持停用。`
-        : `将把 ${effectiveChanges} 项变更写入当前场景草稿。草稿状态的工作流不会立即执行。`
+      : `将把 ${effectiveChanges} 项变更写入当前场景草稿。草稿状态的工作流不会立即执行。`
   try {
     await ElMessageBox.confirm(
       confirmation,
@@ -1910,21 +2509,18 @@ async function applyProposal(message: AssistantMessage, index: number) {
       thread_id: proposalThreadId,
       proposal_id: proposal.proposal_id,
       confirm: true,
-      allow_partial: partialApply,
+      allow_partial: false,
     })
     const appliedScenarioId = proposal.kind === 'scenario' ? result?.data?.scenario_id : ''
-    const partiallyApplied = proposal.kind === 'scenario_model' && result?.data?.partial === true
     message.content += proposal.kind === 'scenario'
       ? '\n\n业务场景已创建，正在进入场景建设。'
       : proposal.kind === 'mapping'
         ? '\n\n映射草稿已保存。下一步请预览、测试并刷新对象。'
-        : partiallyApplied
-          ? `\n\n可用部分已应用；仍有 ${result?.data?.blocked_issue_count || blockerCount} 个阻塞项，请按清单补充资料后重新编译。`
-          : '\n\n变更已应用到当前场景草稿。'
-    message.proposal = { ...proposal, status: partiallyApplied ? 'partially_applied' : 'applied', apply_result: result?.data || {} }
+        : '\n\n变更已应用到当前场景草稿。'
+    message.proposal = { ...proposal, status: 'applied', apply_result: result?.data || {} }
     window.dispatchEvent(new CustomEvent('assistant-proposal-applied', { detail: { scenario_id: appliedScenarioId || context.value.scenario_id, kind: proposal.kind } }))
     if (result?.status === 'replayed') ElMessage.info('该变更已应用过，已恢复应用结果')
-    else ElMessage.success(partiallyApplied ? '可用模型已应用，阻塞项已保留' : proposal.kind === 'scenario' ? '业务场景已创建' : proposal.kind === 'mapping' ? '映射草稿已保存' : '变更已应用到场景草稿')
+    else ElMessage.success(proposal.kind === 'scenario' ? '业务场景已创建' : proposal.kind === 'mapping' ? '映射草稿已保存' : '变更已应用到场景草稿')
     if (appliedScenarioId) {
       visible.value = false
       await router.push({ name: 'scenario-detail', params: { id: appliedScenarioId }, query: { stage: 'workflows' } })
@@ -1947,6 +2543,7 @@ watch(() => storageKey.value, async () => {
   streamGeneration += 1
   streamController = null
   detachCompilationRecovery()
+  clearModelTaskRecovery()
   loading.value = false
   messages.value = []
   threads.value = []
@@ -1962,9 +2559,15 @@ watch(() => storageKey.value, async () => {
   }
 })
 watch(() => context.value.scenario_id, () => {
-  taskPreset.value = 'smart'
-  mode.value = 'ask'
-  draftKind.value = 'auto'
+  if (context.value.scenario_id) {
+    taskPreset.value = 'scenario_model'
+    mode.value = 'draft'
+    draftKind.value = 'scenario_model'
+  } else {
+    taskPreset.value = 'smart'
+    mode.value = 'ask'
+    draftKind.value = 'auto'
+  }
 }, { immediate: true })
 watch(showLauncher, (show) => {
   if (!show) visible.value = false
@@ -1980,6 +2583,7 @@ onBeforeUnmount(() => {
   streamGeneration += 1
   streamController = null
   clearCompilationPollTimer()
+  clearModelTaskRecovery()
   window.removeEventListener('ontology-selection-change', onSelection)
   document.removeEventListener('visibilitychange', onCompilationVisibilityChange)
 })
@@ -2052,6 +2656,75 @@ onBeforeUnmount(() => {
 .compilation-recovery > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .compilation-recovery strong { color: var(--text); font-size: 11px; }
 .compilation-recovery span { overflow: hidden; color: var(--text-2); font-size: 9.5px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.compilation-plan-card { margin: 0 0 16px; overflow: hidden; border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border)); border-radius: 14px; background: linear-gradient(145deg, var(--primary-soft), var(--surface)); box-shadow: var(--shadow-sm); }
+.compilation-plan-card.is-failed { border-color: color-mix(in srgb, var(--danger) 38%, var(--border)); background: linear-gradient(145deg, var(--danger-soft), var(--surface)); }
+.compilation-plan-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 14px 14px 11px; }
+.compilation-plan-heading { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.compilation-plan-kicker { display: inline-flex; align-items: center; gap: 5px; color: var(--primary-600); font-size: 10px; font-weight: 800; letter-spacing: .02em; }
+.compilation-plan-card.is-failed .compilation-plan-kicker { color: var(--danger); }
+.compilation-plan-heading strong { color: var(--text); font-size: 13px; line-height: 1.35; }
+.compilation-plan-heading > span:last-child { overflow-wrap: anywhere; color: var(--text-2); font-size: 10.5px; line-height: 1.5; }
+.compilation-plan-count { display: flex; flex: 0 0 auto; align-items: baseline; gap: 3px; padding: 5px 8px; border: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border)); border-radius: 9px; color: var(--text-3); background: var(--surface); white-space: nowrap; }
+.compilation-plan-count b { color: var(--primary-600); font-size: 17px; font-variant-numeric: tabular-nums; }
+.compilation-plan-count span { font-size: 9px; }
+.compilation-plan-steps { display: grid; gap: 7px; padding: 0 14px 12px; }
+.compilation-plan-step { display: flex; align-items: flex-start; gap: 8px; min-width: 0; padding: 8px 9px; border: 1px solid var(--border); border-radius: 9px; background: color-mix(in srgb, var(--surface) 88%, transparent); }
+.compilation-plan-step.is-running { border-color: color-mix(in srgb, var(--primary) 48%, var(--border)); background: var(--surface); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 10%, transparent); }
+.compilation-plan-step.is-done { background: color-mix(in srgb, var(--success) 7%, var(--surface)); }
+.compilation-plan-step.is-error { border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); background: var(--danger-soft); }
+.compilation-plan-step-icon { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; flex: 0 0 auto; border-radius: 7px; color: var(--text-3); background: var(--surface-2); font-size: 10px; font-variant-numeric: tabular-nums; }
+.compilation-plan-step.is-running .compilation-plan-step-icon { color: var(--primary-600); background: var(--primary-soft); }
+.compilation-plan-step.is-done .compilation-plan-step-icon { color: var(--success); background: var(--success-soft); }
+.compilation-plan-step.is-error .compilation-plan-step-icon { color: var(--danger); background: var(--danger-soft); }
+.compilation-plan-step-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.compilation-plan-step-copy strong { color: var(--text); font-size: 11px; line-height: 1.35; }
+.compilation-plan-step-copy span { overflow-wrap: anywhere; color: var(--text-3); font-size: 9.5px; line-height: 1.45; }
+.compilation-stage-results { display: grid; gap: 5px; padding: 10px 14px 12px; border-top: 1px dashed color-mix(in srgb, var(--primary) 20%, var(--border)); }
+.compilation-stage-results-label { color: var(--text-2); font-size: 10px; font-weight: 800; }
+.compilation-stage-result { display: flex; align-items: flex-start; gap: 5px; color: var(--text-2); font-size: 9.5px; line-height: 1.5; }
+.compilation-stage-result .el-icon { flex: 0 0 auto; margin-top: 2px; color: var(--success); }
+.compilation-plan-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 14px; border-top: 1px solid var(--border); color: var(--text-3); font-size: 9.5px; }
+.compilation-plan-toggle { display: inline-flex; align-items: center; gap: 3px; min-height: 30px; padding: 3px 6px; border: 0; color: var(--primary-600); background: transparent; cursor: pointer; font: inherit; font-weight: 700; }
+.compilation-plan-toggle:hover, .compilation-plan-toggle:focus-visible { color: var(--primary); text-decoration: underline; outline: none; text-underline-offset: 3px; }
+.model-task-board { display: grid; gap: 9px; margin: 12px 0 4px; padding: 11px; border: 1px solid color-mix(in srgb, var(--primary) 26%, var(--border)); border-radius: 12px; background: color-mix(in srgb, var(--primary-soft) 42%, var(--surface)); }
+.model-task-board-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.model-task-board-head > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.model-task-board-head strong { color: var(--text); font-size: 11.5px; }
+.model-task-board-head span { color: var(--text-3); font-size: 9.5px; line-height: 1.45; }
+.model-task-list { display: grid; gap: 7px; }
+.model-task { display: grid; gap: 7px; padding: 9px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.model-task.is-current { border-color: color-mix(in srgb, var(--primary) 62%, var(--border)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 12%, transparent); }
+.model-task.is-ready { border-color: color-mix(in srgb, var(--warning) 32%, var(--border)); }
+.model-task.is-blocked { border-color: color-mix(in srgb, var(--warning) 60%, var(--border)); background: color-mix(in srgb, var(--warning-soft) 46%, var(--surface)); }
+.model-task.is-waiting, .model-task.is-empty { opacity: .78; }
+.model-task.is-applied { border-color: color-mix(in srgb, var(--success) 40%, var(--border)); background: color-mix(in srgb, var(--success-soft) 48%, var(--surface)); }
+.model-task.is-partially_applied { border-color: color-mix(in srgb, var(--warning) 48%, var(--border)); background: color-mix(in srgb, var(--warning-soft) 38%, var(--surface)); }
+.model-task.is-drafted_with_gaps, .model-task.is-deferred, .model-task.is-skipped { border-style: dashed; border-color: color-mix(in srgb, var(--warning) 42%, var(--border)); }
+.model-task-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.model-task-index { display: inline-flex; align-items: center; justify-content: center; width: 21px; height: 21px; flex: 0 0 auto; border-radius: 7px; color: var(--primary-600); background: var(--primary-soft); font-size: 10px; font-weight: 800; }
+.model-task-title { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.model-task-title strong { overflow: hidden; color: var(--text); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.model-task-title small { overflow-wrap: anywhere; color: var(--text-3); font-size: 9px; line-height: 1.4; }
+.model-task-blocker { display: grid; gap: 3px; padding: 7px 8px; border-left: 3px solid var(--warning); color: var(--text-2); background: var(--warning-soft); font-size: 9.5px; line-height: 1.45; }
+.model-task-blocker strong { color: var(--warning-700, var(--warning)); }
+.model-task-blocker small, .model-task-note, .model-task-waiting { color: var(--text-3); font-size: 9px; line-height: 1.45; }
+.model-task-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
+.model-task-actions :deep(.el-button) { min-height: 36px; }
+.model-run-waiting { display: flex; align-items: flex-start; gap: 7px; padding: 8px 9px; border-radius: 9px; color: var(--primary-600); background: var(--primary-soft); font-size: 9.5px; line-height: 1.5; }
+.model-run-waiting strong { flex: 0 0 auto; color: var(--text); }
+.model-run-summary { display: grid; gap: 8px; padding: 10px; border: 1px solid color-mix(in srgb, var(--success) 34%, var(--border)); border-radius: 10px; background: color-mix(in srgb, var(--success-soft) 45%, var(--surface)); }
+.model-run-summary > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.model-run-summary > header strong { color: var(--text); font-size: 11px; }
+.model-run-summary p, .model-run-summary small { margin: 0; color: var(--text-2); font-size: 9.5px; line-height: 1.55; }
+.model-run-summary-counts { display: flex; flex-wrap: wrap; gap: 5px; }
+.model-run-summary-counts span { padding: 4px 6px; border-radius: 6px; color: var(--text-2); background: var(--surface); font-size: 9px; font-variant-numeric: tabular-nums; }
+.model-run-root-causes { display: grid; gap: 5px; }
+.model-run-root-causes article { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding: 6px 0; border-top: 1px solid color-mix(in srgb, var(--warning) 26%, var(--border)); }
+.model-run-root-causes strong { color: var(--text); font-size: 10px; }
+.model-run-root-causes span { color: var(--warning); font-size: 9px; font-variant-numeric: tabular-nums; }
+.model-run-root-causes small { grid-column: 1 / -1; }
+.model-run-solutions { display: grid; gap: 4px; color: var(--text-2); font-size: 9.5px; }
+.model-run-solutions ul { display: grid; gap: 3px; margin: 0; padding-left: 16px; line-height: 1.5; }
 .thread-count { display: inline-flex; align-items: center; justify-content: center; min-width: 17px; height: 17px; margin-left: 4px; padding: 0 4px; border-radius: 9px; color: var(--primary-600); background: var(--primary-soft); font-size: 10px; }
 .assistant-history { flex: 1; min-height: 0; overflow: auto; padding: 18px; background: var(--bg); }
 .history-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
@@ -2176,6 +2849,13 @@ onBeforeUnmount(() => {
 .unresolved-counts span { padding: 3px 6px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-2); background: var(--surface); font-size: 9px; font-weight: 700; }
 .unresolved-counts .is-blocking { border-color: color-mix(in srgb, var(--danger) 38%, var(--border)); color: var(--danger); background: var(--danger-soft); }
 .issue-groups { display: grid; gap: 6px; }
+.issue-group-summary { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: flex-start; gap: 7px; padding: 7px 0; border-top: 1px solid var(--border); }
+.issue-group-summary:first-child { border-top: 0; }
+.issue-group-summary > div { display: grid; min-width: 0; gap: 2px; }
+.issue-group-summary strong { color: var(--text); font-size: 10.5px; }
+.issue-group-summary p { margin: 0; color: var(--text-2); font-size: 9.5px; line-height: 1.5; }
+.issue-group-summary small, .issue-group-summary .issue-resolution { color: var(--text-3); font-size: 9px; line-height: 1.45; }
+.issue-group-summary .issue-resolution { color: var(--primary-600); }
 .issue-category-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 7px; border-radius: 7px; color: var(--text-2); background: var(--surface); font-size: 9.5px; }
 .issue-category-head strong { color: var(--text); font-size: 10.5px; }
 .issue-category-head.is-blocking { color: var(--danger); background: var(--danger-soft); }
@@ -2267,6 +2947,10 @@ onBeforeUnmount(() => {
 .thinking-dots { display: inline-block; width: 18px; overflow: hidden; animation: dots 1.2s steps(3, end) infinite; }
 @keyframes dots { 0%, 20% { width: 0; } 60% { width: 9px; } 100% { width: 18px; } }
 .assistant-composer { padding: 10px 14px 14px; border-top: 1px solid var(--border); background: var(--surface); }
+.model-run-composer-wait { display: flex; align-items: flex-start; gap: 7px; margin-bottom: 8px; padding: 8px 9px; border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border)); border-radius: 9px; color: var(--primary-600); background: var(--primary-soft); }
+.model-run-composer-wait > .el-icon { flex: 0 0 auto; margin-top: 2px; }
+.model-run-composer-wait span { display: grid; gap: 2px; color: var(--text-2); font-size: 9.5px; line-height: 1.45; }
+.model-run-composer-wait strong { color: var(--text); font-size: 10px; }
 .attachment-strip { display: flex; flex-direction: column; gap: 5px; max-height: 90px; overflow: auto; margin-bottom: 8px; }
 .attachment-chip { display: flex; align-items: center; gap: 5px; min-width: 0; padding: 5px 7px; border: 1px solid var(--border); border-radius: 7px; color: var(--text-2); background: var(--surface-2); font-size: 11px; }
 .attachment-chip span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

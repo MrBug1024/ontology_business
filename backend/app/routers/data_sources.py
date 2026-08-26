@@ -24,6 +24,7 @@ from ..services import (
     datasource_service,
     permission_service,
     rag_service,
+    scenario_model_draft_service,
     template_catalog_service,
     tenant_service,
 )
@@ -237,6 +238,12 @@ def test_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
     if ds.type == "file_bucket":
         ds.status = "ok"
         ds.last_error = ""
+        db.flush()
+        scenario_model_draft_service.auto_repair_data_source_drafts(
+            db,
+            ds,
+            validated_source_id=ds.id,
+        )
         db.commit()
         return Msg(ok=True, message="文件桶就绪")
     ok, msg = datasource_service.test_connection(ds)
@@ -246,6 +253,13 @@ def test_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
     msg = msg if ok else datasource_service.CONNECTION_TEST_FAILURE_MESSAGE
     ds.status = "ok" if ok else "error"
     ds.last_error = "" if ok else msg
+    if ok:
+        db.flush()
+        scenario_model_draft_service.auto_repair_data_source_drafts(
+            db,
+            ds,
+            validated_source_id=ds.id,
+        )
     db.commit()
     return Msg(ok=ok, message=msg)
 

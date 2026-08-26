@@ -199,6 +199,7 @@ import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
 import { actionArtifactAttachment } from '@/utils/artifactAttachments'
 import type { ArtifactAttachment } from '@/utils/artifactAttachments'
+import { actionConfirmationParams } from '@/utils/actionConfirmation'
 
 const route = useRoute()
 const router = useRouter()
@@ -402,6 +403,11 @@ async function confirmActionPreview(toolCall: any) {
   const previewResult = actionPreviewOf(toolCall)
   if (!previewResult || toolCall._confirming) return
   const plan = previewResult.result.plan
+  const params = actionConfirmationParams(toolCall, plan)
+  if (!params) {
+    ElMessage.error('操作预演参数不完整，请重新发起业务需求')
+    return
+  }
   const artifactName = plan.artifact?.filename
   try {
     await ElMessageBox.confirm(
@@ -415,7 +421,7 @@ async function confirmActionPreview(toolCall: any) {
   toolCall._confirming = true
   try {
     const result: any = await api.executeAction(plan.action_id, {
-      params: plan.parameters || {},
+      params,
       dry_run: false,
       confirm: true,
       idempotency_key: actionIdempotencyKey(),

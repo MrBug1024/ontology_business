@@ -8,6 +8,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -121,6 +122,43 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.db.add(message)
         self.db.commit()
         return thread, message
+
+    @staticmethod
+    def _model_task(
+        task_id: str,
+        order: int,
+        *,
+        depends_on: list[str] | None = None,
+        change_count: int = 1,
+        safe_change_count: int | None = None,
+        issues: list[dict] | None = None,
+    ) -> dict:
+        safe_count = change_count if safe_change_count is None else safe_change_count
+        task_issues = list(issues or [])
+        return {
+            "id": task_id,
+            "order": order,
+            "title": task_id,
+            "description": f"{task_id} task",
+            "sections": [task_id],
+            "depends_on": list(depends_on or []),
+            "status": "pending",
+            "change_keys": [f"{task_id}.{index}" for index in range(change_count)],
+            "safe_change_keys": [
+                f"{task_id}.{index}" for index in range(min(change_count, safe_count))
+            ],
+            "change_count": change_count,
+            "safe_change_count": safe_count,
+            "compiled_safe_change_count": safe_count,
+            "blocked_issue_count": sum(
+                item.get("blocking", True) is not False for item in task_issues
+            ),
+            "compiled_blocked_issue_count": sum(
+                item.get("blocking", True) is not False for item in task_issues
+            ),
+            "draft_status": "generated" if change_count or task_issues else "empty",
+            "issues": task_issues,
+        }
 
     @staticmethod
     async def _consume_until(response, marker: str = "") -> str:
@@ -336,10 +374,75 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             source_bundle=source_bundle,
         )
         proposal = assistant._build_proposal("scenario_model", payload, scenario)
-        thread, _message = self._proposal_message(
+        legacy_proposal = json.loads(json.dumps(proposal))
+        for key in (
+            "tasks",
+            "current_task_id",
+            "execution_status",
+            "execution_summary",
+            "execution_revision",
+            "next_action",
+            "run_id",
+        ):
+            legacy_proposal["payload"].pop(key, None)
+        legacy_proposal["status"] = "pending"
+        legacy_proposal.pop("run_revision", None)
+        thread, legacy_message = self._proposal_message(
             kind="scenario_model",
-            proposal=proposal,
+            proposal=legacy_proposal,
             scenario=scenario,
+        )
+
+        recovered = assistant.list_thread_messages(
+            thread.id,
+            scenario_id=scenario.id,
+            path=f"/scenarios/{scenario.id}",
+            db=self.db,
+        )
+        recovered_proposal = recovered[-1].proposal
+        self.assertEqual(recovered_proposal["status"], "in_progress")
+        self.assertEqual(recovered_proposal["payload"]["current_task_id"], "ontology")
+        self.assertEqual(len(recovered_proposal["payload"]["tasks"]), 6)
+        self.assertEqual(
+            [item["id"] for item in recovered_proposal["payload"]["tasks"]],
+            [
+                "ontology",
+                "instances",
+                "mapping",
+                "capabilities",
+                "rules",
+                "workflows",
+            ],
+        )
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(AssistantMessage)),
+            1,
+        )
+        with Session(self.engine) as reopened_db:
+            reopened = reopened_db.get(AssistantMessage, legacy_message.id)
+            self.assertEqual(reopened.proposal["status"], "in_progress")
+            self.assertEqual(reopened.context["status"], "waiting_confirmation")
+            self.assertEqual(
+                reopened.proposal["payload"]["current_task_id"],
+                "ontology",
+            )
+        proposal = recovered_proposal
+
+        with self.assertRaises(HTTPException) as task_guard:
+            assistant.apply_proposal(
+                AssistantProposalApplyRequest(
+                    kind="scenario_model",
+                    scenario_id=scenario.id,
+                    thread_id=thread.id,
+                    proposal_id=proposal["proposal_id"],
+                    confirm=True,
+                ),
+                self.db,
+            )
+        self.assertEqual(task_guard.exception.status_code, 409)
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            0,
         )
 
         with self.assertRaises(Exception):
@@ -364,6 +467,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 scenario_id=scenario.id,
                 thread_id=thread.id,
                 proposal_id=proposal["proposal_id"],
+                task_id="ontology",
                 confirm=True,
             ),
             self.db,
@@ -379,6 +483,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 scenario_id=scenario.id,
                 thread_id=thread.id,
                 proposal_id=proposal["proposal_id"],
+                task_id="ontology",
                 confirm=True,
             ),
             self.db,
@@ -473,20 +578,648 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             scenario=scenario,
         )
 
-        with self.assertRaises(Exception):
+        result = assistant.apply_proposal(
+            AssistantProposalApplyRequest(
+                kind="scenario_model",
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                proposal_id=proposal["proposal_id"],
+                task_id="ontology",
+                confirm=True,
+            ),
+            self.db,
+        )
+        self.assertTrue(result["data"]["partial"])
+        self.assertEqual(result["data"]["safe_change_count"], 2)
+        self.assertGreaterEqual(result["data"]["blocked_issue_count"], 1)
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            1,
+        )
+        replay = assistant.apply_proposal(
+            AssistantProposalApplyRequest(
+                kind="scenario_model",
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                proposal_id=proposal["proposal_id"],
+                task_id="ontology",
+                confirm=True,
+                allow_partial=True,
+            ),
+            self.db,
+        )
+        self.assertEqual(replay["status"], "replayed")
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            1,
+        )
+        saved = self.db.get(AssistantMessage, _message.id)
+        self.assertEqual(saved.proposal["status"], "completed_with_gaps")
+
+    def test_model_task_runner_always_exposes_one_action_or_a_final_summary(self) -> None:
+        payload = {
+            "tasks": [
+                self._model_task("ontology", 1),
+                self._model_task(
+                    "instances", 2, depends_on=["ontology"], change_count=0
+                ),
+                self._model_task("mapping", 3, depends_on=["ontology"]),
+                self._model_task(
+                    "capabilities", 4, depends_on=["ontology"], change_count=0
+                ),
+                self._model_task(
+                    "rules",
+                    5,
+                    depends_on=["ontology", "capabilities"],
+                    change_count=0,
+                ),
+                self._model_task(
+                    "workflows",
+                    6,
+                    depends_on=["ontology", "capabilities", "rules"],
+                    change_count=0,
+                ),
+            ],
+            "unresolved": [],
+        }
+
+        first = assistant._refresh_model_task_states(payload)
+        first_by_id = {item["id"]: item for item in first["tasks"]}
+        self.assertEqual(first["current_task_id"], "ontology")
+        self.assertEqual(first["execution_status"], "waiting_for_confirmation")
+        self.assertEqual(first["next_action"]["type"], "confirm_task")
+        self.assertEqual(first_by_id["mapping"]["status"], "waiting")
+        self.assertEqual(first_by_id["capabilities"]["status"], "empty")
+
+        second = assistant._refresh_model_task_states(
+            first,
+            applied_task_id="ontology",
+            applied_status="applied",
+        )
+        self.assertEqual(second["current_task_id"], "mapping")
+        self.assertEqual(second["next_action"]["task_id"], "mapping")
+
+        final = assistant._refresh_model_task_states(
+            second,
+            applied_task_id="mapping",
+            applied_status="applied",
+        )
+        self.assertEqual(final["current_task_id"], "")
+        self.assertEqual(final["execution_status"], "completed")
+        self.assertTrue(final["execution_summary"]["final"])
+        self.assertEqual(final["next_action"]["type"], "refine_model")
+        self.assertTrue(all(
+            item["status"] in assistant._MODEL_TASK_TERMINAL_STATUSES
+            for item in final["tasks"]
+        ))
+
+    def test_mapping_deferred_issues_are_grouped_by_reported_root_cause(self) -> None:
+        issues = [
+            {
+                "code": "document_reported_issue",
+                "reported_code": "MAPPING_DEFERRED_NO_DATA_SOURCE",
+                "message": f"逻辑映射 {index} 尚未绑定物理数据源",
+                "blocking": False,
+                "source_refs": [f"mapping-brief:p{index:04d}"],
+                "resolution_hint": "接入数据源后绑定现有逻辑映射。",
+            }
+            for index in range(1, 81)
+        ]
+        plan_payload = {
+            section: [] for section in assistant._SCENARIO_MODEL_RESOURCE_SECTIONS
+        }
+        plan_payload.update({
+            "conceptual_mappings": [{
+                "key": "conceptual_mapping.unbound_project",
+            }],
+            "changes": [],
+            "unresolved": issues,
+        })
+        tasks = scenario_model_compiler.build_model_task_plan(plan_payload)
+        mapping_task = next(item for item in tasks if item["id"] == "mapping")
+        self.assertEqual(mapping_task["output_count"], 1)
+        self.assertEqual(mapping_task["draft_output_count"], 1)
+        self.assertEqual(len(mapping_task["issues"]), 20)
+        self.assertTrue(all(
+            item["reported_code"] == "MAPPING_DEFERRED_NO_DATA_SOURCE"
+            for item in mapping_task["issues"]
+        ))
+
+        result = assistant._refresh_model_task_states({
+            **plan_payload,
+            "tasks": tasks,
+        })
+
+        self.assertEqual(result["execution_status"], "waiting_for_confirmation")
+        self.assertEqual(result["current_task_id"], "mapping")
+        self.assertFalse(result["execution_summary"]["final"])
+
+        # Draft-only work is no longer auto-accepted.  The explicit decision
+        # records that no governed definition was written before the plan may
+        # finish with gaps.
+        result = assistant._refresh_model_task_states(
+            result,
+            applied_task_id="mapping",
+            applied_status="drafted_with_gaps",
+        )
+        summary = result["execution_summary"]
+        self.assertEqual(result["execution_status"], "completed_with_gaps")
+        self.assertTrue(summary["final"])
+        self.assertEqual(summary["total_task_count"], 6)
+        self.assertEqual(summary["completed_task_count"], 6)
+        self.assertEqual(summary["remaining_issue_count"], 80)
+        self.assertEqual(summary["remaining_issue_group_count"], 1)
+        self.assertEqual(len(summary["issue_groups"]), 1)
+        self.assertEqual(summary["issue_groups"][0]["code"], "DATA_SOURCE_DEPENDENCY")
+        self.assertEqual(summary["issue_groups"][0]["count"], 80)
+        self.assertEqual(summary["issue_groups"][0]["blocking_count"], 0)
+        self.assertTrue(summary["issue_groups"][0]["requires_followup"])
+
+    def test_zero_safe_blocker_preserves_all_drafts_and_finishes_with_gaps(self) -> None:
+        blocker = {
+            "code": "MISSING_REQUIRED_PROPERTY",
+            "message": "缺少项目主键定义",
+            "blocking": True,
+            "source_refs": ["brief:p0001"],
+            "resolution_hint": "确认项目编号字段后重新编译。",
+        }
+        payload = {
+            "tasks": [
+                self._model_task(
+                    "ontology",
+                    1,
+                    safe_change_count=0,
+                    issues=[blocker],
+                ),
+                self._model_task(
+                    "instances", 2, depends_on=["ontology"], change_count=0
+                ),
+                self._model_task("mapping", 3, depends_on=["ontology"]),
+                self._model_task("capabilities", 4, change_count=0),
+                self._model_task("rules", 5, change_count=0),
+                self._model_task("workflows", 6, change_count=0),
+            ],
+            "unresolved": [blocker],
+        }
+
+        result = assistant._refresh_model_task_states(payload)
+        by_id = {item["id"]: item for item in result["tasks"]}
+        self.assertEqual(by_id["ontology"]["status"], "blocked")
+        self.assertEqual(by_id["mapping"]["status"], "waiting")
+        self.assertEqual(by_id["capabilities"]["status"], "empty")
+        self.assertEqual(result["current_task_id"], "ontology")
+        self.assertFalse(result["execution_summary"]["final"])
+
+        result = assistant._refresh_model_task_states(
+            result,
+            applied_task_id="ontology",
+            applied_status="drafted_with_gaps",
+        )
+        self.assertEqual(result["current_task_id"], "mapping")
+        result = assistant._refresh_model_task_states(
+            result,
+            applied_task_id="mapping",
+            applied_status="drafted_with_gaps",
+        )
+        self.assertEqual(result["execution_status"], "completed_with_gaps")
+        self.assertTrue(result["execution_summary"]["final"])
+        self.assertGreaterEqual(result["execution_summary"]["remaining_issue_count"], 1)
+        self.assertIn(
+            "确认项目编号字段后重新编译。",
+            result["execution_summary"]["resolution_hints"],
+        )
+        self.assertEqual(result["next_action"]["type"], "refine_model")
+
+    def test_malformed_task_identity_or_dependency_finishes_as_recoverable_draft(self) -> None:
+        duplicate = assistant._refresh_model_task_states({
+            "tasks": [
+                self._model_task("ontology", 1),
+                self._model_task("ontology", 2),
+            ],
+            "unresolved": [],
+        })
+        self.assertEqual(duplicate["execution_status"], "completed_with_gaps")
+        self.assertEqual(duplicate["current_task_id"], "")
+        self.assertTrue(duplicate["execution_summary"]["final"])
+        self.assertEqual(duplicate["next_action"]["type"], "refine_model")
+        self.assertTrue(all(
+            item["status"] == "drafted_with_gaps" for item in duplicate["tasks"]
+        ))
+        self.assertTrue(any(
+            item["code"] == "INVALID_TASK_PLAN"
+            for item in duplicate["execution_summary"]["remaining_issues"]
+        ))
+
+        cycle = assistant._refresh_model_task_states({
+            "tasks": [
+                self._model_task("ontology", 1, depends_on=["mapping"]),
+                self._model_task("mapping", 2, depends_on=["ontology"]),
+            ],
+            "unresolved": [],
+        })
+        self.assertEqual(cycle["execution_status"], "completed_with_gaps")
+        self.assertEqual(cycle["current_task_id"], "")
+        self.assertTrue(cycle["execution_summary"]["final"])
+        self.assertTrue(any(
+            item["code"] == "INVALID_TASK_DEPENDENCY"
+            for item in cycle["execution_summary"]["remaining_issues"]
+        ))
+
+    def test_malformed_scalar_lifecycle_fields_finish_with_a_recoverable_summary(self) -> None:
+        result = assistant._refresh_model_task_states({
+            "tasks": "not-a-task-list",
+            "current_task_id": 7,
+            "execution_status": ["running"],
+            "execution_summary": "not-a-summary",
+            "execution_revision": "NaN",
+            "next_action": 42,
+            "unresolved": "not-an-issue-list",
+            "changes": [],
+        })
+
+        self.assertEqual(result["execution_status"], "completed_with_gaps")
+        self.assertEqual(result["current_task_id"], "")
+        self.assertTrue(result["execution_summary"]["final"])
+        self.assertEqual(result["execution_revision"], 1)
+        self.assertEqual(result["next_action"]["type"], "refine_model")
+        self.assertTrue(any(
+            issue["code"] == "INVALID_TASK_PLAN"
+            for issue in result["execution_summary"]["remaining_issues"]
+        ))
+
+    def test_malformed_task_scalar_fields_are_lazily_persisted_as_gaps(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="畸形任务字段恢复",
+            namespace="malformed-task-scalars",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        malformed_task = self._model_task("ontology", 1)
+        malformed_task.update({
+            "depends_on": 7,
+            "issues": 42,
+            "change_count": "NaN",
+            "safe_change_count": "NaN",
+            "compiled_safe_change_count": "NaN",
+        })
+        proposal = {
+            "proposal_id": "malformed-task-scalars-proposal",
+            "kind": "scenario_model",
+            "title": "畸形任务字段",
+            "summary": "历史生命周期 JSON 含标量漂移",
+            "payload": {
+                "schema_version": "scenario_model.v1",
+                "tasks": [malformed_task],
+                "current_task_id": 7,
+                "execution_status": "running",
+                "execution_summary": "not-a-summary",
+                "execution_revision": "NaN",
+                "next_action": 42,
+                "unresolved": 99,
+                "changes": [],
+            },
+            "changes": [],
+            "base_snapshot": assistant._scenario_snapshot(scenario),
+            "requires_confirmation": True,
+            "status": "in_progress",
+        }
+        thread, message = self._proposal_message(
+            kind="scenario_model",
+            proposal=proposal,
+            scenario=scenario,
+        )
+
+        recovered = assistant.list_thread_messages(
+            thread.id,
+            scenario_id=scenario.id,
+            path=f"/scenarios/{scenario.id}",
+            db=self.db,
+        )[-1].proposal
+
+        self.assertEqual(recovered["status"], "completed_with_gaps")
+        self.assertEqual(
+            recovered["payload"]["execution_status"],
+            "completed_with_gaps",
+        )
+        self.assertEqual(recovered["payload"]["current_task_id"], "")
+        self.assertTrue(recovered["payload"]["execution_summary"]["final"])
+        self.assertEqual(recovered["payload"]["next_action"]["type"], "refine_model")
+        with Session(self.engine) as reopened_db:
+            saved = reopened_db.get(AssistantMessage, message.id)
+            self.assertEqual(
+                saved.proposal["payload"]["execution_status"],
+                "completed_with_gaps",
+            )
+            self.assertEqual(saved.context["status"], "success")
+
+    def test_complete_looking_deadlock_is_lazily_repaired_to_one_current_task(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="无当前任务的旧计划",
+            namespace="deadlocked-complete-shape",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        proposal = {
+            "proposal_id": "deadlocked-complete-shape-proposal",
+            "kind": "scenario_model",
+            "title": "外形完整但无法继续的计划",
+            "summary": "final=false 但 current_task_id 为空",
+            "payload": {
+                "schema_version": "scenario_model.v1",
+                "tasks": [
+                    self._model_task("ontology", 1),
+                    self._model_task(
+                        "mapping",
+                        2,
+                        depends_on=["ontology"],
+                        change_count=0,
+                    ),
+                ],
+                "current_task_id": "",
+                "execution_status": "waiting_for_confirmation",
+                "execution_summary": {
+                    "final": False,
+                    "status": "waiting_for_confirmation",
+                    "current_task_id": "",
+                },
+                "execution_revision": 6,
+                "next_action": {
+                    "type": "confirm_task",
+                    "task_id": "",
+                    "requires_confirmation": True,
+                },
+                "unresolved": [],
+                "changes": [],
+            },
+            "changes": [],
+            "base_snapshot": assistant._scenario_snapshot(scenario),
+            "requires_confirmation": True,
+            "status": "in_progress",
+        }
+        thread, message = self._proposal_message(
+            kind="scenario_model",
+            proposal=proposal,
+            scenario=scenario,
+        )
+
+        recovered = assistant.list_thread_messages(
+            thread.id,
+            scenario_id=scenario.id,
+            path=f"/scenarios/{scenario.id}",
+            db=self.db,
+        )[-1].proposal
+
+        self.assertEqual(recovered["payload"]["current_task_id"], "ontology")
+        self.assertEqual(
+            recovered["payload"]["execution_status"],
+            "waiting_for_confirmation",
+        )
+        self.assertFalse(recovered["payload"]["execution_summary"]["final"])
+        self.assertEqual(recovered["payload"]["next_action"]["task_id"], "ontology")
+        self.assertEqual(recovered["run_revision"], 7)
+        with Session(self.engine) as reopened_db:
+            saved = reopened_db.get(AssistantMessage, message.id)
+            self.assertEqual(saved.proposal["payload"]["current_task_id"], "ontology")
+            self.assertEqual(saved.context["run_revision"], 7)
+
+    def test_transitional_task_plan_is_upgraded_with_summary_and_next_action(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="过渡任务计划",
+            namespace="transitional-task-plan",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        transitional_payload = {
+            "schema_version": "scenario_model.v1",
+            "tasks": [
+                self._model_task("ontology", 1),
+                self._model_task(
+                    "mapping", 2, depends_on=["ontology"], change_count=0
+                ),
+            ],
+            "current_task_id": "ontology",
+            "execution_status": "ready",
+            "unresolved": [],
+            "changes": [],
+        }
+        proposal = {
+            "proposal_id": "transitional-task-proposal",
+            "kind": "scenario_model",
+            "title": "旧版任务清单",
+            "summary": "已有任务但缺少持续执行元数据",
+            "payload": transitional_payload,
+            "changes": [],
+            "base_snapshot": assistant._scenario_snapshot(scenario),
+            "requires_confirmation": True,
+            "status": "in_progress",
+        }
+        thread, message = self._proposal_message(
+            kind="scenario_model",
+            proposal=proposal,
+            scenario=scenario,
+        )
+
+        recovered = assistant.list_thread_messages(
+            thread.id,
+            scenario_id=scenario.id,
+            path=f"/scenarios/{scenario.id}",
+            db=self.db,
+        )[-1].proposal
+
+        self.assertEqual(recovered["payload"]["current_task_id"], "ontology")
+        self.assertEqual(
+            recovered["payload"]["execution_status"],
+            "waiting_for_confirmation",
+        )
+        self.assertFalse(recovered["payload"]["execution_summary"]["final"])
+        self.assertEqual(recovered["payload"]["next_action"]["type"], "confirm_task")
+        self.assertEqual(recovered["payload"]["next_action"]["task_id"], "ontology")
+        self.db.refresh(message)
+        self.assertEqual(message.context["status"], "waiting_confirmation")
+
+    def test_defer_task_persists_final_summary_instead_of_ending_silently(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="保留草稿计划",
+            namespace="deferred-draft-plan",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        model_payload = assistant._refresh_model_task_states({
+            "schema_version": "scenario_model.v1",
+            "tasks": [
+                self._model_task("ontology", 1),
+                self._model_task(
+                    "instances", 2, depends_on=["ontology"], change_count=0
+                ),
+                self._model_task("mapping", 3, depends_on=["ontology"]),
+                self._model_task("capabilities", 4, change_count=0),
+                self._model_task("rules", 5, change_count=0),
+                self._model_task("workflows", 6, change_count=0),
+            ],
+            "unresolved": [],
+            "changes": [],
+        })
+        proposal = {
+            "proposal_id": "deferred-draft-proposal",
+            "kind": "scenario_model",
+            "title": "持续建模计划",
+            "summary": "测试保留草稿后继续推进",
+            "payload": model_payload,
+            "changes": [],
+            "base_snapshot": assistant._scenario_snapshot(scenario),
+            "requires_confirmation": True,
+            "status": "in_progress",
+        }
+        thread, message = self._proposal_message(
+            kind="scenario_model",
+            proposal=proposal,
+            scenario=scenario,
+        )
+
+        with self.assertRaises(HTTPException) as blocked:
             assistant.apply_proposal(
                 AssistantProposalApplyRequest(
                     kind="scenario_model",
                     scenario_id=scenario.id,
                     thread_id=thread.id,
                     proposal_id=proposal["proposal_id"],
+                    task_id="mapping",
                     confirm=True,
                 ),
                 self.db,
             )
+        self.assertEqual(blocked.exception.status_code, 409)
+
+        result = assistant.apply_proposal(
+            AssistantProposalApplyRequest(
+                kind="scenario_model",
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                proposal_id=proposal["proposal_id"],
+                task_id="ontology",
+                task_action="defer",
+                confirm=True,
+            ),
+            self.db,
+        )
+
+        self.assertEqual(result["data"]["task_status"], "deferred")
+        self.assertFalse(result["execution_summary"]["final"])
+        self.assertEqual(result["execution_summary"]["status"], "waiting_for_confirmation")
+        self.assertEqual(result["next_action"]["task_id"], "mapping")
+
+        result = assistant.apply_proposal(
+            AssistantProposalApplyRequest(
+                kind="scenario_model",
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                proposal_id=proposal["proposal_id"],
+                task_id="mapping",
+                task_action="defer",
+                confirm=True,
+            ),
+            self.db,
+        )
+        self.assertEqual(result["data"]["task_status"], "deferred")
+        self.assertTrue(result["execution_summary"]["final"])
+        self.assertEqual(result["execution_summary"]["status"], "completed_with_gaps")
+        self.assertEqual(result["next_action"]["type"], "refine_model")
+        saved = self.db.get(AssistantMessage, message.id)
+        self.assertEqual(saved.proposal["status"], "completed_with_gaps")
+        self.assertEqual(saved.proposal["payload"]["current_task_id"], "")
+        self.assertEqual(saved.context["status"], "success")
+        self.assertIn("全部 6 项任务均已完成本轮确认", saved.content)
+        self.assertIn("可继续优化的草稿", saved.content)
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(OntologyEntity)),
             0,
+        )
+
+        replay = assistant.apply_proposal(
+            AssistantProposalApplyRequest(
+                kind="scenario_model",
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                proposal_id=proposal["proposal_id"],
+                task_id="ontology",
+                task_action="defer",
+                confirm=True,
+            ),
+            self.db,
+        )
+        self.assertEqual(replay["status"], "replayed")
+        self.assertEqual(
+            replay["proposal"]["payload"]["execution_status"],
+            "completed_with_gaps",
+        )
+
+    def test_compound_scenario_model_applies_one_task_and_replays_that_task(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="任务化建模",
+            namespace="task-model",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        source_bundle = scenario_model_compiler.build_source_bundle(
+            "",
+            [{
+                "id": "task-model-apply",
+                "filename": "任务化建模.md",
+                "text": "项目以项目编号唯一标识。",
+            }],
+        )
+        payload = scenario_model_compiler.normalize_scenario_model(
+            self.db,
+            scenario,
+            {
+                "schema_version": "scenario_model.v1",
+                "entities": [{
+                    "key": "entity.project",
+                    "name": "项目",
+                    "properties": [{
+                        "name": "项目编号",
+                        "data_type": "string",
+                        "is_key": True,
+                        "is_title": True,
+                        "is_required": True,
+                    }],
+                    "evidence_refs": ["task-model-apply:p0001"],
+                    "confidence": 1.0,
+                }],
+                "relations": [],
+                "functions": [],
+                "actions": [],
+                "rules": [],
+                "events": [],
+                "workflows": [],
+                "mappings": [],
+                "unresolved": [],
+                "coverage": [{
+                    "source_ref": "task-model-apply:p0001",
+                    "status": "modeled",
+                    "reason": "项目对象与主键",
+                    "change_keys": ["entity.project"],
+                }],
+            },
+            source_bundle=source_bundle,
+        )
+        proposal = assistant._build_proposal("scenario_model", payload, scenario)
+        ontology_task = next(item for item in proposal["payload"]["tasks"] if item["id"] == "ontology")
+        self.assertEqual(ontology_task["status"], "ready")
+        thread, message = self._proposal_message(
+            kind="scenario_model",
+            proposal=proposal,
+            scenario=scenario,
         )
 
         result = assistant.apply_proposal(
@@ -495,20 +1228,234 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 scenario_id=scenario.id,
                 thread_id=thread.id,
                 proposal_id=proposal["proposal_id"],
+                task_id="ontology",
                 confirm=True,
-                allow_partial=True,
             ),
             self.db,
         )
-        self.assertTrue(result["data"]["partial"])
-        self.assertEqual(result["data"]["safe_change_count"], 2)
-        self.assertEqual(result["data"]["blocked_issue_count"], 1)
+        self.assertEqual(result["data"]["task_status"], "applied")
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(OntologyEntity)),
             1,
         )
-        saved = self.db.get(AssistantMessage, _message.id)
-        self.assertEqual(saved.proposal["status"], "partially_applied")
+        saved = self.db.get(AssistantMessage, message.id)
+        self.assertEqual(saved.proposal["payload"]["current_task_id"], "")
+        self.assertEqual(saved.proposal["payload"]["execution_status"], "completed")
+        self.assertTrue(saved.proposal["payload"]["execution_summary"]["final"])
+        self.assertEqual(saved.proposal["status"], "applied")
+        self.assertIn("全部 6 项任务均已完成", saved.content)
+        self.assertEqual(
+            next(item for item in saved.proposal["payload"]["tasks"] if item["id"] == "ontology")["status"],
+            "applied",
+        )
+        self.assertTrue(all(
+            item["status"] in {"applied", "empty"}
+            for item in saved.proposal["payload"]["tasks"]
+        ))
+
+        replay = assistant.apply_proposal(
+            AssistantProposalApplyRequest(
+                kind="scenario_model",
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                proposal_id=proposal["proposal_id"],
+                task_id="ontology",
+                confirm=True,
+            ),
+            self.db,
+        )
+        self.assertEqual(replay["status"], "replayed")
+        self.assertEqual(replay["proposal"]["payload"]["execution_status"], "completed")
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            1,
+        )
+
+        scenario.description = "任务应用后由另一个请求补充了场景说明"
+        self.db.commit()
+        replay_after_external_change = assistant.apply_proposal(
+            AssistantProposalApplyRequest(
+                kind="scenario_model",
+                scenario_id=scenario.id,
+                thread_id=thread.id,
+                proposal_id=proposal["proposal_id"],
+                task_id="ontology",
+                confirm=True,
+            ),
+            self.db,
+        )
+        self.assertEqual(replay_after_external_change["status"], "replayed")
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            1,
+        )
+
+    def test_scenario_model_without_task_id_is_rejected_even_for_an_empty_plan(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="拒绝整体应用",
+            namespace="reject-whole-model-apply",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        active_payload = assistant._refresh_model_task_states({
+            "schema_version": "scenario_model.v1",
+            "tasks": [self._model_task("ontology", 1)],
+            "unresolved": [],
+            "changes": [],
+        })
+        proposals = [
+            {
+                "proposal_id": "taskful-model-without-task-id",
+                "kind": "scenario_model",
+                "title": "仍有当前任务的计划",
+                "summary": "必须逐项确认",
+                "payload": active_payload,
+                "changes": [],
+                "base_snapshot": assistant._scenario_snapshot(scenario),
+                "requires_confirmation": True,
+                "status": "in_progress",
+            },
+            {
+                "proposal_id": "empty-model-without-task-id",
+                "kind": "scenario_model",
+                "title": "历史空任务计划",
+                "summary": "即使为空也不能退回旧整体应用路径",
+                "payload": {
+                    "schema_version": "scenario_model.v1",
+                    "tasks": [],
+                    "unresolved": [],
+                    "changes": [],
+                },
+                "changes": [],
+                "base_snapshot": assistant._scenario_snapshot(scenario),
+                "requires_confirmation": False,
+                "status": "applied",
+                "apply_result": {"kind": "scenario_model"},
+            },
+        ]
+
+        for proposal in proposals:
+            with self.subTest(proposal_id=proposal["proposal_id"]):
+                thread, _message = self._proposal_message(
+                    kind="scenario_model",
+                    proposal=proposal,
+                    scenario=scenario,
+                )
+                with self.assertRaises(HTTPException) as rejected:
+                    assistant.apply_proposal(
+                        AssistantProposalApplyRequest(
+                            kind="scenario_model",
+                            scenario_id=scenario.id,
+                            thread_id=thread.id,
+                            proposal_id=proposal["proposal_id"],
+                            confirm=True,
+                        ),
+                        self.db,
+                    )
+                self.assertEqual(rejected.exception.status_code, 409)
+
+    def test_claim_conflict_replay_returns_latest_run_revision_and_current_task(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="并发任务重放",
+            namespace="concurrent-task-replay",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        initial_payload = assistant._refresh_model_task_states({
+            "schema_version": "scenario_model.v1",
+            "tasks": [
+                self._model_task("ontology", 1),
+                self._model_task("mapping", 2),
+            ],
+            "unresolved": [],
+            "changes": [],
+        })
+        proposal = {
+            "proposal_id": "concurrent-task-replay-proposal",
+            "kind": "scenario_model",
+            "title": "并发任务计划",
+            "summary": "第二个请求必须读取第一个请求提交后的状态",
+            "payload": initial_payload,
+            "changes": [],
+            "base_snapshot": assistant._scenario_snapshot(scenario),
+            "requires_confirmation": True,
+            "status": "in_progress",
+            "run_revision": initial_payload["execution_revision"],
+        }
+        thread, message = self._proposal_message(
+            kind="scenario_model",
+            proposal=proposal,
+            scenario=scenario,
+        )
+        latest_payload = assistant._refresh_model_task_states(
+            initial_payload,
+            applied_task_id="ontology",
+            applied_status="deferred",
+        )
+        latest_proposal = json.loads(json.dumps(proposal))
+        latest_proposal.update({
+            "payload": latest_payload,
+            "run_revision": latest_payload["execution_revision"],
+            "requires_confirmation": True,
+            "status": "in_progress",
+            "apply_result": {
+                "kind": "scenario_model",
+                "task_id": "ontology",
+                "task_status": "deferred",
+                "run_revision": latest_payload["execution_revision"],
+            },
+        })
+        claim_result = {
+            "kind": "scenario_model",
+            "task_id": "ontology",
+            "task_status": "deferred",
+            "run_revision": latest_payload["execution_revision"],
+        }
+
+        def lose_claim_to_committed_request(*_args, **_kwargs):
+            with Session(self.engine) as concurrent_db:
+                concurrent_message = concurrent_db.get(AssistantMessage, message.id)
+                concurrent_message.proposal = latest_proposal
+                concurrent_db.commit()
+            return SimpleNamespace(status="applied", result=claim_result), False
+
+        with patch.object(
+            assistant,
+            "_claim_proposal_application",
+            side_effect=lose_claim_to_committed_request,
+        ):
+            replay = assistant.apply_proposal(
+                AssistantProposalApplyRequest(
+                    kind="scenario_model",
+                    scenario_id=scenario.id,
+                    thread_id=thread.id,
+                    proposal_id=proposal["proposal_id"],
+                    task_id="ontology",
+                    task_action="defer",
+                    confirm=True,
+                ),
+                self.db,
+            )
+
+        self.assertEqual(replay["status"], "replayed")
+        self.assertGreaterEqual(
+            replay["proposal"]["run_revision"],
+            latest_payload["execution_revision"],
+        )
+        self.assertEqual(
+            replay["proposal"]["run_revision"],
+            replay["proposal"]["payload"]["execution_revision"],
+        )
+        self.assertEqual(
+            replay["proposal"]["payload"]["current_task_id"],
+            "mapping",
+        )
+        self.assertEqual(replay["execution_summary"]["current_task_id"], "mapping")
+        self.assertEqual(replay["next_action"]["task_id"], "mapping")
 
     def test_mapping_apply_rejects_stale_or_invented_columns(self) -> None:
         scenario = BusinessScenario(

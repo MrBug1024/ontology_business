@@ -2327,16 +2327,62 @@ def import_instances_from_mapping(
         ds, mapping_connector_audits.get(str(mapping.id))
     )
 
+    # Keep independently refreshed relation endpoints on a compatible slice.
+    # For an FK-backed relation, ordering the carrier by its FK lets the
+    # opposite endpoint's key-ordered sample cover the same business keys;
+    # without this, two large tables can each return valid but disjoint first
+    # pages and relation refresh reports every link as missing.
+    key_prop = next((p.name for p in ent.properties if p.is_key), None)
+    key_col = col_map.get(key_prop) if key_prop else None
+    order_column = key_col
+    relation_candidates = list(relation_mappings or [])
+    has_non_carrier_relation = False
+    for item in relation_candidates:
+        item_mode = str(_relation_mapping_value(item, "mode") or "")
+        if item_mode not in {"source_fk", "target_fk"}:
+            continue
+        item_carrier_id = str(
+            _relation_mapping_value(
+                item,
+                "source_mapping_id" if item_mode == "source_fk" else "target_mapping_id",
+            )
+            or ""
+        )
+        if str(mapping.id) != item_carrier_id:
+            has_non_carrier_relation = True
+            break
+    for relation_mapping in relation_candidates:
+        mode = str(_relation_mapping_value(relation_mapping, "mode") or "")
+        source_mapping_id = str(
+            _relation_mapping_value(relation_mapping, "source_mapping_id") or ""
+        )
+        target_mapping_id = str(
+            _relation_mapping_value(relation_mapping, "target_mapping_id") or ""
+        )
+        carrier_id = source_mapping_id if mode == "source_fk" else target_mapping_id
+        if (
+            not has_non_carrier_relation
+            and mode in {"source_fk", "target_fk"}
+            and str(mapping.id) == carrier_id
+        ):
+            candidate = str(
+                _relation_mapping_value(relation_mapping, "foreign_key_column") or ""
+            )
+            if candidate:
+                order_column = candidate
+                break
+    query = f"SELECT * FROM {_quoted_mapping_table(mapping.table_name, ds.type)}"
+    if order_column:
+        query += f" ORDER BY {_quoted_mapping_column(order_column, ds.type)}"
     result = datasource_service.run_query(
         ds,
-        f"SELECT * FROM {_quoted_mapping_table(mapping.table_name, ds.type)}",
+        query,
         limit=limit,
+        max_rows=limit,
     )
     rows = result.get("rows", [])
     columns = result.get("columns", [])
     # 主键属性
-    key_prop = next((p.name for p in ent.properties if p.is_key), None)
-    key_col = col_map.get(key_prop) if key_prop else None
     title_prop = next((p.name for p in ent.properties if getattr(p, "is_title", False)), None)
     title_col = col_map.get(title_prop) if title_prop else None
 

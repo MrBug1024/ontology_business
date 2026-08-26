@@ -14,6 +14,9 @@
         <marker id="gc-arrow-sel" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto">
           <path d="M0,0 L8,3.5 L0,7 Z" fill="var(--primary)" />
         </marker>
+        <marker id="gc-arrow-focus" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto">
+          <path d="M0,0 L8,3.5 L0,7 Z" fill="var(--accent)" />
+        </marker>
         <linearGradient id="gc-node-bar" x1="0" y1="0" x2="1" y2="0">
           <stop offset="0%" stop-color="var(--graph-teal)" />
           <stop offset="100%" stop-color="var(--graph-blue)" />
@@ -30,19 +33,19 @@
           <path
             :d="e.path"
             fill="none"
-            :stroke="e.selected ? 'var(--primary)' : 'var(--border-strong)'"
-            :stroke-width="e.selected ? 2.6 : 1.6"
+            :stroke="e.selected ? 'var(--accent)' : 'var(--border-strong)'"
+            :stroke-width="e.selected ? 3 : 1.6"
             :stroke-dasharray="e.dashed ? '6 5' : 'none'"
-            :marker-end="e.selected ? 'url(#gc-arrow-sel)' : 'url(#gc-arrow)'"
-            opacity="0.9"
+            :marker-end="e.selected ? 'url(#gc-arrow-focus)' : 'url(#gc-arrow)'"
+            :opacity="e.dimmed ? 0.12 : e.selected ? 1 : 0.72"
           />
           <!-- 加宽命中区 -->
           <path :d="e.path" fill="none" stroke="transparent" stroke-width="14" class="edge-hit" @mousedown.stop @click.stop="onEdgeClick(e)" />
           <g v-if="e.label" class="edge-label" @mousedown.stop @click.stop="onEdgeClick(e)">
             <rect :x="e.mx - e.labelW / 2" :y="e.my - 10" :width="e.labelW" height="18" rx="9"
-              :fill="e.selected ? 'var(--primary)' : 'var(--surface)'" />
+              :fill="e.selected ? 'var(--accent)' : 'var(--surface)'" :opacity="e.dimmed ? 0.18 : 1" />
             <text :x="e.mx" :y="e.my + 3.5" text-anchor="middle" font-size="10.5"
-              :fill="e.selected ? '#fff' : 'var(--primary-600)'" font-weight="600">{{ e.label }}</text>
+              :fill="e.selected ? '#fff' : 'var(--primary-600)'" :opacity="e.dimmed ? 0.2 : 1" font-weight="600">{{ e.label }}</text>
           </g>
         </g>
 
@@ -52,32 +55,32 @@
 
         <!-- 节点 -->
         <g v-for="n in nodes" :key="n.id" :transform="`translate(${n.x},${n.y})`"
-          class="gnode" :class="{ selected: selectedId === n.id }"
+          class="gnode" :class="{ selected: focusNodeId === n.id, connected: connectedNodeIds.has(n.id) && focusNodeId !== n.id, dimmed: hasFocus && !connectedNodeIds.has(n.id) }"
           @mousedown.stop="onNodeMouseDown($event, n)">
           <!-- 光晕 -->
           <circle v-if="mode === 'instance'" :r="(n.size || 16) + 12" fill="url(#gc-glow)" />
           <!-- 实体节点：圆角矩形 -->
           <template v-if="mode === 'schema'">
             <rect :x="-n.w / 2" :y="-n.h / 2" :width="n.w" :height="n.h" rx="16"
-              :fill="'var(--surface)'" :stroke="n.color" :stroke-width="selectedId === n.id ? 2.4 : 1.3" />
+              :fill="'var(--surface)'" :stroke="focusNodeId === n.id ? 'var(--primary)' : n.color" :stroke-width="focusNodeId === n.id ? 3 : connectedNodeIds.has(n.id) ? 2.2 : 1.3" />
             <rect :x="-n.w / 2" :y="-n.h / 2" :width="n.w" height="6" rx="3" fill="url(#gc-node-bar)" />
             <circle :cx="-n.w / 2 + 18" cy="-4" r="5" :fill="n.color" />
             <text :x="-n.w / 2 + 32" y="0" text-anchor="start" font-size="13" font-weight="700" fill="var(--text)">{{ shortLabel(n.label, 17) }}</text>
             <text :x="-n.w / 2 + 16" y="20" text-anchor="start" font-size="10" fill="var(--text-3)">
-              {{ n.meta?.abstract ? '抽象 · ' : '' }}{{ n.meta?.count ?? 0 }} 属性
+              {{ n.meta?.subtype || `${n.meta?.abstract ? '抽象 · ' : ''}${n.meta?.count ?? 0} 属性` }}
             </text>
           </template>
           <!-- 实例节点：信息卡片，标签不再悬浮在圆形下方互相覆盖 -->
           <template v-else>
             <rect :x="-n.w / 2" :y="-n.h / 2" :width="n.w" :height="n.h" rx="15"
-              :fill="'var(--surface)'" :stroke="n.color" :stroke-width="selectedId === n.id ? 2.4 : 1.2" />
+              :fill="'var(--surface)'" :stroke="focusNodeId === n.id ? 'var(--primary)' : n.color" :stroke-width="focusNodeId === n.id ? 3 : connectedNodeIds.has(n.id) ? 2.2 : 1.2" />
             <circle :cx="-n.w / 2 + 18" cy="0" r="7" :fill="n.color" fill-opacity="0.18" :stroke="n.color" />
             <circle :cx="-n.w / 2 + 18" cy="0" r="3" :fill="n.color" />
             <text :x="-n.w / 2 + 34" y="-2" text-anchor="start" font-size="11.5" font-weight="700" fill="var(--text)">{{ shortLabel(n.label, 18) }}</text>
-            <text :x="-n.w / 2 + 34" y="15" text-anchor="start" font-size="9.5" fill="var(--text-3)">{{ shortLabel(n.meta?.entity_name || '实例节点', 14) }}</text>
+            <text :x="-n.w / 2 + 34" y="15" text-anchor="start" font-size="9.5" fill="var(--text-3)">{{ shortLabel(n.meta?.entity_name || '实例节点', 18) }}</text>
           </template>
           <!-- 连线手柄（schema 模式，hover 显示） -->
-          <circle v-if="mode === 'schema'" :cx="n.w / 2" cy="0" r="7" class="link-handle"
+          <circle v-if="mode === 'schema' && !n.meta?.aiDraft" :cx="n.w / 2" cy="0" r="7" class="link-handle"
             :fill="'var(--accent)'" @mousedown.stop="onLinkStart($event, n)" />
         </g>
       </g>
@@ -142,6 +145,21 @@ const wrapW = ref(1000)
 const wrapH = ref(560)
 const nodes = ref<LayoutNode[]>([])
 const view = reactive({ x: 0, y: 0, k: 1 })
+const localSelectedId = ref<string | null>(null)
+
+const focusNodeId = computed(() => props.selectedId || localSelectedId.value)
+const hasFocus = computed(() => Boolean(focusNodeId.value))
+const connectedNodeIds = computed(() => {
+  const focusId = focusNodeId.value
+  const ids = new Set<string>()
+  if (!focusId) return ids
+  ids.add(focusId)
+  for (const edge of props.data.edges) {
+    if (edge.source === focusId) ids.add(edge.target)
+    if (edge.target === focusId) ids.add(edge.source)
+  }
+  return ids
+})
 
 let drag: { node: LayoutNode; ox: number; oy: number; moved: boolean; sx: number; sy: number } | null = null
 let pan: { sx: number; sy: number; ox: number; oy: number; moved: boolean } | null = null
@@ -156,7 +174,8 @@ function H() {
 }
 
 function toGraph(clientX: number, clientY: number) {
-  const rect = wrapRef.value!.getBoundingClientRect()
+  const rect = wrapRef.value?.getBoundingClientRect()
+  if (!rect) return { x: 0, y: 0 }
   return {
     x: (clientX - rect.left - view.x) / view.k,
     y: (clientY - rect.top - view.y) / view.k,
@@ -215,7 +234,8 @@ function zoomBy(factor: number) {
 }
 
 function onWheel(e: WheelEvent) {
-  const rect = wrapRef.value!.getBoundingClientRect()
+  const rect = wrapRef.value?.getBoundingClientRect()
+  if (!rect) return
   const mx = e.clientX - rect.left
   const my = e.clientY - rect.top
   const factor = e.deltaY < 0 ? 1.12 : 0.89
@@ -301,10 +321,16 @@ function onUp(e: MouseEvent) {
   if (drag) {
     drag.node.fx = null
     drag.node.fy = null
-    if (!drag.moved) emit('select', drag.node)
+    if (!drag.moved) {
+      localSelectedId.value = drag.node.id
+      emit('select', drag.node)
+    }
     drag = null
   } else if (pan) {
-    if (!pan.moved) emit('canvas-click')
+    if (!pan.moved) {
+      localSelectedId.value = null
+      emit('canvas-click')
+    }
     pan = null
   }
 }
@@ -341,7 +367,9 @@ const edgeViews = computed(() => {
         label,
         labelW: label.length * 11 + 16,
         dashed: e.relation_type === 'N:M' || e.relation_type === 'many_to_many' || e.type === 'N:M',
-        selected: false,
+        meta: e.meta,
+        selected: Boolean(focusNodeId.value && (e.source === focusNodeId.value || e.target === focusNodeId.value)),
+        dimmed: Boolean(focusNodeId.value && e.source !== focusNodeId.value && e.target !== focusNodeId.value),
       }
     })
 })
@@ -358,6 +386,9 @@ function resize() {
 watch(
   () => [props.data, props.mode],
   () => {
+    if (localSelectedId.value && !props.data.nodes.some((node) => node.id === localSelectedId.value)) {
+      localSelectedId.value = null
+    }
     relayout()
   },
   { immediate: true },
@@ -415,10 +446,18 @@ onBeforeUnmount(() => {
 }
 .gnode {
   cursor: pointer;
+  transition: opacity .18s ease;
 }
 .gnode.selected rect,
 .gnode.selected circle {
-  filter: drop-shadow(0 7px 12px rgba(38, 147, 196, .24));
+  filter: drop-shadow(0 0 8px color-mix(in srgb, var(--primary) 66%, transparent));
+}
+.gnode.connected rect,
+.gnode.connected circle {
+  filter: drop-shadow(0 0 7px color-mix(in srgb, var(--accent) 52%, transparent));
+}
+.gnode.dimmed {
+  opacity: .18;
 }
 .link-handle {
   opacity: 0;

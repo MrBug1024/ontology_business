@@ -297,11 +297,20 @@ def _trace_model(payload: TracePayload) -> LLMInvocationTrace:
 
 
 def _persist_trace(payload: TracePayload, *, db: Session | None = None) -> None:
-    """优先独立提交 trace；SQLite 写锁冲突时退回当前业务事务。"""
-    try:
-        from ..database import SessionLocal
+    """Persist on the caller's database; fall back to its current transaction.
 
-        trace_db = SessionLocal()
+    A request or test session can be bound to a database other than the
+    process-wide default.  Opening the global ``SessionLocal`` in that case
+    would write observability rows into the wrong database and leave dangling
+    foreign keys after the caller's isolated database is removed.
+    """
+    try:
+        if db is not None:
+            trace_db = Session(bind=db.get_bind(), expire_on_commit=False)
+        else:
+            from ..database import SessionLocal
+
+            trace_db = SessionLocal()
         try:
             trace_db.add(_trace_model(payload))
             trace_db.commit()

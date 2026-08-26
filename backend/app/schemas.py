@@ -555,6 +555,71 @@ class BucketFileOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ScenarioModelDraftResourceOut(BaseModel):
+    """An inert resource candidate visible in the scene draft workspace."""
+
+    id: str
+    scenario_id: str
+    proposal_id: str
+    predecessor_draft_id: str = ""
+    predecessor_revision: int = -1
+    superseded_by_proposal_id: str = ""
+    task_id: str = ""
+    resource_kind: Literal[
+        "entity", "property", "relation", "instance", "mapping",
+        "conceptual_mapping", "relation_mapping", "function", "action",
+        "rule", "event", "workflow",
+    ]
+    resource_key: str
+    title: str = ""
+    payload: dict = Field(default_factory=dict)
+    validation_issues: list[dict] = Field(default_factory=list)
+    issues_count: int = 0
+    blocking_issue_count: int = 0
+    draft_status: Literal[
+        "pending_confirmation", "ready_for_review", "needs_attention",
+        "needs_validation", "accepted", "deferred", "applied", "resolved",
+        "superseded",
+    ]
+    enabled: Literal[False] = False
+    publishable: Literal[False] = False
+    resolved_resource_id: str = ""
+    source_thread_id: str = ""
+    source_message_id: str = ""
+    compilation_job_id: str = ""
+    source_refs: list[str] = Field(default_factory=list)
+    revision: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class ScenarioModelDraftResourceListOut(BaseModel):
+    items: list[ScenarioModelDraftResourceOut] = Field(default_factory=list)
+    summary: dict = Field(default_factory=dict)
+    page_summary: dict = Field(default_factory=dict)
+    total: int = 0
+    has_more: bool = False
+    next_offset: int | None = None
+
+
+class ScenarioModelDraftResourcePatch(BaseModel):
+    """Edit the inert working copy; promotion remains a separate governed flow."""
+
+    expected_revision: int = Field(ge=0)
+    payload: dict
+
+    model_config = {"extra": "forbid"}
+
+
+class ScenarioModelDraftResourceResolve(BaseModel):
+    """Link an inert candidate to a verified formal resource in this scene."""
+
+    expected_revision: int = Field(ge=0)
+    resolved_resource_id: str = Field(min_length=1, max_length=64)
+
+    model_config = {"extra": "forbid"}
+
+
 class ArtifactTemplateRegisterIn(BaseModel):
     """Register an existing file-bucket object as version 1 of a template."""
 
@@ -1286,6 +1351,10 @@ class AssistantAttachmentOut(BaseModel):
 
 class AssistantChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=12000)
+    # Every explicit send is a new compilation intent.  Keeping this separate
+    # from the message/attachment content prevents a historical terminal job
+    # from swallowing a later user request with identical wording.
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
     thread_id: str | None = None
     scenario_id: str | None = None
     page: str = ""
@@ -1325,6 +1394,13 @@ class AssistantProposalApplyRequest(BaseModel):
     # opt-in and only selects a dependency-safe subset; the normal preflight
     # still runs unchanged on that subset.
     allow_partial: bool = False
+    # Compound model proposals expose one resumable task at a time.  Omitting
+    # task_id keeps the legacy whole-proposal confirmation path intact.
+    task_id: str | None = Field(default=None, max_length=80)
+    # ``defer`` means the generated draft and its issues remain part of the
+    # run while execution advances. ``skip`` is accepted for older clients and
+    # is normalized to the same recoverable draft-only decision.
+    task_action: Literal["apply", "defer", "skip"] = "apply"
     # 兼容旧客户端字段；服务端应用时始终以已保存消息中的 payload 为准。
     payload: dict = Field(default_factory=dict)
 
@@ -1389,6 +1465,7 @@ class AssistantCompilationJobResultOut(BaseModel):
     proposal: dict = Field(default_factory=dict)
     proposal_thread_id: str | None = None
     proposal_message_id: str | None = None
+    proposal_scope_key: str | None = None
     apply_ready: bool = False
 
 

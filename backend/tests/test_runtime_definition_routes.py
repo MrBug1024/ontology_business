@@ -448,3 +448,31 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
             self.assertIsNotNone(db.get(OntologyWorkflow, self.workflow.id))
         finally:
             db.close()
+
+    def test_user_owned_scenario_with_dev_release_history_can_be_deleted(self) -> None:
+        """Deleting a draft/dev scenario also removes its immutable history."""
+        self._create_staging_release()
+        db = self.Session()
+        try:
+            release = db.get(OntologyRelease, "release-runtime-a")
+            self.assertIsNotNone(release)
+            release.environment = "dev"
+            db.commit()
+            # The application enables SQLite foreign keys.  Turn them on for
+            # this in-memory route fixture too so deletion order is exercised.
+            db.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
+        finally:
+            db.close()
+
+        response = self.client.delete(f"/api/scenarios/{self.scenario.id}")
+        self.assertEqual(response.status_code, 200, response.text)
+
+        db = self.Session()
+        try:
+            db.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
+            self.assertIsNone(db.get(BusinessScenario, self.scenario.id))
+            self.assertIsNone(db.get(OntologyRelease, "release-runtime-a"))
+            self.assertIsNone(db.get(OntologySnapshot, "snapshot-runtime-a"))
+            self.assertIsNone(db.get(OntologyBranch, "branch-runtime"))
+        finally:
+            db.close()

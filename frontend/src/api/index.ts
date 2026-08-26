@@ -7,6 +7,7 @@ import type {
   AssistantCompilationJobResult,
   AssistantCompilationJobStatus,
   AssistantMessage,
+  AssistantProposalApplyResult,
   AssistantThread,
   AuthMessage,
   BucketFile,
@@ -39,6 +40,10 @@ import type {
   ObjectSearchResult,
   Scenario,
   ScenarioDetail,
+  ScenarioModelDraftListResponse,
+  ScenarioModelDraftResolve,
+  ScenarioModelDraftResource,
+  ScenarioModelDraftUpdate,
   Skill,
   TableInfo,
   User,
@@ -129,12 +134,19 @@ export const api = {
     http.get<AssistantCompilationJobStatus>(`/assistant/compilation-jobs/${jobId}`),
   getAssistantCompilationJobResult: (jobId: string) =>
     http.get<AssistantCompilationJobResult>(`/assistant/compilation-jobs/${jobId}/result`),
-  applyAssistantProposal: (d: { kind: 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'; scenario_id?: string; thread_id: string; proposal_id: string; confirm: boolean; allow_partial?: boolean }) =>
-    http.post('/assistant/proposals/apply', d),
+  applyAssistantProposal: (d: { kind: 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'; scenario_id?: string; thread_id: string; proposal_id: string; confirm: boolean; allow_partial?: boolean; task_id?: string; task_action?: 'apply' | 'defer' | 'skip' }) =>
+    http.post<AssistantProposalApplyResult>('/assistant/proposals/apply', d),
 
   // 场景
   listScenarios: () => http.get<Scenario[]>('/scenarios'),
-  getScenario: (id: string) => http.get<ScenarioDetail>(`/scenarios/${id}`),
+  getScenario: (id: string, params: { include_runtime_facts?: boolean } = {}) =>
+    http.get<ScenarioDetail>(`/scenarios/${id}`, { params }),
+  listScenarioModelDrafts: (id: string, params: { offset?: number; limit?: number; include_issues?: boolean } = {}) =>
+    http.get<ScenarioModelDraftListResponse>(`/scenarios/${id}/model-drafts`, { params }),
+  updateScenarioModelDraft: (scenarioId: string, draftId: string, update: ScenarioModelDraftUpdate) =>
+    http.patch<ScenarioModelDraftResource>(`/scenarios/${scenarioId}/model-drafts/${draftId}`, update),
+  resolveScenarioModelDraft: (scenarioId: string, draftId: string, resolution: ScenarioModelDraftResolve) =>
+    http.post<ScenarioModelDraftResource>(`/scenarios/${scenarioId}/model-drafts/${draftId}/resolve`, resolution),
   createScenario: (d: Partial<Scenario>) => http.post<Scenario>('/scenarios', d),
   updateScenario: (id: string, d: Partial<Scenario>) => http.put<Scenario>(`/scenarios/${id}`, d),
   deleteScenario: (id: string) => http.delete(`/scenarios/${id}`),
@@ -435,6 +447,7 @@ export function streamChat(
 export function streamAssistantChat(
   payload: {
     message: string
+    request_id?: string
     thread_id?: string
     scenario_id?: string
     page?: string

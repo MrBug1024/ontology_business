@@ -47,6 +47,20 @@ class _Column:
     transforms: tuple[dict[str, Any], ...]
 
 
+@dataclass(frozen=True)
+class BusinessQueryPlan:
+    source: Any
+    sql: str
+    parameters: dict[str, Any]
+    limit: int
+    offset: int
+    offset_explicit: bool
+    projected_columns: tuple[_Column, ...]
+    output_labels: tuple[str, ...]
+    expected_columns: tuple[str, ...]
+    scope: dict[str, Any]
+
+
 def _object(value: Any, label: str) -> dict[str, Any]:
     if hasattr(value, "model_dump"):
         value = value.model_dump()
@@ -167,6 +181,12 @@ def _normalize_limit(value: Any) -> int:
         return min(100, maximum)
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
         raise BusinessQueryError(f"limit 必须介于 1 和 {maximum} 之间")
+    return value
+
+
+def _normalize_offset(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BusinessQueryError("offset 必须是非负整数")
     return value
 
 
@@ -468,7 +488,7 @@ def _filter_sql(
     return clauses
 
 
-def query_business_data(
+def prepare_query(
     db: Session,
     *,
     definition: Any,
@@ -479,7 +499,7 @@ def query_business_data(
     request = _object(args, "业务查询参数")
     allowed = {
         "base_entity", "base_properties", "base_filters", "related_entities",
-        "group_by", "aggregations", "having", "sort", "limit",
+        "group_by", "aggregations", "having", "sort", "limit", "offset",
     }
     unknown = set(request) - allowed
     if unknown:
@@ -712,53 +732,152 @@ def query_business_data(
     if sort_sql:
         sql += " ORDER BY " + ", ".join(sort_sql)
     limit = _normalize_limit(request.get("limit"))
+    offset_explicit = "offset" in request
+    offset = _normalize_offset(request.get("offset", 0))
     parameters["bq_limit"] = limit + 1
-    sql += " LIMIT :bq_limit"
+    parameters["bq_offset"] = offset
+    sql += " LIMIT :bq_limit OFFSET :bq_offset"
+
+    expected_columns = tuple(
+        [f"q_col_{index}" for index in range(len(columns))]
+        + [f"q_agg_{index}" for index, _raw in enumerate(raw_aggregations)]
+    )
+    scope = {
+        "entities": [str(base.entity.name)]
+        + [str(plan.entity.name) for plan, _item, _alias in related],
+        "data_source_id": str(base.source.id),
+        "data_source_connector_revision": int(
+            getattr(base.source, "connector_revision", 0) or 0
+        ),
+        "definition_hash": str(getattr(definition, "definition_hash", "") or ""),
+        "mapping_ids": [str(base.mapping.id)]
+        + [str(plan.mapping.id) for plan, _item, _alias in related],
+    }
+    return BusinessQueryPlan(
+        source=base.source,
+        sql=sql,
+        parameters=parameters,
+        limit=limit,
+        offset=offset,
+        offset_explicit=offset_explicit,
+        projected_columns=tuple(columns),
+        output_labels=tuple(output_labels),
+        expected_columns=expected_columns,
+        scope=scope,
+    )
+
+
+def execute_query(plan: BusinessQueryPlan) -> dict[str, Any]:
+    """Execute one prepared business query and project its semantic page."""
 
     try:
         raw = datasource_service.run_parameterized_query(
-            base.source, sql, parameters, limit=limit
+            plan.source, plan.sql, plan.parameters, limit=plan.limit
         )
     except Exception as exc:  # noqa: BLE001 - connector details stay server-side.
         raise BusinessQueryError("业务查询执行失败，请检查数据源连接、数据映射和关联配置") from exc
     if not isinstance(raw, Mapping) or not isinstance(raw.get("rows"), list):
         raise BusinessQueryError("业务查询返回了无效结果")
     raw_columns = list(raw.get("columns") or [])
-    expected_columns = [f"q_col_{index}" for index in range(len(columns))] + [
-        f"q_agg_{index}"
-        for index, _raw in enumerate(raw_aggregations)
-    ]
-    if raw_columns != expected_columns:
+    if raw_columns != list(plan.expected_columns):
         raise BusinessQueryError("业务查询返回列与固定查询计划不一致")
+    if len(raw["rows"]) > plan.limit:
+        raise BusinessQueryError("业务查询返回行数无效")
     records: list[dict[str, Any]] = []
     for row in raw["rows"]:
-        if not isinstance(row, (list, tuple)) or len(row) != len(output_labels):
+        if not isinstance(row, (list, tuple)) or len(row) != len(plan.output_labels):
             raise BusinessQueryError("业务查询返回行结构无效")
         projected: dict[str, Any] = {}
-        for index, (label, value) in enumerate(zip(output_labels, row, strict=True)):
-            if index < len(columns):
+        for index, (label, value) in enumerate(
+            zip(plan.output_labels, row, strict=True)
+        ):
+            if index < len(plan.projected_columns):
                 try:
                     value = ontology_service.apply_transform_rules(
-                        value, list(columns[index].transforms)
+                        value, list(plan.projected_columns[index].transforms)
                     )
                 except (TypeError, ValueError) as exc:
                     raise BusinessQueryError(
-                        f"属性“{columns[index].property_name}”的数据转换失败，请检查映射规则"
+                        f"属性“{plan.projected_columns[index].property_name}”的数据转换失败，请检查映射规则"
                     ) from exc
             projected[label] = value
         records.append(projected)
+    truncated = bool(raw.get("truncated", False))
     return {
         "records": records,
-        "columns": output_labels,
+        "columns": list(plan.output_labels),
         "row_count": len(records),
-        "truncated": bool(raw.get("truncated", False)),
-        "scope": {
-            "entities": [str(base.entity.name)] + [str(plan.entity.name) for plan, _item, _alias in related],
-            "data_source_id": str(base.source.id),
-            "data_source_connector_revision": int(
-                getattr(base.source, "connector_revision", 0) or 0
-            ),
-            "definition_hash": str(getattr(definition, "definition_hash", "") or ""),
-            "mapping_ids": [str(base.mapping.id)] + [str(plan.mapping.id) for plan, _item, _alias in related],
-        },
+        "truncated": truncated,
+        "offset": plan.offset,
+        "next_offset": plan.offset + len(records) if truncated else None,
+        "scope": plan.scope,
     }
+
+
+def query_business_data(
+    db: Session,
+    *,
+    definition: Any,
+    mappings: Sequence[Any],
+    data_sources: Sequence[Any],
+    args: Any,
+) -> dict[str, Any]:
+    plan = prepare_query(
+        db,
+        definition=definition,
+        mappings=mappings,
+        data_sources=data_sources,
+        args=args,
+    )
+    return execute_query(plan)
+
+
+def authorize_historic_result(plan: BusinessQueryPlan, result: Any) -> bool:
+    """Re-authorize one persisted page against the current business plan."""
+    if not isinstance(result, Mapping):
+        return False
+    if result.get("scope") != plan.scope:
+        return False
+    if result.get("columns") != list(plan.output_labels):
+        return False
+    records = result.get("records")
+    if not isinstance(records, list) or len(records) > plan.limit:
+        return False
+    expected_keys = set(plan.output_labels)
+    if any(
+        not isinstance(record, Mapping) or set(record) != expected_keys
+        for record in records
+    ):
+        return False
+    row_count = result.get("row_count")
+    if (
+        isinstance(row_count, bool)
+        or not isinstance(row_count, int)
+        or row_count != len(records)
+    ):
+        return False
+    truncated = result.get("truncated")
+    if not isinstance(truncated, bool):
+        return False
+    has_offset = "offset" in result
+    has_next_offset = "next_offset" in result
+    if not has_offset and not has_next_offset:
+        return not plan.offset_explicit and plan.offset == 0
+    if has_offset != has_next_offset:
+        return False
+    result_offset = result.get("offset")
+    if (
+        isinstance(result_offset, bool)
+        or not isinstance(result_offset, int)
+        or result_offset != plan.offset
+    ):
+        return False
+    expected_next_offset = plan.offset + len(records) if truncated else None
+    next_offset = result.get("next_offset")
+    if expected_next_offset is None:
+        return next_offset is None
+    return (
+        isinstance(next_offset, int)
+        and not isinstance(next_offset, bool)
+        and next_offset == expected_next_offset
+    )

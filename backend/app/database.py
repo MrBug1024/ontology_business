@@ -1443,9 +1443,13 @@ def _migrate_assistant_compilation_jobs() -> None:
             ("execution_policy_fingerprint", "VARCHAR(64)"),
             ("compiler_version", "VARCHAR(80)"),
             ("scenario_baseline", "VARCHAR(64)"),
+            ("execution_input", "JSON"),
             ("progress", "JSON"),
             ("llm_call_budget", "INTEGER"),
             ("llm_calls_used", "INTEGER"),
+            ("lease_token", "VARCHAR(64)"),
+            ("lease_expires_at", "TIMESTAMP"),
+            ("lease_attempt", "INTEGER"),
             ("error", "TEXT"),
             ("result", "JSON"),
             ("completed_at", "DATETIME"),
@@ -1478,9 +1482,12 @@ def _migrate_assistant_compilation_jobs() -> None:
             "execution_policy_fingerprint = COALESCE(execution_policy_fingerprint, ''), "
             "compiler_version = COALESCE(compiler_version, 'legacy'), "
             "scenario_baseline = COALESCE(scenario_baseline, ''), "
+            "execution_input = COALESCE(execution_input, '{}'), "
             "progress = COALESCE(progress, '{}'), "
             "llm_call_budget = COALESCE(llm_call_budget, 1), "
             "llm_calls_used = COALESCE(llm_calls_used, 0), "
+            "lease_token = COALESCE(lease_token, ''), "
+            "lease_attempt = COALESCE(lease_attempt, 0), "
             "error = COALESCE(error, ''), "
             "result = COALESCE(result, '{}'), "
             "updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)"
@@ -1502,6 +1509,123 @@ def _migrate_assistant_compilation_jobs() -> None:
             conn.exec_driver_sql(
                 "CREATE UNIQUE INDEX uq_assistant_compilation_jobs_fingerprint "
                 "ON assistant_compilation_jobs (request_fingerprint)"
+            )
+        if (
+            "ix_assistant_compilation_jobs_status_lease_expiry"
+            not in index_names
+        ):
+            conn.exec_driver_sql(
+                "CREATE INDEX ix_assistant_compilation_jobs_status_lease_expiry "
+                "ON assistant_compilation_jobs (status, lease_expires_at)"
+            )
+
+
+def _migrate_scenario_model_draft_resources() -> None:
+    """Verify and index the inert scene-level assistant draft store.
+
+    The table is introduced atomically by ``Base.metadata.create_all``.  This
+    explicit, idempotent startup migration makes the safety boundary fail
+    closed on interrupted/manual deployments instead of silently falling back
+    to proposal-only storage.
+    """
+    table_name = "scenario_model_draft_resources"
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if not inspector.has_table(table_name):
+            raise RuntimeError(f"{table_name} 表未创建")
+        columns = {
+            column["name"] for column in inspector.get_columns(table_name)
+        }
+        # The staging table predates active-lineage tracking in some local and
+        # self-hosted deployments.  Add only inert provenance columns here;
+        # runtime definition tables remain untouched.
+        timestamp_definition = (
+            "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+            if engine.dialect.name == "postgresql"
+            else "DATETIME DEFAULT CURRENT_TIMESTAMP"
+            if engine.dialect.name == "mysql"
+            else "DATETIME"
+        )
+        lineage_columns = {
+            "lineage_started_at": timestamp_definition,
+            "predecessor_draft_id": "VARCHAR(32) NOT NULL DEFAULT ''",
+            "predecessor_revision": "INTEGER NOT NULL DEFAULT -1",
+            "superseded_by_proposal_id": "VARCHAR(64) NOT NULL DEFAULT ''",
+        }
+        for name, definition in lineage_columns.items():
+            if name not in columns:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}"
+                )
+        conn.exec_driver_sql(
+            "UPDATE scenario_model_draft_resources "
+            "SET lineage_started_at = COALESCE(lineage_started_at, created_at)"
+        )
+        if engine.dialect.name == "postgresql":
+            conn.exec_driver_sql(
+                "ALTER TABLE scenario_model_draft_resources "
+                "ALTER COLUMN lineage_started_at SET NOT NULL"
+            )
+        elif engine.dialect.name == "mysql":
+            conn.exec_driver_sql(
+                "ALTER TABLE scenario_model_draft_resources "
+                "MODIFY lineage_started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            )
+        inspector = inspect(conn)
+        required_columns = {
+            "id", "tenant_id", "scenario_id", "created_by_user_id",
+            "source_thread_id", "source_message_id", "compilation_job_id",
+            "proposal_id", "task_id", "resource_kind", "resource_key",
+            "resource_identity", "title", "source_payload", "payload",
+            "validation_issues", "source_refs", "materialization_source",
+            "draft_status", "enabled", "publishable", "resolved_resource_id",
+            "revision", "lineage_started_at", "predecessor_draft_id",
+            "predecessor_revision", "superseded_by_proposal_id",
+            "created_at", "updated_at",
+        }
+        columns = {
+            column["name"] for column in inspector.get_columns(table_name)
+        }
+        missing = sorted(required_columns - columns)
+        if missing:
+            raise RuntimeError(
+                f"{table_name} 缺少安全存储字段：{', '.join(missing)}"
+            )
+
+        unique_names = {
+            item.get("name")
+            for item in inspect(conn).get_unique_constraints(table_name)
+        }
+        index_names = {
+            item.get("name") for item in inspect(conn).get_indexes(table_name)
+        }
+        if "uq_scenario_model_draft_resource_identity" not in unique_names | index_names:
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX uq_scenario_model_draft_resource_identity "
+                "ON scenario_model_draft_resources "
+                "(tenant_id, scenario_id, proposal_id, resource_identity)"
+            )
+        if "ix_scenario_model_drafts_scenario_status" not in index_names:
+            conn.exec_driver_sql(
+                "CREATE INDEX ix_scenario_model_drafts_scenario_status "
+                "ON scenario_model_draft_resources "
+                "(tenant_id, scenario_id, draft_status, updated_at)"
+            )
+        if "ix_scenario_model_drafts_lineage_started_at" not in index_names:
+            conn.exec_driver_sql(
+                "CREATE INDEX ix_scenario_model_drafts_lineage_started_at "
+                "ON scenario_model_draft_resources (lineage_started_at)"
+            )
+        if "ix_scenario_model_drafts_predecessor" not in index_names:
+            conn.exec_driver_sql(
+                "CREATE INDEX ix_scenario_model_drafts_predecessor "
+                "ON scenario_model_draft_resources "
+                "(tenant_id, scenario_id, predecessor_draft_id)"
+            )
+        if "ix_scenario_model_drafts_superseded_by_proposal_id" not in index_names:
+            conn.exec_driver_sql(
+                "CREATE INDEX ix_scenario_model_drafts_superseded_by_proposal_id "
+                "ON scenario_model_draft_resources (superseded_by_proposal_id)"
             )
 
 
@@ -1884,6 +2008,46 @@ def _migrate_artifact_template_catalog() -> None:
             raise
 
 
+def _repair_nullable_orphan_references() -> None:
+    """Preserve legacy history while repairing nullable foreign-key links.
+
+    Older processes and misconfigured test runs could write audit/trace rows
+    through a connection that did not enforce SQLite foreign keys.  The parent
+    resources may later disappear even though these relationships are declared
+    ``ON DELETE SET NULL``.  Nulling only missing nullable references restores
+    the schema invariant without deleting the historical record.
+    """
+
+    repairs = (
+        ("assistant_audit_logs", "scenario_id", "business_scenarios"),
+        ("assistant_audit_logs", "thread_id", "assistant_threads"),
+        ("assistant_threads", "scenario_id", "business_scenarios"),
+        ("llm_invocation_traces", "llm_config_id", "llm_configs"),
+        ("llm_invocation_traces", "tenant_id", "tenants"),
+    )
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        available_tables = set(inspector.get_table_names())
+        for child_table, child_column, parent_table in repairs:
+            if child_table not in available_tables or parent_table not in available_tables:
+                continue
+            columns = {
+                column["name"]: column
+                for column in inspector.get_columns(child_table)
+            }
+            column = columns.get(child_column)
+            if column is None or not bool(column.get("nullable", True)):
+                continue
+            conn.execute(
+                text(
+                    f'UPDATE "{child_table}" SET "{child_column}" = NULL '
+                    f'WHERE "{child_column}" IS NOT NULL AND NOT EXISTS ('
+                    f'SELECT 1 FROM "{parent_table}" AS parent '
+                    f'WHERE parent.id = "{child_table}"."{child_column}")'
+                )
+            )
+
+
 def init_db() -> None:
     # Import every metadata module so direct maintenance/fixture callers get
     # the same schema as the ASGI application, which imports routers first.
@@ -1919,6 +2083,7 @@ def init_db() -> None:
     _migrate_runtime_definition_pins()
     _migrate_assistant_attachment_lifecycle()
     _migrate_assistant_compilation_jobs()
+    _migrate_scenario_model_draft_resources()
     _migrate_property_default_json()
     _migrate_ontology_runtime_metadata()
     _migrate_action_decision_chain()
@@ -1926,3 +2091,4 @@ def init_db() -> None:
     _migrate_agent_capability_scope()
     _migrate_external_api_key_audit()
     _migrate_artifact_template_catalog()
+    _repair_nullable_orphan_references()

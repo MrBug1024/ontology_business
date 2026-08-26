@@ -572,6 +572,71 @@ class SQLiteMigrationIdempotenceTests(unittest.TestCase):
             )
         legacy_engine.dispose()
 
+    def test_nullable_orphan_repair_preserves_history_and_is_idempotent(self) -> None:
+        legacy_engine = create_engine("sqlite:///:memory:")
+        with legacy_engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE business_scenarios(id VARCHAR(32) PRIMARY KEY)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE assistant_threads("
+                "id VARCHAR(32) PRIMARY KEY, scenario_id VARCHAR(32), title TEXT, "
+                "FOREIGN KEY(scenario_id) REFERENCES business_scenarios(id) ON DELETE SET NULL)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE assistant_audit_logs("
+                "id VARCHAR(32) PRIMARY KEY, scenario_id VARCHAR(32), thread_id VARCHAR(32), "
+                "operation TEXT, FOREIGN KEY(scenario_id) REFERENCES business_scenarios(id) "
+                "ON DELETE SET NULL, FOREIGN KEY(thread_id) REFERENCES assistant_threads(id) "
+                "ON DELETE SET NULL)"
+            )
+            connection.exec_driver_sql("CREATE TABLE tenants(id VARCHAR(32) PRIMARY KEY)")
+            connection.exec_driver_sql("CREATE TABLE llm_configs(id VARCHAR(32) PRIMARY KEY)")
+            connection.exec_driver_sql(
+                "CREATE TABLE llm_invocation_traces("
+                "id VARCHAR(32) PRIMARY KEY, tenant_id VARCHAR(32), llm_config_id VARCHAR(32), "
+                "status TEXT, FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE SET NULL, "
+                "FOREIGN KEY(llm_config_id) REFERENCES llm_configs(id) ON DELETE SET NULL)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO assistant_threads VALUES ('thread-1', 'missing-scene', '保留会话')"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO assistant_audit_logs VALUES "
+                "('audit-1', 'missing-scene', 'missing-thread', '保留审计')"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO llm_invocation_traces VALUES "
+                "('trace-1', 'missing-tenant', 'missing-model', 'failed')"
+            )
+
+        with patch.object(database, "engine", legacy_engine):
+            database._repair_nullable_orphan_references()
+            database._repair_nullable_orphan_references()
+
+        with legacy_engine.connect() as connection:
+            self.assertEqual(
+                connection.exec_driver_sql(
+                    "SELECT scenario_id, title FROM assistant_threads WHERE id='thread-1'"
+                ).one(),
+                (None, "保留会话"),
+            )
+            self.assertEqual(
+                connection.exec_driver_sql(
+                    "SELECT scenario_id, thread_id, operation FROM assistant_audit_logs "
+                    "WHERE id='audit-1'"
+                ).one(),
+                (None, None, "保留审计"),
+            )
+            self.assertEqual(
+                connection.exec_driver_sql(
+                    "SELECT tenant_id, llm_config_id, status FROM llm_invocation_traces "
+                    "WHERE id='trace-1'"
+                ).one(),
+                (None, None, "failed"),
+            )
+        legacy_engine.dispose()
+
 
 if __name__ == "__main__":
     unittest.main()

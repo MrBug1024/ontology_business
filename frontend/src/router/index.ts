@@ -1,5 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { api } from '@/api'
+import { useAuthStore } from '@/stores/auth'
 
 const mainScrollPositions = new Map<string, number>()
 const MAX_SAVED_SCROLL_POSITIONS = 100
@@ -58,9 +58,13 @@ router.afterEach((to, from, failure) => {
 
 router.beforeEach(async (to) => {
   if (to.meta.public) return true
+  const auth = useAuthStore()
   try {
-    await api.me()
-    return true
+    // The app-level auth store validates the session once. Repeating /me on
+    // every menu click makes navigation wait on an unrelated network round
+    // trip; API 401 responses still redirect through the axios interceptor.
+    if (!auth.initialized) await auth.initialize()
+    return auth.user ? true : { name: 'login', query: { redirect: to.fullPath } }
   } catch {
     return { name: 'login', query: { redirect: to.fullPath } }
   }

@@ -383,7 +383,7 @@ const formAgentReady = computed(() => formAgentMissing.value.length === 0)
 async function ensureScenarioDetail(scenarioId?: string | null) {
   if (!scenarioId || scenarioDetails.value[scenarioId]) return
   try {
-    const detail = await api.getScenario(scenarioId)
+    const detail = await api.getScenario(scenarioId, { include_runtime_facts: false })
     if (!viewDisposed) scenarioDetails.value = { ...scenarioDetails.value, [detail.id]: detail }
   } catch {
     // 场景详情的访问错误由就绪提示体现，不阻断 Agent 草稿编辑。
@@ -422,7 +422,7 @@ async function load() {
       api.listAgents(), api.listScenarios(), api.listLLM(), api.listDataSources(),
     ])
     const detailIds = [...new Set(ag.map((agent) => agent.scenario_id).filter((id): id is string => Boolean(id)))]
-    const details = await Promise.allSettled(detailIds.map((id) => api.getScenario(id)))
+    const details = await Promise.allSettled(detailIds.map((id) => api.getScenario(id, { include_runtime_facts: false })))
     if (viewDisposed || request !== loadRequest || scope !== scenarioScope.value) return
     agents.value = scope ? ag.filter((agent) => agent.scenario_id === scope) : ag
     scenarios.value = sc

@@ -46,6 +46,16 @@ async def _operations_worker() -> None:
         await asyncio.sleep(1)
 
 
+async def _assistant_compilation_worker() -> None:
+    """Continuously reclaim durable modelling jobs after crashes or restarts."""
+    while True:
+        try:
+            await asyncio.to_thread(assistant.recover_expired_compilation_jobs)
+        except Exception:  # noqa: BLE001
+            logger.exception("AI 场景建模任务恢复轮询失败")
+        await asyncio.sleep(10)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
@@ -61,13 +71,27 @@ async def lifespan(_: FastAPI):
         skill_service.sync_skills_to_db(db)
     finally:
         db.close()
-    worker = asyncio.create_task(_operations_worker(), name="ontology-operations-worker")
+    try:
+        await asyncio.to_thread(assistant.recover_expired_compilation_jobs)
+    except Exception:  # noqa: BLE001
+        logger.exception("AI 场景建模任务启动恢复失败")
+    operations_worker = asyncio.create_task(
+        _operations_worker(),
+        name="ontology-operations-worker",
+    )
+    compilation_worker = asyncio.create_task(
+        _assistant_compilation_worker(),
+        name="assistant-compilation-recovery-worker",
+    )
     try:
         yield
     finally:
-        worker.cancel()
+        operations_worker.cancel()
+        compilation_worker.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await worker
+            await operations_worker
+        with contextlib.suppress(asyncio.CancelledError):
+            await compilation_worker
 
 
 settings = get_settings()

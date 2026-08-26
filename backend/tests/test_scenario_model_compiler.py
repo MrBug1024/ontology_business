@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base
 from app.models import (
     BusinessScenario,
+    DataSource,
     FunctionDefinition,
     OntologyAction,
     OntologyEntity,
@@ -24,8 +25,10 @@ from app.models import (
     Tenant,
     User,
 )
+from app.routers import assistant
 from app.services import permission_service, scenario_model_compiler
 from app.services.policies import PolicyViolation
+from tests.e2e_mock_llm import _Handler as E2EMockLLMHandler
 
 
 def _schema(properties: dict | None = None) -> dict:
@@ -168,6 +171,43 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 "change_keys": ["entity.project", "action.approve", "workflow.archive"],
             }],
         }
+
+    def test_local_e2e_wage_contract_has_no_blocking_model_errors(self) -> None:
+        bundle = scenario_model_compiler.build_source_bundle(
+            "请编译附件",
+            [{
+                "id": "wage-domain-document",
+                "filename": "建筑领域业务ontology设计.docx",
+                "text": (
+                    "建设项目、农民工、施工企业、工资台账、欠薪风险和欠薪预警。"
+                    "工资逾期后生成预警并由监管人员复核。"
+                ),
+            }],
+        )
+        prompt = (
+            "业务本体文档编译器\n待逐段编译的业务语义来源：\n"
+            + json.dumps(
+                [{"ref": bundle["paragraphs"][0]["ref"]}],
+                ensure_ascii=False,
+            )
+        )
+        raw = E2EMockLLMHandler._structured_model_response([{"content": prompt}])
+
+        payload = scenario_model_compiler.normalize_scenario_model(
+            self.db,
+            self.scenario,
+            raw,
+            source_bundle=bundle,
+            mapping_catalog=[],
+            columns_by_table={},
+        )
+
+        self.assertEqual(len(payload["entities"]), 6)
+        self.assertEqual(len(payload["relations"]), 5)
+        self.assertEqual(len(payload["workflows"]), 1)
+        self.assertFalse(
+            [issue for issue in payload["unresolved"] if issue.get("blocking")]
+        )
 
     def test_entity_constraints_and_many_to_one_are_normalized_without_cascade(self) -> None:
         raw = self._raw()
@@ -514,6 +554,217 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 mapping_is_cleanly_deferred=True,
             )
 
+    def test_instances_and_unbound_logical_mappings_are_preserved_as_disabled_drafts(self) -> None:
+        raw = self._raw()
+        ref = "construction-brief:p0001"
+        raw["instances"] = [{
+            "key": "instance.project.p-001",
+            "entity_ref": "entity.project",
+            "display_name": "P-001",
+            "values": {"项目编号": "P-001", "状态": "草稿"},
+            "evidence_refs": [ref],
+            "confidence": 0.96,
+        }]
+        raw["conceptual_mappings"] = [{
+            "key": "conceptual_mapping.project_source",
+            "mapping_kind": "object",
+            "entity_ref": "entity.project",
+            "source_label": "项目主数据表",
+            "table_name": "project_master",
+            "column_map": {"项目编号": "project_code", "状态": "status"},
+            "binding_requirements": {"needs_data_source": True},
+            "evidence_refs": [ref],
+            "confidence": 0.9,
+        }]
+        raw["unresolved"] = [{
+            "code": "MAPPING_DEFERRED_NO_DATA_SOURCE",
+            "message": "已知逻辑字段对应关系，但数据源尚未连接",
+            "source_refs": [ref],
+            "blocking": False,
+        }]
+
+        payload = scenario_model_compiler.normalize_scenario_model(
+            self.db,
+            self.scenario,
+            raw,
+            source_bundle=self._bundle(),
+            mapping_catalog=[],
+            columns_by_table={},
+        )
+
+        drafts = {
+            (item["resource_kind"], item["resource_key"]): item
+            for item in payload["draft_candidates"]
+        }
+        instance = drafts[("instance", "instance.project.p-001")]
+        logical_mapping = drafts[(
+            "conceptual_mapping", "conceptual_mapping.project_source"
+        )]
+        self.assertTrue(instance["payload"])
+        self.assertTrue(logical_mapping["payload"])
+        self.assertFalse(instance["enabled"])
+        self.assertFalse(instance["publishable"])
+        self.assertEqual(instance["task_id"], "instances")
+        self.assertEqual(instance["payload"]["values"]["项目编号"], "P-001")
+        self.assertFalse(logical_mapping["enabled"])
+        self.assertFalse(logical_mapping["publishable"])
+        self.assertEqual(logical_mapping["validation_status"], "needs_binding")
+        self.assertEqual(logical_mapping["task_id"], "mapping")
+        self.assertIn(
+            "MAPPING_DEFERRED_NO_DATA_SOURCE",
+            {issue["code"] for issue in logical_mapping["validation_issues"]},
+        )
+        self.assertEqual(payload["mappings"], [])
+        tasks = {
+            item["id"]: item
+            for item in scenario_model_compiler.build_model_task_plan(payload)
+        }
+        self.assertEqual(tasks["instances"]["sections"], ["instances"])
+        self.assertEqual(tasks["instances"]["output_count"], 1)
+        self.assertEqual(tasks["instances"]["draft_output_count"], 1)
+        self.assertEqual(tasks["instances"]["draft_candidate_count"], 1)
+        self.assertEqual(
+            tasks["mapping"]["sections"],
+            ["mappings", "relation_mappings", "conceptual_mappings"],
+        )
+        self.assertEqual(tasks["mapping"]["output_count"], 1)
+        self.assertEqual(tasks["mapping"]["draft_output_count"], 1)
+        self.assertEqual(tasks["mapping"]["draft_candidate_count"], 1)
+
+    def test_conceptual_mapping_only_waits_for_one_data_source_gap_confirmation(self) -> None:
+        raw = self._raw()
+        for section in (
+            "entities",
+            "relations",
+            "instances",
+            "functions",
+            "actions",
+            "rules",
+            "events",
+            "workflows",
+            "mappings",
+            "relation_mappings",
+        ):
+            raw[section] = []
+        ref = "construction-brief:p0001"
+        raw["conceptual_mappings"] = [{
+            "key": "conceptual_mapping.project_source",
+            "mapping_kind": "object",
+            "entity_ref": "entity.project",
+            "source_label": "项目主数据表",
+            "table_name": "project_master",
+            "column_map": {"项目编号": "project_code"},
+            "binding_requirements": {"needs_data_source": True},
+            "evidence_refs": [ref],
+            "confidence": 0.9,
+        }]
+        raw["unresolved"] = [{
+            "code": "MAPPING_DEFERRED_NO_DATA_SOURCE",
+            "message": "逻辑字段对应关系已知，但物理数据源尚未连接",
+            "source_refs": [ref],
+            "blocking": False,
+        }]
+        raw["coverage"] = [{
+            "source_ref": ref,
+            "status": "context",
+            "reason": "已形成逻辑映射草稿",
+            "change_keys": [],
+        }]
+
+        payload = scenario_model_compiler.normalize_scenario_model(
+            self.db,
+            self.scenario,
+            raw,
+            source_bundle=self._bundle(),
+            mapping_catalog=[],
+            columns_by_table={},
+        )
+        proposal = assistant._build_proposal(
+            "scenario_model",
+            payload,
+            self.scenario,
+        )
+
+        self.assertNotIn(
+            "no_applicable_changes",
+            {item["code"] for item in payload["unresolved"]},
+        )
+        self.assertEqual(len(payload["draft_candidates"]), 1)
+        self.assertEqual(
+            payload["draft_candidates"][0]["resource_kind"],
+            "conceptual_mapping",
+        )
+        tasks = {
+            item["id"]: item for item in proposal["payload"]["tasks"]
+        }
+        self.assertEqual(tasks["mapping"]["status"], "ready")
+        self.assertEqual(tasks["mapping"]["output_count"], 1)
+        self.assertEqual(tasks["mapping"]["draft_output_count"], 1)
+        summary = proposal["payload"]["execution_summary"]
+        self.assertEqual(proposal["status"], "in_progress")
+        self.assertTrue(proposal["requires_confirmation"])
+        self.assertFalse(summary["final"])
+        self.assertEqual(summary["status"], "waiting_for_confirmation")
+        self.assertEqual(summary["current_task_id"], "mapping")
+        self.assertEqual(summary["remaining_issue_group_count"], 1)
+        self.assertEqual(len(summary["issue_groups"]), 1)
+        self.assertEqual(
+            summary["issue_groups"][0]["cause"],
+            "data_source_dependency",
+        )
+        self.assertEqual(summary["issue_groups"][0]["count"], 1)
+
+    def test_invalid_formal_candidate_is_not_lost_from_scene_draft_sidecar(self) -> None:
+        raw = self._raw()
+        raw["entities"][0]["name"] = ""
+
+        payload = scenario_model_compiler.normalize_scenario_model(
+            self.db,
+            self.scenario,
+            raw,
+            source_bundle=self._bundle(),
+            mapping_catalog=[],
+            columns_by_table={},
+        )
+
+        self.assertEqual(payload["entities"], [])
+        candidate = next(
+            item for item in payload["draft_candidates"]
+            if item["resource_kind"] == "entity"
+            and item["resource_key"] == "entity.project"
+        )
+        self.assertEqual(candidate["payload"]["properties"][0]["name"], "项目编号")
+        self.assertEqual(candidate["validation_status"], "blocked")
+        self.assertIn(
+            "missing_name",
+            {issue["code"] for issue in candidate["validation_issues"]},
+        )
+
+    def test_draft_sidecar_matches_canonicalized_resource_key_without_duplicate(self) -> None:
+        raw = self._raw()
+        raw["entities"][0]["key"] = "project"
+
+        payload = scenario_model_compiler.normalize_scenario_model(
+            self.db,
+            self.scenario,
+            raw,
+            source_bundle=self._bundle(),
+            mapping_catalog=[],
+            columns_by_table={},
+        )
+
+        candidates = [
+            item for item in payload["draft_candidates"]
+            if item["resource_kind"] == "entity"
+            and item["resource_key"] == "entity.project"
+        ]
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(candidates[0]["formal_candidate"])
+        self.assertNotIn(
+            "draft_not_formally_validated",
+            {issue["code"] for issue in candidates[0]["validation_issues"]},
+        )
+
     def test_entity_json_aliases_and_enum_values_are_canonicalized(self) -> None:
         raw = self._raw()
         raw["entities"][0]["properties"][1].update({
@@ -614,6 +865,10 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 "业务描述：暂无，请结合我上传的文档提取业务目标和边界。"
             ),
             "请编译附件。补充描述：无。",
+            "继续吧",
+            "下一步",
+            "接着处理",
+            "把剩下的做完",
         ]
 
         for message in messages:
@@ -630,6 +885,14 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                     [item["ref"] for item in source_bundle["paragraphs"]],
                     ["only-document:p0001"],
                 )
+
+        working_only = scenario_model_compiler.build_source_bundle(
+            "继续吧",
+            [],
+            has_working_drafts=True,
+        )
+        self.assertEqual(working_only["documents"], [])
+        self.assertEqual(working_only["paragraphs"], [])
 
     def test_free_text_correction_with_attachment_is_retained_conservatively(self) -> None:
         message = "请根据附件编译，并将状态名称修正为履约状态。"
@@ -1229,7 +1492,7 @@ class ScenarioModelCompilerTests(unittest.TestCase):
         self.assertEqual(self.db.scalar(select(func.count()).select_from(OntologyEntity)), 0)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(OntologyAction)), 0)
 
-    def test_single_paragraph_chunk_truncation_fails_without_dropping_source(self) -> None:
+    def test_single_paragraph_chunk_truncation_creates_editable_stage_placeholders(self) -> None:
         document = {
             "id": "single-source",
             "filename": "单段文档.md",
@@ -1251,17 +1514,13 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 side_effect=[truncated, truncated],
             ) as chat,
         ):
-            with self.assertRaisesRegex(
-                ValueError,
-                "single-source:p0001.*不会丢弃",
-            ):
-                scenario_model_compiler.compile_scenario_model(
-                    self.db,
-                    self.scenario,
-                    message="请编译附件",
-                    documents=[document],
-                    llm=object(),
-                )
+            payload = scenario_model_compiler.compile_scenario_model(
+                self.db,
+                self.scenario,
+                message="请编译附件",
+                documents=[document],
+                llm=object(),
+            )
         self.assertEqual(chat.call_count, 2)
         self.assertEqual(
             [call.kwargs["max_tokens"] for call in chat.call_args_list],
@@ -1270,9 +1529,61 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 scenario_model_compiler.FALLBACK_MAX_OUTPUT_TOKENS,
             ],
         )
+        self.assertEqual(payload["changes"], [])
+        self.assertEqual(len(payload["draft_candidates"]), 6)
+        self.assertEqual(
+            {item["task_id"] for item in payload["draft_candidates"]},
+            {
+                "ontology",
+                "instances",
+                "mapping",
+                "capabilities",
+                "rules",
+                "workflows",
+            },
+        )
+        self.assertTrue(all(not item["publishable"] for item in payload["draft_candidates"]))
         self.assertEqual(self.db.scalar(select(func.count()).select_from(OntologyEntity)), 0)
 
-    def test_chunk_timeout_propagates_without_recursive_retry(self) -> None:
+    def test_mapping_catalog_does_not_silently_drop_the_fifty_first_source(self) -> None:
+        sources = [
+            DataSource(
+                id=f"source-catalog-{index:02d}",
+                tenant_id="tenant-scenario-compiler",
+                scenario_id=self.scenario.id,
+                name=f"Catalog source {index:02d}",
+                type="sqlite",
+                config={"path": f"catalog-{index:02d}.sqlite3"},
+                status="ok",
+            )
+            for index in range(1, 52)
+        ]
+        self.db.add_all(sources)
+        self.db.commit()
+
+        def one_table(source):
+            return [{
+                "name": f"table_{source.id[-2:]}",
+                "columns": [{"name": "id", "type": "text", "pk": True}],
+            }]
+
+        with patch.object(
+            scenario_model_compiler.datasource_service,
+            "list_tables",
+            side_effect=one_table,
+        ) as list_tables:
+            context = scenario_model_compiler.prepare_compilation_context(
+                self.db,
+                self.scenario,
+            )
+        self.assertEqual(list_tables.call_count, 51)
+        self.assertEqual(len(context["mapping_catalog"]), 51)
+        self.assertIn(
+            "source-catalog-51",
+            {item["data_source_id"] for item in context["mapping_catalog"]},
+        )
+
+    def test_chunk_timeout_becomes_source_bound_placeholders_without_retry_loop(self) -> None:
         document = {
             "id": "timeout-source",
             "filename": "超时文档.md",
@@ -1294,16 +1605,169 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 side_effect=[truncated, TimeoutError("子分块 provider 超时")],
             ) as chat,
         ):
-            with self.assertRaisesRegex(TimeoutError, "子分块 provider 超时"):
-                scenario_model_compiler.compile_scenario_model(
-                    self.db,
-                    self.scenario,
-                    message="请编译附件",
-                    documents=[document],
-                    llm=object(),
-                )
+            payload = scenario_model_compiler.compile_scenario_model(
+                self.db,
+                self.scenario,
+                message="请编译附件",
+                documents=[document],
+                llm=object(),
+            )
         self.assertEqual(chat.call_count, 2)
+        self.assertEqual(payload["changes"], [])
+        self.assertEqual(len(payload["draft_candidates"]), 6)
+        self.assertIn(
+            "COMPILER_CONTRACT_ERROR",
+            {item["code"] for item in payload["unresolved"]},
+        )
         self.assertEqual(self.db.scalar(select(func.count()).select_from(OntologyEntity)), 0)
+
+    def test_empty_or_wrapped_contract_never_finishes_with_an_empty_workbench(self) -> None:
+        document = {
+            "id": "empty-contract",
+            "filename": "空结构输出.md",
+            "text": "订单对象包含订单编号，并需要审批规则。",
+        }
+        with patch.object(
+            scenario_model_compiler.llm_service,
+            "chat",
+            return_value={"content": "{}"},
+        ) as empty_chat:
+            empty_payload = scenario_model_compiler.compile_scenario_model(
+                self.db,
+                self.scenario,
+                message="继续建设完整场景模型",
+                documents=[document],
+                llm=object(),
+            )
+        self.assertEqual(empty_chat.call_count, 3)
+        self.assertEqual(len(empty_payload["draft_candidates"]), 6)
+        self.assertEqual(empty_payload["draft_salvage"]["formal_change_count"], 0)
+        self.assertIn(
+            "COMPILER_NO_RECOVERABLE_CANDIDATE",
+            {
+                issue["code"]
+                for item in empty_payload["draft_candidates"]
+                for issue in item["validation_issues"]
+            },
+        )
+
+        wrapped = self._raw()
+        with patch.object(
+            scenario_model_compiler.llm_service,
+            "chat",
+            return_value={"content": json.dumps({"data": wrapped}, ensure_ascii=False)},
+        ) as wrapped_chat:
+            wrapped_payload = scenario_model_compiler.compile_scenario_model(
+                self.db,
+                self.scenario,
+                message="继续建设完整场景模型",
+                documents=[{
+                    "id": "construction-brief",
+                    "filename": "建筑项目实施文档.md",
+                    "text": "项目以项目编号唯一标识。项目可包含子项目。审批操作校验项目状态，审批后发布已审批事件并进入归档流程。",
+                }],
+                llm=object(),
+            )
+        self.assertEqual(wrapped_chat.call_count, 3)
+        self.assertTrue(wrapped_payload["draft_candidates"])
+        self.assertIn(
+            "entity",
+            {item["resource_kind"] for item in wrapped_payload["draft_candidates"]},
+        )
+        self.assertEqual(wrapped_payload["changes"], [])
+
+    def test_chunk_nested_ref_shape_salvages_but_foreign_scope_stays_strict(self) -> None:
+        raw = self._raw()
+        raw["entities"][0]["evidence_refs"] = 123
+        raw["coverage"] = [{
+            "source_ref": "construction-brief:p0001",
+            "status": "modeled",
+            "reason": "候选可识别但 evidence_refs 类型错误",
+            "change_keys": ["entity.project"],
+        }]
+        with patch.object(
+            scenario_model_compiler.llm_service,
+            "chat",
+            return_value={"content": json.dumps(raw, ensure_ascii=False)},
+        ) as chat:
+            salvaged = scenario_model_compiler._chat_raw_model(
+                self.db,
+                object(),
+                "test",
+                max_tokens=1_000,
+                allowed_refs={"construction-brief:p0001"},
+            )
+        self.assertEqual(chat.call_count, 1)
+        self.assertEqual(salvaged["entities"][0]["evidence_refs"], [])
+        self.assertIn(
+            "COMPILER_CONTRACT_ERROR",
+            {item["code"] for item in salvaged["unresolved"]},
+        )
+
+    def test_completed_chunk_candidates_survive_a_later_chunk_failure(self) -> None:
+        document = {
+            "id": "partial-chunks",
+            "filename": "分段业务文档.md",
+            "text": "订单以订单编号唯一标识。\n\n审批规则检查订单状态。",
+        }
+        first_ref = "partial-chunks:p0001"
+        first_chunk = self._raw()
+        for section in (
+            "relations", "functions", "actions", "rules", "events",
+            "workflows", "mappings", "relation_mappings",
+        ):
+            first_chunk[section] = []
+        first_chunk["entities"][0]["evidence_refs"] = [first_ref]
+        first_chunk["coverage"] = [{
+            "source_ref": first_ref,
+            "status": "modeled",
+            "reason": "订单对象",
+            "change_keys": ["entity.project"],
+        }]
+        truncated = {
+            "content": "{",
+            "raw": {"choices": [{"finish_reason": "length"}]},
+        }
+        malformed = {"content": "{not-json"}
+
+        def two_chunks(paragraphs):
+            values = list(paragraphs)
+            return [[values[0]], [values[1]]]
+
+        with (
+            patch.object(
+                scenario_model_compiler,
+                "_source_chunks",
+                side_effect=two_chunks,
+            ),
+            patch.object(
+                scenario_model_compiler.llm_service,
+                "chat",
+                side_effect=[
+                    truncated,
+                    {"content": json.dumps(first_chunk, ensure_ascii=False)},
+                    malformed,
+                    malformed,
+                    malformed,
+                ],
+            ) as chat,
+        ):
+            payload = scenario_model_compiler.compile_scenario_model(
+                self.db,
+                self.scenario,
+                message="请编译附件",
+                documents=[document],
+                llm=object(),
+            )
+        self.assertEqual(chat.call_count, 5)
+        self.assertEqual(payload["changes"], [])
+        entity_drafts = [
+            item for item in payload["draft_candidates"]
+            if item["resource_kind"] == "entity"
+        ]
+        self.assertEqual(len(entity_drafts), 1)
+        self.assertEqual(entity_drafts[0]["resource_key"], "entity.project")
+        self.assertEqual(payload["coverage_summary"]["ambiguous"], 2)
 
     def test_source_chunks_preserve_ref_order_without_overlap(self) -> None:
         paragraphs = [
@@ -1432,7 +1896,7 @@ class ScenarioModelCompilerTests(unittest.TestCase):
         chunker.assert_not_called()
         self.assertFalse(payload["unresolved"])
 
-    def test_non_timeout_provider_error_does_not_activate_chunk_fallback(self) -> None:
+    def test_non_timeout_provider_error_creates_placeholders_without_chunk_loop(self) -> None:
         document = {
             "id": "construction-brief",
             "filename": "建筑项目实施文档.md",
@@ -1451,15 +1915,71 @@ class ScenarioModelCompilerTests(unittest.TestCase):
             ),
             patch.object(scenario_model_compiler, "_source_chunks") as chunker,
         ):
-            with self.assertRaisesRegex(RuntimeError, "provider rejected"):
-                scenario_model_compiler.compile_scenario_model(
-                    self.db,
-                    self.scenario,
-                    message="请编译附件",
-                    documents=[document],
-                    llm=object(),
-                )
+            payload = scenario_model_compiler.compile_scenario_model(
+                self.db,
+                self.scenario,
+                message="请编译附件",
+                documents=[document],
+                llm=object(),
+            )
         chunker.assert_not_called()
+        self.assertEqual(len(payload["draft_candidates"]), 6)
+        self.assertEqual(payload["changes"], [])
+        self.assertEqual(
+            {issue["code"] for issue in payload["unresolved"]},
+            {"COMPILER_PROVIDER_REQUEST_FAILED"},
+        )
+
+    def test_missing_or_unavailable_llm_still_creates_source_bound_placeholders(self) -> None:
+        document = {
+            "id": "provider-unavailable",
+            "filename": "业务说明.md",
+            "text": "订单以订单编号唯一标识。",
+        }
+        progress_events: list[tuple[str, str]] = []
+        without_llm = scenario_model_compiler.compile_scenario_model(
+            self.db,
+            self.scenario,
+            message="继续建设场景模型",
+            documents=[document],
+            llm=None,
+            on_progress=lambda step_id, _detail, status, _result: (
+                progress_events.append((step_id, status))
+            ),
+        )
+        self.assertEqual(len(without_llm["draft_candidates"]), 6)
+        self.assertEqual(
+            {issue["code"] for issue in without_llm["unresolved"]},
+            {"LLM_NOT_CONFIGURED"},
+        )
+        self.assertTrue({
+            ("analyze", "done"),
+            ("plan", "done"),
+            ("ontology", "done"),
+            ("mapping", "done"),
+            ("rules", "done"),
+            ("review", "done"),
+        }.issubset(set(progress_events)))
+
+        connection_error = type("APIConnectionError", (RuntimeError,), {})
+        with patch.object(
+            scenario_model_compiler.llm_service,
+            "chat",
+            side_effect=connection_error("Connection error."),
+        ) as chat:
+            unavailable = scenario_model_compiler.compile_scenario_model(
+                self.db,
+                self.scenario,
+                message="继续建设场景模型",
+                documents=[document],
+                llm=object(),
+            )
+        self.assertEqual(chat.call_count, 3)
+        self.assertEqual(len(unavailable["draft_candidates"]), 6)
+        self.assertEqual(
+            {issue["code"] for issue in unavailable["unresolved"]},
+            {"COMPILER_PROVIDER_UNAVAILABLE"},
+        )
 
     def test_compound_model_applies_all_resources_and_rollback_is_atomic(self) -> None:
         payload = scenario_model_compiler.normalize_scenario_model(

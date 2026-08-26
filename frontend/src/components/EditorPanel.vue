@@ -1,5 +1,5 @@
 <template>
-  <div class="editor-panel" @mousedown.stop @wheel.stop>
+  <div ref="panelRef" class="editor-panel" @mousedown.stop @wheel.stop>
     <div class="ep-head">
       <span class="ep-dot" :style="{ background: accent }"></span>
       <div class="ep-title">
@@ -12,20 +12,6 @@
     <div class="ep-body">
       <!-- ══ 实体编辑 ══ -->
       <template v-if="editor.kind === 'entity'">
-        <el-alert
-          v-if="editor.id && editedEntity"
-          class="model-readiness-alert"
-          :type="editedEntity.model_ready ? 'success' : 'warning'"
-          :title="editedEntity.model_ready ? '对象模型已就绪' : '对象模型尚未就绪'"
-          :closable="false"
-          show-icon
-        >
-          <template v-if="!editedEntity.model_ready" #default>
-            <ul class="model-issue-list">
-              <li v-for="issue in editedEntity.model_issues || []" :key="issue">{{ issue }}</li>
-            </ul>
-          </template>
-        </el-alert>
         <div class="ep-field">
           <label>名称</label>
           <el-input v-model="editor.form.name" placeholder="如：业务对象、资源、事项" />
@@ -77,18 +63,16 @@
             <small class="field-help">用于图谱展示和 Agent 回答；可与主键属性相同。</small>
           </div>
         </div>
-        <el-alert
-          v-if="!editor.form.is_abstract && (!hasKeyProperty || !hasTitleProperty)"
-          class="draft-readiness-alert"
-          type="warning"
-          :closable="false"
-          show-icon
-          title="保存草稿后仍不能发布或用于可靠数据映射"
-        >
-          <template #default>具体对象类型需要各选择一个主键属性和标题属性；同一属性可以兼任。</template>
-        </el-alert>
         <div class="ep-props">
-          <div class="prop-row" v-for="(p, i) in editor.form.properties" :key="i">
+          <div
+            v-for="(p, i) in editor.form.properties"
+            :key="i"
+            class="prop-row"
+            :class="{ 'draft-property-focus': props.focusPropertyIndex === i }"
+            :data-property-index="i"
+            :tabindex="props.focusPropertyIndex === i ? -1 : undefined"
+            :aria-label="props.focusPropertyIndex === i ? `AI 草稿属性：${p.name || i + 1}` : undefined"
+          >
             <el-input v-model="p.name" size="small" placeholder="属性名" />
             <el-select v-model="p.data_type" size="small" class="prop-type" @change="handlePropertyTypeChange(i)">
               <el-option v-for="t in DATA_TYPES" :key="t.value" :label="t.label" :value="t.value" />
@@ -390,7 +374,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import type { Entity, Property, Relation } from '@/types'
@@ -400,6 +384,7 @@ import {
   type RelationConstraintForm,
 } from '@/utils/relationConstraints'
 import StructuredValueEditor from '@/components/StructuredValueEditor.vue'
+import { cloneForForm } from '@/utils/clone'
 
 const DATA_TYPES = [
   { value: 'string', label: '文本' },
@@ -424,6 +409,7 @@ const props = defineProps<{
   entities: Entity[]
   relations?: Relation[]
   saving?: boolean
+  focusPropertyIndex?: number | null
 }>()
 const emit = defineEmits<{
   (e: 'save'): void
@@ -432,6 +418,7 @@ const emit = defineEmits<{
 }>()
 
 const constraintForms = ref<Array<Record<string, any>>>([])
+const panelRef = ref<HTMLElement>()
 const relationConstraints = ref<RelationConstraintForm>(relationConstraintForm(undefined))
 const qualityForm = ref<Record<string, any>>({ score: undefined, status: '', issues: [], checked_at: '', source: '' })
 const runtimeLoading = ref(false)
@@ -469,17 +456,6 @@ function addProp() {
   constraintForms.value.push({})
 }
 
-const editedEntity = computed(() => (
-  props.editor.kind === 'entity' && props.editor.id
-    ? props.entities.find((entity) => entity.id === props.editor.id)
-    : undefined
-))
-const hasKeyProperty = computed(() => (
-  props.editor.kind === 'entity' && (props.editor.form.properties || []).filter((property: Property) => property.is_key).length === 1
-))
-const hasTitleProperty = computed(() => (
-  props.editor.kind === 'entity' && (props.editor.form.properties || []).filter((property: Property) => property.is_title).length === 1
-))
 const keyPropertyIndex = computed<number | undefined>({
   get: () => {
     const indexes = (props.editor.form.properties || []).flatMap((property: Property, index: number) => property.is_key ? [index] : [])
@@ -580,7 +556,7 @@ function initializeDrafts() {
       property.is_title = Boolean(property.is_title)
       if (!Array.isArray(property.enum_values)) property.enum_values = []
       if (!property.constraints || typeof property.constraints !== 'object' || Array.isArray(property.constraints)) property.constraints = {}
-      constraintForms.value.push(structuredClone(property.constraints))
+      constraintForms.value.push(cloneForForm(property.constraints, {}))
     }
     return
   }
@@ -638,6 +614,13 @@ async function hydrateExistingInstance(request: number) {
 }
 
 watch(() => props.editor, initializeDrafts, { immediate: true })
+watch([() => props.editor, () => props.focusPropertyIndex], async () => {
+  if (props.editor.kind !== 'entity' || props.focusPropertyIndex == null) return
+  await nextTick()
+  const row = panelRef.value?.querySelector<HTMLElement>(`[data-property-index="${props.focusPropertyIndex}"]`)
+  row?.scrollIntoView({ block: 'center' })
+  row?.querySelector<HTMLInputElement>('input')?.focus({ preventScroll: true })
+}, { immediate: true })
 
 // 实例属性行
 const attrRows = computed(() => {
@@ -818,15 +801,6 @@ function prepareAndSave() {
 .runtime-alert {
   margin-bottom: 12px;
 }
-.model-readiness-alert,
-.draft-readiness-alert {
-  margin-bottom: 12px;
-}
-.model-issue-list {
-  margin: 4px 0 0;
-  padding-left: 18px;
-  line-height: 1.55;
-}
 .identity-selectors {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -947,6 +921,11 @@ function prepareAndSave() {
 }
 .prop-flags .el-button {
   margin-left: auto;
+}
+.prop-row.draft-property-focus {
+  border-color: var(--primary);
+  outline: 2px solid color-mix(in srgb, var(--primary) 28%, transparent);
+  outline-offset: 2px;
 }
 .prop-detail {
   padding-top: 2px;

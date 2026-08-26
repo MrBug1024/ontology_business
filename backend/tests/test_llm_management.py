@@ -160,13 +160,17 @@ class LLMManagementTests(unittest.TestCase):
     def test_sync_call_persists_costed_trace_without_prompt_or_key(self) -> None:
         with (
             patch("app.services.llm_service._client", return_value=_CompletionClient(_response("业务回复"))),
-            patch("app.database.SessionLocal", side_effect=self._trace_session),
+            patch(
+                "app.database.SessionLocal",
+                side_effect=AssertionError("不得把隔离会话的 trace 写入默认数据库"),
+            ) as global_session,
         ):
             result = llm_service.chat(
                 self.config,
                 [{"role": "user", "content": "包含敏感业务内容的提示词"}],
                 db=self.db,
             )
+        global_session.assert_not_called()
         self.assertEqual(result["content"], "业务回复")
         trace = Session(self.engine).execute(select(LLMInvocationTrace)).scalars().one()
         self.assertEqual(trace.status, "succeeded")

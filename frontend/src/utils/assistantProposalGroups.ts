@@ -10,6 +10,11 @@ export interface ScenarioModelIssueGroup {
   key: string
   code: string
   blocking: boolean
+  count: number
+  blockingCount: number
+  affectedCount: number
+  message: string
+  resolutionHint?: string
   issues: ScenarioModelIssue[]
 }
 
@@ -38,11 +43,41 @@ const ISSUE_LABELS: Record<string, string> = {
   document_reported_issue: '文档识别待确认',
   mapping_deferred_no_data_source: '数据映射等待数据源',
   missing_data_source: '数据映射等待数据源',
+  prerequisite_draft_only: '前置任务仅保留草稿',
+  invalid_task_plan: '建模任务计划标识异常',
+  invalid_task_dependency: '建模任务依赖异常',
+  invalid_task_state: '建模任务状态异常',
+  data_source_dependency: '数据源尚未接入或绑定',
 }
+
+const DATA_SOURCE_CODES = new Set([
+  'missing_data_source',
+  'mapping_deferred_no_data_source',
+  'data_source_not_configured',
+  'data_source_unavailable',
+  'missing_mapping_table',
+  'uninspected_relation_mapping_table',
+  'missing_relation_mapping_table',
+  'data_source_dependency',
+])
 
 function normalizedCode(value: unknown) {
   const code = typeof value === 'string' ? value.trim() : ''
   return code || 'uncategorized'
+}
+
+function effectiveCode(issue: Record<string, unknown>) {
+  const code = normalizedCode(issue.code).toLocaleLowerCase()
+  const reported = normalizedCode(issue.reported_code).toLocaleLowerCase()
+  const selected = code === 'document_reported_issue' && reported !== 'uncategorized'
+    ? reported
+    : code
+  const message = normalizedMessage(issue.message).toLocaleLowerCase()
+  if (DATA_SOURCE_CODES.has(selected) || (
+    selected === 'missing_reference'
+    && ['数据源', '物理表', '数据表', 'data source'].some((token) => message.includes(token))
+  )) return 'data_source_dependency'
+  return selected
 }
 
 function normalizedMessage(value: unknown) {
@@ -57,11 +92,7 @@ function normalizedSourceRefs(value: unknown) {
     .map((item) => item.trim()))]
 }
 
-/**
- * Keeps every compiler issue visible while reducing a large unresolved list to
- * stable, severity-aware disclosure groups. `blocking: false` is intentionally
- * the only non-blocking value so malformed data fails closed in the UI.
- */
+/** Collapse repeated resource-level failures into one user-facing root cause. */
 export function groupScenarioModelIssues(value: unknown): ScenarioModelIssueGroup[] {
   if (!Array.isArray(value)) return []
 
@@ -70,9 +101,15 @@ export function groupScenarioModelIssues(value: unknown): ScenarioModelIssueGrou
     const issueRecord: Record<string, unknown> = rawIssue && typeof rawIssue === 'object'
       ? rawIssue as Record<string, unknown>
       : { message: rawIssue }
-    const code = normalizedCode(issueRecord.code)
-    const blocking = issueRecord.blocking !== false
-    const key = `${blocking ? 'blocking' : 'notice'}:${code.toLocaleLowerCase()}`
+    const code = effectiveCode(issueRecord)
+    const explicitCount = Number(issueRecord.count)
+    const count = Number.isFinite(explicitCount) && explicitCount > 0 ? Math.trunc(explicitCount) : 1
+    const explicitBlockingCount = Number(issueRecord.blocking_count)
+    const blockingCount = Number.isFinite(explicitBlockingCount) && explicitBlockingCount >= 0
+      ? Math.min(Math.trunc(explicitBlockingCount), count)
+      : issueRecord.blocking !== false ? count : 0
+    const blocking = blockingCount > 0
+    const key = code
     const issue: ScenarioModelIssue = {
       code,
       message: normalizedMessage(issueRecord.message),
@@ -83,13 +120,36 @@ export function groupScenarioModelIssues(value: unknown): ScenarioModelIssueGrou
         : '',
     }
     const existing = groups.get(key)
-    if (existing) existing.issues.push(issue)
-    else groups.set(key, { key, code, blocking, issues: [issue] })
+    if (existing) {
+      existing.count += count
+      existing.blockingCount += blockingCount
+      existing.blocking = existing.blockingCount > 0
+      existing.affectedCount += Math.max(Number(issueRecord.affected_count) || count, 0)
+      if (!existing.resolutionHint && issue.resolutionHint) existing.resolutionHint = issue.resolutionHint
+    } else {
+      groups.set(key, {
+        key,
+        code,
+        blocking,
+        count,
+        blockingCount,
+        affectedCount: Math.max(Number(issueRecord.affected_count) || count, 0),
+        message: code === 'data_source_dependency'
+          ? '数据源、物理表或字段尚未接入或绑定。'
+          : issue.message,
+        resolutionHint: code === 'data_source_dependency'
+          ? '接入并检查数据源后，把现有逻辑映射绑定到真实表和字段；无需重建其他草稿。'
+          : issue.resolutionHint,
+        // One representative is enough for diagnostics; the count preserves
+        // scale without rendering dozens of near-identical resource rows.
+        issues: [issue],
+      })
+    }
   })
 
   return [...groups.values()].sort((left, right) => {
     if (left.blocking !== right.blocking) return left.blocking ? -1 : 1
-    if (left.issues.length !== right.issues.length) return right.issues.length - left.issues.length
+    if (left.count !== right.count) return right.count - left.count
     return left.code.localeCompare(right.code, 'zh-CN')
   })
 }

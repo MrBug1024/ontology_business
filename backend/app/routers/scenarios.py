@@ -1,21 +1,26 @@
 """业务场景 & 本体建模路由。"""
 from __future__ import annotations
 
+import copy
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, load_only
 
 from ..config import get_settings
 from ..database import get_db
 from ..models import (
     ActionExecutionLog,
     Agent,
+    AssistantAuditLog,
+    AssistantCompilationJob,
+    AssistantMessage,
+    AssistantThread,
     AuthorizationGrant,
     BucketFile,
     BusinessScenario,
@@ -27,16 +32,23 @@ from ..models import (
     MCPConfig,
     Message,
     OntologyAction,
+    OntologyBranch,
     OntologyEntity,
     OntologyEvent,
     OntologyInstance,
     OntologyProperty,
     OntologyRelation,
+    OntologyProposal,
+    OntologyRelease,
+    OntologyReview,
+    OntologyRollback,
     OntologyRule,
+    OntologySnapshot,
     OntologyWorkflow,
     RelationDataMapping,
     Skill,
     RelationInstance,
+    ScenarioModelDraftResource,
     WorkflowApprovalRequest,
     WorkflowRun,
 )
@@ -78,6 +90,10 @@ from ..schemas import (
     RuleOut,
     ScenarioDetail,
     ScenarioIn,
+    ScenarioModelDraftResourceListOut,
+    ScenarioModelDraftResourceOut,
+    ScenarioModelDraftResourcePatch,
+    ScenarioModelDraftResourceResolve,
     ScenarioOut,
     WorkflowExecuteRequest,
     WorkflowGenerateRequest,
@@ -98,6 +114,7 @@ from ..services import (
     release_service,
     runtime_connector_service,
     runtime_definition_service,
+    scenario_model_draft_service,
     template_artifact_service,
     template_catalog_service,
     tenant_service,
@@ -669,6 +686,394 @@ def _scenario_for_request(db: Session, scenario_id: str, writable: bool = False)
     return scenario
 
 
+def _delete_scenario_governance_history(
+    db: Session, scenario: BusinessScenario
+) -> None:
+    """Remove governance rows before the scenario ORM cascade runs.
+
+    Releases, rollbacks and proposals keep RESTRICT foreign keys to immutable
+    snapshots.  Deleting the scenario directly lets SQLAlchemy schedule the
+    snapshot deletes before those rows, which fails on SQLite/Postgres even
+    though every row belongs to the same user-owned scenario.  Clear the
+    dependency chain explicitly; active staging/prod releases are rejected by
+    ``assert_scenario_deletion_allowed`` before this helper is called.
+    """
+    proposal_ids = select(OntologyProposal.id).where(
+        OntologyProposal.scenario_id == scenario.id
+    )
+    db.execute(
+        delete(OntologyReview).where(OntologyReview.proposal_id.in_(proposal_ids))
+    )
+    # These rows reference snapshots/branches with RESTRICT and therefore must
+    # disappear before the snapshot and branch rows are cascaded.
+    db.execute(
+        delete(OntologyRelease).where(OntologyRelease.scenario_id == scenario.id)
+    )
+    db.execute(
+        delete(OntologyRollback).where(OntologyRollback.scenario_id == scenario.id)
+    )
+    db.execute(
+        delete(OntologyProposal).where(OntologyProposal.scenario_id == scenario.id)
+    )
+    db.flush()
+
+    # Keep already-loaded relationship collections from reintroducing stale
+    # governance objects into the parent delete cascade.
+    db.expire(
+        scenario,
+        (
+            "ontology_releases",
+            "ontology_rollbacks",
+            "ontology_proposals",
+            "ontology_snapshots",
+            "ontology_branches",
+        ),
+    )
+
+
+def _scenario_model_draft_out(
+    row: ScenarioModelDraftResource,
+    *,
+    include_issues: bool = True,
+) -> ScenarioModelDraftResourceOut:
+    # Validation issue arrays can be very large because a compiler run may
+    # attach the same evidence to many candidate resources.  The scene list
+    # only needs payloads and lifecycle metadata; callers that open a draft or
+    # need the full diagnostics can keep the legacy include_issues=true mode.
+    issues = [
+        item for item in (row.validation_issues or []) if isinstance(item, dict)
+    ] if include_issues else []
+    return ScenarioModelDraftResourceOut(
+        id=row.id,
+        scenario_id=row.scenario_id,
+        proposal_id=row.proposal_id,
+        predecessor_draft_id=row.predecessor_draft_id or "",
+        predecessor_revision=int(row.predecessor_revision or 0),
+        superseded_by_proposal_id=row.superseded_by_proposal_id or "",
+        task_id=row.task_id or "",
+        resource_kind=row.resource_kind,
+        resource_key=row.resource_key,
+        title=row.title or "",
+        payload=row.payload if isinstance(row.payload, dict) else {},
+        validation_issues=issues,
+        issues_count=len(issues) if include_issues else 0,
+        blocking_issue_count=sum(1 for item in issues if item.get("blocking", True)),
+        draft_status=row.draft_status,
+        # These are platform-owned constants, not editable lifecycle flags.
+        enabled=False,
+        publishable=False,
+        resolved_resource_id=row.resolved_resource_id or "",
+        source_thread_id=row.source_thread_id or "",
+        source_message_id=row.source_message_id or "",
+        compilation_job_id=row.compilation_job_id or "",
+        source_refs=[str(value) for value in (row.source_refs or [])],
+        revision=max(int(row.revision or 0), 0),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _refresh_resolved_draft_source_plan(
+    db: Session,
+    scenario: BusinessScenario,
+    row: ScenarioModelDraftResource,
+) -> None:
+    """Advance and rebaseline the owner-scoped proposal after formal resolution."""
+    if not row.source_message_id or not row.task_id:
+        return
+    thread = db.scalars(
+        select(AssistantThread)
+        .join(AssistantMessage, AssistantMessage.thread_id == AssistantThread.id)
+        .where(
+            AssistantMessage.id == row.source_message_id,
+            AssistantThread.tenant_id == row.tenant_id,
+            AssistantThread.scenario_id == scenario.id,
+            AssistantThread.created_by_user_id == row.created_by_user_id,
+        )
+    ).first()
+    message = db.get(AssistantMessage, row.source_message_id)
+    if not thread or not message or message.thread_id != thread.id:
+        return
+    proposal = copy.deepcopy(
+        message.proposal if isinstance(message.proposal, dict) else {}
+    )
+    if (
+        proposal.get("kind") != "scenario_model"
+        or str(proposal.get("proposal_id") or "") != row.proposal_id
+    ):
+        return
+
+    # Local import avoids a router import cycle while reusing the one lifecycle
+    # state machine that list/apply/result already expose.
+    from . import assistant as assistant_router
+
+    proposal_rows = list(db.scalars(
+        select(ScenarioModelDraftResource).where(
+            ScenarioModelDraftResource.tenant_id == row.tenant_id,
+            ScenarioModelDraftResource.scenario_id == scenario.id,
+            ScenarioModelDraftResource.created_by_user_id == row.created_by_user_id,
+            ScenarioModelDraftResource.proposal_id == row.proposal_id,
+        )
+    ).all())
+    proposal = assistant_router._attach_draft_materialization(
+        proposal,
+        scenario_model_draft_service.draft_summary(proposal_rows),
+    )
+    data = proposal.get("payload") if isinstance(proposal.get("payload"), dict) else {}
+    remaining_task_rows = [
+        candidate for candidate in proposal_rows
+        if candidate.task_id == row.task_id
+        and candidate.draft_status in scenario_model_draft_service.OPEN_DRAFT_STATUSES
+    ]
+    if not remaining_task_rows:
+        data = assistant_router._refresh_model_task_states(
+            data,
+            applied_task_id=row.task_id,
+            applied_status="applied",
+        )
+        manual_result = {
+            "kind": "scenario_model",
+            "task_id": row.task_id,
+            "task_status": "applied",
+            "manual_resolution": True,
+            "resolved_draft_id": row.id,
+            "resolved_resource_id": row.resolved_resource_id,
+            "applied_change_keys": [],
+        }
+        task = next(
+            (
+                item for item in (data.get("tasks") or [])
+                if isinstance(item, dict) and str(item.get("id") or "") == row.task_id
+            ),
+            None,
+        )
+        if task is not None:
+            task["apply_result"] = manual_result
+        proposal["apply_result"] = manual_result
+    proposal["payload"] = data
+
+    db.flush()
+    db.expire(
+        scenario,
+        (
+            "entities", "relations", "data_sources", "data_mappings",
+            "relation_data_mappings", "function_definitions", "actions",
+            "rules", "events", "workflows",
+        ),
+    )
+    proposal["base_snapshot"] = assistant_router._scenario_snapshot(scenario)
+    execution_status = str(data.get("execution_status") or "")
+    proposal["status"] = (
+        "applied"
+        if execution_status == "completed"
+        else "completed_with_gaps"
+        if execution_status == "completed_with_gaps"
+        else "in_progress"
+    )
+    proposal["requires_confirmation"] = bool(data.get("current_task_id"))
+    proposal["run_revision"] = assistant_router._safe_nonnegative_int(
+        data.get("execution_revision")
+    )
+    message.proposal = copy.deepcopy(proposal)
+    message_context = (
+        copy.deepcopy(message.context) if isinstance(message.context, dict) else {}
+    )
+    message_context.update({
+        "status": (
+            "success"
+            if execution_status in {"completed", "completed_with_gaps"}
+            else "waiting_confirmation"
+        ),
+        "run_revision": proposal["run_revision"],
+        "model_run_id": proposal.get("proposal_id"),
+    })
+    message.context = message_context
+    if row.compilation_job_id:
+        job = db.scalars(
+            select(AssistantCompilationJob).where(
+                AssistantCompilationJob.id == row.compilation_job_id,
+                AssistantCompilationJob.tenant_id == row.tenant_id,
+                AssistantCompilationJob.created_by_user_id == row.created_by_user_id,
+                AssistantCompilationJob.message_id == message.id,
+            )
+        ).first()
+        if job and job.status == "succeeded":
+            assistant_router._sync_compilation_job_result(
+                job, proposal, canonical=True
+            )
+
+
+def _resolved_draft_ontology_reference_id(
+    db: Session,
+    *,
+    scenario_id: str,
+    model: Any,
+    resource_prefix: str,
+    reference: Any,
+) -> str:
+    if isinstance(reference, dict):
+        stable_id = str(reference.get("id") or "").strip()
+        if stable_id:
+            resource = db.get(model, stable_id)
+            return (
+                str(resource.id)
+                if resource and str(resource.scenario_id) == scenario_id
+                else ""
+            )
+        reference = next(
+            (
+                reference.get(field)
+                for field in ("api_name", "key", "name", "display_name")
+                if str(reference.get(field) or "").strip()
+            ),
+            "",
+        )
+    token = str(reference or "").strip()
+    if not token:
+        return ""
+
+    tokens = {token}
+    lowered = token.casefold()
+    for separator in (".", "_", ":", "-"):
+        marker = f"{resource_prefix}{separator}"
+        if lowered.startswith(marker) and len(token) > len(marker):
+            tokens.add(token[len(marker):].strip())
+    api_names = set(tokens)
+    for value in tokens:
+        try:
+            api_names.add(ontology_service.normalize_api_name(
+                value,
+                prefix=resource_prefix,
+                stable_key=value,
+            ))
+        except ValueError:
+            continue
+    matches = list(db.scalars(
+        select(model).where(
+            model.scenario_id == scenario_id,
+            or_(
+                model.id.in_(tokens),
+                model.api_name.in_(api_names),
+                model.name.in_(tokens),
+            ),
+        )
+    ).all())
+    unique = {str(item.id): item for item in matches}
+    return next(iter(unique)) if len(unique) == 1 else ""
+
+
+def _resolved_formal_resource_id(
+    db: Session,
+    *,
+    scenario_id: str,
+    draft: ScenarioModelDraftResource,
+    resource_id: str,
+) -> str:
+    model_by_kind = {
+        "entity": OntologyEntity,
+        "relation": OntologyRelation,
+        "instance": OntologyInstance,
+        "mapping": DataMapping,
+        "relation_mapping": RelationDataMapping,
+        "function": FunctionDefinition,
+        "action": OntologyAction,
+        "rule": OntologyRule,
+        "event": OntologyEvent,
+        "workflow": OntologyWorkflow,
+    }
+    if draft.resource_kind == "property":
+        prop = db.get(OntologyProperty, resource_id)
+        if (
+            prop
+            and prop.entity
+            and str(prop.entity.scenario_id) == scenario_id
+        ):
+            return str(prop.id)
+        # Entity create/update responses do not expose child property IDs.
+        # Accept the verified parent entity ID and resolve one exact child by
+        # the staging payload's immutable API/display identity.
+        entity = db.get(OntologyEntity, resource_id)
+        if not entity or str(entity.scenario_id) != scenario_id:
+            return ""
+        working = draft.payload if isinstance(draft.payload, dict) else {}
+        api_name = str(working.get("api_name") or "").strip()
+        name = str(working.get("name") or "").strip()
+        matches = [
+            item for item in entity.properties
+            if (api_name and str(item.api_name or "") == api_name)
+            or (not api_name and name and str(item.name or "") == name)
+        ]
+        return str(matches[0].id) if len(matches) == 1 else ""
+    if draft.resource_kind == "conceptual_mapping":
+        source = draft.source_payload if isinstance(draft.source_payload, dict) else {}
+        working = draft.payload if isinstance(draft.payload, dict) else {}
+        mapping_kind = str(source.get("mapping_kind") or "").strip().casefold()
+        if mapping_kind in {"entity", "object"}:
+            mapping = db.get(DataMapping, resource_id)
+            if not mapping or str(mapping.scenario_id) != scenario_id:
+                return ""
+            entity_id = _resolved_draft_ontology_reference_id(
+                db,
+                scenario_id=scenario_id,
+                model=OntologyEntity,
+                resource_prefix="entity",
+                reference=working.get("entity_ref"),
+            )
+            return (
+                str(mapping.id)
+                if entity_id and str(mapping.entity_id) == entity_id
+                else ""
+            )
+        if mapping_kind == "relation":
+            mapping = db.get(RelationDataMapping, resource_id)
+            if not mapping or str(mapping.scenario_id) != scenario_id:
+                return ""
+            relation_id = _resolved_draft_ontology_reference_id(
+                db,
+                scenario_id=scenario_id,
+                model=OntologyRelation,
+                resource_prefix="relation",
+                reference=working.get("relation_ref"),
+            )
+            relation = db.get(OntologyRelation, relation_id) if relation_id else None
+            source_mapping = db.get(DataMapping, mapping.source_mapping_id)
+            target_mapping = db.get(DataMapping, mapping.target_mapping_id)
+            source_entity = (
+                db.get(OntologyEntity, relation.source_entity_id) if relation else None
+            )
+            target_entity = (
+                db.get(OntologyEntity, relation.target_entity_id) if relation else None
+            )
+            expected_mode = str(working.get("mode") or "").strip().casefold()
+            if (
+                not relation
+                or not source_entity
+                or not target_entity
+                or str(mapping.relation_id) != relation_id
+                or not source_mapping
+                or not target_mapping
+                or str(source_entity.scenario_id) != scenario_id
+                or str(target_entity.scenario_id) != scenario_id
+                or str(source_mapping.scenario_id) != scenario_id
+                or str(target_mapping.scenario_id) != scenario_id
+                or str(source_mapping.entity_id) != str(relation.source_entity_id)
+                or str(target_mapping.entity_id) != str(relation.target_entity_id)
+                or (expected_mode and str(mapping.mode).casefold() != expected_mode)
+            ):
+                return ""
+            return str(mapping.id)
+        return ""
+    model = model_by_kind.get(draft.resource_kind)
+    if model is None:
+        return ""
+    resource = db.get(model, resource_id)
+    return (
+        str(resource.id)
+        if resource and str(getattr(resource, "scenario_id", "")) == scenario_id
+        else ""
+    )
+
+
 def _require_restricted_scope_management(db: Session, access_scope: str) -> None:
     """受限资源会改变 ACL 语义，只允许组织管理者创建或调整该标记。"""
     if access_scope != "tenant":
@@ -1197,8 +1602,281 @@ def _object_detail_out(
     return ObjectDetailOut(**item.model_dump(), relations=relations)
 
 
+@router.get(
+    "/{scenario_id}/model-drafts",
+    response_model=ScenarioModelDraftResourceListOut,
+)
+def list_scenario_model_drafts(
+    scenario_id: str,
+    proposal_id: str | None = Query(default=None, max_length=64),
+    resource_kind: str | None = Query(default=None, max_length=40),
+    draft_status: str | None = Query(default=None, max_length=30),
+    include_resolved: bool = False,
+    include_issues: bool = Query(
+        default=True,
+        description="是否返回每个草稿的完整校验问题明细；场景列表可关闭以减少响应体。",
+    ),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=500, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    """List inert AI-generated resources under the normal scenario ACL."""
+    scenario = _scenario_for_request(db, scenario_id)
+    tenant_id = tenant_service.current_tenant_id(db)
+    user_id = str(db.info.get("user_id") or "")
+    filters = [
+        ScenarioModelDraftResource.tenant_id == tenant_id,
+        ScenarioModelDraftResource.scenario_id == scenario.id,
+        ScenarioModelDraftResource.created_by_user_id == user_id,
+    ]
+    if proposal_id:
+        filters.append(ScenarioModelDraftResource.proposal_id == proposal_id)
+    if resource_kind:
+        normalized_kind = scenario_model_draft_service.normalize_resource_kind(resource_kind)
+        if not normalized_kind:
+            raise HTTPException(400, "不支持的场景模型草稿资源类型")
+        filters.append(
+            ScenarioModelDraftResource.resource_kind == normalized_kind
+        )
+    if draft_status:
+        allowed_statuses = {
+            "pending_confirmation", "ready_for_review", "needs_attention",
+            "needs_validation", "accepted", "deferred", "applied", "resolved",
+            "superseded",
+        }
+        if draft_status not in allowed_statuses:
+            raise HTTPException(400, "不支持的场景模型草稿状态")
+        filters.append(
+            ScenarioModelDraftResource.draft_status == draft_status
+        )
+    elif not proposal_id:
+        # A caller that names a proposal is inspecting that exact compilation
+        # result, including its pre-confirmation staging rows.  Scene-level
+        # lists still hide those rows until the proposal crosses the explicit
+        # confirmation boundary.
+        filters.append(
+            ScenarioModelDraftResource.draft_status
+            != scenario_model_draft_service.PENDING_CONFIRMATION_STATUS
+        )
+    if not draft_status and not include_resolved:
+        filters.append(
+            ScenarioModelDraftResource.draft_status.notin_({"resolved", "superseded"})
+        )
+    stmt = select(ScenarioModelDraftResource).where(*filters)
+    draft_list_columns = []
+    if not include_issues:
+        # Keep large immutable provenance and diagnostic JSON columns out of
+        # the compact list query entirely.  This prevents SQLAlchemy from
+        # decoding them before the response serializer has a chance to omit
+        # them.
+        draft_list_columns = [
+            ScenarioModelDraftResource.id,
+            ScenarioModelDraftResource.scenario_id,
+            ScenarioModelDraftResource.proposal_id,
+            ScenarioModelDraftResource.predecessor_draft_id,
+            ScenarioModelDraftResource.predecessor_revision,
+            ScenarioModelDraftResource.superseded_by_proposal_id,
+            ScenarioModelDraftResource.task_id,
+            ScenarioModelDraftResource.resource_kind,
+            ScenarioModelDraftResource.resource_key,
+            ScenarioModelDraftResource.title,
+            ScenarioModelDraftResource.payload,
+            ScenarioModelDraftResource.source_refs,
+            ScenarioModelDraftResource.draft_status,
+            ScenarioModelDraftResource.resolved_resource_id,
+            ScenarioModelDraftResource.source_thread_id,
+            ScenarioModelDraftResource.source_message_id,
+            ScenarioModelDraftResource.compilation_job_id,
+            ScenarioModelDraftResource.revision,
+            ScenarioModelDraftResource.created_at,
+            ScenarioModelDraftResource.updated_at,
+        ]
+        stmt = stmt.options(load_only(*draft_list_columns))
+    total = int(db.scalar(
+        select(func.count()).select_from(ScenarioModelDraftResource).where(*filters)
+    ) or 0)
+    rows = list(db.scalars(
+        stmt.order_by(
+            ScenarioModelDraftResource.updated_at.desc(),
+            ScenarioModelDraftResource.resource_kind,
+            ScenarioModelDraftResource.title,
+            ScenarioModelDraftResource.id,
+        )
+        .offset(offset)
+        .limit(limit)
+    ).all())
+    all_rows_stmt = select(ScenarioModelDraftResource).where(*filters)
+    if draft_list_columns:
+        all_rows_stmt = all_rows_stmt.options(load_only(*draft_list_columns))
+    all_rows = list(db.scalars(all_rows_stmt).all())
+    next_offset = offset + len(rows)
+    return ScenarioModelDraftResourceListOut(
+        items=[
+            _scenario_model_draft_out(row, include_issues=include_issues)
+            for row in rows
+        ],
+        summary=scenario_model_draft_service.draft_summary(
+            all_rows, include_issue_counts=include_issues
+        ),
+        page_summary=scenario_model_draft_service.draft_summary(
+            rows, include_issue_counts=include_issues
+        ),
+        total=total,
+        has_more=next_offset < total,
+        next_offset=next_offset if next_offset < total else None,
+    )
+
+
+@router.patch(
+    "/{scenario_id}/model-drafts/{draft_id}",
+    response_model=ScenarioModelDraftResourceOut,
+)
+def update_scenario_model_draft(
+    scenario_id: str,
+    draft_id: str,
+    payload: ScenarioModelDraftResourcePatch,
+    db: Session = Depends(get_db),
+):
+    """Edit only the disabled staging copy and require revalidation."""
+    scenario = _scenario_for_request(db, scenario_id, writable=True)
+    tenant_id = tenant_service.current_tenant_id(db)
+    user_id = str(db.info.get("user_id") or "")
+    try:
+        row = scenario_model_draft_service.update_working_draft_atomic(
+            db,
+            tenant_id=tenant_id,
+            scenario_id=scenario.id,
+            draft_id=draft_id,
+            created_by_user_id=user_id,
+            payload=payload.payload,
+            expected_revision=payload.expected_revision,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, "场景模型草稿资源不存在") from exc
+    except scenario_model_draft_service.DraftRevisionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.add(
+        AssistantAuditLog(
+            tenant_id=tenant_id,
+            user_id=str(db.info.get("user_id") or ""),
+            scenario_id=scenario.id,
+            thread_id=None,
+            operation="update_model_draft_resource",
+            status="success",
+            context={
+                "draft_resource_id": row.id,
+                "proposal_id": row.proposal_id,
+                "resource_kind": row.resource_kind,
+                "resource_key": row.resource_key,
+                "revision": row.revision,
+            },
+            result={
+                "draft_status": row.draft_status,
+                "enabled": False,
+                "publishable": False,
+            },
+        )
+    )
+    db.commit()
+    db.refresh(row)
+    return _scenario_model_draft_out(row)
+
+
+@router.post(
+    "/{scenario_id}/model-drafts/{draft_id}/resolve",
+    response_model=ScenarioModelDraftResourceOut,
+)
+def resolve_scenario_model_draft(
+    scenario_id: str,
+    draft_id: str,
+    payload: ScenarioModelDraftResourceResolve,
+    db: Session = Depends(get_db),
+):
+    """Resolve staging only after a matching formal scene resource exists."""
+    scenario = _scenario_for_request(db, scenario_id, writable=True)
+    tenant_id = tenant_service.current_tenant_id(db)
+    user_id = str(db.info.get("user_id") or "")
+    # Serialize formal-resolution lifecycle changes with assistant task apply.
+    scenario = db.scalars(
+        select(BusinessScenario)
+        .where(
+            BusinessScenario.id == scenario.id,
+            BusinessScenario.tenant_id == tenant_id,
+        )
+        .with_for_update()
+    ).one()
+    row = db.scalars(
+        select(ScenarioModelDraftResource)
+        .where(
+            ScenarioModelDraftResource.id == draft_id,
+            ScenarioModelDraftResource.tenant_id == tenant_id,
+            ScenarioModelDraftResource.scenario_id == scenario.id,
+            ScenarioModelDraftResource.created_by_user_id == user_id,
+        )
+    ).first()
+    if not row:
+        raise HTTPException(404, "场景模型草稿资源不存在")
+    resolved_resource_id = _resolved_formal_resource_id(
+        db,
+        scenario_id=scenario.id,
+        draft=row,
+        resource_id=payload.resolved_resource_id,
+    )
+    if not resolved_resource_id:
+        # Keep missing, cross-scene and wrong-kind identifiers indistinguishable.
+        raise HTTPException(409, "正式资源不存在、类型不匹配或不属于当前场景")
+    try:
+        row = scenario_model_draft_service.resolve_draft_atomic(
+            db,
+            tenant_id=tenant_id,
+            scenario_id=scenario.id,
+            draft_id=draft_id,
+            created_by_user_id=user_id,
+            expected_revision=payload.expected_revision,
+            resolved_resource_id=resolved_resource_id,
+        )
+    except scenario_model_draft_service.DraftRevisionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    _refresh_resolved_draft_source_plan(db, scenario, row)
+    db.add(
+        AssistantAuditLog(
+            tenant_id=tenant_id,
+            user_id=str(db.info.get("user_id") or ""),
+            scenario_id=scenario.id,
+            thread_id=None,
+            operation="resolve_model_draft_resource",
+            status="success",
+            context={
+                "draft_resource_id": row.id,
+                "proposal_id": row.proposal_id,
+                "resource_kind": row.resource_kind,
+                "resource_key": row.resource_key,
+                "revision": row.revision,
+            },
+            result={
+                "draft_status": "resolved",
+                "resolved_resource_id": row.resolved_resource_id,
+                "enabled": False,
+                "publishable": False,
+            },
+        )
+    )
+    db.commit()
+    db.refresh(row)
+    return _scenario_model_draft_out(row)
+
+
 @router.get("/{scenario_id}", response_model=ScenarioDetail)
-def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
+def get_scenario(
+    scenario_id: str,
+    db: Session = Depends(get_db),
+    include_runtime_facts: bool = Query(
+        default=True,
+        description="是否返回对象/关系实例；模型与映射页可关闭以避免传输大批运行时事实",
+    ),
+):
     s = _scenario_for_request(db, scenario_id)
     definition = _runtime_definition_for_scenario(db, s)
     base = _scenario_out(s)
@@ -1247,21 +1925,25 @@ def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
         for d in s.data_sources
         if d.tenant_id == tenant_service.current_tenant_id(db) or d.is_public
     ]
-    visible_instances = [
-        instance
-        for instance in s.instances
-        if _instance_in_current_runtime(instance, definition)
-        and permission_service.check_object(db, instance, "read").allowed
-    ]
-    visible_instance_ids = {instance.id for instance in visible_instances}
-    instances = [_instance_out(db, instance) for instance in visible_instances]
-    rel_instances = [
-        _rel_instance_out(ri)
-        for ri in s.relation_instances
-        if ri.source_instance_id in visible_instance_ids
-        and ri.target_instance_id in visible_instance_ids
-        and _relation_in_current_runtime(ri, definition)
-    ]
+    if include_runtime_facts:
+        visible_instances = [
+            instance
+            for instance in s.instances
+            if _instance_in_current_runtime(instance, definition)
+            and permission_service.check_object(db, instance, "read").allowed
+        ]
+        visible_instance_ids = {instance.id for instance in visible_instances}
+        instances = [_instance_out(db, instance) for instance in visible_instances]
+        rel_instances = [
+            _rel_instance_out(ri)
+            for ri in s.relation_instances
+            if ri.source_instance_id in visible_instance_ids
+            and ri.target_instance_id in visible_instance_ids
+            and _relation_in_current_runtime(ri, definition)
+        ]
+    else:
+        instances = []
+        rel_instances = []
     mappings = [_mapping_out(m) for m in s.data_mappings if m.id in mapping_ids]
     relation_mappings = [
         _relation_mapping_out(m)
@@ -1471,6 +2153,7 @@ def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
         template_catalog_service.prepare_scenario_deletion(db, s)
     except template_catalog_service.TemplateCatalogError as exc:
         raise HTTPException(409, str(exc)) from exc
+    _delete_scenario_governance_history(db, s)
     db.delete(s)
     db.commit()
     return Msg(message="已删除")

@@ -118,13 +118,25 @@ def list_tables(ds: DataSource) -> list[dict[str, Any]]:
     return tables
 
 
-def run_query(ds: DataSource, sql: str, limit: int | None = None) -> dict[str, Any]:
-    """执行单条只读 SQL 查询，返回列名与行数据。"""
+def run_query(
+    ds: DataSource,
+    sql: str,
+    limit: int | None = None,
+    *,
+    max_rows: int | None = None,
+) -> dict[str, Any]:
+    """执行单条只读 SQL 查询，返回列名与行数据。
+
+    ``max_rows`` is an internal caller ceiling.  Mapping refresh jobs have a
+    separately bounded batch size (currently 500), while interactive Agent
+    queries must continue to use the lower application-wide query limit.
+    """
     if ds.type == "file_bucket":
         raise ValueError("文件桶数据源不支持 SQL 查询")
     sql = validate_read_only_sql(sql)
-    max_rows = get_settings().max_query_rows
-    limit = max(1, min(int(limit or max_rows), max_rows))
+    configured_max_rows = get_settings().max_query_rows
+    caller_max_rows = configured_max_rows if max_rows is None else max(1, int(max_rows))
+    limit = max(1, min(int(limit or caller_max_rows), caller_max_rows))
     engine = get_engine(ds)
     with engine.connect() as conn:
         result = conn.execute(text(sql))

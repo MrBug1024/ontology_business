@@ -33,6 +33,7 @@ from app.models import (
     Message,
     OrganizationMember,
     OntologyEntity,
+    OntologyRelation,
     Skill,
     Tenant,
     User,
@@ -598,6 +599,51 @@ class SecurityAclRegressionTests(unittest.TestCase):
         self.assertEqual(refreshed, persisted[0])
         self.assertEqual(agents._stream_error_content("", error_data), f"[错误] {error_data}")
 
+    def test_agent_stream_reloads_runtime_in_stream_owned_session(self) -> None:
+        db = self.Session()
+        try:
+            llm = LLMConfig(
+                id="llm-security-stream-session",
+                tenant_id=self.tenant.id,
+                name="流式会话生命周期测试模型",
+                provider="openai",
+                model="test-model",
+                capabilities=["chat", "tool"],
+                enabled=True,
+            )
+            relation = OntologyRelation(
+                id="relation-security-stream-session",
+                scenario_id=self.scenario.id,
+                name="关联自身",
+                source_entity_id=self.entity.id,
+                target_entity_id=self.entity.id,
+            )
+            db.get(Agent, self.agent.id).llm_config_id = llm.id
+            db.add_all([llm, relation])
+            db.commit()
+        finally:
+            db.close()
+
+        def inspect_runtime(*_args, **kwargs):
+            context = kwargs["runtime_context"]
+            self.assertEqual(context.relations[0].source_entity.name, self.entity.name)
+            self.assertEqual(context.relations[0].target_entity.name, self.entity.name)
+            yield {"type": "token", "data": "关系运行时可用"}
+            yield {"type": "done", "data": "关系运行时可用"}
+
+        with (
+            patch.object(agents, "SessionLocal", self.Session),
+            patch.object(agents.agent_engine, "run_agent", inspect_runtime),
+        ):
+            response = self.client.post(
+                f"/api/agents/{self.agent.id}/chat",
+                json={"message": "检查关系模型"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn('"type": "error"', response.text)
+        self.assertIn("关系运行时可用", response.text)
+
     def test_revoked_agent_binding_preserves_snapshot_but_filters_llm_replay(self) -> None:
         visible_marker = "VISIBLE_DURABLE_ANSWER"
         raw_result_marker = "STALE_BOUND_SOURCE_TOOL_RESULT"
@@ -747,8 +793,8 @@ class SecurityAclRegressionTests(unittest.TestCase):
         self.assertNotIn("AP001年度审计报告.docx", replayed)
         self.assertIn(agents._HISTORIC_MODEL_REPLAY_PLACEHOLDER, replayed)
         self.assertEqual(len(captured_runtime_context), 1)
-        self.assertEqual(len(authorization_contexts), 1)
-        self.assertIs(captured_runtime_context[0], authorization_contexts[0])
+        self.assertEqual(len(authorization_contexts), 2)
+        self.assertIs(captured_runtime_context[0], authorization_contexts[-1])
         self.assertEqual(
             {source.id for source in captured_runtime_context[0].data_sources},
             {self.scoped_source.id},

@@ -38,7 +38,7 @@ FILTER_OPERATORS = frozenset(
 )
 SORT_DIRECTIONS = frozenset({"asc", "desc"})
 QUERY_ARGUMENTS = frozenset(
-    {"entity_id", "entity_name", "properties", "filters", "sort", "limit"}
+    {"entity_id", "entity_name", "properties", "filters", "sort", "limit", "offset"}
 )
 _ORDERED_OPERATORS = frozenset({"gt", "gte", "lt", "lte"})
 _TEXT_OPERATORS = frozenset({"contains", "starts_with", "ends_with"})
@@ -70,6 +70,8 @@ class MappedQueryPlan:
     sql: str
     parameters: dict[str, Any]
     limit: int
+    offset: int
+    offset_explicit: bool
     normalized_request: dict[str, Any]
 
     @property
@@ -385,6 +387,7 @@ def _compile_sql(
     filters: Sequence[Mapping[str, Any]],
     sort: Sequence[Mapping[str, str]],
     limit: int,
+    offset: int,
 ) -> tuple[str, dict[str, Any]]:
     select_sql = ", ".join(
         f"{quote_identifier(source_type, item.column)} AS "
@@ -434,7 +437,8 @@ def _compile_sql(
             for item in sort
         )
     params["mq_limit"] = limit + 1
-    sql += " LIMIT :mq_limit"
+    params["mq_offset"] = offset
+    sql += " LIMIT :mq_limit OFFSET :mq_offset"
     return sql, params
 
 
@@ -526,6 +530,10 @@ def prepare_query(
         raise MappedQueryError("limit 必须是整数")
     if not 1 <= raw_limit <= max_rows:
         raise MappedQueryError(f"limit 必须介于 1 和 {max_rows} 之间")
+    offset_explicit = "offset" in request
+    raw_offset = request.get("offset", 0)
+    if isinstance(raw_offset, bool) or not isinstance(raw_offset, int) or raw_offset < 0:
+        raise MappedQueryError("offset 必须是非负整数")
     sql, parameters = _compile_sql(
         str(source.type),
         str(mapping.table_name),
@@ -533,6 +541,7 @@ def prepare_query(
         filters,
         sort,
         raw_limit,
+        raw_offset,
     )
     normalized_request = {
         "entity_id": str(entity.id),
@@ -547,6 +556,7 @@ def prepare_query(
             for item in sort
         ],
         "limit": raw_limit,
+        "offset": raw_offset,
     }
     return MappedQueryPlan(
         entity=entity,
@@ -557,6 +567,8 @@ def prepare_query(
         sql=sql,
         parameters=parameters,
         limit=raw_limit,
+        offset=raw_offset,
+        offset_explicit=offset_explicit,
         normalized_request=normalized_request,
     )
 
@@ -595,12 +607,15 @@ def execute_query(plan: MappedQueryPlan) -> dict[str, Any]:
                     f"属性“{item.name}”的数据转换失败，请检查映射规则或源数据"
                 ) from exc
         objects.append(projected)
+    truncated = bool(raw.get("truncated", False))
     return {
         "entity": {"id": str(plan.entity.id), "name": str(plan.entity.name)},
         "properties": [item.name for item in plan.properties],
         "objects": objects,
         "row_count": len(objects),
-        "truncated": bool(raw.get("truncated", False)),
+        "truncated": truncated,
+        "offset": plan.offset,
+        "next_offset": plan.offset + len(objects) if truncated else None,
         "lineage": plan.lineage,
     }
 
@@ -640,4 +655,28 @@ def authorize_historic_result(plan: MappedQueryPlan, result: Any) -> bool:
     row_count = result.get("row_count")
     if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count != len(objects):
         return False
-    return isinstance(result.get("truncated"), bool)
+    truncated = result.get("truncated")
+    if not isinstance(truncated, bool):
+        return False
+    has_offset = "offset" in result
+    has_next_offset = "next_offset" in result
+    if not has_offset and not has_next_offset:
+        return not plan.offset_explicit and plan.offset == 0
+    if has_offset != has_next_offset:
+        return False
+    result_offset = result.get("offset")
+    if (
+        isinstance(result_offset, bool)
+        or not isinstance(result_offset, int)
+        or result_offset != plan.offset
+    ):
+        return False
+    expected_next_offset = plan.offset + len(objects) if truncated else None
+    next_offset = result.get("next_offset")
+    if expected_next_offset is None:
+        return next_offset is None
+    return (
+        isinstance(next_offset, int)
+        and not isinstance(next_offset, bool)
+        and next_offset == expected_next_offset
+    )

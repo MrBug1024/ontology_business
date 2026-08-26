@@ -3,8 +3,16 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import { actionArtifactAttachment } from '../src/utils/artifactAttachments.ts'
+import { actionConfirmationParams } from '../src/utils/actionConfirmation.ts'
 import { groupScenarioModelIssues, scenarioModelIssueLabel } from '../src/utils/assistantProposalGroups.ts'
 import { compilationRetryDraft, retryAttachmentsForMessage } from '../src/utils/assistantRetry.ts'
+import {
+  draftRefToken,
+  normalizeScenarioModelDrafts,
+  scenarioDraftBlockingIssueCount,
+  scenarioDraftIssueCount,
+  scenarioDraftStage,
+} from '../src/utils/scenarioModelDrafts.ts'
 import {
   clearCompilationJobBookmark,
   compilationPollDelay,
@@ -42,6 +50,36 @@ function memoryStorage() {
   }
 }
 
+test('action confirmation keeps original parameters when the preview is compacted', () => {
+  const params = { report_name: 'annual-audit', payload: 'x'.repeat(9000) }
+  const compactPlan = {
+    action_id: 'action-a',
+    parameters_omitted: true,
+    parameters_sha256: 'digest-only',
+  }
+
+  assert.equal(actionConfirmationParams({ args: { params } }, compactPlan), params)
+  assert.deepEqual(
+    actionConfirmationParams(
+      { arguments: JSON.stringify({ params: { account_id: 'AP001' } }) },
+      compactPlan,
+    ),
+    { account_id: 'AP001' },
+  )
+  assert.deepEqual(
+    actionConfirmationParams({}, { parameters: { account_id: 'legacy' } }),
+    { account_id: 'legacy' },
+  )
+  assert.equal(actionConfirmationParams({}, compactPlan), null)
+
+  const source = readFileSync(
+    new URL('../src/views/AgentChat.vue', import.meta.url),
+    'utf8',
+  )
+  assert.match(source, /const params = actionConfirmationParams\(toolCall, plan\)/)
+  assert.doesNotMatch(source, /params:\s*plan\.parameters\s*\|\|\s*\{\}/)
+})
+
 test('global assistant shows safe reference names and makes capability updates read-only', () => {
   const source = readFileSync(
     new URL('../src/components/GlobalAssistant.vue', import.meta.url),
@@ -51,6 +89,310 @@ test('global assistant shows safe reference names and makes capability updates r
   assert.match(source, /修改或删除将切换为只读指导/)
   assert.match(source, /新增业务能力/)
   assert.doesNotMatch(source, /return '场景已有定义'/)
+})
+
+test('scenario modelling stays as a durable sequential plan until final summary', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  assert.match(source, /持续执行计划/)
+  assert.match(source, /草稿生成阶段结束不代表计划结束/)
+  assert.match(source, /当前持续任务停在确认点/)
+  assert.match(source, /直接在下方说明修正、新增或删除要求/)
+  assert.match(source, /保留草稿并继续/)
+  assert.match(source, /全部任务已推进，存在待补全项/)
+  assert.match(source, /解决建议/)
+  assert.match(source, /modelRunAwaitingConfirmation/)
+  assert.match(source, /latestModelRunMessage/)
+  assert.match(source, /isActiveModelRun\(message\)/)
+  assert.match(source, /event\.data\.thread_id/)
+  assert.match(source, /task_update_text/)
+  assert.match(source, /completed_with_gaps/)
+  assert.doesNotMatch(source, /if \(modelRunAwaitingConfirmation\.value\) \{\s*ElMessage\.info/)
+  assert.doesNotMatch(source, /先跳过，保留问题/)
+})
+
+test('only the active message card is actionable when two messages share a model proposal id', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const start = source.indexOf('function isActiveModelRun')
+  const end = source.indexOf('\nfunction modelTasks', start)
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  const functionSource = source.slice(start, end)
+  const body = functionSource.slice(
+    functionSource.indexOf('{') + 1,
+    functionSource.lastIndexOf('}'),
+  )
+  const sharedProposal = {
+    kind: 'scenario_model',
+    proposal_id: 'shared-run-id',
+    status: 'in_progress',
+    payload: {},
+  }
+  const activeMessage = { id: 'message-new', proposal: sharedProposal }
+  const staleMessage = { id: 'message-old', proposal: sharedProposal }
+  const sameDurableMessageReloaded = { id: 'message-new', proposal: { ...sharedProposal } }
+  const isActiveModelRun = Function(
+    'activeModelRunMessage',
+    `return function (message) {${body}}`,
+  )({ value: activeMessage })
+
+  assert.equal(isActiveModelRun(activeMessage), true)
+  assert.equal(isActiveModelRun(sameDurableMessageReloaded), true)
+  assert.equal(isActiveModelRun(staleMessage), false)
+  assert.doesNotMatch(functionSource, /proposal_id|proposalOf\(/)
+})
+
+test('scenario model recovery reloads the durable proposal instead of fabricating one', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const start = source.indexOf('async function recoverSucceededCompilation')
+  const end = source.indexOf('async function recoverFailedCompilation', start)
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  const recovery = source.slice(start, end)
+
+  assert.match(
+    recovery,
+    /if \(result\.apply_ready && proposalId && !hasProposalMessage\) \{[\s\S]*?await api\.listAssistantMessages\(/,
+  )
+  assert.doesNotMatch(
+    recovery,
+    /recoveredMessages\s*=\s*\[\.\.\.recoveredMessages,\s*\{/,
+  )
+  assert.doesNotMatch(recovery, /compilation-result-\$\{job\.id\}/)
+})
+
+test('scenario model recovery remains bound to its durable scope and monotonic revision', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const taskRecovery = source.slice(
+    source.indexOf('function beginModelTaskRecovery'),
+    source.indexOf('async function applyModelTask'),
+  )
+  const discovery = source.slice(
+    source.indexOf('async function discoverCompilationForThread'),
+    source.indexOf('async function beginCompilationRecoveryFromEvent'),
+  )
+  const succeeded = source.slice(
+    source.indexOf('async function recoverSucceededCompilation'),
+    source.indexOf('async function recoverFailedCompilation'),
+  )
+
+  assert.match(taskRecovery, /ownerScopeKey = assistantScopeKey\.value/)
+  assert.match(taskRecovery, /generation === modelTaskRecoveryGeneration/)
+  assert.match(taskRecovery, /const recoveryContext = apiContext\(\)/)
+  assert.match(taskRecovery, /if \(!isCurrent\(\)\) return[\s\S]*?await api\.listAssistantMessages[\s\S]*?if \(!isCurrent\(\)\) return/)
+  assert.match(source, /Math\.max\(localRevision, responseRevision\)/)
+  assert.match(discovery, /selectCompilationJobForRecovery\(jobs, scope\.scenarioId, knownJobId\)/)
+  assert.match(succeeded, /compilationPathFromScopeKey\(result\.proposal_scope_key, scope\.scenarioId\)/)
+  assert.match(succeeded, /if \(canonicalPath !== currentPath\)/)
+})
+
+test('scenario model cards never expose the legacy whole-proposal apply action', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(
+    source,
+    /v-if="proposalOf\(message\)\?\.kind !== 'scenario_model' && !modelTasks\(proposalOf\(message\)\)\.length" class="proposal-actions"/,
+  )
+  assert.doesNotMatch(
+    source,
+    /v-if="!modelTasks\(proposalOf\(message\)\)\.length" class="proposal-actions"/,
+  )
+})
+
+test('materialized AI drafts stay durable, disabled and linked to the original modelling stages', () => {
+  const drafts = normalizeScenarioModelDrafts({
+    items: [{
+      id: 'draft-action-1',
+      scenario_id: 'scenario-1',
+      proposal_id: 'proposal-1',
+      task_id: 'capabilities',
+      resource_kind: 'action',
+      resource_key: 'action:create-order',
+      payload: { name: '创建订单', enabled: true },
+      validation_issues: [
+        { code: 'EXECUTOR_MISSING', message: '尚未绑定执行方式', blocking: true, resolution_hint: '选择受治理执行器' },
+      ],
+      issues_count: 1,
+      blocking_issue_count: 1,
+      draft_status: 'needs_revision',
+      enabled: true,
+      publishable: true,
+    }],
+  })
+
+  assert.equal(drafts.length, 1)
+  assert.equal(drafts[0].enabled, false)
+  assert.equal(drafts[0].publishable, false)
+  assert.equal(scenarioDraftStage(drafts[0].resource_kind), 'actions')
+  assert.equal(scenarioDraftIssueCount(drafts[0]), 1)
+  assert.equal(scenarioDraftBlockingIssueCount(drafts[0]), 1)
+  assert.equal(drafts[0].validation_issues[0].resolution_hint, '选择受治理执行器')
+
+  const conceptual = normalizeScenarioModelDrafts([{
+    id: 'draft-mapping-1', proposal_id: 'proposal-1', task_id: 'mapping',
+    resource_kind: 'conceptual_mapping', resource_key: 'mapping:order',
+    payload: { entity: '订单' }, validation_issues: [], draft_status: 'needs_binding',
+    enabled: false, publishable: false,
+  }])
+  assert.equal(scenarioDraftStage(conceptual[0].resource_kind), 'mappings')
+  const instance = normalizeScenarioModelDrafts([{
+    id: 'draft-instance-1', proposal_id: 'proposal-1', task_id: 'ontology',
+    resource_kind: 'instance', resource_key: 'instance:order-1', revision: 0,
+    payload: { name: '订单 1' }, validation_issues: [], draft_status: 'needs_attention',
+    enabled: false, publishable: false,
+  }])
+  assert.equal(scenarioDraftStage(instance[0].resource_kind), 'instances')
+  const property = normalizeScenarioModelDrafts([{
+    id: 'draft-property-1', proposal_id: 'proposal-1', task_id: 'ontology',
+    resource_kind: 'property', resource_key: 'entity:order:property:code', revision: 0,
+    payload: { entity_ref: 'entity:order', name: '订单编号', data_type: 'string' },
+    validation_issues: [], draft_status: 'ready_for_review', enabled: false, publishable: false,
+  }])
+  assert.equal(scenarioDraftStage(property[0].resource_kind), 'ontology')
+  assert.equal(draftRefToken({ kind: 'entity', key: 'entity:Order' }), 'entity:Order')
+  assert.equal(draftRefToken({ kind: 'data_source', id: 'source-1' }), 'source-1')
+})
+
+test('scenario page projects durable model resources into normal canvases and tabs without AI warning chrome', () => {
+  const source = readFileSync(
+    new URL('../src/views/ScenarioDetail.vue', import.meta.url),
+    'utf8',
+  )
+  const graphCanvas = readFileSync(
+    new URL('../src/components/GraphCanvas.vue', import.meta.url),
+    'utf8',
+  )
+  const apiSource = readFileSync(
+    new URL('../src/api/index.ts', import.meta.url),
+    'utf8',
+  )
+  const editorPanel = readFileSync(
+    new URL('../src/components/EditorPanel.vue', import.meta.url),
+    'utf8',
+  )
+
+  assert.doesNotMatch(source, /ScenarioDraftWorkbench/)
+  assert.doesNotMatch(source, /AI 待修正草稿|待修正草稿/)
+  const pageTemplate = source.slice(0, source.indexOf('<script setup'))
+  assert.doesNotMatch(pageTemplate, /AI 草稿|AI 已写入|草稿停用|>修正(?:并编排)?</)
+  assert.doesNotMatch(pageTemplate, /class="mapping-prerequisite"|class="mapping-readiness-alert"/)
+  assert.doesNotMatch(pageTemplate, /stat-draft|is-ai-draft|inlineDraftRowClass/)
+  assert.doesNotMatch(pageTemplate, /scenarioDraftsLoading|scenarioDraftsError|scenarioDraftPromotionError/)
+  assert.doesNotMatch(graphCanvas, /AI 已写入|draftStatus|e\.draft/)
+  assert.doesNotMatch(graphCanvas, /:stroke-dasharray="n\.meta\?\.aiDraft|e\.dashed \|\| e\.draft/)
+  assert.match(source, /对象类型 <b>\{\{ detail\.entities\.length \+ scenarioDraftsOf\('entity'\)\.length \}\}<\/b>/)
+  assert.match(source, /对象实例 <b>\{\{ detail\.instances\.length \+ scenarioDraftsOf\('instance'\)\.length \}\}<\/b>/)
+  for (const rowsName of ['objectMappingRows', 'relationMappingRows', 'functionRows', 'actionRows', 'ruleRows', 'eventRows', 'workflowRows']) {
+    assert.match(source, new RegExp(`<b>\\{\\{ ${rowsName}\\.length \\}\\}</b>`))
+  }
+  assert.match(source, /loadScenarioModelDrafts|listScenarioModelDrafts/)
+  assert.match(source, /const openScenarioDrafts = computed\(\(\) => scenarioDrafts\.value\.filter\(scenarioDraftIsOpen\)\)/)
+  assert.match(source, /function scenarioDraftDisplayId[\s\S]*?`ai-draft:\$\{item\.resource_kind\}:\$\{item\.id\}`/)
+
+  const schemaGraph = source.slice(
+    source.indexOf('const schemaGraph = computed'),
+    source.indexOf('const instanceGraph = computed'),
+  )
+  assert.match(schemaGraph, /scenarioDraftsOf\('entity'\)/)
+  assert.match(schemaGraph, /scenarioDraftsOf\('property'\)/)
+  assert.match(schemaGraph, /scenarioDraftsOf\('relation'\)/)
+  assert.match(schemaGraph, /meta:\s*\{[\s\S]*?aiDraft:\s*draft/)
+
+  const instanceGraph = source.slice(
+    source.indexOf('const instanceGraph = computed'),
+    source.indexOf('const legend = computed'),
+  )
+  assert.match(instanceGraph, /scenarioDraftsOf\('instance'\)/)
+  assert.match(instanceGraph, /aiDraft:\s*draft/)
+
+  const mergedRows = [
+    ['objectMappingRows', /scenarioDraftsOf\('mapping', 'data_mapping', 'conceptual_mapping'\)[\s\S]*?detail\.value\.mappings/],
+    ['relationMappingRows', /scenarioDraftsOf\('relation_mapping'\)[\s\S]*?detail\.value\.relation_mappings/],
+    ['functionRows', /scenarioDraftsOf\('function'\)[\s\S]*?detail\.value\.functions/],
+    ['actionRows', /scenarioDraftsOf\('action'\)[\s\S]*?detail\.value\.actions/],
+    ['ruleRows', /scenarioDraftsOf\('rule'\)[\s\S]*?detail\.value\.rules/],
+    ['eventRows', /scenarioDraftsOf\('event'\)[\s\S]*?detail\.value\.events/],
+    ['workflowRows', /scenarioDraftsOf\('workflow'\)[\s\S]*?detail\.value\.workflows/],
+  ]
+  for (const [name, projection] of mergedRows) {
+    assert.match(source, new RegExp(`const ${name} = computed`))
+    assert.match(source, projection)
+  }
+  assert.match(source, /v-if="objectMappingRows\.length"[\s\S]*?v-for="row in objectMappingRows"/)
+  assert.match(source, /v-if="relationMappingRows\.length"[\s\S]*?v-for="row in relationMappingRows"/)
+  for (const name of ['functionRows', 'actionRows', 'ruleRows', 'eventRows', 'workflowRows']) {
+    assert.match(source, new RegExp(`:data="${name}"`))
+  }
+
+  const operationBranches = [
+    ['objectMappingRows', 'doPreviewMapping'],
+    ['functionRows', 'doRunFunction'],
+    ['actionRows', 'doExecuteAction'],
+    ['ruleRows', 'doEvalRule'],
+    ['eventRows', 'publishEvent'],
+    ['workflowRows', 'doExecuteWorkflow'],
+  ]
+  for (const [rowsName, dangerousOperation] of operationBranches) {
+    const surfaceStart = rowsName === 'objectMappingRows'
+      ? source.indexOf('v-if="objectMappingRows.length"')
+      : source.indexOf(`:data="${rowsName}"`)
+    const nextTab = source.indexOf('<el-tab-pane', surfaceStart)
+    const section = source.slice(surfaceStart, nextTab === -1 ? source.length : nextTab)
+    const draftAction = section.indexOf('row._isAiDraft')
+    const formalBranch = section.indexOf('<template v-else>', draftAction)
+    const operation = section.indexOf(dangerousOperation, draftAction)
+    assert.ok(surfaceStart >= 0, `${rowsName} must render in its original surface`)
+    assert.ok(draftAction >= 0, `${rowsName} must branch on AI draft rows`)
+    assert.ok(formalBranch > draftAction, `${rowsName} must keep formal operations in a separate branch`)
+    assert.ok(operation > formalBranch, `${dangerousOperation} must be hidden from AI draft rows`)
+  }
+
+  const directEditor = source.slice(
+    source.indexOf('async function startEditingScenarioDraft'),
+    source.indexOf('function unresolvedDraftReferenceIssue'),
+  )
+  assert.match(directEditor, /^async function startEditingScenarioDraft\(item: ScenarioModelDraftResource\)/)
+  assert.match(directEditor, /editor\.value =/)
+  assert.match(directEditor, /mappingForm\.value =/)
+  assert.match(directEditor, /functionForm\.value =/)
+  assert.match(directEditor, /wfEditor\.value =/)
+  assert.doesNotMatch(directEditor, /selectedScenarioDraft|scenarioDraftDrawer|inspectScenarioDraft/)
+  assert.match(source, /node\.meta\?\.aiDraft[\s\S]*?startEditingScenarioDraft\(node\.meta\.aiDraft\)/)
+  assert.match(source, /@click="startEditingScenarioDraft\(row\._scenarioDraft\)"/)
+  assert.match(source, /v-if="row\._isAiDraft"[^>]*@click="startEditingScenarioDraft\(row\._scenarioDraft\)"[^>]*>编辑<\/el-button>/)
+  assert.match(source, /activeScenarioDraftPromotion/)
+  assert.match(source, /resolveScenarioDraftAfterFormalSave/)
+  assert.match(source, /resolveScenarioModelDraft/)
+  assert.match(apiSource, /listScenarioModelDrafts: \(id: string, params:/)
+  assert.match(apiSource, /model-drafts`, \{ params \}/)
+  assert.match(source, /while \(true\)/)
+  assert.match(source, /metadata\?\.has_more !== true/)
+  assert.match(source, /nextOffset <= offset/)
+  assert.match(source, /草稿分页游标无效/)
+  assert.match(source, /draftsById\.size !== expectedTotal/)
+  assert.match(source, /formalPropertyResourceId/)
+  assert.match(source, /openEntity\(entity\.id\)/)
+  assert.match(source, /draftPropertyEditorIndex/)
+  assert.match(source, /runtime_kind: 'contract'/)
+  assert.match(source, /status: 'draft'/)
+  assert.match(source, /enabled: false/)
+  assert.doesNotMatch(source, /detail\.value\.(?:functions|actions|rules|events|workflows)\s*=\s*\[\.\.\..*scenarioDrafts/)
+  assert.match(editorPanel, /focusPropertyIndex/)
+  assert.match(editorPanel, /draft-property-focus/)
 })
 
 test('successful Action artifacts ignore a forged download URL', () => {
@@ -289,7 +631,7 @@ test('compilation recovery selects a bookmarked terminal job or a live job only 
   assert.ok(compilationPollDelay(false, 2) > compilationPollDelay(false, 0))
 })
 
-test('scenario compiler issues are grouped by severity and stable code without dropping details', () => {
+test('scenario compiler issues collapse repeated root causes to one representative with accurate counts', () => {
   const issues = [
     { code: 'unknown_rule_field', message: '字段 A 不存在', blocking: true, source_refs: ['p0001', 'p0001'] },
     { code: ' UNKNOWN_RULE_FIELD ', message: '字段 B 不存在', source_refs: ['p0002'] },
@@ -298,17 +640,59 @@ test('scenario compiler issues are grouped by severity and stable code without d
   ]
 
   const groups = groupScenarioModelIssues(issues)
-  assert.deepEqual(groups.map((group) => [group.key, group.issues.length]), [
-    ['blocking:unknown_rule_field', 2],
-    ['blocking:missing_reference', 1],
-    ['notice:unknown_rule_field', 1],
+  assert.deepEqual(groups.map((group) => [group.key, group.count, group.blockingCount, group.issues.length]), [
+    ['unknown_rule_field', 3, 2, 1],
+    ['missing_reference', 1, 1, 1],
   ])
   assert.deepEqual(groups[0].issues[0].sourceRefs, ['p0001'])
-  assert.equal(groups.flatMap((group) => group.issues).length, issues.length)
+  assert.equal(groups.reduce((total, group) => total + group.count, 0), issues.length)
+  assert.equal(groups.flatMap((group) => group.issues).length, groups.length)
   assert.equal(scenarioModelIssueLabel('unknown_rule_field'), '规则字段未定义')
   assert.equal(scenarioModelIssueLabel('invalid_relation_constraints'), '关系约束格式不正确')
   assert.equal(scenarioModelIssueLabel('MAPPING_DEFERRED_NO_DATA_SOURCE'), '数据映射等待数据源')
+  assert.equal(scenarioModelIssueLabel('data_source_dependency'), '数据源尚未接入或绑定')
+  assert.equal(scenarioModelIssueLabel('PREREQUISITE_DRAFT_ONLY'), '前置任务仅保留草稿')
+  assert.equal(scenarioModelIssueLabel('INVALID_TASK_DEPENDENCY'), '建模任务依赖异常')
   assert.equal(scenarioModelIssueLabel('future_code'), '其他预检问题')
+})
+
+test('data source issue aliases produce one summary row and preserve aggregate scale', () => {
+  const groups = groupScenarioModelIssues([
+    {
+      code: 'missing_data_source',
+      message: '订单映射缺少数据源',
+      count: 3,
+      blocking_count: 3,
+      affected_count: 2,
+      source_refs: ['mapping:order', 'mapping:order'],
+    },
+    {
+      code: 'MAPPING_DEFERRED_NO_DATA_SOURCE',
+      message: '客户映射等待数据源',
+      count: 5,
+    },
+    {
+      code: 'document_reported_issue',
+      reported_code: 'DATA_SOURCE_UNAVAILABLE',
+      message: '附件声明的数据源当前不可用',
+      count: 4,
+      blocking: false,
+    },
+    {
+      code: 'missing_reference',
+      message: '关系映射引用的数据源不存在',
+      count: 2,
+    },
+  ])
+
+  assert.equal(groups.length, 1)
+  assert.equal(groups[0].key, 'data_source_dependency')
+  assert.equal(groups[0].count, 14)
+  assert.equal(groups[0].blockingCount, 10)
+  assert.equal(groups[0].affectedCount, 13)
+  assert.equal(groups[0].issues.length, 1)
+  assert.deepEqual(groups[0].issues[0].sourceRefs, ['mapping:order'])
+  assert.equal(groups[0].message, '数据源、物理表或字段尚未接入或绑定。')
 })
 
 test('relation axiom form produces a closed payload without JSON authoring', () => {

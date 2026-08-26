@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from sqlalchemy import create_engine, text
@@ -11,6 +13,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 from app.routers import agents as agents_router
+from app.routers import scenarios as scenarios_router
+from app.schemas import ActionExecuteRequest
 from app.models import (
     ActionExecutionLog,
     Agent,
@@ -334,6 +338,60 @@ class AgentCapabilityClosureTests(unittest.TestCase):
     def _context(self) -> agent_engine.AgentContext:
         return agent_engine.AgentContext(self.db, self.agent, LLMConfig(name="工具模型"))
 
+    def test_large_action_preview_remains_bounded_and_confirmable_without_echoing_params(self) -> None:
+        context = self._context()
+        sensitive_value = "医保敏感业务参数" * 1_500
+        self.assertGreater(len(sensitive_value), agent_engine._MAX_TOOL_RESULT_CHARS)
+
+        raw = context.execute_tool(
+            "execute_action",
+            {
+                "action_id": "action-mark-risk",
+                "params": {"project_id": sensitive_value},
+            },
+        )
+        preview = json.loads(raw)
+
+        self.assertLess(len(raw), agent_engine._MAX_TOOL_RESULT_CHARS)
+        self.assertEqual(agent_engine._bounded_tool_result(raw), raw)
+        self.assertEqual(preview["status"], "dry_run")
+        self.assertTrue(preview["log_id"])
+        self.assertTrue(preview["preview_compacted"])
+        self.assertTrue(preview["result"]["plan"]["parameters_omitted"])
+        self.assertNotIn(sensitive_value, raw)
+
+        # The compact tool result still carries the durable confirmation handle;
+        # exact parameters remain server-side for the confirmation equality check.
+        log = self.db.get(ActionExecutionLog, preview["log_id"])
+        self.assertIsNotNone(log)
+        self.assertEqual(log.status, "dry_run")
+        self.assertEqual(log.input_params, {"project_id": sensitive_value})
+        self.assertTrue(log.result["plan"]["parameters_omitted"])
+        self.assertNotIn(sensitive_value, json.dumps(log.result, ensure_ascii=False))
+
+        confirmed_response = {"status": "success", "result": {"updated": True}}
+        with patch.object(
+            scenarios_router.workflow_service,
+            "execute_action",
+            return_value=confirmed_response,
+        ):
+            confirmed = scenarios_router.execute_action(
+                "action-mark-risk",
+                ActionExecuteRequest(
+                    params={"project_id": sensitive_value},
+                    confirm=True,
+                    idempotency_key="large-preview-confirmation",
+                    preview_log_id=preview["log_id"],
+                    correlation_id=preview["correlation_id"],
+                    expected_environment=preview["environment"],
+                    expected_definition_snapshot_id=preview["definition_snapshot_id"],
+                    expected_release_id=preview["release_id"],
+                    expected_definition_hash=preview["definition_hash"],
+                ),
+                self.db,
+            )
+        self.assertEqual(confirmed, confirmed_response)
+
     def test_every_scenario_resource_changes_agent_tools_or_context(self) -> None:
         context = self._context()
         tools_by_name = {
@@ -371,6 +429,19 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertNotIn("run_sql", prompt)
 
         business_schema = tools_by_name["query_business_data"]["parameters"]
+        mapped_schema = tools_by_name["query_mapped_objects"]["parameters"]
+        for query_schema in (mapped_schema, business_schema):
+            self.assertEqual(
+                query_schema["properties"]["offset"]["minimum"],
+                0,
+            )
+            self.assertNotIn("offset", query_schema["required"])
+        self.assertIn("next_offset", tools_by_name["query_mapped_objects"]["description"])
+        self.assertIn("next_offset", tools_by_name["query_business_data"]["description"])
+        self.assertIn(
+            "entity",
+            tools_by_name["list_ontology_model"]["parameters"]["properties"],
+        )
         base_schema = business_schema["properties"]["base_entity"]
         self.assertEqual(
             {choice.get("type") for choice in base_schema["oneOf"]},
@@ -386,12 +457,33 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         )
         self.assertEqual(aggregate_item["required"], ["function", "alias"])
         self.assertIn("COUNT(*)", business_schema["properties"]["aggregations"]["description"])
+        self.assertIn(
+            "action",
+            tools_by_name["list_actions"]["parameters"]["properties"],
+        )
         self.assertIn("list_actions", tools_by_name["execute_action"]["description"])
         self.assertIn("list_workflows", tools_by_name["execute_workflow"]["description"])
 
         ontology = json.loads(context.execute_tool("list_ontology_model", {}))
         self.assertEqual({item["name"] for item in ontology["entities"]}, {"项目", "承包商"})
         self.assertEqual(ontology["relations"][0]["name"], "负责施工")
+        self.assertTrue(all("properties" not in item for item in ontology["entities"]))
+        project_model = json.loads(
+            context.execute_tool("list_ontology_model", {"entity": "项目"})
+        )
+        self.assertEqual([item["name"] for item in project_model["entities"]], ["项目"])
+        self.assertEqual(
+            {item["name"] for item in project_model["entities"][0]["properties"]},
+            {"项目编号", "项目名称", "风险分", "状态"},
+        )
+        self.assertEqual([item["name"] for item in project_model["relations"]], ["负责施工"])
+        self.assertTrue(
+            context.authorize_historic_tool_result(
+                "list_ontology_model",
+                {},
+                json.dumps(context._ontology_model(), ensure_ascii=False),
+            )
+        )
 
         objects = json.loads(
             context.execute_tool("search_ontology", {"entity": "项目", "query": "P-001"})
@@ -431,8 +523,13 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertTrue(actions[0]["executable"])
         self.assertEqual(actions[0]["blocked_reasons"], [])
         self.assertEqual(actions[0]["required"], ["project_id"])
-        self.assertIn('"field": "project_id"', actions[0]["precondition"])
-        self.assertIn('"field": "updated"', actions[0]["postcondition"])
+        self.assertNotIn("input_schema", actions[0])
+        action_detail = json.loads(
+            context.execute_tool("list_actions", {"action": "标记高风险"})
+        )[0]
+        self.assertIn('"field": "project_id"', action_detail["precondition"])
+        self.assertIn('"field": "updated"', action_detail["postcondition"])
+        self.assertEqual(action_detail["input_schema"]["required"], ["project_id"])
         preview = json.loads(
             context.execute_tool(
                 "execute_action",
@@ -902,6 +999,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                 ],
                 "sort": [{"property": "风险分", "direction": "desc"}],
                 "limit": 10,
+                "offset": 7,
             }
             result = json.loads(
                 context.execute_tool("query_mapped_objects", args)
@@ -930,12 +1028,35 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             self.assertEqual(parameters["mq_0"], "P-001' OR 1=1 --")
             self.assertEqual(parameters["mq_1"], 80.0)
             self.assertEqual(parameters["mq_limit"], 11)
+            self.assertEqual(parameters["mq_offset"], 7)
+            self.assertIn("LIMIT :mq_limit OFFSET :mq_offset", sql)
+            self.assertEqual(result["offset"], 7)
+            self.assertIsNone(result["next_offset"])
 
             self.assertTrue(
                 context.authorize_historic_tool_result(
                     "query_mapped_objects",
                     args,
                     json.dumps(result, ensure_ascii=False),
+                )
+            )
+
+            tampered_page = json.loads(json.dumps(result))
+            tampered_page["offset"] = 0
+            self.assertFalse(
+                context.authorize_historic_tool_result(
+                    "query_mapped_objects",
+                    args,
+                    json.dumps(tampered_page, ensure_ascii=False),
+                )
+            )
+            tampered_page = json.loads(json.dumps(result))
+            tampered_page["next_offset"] = 8
+            self.assertFalse(
+                context.authorize_historic_tool_result(
+                    "query_mapped_objects",
+                    args,
+                    json.dumps(tampered_page, ensure_ascii=False),
                 )
             )
 
@@ -1018,6 +1139,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             "having": [{"alias": "承包商数量", "op": "gt", "value": 0}],
             "sort": [{"alias": "承包商数量", "direction": "desc"}],
             "limit": 10,
+            "offset": 3,
         }
         with patch.object(
             agent_engine.business_query_service.datasource_service,
@@ -1034,6 +1156,17 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertIn('HAVING "q_agg_0" > :having_0', sql)
         self.assertEqual(parameters["having_0"], 0)
         self.assertEqual(parameters["bq_limit"], 11)
+        self.assertEqual(parameters["bq_offset"], 3)
+        self.assertIn("LIMIT :bq_limit OFFSET :bq_offset", sql)
+        self.assertEqual(result["offset"], 3)
+        self.assertIsNone(result["next_offset"])
+        self.assertTrue(
+            context.authorize_historic_tool_result(
+                "query_business_data",
+                args,
+                json.dumps(result, ensure_ascii=False),
+            )
+        )
 
     def test_business_query_accepts_string_entity_and_count_star_without_key_transform(self) -> None:
         context = self._context()
@@ -1066,11 +1199,23 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertNotIn("project_code", sql)
         self.assertNotIn("TRIM(", sql.upper())
         self.assertEqual(parameters["bq_limit"], 101)
+        self.assertEqual(parameters["bq_offset"], 0)
         self.assertTrue(
             context.authorize_historic_tool_result(
                 "query_business_data",
                 args,
                 raw_result,
+            )
+        )
+
+        legacy_page = json.loads(raw_result)
+        legacy_page.pop("offset")
+        legacy_page.pop("next_offset")
+        self.assertTrue(
+            context.authorize_historic_tool_result(
+                "query_business_data",
+                args,
+                json.dumps(legacy_page, ensure_ascii=False),
             )
         )
 
@@ -1377,6 +1522,173 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         finally:
             source_engine.dispose()
 
+    def test_semantic_queries_page_without_duplicates_and_end_with_null_offset(self) -> None:
+        context = self._context()
+        source_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        try:
+            with source_engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "CREATE TABLE projects ("
+                        "project_code TEXT, project_name TEXT, risk_score REAL)"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO projects(project_code, project_name, risk_score) "
+                        "VALUES (:code, :name, :score)"
+                    ),
+                    [
+                        {"code": " P-001 ", "name": "项目一", "score": 82.0},
+                        {"code": "P-002", "name": "项目二", "score": 99.0},
+                        {"code": "P-003", "name": "项目三", "score": 70.0},
+                        {"code": "P-004", "name": "项目四", "score": 90.0},
+                        {"code": "P-005", "name": "项目五", "score": 60.0},
+                    ],
+                )
+
+            mapped_pages: list[dict] = []
+            business_pages: list[dict] = []
+            with patch.object(
+                mapped_query_service.datasource_service,
+                "get_engine",
+                return_value=source_engine,
+            ):
+                offset = 0
+                while True:
+                    args = {
+                        "entity_name": "项目",
+                        "properties": ["项目编号", "风险分"],
+                        "sort": [{"property": "风险分", "direction": "desc"}],
+                        "limit": 2,
+                        "offset": offset,
+                    }
+                    raw_page = context.execute_tool("query_mapped_objects", args)
+                    page = json.loads(raw_page)
+                    self.assertTrue(
+                        context.authorize_historic_tool_result(
+                            "query_mapped_objects", args, raw_page
+                        )
+                    )
+                    mapped_pages.append(page)
+                    if page["next_offset"] is None:
+                        break
+                    offset = page["next_offset"]
+
+                offset = 0
+                while True:
+                    args = {
+                        "base_entity": "项目",
+                        "base_properties": ["项目编号", "风险分"],
+                        "sort": [
+                            {
+                                "entity_name": "项目",
+                                "property": "风险分",
+                                "direction": "desc",
+                            }
+                        ],
+                        "limit": 2,
+                        "offset": offset,
+                    }
+                    raw_page = context.execute_tool("query_business_data", args)
+                    page = json.loads(raw_page)
+                    self.assertTrue(
+                        context.authorize_historic_tool_result(
+                            "query_business_data", args, raw_page
+                        )
+                    )
+                    business_pages.append(page)
+                    if page["next_offset"] is None:
+                        break
+                    offset = page["next_offset"]
+
+            self.assertEqual(
+                [(page["offset"], page["row_count"]) for page in mapped_pages],
+                [(0, 2), (2, 2), (4, 1)],
+            )
+            self.assertEqual(
+                [page["next_offset"] for page in mapped_pages],
+                [2, 4, None],
+            )
+            self.assertEqual(
+                [page["truncated"] for page in mapped_pages],
+                [True, True, False],
+            )
+            mapped_ids = [
+                record["项目编号"]
+                for page in mapped_pages
+                for record in page["objects"]
+            ]
+            business_ids = [
+                record["项目编号"]
+                for page in business_pages
+                for record in page["records"]
+            ]
+            self.assertEqual(mapped_ids, ["P-002", "P-004", "P-001", "P-003", "P-005"])
+            self.assertEqual(business_ids, mapped_ids)
+            self.assertEqual(len(set(mapped_ids)), 5)
+
+            tampered = json.loads(json.dumps(business_pages[0]))
+            tampered["next_offset"] = 3
+            self.assertFalse(
+                context.authorize_historic_tool_result(
+                    "query_business_data",
+                    {
+                        "base_entity": "项目",
+                        "base_properties": ["项目编号", "风险分"],
+                        "sort": [
+                            {
+                                "entity_name": "项目",
+                                "property": "风险分",
+                                "direction": "desc",
+                            }
+                        ],
+                        "limit": 2,
+                        "offset": 0,
+                    },
+                    json.dumps(tampered, ensure_ascii=False),
+                )
+            )
+        finally:
+            source_engine.dispose()
+
+    def test_semantic_query_offsets_must_be_non_negative_integers(self) -> None:
+        context = self._context()
+        with patch.object(
+            mapped_query_service.datasource_service,
+            "run_parameterized_query",
+        ) as run_query:
+            for offset in (-1, True, None, "1"):
+                mapped_error = json.loads(
+                    context.execute_tool(
+                        "query_mapped_objects",
+                        {
+                            "entity_name": "项目",
+                            "properties": ["风险分"],
+                            "offset": offset,
+                        },
+                    )
+                )
+                business_error = json.loads(
+                    context.execute_tool(
+                        "query_business_data",
+                        {
+                            "base_entity": "项目",
+                            "base_properties": ["风险分"],
+                            "offset": offset,
+                        },
+                    )
+                )
+                self.assertEqual(mapped_error["error"]["code"], "INVALID_QUERY")
+                self.assertEqual(business_error["error"]["code"], "INVALID_QUERY")
+                self.assertIn("offset", mapped_error["error"]["message"])
+                self.assertIn("offset", business_error["error"]["message"])
+            run_query.assert_not_called()
+
     def test_semantic_mapping_query_fails_closed_on_ambiguity_and_invalid_fields(self) -> None:
         context = self._context()
         with patch.object(
@@ -1528,6 +1840,27 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             owner_result_text = owner_context.execute_tool("query_mapped_objects", args)
         owner_result = json.loads(owner_result_text)
         self.assertEqual(owner_result["objects"][0]["风险分"], 82.0)
+        business_args = {
+            "base_entity": "项目",
+            "base_properties": ["项目编号", "风险分"],
+        }
+        with patch.object(
+            mapped_query_service.datasource_service,
+            "run_parameterized_query",
+            return_value={
+                "columns": ["q_col_0", "q_col_1"],
+                "rows": [["P-001", 82.0]],
+                "row_count": 1,
+                "truncated": False,
+            },
+        ):
+            owner_business_result_text = owner_context.execute_tool(
+                "query_business_data", business_args
+            )
+        self.assertEqual(
+            json.loads(owner_business_result_text)["records"][0]["风险分"],
+            82.0,
+        )
 
         viewer = User(
             id="user-agent-viewer",
@@ -1564,6 +1897,13 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                 "query_mapped_objects",
                 args,
                 owner_result_text,
+            )
+        )
+        self.assertFalse(
+            viewer_context.authorize_historic_tool_result(
+                "query_business_data",
+                business_args,
+                owner_business_result_text,
             )
         )
         self.assertFalse(
@@ -1888,6 +2228,1144 @@ class AgentCapabilityClosureTests(unittest.TestCase):
 
         self.assertEqual(events[-1], {"type": "done", "data": "完成"})
         self.assertIs(context.llm, llm)
+
+    def test_list_ontology_model_compacts_large_catalog_and_exact_lookup_keeps_properties(self) -> None:
+        resources = []
+        for entity_index in range(30):
+            entity = OntologyEntity(
+                id=f"entity-catalog-{entity_index:02d}",
+                scenario_id=self.scenario.id,
+                name=f"目录对象 {entity_index:02d}",
+                api_name=f"catalog_entity_{entity_index:02d}",
+                description="用于验证大型本体目录的两阶段字段发现。",
+            )
+            resources.append(entity)
+            resources.extend(
+                OntologyProperty(
+                    id=f"property-catalog-{entity_index:02d}-{property_index:02d}",
+                    entity_id=entity.id,
+                    name=f"目录字段 {property_index:02d}",
+                    api_name=f"catalog_field_{property_index:02d}",
+                    data_type="string",
+                    description="精确对象字段说明" * 12,
+                )
+                for property_index in range(12)
+            )
+        self.db.add_all(resources)
+        self.db.commit()
+
+        context = self._context()
+        full_raw = json.dumps(context._ontology_model(), ensure_ascii=False)
+        self.assertGreater(len(full_raw), agent_engine._MAX_TOOL_RESULT_CHARS)
+
+        compact_raw = context.execute_tool("list_ontology_model", {})
+        compact = json.loads(compact_raw)
+        self.assertLess(len(compact_raw), agent_engine._MAX_TOOL_RESULT_CHARS)
+        self.assertEqual(len(compact["entities"]), 32)
+        self.assertTrue(all("properties" not in item for item in compact["entities"]))
+        self.assertIn("目录对象 29", {item["name"] for item in compact["entities"]})
+        self.assertTrue(
+            context.authorize_historic_tool_result(
+                "list_ontology_model", {}, compact_raw
+            )
+        )
+
+        detail_args = {"entity": "catalog_entity_29"}
+        detail_raw = context.execute_tool("list_ontology_model", detail_args)
+        detail = json.loads(detail_raw)
+        self.assertEqual([item["name"] for item in detail["entities"]], ["目录对象 29"])
+        self.assertEqual(len(detail["entities"][0]["properties"]), 12)
+        self.assertIn(
+            "目录字段 11",
+            {item["name"] for item in detail["entities"][0]["properties"]},
+        )
+        self.assertTrue(
+            context.authorize_historic_tool_result(
+                "list_ontology_model", detail_args, detail_raw
+            )
+        )
+        self.assertEqual(
+            json.loads(
+                context.execute_tool(
+                    "list_ontology_model", {"entity": "不存在的对象"}
+                )
+            ),
+            {"entities": [], "relations": []},
+        )
+
+    def test_list_actions_compacts_large_catalog_and_exact_lookup_keeps_schema(self) -> None:
+        extra_actions: list[OntologyAction] = []
+        selected_ids = list(self.agent.capability_scope["actions"]["selected_ids"])
+        for index in range(24):
+            properties = {
+                f"field_{field_index:02d}": {
+                    "type": "string",
+                    "description": "精确操作参数" * 8,
+                }
+                for field_index in range(12)
+            }
+            action = OntologyAction(
+                id=f"action-catalog-{index:02d}",
+                scenario_id=self.scenario.id,
+                entity_id="entity-project",
+                name=f"目录操作 {index:02d}",
+                description="用于验证大动作目录的两阶段发现。",
+                input_schema=_schema(properties, ["field_00", "field_11"]),
+                executor_type="sql",
+                executor_config={
+                    "data_source_id": "source-projects",
+                    "sql": "SELECT 1",
+                },
+                enabled=True,
+                requires_confirmation=True,
+            )
+            extra_actions.append(action)
+            selected_ids.append(action.id)
+        self.db.add_all(extra_actions)
+        scope = dict(self.agent.capability_scope)
+        scope["actions"] = {
+            "mode": "explicit",
+            "selected_ids": selected_ids,
+        }
+        self.agent.capability_scope = scope
+        self.db.commit()
+
+        context = self._context()
+        compact_raw = context.execute_tool("list_actions", {})
+        compact = json.loads(compact_raw)
+        self.assertEqual(len(compact), 25)
+        self.assertLess(len(compact_raw), agent_engine._MAX_TOOL_RESULT_CHARS)
+        self.assertTrue(all("input_schema" not in item for item in compact))
+        self.assertIn("目录操作 23", {item["name"] for item in compact})
+
+        detailed = json.loads(
+            context.execute_tool("list_actions", {"action": "目录操作 23"})
+        )
+        self.assertEqual(len(detailed), 1)
+        self.assertEqual(detailed[0]["id"], "action-catalog-23")
+        self.assertEqual(
+            detailed[0]["input_schema"]["required"],
+            ["field_00", "field_11"],
+        )
+        self.assertIn("field_11", detailed[0]["input_schema"]["properties"])
+        self.assertEqual(
+            json.loads(context.execute_tool("list_actions", {"action": "不存在"})),
+            [],
+        )
+
+    def test_run_agent_replaces_oversized_tool_result_with_valid_typed_json(self) -> None:
+        context = self._context()
+        oversized = json.dumps(
+            [{"id": index, "value": "x" * 500} for index in range(30)],
+            ensure_ascii=False,
+        )
+        self.assertGreater(len(oversized), agent_engine._MAX_TOOL_RESULT_CHARS)
+        responses = iter(
+            [
+                iter(
+                    [
+                        {
+                            "type": "tool_calls",
+                            "tool_calls": [
+                                {
+                                    "id": "catalog-1",
+                                    "function": {
+                                        "name": "list_actions",
+                                        "arguments": {},
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                iter([{"type": "token", "content": "已缩小查询范围。"}]),
+            ]
+        )
+        replayed_results: list[str] = []
+
+        def fake_chat_stream(_llm, messages, **_kwargs):
+            for message in messages:
+                if message.get("role") == "tool":
+                    replayed_results.append(message["content"])
+            return next(responses)
+
+        with (
+            patch.object(context, "execute_tool", return_value=oversized),
+            patch.object(agent_engine.llm_service, "chat_stream", fake_chat_stream),
+        ):
+            events = list(
+                agent_engine.run_agent(
+                    self.db,
+                    self.agent,
+                    LLMConfig(name="工具模型"),
+                    [],
+                    "列出所有操作",
+                    self.scenario.name,
+                    "",
+                    runtime_context=context,
+                )
+            )
+
+        tool_result = next(event["data"]["result"] for event in events if event["type"] == "tool_result")
+        parsed = json.loads(tool_result)
+        self.assertEqual(parsed["error"]["code"], "TOOL_RESULT_TOO_LARGE")
+        self.assertTrue(parsed["error"]["retryable"])
+        self.assertEqual(replayed_results, [tool_result])
+
+    def test_run_agent_truth_guard_rejects_delivery_claim_without_tools(self) -> None:
+        context = self._context()
+        with patch.object(
+            agent_engine.llm_service,
+            "chat_stream",
+            return_value=iter([{"type": "token", "content": "全部工作已经完成。"}]),
+        ):
+            events = list(
+                agent_engine.run_agent(
+                    self.db,
+                    self.agent,
+                    LLMConfig(name="工具模型"),
+                    [],
+                    "请完成 AP001 年度审计的全部工作任务",
+                    self.scenario.name,
+                    "",
+                    runtime_context=context,
+                )
+            )
+
+        final_content = events[-1]["data"]
+        self.assertIn("系统核验状态（以此为准）", final_content)
+        self.assertIn("未生成可确认预演，不能视为业务任务已完成", final_content)
+        self.assertIn("未形成可验证审计结论", final_content)
+
+    def test_run_agent_truth_guard_reports_failed_action(self) -> None:
+        context = self._context()
+        responses = iter(
+            [
+                iter(
+                    [
+                        {
+                            "type": "tool_calls",
+                            "tool_calls": [
+                                {
+                                    "id": "action-failed-1",
+                                    "function": {
+                                        "name": "execute_action",
+                                        "arguments": {
+                                            "action_id": "action-mark-risk",
+                                            "params": {},
+                                        },
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                iter([{"type": "token", "content": "报告已经生成。"}]),
+            ]
+        )
+
+        with (
+            patch.object(
+                context,
+                "execute_tool",
+                return_value=agent_engine._tool_error(
+                    "INVALID_TOOL_ARGUMENTS",
+                    "参数不完整",
+                    retryable=True,
+                ),
+            ),
+            patch.object(
+                agent_engine.llm_service,
+                "chat_stream",
+                side_effect=lambda *_args, **_kwargs: next(responses),
+            ),
+        ):
+            events = list(
+                agent_engine.run_agent(
+                    self.db,
+                    self.agent,
+                    LLMConfig(name="工具模型"),
+                    [],
+                    "请生成年度报告文件",
+                    self.scenario.name,
+                    "",
+                    runtime_context=context,
+                )
+            )
+
+        final_content = events[-1]["data"]
+        self.assertIn("未生成可确认预演", final_content)
+        self.assertIn("失败工具：execute_action（1 次）", final_content)
+
+    def test_run_agent_truth_guard_counts_only_dry_run_action_previews(self) -> None:
+        context = self._context()
+        responses = iter(
+            [
+                iter(
+                    [
+                        {
+                            "type": "tool_calls",
+                            "tool_calls": [
+                                {
+                                    "id": "action-preview-1",
+                                    "function": {
+                                        "name": "execute_action",
+                                        "arguments": {
+                                            "action_id": "action-mark-risk",
+                                            "params": {},
+                                        },
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                iter([{"type": "token", "content": "报告已经正式生成。"}]),
+            ]
+        )
+
+        with (
+            patch.object(
+                context,
+                "execute_tool",
+                return_value=json.dumps({"status": "dry_run"}, ensure_ascii=False),
+            ),
+            patch.object(
+                agent_engine.llm_service,
+                "chat_stream",
+                side_effect=lambda *_args, **_kwargs: next(responses),
+            ),
+        ):
+            events = list(
+                agent_engine.run_agent(
+                    self.db,
+                    self.agent,
+                    LLMConfig(name="工具模型"),
+                    [],
+                    "请生成年度报告文件",
+                    self.scenario.name,
+                    "",
+                    runtime_context=context,
+                )
+            )
+
+        final_content = events[-1]["data"]
+        self.assertIn("已生成 1 个可确认预演", final_content)
+        self.assertIn("尚未正式执行或生成交付物，需用户确认", final_content)
+        self.assertNotIn("未生成可确认预演", final_content)
+
+    def test_truth_guard_deduplicates_dry_runs_by_canonical_action(self) -> None:
+        def preview(action_id: str, action_name: str) -> str:
+            return json.dumps(
+                {
+                    "status": "dry_run",
+                    "result": {
+                        "plan": {
+                            "action_id": action_id,
+                            "action_name": action_name,
+                        }
+                    },
+                },
+                ensure_ascii=False,
+            )
+
+        final_content = agent_engine._truthful_final_content(
+            "三个附件已经生成。",
+            user_message="请生成年度审计报告、附注和财务报表",
+            tool_outcomes=[
+                {
+                    "name": "execute_action",
+                    "arguments": {
+                        "action_id": "年度审计报告",
+                        "params": {"project_id": "AP001"},
+                    },
+                    "result": preview("action-report", "生成年度审计报告"),
+                },
+                {
+                    "name": "execute_action",
+                    "arguments": {
+                        "action_id": "action-report",
+                        "params": {"project_id": "AP002"},
+                    },
+                    "result": preview("action-report", "生成年度审计报告"),
+                },
+                {
+                    "name": "execute_action",
+                    "arguments": {
+                        "action_id": "action-notes",
+                        "params": {"project_id": "AP001"},
+                    },
+                    "result": preview("action-notes", "生成财务报表附注"),
+                },
+            ],
+        )
+
+        self.assertIn("已生成 2 个可确认预演", final_content)
+        self.assertNotIn("已生成 3 个可确认预演", final_content)
+        self.assertIn("目标：生成年度审计报告、生成财务报表附注", final_content)
+
+    def test_run_agent_truth_guard_requires_successful_audit_query(self) -> None:
+        context = self._context()
+        responses = iter(
+            [
+                iter(
+                    [
+                        {
+                            "type": "tool_calls",
+                            "tool_calls": [
+                                {
+                                    "id": "audit-query-1",
+                                    "function": {
+                                        "name": "query_mapped_objects",
+                                        "arguments": {"entity": "项目"},
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                iter([{"type": "token", "content": "已完成违规审计。"}]),
+            ]
+        )
+
+        with (
+            patch.object(
+                context,
+                "execute_tool",
+                return_value=agent_engine._tool_error(
+                    "INVALID_QUERY",
+                    "查询条件无效",
+                    retryable=True,
+                ),
+            ),
+            patch.object(
+                agent_engine.llm_service,
+                "chat_stream",
+                side_effect=lambda *_args, **_kwargs: next(responses),
+            ),
+        ):
+            events = list(
+                agent_engine.run_agent(
+                    self.db,
+                    self.agent,
+                    LLMConfig(name="工具模型"),
+                    [],
+                    "请审计项目违规情况",
+                    self.scenario.name,
+                    "",
+                    runtime_context=context,
+                )
+            )
+
+        final_content = events[-1]["data"]
+        self.assertIn("未形成可验证审计结论", final_content)
+        self.assertIn("失败工具：query_mapped_objects（1 次）", final_content)
+
+    def test_controlled_medical_audit_rejects_successful_unrelated_query(self) -> None:
+        outcomes = [
+            {
+                "name": "query_business_data",
+                "arguments": {"base_entity": "医疗机构"},
+                "result": json.dumps(
+                    {
+                        "records": [{"医疗机构名称": "示例医院"}],
+                        "row_count": 1,
+                        "offset": 0,
+                        "truncated": False,
+                        "next_offset": None,
+                        "scope": {"entities": ["医疗机构"]},
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        ]
+
+        controlled = agent_engine._truthful_final_content(
+            "已完成重复收费违规审计。",
+            user_message="请完成医保重复收费违规审计",
+            tool_outcomes=outcomes,
+            controlled_medical_audit=True,
+        )
+        general = agent_engine._truthful_final_content(
+            "已完成项目审计。",
+            user_message="请审计项目违规情况",
+            tool_outcomes=outcomes,
+        )
+
+        self.assertIn("未形成可验证审计结论", controlled)
+        self.assertIn("未形成可验证审计结论", general)
+
+    def test_general_query_pages_cannot_substitute_for_governed_audit_proof(self) -> None:
+        def mapped_page(offset: int, *, truncated: bool) -> str:
+            objects = [{"项目编号": f"P{index}"} for index in range(offset, offset + 2)]
+            return json.dumps(
+                {
+                    "entity": {"id": "project-entity", "name": "审计项目"},
+                    "properties": ["项目编号"],
+                    "objects": objects,
+                    "row_count": len(objects),
+                    "offset": offset,
+                    "truncated": truncated,
+                    "next_offset": offset + len(objects) if truncated else None,
+                    "lineage": {"definition_hash": "definition-v1"},
+                },
+                ensure_ascii=False,
+            )
+
+        first_page = {
+            "name": "query_mapped_objects",
+            "arguments": {
+                "entity_name": "审计项目",
+                "filters": [{"property": "项目编号", "op": "eq", "value": "AP001"}],
+                "limit": 2,
+                "offset": 0,
+            },
+            "result": mapped_page(0, truncated=True),
+        }
+        incomplete = agent_engine._truthful_final_content(
+            "AP001 年度审计已经完成。",
+            user_message="请完成 AP001 年度审计的全部工作任务",
+            tool_outcomes=[first_page],
+        )
+        complete = agent_engine._truthful_final_content(
+            "AP001 年度审计查询完成。",
+            user_message="请完成 AP001 年度审计的全部工作任务",
+            tool_outcomes=[
+                first_page,
+                {
+                    **first_page,
+                    "arguments": {**first_page["arguments"], "offset": 2},
+                    "result": mapped_page(2, truncated=False),
+                },
+            ],
+        )
+
+        self.assertIn("未形成可验证审计结论", incomplete)
+        self.assertIn("未形成可验证审计结论", complete)
+
+    def test_truth_guard_uses_medical_summary_and_flags_incomplete_details(self) -> None:
+        arguments = {
+            "strategy": "included_service_duplicate",
+            "included_service": "电子结肠镜检查",
+            "duplicate_service": "电子乙状结肠镜检查",
+        }
+        payload = {
+            "ok": True,
+            "audit_version": "medical-audit-v1",
+            "strategy": "included_service_duplicate",
+            "summary": {"violation_count": 20, "violation_amount": 955.85},
+            "records": [{"charge_line_id": str(index)} for index in range(10)],
+            "row_count": 10,
+            "offset": 0,
+            "limit": 10,
+            "truncated": True,
+            "next_offset": 10,
+            "evidence": {
+                "source_id": "medical-source",
+                "parameters": {
+                    "facility_name": None,
+                    "included_service": "电子结肠镜检查",
+                    "duplicate_service": "电子乙状结肠镜检查",
+                },
+            },
+        }
+
+        final_content = agent_engine._truthful_final_content(
+            "审计完成：20 条，金额 975.95 元。",
+            user_message=(
+                "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
+                "并返回全部违规明细"
+            ),
+            tool_outcomes=[
+                {
+                    "name": "run_medical_audit",
+                    "arguments": arguments,
+                    "result": json.dumps(payload, ensure_ascii=False),
+                }
+            ],
+        )
+
+        self.assertIn("模型正文数字不一致时以此为准", final_content)
+        self.assertIn("违规 20 条（组），违规金额 955.85 元", final_content)
+        self.assertIn("本次要求全部明细", final_content)
+        self.assertIn("仅连续读取 10/20 条", final_content)
+        self.assertNotIn("未形成可验证审计结论", final_content)
+
+    def test_truth_guard_proves_a_complete_medical_pagination_chain(self) -> None:
+        base_arguments = {
+            "strategy": "included_service_duplicate",
+            "included_service": "电子结肠镜检查",
+            "duplicate_service": "电子乙状结肠镜检查",
+            "limit": 10,
+        }
+        evidence = {
+            "source_id": "medical-source",
+            "parameters": {
+                "facility_name": None,
+                "included_service": "电子结肠镜检查",
+                "duplicate_service": "电子乙状结肠镜检查",
+            },
+        }
+
+        def page(offset: int, *, truncated: bool) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "audit_version": "medical-audit-v1",
+                "strategy": "included_service_duplicate",
+                "summary": {"violation_count": 20, "violation_amount": 955.85},
+                "records": [
+                    {"charge_line_id": str(index)}
+                    for index in range(offset, offset + 10)
+                ],
+                "row_count": 10,
+                "offset": offset,
+                "limit": 10,
+                "truncated": truncated,
+                "next_offset": offset + 10 if truncated else None,
+                "evidence": evidence,
+            }
+
+        tool_outcomes = [
+            {
+                "name": "run_medical_audit",
+                "arguments": {**base_arguments, "offset": 0},
+                "result": json.dumps(page(0, truncated=True), ensure_ascii=False),
+            },
+            {
+                "name": "run_medical_audit",
+                "arguments": {**base_arguments, "offset": 10},
+                "result": json.dumps(page(10, truncated=False), ensure_ascii=False),
+            },
+        ]
+
+        final_content = agent_engine._truthful_final_content(
+            "已完成审计。",
+            user_message=(
+                "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
+                "并返回全部违规明细"
+            ),
+            tool_outcomes=tool_outcomes,
+        )
+
+        self.assertIn("审计明细分页已完整读取 20/20 条", final_content)
+        self.assertNotIn("不能视为全部明细已交付", final_content)
+
+    def test_medical_truth_guard_rejects_strategy_or_parameter_drift(self) -> None:
+        arguments = {
+            "strategy": "included_service_duplicate",
+            "included_service": "电子结肠镜检查",
+            "duplicate_service": "电子乙状结肠镜检查",
+        }
+        payload = {
+            "ok": True,
+            "audit_version": "medical-audit-v1",
+            "strategy": "included_service_duplicate",
+            "summary": {"violation_count": 1, "violation_amount": 10.0},
+            "records": [{"charge_line_id": "line-1"}],
+            "row_count": 1,
+            "offset": 0,
+            "limit": 10,
+            "truncated": False,
+            "next_offset": None,
+            "evidence": {
+                "source_id": "medical-source",
+                "parameters": {
+                    "facility_name": None,
+                    "included_service": "电子结肠镜检查",
+                    "duplicate_service": "电子乙状结肠镜检查",
+                },
+            },
+        }
+        outcome = [{
+            "name": "run_medical_audit",
+            "arguments": arguments,
+            "result": json.dumps(payload, ensure_ascii=False),
+        }]
+
+        wrong_strategy = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message="请审计阿司匹林用药天数超过 7 天的违规记录",
+            tool_outcomes=outcome,
+            controlled_medical_audit=True,
+        )
+        missing_parameter = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message="请审计电子结肠镜检查的重复收费问题",
+            tool_outcomes=outcome,
+            controlled_medical_audit=True,
+        )
+
+        self.assertIn("未形成可验证审计结论", wrong_strategy)
+        self.assertIn("未形成可验证审计结论", missing_parameter)
+        self.assertNotIn("医保确定性汇总", wrong_strategy)
+        self.assertNotIn("医保确定性汇总", missing_parameter)
+        self.assertTrue(
+            agent_engine._medical_number_mentioned(
+                "请审计 AP001 刮痧治疗收费大于两次的记录",
+                2,
+            )
+        )
+        self.assertFalse(
+            agent_engine._medical_number_mentioned(
+                "请审计 AP001 刮痧治疗收费大于两次的记录",
+                1,
+            )
+        )
+
+    def test_medical_truth_guard_requires_explicit_user_facility_scope(self) -> None:
+        def outcome(facility_name: str | None) -> list[dict[str, Any]]:
+            arguments: dict[str, Any] = {
+                "strategy": "charge_threshold",
+                "service_name": "刮痧治疗",
+                "threshold": 2,
+            }
+            if facility_name is not None:
+                arguments["facility_name"] = facility_name
+            payload = {
+                "ok": True,
+                "audit_version": "medical-audit-v1",
+                "strategy": "charge_threshold",
+                "summary": {"violation_count": 1, "violation_amount": 10.0},
+                "records": [{"charge_line_id": "line-1"}],
+                "row_count": 1,
+                "offset": 0,
+                "limit": 10,
+                "truncated": False,
+                "next_offset": None,
+                "evidence": {
+                    "source_id": "medical-source",
+                    "parameters": {
+                        "facility_name": facility_name,
+                        "service_name": "刮痧治疗",
+                        "threshold": 2,
+                    },
+                },
+            }
+            return [{
+                "name": "run_medical_audit",
+                "arguments": arguments,
+                "result": json.dumps(payload, ensure_ascii=False),
+            }]
+
+        scoped_request = (
+            "请审计贵阳泰康乐综合医院刮痧治疗收费大于两次的违规记录"
+        )
+        omitted = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message=scoped_request,
+            tool_outcomes=outcome(None),
+            controlled_medical_audit=True,
+        )
+        wrong = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message=scoped_request,
+            tool_outcomes=outcome("其他医院"),
+            controlled_medical_audit=True,
+        )
+        matched = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message=scoped_request,
+            tool_outcomes=outcome("贵阳泰康乐综合医院"),
+            controlled_medical_audit=True,
+        )
+        project_code_only = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message="请审计 AP001 刮痧治疗收费大于两次的违规记录",
+            tool_outcomes=outcome(None),
+            controlled_medical_audit=True,
+        )
+
+        self.assertIn("未形成可验证审计结论", omitted)
+        self.assertIn("未形成可验证审计结论", wrong)
+        self.assertNotIn("医保确定性汇总", omitted)
+        self.assertNotIn("医保确定性汇总", wrong)
+        self.assertIn("医保确定性汇总", matched)
+        self.assertNotIn("未形成可验证审计结论", matched)
+        self.assertIn("医保确定性汇总", project_code_only)
+        self.assertNotIn("未形成可验证审计结论", project_code_only)
+        production_matched = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message=scoped_request,
+            tool_outcomes=outcome("贵阳泰康乐综合医院"),
+            controlled_medical_audit=True,
+            authoritative_medical_facilities=["贵阳泰康乐综合医院"],
+            medical_facility_lookup_succeeded=True,
+        )
+        global_matched = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message="请审计刮痧治疗收费大于 2 次的违规记录",
+            tool_outcomes=outcome(None),
+            controlled_medical_audit=True,
+            authoritative_medical_facilities=[],
+            medical_facility_lookup_succeeded=True,
+        )
+        no_facility_negative_business_term = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message=(
+                "请审计刮痧治疗收费大于 2 次且不包含已撤销记录的违规情况"
+            ),
+            tool_outcomes=outcome(None),
+            controlled_medical_audit=True,
+            authoritative_medical_facilities=[],
+            medical_facility_lookup_succeeded=True,
+        )
+        self.assertIn("医保确定性汇总", production_matched)
+        self.assertIn("医保确定性汇总", global_matched)
+        self.assertIn("医保确定性汇总", no_facility_negative_business_term)
+
+        service_exclusion_requests = (
+            (
+                "审计贵阳泰康乐综合医院，但不包含电子乙状结肠镜检查"
+                "以外的项目"
+            ),
+            (
+                "请审计贵阳泰康乐综合医院刮痧治疗收费数量大于2次的"
+                "违规记录，但不包含已撤销记录"
+            ),
+            (
+                "请审计贵阳泰康乐综合医院刮痧治疗收费数量大于2次的"
+                "违规记录，但排除自费项目"
+            ),
+            (
+                "请审计贵阳泰康乐综合医院刮痧治疗收费数量大于2次的"
+                "违规记录，但不涉及电子乙状结肠镜检查项目"
+            ),
+            (
+                "请审计贵阳泰康乐综合医院刮痧治疗收费数量大于2次的"
+                "违规记录，但不纳入自费项目"
+            ),
+        )
+        for service_exclusion_request in service_exclusion_requests:
+            with self.subTest(service_exclusion_request=service_exclusion_request):
+                self.assertFalse(
+                    agent_engine._medical_request_excludes_facility(
+                        service_exclusion_request,
+                        ["贵阳泰康乐综合医院"],
+                    )
+                )
+        for auditable_service_exclusion in service_exclusion_requests[1:]:
+            with self.subTest(auditable_service_exclusion=auditable_service_exclusion):
+                verified = agent_engine._truthful_final_content(
+                    "审计完成。",
+                    user_message=auditable_service_exclusion,
+                    tool_outcomes=outcome("贵阳泰康乐综合医院"),
+                    controlled_medical_audit=True,
+                    authoritative_medical_facilities=["贵阳泰康乐综合医院"],
+                    medical_facility_lookup_succeeded=True,
+                )
+                self.assertIn("医保确定性汇总", verified)
+                self.assertNotIn("未形成可验证审计结论", verified)
+
+        facility = "贵阳泰康乐综合医院"
+        excluded_requests = (
+            f"除{facility}以外所有医疗机构，审计刮痧治疗收费数量大于2次的违规记录",
+            f"除{facility}之外，审计其他医疗机构刮痧治疗收费数量大于2次的违规记录",
+            f"除{facility}外，审计其他医疗机构刮痧治疗收费数量大于2次的违规记录",
+            f"{facility}除外，审计所有医疗机构刮痧治疗收费数量大于2次的违规记录",
+            f"审计不含{facility}的医疗机构刮痧治疗收费数量大于2次的违规记录",
+            f"审计不包括{facility}的医疗机构刮痧治疗收费数量大于2次的违规记录",
+            f"审计不包含{facility}的医疗机构刮痧治疗收费数量大于2次的违规记录",
+            f"排除{facility}，审计其他医疗机构刮痧治疗收费数量大于2次的违规记录",
+            f"剔除{facility}后，审计刮痧治疗收费数量大于2次的违规记录",
+            f"不要审计{facility}，只审计其他机构刮痧治疗收费数量大于2次的违规记录",
+            f"不审计{facility}，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
+            f"{facility}无需审计，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
+            f"无需对{facility}进行审计，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
+            f"{facility}不在本次审计范围内，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
+            f"{facility}暂不纳入审计，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
+            f"本次审计不涉及{facility}，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
+            f"跳过{facility}，审计其他医院刮痧治疗收费数量大于2次的违规记录",
+            f"除{facility}，审计其他机构刮痧治疗收费数量大于2次的违规记录",
+        )
+        for excluded_request in excluded_requests:
+            with self.subTest(excluded_request=excluded_request):
+                self.assertTrue(
+                    agent_engine._medical_request_excludes_facility(
+                        excluded_request,
+                        [facility],
+                    )
+                )
+                for tool_facility in (facility, None):
+                    excluded = agent_engine._truthful_final_content(
+                        "审计完成。",
+                        user_message=excluded_request,
+                        tool_outcomes=outcome(tool_facility),
+                        controlled_medical_audit=True,
+                        authoritative_medical_facilities=[facility],
+                        medical_facility_lookup_succeeded=True,
+                    )
+                    self.assertIn("未形成可验证审计结论", excluded)
+                    self.assertNotIn("医保确定性汇总", excluded)
+
+        alias = "泰康乐医院"
+        alias_zero_outcome = outcome(alias)
+        alias_zero_payload = json.loads(alias_zero_outcome[0]["result"])
+        alias_zero_payload["summary"] = {
+            "violation_count": 0,
+            "violation_amount": 0.0,
+        }
+        alias_zero_payload["records"] = []
+        alias_zero_payload["row_count"] = 0
+        alias_zero_outcome[0]["result"] = json.dumps(
+            alias_zero_payload,
+            ensure_ascii=False,
+        )
+        unmatched_alias = agent_engine._truthful_final_content(
+            "未发现违规记录。",
+            user_message=f"请审计{alias}刮痧治疗收费大于 2 次的违规记录",
+            tool_outcomes=alias_zero_outcome,
+            controlled_medical_audit=True,
+            authoritative_medical_facilities=[],
+            medical_facility_lookup_succeeded=True,
+        )
+        self.assertIn("未形成可验证审计结论", unmatched_alias)
+        self.assertNotIn("医保确定性汇总", unmatched_alias)
+        self.assertEqual(
+            agent_engine._requested_medical_facilities(scoped_request),
+            {agent_engine._normalized_business_text("贵阳泰康乐综合医院")},
+        )
+        self.assertEqual(
+            agent_engine._requested_medical_facilities(
+                "请审计 AP001 项目和所有医疗机构的违规记录"
+            ),
+            set(),
+        )
+        for generic_project_scope in (
+            "请核查项目 AP001 对应的定点医院",
+            "请审计该项目中的医院收费",
+            "请审计 AP-001 医院项目的收费情况",
+        ):
+            self.assertEqual(
+                agent_engine._requested_medical_facilities(generic_project_scope),
+                set(),
+            )
+
+        long_facility = (
+            "贵阳市观山湖区信义口腔门诊部有限公司世纪城口腔门诊部"
+        )
+        long_request = (
+            f"请审计{long_facility}刮痧治疗收费大于两次的违规记录"
+        )
+        resolved = agent_engine._resolved_medical_facilities(
+            long_request,
+            [long_facility],
+        )
+        self.assertEqual(
+            resolved,
+            {agent_engine._normalized_business_text(long_facility)},
+        )
+        long_omitted = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message=long_request,
+            tool_outcomes=outcome(None),
+            controlled_medical_audit=True,
+            authoritative_medical_facilities=[long_facility],
+            medical_facility_lookup_succeeded=True,
+        )
+        long_matched = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message=long_request,
+            tool_outcomes=outcome(long_facility),
+            controlled_medical_audit=True,
+            authoritative_medical_facilities=[long_facility],
+            medical_facility_lookup_succeeded=True,
+        )
+        failed_lookup = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message=scoped_request,
+            tool_outcomes=outcome("贵阳泰康乐综合医院"),
+            controlled_medical_audit=True,
+            authoritative_medical_facilities=[],
+            medical_facility_lookup_succeeded=False,
+        )
+        self.assertIn("未形成可验证审计结论", long_omitted)
+        self.assertIn("医保确定性汇总", long_matched)
+        self.assertNotIn("未形成可验证审计结论", long_matched)
+        self.assertIn("未形成可验证审计结论", failed_lookup)
+        self.assertNotIn("医保确定性汇总", failed_lookup)
+
+        long_station = "贵阳市观山湖区长岭街道金融城社区卫生服务站"
+        short_station = "观山湖区长岭街道金融城社区卫生服务站"
+        station_request = (
+            f"请审计{long_station}和{short_station}刮痧治疗收费大于两次的违规记录"
+        )
+        station_scopes = agent_engine._resolved_medical_facilities(
+            station_request,
+            [long_station, short_station],
+        )
+        self.assertEqual(
+            station_scopes,
+            {
+                agent_engine._normalized_business_text(long_station),
+                agent_engine._normalized_business_text(short_station),
+            },
+        )
+        station_single_result = agent_engine._truthful_final_content(
+            "审计完成。",
+            user_message=station_request,
+            tool_outcomes=outcome(long_station),
+            controlled_medical_audit=True,
+            authoritative_medical_facilities=[long_station, short_station],
+            medical_facility_lookup_succeeded=True,
+        )
+        self.assertIn("未形成可验证审计结论", station_single_result)
+        self.assertNotIn("医保确定性汇总", station_single_result)
+
+        for facility in (
+            "观山湖区世纪城社区卫生服务站",
+            "青岩镇中心卫生室",
+            "遵义路便民服务站",
+            "益康药房",
+            "黔灵医学检验所",
+        ):
+            with self.subTest(facility_suffix=facility):
+                self.assertEqual(
+                    agent_engine._requested_medical_facilities(
+                        f"请审计{facility}的收费记录"
+                    ),
+                    {agent_engine._normalized_business_text(facility)},
+                )
+
+    def test_truth_guard_rejects_duplicate_or_empty_medical_page_identity(self) -> None:
+        base_arguments = {
+            "strategy": "included_service_duplicate",
+            "included_service": "电子结肠镜检查",
+            "duplicate_service": "电子乙状结肠镜检查",
+            "limit": 10,
+        }
+        evidence = {
+            "source_id": "medical-source",
+            "parameters": {
+                "facility_name": None,
+                "included_service": "电子结肠镜检查",
+                "duplicate_service": "电子乙状结肠镜检查",
+            },
+        }
+
+        def page(offset: int, identities: list[str], *, truncated: bool) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "audit_version": "medical-audit-v1",
+                "strategy": "included_service_duplicate",
+                "summary": {"violation_count": 20, "violation_amount": 955.85},
+                "records": [{"charge_line_id": value} for value in identities],
+                "row_count": len(identities),
+                "offset": offset,
+                "limit": 10,
+                "truncated": truncated,
+                "next_offset": offset + len(identities) if truncated else None,
+                "evidence": evidence,
+            }
+
+        first = page(0, [str(index) for index in range(10)], truncated=True)
+        duplicate_second = page(
+            10,
+            [str(index) for index in range(10)],
+            truncated=False,
+        )
+        duplicate_content = agent_engine._truthful_final_content(
+            "已返回全部明细。",
+            user_message=(
+                "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
+                "并返回全部违规明细"
+            ),
+            tool_outcomes=[
+                {
+                    "name": "run_medical_audit",
+                    "arguments": {**base_arguments, "offset": 0},
+                    "result": json.dumps(first, ensure_ascii=False),
+                },
+                {
+                    "name": "run_medical_audit",
+                    "arguments": {**base_arguments, "offset": 10},
+                    "result": json.dumps(duplicate_second, ensure_ascii=False),
+                },
+            ],
+            controlled_medical_audit=True,
+        )
+        empty_identity = page(
+            0,
+            ["", *[str(index) for index in range(1, 10)]],
+            truncated=True,
+        )
+        empty_content = agent_engine._truthful_final_content(
+            "已返回全部明细。",
+            user_message=(
+                "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
+                "并返回全部违规明细"
+            ),
+            tool_outcomes=[
+                {
+                    "name": "run_medical_audit",
+                    "arguments": {**base_arguments, "offset": 0},
+                    "result": json.dumps(empty_identity, ensure_ascii=False),
+                }
+            ],
+            controlled_medical_audit=True,
+        )
+
+        self.assertIn("仅连续读取 10/20 条", duplicate_content)
+        self.assertNotIn("完整读取 20/20 条", duplicate_content)
+        self.assertIn("仅连续读取 0/20 条", empty_content)
+
+    def test_run_agent_emits_and_persists_fallback_when_final_summary_fails(self) -> None:
+        context = self._context()
+        responses = iter(
+            [
+                iter(
+                    [
+                        {
+                            "type": "tool_calls",
+                            "tool_calls": [
+                                {
+                                    "id": "one-round-query",
+                                    "function": {
+                                        "name": "query_mapped_objects",
+                                        "arguments": {"entity": "项目"},
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                RuntimeError("summary provider failed"),
+            ]
+        )
+
+        def fake_chat_stream(*_args, **_kwargs):
+            value = next(responses)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with (
+            patch.object(context, "execute_tool", return_value=json.dumps({"records": []})),
+            patch.object(agent_engine.llm_service, "chat_stream", side_effect=fake_chat_stream),
+            patch.object(
+                agent_engine,
+                "get_settings",
+                return_value=SimpleNamespace(max_tool_rounds=1),
+            ),
+        ):
+            events = list(
+                agent_engine.run_agent(
+                    self.db,
+                    self.agent,
+                    LLMConfig(name="工具模型"),
+                    [],
+                    "查询项目",
+                    self.scenario.name,
+                    "",
+                    runtime_context=context,
+                )
+            )
+
+        emitted = "".join(
+            event["data"] for event in events if event["type"] == "token"
+        )
+        self.assertTrue(emitted)
+        self.assertEqual(emitted, events[-1]["data"])
+        self.assertIn("未能形成完整结论", emitted)
 
 
 if __name__ == "__main__":

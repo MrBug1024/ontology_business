@@ -37,11 +37,11 @@
 
     <el-tabs v-model="tab" class="sd-tabs">
       <!-- ═══════════ 本体 ═══════════ -->
-      <el-tab-pane label="本体模型" name="ontology">
+      <el-tab-pane label="本体模型" name="ontology" lazy>
         <div class="tab-toolbar">
           <div class="tab-stats">
-            <span class="stat">对象类型 <b>{{ detail.entities.length }}</b></span>
-            <span class="stat">关系类型 <b>{{ detail.relations.length }}</b></span>
+            <span class="stat">对象类型 <b>{{ detail.entities.length + scenarioDraftsOf('entity').length }}</b></span>
+            <span class="stat">关系类型 <b>{{ detail.relations.length + scenarioDraftsOf('relation').length }}</b></span>
           </div>
           <div v-if="canWrite" class="tab-actions">
             <el-button size="small" @click="openEntity()"><el-icon><Plus /></el-icon> 对象类型</el-button>
@@ -65,6 +65,7 @@
             :entities="detail.entities"
             :relations="detail.relations"
             :saving="saving"
+            :focus-property-index="draftPropertyEditorIndex"
             @save="saveEditor"
             @delete="deleteEditor"
             @close="closeEditor"
@@ -73,10 +74,10 @@
       </el-tab-pane>
 
       <!-- ═══════════ 实例 ═══════════ -->
-      <el-tab-pane label="实例数据" name="instances">
+      <el-tab-pane label="实例数据" name="instances" lazy>
         <div class="tab-toolbar">
           <div class="tab-stats">
-            <span class="stat">对象实例 <b>{{ detail.instances.length }}</b></span>
+            <span class="stat">对象实例 <b>{{ detail.instances.length + scenarioDraftsOf('instance').length }}</b></span>
             <span class="stat">关系实例 <b>{{ detail.relation_instances.length }}</b></span>
             <span class="stat stat-runtime">运行时对象 <b>{{ objectTotal }}</b></span>
           </div>
@@ -105,6 +106,7 @@
               :entities="detail.entities"
               :relations="detail.relations"
               :saving="saving"
+              :focus-property-index="draftPropertyEditorIndex"
               @save="saveEditor"
               @delete="deleteEditor"
               @close="closeEditor"
@@ -228,38 +230,13 @@
       </el-tab-pane>
 
       <!-- ═══════════ 数据映射 ═══════════ -->
-      <el-tab-pane label="数据映射" name="mappings">
-        <el-alert
-          v-if="!databaseDataSources.length"
-          class="mapping-prerequisite"
-          title="请先接入并测试数据源，再配置字段映射"
-          description="没有数据源结构时，系统无法知道可映射的表和字段。"
-          type="warning"
-          :closable="false"
-          show-icon
-        >
-          <template #default><el-button type="primary" plain size="small" @click="goToDataSources">接入数据源</el-button></template>
-        </el-alert>
+      <el-tab-pane label="数据映射" name="mappings" lazy>
         <div class="tab-toolbar">
           <div class="tab-stats mapping-stats">
-            <span class="stat">对象映射 <b>{{ detail.mappings.length }}</b></span>
-            <span class="stat">关系映射 <b>{{ detail.relation_mappings.length }}</b></span>
-            <span class="stat" :class="{ 'stat-warning': modelReadyCount < concreteEntityCount }">模型就绪 <b>{{ modelReadyCount }}/{{ concreteEntityCount }}</b></span>
-            <span class="stat" :class="{ 'stat-warning': titleReadyCount < concreteEntityCount }">标题就绪 <b>{{ titleReadyCount }}/{{ concreteEntityCount }}</b></span>
+            <span class="stat">对象映射 <b>{{ objectMappingRows.length }}</b></span>
+            <span class="stat">关系映射 <b>{{ relationMappingRows.length }}</b></span>
           </div>
         </div>
-        <el-alert
-          v-if="unreadyConcreteEntities.length"
-          class="mapping-readiness-alert"
-          type="warning"
-          :closable="false"
-          show-icon
-          title="先补齐对象模型，再刷新业务数据"
-        >
-          <template #default>
-            <span>{{ unreadyConcreteEntities.map((entity) => `${entity.name}：${(entity.model_issues || []).join('、') || '缺少主键或标题属性'}`).join('；') }}</span>
-          </template>
-        </el-alert>
 
         <section class="mapping-section" aria-labelledby="object-mapping-heading">
           <div class="mapping-section-head">
@@ -269,17 +246,13 @@
             </div>
             <el-button v-if="canWrite" size="small" type="primary" :disabled="!databaseDataSources.length || !detail.entities.length" @click="openMapping()"><el-icon><Plus /></el-icon> 添加对象映射</el-button>
           </div>
-          <div v-if="detail.mappings.length" class="mapping-card-grid">
-            <article v-for="row in detail.mappings" :key="row.id" class="mapping-item-card">
+          <div v-if="objectMappingRows.length" class="mapping-card-grid">
+            <article v-for="row in objectMappingRows" :key="row.id" class="mapping-item-card">
               <header class="mapping-item-head">
-                <span class="ent-chip" :style="{ color: entColor(row.entity_id) }"><i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}</span>
+                <span class="ent-chip" :style="{ color: entColor(row.entity_id) }"><i :style="{ background: entColor(row.entity_id) }"></i>{{ row._isAiDraft ? row._entityLabel : entName(row.entity_id) }}</span>
                 <el-tag size="small" effect="plain" :type="mappingStatusType(row.status)">{{ mappingStatusLabel(row.status) }}</el-tag>
               </header>
-              <div class="mapping-source"><b>{{ dsName(row.data_source_id) }}</b><span>{{ row.table_name || '未选择数据表' }}</span></div>
-              <div class="mapping-readiness-tags">
-                <el-tag size="small" effect="plain" :type="mappingIdentityCoverage(row).key ? 'success' : 'danger'">{{ mappingIdentityCoverage(row).key ? '主键已映射' : '主键未映射' }}</el-tag>
-                <el-tag size="small" effect="plain" :type="mappingIdentityCoverage(row).title ? 'success' : 'warning'">{{ mappingIdentityCoverage(row).title ? '标题已映射' : '标题未映射' }}</el-tag>
-              </div>
+              <div class="mapping-source"><b>{{ row._isAiDraft ? row._sourceLabel : dsName(row.data_source_id) }}</b><span>{{ row.table_name || '—' }}</span></div>
               <div class="col-maps">
                 <span class="col-map" v-for="(value, key) in row.column_map" :key="key">{{ key }} ← {{ value }}</span>
                 <span v-if="!Object.keys(row.column_map || {}).length" class="muted">尚未映射字段</span>
@@ -289,11 +262,14 @@
                 {{ mappingJobLabel(mappingRefreshJob(row)?.status) }} · 第 {{ mappingRefreshJob(row)?.attempt || 0 }}/{{ mappingRefreshJob(row)?.max_attempts || 0 }} 次
               </small>
               <footer class="mapping-item-actions">
-                <el-button v-if="canWrite" size="small" text @click="openMapping(row.id)">编辑</el-button>
-                <el-button size="small" text @click="doPreviewMapping(row)">预览</el-button>
-                <el-button v-if="canWrite" size="small" text :loading="(row as any)._testing" @click="doTestMapping(row)">测试</el-button>
-                <el-button v-if="canWrite" size="small" text type="primary" :loading="mappingRefreshActive(row)" :disabled="mappingRefreshActive(row)" @click="doRefreshMapping(row)">{{ mappingRefreshActive(row) ? '刷新中' : '刷新对象' }}</el-button>
-                <el-button v-if="canWrite && row.id" size="small" text type="danger" @click="removeMapping(row.id)">删除</el-button>
+                <el-button v-if="canWrite && row._isAiDraft" size="small" text @click="startEditingScenarioDraft(row._scenarioDraft)">编辑</el-button>
+                <template v-else>
+                  <el-button v-if="canWrite" size="small" text @click="openMapping(row.id)">编辑</el-button>
+                  <el-button size="small" text @click="doPreviewMapping(row)">预览</el-button>
+                  <el-button v-if="canWrite" size="small" text :loading="(row as any)._testing" @click="doTestMapping(row)">测试</el-button>
+                  <el-button v-if="canWrite" size="small" text type="primary" :loading="mappingRefreshActive(row)" :disabled="mappingRefreshActive(row)" @click="doRefreshMapping(row)">{{ mappingRefreshActive(row) ? '刷新中' : '刷新对象' }}</el-button>
+                  <el-button v-if="canWrite && row.id" size="small" text type="danger" @click="removeMapping(row.id)">删除</el-button>
+                </template>
               </footer>
             </article>
           </div>
@@ -308,9 +284,8 @@
             </div>
             <el-button v-if="canWrite" size="small" type="primary" :disabled="!detail.relations.length" @click="openRelationMapping()"><el-icon><Plus /></el-icon> 添加关系映射</el-button>
           </div>
-          <el-alert v-if="!detail.relations.length" type="info" :closable="false" show-icon title="请先在本体模型中创建关系类型" class="relation-mapping-prerequisite" />
-          <div v-if="detail.relation_mappings.length" class="mapping-card-grid relation-mapping-grid">
-            <article v-for="row in detail.relation_mappings" :key="row.id" class="mapping-item-card relation-mapping-card">
+          <div v-if="relationMappingRows.length" class="mapping-card-grid relation-mapping-grid">
+            <article v-for="row in relationMappingRows" :key="row.id" class="mapping-item-card relation-mapping-card">
               <header class="mapping-item-head">
                 <div class="relation-mapping-title"><b>{{ row.relation_name }}</b><span>{{ row.source_entity_name }} → {{ row.target_entity_name }}</span></div>
                 <el-tag size="small" effect="plain" :type="mappingStatusType(row.status)">{{ mappingStatusLabel(row.status) }}</el-tag>
@@ -323,9 +298,12 @@
               </dl>
               <p v-if="row.last_error" class="mapping-inline-error"><el-icon><WarningFilled /></el-icon>{{ row.last_error }}</p>
               <footer class="mapping-item-actions">
-                <el-button v-if="canWrite" size="small" text @click="preflightSavedRelationMapping(row)">预检</el-button>
-                <el-button v-if="canWrite" size="small" text @click="openRelationMapping(row.id)">编辑</el-button>
-                <el-button v-if="canWrite" size="small" text type="danger" @click="removeRelationMapping(row)">删除</el-button>
+                <el-button v-if="canWrite && row._isAiDraft" size="small" text @click="startEditingScenarioDraft(row._scenarioDraft)">编辑</el-button>
+                <template v-else>
+                  <el-button v-if="canWrite" size="small" text @click="preflightSavedRelationMapping(row)">预检</el-button>
+                  <el-button v-if="canWrite" size="small" text @click="openRelationMapping(row.id)">编辑</el-button>
+                  <el-button v-if="canWrite" size="small" text type="danger" @click="removeRelationMapping(row)">删除</el-button>
+                </template>
               </footer>
             </article>
           </div>
@@ -334,9 +312,9 @@
       </el-tab-pane>
 
       <!-- ═══════════ 业务函数（无副作用、可由 Agent 调用）═══════════ -->
-      <el-tab-pane label="函数" name="functions" data-testid="functions-tab">
+      <el-tab-pane label="函数" name="functions" data-testid="functions-tab" lazy>
         <div class="tab-toolbar">
-          <div class="tab-stats"><span class="stat">函数 <b>{{ detail.functions.length }}</b></span></div>
+          <div class="tab-stats"><span class="stat">函数 <b>{{ functionRows.length }}</b></span></div>
           <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" data-testid="create-function" @click="openFunction()"><el-icon><Plus /></el-icon> 添加函数</el-button>
           </div>
@@ -349,11 +327,11 @@
           show-icon
         />
         <div class="card map-card">
-          <el-table :data="detail.functions" class="map-table" :empty-text="canWrite ? '暂无函数，点击「添加函数」配置可供 Agent 调用的确定性计算' : '暂无函数'">
+          <el-table :data="functionRows" class="map-table" :empty-text="canWrite ? '暂无函数，点击「添加函数」配置可供 Agent 调用的确定性计算' : '暂无函数'">
             <el-table-column label="名称 / 说明" min-width="190">
               <template #default="{ row }">
                 <div class="function-name-cell">
-                  <b>{{ row.name }}</b>
+                  <div class="inline-resource-name"><b>{{ row.name }}</b></div>
                   <span class="muted">{{ row.description || '—' }}</span>
                 </div>
               </template>
@@ -388,9 +366,12 @@
             </el-table-column>
             <el-table-column v-if="canWrite" label="操作" width="210" fixed="right">
               <template #default="{ row }">
-                <el-button size="small" text @click="openFunction(row.id)">编辑</el-button>
-                <el-button v-if="row.runtime_kind !== 'contract'" size="small" text type="primary" @click="doRunFunction(row)">运行</el-button>
-                <el-button size="small" text type="danger" @click="removeFunction(row.id)">删除</el-button>
+                <el-button v-if="row._isAiDraft" size="small" text @click="startEditingScenarioDraft(row._scenarioDraft)">编辑</el-button>
+                <template v-else>
+                  <el-button size="small" text @click="openFunction(row.id)">编辑</el-button>
+                  <el-button v-if="row.runtime_kind !== 'contract'" size="small" text type="primary" @click="doRunFunction(row)">运行</el-button>
+                  <el-button size="small" text type="danger" @click="removeFunction(row.id)">删除</el-button>
+                </template>
               </template>
             </el-table-column>
           </el-table>
@@ -398,22 +379,22 @@
       </el-tab-pane>
 
       <!-- ═══════════ 操作（Actions）═══════════ -->
-      <el-tab-pane label="操作" name="actions">
+      <el-tab-pane label="操作" name="actions" lazy>
         <div class="tab-toolbar">
-          <div class="tab-stats"><span class="stat">操作 <b>{{ detail.actions.length }}</b></span></div>
+          <div class="tab-stats"><span class="stat">操作 <b>{{ actionRows.length }}</b></span></div>
           <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" @click="openAction()"><el-icon><Plus /></el-icon> 添加操作</el-button>
           </div>
         </div>
         <div class="card map-card">
-          <el-table :data="detail.actions" class="map-table" :empty-text="canWrite ? '暂无操作，点击「添加操作」创建' : '暂无操作'">
+          <el-table :data="actionRows" class="map-table" :empty-text="canWrite ? '暂无操作，点击「添加操作」创建' : '暂无操作'">
             <el-table-column label="名称" min-width="140">
-              <template #default="{ row }"><b>{{ row.name }}</b></template>
+              <template #default="{ row }"><div class="inline-resource-name"><b>{{ row.name }}</b></div></template>
             </el-table-column>
             <el-table-column label="所属对象类型" min-width="120">
               <template #default="{ row }">
                 <span class="ent-chip" :style="{ color: entColor(row.entity_id) }">
-                  <i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}
+                  <i :style="{ background: entColor(row.entity_id) }"></i>{{ row._isAiDraft ? row._entityLabel : entName(row.entity_id) }}
                 </span>
               </template>
             </el-table-column>
@@ -432,9 +413,12 @@
             </el-table-column>
             <el-table-column v-if="canWrite" label="操作" width="245" fixed="right">
               <template #default="{ row }">
-                <el-button size="small" text @click="openAction(row.id)">编辑</el-button>
-                <el-button size="small" text type="primary" :loading="row._executing" @click="doExecuteAction(row)">参数与执行</el-button>
-                <el-button size="small" text type="danger" @click="removeAction(row.id)">删除</el-button>
+                <el-button v-if="row._isAiDraft" size="small" text @click="startEditingScenarioDraft(row._scenarioDraft)">编辑</el-button>
+                <template v-else>
+                  <el-button size="small" text @click="openAction(row.id)">编辑</el-button>
+                  <el-button size="small" text type="primary" :loading="row._executing" @click="doExecuteAction(row)">参数与执行</el-button>
+                  <el-button size="small" text type="danger" @click="removeAction(row.id)">删除</el-button>
+                </template>
               </template>
             </el-table-column>
           </el-table>
@@ -442,22 +426,22 @@
       </el-tab-pane>
 
       <!-- ═══════════ 规则（Rules）═══════════ -->
-      <el-tab-pane label="规则" name="rules">
+      <el-tab-pane label="规则" name="rules" lazy>
         <div class="tab-toolbar">
-          <div class="tab-stats"><span class="stat">规则 <b>{{ detail.rules.length }}</b></span></div>
+          <div class="tab-stats"><span class="stat">规则 <b>{{ ruleRows.length }}</b></span></div>
           <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" @click="openRule()"><el-icon><Plus /></el-icon> 添加规则</el-button>
           </div>
         </div>
         <div class="card map-card">
-          <el-table :data="detail.rules" class="map-table" :empty-text="canWrite ? '暂无规则，点击「添加规则」创建' : '暂无规则'">
+          <el-table :data="ruleRows" class="map-table" :empty-text="canWrite ? '暂无规则，点击「添加规则」创建' : '暂无规则'">
             <el-table-column label="名称" min-width="140">
-              <template #default="{ row }"><b>{{ row.name }}</b></template>
+              <template #default="{ row }"><div class="inline-resource-name"><b>{{ row.name }}</b></div></template>
             </el-table-column>
             <el-table-column label="关联对象类型" min-width="120">
               <template #default="{ row }">
                 <span v-if="row.entity_id" class="ent-chip" :style="{ color: entColor(row.entity_id) }">
-                  <i :style="{ background: entColor(row.entity_id) }"></i>{{ entName(row.entity_id) }}
+                    <i :style="{ background: entColor(row.entity_id) }"></i>{{ row._isAiDraft ? row._entityLabel : entName(row.entity_id) }}
                 </span>
                 <span v-else class="muted">全局</span>
               </template>
@@ -472,9 +456,12 @@
             </el-table-column>
             <el-table-column v-if="canWrite" label="操作" width="200" fixed="right">
               <template #default="{ row }">
-                <el-button size="small" text @click="openRule(row.id)">编辑</el-button>
-                <el-button size="small" text type="primary" @click="doEvalRule(row)">评估</el-button>
-                <el-button size="small" text type="danger" @click="removeRule(row.id)">删除</el-button>
+                <el-button v-if="row._isAiDraft" size="small" text @click="startEditingScenarioDraft(row._scenarioDraft)">编辑</el-button>
+                <template v-else>
+                  <el-button size="small" text @click="openRule(row.id)">编辑</el-button>
+                  <el-button size="small" text type="primary" @click="doEvalRule(row)">评估</el-button>
+                  <el-button size="small" text type="danger" @click="removeRule(row.id)">删除</el-button>
+                </template>
               </template>
             </el-table-column>
           </el-table>
@@ -482,17 +469,17 @@
       </el-tab-pane>
 
       <!-- ═══════════ 事件（Events）═══════════ -->
-      <el-tab-pane label="事件" name="events">
+      <el-tab-pane label="事件" name="events" lazy>
         <div class="tab-toolbar">
-          <div class="tab-stats"><span class="stat">事件 <b>{{ detail.events.length }}</b></span></div>
+          <div class="tab-stats"><span class="stat">事件 <b>{{ eventRows.length }}</b></span></div>
           <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" @click="openEvent()"><el-icon><Plus /></el-icon> 添加事件</el-button>
           </div>
         </div>
         <div class="card map-card">
-          <el-table :data="detail.events" class="map-table" :empty-text="canWrite ? '暂无事件，点击「添加事件」创建' : '暂无事件'">
+          <el-table :data="eventRows" class="map-table" :empty-text="canWrite ? '暂无事件，点击「添加事件」创建' : '暂无事件'">
             <el-table-column label="名称" min-width="140">
-              <template #default="{ row }"><b>{{ row.name }}</b></template>
+              <template #default="{ row }"><div class="inline-resource-name"><b>{{ row.name }}</b></div></template>
             </el-table-column>
             <el-table-column label="触发来源" width="140">
               <template #default="{ row }"><el-tag size="small" effect="plain">{{ row.trigger_source || '—' }}</el-tag></template>
@@ -507,6 +494,8 @@
             </el-table-column>
             <el-table-column v-if="canWrite" label="操作" width="205" fixed="right">
               <template #default="{ row }">
+                <el-button v-if="row._isAiDraft" size="small" text @click="startEditingScenarioDraft(row._scenarioDraft)">编辑</el-button>
+                <template v-else>
                 <el-button
                   size="small"
                   text
@@ -518,6 +507,7 @@
                 >发布</el-button>
                 <el-button size="small" text @click="openEvent(row.id)">编辑</el-button>
                 <el-button size="small" text type="danger" @click="removeEvent(row.id)">删除</el-button>
+                </template>
               </template>
             </el-table-column>
           </el-table>
@@ -525,7 +515,7 @@
       </el-tab-pane>
 
       <!-- ═══════════ 工作流（Workflows）═══════════ -->
-      <el-tab-pane label="工作流" name="workflows">
+      <el-tab-pane label="工作流" name="workflows" lazy>
         <!-- 可视化编排画布 -->
         <div v-if="wfEditor && canWrite" class="wf-editor-stage">
           <WorkflowEditor
@@ -536,7 +526,7 @@
             :events="detail.events"
             :llm-configs="llmConfigs"
             @update:model-value="wfEditor = $event"
-            @close="wfEditor = null"
+            @close="closeWorkflowEditor"
             @save="saveWorkflow"
             @run-created="openWorkflowRun"
           />
@@ -544,15 +534,15 @@
         <!-- 工作流列表 -->
         <template v-else>
           <div class="tab-toolbar">
-            <div class="tab-stats"><span class="stat">工作流 <b>{{ detail.workflows.length }}</b></span></div>
+            <div class="tab-stats"><span class="stat">工作流 <b>{{ workflowRows.length }}</b></span></div>
             <div v-if="canWrite" class="tab-actions">
               <el-button size="small" type="primary" @click="openWorkflow()"><el-icon><Plus /></el-icon> 新建工作流</el-button>
             </div>
           </div>
           <div class="card map-card">
-            <el-table :data="detail.workflows" class="map-table" :empty-text="canWrite ? '暂无工作流，点击「新建工作流」开始可视化编排' : '暂无工作流'">
+            <el-table :data="workflowRows" class="map-table" :empty-text="canWrite ? '暂无工作流，点击「新建工作流」开始可视化编排' : '暂无工作流'">
               <el-table-column label="名称" min-width="140">
-                <template #default="{ row }"><b>{{ row.name }}</b></template>
+                <template #default="{ row }"><div class="inline-resource-name"><b>{{ row.name }}</b></div></template>
               </el-table-column>
               <el-table-column label="触发方式" width="110">
                 <template #default="{ row }">
@@ -580,10 +570,13 @@
               </el-table-column>
               <el-table-column label="操作" :width="canWrite ? 258 : 74" fixed="right">
                 <template #default="{ row }">
-                  <el-button v-if="canWrite" size="small" text @click="openWorkflow(row.id)">编排</el-button>
-                  <el-button v-if="canWrite" size="small" text type="primary" :disabled="row.status !== 'active'" :loading="row._executing" @click="doExecuteWorkflow(row)">执行</el-button>
-                  <el-button size="small" text @click="goToWorkflowTasks(row)">任务</el-button>
-                  <el-button v-if="canWrite" size="small" text type="danger" @click="removeWorkflow(row.id)">删除</el-button>
+                  <el-button v-if="canWrite && row._isAiDraft" size="small" text @click="startEditingScenarioDraft(row._scenarioDraft)">编辑</el-button>
+                  <template v-else>
+                    <el-button v-if="canWrite" size="small" text @click="openWorkflow(row.id)">编排</el-button>
+                    <el-button v-if="canWrite" size="small" text type="primary" :disabled="row.status !== 'active'" :loading="row._executing" @click="doExecuteWorkflow(row)">执行</el-button>
+                    <el-button size="small" text @click="goToWorkflowTasks(row)">任务</el-button>
+                    <el-button v-if="canWrite" size="small" text type="danger" @click="removeWorkflow(row.id)">删除</el-button>
+                  </template>
                 </template>
               </el-table-column>
             </el-table>
@@ -696,7 +689,7 @@
       </el-form>
       <template #footer>
         <el-button @click="mappingDlg = false">取消</el-button>
-        <el-button type="primary" @click="saveMapping">保存</el-button>
+        <el-button type="primary" :loading="scenarioDraftPromotionSyncing" @click="saveMapping">保存</el-button>
       </template>
     </el-dialog>
 
@@ -919,7 +912,7 @@
     </el-dialog>
 
     <!-- ═══════════ 业务函数对话框 ═══════════ -->
-    <el-dialog v-if="canWrite" v-model="functionDlg" :title="functionForm.id ? '编辑函数' : '添加函数'" width="680px" class="glass-dialog" data-testid="function-dialog">
+    <el-dialog v-if="canWrite" v-model="functionDlg" :title="functionForm.id ? '编辑函数' : '添加函数'" width="680px" class="glass-dialog" data-testid="function-dialog" @closed="clearActiveScenarioDraftPromotion('function')">
       <el-alert
         title="选择受治理的内置计算方式，不填写代码、网址或连接凭据。函数可被 Agent 安全调用。"
         type="info"
@@ -999,7 +992,7 @@
     </el-dialog>
 
     <!-- ═══════════ 操作对话框 ═══════════ -->
-    <el-dialog v-if="canWrite" v-model="actionDlg" :title="actionForm.id ? '编辑操作' : '添加操作'" width="640px" class="glass-dialog">
+    <el-dialog v-if="canWrite" v-model="actionDlg" :title="actionForm.id ? '编辑操作' : '添加操作'" width="640px" class="glass-dialog" @closed="clearActiveScenarioDraftPromotion('action')">
       <el-form label-position="top">
         <div class="form-row">
           <el-form-item label="名称" class="form-col">
@@ -1179,7 +1172,7 @@
       </el-form>
       <template #footer>
         <el-button @click="actionDlg = false">取消</el-button>
-        <el-button type="primary" @click="saveAction">保存</el-button>
+        <el-button type="primary" :loading="scenarioDraftPromotionSyncing" @click="saveAction">保存</el-button>
       </template>
     </el-dialog>
 
@@ -1242,7 +1235,7 @@
     </el-dialog>
 
     <!-- ═══════════ 规则对话框 ═══════════ -->
-    <el-dialog v-if="canWrite" v-model="ruleDlg" :title="ruleForm.id ? '编辑规则' : '添加规则'" width="640px" class="glass-dialog">
+    <el-dialog v-if="canWrite" v-model="ruleDlg" :title="ruleForm.id ? '编辑规则' : '添加规则'" width="640px" class="glass-dialog" @closed="clearActiveScenarioDraftPromotion('rule')">
       <el-form label-position="top">
         <div class="form-row">
           <el-form-item label="名称" class="form-col">
@@ -1278,12 +1271,12 @@
       </el-form>
       <template #footer>
         <el-button @click="ruleDlg = false">取消</el-button>
-        <el-button type="primary" @click="saveRule">保存</el-button>
+        <el-button type="primary" :loading="scenarioDraftPromotionSyncing" @click="saveRule">保存</el-button>
       </template>
     </el-dialog>
 
     <!-- ═══════════ 事件对话框 ═══════════ -->
-    <el-dialog v-if="canWrite" v-model="eventDlg" :title="eventForm.id ? '编辑事件' : '添加事件'" width="560px" class="glass-dialog">
+    <el-dialog v-if="canWrite" v-model="eventDlg" :title="eventForm.id ? '编辑事件' : '添加事件'" width="560px" class="glass-dialog" @closed="clearActiveScenarioDraftPromotion('event')">
       <el-form label-position="top">
         <div class="form-row">
           <el-form-item label="名称" class="form-col">
@@ -1305,7 +1298,7 @@
       </el-form>
       <template #footer>
         <el-button @click="eventDlg = false">取消</el-button>
-        <el-button type="primary" @click="saveEvent">保存</el-button>
+        <el-button type="primary" :loading="scenarioDraftPromotionSyncing" @click="saveEvent">保存</el-button>
       </template>
     </el-dialog>
 
@@ -1330,10 +1323,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, shallowRef, computed, watch, nextTick, onMounted, onBeforeUnmount, toRaw } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
+import { cloneForForm } from '@/utils/clone'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import EditorPanel from '@/components/EditorPanel.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
@@ -1352,8 +1346,9 @@ import {
   relationMappingModeLabel,
   relationMappingPayloadFingerprint,
 } from '@/utils/relationMappings'
-import type { ArtifactTemplate, AssistantActionPreview, ScenarioDetail, GraphData, GraphNode, GraphEdge, Entity, Relation, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, RelationDataMapping, RelationDataMappingInput, RelationDataMappingPreview, TableInfo, WorkflowRun } from '@/types'
+import type { ArtifactTemplate, AssistantActionPreview, ScenarioDetail, ScenarioModelDraftIssue, ScenarioModelDraftResource, GraphData, GraphNode, GraphEdge, Entity, Relation, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, RelationDataMapping, RelationDataMappingInput, RelationDataMappingPreview, TableInfo, WorkflowRun } from '@/types'
 import { cleanTemplateExecutorConfig, templateFormatLabel, templatePathsToSchema, templateUnavailableReason } from '@/utils/templates'
+import { draftRefToken, normalizeScenarioModelDrafts, scenarioDraftIsOpen, scenarioDraftKindLabel, scenarioDraftStage } from '@/utils/scenarioModelDrafts'
 
 const route = useRoute()
 const router = useRouter()
@@ -1361,6 +1356,25 @@ const sid = route.params.id as string
 const scenarioLoading = ref(true)
 const scenarioAccessDenied = ref(false)
 const scenarioLoadError = ref('')
+// Draft resources can be numerous and are replaced as a batch; deep-reactive
+// proxying them makes route teardown and graph projection unnecessarily costly.
+const scenarioDrafts = shallowRef<ScenarioModelDraftResource[]>([])
+const scenarioDraftsLoading = ref(false)
+const scenarioDraftsError = ref('')
+type PendingScenarioDraftResolution = {
+  draftId: string
+  expectedRevision: number
+  resolvedResourceId: string
+  resourceKind: string
+  title: string
+  error: string
+  retryable: boolean
+}
+const activeScenarioDraftPromotion = ref<ScenarioModelDraftResource | null>(null)
+const pendingScenarioDraftResolutions = ref<PendingScenarioDraftResolution[]>([])
+const scenarioDraftPromotionSyncing = ref(false)
+let scenarioDraftRequest = 0
+let scenarioDraftViewDisposed = false
 
 const detail = ref<ScenarioDetail>({
   id: sid, name: '', description: '',
@@ -1380,11 +1394,6 @@ const scenarioDataSources = computed(() => dataSources.value.filter((source) => 
 const databaseDataSources = computed(() => scenarioDataSources.value.filter((source) => source.type !== 'file_bucket'))
 const fileBucketSources = computed(() => scenarioDataSources.value.filter((source) => source.type === 'file_bucket'))
 const writableFileBucketSources = computed(() => fileBucketSources.value.filter((source) => source.can_write !== false))
-const concreteEntities = computed(() => detail.value.entities.filter((entity) => !entity.is_abstract))
-const concreteEntityCount = computed(() => concreteEntities.value.length)
-const modelReadyCount = computed(() => concreteEntities.value.filter((entity) => entity.model_ready).length)
-const titleReadyCount = computed(() => concreteEntities.value.filter((entity) => entity.properties.filter((property) => property.is_title).length === 1).length)
-const unreadyConcreteEntities = computed(() => concreteEntities.value.filter((entity) => !entity.model_ready))
 const stageNames = new Set(['ontology', 'instances', 'mappings', 'functions', 'actions', 'rules', 'events', 'workflows'])
 const requestedStage = Array.isArray(route.query.stage) ? route.query.stage[0] : route.query.stage
 const tab = ref(typeof requestedStage === 'string' && stageNames.has(requestedStage) ? requestedStage : 'ontology')
@@ -1414,10 +1423,15 @@ function visualColor(color: string | undefined, index: number) {
 
 // ── 悬浮编辑面板状态 ──
 const editor = ref<{ kind: 'entity' | 'relation' | 'instance'; id?: string; form: any } | null>(null)
+const draftPropertyEditorIndex = ref<number | null>(null)
 // 切换 tab 时关闭悬浮编辑器，避免跨 tab 状态残留；进入实例页时刷新对象运行时列表。
-watch(tab, (value) => {
+watch(tab, (value, previousValue) => {
+  const wasInstances = previousValue === 'instances'
   editor.value = null
+  draftPropertyEditorIndex.value = null
+  clearActiveScenarioDraftPromotion()
   if (value === 'instances') searchObjects()
+  if (value === 'instances' || wasInstances) void load()
   if (route.query.stage !== value) {
     void router.replace({ query: { ...route.query, stage: value } })
   }
@@ -1431,6 +1445,82 @@ watch(instFilter, () => {
 })
 
 // ── 图谱数据 ──
+type InlineScenarioDraftRow = Record<string, any> & {
+  _isAiDraft: true
+  _scenarioDraft: ScenarioModelDraftResource
+}
+
+const openScenarioDrafts = computed(() => scenarioDrafts.value.filter(scenarioDraftIsOpen))
+
+function scenarioDraftsOf(...kinds: string[]) {
+  const accepted = new Set(kinds)
+  return openScenarioDrafts.value.filter((item) => accepted.has(item.resource_kind))
+}
+
+function scenarioDraftDisplayId(item: ScenarioModelDraftResource) {
+  return `ai-draft:${item.resource_kind}:${item.id}`
+}
+
+function scenarioDraftRow(item: ScenarioModelDraftResource): InlineScenarioDraftRow {
+  const payload = draftPayload(item)
+  const entityReference = payload.entity_id || payload.entity_ref || payload.entity || payload.entity_name
+  const dataSourceReference = payload.data_source_id || payload.data_source_ref || payload.data_source || payload.data_source_name
+  return {
+    ...payload,
+    id: scenarioDraftDisplayId(item),
+    name: String(payload.name || payload.display_name || item.title || scenarioDraftKindLabel(item.resource_kind)),
+    description: String(payload.description || ''),
+    entity_id: draftEntityId(entityReference),
+    data_source_id: draftDataSourceId(dataSourceReference),
+    table_name: String(payload.table_name || payload.table || ''),
+    column_map: cloneForForm(payload.column_map || payload.field_mappings || {}),
+    input_schema: cloneForForm(payload.input_schema || {}),
+    output_schema: cloneForForm(payload.output_schema || {}),
+    payload_schema: cloneForForm(payload.payload_schema || {}),
+    runtime_kind: 'contract',
+    executor_type: String(payload.executor_type || 'unbound'),
+    status: 'draft',
+    enabled: false,
+    publishable: false,
+    _entityLabel: String(payload.entity_name || draftRefToken(entityReference) || '—'),
+    _sourceLabel: String(payload.source_label || payload.data_source_name || draftRefToken(dataSourceReference) || '—'),
+    _isAiDraft: true,
+    _scenarioDraft: item,
+  }
+}
+
+const objectMappingRows = computed<Record<string, any>[]>(() => [
+  ...scenarioDraftsOf('mapping', 'data_mapping', 'conceptual_mapping').map(scenarioDraftRow),
+  ...detail.value.mappings,
+])
+const relationMappingRows = computed<Record<string, any>[]>(() => [
+  ...scenarioDraftsOf('relation_mapping').map((item) => {
+    const row = scenarioDraftRow(item)
+    const payload = row._scenarioDraft.payload || {}
+    return {
+      ...row,
+      relation_name: String(payload.relation_name || payload.name || item.title || '关系映射'),
+      source_entity_name: String(payload.source_entity_name || draftRefToken(payload.source_entity_ref || payload.source_entity_id) || '—'),
+      target_entity_name: String(payload.target_entity_name || draftRefToken(payload.target_entity_ref || payload.target_entity_id) || '—'),
+      data_source_name: row._sourceLabel,
+      mode: String(payload.mode || 'foreign_key'),
+    }
+  }),
+  ...detail.value.relation_mappings,
+])
+const functionRows = computed<Record<string, any>[]>(() => [...scenarioDraftsOf('function').map(scenarioDraftRow), ...detail.value.functions])
+const actionRows = computed<Record<string, any>[]>(() => [...scenarioDraftsOf('action').map(scenarioDraftRow), ...detail.value.actions])
+const ruleRows = computed<Record<string, any>[]>(() => [...scenarioDraftsOf('rule').map(scenarioDraftRow), ...detail.value.rules])
+const eventRows = computed<Record<string, any>[]>(() => [...scenarioDraftsOf('event').map(scenarioDraftRow), ...detail.value.events])
+const workflowRows = computed<Record<string, any>[]>(() => [...scenarioDraftsOf('workflow').map(scenarioDraftRow), ...detail.value.workflows])
+
+function draftEntityGraphNodeId(value: unknown) {
+  const formalId = draftEntityId(value)
+  if (formalId) return formalId
+  const draft = referencedScenarioEntityDraft(value)
+  return draft ? scenarioDraftDisplayId(draft) : ''
+}
+
 const schemaGraph = computed<GraphData>(() => {
   const nodes: GraphNode[] = detail.value.entities
     .filter((e) => e.id)
@@ -1444,6 +1534,60 @@ const schemaGraph = computed<GraphData>(() => {
       id: r.id!, source: r.source_entity_id, target: r.target_entity_id,
       label: r.name, type: r.relation_type,
     }))
+  for (const [index, draft] of scenarioDraftsOf('entity').entries()) {
+    const payload = draftPayload(draft)
+    nodes.push({
+      id: scenarioDraftDisplayId(draft),
+      label: String(payload.name || draft.title || '对象类型'),
+      type: 'entity',
+      color: visualColor(String(payload.color || ''), detail.value.entities.length + index),
+      meta: {
+        aiDraft: draft,
+        count: Array.isArray(payload.properties) ? payload.properties.length : 0,
+        abstract: payload.is_abstract === true,
+        description: String(payload.description || ''),
+        colorIndex: detail.value.entities.length + index,
+      },
+    })
+  }
+  for (const draft of scenarioDraftsOf('property')) {
+    const payload = draftPayload(draft)
+    const parent = draftEntityGraphNodeId(payload.entity_id || payload.entity_ref || payload.entity || payload.entity_name)
+    const nodeId = scenarioDraftDisplayId(draft)
+    nodes.push({
+      id: nodeId,
+      label: String(payload.name || draft.title || '属性'),
+      type: 'property',
+      color: visualColor(undefined, nodes.length),
+      meta: { aiDraft: draft, count: 0, subtype: '属性' },
+    })
+    if (parent) {
+      edges.push({ id: `${nodeId}:parent`, source: parent, target: nodeId, label: '属性', type: 'belongs' })
+    }
+  }
+  for (const draft of scenarioDraftsOf('relation')) {
+    const payload = draftPayload(draft)
+    const source = draftEntityGraphNodeId(payload.source_entity_id || payload.source_ref || payload.source_entity || payload.source_entity_name)
+    const target = draftEntityGraphNodeId(payload.target_entity_id || payload.target_ref || payload.target_entity || payload.target_entity_name)
+    if (source && target) {
+      edges.push({
+        id: scenarioDraftDisplayId(draft),
+        source,
+        target,
+        label: String(payload.name || draft.title || '关系'),
+        type: String(payload.relation_type || payload.cardinality || '1:N'),
+        meta: { aiDraft: draft },
+      } as GraphEdge)
+    } else {
+      nodes.push({
+        id: scenarioDraftDisplayId(draft),
+        label: String(payload.name || draft.title || '关系'),
+        type: 'relation',
+        color: visualColor(undefined, nodes.length),
+        meta: { aiDraft: draft, count: 0, subtype: '关系' },
+      })
+    }
+  }
   return { nodes, edges }
 })
 const instanceGraph = computed<GraphData>(() => {
@@ -1462,10 +1606,37 @@ const instanceGraph = computed<GraphData>(() => {
     const entity = detail.value.entities.find((e) => e.id === i.entity_id)
     nodes.push({ id: i.id, label: i.name, type: 'instance', color: visualColor(entity?.color, Math.max(0, entityIndex)), meta: { entity: i.entity_id, entity_name: entity?.name || '未分类' } })
   }
+  for (const draft of scenarioDraftsOf('instance')) {
+    const payload = draftPayload(draft)
+    const entityReference = payload.entity_id || payload.entity_ref || payload.entity || payload.entity_name
+    const entityId = draftEntityId(entityReference)
+    if (instFilter.value && entityId !== instFilter.value) continue
+    const entity = detail.value.entities.find((item) => item.id === entityId)
+    const nodeId = scenarioDraftDisplayId(draft)
+    nodes.push({
+      id: nodeId,
+      label: String(payload.name || payload.display_name || draft.title || '对象实例'),
+      type: 'instance',
+      color: visualColor(entity?.color, Math.max(0, detail.value.entities.findIndex((item) => item.id === entityId))),
+      meta: {
+        aiDraft: draft,
+        entity: entityId,
+        entity_name: entity?.name || draftRefToken(entityReference) || '实例节点',
+      },
+    })
+  }
   const edges: GraphEdge[] = []
   for (const i of detail.value.instances) {
     if (!i.id || !entIds.has(i.entity_id)) continue
     edges.push({ id: `ie:${i.id}`, source: entNode.get(i.entity_id)!, target: i.id, type: 'belongs' })
+  }
+  for (const draft of scenarioDraftsOf('instance')) {
+    const payload = draftPayload(draft)
+    const entityId = draftEntityId(payload.entity_id || payload.entity_ref || payload.entity || payload.entity_name)
+    const nodeId = scenarioDraftDisplayId(draft)
+    if (nodes.some((node) => node.id === nodeId) && entityId && entNode.has(entityId)) {
+      edges.push({ id: `${nodeId}:entity`, source: entNode.get(entityId)!, target: nodeId, type: 'belongs' })
+    }
   }
   const nodeIds = new Set(nodes.map((n) => n.id))
   for (const ri of detail.value.relation_instances) {
@@ -1497,7 +1668,6 @@ function entColor(id: string) {
   return visualColor(detail.value.entities[index]?.color, Math.max(0, index))
 }
 function dsName(id: string) { return dataSources.value.find((d) => d.id === id)?.name || '—' }
-
 // ── 对象运行时浏览 ──
 async function searchObjects() {
   const requestKey = objectSearchKey()
@@ -1584,6 +1754,10 @@ function onNodeSelect(node: any) {
     detail: { id: node.id, kind: tab.value === 'instances' ? 'instance' : 'entity', label: node.label || node.name || node.id },
   }))
   if (!canWrite.value) return
+  if (node.meta?.aiDraft) {
+    void startEditingScenarioDraft(node.meta.aiDraft)
+    return
+  }
   if (tab.value === 'instances') openInstance(node.id)
   else openEntity(node.id)
 }
@@ -1591,6 +1765,10 @@ function onInstSelect(node: any) {
   window.dispatchEvent(new CustomEvent('ontology-selection-change', {
     detail: { id: node.id, kind: node.id.startsWith('ent:') ? 'entity' : 'instance', label: node.label || node.name || node.id },
   }))
+  if (node.meta?.aiDraft) {
+    if (canWrite.value) void startEditingScenarioDraft(node.meta.aiDraft)
+    return
+  }
   if (node.id.startsWith('ent:')) {
     if (canWrite.value) openEntity(node.id.slice(4))
   }
@@ -1603,6 +1781,10 @@ function onEdgeClick(edge: any) {
   window.dispatchEvent(new CustomEvent('ontology-selection-change', {
     detail: { id: edge.id, kind: tab.value === 'instances' ? 'relation-instance' : 'relation', label: edge.label || edge.id },
   }))
+  if (edge.meta?.aiDraft) {
+    if (canWrite.value) void startEditingScenarioDraft(edge.meta.aiDraft)
+    return
+  }
   if (canWrite.value && tab.value !== 'instances') openRelation(edge.id)
 }
 function onAddRelation(sourceId: string, targetId: string) {
@@ -1615,43 +1797,55 @@ function onAddRelation(sourceId: string, targetId: string) {
 }
 function clearSelection() {
   editor.value = null
+  draftPropertyEditorIndex.value = null
+  clearActiveScenarioDraftPromotion()
   selectedObjectId.value = null
   objectDetail.value = null
   window.dispatchEvent(new CustomEvent('ontology-selection-change', { detail: {} }))
 }
-function closeEditor() { editor.value = null }
+function closeEditor() {
+  editor.value = null
+  draftPropertyEditorIndex.value = null
+  clearActiveScenarioDraftPromotion()
+}
 
 // ── 打开编辑器 ──
 function openEntity(id?: string) {
   if (!canWrite.value) return
+  clearActiveScenarioDraftPromotion()
+  draftPropertyEditorIndex.value = null
   const e = id ? detail.value.entities.find((x) => x.id === id) : null
   editor.value = {
     kind: 'entity',
     id: e?.id,
     form: e
-      ? { name: e.name, color: e.color, description: e.description, is_abstract: e.is_abstract, properties: e.properties.map((p) => ({ ...p })) }
+      ? { name: e.name, color: e.color, description: e.description, is_abstract: e.is_abstract, properties: e.properties.map((p) => cloneForForm(p)) }
       : { name: '', color: graphPalette[0], description: '', is_abstract: false, properties: [] },
   }
 }
 function openRelation(id?: string) {
   if (!canWrite.value) return
+  clearActiveScenarioDraftPromotion()
+  draftPropertyEditorIndex.value = null
   const r = id ? detail.value.relations.find((x) => x.id === id) : null
   editor.value = {
     kind: 'relation',
     id: r?.id,
     form: r
-      ? { name: r.name, namespace: r.namespace || '', source_entity_id: r.source_entity_id, target_entity_id: r.target_entity_id, relation_type: r.relation_type, description: r.description, constraints: structuredClone(r.constraints || {}) }
+      ? { name: r.name, namespace: r.namespace || '', source_entity_id: r.source_entity_id, target_entity_id: r.target_entity_id, relation_type: r.relation_type, description: r.description, constraints: cloneForForm(r.constraints || {}) }
       : { name: '', namespace: '', source_entity_id: detail.value.entities[0]?.id || '', target_entity_id: detail.value.entities[1]?.id || detail.value.entities[0]?.id || '', relation_type: '1:N', description: '', constraints: {} },
   }
 }
 function openInstance(id?: string) {
   if (!canWrite.value) return
+  clearActiveScenarioDraftPromotion()
+  draftPropertyEditorIndex.value = null
   const i = id ? detail.value.instances.find((x) => x.id === id) : null
   editor.value = {
     kind: 'instance',
     id: i?.id,
     form: i
-      ? { entity_id: i.entity_id, name: i.name, attributes: { ...i.attributes } }
+      ? { entity_id: i.entity_id, name: i.name, attributes: cloneForForm(i.attributes || {}) }
       : { entity_id: instFilter.value || detail.value.entities[0]?.id || '', name: '', attributes: {} },
   }
 }
@@ -1718,18 +1912,22 @@ async function removeRelationInstance(row: RelationInstance) {
 async function saveEditor() {
   if (!canWrite.value || !editor.value) return
   const { kind, id, form } = editor.value
+  const promotion = claimScenarioDraftPromotionSave(kind)
+  if (!promotion.allowed) return
   saving.value = true
   try {
+    let saved: any
     if (kind === 'entity') {
-      if (id) await api.updateEntity(id, form)
-      else await api.createEntity(sid, form)
+      if (id) saved = await api.updateEntity(id, form)
+      else saved = await api.createEntity(sid, form)
     } else if (kind === 'relation') {
-      if (id) await api.updateRelation(id, form)
-      else await api.createRelation(sid, form)
+      if (id) saved = await api.updateRelation(id, form)
+      else saved = await api.createRelation(sid, form)
     } else {
-      if (id) await api.updateInstance(id, form)
-      else await api.createInstance(sid, form)
+      if (id) saved = await api.updateInstance(id, form)
+      else saved = await api.createInstance(sid, form)
     }
+    const draftResolved = await resolveScenarioDraftAfterFormalSave(kind, saved, id, promotion.draft)
     await load()
     if (id) {
       if (kind === 'entity') openEntity(id)
@@ -1738,11 +1936,12 @@ async function saveEditor() {
     } else {
       editor.value = null
     }
-    ElMessage.success('已保存')
+    scenarioDraftSaveToast('已保存', draftResolved)
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.detail || '保存失败')
   } finally {
     saving.value = false
+    releaseScenarioDraftPromotionSave(promotion)
   }
 }
 async function deleteEditor() {
@@ -1852,18 +2051,10 @@ function mappingStatusLabel(status?: string) {
 function mappingStatusType(status?: string) {
   return ({ unknown: 'info', ready: 'success', queued: 'warning', refreshing: 'primary', retry_waiting: 'warning', ok: 'success', error: 'danger' } as Record<string, string>)[status || 'unknown'] || 'info'
 }
-function mappingIdentityCoverage(row: DataMapping) {
-  const entity = detail.value.entities.find((item) => item.id === row.entity_id)
-  const mappedProperties = new Set(Object.entries(row.column_map || {}).filter(([, column]) => Boolean(String(column || '').trim())).map(([property]) => property))
-  return {
-    key: Boolean(entity?.properties.some((property) => property.is_key && mappedProperties.has(property.name))),
-    title: Boolean(entity?.properties.some((property) => property.is_title && mappedProperties.has(property.name))),
-  }
-}
-function mappingRefreshJob(row: DataMapping): DataMappingRefreshJob | undefined {
+function mappingRefreshJob(row: any): DataMappingRefreshJob | undefined {
   return row.id ? mappingRefreshJobs.value[row.id] : undefined
 }
-function mappingRefreshActive(row: DataMapping): boolean {
+function mappingRefreshActive(row: any): boolean {
   return ['queued', 'running', 'retry_waiting'].includes(mappingRefreshJob(row)?.status || '')
 }
 function mappingJobLabel(status?: string): string {
@@ -1954,6 +2145,7 @@ function formatDate(value?: string) {
 
 function openMapping(id?: string) {
   if (!canWrite.value) return
+  clearActiveScenarioDraftPromotion()
   const m = id ? detail.value.mappings.find((x) => x.id === id) : null
   mappingForm.value = m
     ? { ...m, data_source_binding_ref: { ...(m.data_source_binding_ref || {}) }, column_map: { ...(m.column_map || {}) } }
@@ -2001,12 +2193,15 @@ watch(() => mappingForm.value.table_name, () => {
 })
 watch(mappingDlg, (open) => {
   if (open) return
+  clearActiveScenarioDraftPromotion('mapping')
   mappingTableRequest += 1
   mapTables.value = []
   mapCols.value = []
 })
 async function saveMapping() {
   if (!canWrite.value) return
+  const promotion = claimScenarioDraftPromotionSave('mapping')
+  if (!promotion.allowed) return
   try {
     // 后端无独立更新接口：create 会替换同实体的旧映射
     const replacedMappingId = mappingForm.value.id
@@ -2018,13 +2213,18 @@ async function saveMapping() {
       // 表单只编辑键；清空键即明确解除旧的兼容描述，避免提交孤立 ref。
       data_source_binding_ref: bindingKey ? (mappingForm.value.data_source_binding_ref || {}) : {},
     })
+    const draftResolved = await resolveScenarioDraftAfterFormalSave('mapping', saved, replacedMappingId, promotion.draft)
     if (replacedMappingId && replacedMappingId !== saved.id) clearMappingRefreshTracking(replacedMappingId)
     mappingDlg.value = false
     await load()
-    ElMessage.success('已保存')
-  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
+    scenarioDraftSaveToast('已保存', draftResolved)
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败')
+  } finally {
+    releaseScenarioDraftPromotionSave(promotion)
+  }
 }
-async function doPreviewMapping(row: DataMapping) {
+async function doPreviewMapping(row: any) {
   if (!row.id) return
   mappingPreview.value = null
   mappingPreviewDlg.value = true
@@ -2232,6 +2432,7 @@ function onRelationJoinTableChange() {
 }
 async function openRelationMapping(id?: string) {
   if (!canWrite.value) return
+  clearActiveScenarioDraftPromotion()
   const existing = id ? detail.value.relation_mappings.find((mapping) => mapping.id === id) : undefined
   relationMappingEditingId.value = existing?.id || ''
   relationMappingForm.value = existing
@@ -2260,6 +2461,7 @@ async function openRelationMapping(id?: string) {
   await loadRelationMappingOptions()
 }
 function resetRelationMappingDialog() {
+  clearActiveScenarioDraftPromotion('relation_mapping')
   relationMappingOptionsRequest += 1
   relationMappingPreflightRequest += 1
   relationMappingEditingId.value = ''
@@ -2309,29 +2511,34 @@ async function preflightRelationMapping(): Promise<boolean> {
 }
 async function saveRelationMapping() {
   if (!relationMappingCanSave.value) return
+  const promotion = claimScenarioDraftPromotionSave('relation_mapping')
+  if (!promotion.allowed) return
   relationMappingSaving.value = true
   try {
     // Re-run the server preflight immediately before the write so a stale UI
     // success cannot bypass changed mappings, tables or columns.
     if (!await preflightRelationMapping()) return
     const payload = relationMappingPayload.value
-    if (relationMappingEditingId.value) await api.updateRelationMapping(relationMappingEditingId.value, payload)
-    else await api.createRelationMapping(sid, payload)
+    const saved = relationMappingEditingId.value
+      ? await api.updateRelationMapping(relationMappingEditingId.value, payload)
+      : await api.createRelationMapping(sid, payload)
+    const draftResolved = await resolveScenarioDraftAfterFormalSave('relation_mapping', saved, relationMappingEditingId.value, promotion.draft)
     relationMappingDlg.value = false
     await load()
-    ElMessage.success('关系映射已保存')
+    scenarioDraftSaveToast('关系映射已保存', draftResolved)
   } catch (error: any) {
     ElMessage.error(error?.message || '关系映射保存失败')
   } finally {
     relationMappingSaving.value = false
+    releaseScenarioDraftPromotionSave(promotion)
   }
 }
-async function preflightSavedRelationMapping(row: RelationDataMapping) {
+async function preflightSavedRelationMapping(row: any) {
   if (!canWrite.value) return
   await openRelationMapping(row.id)
   await preflightRelationMapping()
 }
-async function removeRelationMapping(row: RelationDataMapping) {
+async function removeRelationMapping(row: any) {
   if (!canWrite.value) return
   try {
     await ElMessageBox.confirm(`删除关系“${row.relation_name}”的数据映射？系统会同时删除由该映射自动生成的关系链接，手工创建的关系不受影响。`, '确认删除', { type: 'warning' })
@@ -2401,6 +2608,7 @@ function resetFunctionRuntime(kind: string) {
 }
 function openFunction(id?: string) {
   if (!canWrite.value) return
+  clearActiveScenarioDraftPromotion()
   const fn = id ? detail.value.functions.find((item) => item.id === id) : null
   functionForm.value = fn
     ? {
@@ -2409,10 +2617,10 @@ function openFunction(id?: string) {
         description: fn.description || '',
         tags_text: (fn.tags || []).join(', '),
         visibility: fn.visibility === 'tenant' ? 'tenant' : 'scenario',
-        input_schema: structuredClone(fn.input_schema || emptyFunctionSchema()),
-        output_schema: structuredClone(fn.output_schema || emptyFunctionSchema()),
+        input_schema: cloneForForm(fn.input_schema || emptyFunctionSchema()),
+        output_schema: cloneForForm(fn.output_schema || emptyFunctionSchema()),
         runtime_kind: fn.runtime_kind || 'contract',
-        runtime_config: structuredClone(fn.runtime_config || {}),
+        runtime_config: cloneForForm(fn.runtime_config || {}),
       }
     : {
         name: '', description: '', tags_text: '', visibility: 'scenario',
@@ -2447,17 +2655,22 @@ async function saveFunction() {
     ElMessage.error(error?.message || '函数声明格式错误')
     return
   }
+  const promotion = claimScenarioDraftPromotionSave('function')
+  if (!promotion.allowed) return
   functionSaving.value = true
   try {
-    if (functionForm.value.id) await api.updateFunction(functionForm.value.id, payload)
-    else await api.createFunction(sid, payload)
+    const saved = functionForm.value.id
+      ? await api.updateFunction(functionForm.value.id, payload)
+      : await api.createFunction(sid, payload)
+    const draftResolved = await resolveScenarioDraftAfterFormalSave('function', saved, functionForm.value.id, promotion.draft)
     functionDlg.value = false
     await load()
-    ElMessage.success('函数已保存')
+    scenarioDraftSaveToast('函数已保存', draftResolved)
   } catch (error: any) {
     ElMessage.error(error?.response?.data?.detail || error?.message || '函数保存失败')
   } finally {
     functionSaving.value = false
+    releaseScenarioDraftPromotionSave(promotion)
   }
 }
 async function removeFunction(id?: string) {
@@ -2666,6 +2879,7 @@ function useCurrentTemplateVersion() {
 }
 function openAction(id?: string) {
   if (!canWrite.value) return
+  clearActiveScenarioDraftPromotion()
   const a = id ? detail.value.actions.find((x) => x.id === id) : null
   actionForm.value = a
     ? {
@@ -2718,13 +2932,19 @@ async function saveAction() {
       )
     }
   }
+  const promotion = claimScenarioDraftPromotionSave('action')
+  if (!promotion.allowed) return
   try {
-    if (f.id) await api.updateAction(f.id, f)
-    else await api.createAction(sid, f)
+    const saved = f.id ? await api.updateAction(f.id, f) : await api.createAction(sid, f)
+    const draftResolved = await resolveScenarioDraftAfterFormalSave('action', saved, f.id, promotion.draft)
     actionDlg.value = false
     await load()
-    ElMessage.success('已保存')
-  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
+    scenarioDraftSaveToast('已保存', draftResolved)
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败')
+  } finally {
+    releaseScenarioDraftPromotionSave(promotion)
+  }
 }
 async function removeAction(id: string) {
   if (!canWrite.value) return
@@ -2833,22 +3053,29 @@ const ruleFieldOptions = computed(() => {
 })
 function openRule(id?: string) {
   if (!canWrite.value) return
+  clearActiveScenarioDraftPromotion()
   const r = id ? detail.value.rules.find((x) => x.id === id) : null
   ruleForm.value = r
-    ? { ...r, condition: structuredClone(r.condition || {}) }
+    ? { ...r, condition: cloneForForm(r.condition || {}) }
     : { name: '', description: '', entity_id: '', severity: 'warning', condition: {}, action_on_match: '', enabled: true }
   ruleDlg.value = true
 }
 async function saveRule() {
   if (!canWrite.value) return
-  const f = { ...ruleForm.value, condition: structuredClone(ruleForm.value.condition || {}) }
+  const f = { ...ruleForm.value, condition: cloneForForm(ruleForm.value.condition || {}) }
+  const promotion = claimScenarioDraftPromotionSave('rule')
+  if (!promotion.allowed) return
   try {
-    if (f.id) await api.updateRule(f.id, f)
-    else await api.createRule(sid, f)
+    const saved = f.id ? await api.updateRule(f.id, f) : await api.createRule(sid, f)
+    const draftResolved = await resolveScenarioDraftAfterFormalSave('rule', saved, f.id, promotion.draft)
     ruleDlg.value = false
     await load()
-    ElMessage.success('已保存')
-  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
+    scenarioDraftSaveToast('已保存', draftResolved)
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败')
+  } finally {
+    releaseScenarioDraftPromotionSave(promotion)
+  }
 }
 async function removeRule(id: string) {
   if (!canWrite.value) return
@@ -2889,22 +3116,29 @@ const eventForm = ref<any>({ payload_schema: emptyFunctionSchema() })
 const publishingEventId = ref<string | null>(null)
 function openEvent(id?: string) {
   if (!canWrite.value) return
+  clearActiveScenarioDraftPromotion()
   const e = id ? detail.value.events.find((x) => x.id === id) : null
   eventForm.value = e
-    ? { ...e, payload_schema: structuredClone(e.payload_schema || emptyFunctionSchema()) }
+    ? { ...e, payload_schema: cloneForForm(e.payload_schema || emptyFunctionSchema()) }
     : { name: '', description: '', trigger_source: '', payload_schema: emptyFunctionSchema(), enabled: true }
   eventDlg.value = true
 }
 async function saveEvent() {
   if (!canWrite.value) return
-  const f = { ...eventForm.value, payload_schema: structuredClone(eventForm.value.payload_schema || emptyFunctionSchema()) }
+  const f = { ...eventForm.value, payload_schema: cloneForForm(eventForm.value.payload_schema || emptyFunctionSchema()) }
+  const promotion = claimScenarioDraftPromotionSave('event')
+  if (!promotion.allowed) return
   try {
-    if (f.id) await api.updateEvent(f.id, f)
-    else await api.createEvent(sid, f)
+    const saved = f.id ? await api.updateEvent(f.id, f) : await api.createEvent(sid, f)
+    const draftResolved = await resolveScenarioDraftAfterFormalSave('event', saved, f.id, promotion.draft)
     eventDlg.value = false
     await load()
-    ElMessage.success('已保存')
-  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
+    scenarioDraftSaveToast('已保存', draftResolved)
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败')
+  } finally {
+    releaseScenarioDraftPromotionSave(promotion)
+  }
 }
 async function removeEvent(id: string) {
   if (!canWrite.value) return
@@ -2917,8 +3151,13 @@ async function removeEvent(id: string) {
 
 // ── 工作流（Workflows）：可视化编排 ──
 const wfEditor = ref<any>(null)
+function closeWorkflowEditor() {
+  wfEditor.value = null
+  clearActiveScenarioDraftPromotion('workflow')
+}
 function openWorkflow(id?: string) {
   if (!canWrite.value) return
+  clearActiveScenarioDraftPromotion()
   const w = id ? detail.value.workflows.find((x) => x.id === id) : null
   wfEditor.value = w
     ? {
@@ -2936,13 +3175,19 @@ function openWorkflow(id?: string) {
 }
 async function saveWorkflow(w: any) {
   if (!canWrite.value) return
+  const promotion = claimScenarioDraftPromotionSave('workflow')
+  if (!promotion.allowed) return
   try {
-    if (w.id) await api.updateWorkflow(w.id, w)
-    else await api.createWorkflow(sid, w)
+    const saved = w.id ? await api.updateWorkflow(w.id, w) : await api.createWorkflow(sid, w)
+    const draftResolved = await resolveScenarioDraftAfterFormalSave('workflow', saved, w.id, promotion.draft)
     wfEditor.value = null
     await load()
-    ElMessage.success('工作流已保存')
-  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败') }
+    scenarioDraftSaveToast('工作流已保存', draftResolved)
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败')
+  } finally {
+    releaseScenarioDraftPromotionSave(promotion)
+  }
 }
 async function removeWorkflow(id: string) {
   if (!canWrite.value) return
@@ -3072,7 +3317,7 @@ let recordInputReject: ((reason: string) => void) | null = null
 function promptParams(initialValue: Record<string, any> | null, title = '填写参数'): Promise<Record<string, any>> {
   if (recordInputReject) recordInputReject('cancel')
   recordInputTitle.value = title
-  recordInputValue.value = structuredClone(initialValue || {})
+  recordInputValue.value = cloneForForm(initialValue || {})
   recordInputDlg.value = true
   return new Promise((resolve, reject) => {
     recordInputResolve = resolve
@@ -3084,7 +3329,7 @@ function confirmRecordInput() {
   recordInputResolve = null
   recordInputReject = null
   recordInputDlg.value = false
-  resolve?.(structuredClone(recordInputValue.value))
+  resolve?.(cloneForForm(recordInputValue.value))
 }
 function cancelRecordInput() {
   const reject = recordInputReject
@@ -3107,13 +3352,583 @@ watch(canWrite, (allowed) => {
   wfEditor.value = null
 })
 
+function scenarioDraftCanEdit(item: ScenarioModelDraftResource) {
+  return ['entity', 'property', 'relation', 'instance', 'mapping', 'data_mapping', 'conceptual_mapping', 'relation_mapping', 'function', 'action', 'rule', 'event', 'workflow']
+    .includes(String(item.resource_kind || ''))
+}
+
+function draftPayload(item: ScenarioModelDraftResource) {
+  // ``scenarioDrafts`` is reactive; cloning a proxied payload throws a
+  // DataCloneError as soon as an accepted AI draft is projected into a tab.
+  // Payloads come from the JSON API, so JSON round-tripping also unwraps any
+  // nested proxies that `toRaw` cannot reach.
+  const payload = JSON.parse(JSON.stringify(toRaw(item.payload || {}))) as Record<string, any>
+  delete payload.id
+  delete payload.scenario_id
+  delete payload.tenant_id
+  delete payload.created_at
+  delete payload.updated_at
+  return payload
+}
+
+function draftRefCandidates(value: unknown) {
+  const token = draftRefToken(value)
+  if (!token) return []
+  const parts = token.split(/[:/.]/).filter(Boolean)
+  const tail = parts[parts.length - 1] || token
+  return [...new Set([token, tail])]
+}
+
+function referencedScenarioEntityDraft(value: unknown) {
+  const candidates = draftRefCandidates(value)
+  return scenarioDrafts.value.find((item) => item.resource_kind === 'entity' && (
+    candidates.includes(item.resource_key)
+    || candidates.includes(String(item.payload?.key || ''))
+    || candidates.includes(String(item.payload?.id || ''))
+  ))
+}
+
+function draftEntityId(value: unknown) {
+  const candidates = draftRefCandidates(value)
+  if (!candidates.length) return ''
+  const referencedDraft = referencedScenarioEntityDraft(value)
+  const aliases = [...new Set([
+    ...candidates,
+    String(referencedDraft?.payload?.name || ''),
+    String(referencedDraft?.payload?.namespace || ''),
+    String(referencedDraft?.title || ''),
+  ].filter(Boolean))]
+  return detail.value.entities.find((entity) => aliases.some((reference) => (
+    entity.id === reference || entity.name === reference || entity.namespace === reference || (entity as any).key === reference
+  )))?.id || ''
+}
+
+function draftDataSourceId(value: unknown) {
+  const candidates = draftRefCandidates(value)
+  if (!candidates.length) return ''
+  return scenarioDataSources.value.find((source) => candidates.some((reference) => (
+    source.id === reference || source.name === reference || source.key === reference || source.binding_key === reference
+  )))?.id || ''
+}
+
+function scenarioDraftFormalKind(kind: string) {
+  if (['mapping', 'data_mapping', 'conceptual_mapping'].includes(kind)) return 'mapping'
+  if (kind === 'property') return 'entity'
+  return kind
+}
+
+function clearActiveScenarioDraftPromotion(kind?: string) {
+  const active = activeScenarioDraftPromotion.value
+  if (!active || (kind && scenarioDraftFormalKind(active.resource_kind) !== kind)) return
+  activeScenarioDraftPromotion.value = null
+}
+
+type ScenarioDraftPromotionClaim = {
+  allowed: boolean
+  draft: ScenarioModelDraftResource | null
+}
+
+function claimScenarioDraftPromotionSave(formalKind: string): ScenarioDraftPromotionClaim {
+  const draft = activeScenarioDraftPromotion.value
+  if (!draft || scenarioDraftFormalKind(draft.resource_kind) !== formalKind) return { allowed: true, draft: null }
+  if (scenarioDraftPromotionSyncing.value) return { allowed: false, draft }
+  scenarioDraftPromotionSyncing.value = true
+  return { allowed: true, draft }
+}
+
+function releaseScenarioDraftPromotionSave(claim: ScenarioDraftPromotionClaim) {
+  if (claim.draft) scenarioDraftPromotionSyncing.value = false
+}
+
+function upsertPendingScenarioDraftResolution(pending: PendingScenarioDraftResolution) {
+  const index = pendingScenarioDraftResolutions.value.findIndex((item) => item.draftId === pending.draftId)
+  if (index >= 0) pendingScenarioDraftResolutions.value.splice(index, 1, pending)
+  else pendingScenarioDraftResolutions.value.push(pending)
+}
+
+function removePendingScenarioDraftResolution(draftId: string) {
+  pendingScenarioDraftResolutions.value = pendingScenarioDraftResolutions.value.filter((item) => item.draftId !== draftId)
+}
+
+function formalResourceId(result: any, fallback = '') {
+  return String(result?.id || result?.item?.id || result?.resource?.id || fallback || '').trim()
+}
+
+function formalPropertyResourceId(draft: ScenarioModelDraftResource, result: any, fallbackEntityId = '') {
+  const entity = result?.item || result?.resource || result
+  const properties = Array.isArray(entity?.properties) ? entity.properties : []
+  const payload = draft.payload || {}
+  const apiName = String(payload.api_name || '').trim()
+  const name = String(payload.name || draft.title || '').trim()
+  const property = properties.find((item: any) => (
+    (apiName && String(item?.api_name || '') === apiName)
+    || (name && String(item?.name || '') === name)
+  ))
+  // Older EntityOut responses omit child IDs. The resolve contract accepts the
+  // just-saved parent ID and uniquely matches this draft by api_name/name.
+  return String(property?.id || formalResourceId(entity, fallbackEntityId)).trim()
+}
+
+async function resolvePendingScenarioDraft(pending: PendingScenarioDraftResolution): Promise<boolean> {
+  try {
+    const response = await api.resolveScenarioModelDraft(sid, pending.draftId, {
+      expected_revision: pending.expectedRevision,
+      resolved_resource_id: pending.resolvedResourceId,
+    })
+    const raw = (response as any)?.item || (response as any)?.draft || response
+    const resolved = normalizeScenarioModelDrafts([raw])[0]
+    if (resolved) {
+      const index = scenarioDrafts.value.findIndex((item) => item.id === resolved.id)
+      if (index >= 0) scenarioDrafts.value = scenarioDrafts.value.map((item, itemIndex) => itemIndex === index ? resolved : item)
+    }
+    removePendingScenarioDraftResolution(pending.draftId)
+    await loadScenarioDrafts()
+    return true
+  } catch (error: any) {
+    await loadScenarioDrafts()
+    const stillOpen = scenarioDrafts.value.some((item) => item.id === pending.draftId && scenarioDraftIsOpen(item))
+    // A timed-out resolve may have committed successfully. The normal list no
+    // longer returns resolved drafts, so absence after a successful refresh is
+    // the durable confirmation and must not leave a false retry banner.
+    if (!scenarioDraftsError.value && !stillOpen) {
+      removePendingScenarioDraftResolution(pending.draftId)
+      return true
+    }
+    const status = Number(error?.status || 0)
+    const retryable = ![400, 403, 404, 409].includes(status)
+    upsertPendingScenarioDraftResolution({
+      ...pending,
+      retryable,
+      error: status === 409
+        ? '草稿修订或资源绑定已经变化，不能把旧编辑结果自动关联到新修订。请重新打开该草稿并再次带入资源编辑器。'
+        : error?.message || '请重试同步；系统不会重复创建已经保存的正式资源。',
+    })
+    return false
+  }
+}
+
+async function resolveScenarioDraftAfterFormalSave(
+  formalKind: string,
+  result: any,
+  fallbackResourceId = '',
+  claimedDraft: ScenarioModelDraftResource | null = null,
+): Promise<boolean | null> {
+  const active = claimedDraft || activeScenarioDraftPromotion.value
+  if (!active || scenarioDraftFormalKind(active.resource_kind) !== formalKind) return null
+  const relatedPropertyDrafts = active.resource_kind === 'entity'
+    ? scenarioDrafts.value.filter((item) => (
+      item.resource_kind === 'property'
+      && scenarioDraftIsOpen(item)
+      && referencedScenarioEntityDraft(item.payload?.entity_id || item.payload?.entity_ref || item.payload?.entity || item.payload?.entity_name)?.id === active.id
+    ))
+    : []
+  const resolvedResourceId = active.resource_kind === 'property'
+    ? formalPropertyResourceId(active, result, fallbackResourceId)
+    : formalResourceId(result, fallbackResourceId)
+  if (activeScenarioDraftPromotion.value?.id === active.id) activeScenarioDraftPromotion.value = null
+  const pending: PendingScenarioDraftResolution = {
+    draftId: active.id,
+    expectedRevision: active.revision,
+    resolvedResourceId,
+    resourceKind: active.resource_kind,
+    title: active.title || scenarioDraftKindLabel(active.resource_kind),
+    error: '',
+    retryable: Boolean(resolvedResourceId),
+  }
+  if (!resolvedResourceId) {
+    upsertPendingScenarioDraftResolution({
+      ...pending,
+      error: '正式资源接口没有返回资源 ID，无法自动关联。请重新打开草稿并确认正式资源。',
+      retryable: false,
+    })
+    return false
+  }
+  upsertPendingScenarioDraftResolution(pending)
+  const primaryResolved = await resolvePendingScenarioDraft(pending)
+  if (!primaryResolved || !relatedPropertyDrafts.length) return primaryResolved
+  let allResolved = true
+  for (const propertyDraft of relatedPropertyDrafts) {
+    const propertyResourceId = formalPropertyResourceId(propertyDraft, result, fallbackResourceId)
+    if (!propertyResourceId) {
+      allResolved = false
+      continue
+    }
+    const childPending: PendingScenarioDraftResolution = {
+      draftId: propertyDraft.id,
+      expectedRevision: propertyDraft.revision,
+      resolvedResourceId: propertyResourceId,
+      resourceKind: propertyDraft.resource_kind,
+      title: propertyDraft.title || scenarioDraftKindLabel(propertyDraft.resource_kind),
+      error: '',
+      retryable: true,
+    }
+    upsertPendingScenarioDraftResolution(childPending)
+    if (!await resolvePendingScenarioDraft(childPending)) allResolved = false
+  }
+  return allResolved
+}
+
+function scenarioDraftSaveToast(message: string, _resolved: boolean | null) {
+  ElMessage.success(message)
+}
+
+async function startEditingScenarioDraft(item: ScenarioModelDraftResource) {
+  if (!item || !canWrite.value || !scenarioDraftCanEdit(item)) return
+  const payload = draftPayload(item)
+  if (item.resource_kind === 'property') {
+    const entityReference = payload.entity_id || payload.entity_ref || payload.entity || payload.entity_name
+    const entityId = draftEntityId(entityReference)
+    const entity = detail.value.entities.find((candidate) => candidate.id === entityId)
+    const entityDraft = entity?.id ? undefined : referencedScenarioEntityDraft(entityReference)
+    if (!entity?.id) {
+      if (entityDraft) {
+        await startEditingScenarioDraft(entityDraft)
+      } else {
+        if (tab.value !== 'ontology') {
+          tab.value = 'ontology'
+          await nextTick()
+        }
+        const references = draftRefCandidates(entityReference)
+        activeScenarioDraftPromotion.value = item
+        removePendingScenarioDraftResolution(item.id)
+        editor.value = {
+          kind: 'entity',
+          form: {
+            name: references[references.length - 1] || '对象类型',
+            namespace: '',
+            color: graphPalette[0],
+            description: '',
+            is_abstract: false,
+            state_property: '',
+            properties: [],
+          },
+        }
+      }
+    } else if (tab.value !== 'ontology') {
+      tab.value = 'ontology'
+      await nextTick()
+      openEntity(entity.id)
+    } else {
+      openEntity(entity.id)
+    }
+    if (!editor.value || editor.value.kind !== 'entity') return
+    const properties = editor.value.form.properties as any[]
+    const propertyName = String(payload.name || item.title || '').trim()
+    const apiName = String(payload.api_name || '').trim()
+    const existingIndex = properties.findIndex((property) => (
+      (apiName && String(property.api_name || '') === apiName)
+      || (propertyName && String(property.name || '') === propertyName)
+    ))
+    const existing = existingIndex >= 0 ? properties[existingIndex] : {}
+    const has = (field: string) => Object.prototype.hasOwnProperty.call(payload, field)
+    const enumValues = Array.isArray(payload.enum_values)
+      ? payload.enum_values.map((value: unknown) => String(value).trim()).filter(Boolean)
+      : Array.isArray(existing.enum_values) ? [...existing.enum_values] : []
+    const property = {
+      ...existing,
+      name: propertyName,
+      api_name: apiName || String(existing.api_name || ''),
+      data_type: String(payload.data_type || payload.type || existing.data_type || 'string'),
+      description: String(payload.description ?? existing.description ?? ''),
+      is_key: has('is_key') ? payload.is_key === true : Boolean(existing.is_key),
+      is_title: has('is_title') ? payload.is_title === true : Boolean(existing.is_title),
+      is_required: has('is_required') ? payload.is_required === true : Boolean(existing.is_required),
+      is_enum: has('is_enum') ? payload.is_enum === true : (Boolean(existing.is_enum) || enumValues.length > 0),
+      enum_values: enumValues,
+      default_value: has('default_value') ? cloneForForm(payload.default_value) : existing.default_value ?? '',
+      constraints: cloneForForm(payload.constraints || existing.constraints || {}),
+      is_sensitive: has('is_sensitive') ? payload.is_sensitive === true : Boolean(existing.is_sensitive),
+    }
+    const propertyIndex = existingIndex >= 0 ? existingIndex : properties.length
+    if (existingIndex >= 0) properties.splice(existingIndex, 1, property)
+    else properties.push(property)
+    const promotion = entityDraft || item
+    activeScenarioDraftPromotion.value = promotion
+    removePendingScenarioDraftResolution(promotion.id)
+    draftPropertyEditorIndex.value = propertyIndex
+    return
+  }
+  const stage = scenarioDraftStage(item.resource_kind)
+  if (stage) tab.value = stage
+  await nextTick()
+  activeScenarioDraftPromotion.value = item
+  removePendingScenarioDraftResolution(item.id)
+  draftPropertyEditorIndex.value = null
+
+  if (item.resource_kind === 'entity') {
+    editor.value = {
+      kind: 'entity',
+      form: {
+        name: String(payload.name || item.title || ''),
+        namespace: String(payload.namespace || ''),
+        color: String(payload.color || graphPalette[0]),
+        description: String(payload.description || ''),
+        is_abstract: payload.is_abstract === true,
+        state_property: String(payload.state_property || ''),
+        properties: Array.isArray(payload.properties) ? payload.properties.map((property: any) => ({ ...property })) : [],
+      },
+    }
+    return
+  }
+  if (item.resource_kind === 'relation') {
+    editor.value = {
+      kind: 'relation',
+      form: {
+        name: String(payload.name || item.title || ''),
+        namespace: String(payload.namespace || ''),
+        source_entity_id: draftEntityId(payload.source_entity_id || payload.source_ref || payload.source_entity || payload.source_entity_name),
+        target_entity_id: draftEntityId(payload.target_entity_id || payload.target_ref || payload.target_entity || payload.target_entity_name),
+        relation_type: String(payload.relation_type || payload.cardinality || '1:N'),
+        description: String(payload.description || ''),
+        constraints: cloneForForm(payload.constraints || {}),
+      },
+    }
+    return
+  }
+  if (item.resource_kind === 'instance') {
+    editor.value = {
+      kind: 'instance',
+      form: {
+        entity_id: draftEntityId(payload.entity_id || payload.entity_ref || payload.entity || payload.entity_name),
+        name: String(payload.name || payload.display_name || item.title || ''),
+        attributes: cloneForForm(payload.attributes || payload.values || {}),
+        state: String(payload.state || ''),
+        valid_from: payload.valid_from || null,
+        valid_to: payload.valid_to || null,
+        quality: cloneForForm(payload.quality || {}),
+        access_scope: payload.access_scope === 'restricted' ? 'restricted' : 'tenant',
+        source: 'assistant_draft',
+        source_ref: item.id,
+      },
+    }
+    return
+  }
+  if (['mapping', 'data_mapping', 'conceptual_mapping'].includes(item.resource_kind)) {
+    mappingForm.value = {
+      entity_id: draftEntityId(payload.entity_id || payload.entity_ref || payload.entity || payload.entity_name),
+      // Conceptual AI mappings must stay visibly unbound. Never guess a source.
+      data_source_id: draftDataSourceId(payload.data_source_id || payload.data_source_ref || payload.data_source || payload.data_source_name),
+      data_source_binding_key: String(payload.data_source_binding_key || ''),
+      data_source_binding_ref: cloneForForm(payload.data_source_binding_ref || {}),
+      table_name: String(payload.table_name || payload.table || ''),
+      column_map: cloneForForm(payload.column_map || payload.field_mappings || {}),
+    }
+    const draftTransforms = payload.transform_rules && typeof payload.transform_rules === 'object' ? payload.transform_rules : {}
+    mappingTransformRules.value = Object.fromEntries(Object.entries(draftTransforms).map(([propertyName, rules]) => [
+      propertyName,
+      Array.isArray(rules) ? rules.map((rule: any) => ({ ...rule })) : [],
+    ]))
+    mappingDlg.value = true
+    void loadTables()
+    return
+  }
+  if (item.resource_kind === 'relation_mapping') {
+    relationMappingEditingId.value = ''
+    relationMappingForm.value = {
+      ...emptyRelationMappingForm(),
+      ...payload,
+      relation_id: String(payload.relation_id || ''),
+      source_mapping_id: String(payload.source_mapping_id || ''),
+      target_mapping_id: String(payload.target_mapping_id || ''),
+      join_data_source_id: draftDataSourceId(payload.join_data_source_id || payload.data_source_id),
+    }
+    invalidateRelationMappingPreview()
+    relationMappingDlg.value = true
+    await nextTick()
+    await loadRelationMappingOptions()
+    return
+  }
+  if (item.resource_kind === 'function') {
+    functionForm.value = {
+      name: String(payload.name || item.title || ''),
+      description: String(payload.description || ''),
+      tags_text: Array.isArray(payload.tags) ? payload.tags.join(', ') : String(payload.tags_text || ''),
+      visibility: payload.visibility === 'tenant' ? 'tenant' : 'scenario',
+      input_schema: cloneForForm(payload.input_schema || emptyFunctionSchema()),
+      output_schema: cloneForForm(payload.output_schema || emptyFunctionSchema()),
+      // A promoted AI draft starts as a non-runnable declaration. The user can
+      // explicitly select a governed built-in runtime after reviewing it.
+      runtime_kind: 'contract',
+      runtime_config: {},
+    }
+    functionDlg.value = true
+    return
+  }
+  if (item.resource_kind === 'action') {
+    const executorType = String(payload.executor_type || 'unbound')
+    actionForm.value = {
+      ...payload,
+      entity_id: draftEntityId(payload.entity_id || payload.entity_ref || payload.entity || payload.entity_name),
+      name: String(payload.name || item.title || ''),
+      description: String(payload.description || ''),
+      executor_type: executorType,
+      executor_config: { ...emptyExecutorConfig(executorType), ...cloneForForm(payload.executor_config || {}) },
+      input_schema: cloneForForm(payload.input_schema || emptyFunctionSchema()),
+      enabled: false,
+      requires_confirmation: payload.requires_confirmation !== false,
+      idempotency_required: payload.idempotency_required !== false,
+      permission_scope: 'scenario',
+    }
+    actionLegacyConditions.value = []
+    actionPrecondition.value = parseActionCondition(actionForm.value.precondition, '执行前条件')
+    actionPostcondition.value = parseActionCondition(actionForm.value.postcondition, '执行后校验')
+    originalActionTemplateId.value = ''
+    if (executorType === 'template') void loadActionTemplates()
+    actionDlg.value = true
+    return
+  }
+  if (item.resource_kind === 'rule') {
+    ruleForm.value = {
+      ...payload,
+      name: String(payload.name || item.title || ''),
+      entity_id: draftEntityId(payload.entity_id || payload.entity_ref || payload.entity || payload.entity_name),
+      condition: cloneForForm(payload.condition || {}),
+      enabled: false,
+    }
+    ruleDlg.value = true
+    return
+  }
+  if (item.resource_kind === 'event') {
+    eventForm.value = {
+      ...payload,
+      name: String(payload.name || item.title || ''),
+      payload_schema: cloneForForm(payload.payload_schema || emptyFunctionSchema()),
+      enabled: false,
+    }
+    eventDlg.value = true
+    return
+  }
+  if (item.resource_kind === 'workflow') {
+    wfEditor.value = {
+      ...payload,
+      name: String(payload.name || item.title || ''),
+      trigger_type: String(payload.trigger_type || 'manual'),
+      trigger_config: { interval_seconds: 300, max_attempts: 3, retry_backoff_seconds: 5, timeout_seconds: 300, event_id: '', ...cloneForForm(payload.trigger_config || {}) },
+      steps: Array.isArray(payload.steps) ? payload.steps.map((step: any) => ({ ...step })) : [],
+      nodes: Array.isArray(payload.nodes) ? payload.nodes.map((node: any) => ({ ...node, data: { ...(node.data || {}) } })) : [],
+      edges: Array.isArray(payload.edges) ? payload.edges.map((edge: any) => ({ ...edge })) : [],
+      status: 'draft',
+      enabled: false,
+    }
+  }
+}
+
+function unresolvedDraftReferenceIssue(
+  label: string,
+  value: unknown,
+  resolvedId: string,
+): ScenarioModelDraftIssue | null {
+  const token = draftRefToken(value)
+  if (!token || resolvedId) return null
+  return {
+    code: 'FRONTEND_UNRESOLVED_DRAFT_REFERENCE',
+    message: `${label}“${token}”尚未绑定到当前场景中的正式资源。`,
+    blocking: true,
+    resolution_hint: '先创建或修正被引用资源，再在草稿编辑器中选择正式资源。',
+    source_refs: [token],
+  }
+}
+
+function withDraftReferenceIssues(item: ScenarioModelDraftResource): ScenarioModelDraftResource {
+  const payload = item.payload || {}
+  const localIssues: ScenarioModelDraftIssue[] = []
+  const add = (issue: ScenarioModelDraftIssue | null) => { if (issue) localIssues.push(issue) }
+  if (item.resource_kind === 'relation') {
+    const source = payload.source_entity_id || payload.source_ref || payload.source_entity || payload.source_entity_name
+    const target = payload.target_entity_id || payload.target_ref || payload.target_entity || payload.target_entity_name
+    add(unresolvedDraftReferenceIssue('来源对象', source, draftEntityId(source)))
+    add(unresolvedDraftReferenceIssue('目标对象', target, draftEntityId(target)))
+  }
+  if (['property', 'instance', 'mapping', 'data_mapping', 'conceptual_mapping', 'action', 'rule'].includes(item.resource_kind)) {
+    const entity = payload.entity_id || payload.entity_ref || payload.entity || payload.entity_name
+    add(unresolvedDraftReferenceIssue('对象类型', entity, draftEntityId(entity)))
+  }
+  if (['mapping', 'data_mapping'].includes(item.resource_kind)) {
+    const source = payload.data_source_id || payload.data_source_ref || payload.data_source || payload.data_source_name
+    add(unresolvedDraftReferenceIssue('数据源', source, draftDataSourceId(source)))
+  }
+  const issues = [...item.validation_issues]
+  for (const local of localIssues) {
+    if (!issues.some((existing) => existing.code === local.code && existing.message === local.message)) issues.push(local)
+  }
+  return {
+    ...item,
+    validation_issues: issues,
+    issues_count: Math.max(Number(item.issues_count || 0), issues.length),
+    blocking_issue_count: Math.max(
+      Number(item.blocking_issue_count || 0),
+      issues.filter((issue) => issue.blocking).length,
+    ),
+  }
+}
+
+async function loadScenarioDrafts() {
+  const request = ++scenarioDraftRequest
+  scenarioDraftsLoading.value = true
+  scenarioDraftsError.value = ''
+  try {
+    const draftsById = new Map<string, ScenarioModelDraftResource>()
+    const limit = 1000
+    let offset = 0
+    let expectedTotal: number | undefined
+    while (true) {
+      const response = await api.listScenarioModelDrafts(sid, {
+        offset,
+        limit,
+        // The scene projection only needs editable payloads and lifecycle
+        // metadata. Large validation evidence is loaded on demand by callers
+        // that explicitly request the detailed draft view.
+        include_issues: false,
+      })
+      if (scenarioDraftViewDisposed || request !== scenarioDraftRequest) return
+      const normalizedPage = normalizeScenarioModelDrafts(response)
+        .filter((item) => !item.scenario_id || item.scenario_id === sid)
+      for (const item of normalizedPage) draftsById.set(item.id, item)
+
+      const metadata = response && !Array.isArray(response) ? response : undefined
+      const responseTotal = Number(metadata?.total)
+      if (Number.isSafeInteger(responseTotal) && responseTotal >= 0) {
+        if (expectedTotal === undefined) expectedTotal = responseTotal
+        else if (responseTotal !== expectedTotal) {
+          throw new Error('草稿列表在分页读取期间发生变化，请重试以获取一致的完整列表。')
+        }
+      }
+      if (metadata?.has_more !== true) {
+        if (expectedTotal !== undefined && draftsById.size !== expectedTotal) {
+          throw new Error(`草稿分页结果不完整（应有 ${expectedTotal} 项，实际收到 ${draftsById.size} 项），请重试。`)
+        }
+        break
+      }
+      const nextOffset = Number(metadata.next_offset)
+      if (
+        !Number.isSafeInteger(nextOffset)
+        || nextOffset <= offset
+        || (expectedTotal !== undefined && nextOffset >= expectedTotal)
+      ) {
+        throw new Error('草稿分页游标无效，已停止继续请求以避免循环；请重试。')
+      }
+      offset = nextOffset
+    }
+    const normalized = [...draftsById.values()]
+    // Resolve compiler refs against both the formal model and entity drafts in
+    // the complete paginated result before surfacing local binding issues.
+    scenarioDrafts.value = normalized
+    scenarioDrafts.value = normalized.map(withDraftReferenceIssues)
+  } catch (error: any) {
+    if (scenarioDraftViewDisposed || request !== scenarioDraftRequest) return
+    scenarioDraftsError.value = error?.message || '请稍后重试；正式场景资源不受影响。'
+  } finally {
+    if (!scenarioDraftViewDisposed && request === scenarioDraftRequest) scenarioDraftsLoading.value = false
+  }
+}
+
 // ── 加载 ──
 async function load() {
   scenarioLoading.value = true
   scenarioAccessDenied.value = false
   scenarioLoadError.value = ''
   try {
-    const loaded = await api.getScenario(sid)
+    const loaded = await api.getScenario(sid, { include_runtime_facts: tab.value === 'instances' })
     detail.value = { ...loaded, relation_mappings: loaded.relation_mappings || [] }
   } catch (e: any) {
     if (Number(e?.status || e?.response?.status) === 403) {
@@ -3135,8 +3950,12 @@ async function load() {
     mcpConfigs.value = mcpItems
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.detail || e?.message || '场景关联资源加载失败')
+  } finally {
+    await loadScenarioDrafts()
   }
-  await searchObjects()
+  // The object explorer is only visible on the instances tab. Avoid doing a
+  // runtime object scan while the ontology tab is becoming interactive.
+  if (tab.value === 'instances') void searchObjects()
 }
 function goBack() { void router.push(returnPath.value) }
 function goToDataSources() {
@@ -3148,6 +3967,10 @@ function goToTemplates() {
 function onAssistantApplied(event: Event) {
   const detail = (event as CustomEvent<{ scenario_id?: string }>).detail || {}
   if (!detail.scenario_id || detail.scenario_id === sid) load()
+}
+function onAssistantScenarioDraftsUpdated(event: Event) {
+  const eventDetail = (event as CustomEvent<{ scenario_id?: string }>).detail || {}
+  if (!eventDetail.scenario_id || eventDetail.scenario_id === sid) void loadScenarioDrafts()
 }
 function requestedActionId() {
   const value = route.query.action_id
@@ -3195,7 +4018,7 @@ async function openGovernedActionById(actionId: string, assistantPreview?: Assis
   for (const field of actionParameterFields.value) {
     if (!Object.prototype.hasOwnProperty.call(parameters, field.name)) continue
     const value = parameters[field.name]
-    actionParamsForm.value[field.name] = structuredClone(value)
+    actionParamsForm.value[field.name] = cloneForForm(value)
   }
   // Let the deep parameter watcher finish before restoring the immutable dry-run.
   await nextTick()
@@ -3221,11 +4044,12 @@ function workflowStatusLabel(status?: string) {
   return status === 'active' ? '启用' : status === 'disabled' ? '停用' : '草稿'
 }
 function workflowStatusType(status?: string) {
-  return status === 'active' ? 'success' : status === 'disabled' ? 'info' : 'warning'
+  return status === 'active' ? 'success' : 'info'
 }
 onMounted(async () => {
   mappingRefreshViewDisposed = false
   objectSearchViewDisposed = false
+  scenarioDraftViewDisposed = false
   if (route.query.stage !== tab.value) void router.replace({ query: { ...route.query, stage: tab.value } })
   await load()
   const editActionId = requestedEditActionId()
@@ -3235,6 +4059,7 @@ onMounted(async () => {
     await openGovernedActionById(requestedActionId(), consumeAssistantActionPreviewState())
   }
   window.addEventListener('assistant-proposal-applied', onAssistantApplied)
+  window.addEventListener('assistant-scenario-drafts-updated', onAssistantScenarioDraftsUpdated)
   window.addEventListener('open-governed-action', onOpenGovernedAction)
 })
 onBeforeUnmount(() => {
@@ -3243,7 +4068,10 @@ onBeforeUnmount(() => {
   objectSearchViewDisposed = true
   objectRequestId += 1
   objectPendingKey = ''
+  scenarioDraftViewDisposed = true
+  scenarioDraftRequest += 1
   window.removeEventListener('assistant-proposal-applied', onAssistantApplied)
+  window.removeEventListener('assistant-scenario-drafts-updated', onAssistantScenarioDraftsUpdated)
   window.removeEventListener('open-governed-action', onOpenGovernedAction)
   for (const timer of mappingRefreshTimers.values()) window.clearTimeout(timer)
   mappingRefreshTimers.clear()
@@ -3291,6 +4119,9 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
 }
 .ph-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   flex-shrink: 0;
 }
 .ai-btn {
@@ -3621,14 +4452,6 @@ onBeforeUnmount(() => {
 .mapping-stats {
   flex-wrap: wrap;
 }
-.stat-warning {
-  border-color: color-mix(in srgb, var(--warning) 38%, var(--border));
-  color: var(--warning);
-}
-.mapping-readiness-alert,
-.mapping-prerequisite {
-  margin-bottom: 12px;
-}
 .mapping-section {
   min-width: 0;
   margin-bottom: 16px;
@@ -3698,7 +4521,6 @@ onBeforeUnmount(() => {
   font-size: 11px;
   overflow-wrap: anywhere;
 }
-.mapping-readiness-tags,
 .mapping-item-actions {
   display: flex;
   flex-wrap: wrap;
@@ -3756,6 +4578,14 @@ onBeforeUnmount(() => {
 .map-table {
   flex: 1;
 }
+.inline-resource-name {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.inline-resource-name b { overflow-wrap: anywhere; }
 .workflow-trigger {
   display: flex;
   flex-direction: column;

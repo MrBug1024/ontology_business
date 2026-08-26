@@ -1,3 +1,5 @@
+import { cloneForForm } from './clone.ts'
+
 export type SchemaObject = Record<string, any>
 
 export type EditableSchemaField = {
@@ -23,7 +25,7 @@ function fieldExtras(schema: SchemaObject): SchemaObject {
   const extras: SchemaObject = {}
   for (const [key, value] of Object.entries(schema)) {
     if (['type', 'format', 'description', 'enum', 'properties', 'required', 'items'].includes(key)) continue
-    extras[key] = structuredClone(value)
+    extras[key] = cloneForForm(value)
   }
   // Scalar arrays cannot be expressed as a separate child row, so retain the
   // item schema as an opaque constraint. Object-array children are rebuilt
@@ -31,7 +33,7 @@ function fieldExtras(schema: SchemaObject): SchemaObject {
   if (schema.type === 'array' && isObject(schema.items)) {
     const itemProperties = isObject(schema.items.properties) ? schema.items.properties : {}
     if (schema.items.type !== 'object' || !Object.keys(itemProperties).length) {
-      extras.items = structuredClone(schema.items)
+      extras.items = cloneForForm(schema.items)
     }
   }
   return extras

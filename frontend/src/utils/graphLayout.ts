@@ -77,6 +77,14 @@ export function forceLayout(data: GraphData, opts: LayoutOptions = {}): LayoutRe
     }
   })
 
+  // A large ontology is better served by the deterministic grid than by the
+  // O(n²) force/collision passes. Keeping the grid also preserves every node
+  // and edge for interaction while preventing menu navigation from blocking
+  // the main thread on hundreds of nodes.
+  if (count > 180) {
+    return { nodes, width: layoutWidth, height: layoutHeight }
+  }
+
   const byId = new Map(nodes.map((node) => [node.id, node]))
   const edges = data.edges.filter((edge) => byId.has(edge.source) && byId.has(edge.target))
   const idealEdgeLength = Math.max(170, Math.min(360, Math.sqrt((layoutWidth * layoutHeight) / count) * 0.88))

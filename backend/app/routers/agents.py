@@ -402,6 +402,82 @@ def _message_out_for_model_replay(
     return MessageOut.model_validate(message)
 
 
+def _model_history(
+    db: Session,
+    conversation_id: str,
+    agent: Agent,
+    context: agent_engine.AgentContext,
+    *,
+    excluded_message_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Re-authorize transcript data with the same context used for this turn."""
+    statement = select(Message).where(Message.conversation_id == conversation_id)
+    excluded = {str(item) for item in (excluded_message_ids or set()) if str(item)}
+    if excluded:
+        statement = statement.where(Message.id.notin_(excluded))
+    history_msgs = db.execute(
+        statement.order_by(Message.created_at, Message.id)
+    ).scalars().all()
+    history: list[dict[str, Any]] = []
+    for message in history_msgs:
+        if message.role == "user":
+            history.append({"role": "user", "content": message.content})
+            continue
+        if message.role != "assistant":
+            continue
+        safe_message = _message_out_for_model_replay(
+            db,
+            message,
+            agent,
+            context=context,
+        )
+        # Only replay raw tools when calls and results still form one fully
+        # authorized chain. A stripped message contributes at most its neutral
+        # continuity marker.
+        if safe_message.tool_calls and safe_message.tool_results:
+            calls = [
+                {
+                    "id": call.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": call.get("name", ""),
+                        "arguments": (
+                            call.get("arguments", "")
+                            if isinstance(call.get("arguments"), str)
+                            else json.dumps(call.get("arguments", {}), ensure_ascii=False)
+                        ),
+                    },
+                }
+                for call in safe_message.tool_calls
+                if call.get("id")
+            ]
+            result_map = {
+                result.get("id"): result
+                for result in safe_message.tool_results
+                if result.get("id")
+            }
+            if calls and all(call["id"] in result_map for call in calls):
+                history.append({
+                    "role": "assistant",
+                    "content": safe_message.content,
+                    "tool_calls": calls,
+                })
+                for call in calls:
+                    result = result_map[call["id"]]
+                    history.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": result["id"],
+                            "name": result.get("name", ""),
+                            "content": result.get("result", ""),
+                        }
+                    )
+                continue
+        if safe_message.content:
+            history.append({"role": "assistant", "content": safe_message.content})
+    return history
+
+
 def _out(a: Agent, db: Session) -> AgentOut:
     scenario = tenant_service.get_visible(db, BusinessScenario, a.scenario_id) if a.scenario_id else None
     llm = tenant_service.get_visible(db, LLMConfig, a.llm_config_id) if a.llm_config_id else None
@@ -800,75 +876,20 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
         db.commit()
         db.refresh(conv)
 
-    # 历史
-    history_msgs = db.execute(
-        select(Message).where(Message.conversation_id == conv.id).order_by(Message.created_at)
-    ).scalars().all()
-    history: list[dict[str, Any]] = []
-    for m in history_msgs:
-        if m.role == "user":
-            history.append({"role": "user", "content": m.content})
-        elif m.role == "assistant":
-            safe_message = _message_out_for_model_replay(
-                db,
-                m,
-                a,
-                context=history_context,
-            )
-            # Model replay is a different trust boundary from showing the
-            # creator-owned transcript. Only replay raw tool payloads that
-            # survived current authorization; never fall back to the stored
-            # (possibly stale) payloads after ``_message_out`` stripped them.
-            if safe_message.tool_calls and safe_message.tool_results:
-                calls = [
-                    {
-                        "id": call.get("id"),
-                        "type": "function",
-                        "function": {
-                            "name": call.get("name", ""),
-                            "arguments": (
-                                call.get("arguments", "")
-                                if isinstance(call.get("arguments"), str)
-                                else json.dumps(call.get("arguments", {}), ensure_ascii=False)
-                            ),
-                        },
-                    }
-                    for call in safe_message.tool_calls
-                    if call.get("id")
-                ]
-                result_map = {
-                    result.get("id"): result
-                    for result in safe_message.tool_results
-                    if result.get("id")
-                }
-                if calls and all(call["id"] in result_map for call in calls):
-                    history.append({
-                        "role": "assistant",
-                        "content": safe_message.content,
-                        "tool_calls": calls,
-                    })
-                    for call in calls:
-                        result = result_map[call["id"]]
-                        history.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": result["id"],
-                                "name": result.get("name", ""),
-                                "content": result.get("result", ""),
-                            }
-                        )
-                    continue
-            if safe_message.content:
-                history.append({"role": "assistant", "content": safe_message.content})
-
     # 场景 & 本体
     scenario = tenant_service.get_visible(db, BusinessScenario, a.scenario_id) if a.scenario_id else None
     scenario_name = scenario.name if scenario else ""
     ontology_summary = agent_engine.ontology_summary_for(scenario, db=db)
 
     # 保存用户消息
-    db.add(Message(conversation_id=conv.id, role="user", content=payload.message))
+    current_user_message = Message(
+        conversation_id=conv.id,
+        role="user",
+        content=payload.message,
+    )
+    db.add(current_user_message)
     db.commit()
+    current_user_message_id = str(current_user_message.id)
 
     conv_id = conv.id
     trace_context = {
@@ -881,6 +902,9 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
         "scenario_id": a.scenario_id or "",
         "user_id": str(db.info.get("user_id") or "") or None,
     }
+    stream_tenant_id = str(db.info.get("tenant_id") or "")
+    stream_user_id = str(db.info.get("user_id") or "")
+    stream_llm_id = str(llm.id)
     # Action tools may commit their dry-run audit row before the streaming turn
     # finishes.  Persist its parent answer first so SQLite/Postgres FK checks and
     # lineage never depend on a not-yet-created message id.
@@ -928,17 +952,60 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
         tool_calls_log: list[dict[str, Any]] = []
         tool_results_log: list[dict[str, Any]] = []
         citations_log: list[dict[str, Any]] = []
+        stream_db: Session | None = None
         try:
+            # FastAPI may close yield-based request dependencies before a
+            # StreamingResponse body is consumed. Never carry request-bound ORM
+            # objects into the SSE generator: commits above also expire them,
+            # which otherwise makes relation/property lazy loads fail as
+            # detached instances. Re-authorize and resolve the runtime using a
+            # session owned for the entire stream instead.
+            stream_db = SessionLocal()
+            stream_db.info["tenant_id"] = stream_tenant_id
+            stream_db.info["user_id"] = stream_user_id
+            stream_agent = _agent(stream_db, agent_id)
+            stream_context = _authorization_context(stream_db, stream_agent)
+            if stream_context is None:
+                raise RuntimeError("Agent 当前运行定义、发布快照或环境连接器不完整，已阻止对话")
+            stream_missing = _agent_readiness_missing(
+                stream_db,
+                stream_agent,
+                runtime_context=stream_context,
+            )
+            if stream_missing:
+                raise RuntimeError("Agent 尚未就绪，请先完成：" + "、".join(stream_missing))
+            stream_llm = tenant_service.get_visible(stream_db, LLMConfig, stream_llm_id)
+            if not stream_llm or not llm_service.supports_capability(stream_llm, "chat"):
+                raise RuntimeError("Agent 绑定的 LLM 不可用或未启用聊天能力，请重新配置")
+            if (
+                stream_context.build_tools()
+                and not llm_service.supports_capability(stream_llm, "tool")
+            ):
+                raise RuntimeError("Agent 需要工具调用，但绑定的 LLM 未启用工具能力")
+            stream_context.llm = stream_llm
+            stream_conversation = _conversation(stream_db, conv_id)
+            if stream_conversation.agent_id != stream_agent.id:
+                raise RuntimeError("对话不属于当前 Agent")
+            history = _model_history(
+                stream_db,
+                conv_id,
+                stream_agent,
+                stream_context,
+                excluded_message_ids={
+                    current_user_message_id,
+                    str(trace_context["assistant_message_id"]),
+                },
+            )
             for ev in agent_engine.run_agent(
-                db,
-                a,
-                llm,
+                stream_db,
+                stream_agent,
+                stream_llm,
                 history,
                 payload.message,
                 scenario_name,
                 ontology_summary,
                 trace_context=trace_context,
-                runtime_context=history_context,
+                runtime_context=stream_context,
             ):
                 etype = ev["type"]
                 if etype == "token":
@@ -955,7 +1022,7 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
                     # A tool result can contain a durable Action dry-run id.  Save
                     # it into the already-existing answer before the SSE event is
                     # visible so early client cancellation cannot break lineage.
-                    db.commit()
+                    stream_db.commit()
                     persist_answer(
                         assistant_content or "已完成受控工具预演，正在整理最终说明。",
                         tool_calls_log,
@@ -1001,6 +1068,8 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
                 pass
             yield f"data: {json.dumps({'type': 'error', 'data': error_data}, ensure_ascii=False)}\n\n"
         finally:
+            if stream_db is not None:
+                stream_db.close()
             if not cancelled:
                 yield "data: [DONE]\n\n"
 

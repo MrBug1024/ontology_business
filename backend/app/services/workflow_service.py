@@ -762,6 +762,180 @@ def _response_from_log(log: ActionExecutionLog, status: str | None = None) -> di
     }
 
 
+# Agent tool results have an 8,000-character transport boundary.  Leave room
+# for the Agent-owned message/definition fields that are appended after this
+# service returns, while ensuring the confirmation capability never disappears
+# behind a generic "result too large" error.
+_ACTION_PREVIEW_RESPONSE_MAX_CHARS = 6_500
+_ACTION_PREVIEW_INLINE_PARAMETERS_MAX_CHARS = 1_500
+
+
+def _json_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+
+
+def _preview_digest(value: Any) -> tuple[str, int]:
+    serialized = _json_text(value)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest(), len(serialized)
+
+
+def _compact_preview_value(value: Any, *, max_chars: int) -> Any:
+    """Keep a small JSON value intact or replace it with non-reversible metadata."""
+    serialized = _json_text(value)
+    if len(serialized) <= max_chars:
+        return value
+    return {
+        "omitted": True,
+        "sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        "serialized_chars": len(serialized),
+    }
+
+
+def _compact_action_preview_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Build a bounded plan without echoing arbitrarily large business input.
+
+    The durable ActionExecutionLog retains the validated parameters so the
+    confirmation endpoint can compare the user's explicit confirmation with
+    the exact preview.  The transport envelope only needs a compact rendering;
+    the original arguments already travel in the authenticated tool call.
+    """
+    compact: dict[str, Any] = {
+        "action_id": str(plan.get("action_id") or "")[:128],
+        "action_name": str(plan.get("action_name") or "")[:240],
+        "executor_type": str(plan.get("executor_type") or "")[:40],
+        "parameter_count": max(0, int(plan.get("parameter_count") or 0)),
+        "side_effects_skipped": True,
+    }
+    if plan.get("parameters_omitted"):
+        compact.update({
+            "parameters_omitted": True,
+            "parameter_keys": [
+                str(key)[:80]
+                for key in list(plan.get("parameter_keys") or [])[:20]
+            ],
+            "parameter_keys_truncated": bool(plan.get("parameter_keys_truncated")),
+            "parameters_sha256": str(plan.get("parameters_sha256") or "")[:64],
+            "parameters_serialized_chars": max(
+                0,
+                int(plan.get("parameters_serialized_chars") or 0),
+            ),
+        })
+    else:
+        parameters = plan.get("parameters")
+        parameter_text = _json_text(parameters)
+        if len(parameter_text) <= _ACTION_PREVIEW_INLINE_PARAMETERS_MAX_CHARS:
+            compact["parameters"] = parameters
+        else:
+            digest, size = _preview_digest(parameters)
+            keys = list(parameters) if isinstance(parameters, dict) else []
+            compact.update({
+                "parameters_omitted": True,
+                "parameter_keys": [str(key)[:80] for key in keys[:20]],
+                "parameter_keys_truncated": len(keys) > 20,
+                "parameters_sha256": digest,
+                "parameters_serialized_chars": size,
+            })
+
+    for key, limit in (
+        ("precondition", 500),
+        ("postcondition", 500),
+        ("sql_template", 500),
+        ("url", 500),
+        ("target", 240),
+        ("method", 20),
+        ("data_source_id", 128),
+        ("mcp_id", 128),
+        ("skill_id", 128),
+    ):
+        if key in plan:
+            compact[key] = str(plan.get(key) or "")[:limit]
+    for key in ("precondition_condition", "postcondition_condition"):
+        if key in plan:
+            compact[key] = _compact_preview_value(plan.get(key), max_chars=800)
+    if "artifact" in plan:
+        compact["artifact"] = _compact_preview_value(plan.get("artifact"), max_chars=1_200)
+    if "connector_audit" in plan:
+        compact["connector_audit"] = _compact_preview_value(
+            plan.get("connector_audit"),
+            max_chars=800,
+        )
+    return compact
+
+
+def _compact_permission(permission: dict[str, Any]) -> dict[str, Any]:
+    """Return only fixed-size fields needed to explain the preview decision."""
+    return {
+        "allowed": bool(permission.get("allowed")),
+        "scope": str(permission.get("scope") or "")[:40],
+        "configured_scope": str(permission.get("configured_scope") or "")[:40],
+        "requires_confirmation": bool(permission.get("requires_confirmation")),
+        "confirmed": bool(permission.get("confirmed")),
+        "reason": str(permission.get("reason") or "")[:500],
+        "role": str(permission.get("role") or "")[:80],
+    }
+
+
+def _preview_response_from_log(
+    log: ActionExecutionLog,
+    *,
+    action: Any,
+    permission: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a hard-bounded preview envelope that remains confirmable."""
+    response = _response_from_log(log, status="dry_run")
+    persisted_result = log.result if isinstance(log.result, dict) else {}
+    persisted_plan = persisted_result.get("plan")
+    plan = _compact_action_preview_plan(
+        persisted_plan if isinstance(persisted_plan, dict) else {}
+    )
+    compact_permission = _compact_permission(permission)
+    response.update({
+        "result": {"plan": plan, "permission": compact_permission},
+        "connector_audit": _compact_preview_value(
+            log.connector_audit or [],
+            max_chars=800,
+        ),
+        "permission": compact_permission,
+        "permission_decision": compact_permission,
+        "data_context": {},
+        "requires_confirmation": bool(action.requires_confirmation),
+        "idempotency_key": None,
+        "preview_compacted": bool(plan.get("parameters_omitted")),
+    })
+    if len(_json_text(response)) <= _ACTION_PREVIEW_RESPONSE_MAX_CHARS:
+        return response
+
+    # Defensive fallback for unexpectedly verbose connector/provenance data.
+    # Keep the immutable confirmation handle and definition pin, and reduce the
+    # explanatory plan to a fixed allowlist.  No caller should need to guess or
+    # repeat the Action merely because its preview rendering was large.
+    response.update({
+        "result": {
+            "plan": {
+                key: plan[key]
+                for key in (
+                    "action_id",
+                    "action_name",
+                    "executor_type",
+                    "parameter_count",
+                    "parameter_keys",
+                    "parameter_keys_truncated",
+                    "parameters_sha256",
+                    "parameters_serialized_chars",
+                    "side_effects_skipped",
+                )
+                if key in plan
+            },
+            "permission": compact_permission,
+        },
+        "connector_audit": [],
+        "permission_decision": compact_permission,
+        "data_context": {},
+        "preview_compacted": True,
+    })
+    return response
+
+
 def _find_idempotent_log(db: Session, action: Any, key: str) -> ActionExecutionLog | None:
     return db.execute(
         select(ActionExecutionLog)
@@ -867,7 +1041,13 @@ def preview_action(
         input_params=normalized,
         status="dry_run",
         mode="dry_run",
-        result={"plan": plan, "permission": permission},
+        # input_params is the one authoritative, access-controlled copy used
+        # by confirmation equality checks.  Avoid retaining a second unbounded
+        # copy inside the broadly rendered result plan.
+        result={
+            "plan": _compact_action_preview_plan(plan),
+            "permission": _compact_permission(permission),
+        },
         connector_audit=plan.get("connector_audit", []),
         **_decision_chain_context(db, permission),
         **provenance,
@@ -876,13 +1056,10 @@ def preview_action(
     db.add(log)
     db.commit()
     db.refresh(log)
-    response = _response_from_log(log, status="dry_run")
-    response.update(
-        {
-            "requires_confirmation": bool(action.requires_confirmation),
-            "permission": permission,
-            "idempotency_key": None,
-        }
+    response = _preview_response_from_log(
+        log,
+        action=action,
+        permission=permission,
     )
     return response
 
