@@ -5,18 +5,21 @@ from collections.abc import Generator
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import uuid
 
 from fastapi import Request
 from sqlalchemy import Index, MetaData, Table, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-from .config import get_settings
+from .config import ensure_runtime_directories, get_settings
 
 
 class Base(DeclarativeBase):
     pass
 
+
+logger = logging.getLogger(__name__)
 
 _settings = get_settings()
 connect_args = {"check_same_thread": False} if _settings.database_url.startswith("sqlite") else {}
@@ -129,16 +132,12 @@ def _migrate_data_sources_nullable_scenario() -> None:
 
 
 def _migrate_workflows_dag() -> None:
-    """SQLite 的 create_all 不会给已有表加列：为 ontology_workflows 补 nodes/edges 列。"""
-    if not _settings.database_url.startswith("sqlite"):
-        return
+    """为既有工作流补 nodes/edges 列。"""
     with engine.begin() as conn:
-        cols = [
-            r[1]
-            for r in conn.exec_driver_sql("PRAGMA table_info('ontology_workflows')").fetchall()
-        ]
-        if not cols:
+        inspector = inspect(conn)
+        if not inspector.has_table("ontology_workflows"):
             return
+        cols = {column["name"] for column in inspector.get_columns("ontology_workflows")}
         if "nodes" not in cols:
             conn.exec_driver_sql("ALTER TABLE ontology_workflows ADD COLUMN nodes JSON DEFAULT '[]'")
         if "edges" not in cols:
@@ -147,13 +146,11 @@ def _migrate_workflows_dag() -> None:
 
 def _migrate_data_mapping_status() -> None:
     """为已有数据映射补充检查、刷新和错误状态字段。"""
-    if not _settings.database_url.startswith("sqlite"):
-        return
     with engine.begin() as conn:
-        existing = {
-            row[1]
-            for row in conn.exec_driver_sql("PRAGMA table_info('data_mappings')").fetchall()
-        }
+        inspector = inspect(conn)
+        if not inspector.has_table("data_mappings"):
+            return
+        existing = {column["name"] for column in inspector.get_columns("data_mappings")}
         if not existing:
             return
         columns = {
@@ -161,8 +158,8 @@ def _migrate_data_mapping_status() -> None:
             "data_source_binding_ref": "JSON DEFAULT '{}'",
             "status": "VARCHAR(20) DEFAULT 'unknown'",
             "last_error": "TEXT DEFAULT ''",
-            "last_checked_at": "DATETIME",
-            "last_refreshed_at": "DATETIME",
+            "last_checked_at": "TIMESTAMP",
+            "last_refreshed_at": "TIMESTAMP",
             "last_row_count": "INTEGER DEFAULT 0",
             "last_imported_count": "INTEGER DEFAULT 0",
             "environment_status": "JSON DEFAULT '{}'",
@@ -298,13 +295,13 @@ def _migrate_mapping_refresh_provenance() -> None:
 
 def _migrate_action_safety() -> None:
     """为已有 Action 和执行日志补充确认、幂等和执行模式字段。"""
-    if not _settings.database_url.startswith("sqlite"):
-        return
     with engine.begin() as conn:
-        action_columns = {
-            row[1]
-            for row in conn.exec_driver_sql("PRAGMA table_info('ontology_actions')").fetchall()
-        }
+        inspector = inspect(conn)
+        action_columns = (
+            {column["name"] for column in inspector.get_columns("ontology_actions")}
+            if inspector.has_table("ontology_actions")
+            else set()
+        )
         if action_columns:
             for name, definition in {
                 "requires_confirmation": "BOOLEAN DEFAULT 1",
@@ -316,10 +313,11 @@ def _migrate_action_safety() -> None:
                         f"ALTER TABLE ontology_actions ADD COLUMN {name} {definition}"
                     )
 
-        log_columns = {
-            row[1]
-            for row in conn.exec_driver_sql("PRAGMA table_info('action_execution_logs')").fetchall()
-        }
+        log_columns = (
+            {column["name"] for column in inspector.get_columns("action_execution_logs")}
+            if inspector.has_table("action_execution_logs")
+            else set()
+        )
         if log_columns:
             for name, definition in {
                 "mode": "VARCHAR(20) DEFAULT 'execute'",
@@ -334,25 +332,40 @@ def _migrate_action_safety() -> None:
                 "UPDATE action_execution_logs SET connector_audit = '[]' "
                 "WHERE connector_audit IS NULL"
             )
-            conn.exec_driver_sql(
-                "CREATE INDEX IF NOT EXISTS ix_action_execution_logs_idempotency_key "
-                "ON action_execution_logs (idempotency_key)"
-            )
-            conn.exec_driver_sql(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_action_execution_logs_idempotency "
-                "ON action_execution_logs (scenario_id, target_type, target_id, idempotency_key)"
-            )
+            existing_indexes = {
+                index["name"] for index in inspect(conn).get_indexes("action_execution_logs")
+            }
+            if "ix_action_execution_logs_idempotency_key" not in existing_indexes:
+                try:
+                    conn.exec_driver_sql(
+                        "CREATE INDEX ix_action_execution_logs_idempotency_key "
+                        "ON action_execution_logs (idempotency_key)"
+                    )
+                except Exception:  # noqa: BLE001 - tolerate startup races.
+                    pass
+            unique_names = {
+                constraint["name"]
+                for constraint in inspect(conn).get_unique_constraints("action_execution_logs")
+            } | existing_indexes
+            if "uq_action_execution_logs_idempotency" not in unique_names:
+                try:
+                    conn.exec_driver_sql(
+                        "CREATE UNIQUE INDEX uq_action_execution_logs_idempotency "
+                        "ON action_execution_logs (scenario_id, target_type, target_id, idempotency_key)"
+                    )
+                except Exception:  # noqa: BLE001 - preserve legacy duplicate audit rows.
+                    logger.warning(
+                        "action_execution_logs 存在历史幂等键冲突，保留原记录并跳过唯一索引"
+                    )
 
 
 def _migrate_workflow_lifecycle() -> None:
     """为已有工作流补充草稿/启用/停用生命周期状态。"""
-    if not _settings.database_url.startswith("sqlite"):
-        return
     with engine.begin() as conn:
-        existing = {
-            row[1]
-            for row in conn.exec_driver_sql("PRAGMA table_info('ontology_workflows')").fetchall()
-        }
+        inspector = inspect(conn)
+        if not inspector.has_table("ontology_workflows"):
+            return
+        existing = {column["name"] for column in inspector.get_columns("ontology_workflows")}
         if not existing or "status" in existing:
             return
         # 旧版本只有 enabled 字段，迁移为可执行的 active，避免升级后已有流程突然无法运行。
@@ -363,8 +376,6 @@ def _migrate_workflow_lifecycle() -> None:
 
 def _migrate_tenancy() -> None:
     """为已有平台表补充租户列；旧数据在首个用户注册时认领。"""
-    if not _settings.database_url.startswith("sqlite"):
-        return
     columns_by_table = {
         "business_scenarios": {
             "tenant_id": "VARCHAR(32)",
@@ -391,13 +402,11 @@ def _migrate_tenancy() -> None:
         },
     }
     with engine.begin() as conn:
+        inspector = inspect(conn)
         for table, columns in columns_by_table.items():
-            existing = {
-                row[1]
-                for row in conn.exec_driver_sql(f"PRAGMA table_info('{table}')").fetchall()
-            }
-            if not existing:
+            if not inspector.has_table(table):
                 continue
+            existing = {column["name"] for column in inspector.get_columns(table)}
             for name, definition in columns.items():
                 if name not in existing:
                     conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
@@ -405,40 +414,45 @@ def _migrate_tenancy() -> None:
 
 def _migrate_assistant_scopes() -> None:
     """为已有助手会话补充上下文范围；旧消息可用最近一条消息的路径回填。"""
-    if not _settings.database_url.startswith("sqlite"):
-        return
     with engine.begin() as conn:
-        existing = {
-            row[1]
-            for row in conn.exec_driver_sql("PRAGMA table_info('assistant_threads')").fetchall()
-        }
-        if not existing:
+        inspector = inspect(conn)
+        if not inspector.has_table("assistant_threads"):
             return
+        existing = {column["name"] for column in inspector.get_columns("assistant_threads")}
         if "scope_key" not in existing:
             conn.exec_driver_sql("ALTER TABLE assistant_threads ADD COLUMN scope_key VARCHAR(700) DEFAULT 'global'")
-        # 仅回填旧版本的 global 值；新会话会在创建时写入准确范围。
-        conn.exec_driver_sql(
-            """
-            UPDATE assistant_threads
-            SET scope_key = CASE
-                WHEN scenario_id IS NOT NULL THEN 'scenario:' || scenario_id || '|path:' || COALESCE(
-                    (SELECT json_extract(m.context, '$.path')
-                     FROM assistant_messages m
-                     WHERE m.thread_id = assistant_threads.id
-                     ORDER BY m.created_at DESC LIMIT 1), '/')
-                ELSE 'global|path:' || COALESCE(
-                    (SELECT json_extract(m.context, '$.path')
-                     FROM assistant_messages m
-                     WHERE m.thread_id = assistant_threads.id
-                     ORDER BY m.created_at DESC LIMIT 1), '/')
-            END
-            WHERE scope_key IS NULL OR scope_key = 'global'
-            """
-        )
-        message_columns = {
-            row[1]
-            for row in conn.exec_driver_sql("PRAGMA table_info('assistant_messages')").fetchall()
-        }
+        if conn.dialect.name == "sqlite":
+            # 仅在 SQLite 上使用 json_extract 回填旧版本的 global 值；新会话会在
+            # 创建时写入准确范围。其他数据库在这里保留安全的 global 默认值。
+            conn.exec_driver_sql(
+                """
+                UPDATE assistant_threads
+                SET scope_key = CASE
+                    WHEN scenario_id IS NOT NULL THEN 'scenario:' || scenario_id || '|path:' || COALESCE(
+                        (SELECT json_extract(m.context, '$.path')
+                         FROM assistant_messages m
+                         WHERE m.thread_id = assistant_threads.id
+                         ORDER BY m.created_at DESC LIMIT 1), '/')
+                    ELSE 'global|path:' || COALESCE(
+                        (SELECT json_extract(m.context, '$.path')
+                         FROM assistant_messages m
+                         WHERE m.thread_id = assistant_threads.id
+                         ORDER BY m.created_at DESC LIMIT 1), '/')
+                END
+                WHERE scope_key IS NULL OR scope_key = 'global'
+                """
+            )
+        else:
+            conn.exec_driver_sql(
+                "UPDATE assistant_threads SET scope_key = 'global' "
+                "WHERE scope_key IS NULL OR scope_key = ''"
+            )
+        if inspector.has_table("assistant_messages"):
+            message_columns = {
+                column["name"] for column in inspector.get_columns("assistant_messages")
+            }
+        else:
+            message_columns = set()
         if message_columns and "thinking" not in message_columns:
             conn.exec_driver_sql("ALTER TABLE assistant_messages ADD COLUMN thinking JSON DEFAULT '[]'")
 
@@ -1276,22 +1290,16 @@ def _migrate_ontology_runtime_metadata() -> None:
                 "id", "relation_id", "source_instance_id", "target_instance_id"
             }
             if edge_columns.issubset(relation_columns):
-                rows = conn.execute(
+                duplicate_count = conn.execute(
                     text(
-                        "SELECT id, relation_id, source_instance_id, target_instance_id "
-                        "FROM relation_instances ORDER BY id"
+                        "SELECT COUNT(*) FROM ("
+                        "SELECT relation_id, source_instance_id, target_instance_id "
+                        "FROM relation_instances "
+                        "GROUP BY relation_id, source_instance_id, target_instance_id "
+                        "HAVING COUNT(*) > 1"
+                        ")"
                     )
-                ).all()
-                seen_edges: set[tuple[str, str, str]] = set()
-                for row in rows:
-                    edge = (str(row[1]), str(row[2]), str(row[3]))
-                    if edge in seen_edges:
-                        conn.execute(
-                            text("DELETE FROM relation_instances WHERE id = :id"),
-                            {"id": row[0]},
-                        )
-                    else:
-                        seen_edges.add(edge)
+                ).scalar_one()
                 unique_names = {
                     item.get("name")
                     for item in refreshed.get_unique_constraints("relation_instances")
@@ -1299,7 +1307,16 @@ def _migrate_ontology_runtime_metadata() -> None:
                 index_names = {
                     item.get("name") for item in refreshed.get_indexes("relation_instances")
                 }
-                if "uq_relation_instances_edge" not in unique_names | index_names:
+                if duplicate_count:
+                    # Never delete historical edges during an automatic boot.
+                    # The unique guard can be added after an operator resolves
+                    # the pre-existing ambiguity deliberately.
+                    logger.warning(
+                        "relation_instances 存在 %s 组重复边，保留全部记录并跳过唯一索引；"
+                        "请人工处理后重新启动",
+                        duplicate_count,
+                    )
+                elif "uq_relation_instances_edge" not in unique_names | index_names:
                     # Concurrency correctness depends on this database guard.
                     # A failed DDL must stop startup instead of silently
                     # downgrading relation-instance idempotency to best effort.
@@ -1333,12 +1350,13 @@ def _migrate_assistant_attachment_lifecycle() -> None:
             {"expiry": expiry},
         )
         if inspector.has_table("assistant_threads"):
-            # SQLite cannot add an FK with ALTER TABLE.  Delete unowned orphan
-            # context and install equivalent fail-closed/cascade triggers for
-            # upgraded databases.  Fresh databases already have the real FK;
-            # the idempotent triggers are harmless there.
+            # SQLite cannot add an FK with ALTER TABLE.  Preserve unowned
+            # legacy context by detaching it from the missing thread, then
+            # install equivalent fail-closed/cascade triggers for upgraded
+            # databases.  Fresh databases already have the real FK; the
+            # idempotent triggers are harmless there.
             conn.exec_driver_sql(
-                "DELETE FROM assistant_attachments "
+                "UPDATE assistant_attachments SET thread_id = NULL "
                 "WHERE thread_id IS NOT NULL AND NOT EXISTS ("
                 "SELECT 1 FROM assistant_threads WHERE assistant_threads.id = assistant_attachments.thread_id"
                 ")"
@@ -2055,6 +2073,15 @@ def init_db() -> None:
     # ``models.py`` to keep browser and API-key auth boundaries explicit.
     from . import external_api_models, models  # noqa: F401
 
+    ensure_runtime_directories(_settings)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001 - keep DSNs and credentials out of errors.
+        raise RuntimeError(
+            "平台数据库连接失败，请检查 DATABASE_URL、数据库服务和账号权限"
+        ) from exc
+
     Base.metadata.create_all(bind=engine)
     _migrate_ontology_api_names()
     _migrate_ontology_entity_lifecycle()
@@ -2092,3 +2119,46 @@ def init_db() -> None:
     _migrate_external_api_key_audit()
     _migrate_artifact_template_catalog()
     _repair_nullable_orphan_references()
+    _verify_schema()
+
+
+def _verify_schema() -> None:
+    """Fail startup if the installed schema is still incomplete.
+
+    ``create_all`` adds missing tables but intentionally does not alter an
+    existing table.  The explicit column check catches interrupted or
+    manually-created deployments before requests can reach a partial schema.
+    It only reads schema metadata and never changes application data.
+    """
+    with engine.connect() as conn:
+        inspector = inspect(conn)
+        missing_tables: list[str] = []
+        missing_columns: dict[str, list[str]] = {}
+        for table_name, table in Base.metadata.tables.items():
+            if not inspector.has_table(table_name):
+                missing_tables.append(table_name)
+                continue
+            installed_columns = {
+                column["name"] for column in inspector.get_columns(table_name)
+            }
+            missing = sorted(
+                column.name
+                for column in table.columns
+                if column.name not in installed_columns
+            )
+            if missing:
+                missing_columns[table_name] = missing
+
+        if missing_tables or missing_columns:
+            details = []
+            if missing_tables:
+                details.append(f"缺少表: {', '.join(sorted(missing_tables))}")
+            if missing_columns:
+                details.extend(
+                    f"{table}: {', '.join(columns)}"
+                    for table, columns in sorted(missing_columns.items())
+                )
+            raise RuntimeError(
+                "平台数据库结构不完整，启动已停止，请检查迁移执行结果："
+                + "; ".join(details)
+            )

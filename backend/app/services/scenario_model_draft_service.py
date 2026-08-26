@@ -1376,6 +1376,37 @@ def has_active_working_drafts(db: Session, scenario: BusinessScenario) -> bool:
     ).first() is not None
 
 
+def active_working_draft_scopes(
+    db: Session,
+    scenario: BusinessScenario,
+) -> list[str]:
+    """Return semantic scopes that have an owned active draft lineage."""
+    tenant_id = str(scenario.tenant_id or db.info.get("tenant_id") or "")
+    user_id = str(db.info.get("user_id") or "")
+    if not user_id:
+        return []
+    kinds = set(db.scalars(
+        select(ScenarioModelDraftResource.resource_kind).where(
+            ScenarioModelDraftResource.tenant_id == tenant_id,
+            ScenarioModelDraftResource.scenario_id == scenario.id,
+            ScenarioModelDraftResource.created_by_user_id == user_id,
+            ScenarioModelDraftResource.draft_status.in_(OPEN_DRAFT_STATUSES),
+        ).distinct()
+    ).all())
+    if not kinds:
+        return []
+    scopes = {"scenario_model"}
+    if kinds & {"entity", "property", "relation", "instance"}:
+        scopes.add("ontology")
+    if kinds & {"mapping", "conceptual_mapping", "relation_mapping"}:
+        scopes.add("mapping")
+    if kinds & {"function", "action", "rule", "event"}:
+        scopes.add("capabilities")
+    if "workflow" in kinds:
+        scopes.add("workflow")
+    return sorted(scopes)
+
+
 def _generated_keys(value: Any) -> set[str]:
     result: set[str] = set()
     if isinstance(value, dict):

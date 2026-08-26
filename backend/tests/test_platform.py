@@ -12,6 +12,10 @@ from app.models import DataSource, OntologyEntity
 from app.schemas import AssistantProposalApplyRequest, ObjectProvenanceOut, ObjectSearchItemOut, ObjectSearchOut, WorkflowIn
 from app.services.policies import PolicyViolation, validate_action_params, validate_read_only_sql, validate_workflow_graph
 from app.services.auth_service import hash_password, verify_password
+from app.services.assistant_orchestrator import (
+    AssistantSemanticDecision,
+    route_assistant_decision,
+)
 from app.services.ontology_service import _quoted_mapping_table, preview_mapping
 from app.services.workflow_service import (
     WORKFLOW_CONTEXT_MAX_CHARS,
@@ -24,7 +28,6 @@ from app.services.workflow_service import (
 from app.routers.assistant import (
     _build_proposal,
     _context_scope,
-    _intent,
     _scenario_snapshot,
     _snapshot_matches,
     _sse,
@@ -148,53 +151,114 @@ class AuthPolicyTests(unittest.TestCase):
 
 
 class AssistantIntentTests(unittest.TestCase):
-    def test_routes_business_requests_to_safe_draft_intents(self) -> None:
-        self.assertEqual(_intent("请根据资料建立供应商实体和关系", "ask"), "ontology")
-        self.assertEqual(_intent("把异常处理编排成审批工作流", "ask"), "workflow")
+    @staticmethod
+    def decision(goal: str, scope: str, confidence: str = "high") -> AssistantSemanticDecision:
+        return AssistantSemanticDecision(
+            goal=goal,
+            scope=scope,
+            confidence=confidence,
+            reason="测试语义决策",
+        )
+
+    def test_questions_remain_answers_even_with_a_draft_scope_hint(self) -> None:
+        plan = route_assistant_decision(
+            self.decision("answer", "workflow"),
+            mode="draft",
+            preferred_scope="workflow",
+        )
+        self.assertEqual(plan.intent, "chat")
+
+    def test_high_confidence_creation_routes_to_the_selected_draft_branch(self) -> None:
         self.assertEqual(
-            _intent("请按文档完成本体建模，文档中还包含规则、事件和工作流", "ask"),
+            route_assistant_decision(self.decision("create", "workflow")).intent,
+            "workflow",
+        )
+        self.assertEqual(
+            route_assistant_decision(self.decision("create", "capabilities")).intent,
             "scenario_model",
         )
+
+    def test_explicit_draft_scope_conflicts_fail_closed(self) -> None:
+        conflict = route_assistant_decision(
+            self.decision("create", "ontology"),
+            mode="draft",
+            preferred_scope="workflow",
+        )
+        self.assertEqual(conflict.intent, "chat")
+        self.assertIn("范围不一致", conflict.policy_note)
+        matching = route_assistant_decision(
+            self.decision("create", "workflow"),
+            mode="draft",
+            preferred_scope="workflow",
+        )
+        self.assertEqual(matching.intent, "workflow")
+
+    def test_uncertain_mutations_fail_closed_to_read_only_chat(self) -> None:
+        plan = route_assistant_decision(
+            self.decision("create", "ontology", confidence="medium")
+        )
+        self.assertEqual(plan.intent, "chat")
+        self.assertIn("置信度不足", plan.policy_note)
+
+    def test_existing_definition_changes_use_governed_guidance(self) -> None:
         self.assertEqual(
-            _intent("根据附件完成对象、关系、映射、函数、操作、规则、事件和工作流", "ask"),
+            route_assistant_decision(self.decision("delete", "workflow")).intent,
+            "change_guidance",
+        )
+        self.assertEqual(
+            route_assistant_decision(
+                self.decision("update", "scenario_model"),
+                has_active_model_drafts=True,
+            ).intent,
+            "change_guidance",
+        )
+        self.assertEqual(
+            route_assistant_decision(
+                self.decision("continue_work", "scenario_model"),
+                has_active_model_drafts=True,
+            ).intent,
             "scenario_model",
         )
-        self.assertEqual(_intent("请创建合同到期提醒规则", "ask"), "scenario_model")
-        self.assertEqual(_intent("请完成当前场景的完整建模", "ask"), "scenario_model")
-        self.assertEqual(_intent("请开展当前场景建模", "ask"), "scenario_model")
-        self.assertEqual(_intent("基于已有本体编排审批工作流", "ask"), "workflow")
-        self.assertEqual(_intent("场景建模是什么", "ask"), "chat")
-        self.assertEqual(_intent("如何创建合同到期提醒规则", "ask"), "chat")
+        unrelated_continuation = route_assistant_decision(
+            self.decision("continue_work", "general"),
+            has_active_model_drafts=True,
+            active_draft_scopes=["scenario_model", "workflow"],
+        )
+        self.assertEqual(unrelated_continuation.intent, "chat")
+
+    def test_read_only_mode_is_a_safety_ceiling_not_a_keyword_route(self) -> None:
+        plan = route_assistant_decision(
+            self.decision("create", "scenario_model"),
+            mode="explain",
+        )
+        self.assertEqual(plan.intent, "explain")
+
+    def test_preview_and_apply_goals_keep_existing_governance_boundaries(self) -> None:
         self.assertEqual(
-            _intent("更新现有合同到期提醒规则", "ask"),
-            "capability_update_guidance",
+            route_assistant_decision(self.decision("preview_action", "capabilities")).intent,
+            "execute_guidance",
         )
         self.assertEqual(
-            _intent("更新现有合同到期提醒规则", "draft", "scenario_model"),
-            "capability_update_guidance",
+            route_assistant_decision(self.decision("apply_change", "scenario_model")).intent,
+            "apply_guidance",
+        )
+
+    def test_apply_and_execute_modes_still_answer_real_questions(self) -> None:
+        question = self.decision("answer", "workflow")
+        self.assertEqual(
+            route_assistant_decision(question, mode="apply").intent,
+            "chat",
         )
         self.assertEqual(
-            _intent("更新合同规则并创建合同到期事件", "ask"),
-            "capability_update_guidance",
+            route_assistant_decision(question, mode="execute").intent,
+            "chat",
         )
-        self.assertEqual(
-            _intent("根据更新后的文档创建合同到期规则", "ask"),
-            "scenario_model",
+        blocked_creation = route_assistant_decision(
+            self.decision("create", "workflow"),
+            mode="execute",
         )
-        self.assertEqual(
-            _intent("请设计订单规则，收到订单事件后更新库存", "draft", "scenario_model"),
-            "scenario_model",
-        )
-        self.assertEqual(
-            _intent("请创建合同事件并更新现有提醒规则", "draft", "scenario_model"),
-            "capability_update_guidance",
-        )
-        self.assertEqual(_intent("完成这个操作", "ask"), "chat")
-        self.assertEqual(_intent("帮我看看当前页面", "ask"), "chat")
-        self.assertEqual(_intent("继续分析", "draft"), "ontology")
-        self.assertEqual(_intent("帮我创建场景", "explain"), "explain")
-        self.assertEqual(_intent("立即应用这份草稿", "apply"), "apply_guidance")
-        self.assertEqual(_intent("执行这个工作流", "execute"), "execute_guidance")
+        self.assertEqual(blocked_creation.intent, "chat")
+        self.assertIn("不会创建", blocked_creation.policy_note)
 
     def test_workflow_context_is_complete_or_explicitly_rejected(self) -> None:
         document = "建筑业务规则" * 500

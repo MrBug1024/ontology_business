@@ -22,6 +22,7 @@ from app.models import (
     AssistantAttachment,
     AssistantCompilationJob,
     AssistantMessage,
+    AssistantRouteDecision,
     AssistantThread,
     BusinessScenario,
     Conversation,
@@ -34,12 +35,14 @@ from app.models import (
     OntologyEntity,
     OntologyInstance,
     OntologyProperty,
+    OntologyWorkflow,
     Tenant,
     User,
 )
 from app.routers import agents, assistant, scenarios
 from app.schemas import ActionExecuteRequest, AssistantChatRequest, AssistantProposalApplyRequest, ChatRequest
 from app.services import (
+    assistant_orchestrator,
     datasource_service,
     operations_service,
     permission_service,
@@ -673,6 +676,28 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             for item in final["tasks"]
         ))
 
+    def test_all_empty_model_tasks_finish_without_claiming_any_write(self) -> None:
+        result = assistant._refresh_model_task_states({
+            "tasks": [
+                self._model_task(task_id, order, change_count=0)
+                for order, task_id in enumerate(
+                    ("ontology", "instances", "mapping", "capabilities", "rules", "workflows"),
+                    start=1,
+                )
+            ],
+            "unresolved": [],
+        })
+
+        summary = result["execution_summary"]
+        self.assertTrue(summary["final"])
+        self.assertEqual(result["execution_status"], "completed_no_changes")
+        self.assertEqual(summary["status"], "completed_no_changes")
+        self.assertEqual(summary["applied_task_count"], 0)
+        self.assertEqual(summary["partially_applied_task_count"], 0)
+        self.assertEqual(summary["empty_task_count"], 6)
+        self.assertIn("没有正式定义写入当前场景", summary["message"])
+        self.assertNotIn("已应用", summary["message"])
+
     def test_mapping_deferred_issues_are_grouped_by_reported_root_cause(self) -> None:
         issues = [
             {
@@ -912,7 +937,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 saved.proposal["payload"]["execution_status"],
                 "completed_with_gaps",
             )
-            self.assertEqual(saved.context["status"], "success")
+            self.assertEqual(saved.context["status"], "no_changes")
 
     def test_complete_looking_deadlock_is_lazily_repaired_to_one_current_task(self) -> None:
         scenario = BusinessScenario(
@@ -1135,8 +1160,9 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         saved = self.db.get(AssistantMessage, message.id)
         self.assertEqual(saved.proposal["status"], "completed_with_gaps")
         self.assertEqual(saved.proposal["payload"]["current_task_id"], "")
-        self.assertEqual(saved.context["status"], "success")
-        self.assertIn("全部 6 项任务均已完成本轮确认", saved.content)
+        self.assertEqual(saved.context["status"], "no_changes")
+        self.assertIn("全部 6 项任务均已推进", saved.content)
+        self.assertIn("没有正式定义写入当前场景", saved.content)
         self.assertIn("可继续优化的草稿", saved.content)
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(OntologyEntity)),
@@ -1243,7 +1269,8 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.assertEqual(saved.proposal["payload"]["execution_status"], "completed")
         self.assertTrue(saved.proposal["payload"]["execution_summary"]["final"])
         self.assertEqual(saved.proposal["status"], "applied")
-        self.assertIn("全部 6 项任务均已完成", saved.content)
+        self.assertIn("全部 6 项任务均已推进", saved.content)
+        self.assertIn("1 项任务的正式定义已写入当前场景", saved.content)
         self.assertEqual(
             next(item for item in saved.proposal["payload"]["tasks"] if item["id"] == "ontology")["status"],
             "applied",
@@ -1643,6 +1670,60 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 self.db,
             )
 
+    def test_invalid_workflow_reference_returns_422_and_writes_nothing(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="无正式操作场景",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        proposal = assistant._build_proposal(
+            "workflow",
+            {
+                "name": "包含虚构操作的流程",
+                "nodes": [
+                    {"id": "start", "type": "start", "name": "开始", "data": {}},
+                    {
+                        "id": "n1",
+                        "type": "action",
+                        "name": "初始化测试数据",
+                        "data": {"action_id": "test_init", "params": {}},
+                    },
+                    {"id": "end", "type": "end", "name": "结束", "data": {}},
+                ],
+                "edges": [
+                    {"source": "start", "target": "n1"},
+                    {"source": "n1", "target": "end"},
+                ],
+            },
+            scenario,
+        )
+        thread, _message = self._proposal_message(
+            kind="workflow",
+            proposal=proposal,
+            scenario=scenario,
+        )
+
+        with self.assertRaises(HTTPException) as rejected:
+            assistant.apply_proposal(
+                AssistantProposalApplyRequest(
+                    kind="workflow",
+                    scenario_id=scenario.id,
+                    thread_id=thread.id,
+                    proposal_id=proposal["proposal_id"],
+                    confirm=True,
+                ),
+                self.db,
+            )
+
+        self.assertEqual(rejected.exception.status_code, 422)
+        self.assertIn("没有可引用的正式操作", str(rejected.exception.detail))
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyWorkflow)),
+            0,
+        )
+
     def test_explain_mode_overrides_draft_keywords_and_remains_read_only(self) -> None:
         reply = assistant.chat(
             AssistantChatRequest(
@@ -1799,6 +1880,16 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         user_id = self.user.id
         factory = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
         observed: dict[str, object] = {}
+        route_plan = assistant_orchestrator.AssistantRoutePlan(
+            intent="scenario_model",
+            decision=assistant_orchestrator.AssistantSemanticDecision(
+                goal="create",
+                scope="scenario_model",
+                confidence="high",
+                reason="用户明确要求编译完整业务模型",
+            ),
+            source="model",
+        )
 
         def fake_compile(db, streamed_scenario, **_kwargs):
             # This relationship was not touched by _scenario_context.  It can
@@ -1835,6 +1926,11 @@ class AssistantGovernedProposalTests(unittest.TestCase):
 
         with (
             patch.object(assistant, "SessionLocal", factory),
+            patch.object(
+                assistant,
+                "_request_route_plan",
+                return_value=route_plan,
+            ),
             patch.object(
                 assistant.scenario_model_compiler,
                 "compile_scenario_model",
@@ -1882,6 +1978,263 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.assertEqual(observed["functions"], ["计算风险分"])
         self.assertEqual(observed["tenant_id"], tenant_id)
         self.assertEqual(observed["user_id"], user_id)
+
+    def test_workflow_count_question_never_generates_a_workflow_proposal(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="薪莫愁",
+            status="active",
+        )
+        llm = LLMConfig(
+            tenant_id=self.tenant.id,
+            name="语义路由测试模型",
+            provider="openai",
+            model="test-model",
+            api_key="test-key",
+            capabilities=["chat", "tool"],
+            enabled=True,
+            is_default=True,
+        )
+        self.db.add_all([scenario, llm])
+        self.db.commit()
+        decision = assistant_orchestrator.AssistantSemanticDecision(
+            goal="answer",
+            scope="workflow",
+            confidence="high",
+            reason="用户正在询问已有工作流数量",
+        )
+
+        with (
+            patch.object(
+                assistant.llm_service,
+                "structured_chat",
+                return_value=decision,
+            ) as classify,
+            patch.object(
+                assistant.llm_service,
+                "chat",
+                return_value={"content": "当前业务场景有 0 个正式工作流。"},
+            ) as answer,
+            patch.object(
+                assistant.workflow_service,
+                "generate_workflow",
+            ) as generate_workflow,
+        ):
+            reply = assistant.chat(
+                AssistantChatRequest(
+                    message="当前业务场景有多少个工作流？",
+                    request_id="workflow-count-question",
+                    scenario_id=scenario.id,
+                    path=f"/scenarios/{scenario.id}",
+                    mode="draft",
+                    draft_kind="workflow",
+                ),
+                self.db,
+            )
+            replay = assistant.chat(
+                AssistantChatRequest(
+                    message="当前业务场景有多少个工作流？",
+                    request_id="workflow-count-question",
+                    thread_id=reply.thread_id,
+                    scenario_id=scenario.id,
+                    path=f"/scenarios/{scenario.id}",
+                    mode="draft",
+                    draft_kind="workflow",
+                ),
+                self.db,
+            )
+
+        self.assertEqual(reply.reply, "当前业务场景有 0 个正式工作流。")
+        self.assertEqual(replay.reply, reply.reply)
+        self.assertEqual(replay.thread_id, reply.thread_id)
+        self.assertEqual(reply.proposal, {})
+        classify.assert_called_once()
+        self.assertEqual(answer.call_count, 2)
+        generate_workflow.assert_not_called()
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(AssistantRouteDecision)),
+            1,
+        )
+        with self.assertRaises(HTTPException) as conflict:
+            assistant.chat(
+                AssistantChatRequest(
+                    message="请创建一个工作流",
+                    request_id="workflow-count-question",
+                    thread_id=reply.thread_id,
+                    scenario_id=scenario.id,
+                    path=f"/scenarios/{scenario.id}",
+                    mode="draft",
+                    draft_kind="workflow",
+                ),
+                self.db,
+            )
+        self.assertEqual(conflict.exception.status_code, 409)
+        saved_users = self.db.execute(
+            select(AssistantMessage)
+            .where(
+                AssistantMessage.thread_id == reply.thread_id,
+                AssistantMessage.role == "user",
+            )
+        ).scalars().all()
+        self.assertEqual(len(saved_users), 2)
+        self.assertTrue(all(
+            saved_user.context["routing"]["intent"] == "chat"
+            and saved_user.context["routing"]["goal"] == "answer"
+            for saved_user in saved_users
+        ))
+
+    def test_route_failure_stops_before_sync_chat_or_model_generation(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="薪莫愁",
+            status="active",
+        )
+        llm = LLMConfig(
+            tenant_id=self.tenant.id,
+            name="失败语义路由模型",
+            provider="openai",
+            model="test-model",
+            api_key="test-key",
+            capabilities=["chat", "tool"],
+            enabled=True,
+            is_default=True,
+        )
+        self.db.add_all([scenario, llm])
+        self.db.commit()
+
+        with (
+            patch.object(
+                assistant.llm_service,
+                "structured_chat",
+                side_effect=TimeoutError("route timeout"),
+            ),
+            patch.object(assistant.llm_service, "chat") as ordinary_chat,
+            patch.object(assistant.scenario_model_compiler, "compile_scenario_model") as compile_model,
+        ):
+            reply = assistant.chat(
+                AssistantChatRequest(
+                    message="请根据附件完成整个业务场景建模，做好后让我确认应用",
+                    request_id="route-failure-sync",
+                    scenario_id=scenario.id,
+                    path=f"/scenarios/{scenario.id}",
+                    mode="ask",
+                ),
+                self.db,
+            )
+
+        ordinary_chat.assert_not_called()
+        compile_model.assert_not_called()
+        self.assertEqual(reply.proposal, {})
+        self.assertIn("语义规划没有完成", reply.reply)
+        self.assertIn("没有生成、应用或保存任何变更", reply.reply)
+        saved = self.db.execute(
+            select(AssistantMessage)
+            .where(
+                AssistantMessage.thread_id == reply.thread_id,
+                AssistantMessage.role == "assistant",
+            )
+            .order_by(AssistantMessage.created_at.desc())
+        ).scalars().first()
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved.proposal, {})
+        self.assertEqual(saved.context["status"], "route_fallback")
+        self.assertEqual(saved.context["routing"]["source"], "model_fallback")
+
+    def test_historic_route_fallback_content_is_serialized_from_route_evidence(self) -> None:
+        thread = AssistantThread(
+            tenant_id=self.tenant.id,
+            created_by_user_id=self.user.id,
+            scope_key="scenario:global|path:/scenarios",
+            title="历史路由失败",
+        )
+        self.db.add(thread)
+        self.db.flush()
+        raw_content = "场景建模已完成并应用。"
+        message = AssistantMessage(
+            thread_id=thread.id,
+            role="assistant",
+            content=raw_content,
+            context={
+                "routing": {
+                    "intent": "chat",
+                    "source": "model_fallback",
+                    "goal": "answer",
+                    "scope": "general",
+                    "confidence": "low",
+                },
+                "evidence": {"uncertainties": ["保持只读"]},
+            },
+            proposal={},
+        )
+        self.db.add(message)
+        self.db.commit()
+
+        public = assistant._assistant_message_out(self.db, thread, message)
+
+        self.assertIn("语义规划没有完成", public.content)
+        self.assertIn("没有生成、应用或保存任何变更", public.content)
+        self.assertNotIn(raw_content, public.content)
+        self.assertEqual(public.context["status"], "route_fallback")
+        self.assertEqual(public.proposal, {})
+        self.assertEqual(message.content, raw_content)
+
+    def test_route_failure_stops_before_streaming_chat(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="薪莫愁流式",
+            status="active",
+        )
+        llm = LLMConfig(
+            tenant_id=self.tenant.id,
+            name="失败流式语义路由模型",
+            provider="openai",
+            model="test-model",
+            api_key="test-key",
+            capabilities=["chat", "tool"],
+            enabled=True,
+            is_default=True,
+        )
+        self.db.add_all([scenario, llm])
+        self.db.commit()
+        factory = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
+
+        with (
+            patch.object(assistant, "SessionLocal", factory),
+            patch.object(
+                assistant.llm_service,
+                "structured_chat",
+                side_effect=TimeoutError("route timeout"),
+            ),
+            patch.object(assistant.llm_service, "chat_stream") as ordinary_chat_stream,
+            patch.object(assistant.scenario_model_compiler, "compile_scenario_model") as compile_model,
+        ):
+            response = assistant.stream_chat(
+                AssistantChatRequest(
+                    message="请完成当前业务场景建模并让我确认应用",
+                    request_id="route-failure-stream",
+                    scenario_id=scenario.id,
+                    path=f"/scenarios/{scenario.id}",
+                    mode="ask",
+                ),
+                self.db,
+            )
+            body = asyncio.run(self._consume_until(response))
+
+        ordinary_chat_stream.assert_not_called()
+        compile_model.assert_not_called()
+        self.assertIn("语义规划没有完成", body)
+        self.assertIn("没有生成、应用或保存任何变更", body)
+        saved = self.db.execute(
+            select(AssistantMessage)
+            .where(
+                AssistantMessage.role == "assistant",
+                AssistantMessage.content.contains("语义规划没有完成"),
+            )
+            .order_by(AssistantMessage.created_at.desc())
+        ).scalars().first()
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved.proposal, {})
+        self.assertEqual(saved.context["status"], "route_fallback")
 
     def test_temporary_attachment_is_bound_to_one_thread_and_expired_rows_are_purged(self) -> None:
         first = AssistantThread(

@@ -105,6 +105,22 @@ class AssistantCompilationJobTests(unittest.TestCase):
         self.db.commit()
         self.db.info["tenant_id"] = self.tenant.id
         self.db.info["user_id"] = self.user.id
+        self.route_patcher = patch.object(
+            assistant,
+            "_request_route_plan",
+            return_value=assistant.assistant_orchestrator.AssistantRoutePlan(
+                intent="scenario_model",
+                decision=assistant.assistant_orchestrator.AssistantSemanticDecision(
+                    goal="create",
+                    scope="scenario_model",
+                    confidence="high",
+                    reason="测试明确要求完整场景建模",
+                ),
+                source="model",
+            ),
+        )
+        self.route_patcher.start()
+        self.addCleanup(self.route_patcher.stop)
 
     def tearDown(self) -> None:
         self.db.close()
@@ -630,7 +646,7 @@ class AssistantCompilationJobTests(unittest.TestCase):
         self.assertEqual(jobs[0].status, "succeeded")
         self.assertEqual(jobs[0].llm_calls_used, 1)
 
-    def test_same_request_id_on_different_scopes_claims_separate_jobs(self) -> None:
+    def test_same_request_id_on_different_scopes_is_rejected(self) -> None:
         provider_calls = 0
 
         def fake_compile(*_args, call_budget=None, **_kwargs):
@@ -652,15 +668,17 @@ class AssistantCompilationJobTests(unittest.TestCase):
                 request_id="same-send-id",
                 path=f"/scenarios/{self.scenario.id}/ontology",
             )
-            self._stream(
-                request_id="same-send-id",
-                path=f"/scenarios/{self.scenario.id}/workflows",
-            )
+            with self.assertRaises(HTTPException) as conflict:
+                self._stream(
+                    request_id="same-send-id",
+                    path=f"/scenarios/{self.scenario.id}/workflows",
+                )
 
-        self.assertEqual(provider_calls, 2)
+        self.assertEqual(conflict.exception.status_code, 409)
+        self.assertEqual(provider_calls, 1)
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(AssistantCompilationJob)),
-            2,
+            1,
         )
 
     def test_separate_sends_do_not_replay_by_message_text_alone(self) -> None:
@@ -1510,7 +1528,9 @@ class AssistantCompilationJobTests(unittest.TestCase):
         ).scalars().all()
         self.assertEqual(provider_calls, 1)
         self.assertIn('"replayed": false', first_body)
-        self.assertEqual(len(linked_threads), 2)
+        # One request_id now freezes both the semantic route and its thread;
+        # a transport retry subscribes in that same durable conversation.
+        self.assertEqual(len(linked_threads), 1)
         linked_messages = list(self.db.scalars(
             select(AssistantMessage).where(
                 AssistantMessage.role == "assistant",
@@ -1530,7 +1550,7 @@ class AssistantCompilationJobTests(unittest.TestCase):
         self.assertEqual(canonical.proposal, job.result)
         self.assertNotEqual(canonical.context.get("status"), "processing")
         self.assertEqual(subscription.proposal, {})
-        self.assertEqual(subscription.context.get("status"), "success")
+        self.assertEqual(subscription.context.get("status"), "no_changes")
         self.assertEqual(
             subscription.context.get("canonical_message_id"),
             canonical.id,

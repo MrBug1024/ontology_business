@@ -6,9 +6,12 @@ import math
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional, TypeVar
 
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_openai import ChatOpenAI
 from openai import OpenAI
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -38,6 +41,9 @@ _TOKEN_PATTERNS = (
 
 class LLMRuntimeError(RuntimeError):
     """模型能力或启用状态不满足真实调用要求。"""
+
+
+StructuredResultT = TypeVar("StructuredResultT", bound=BaseModel)
 
 
 @dataclass(frozen=True)
@@ -385,6 +391,7 @@ def chat(
     *,
     request_timeout: float | None = None,
     max_retries: int | None = None,
+    retry_on_length: bool = True,
     db: Session | None = None,
     operation: str = "chat",
     before_provider_call: Callable[[], None] | None = None,
@@ -404,7 +411,7 @@ def chat(
         kwargs["tool_choice"] = "auto"
     # 推理模型的思考过程会占用 max_tokens；若首轮仅长度截断则放大一次。每一轮
     # 都是独立的真实 provider 调用，必须各自计费、追踪和预算检查。
-    for attempt in range(2):
+    for attempt in range(2 if retry_on_length else 1):
         started_at = time.perf_counter()
         reserved_output = max(1, int(kwargs.get("max_tokens") or cfg.max_tokens or 1))
         _assert_budget_available(
@@ -472,7 +479,7 @@ def chat(
                 getattr(response_choice, "finish_reason", None)
                 or getattr(choice, "finish_reason", None)
             ) == "length"
-            if attempt == 0 and truncated and not content.strip() and not tool_calls:
+            if retry_on_length and attempt == 0 and truncated and not content.strip() and not tool_calls:
                 kwargs["max_tokens"] = (kwargs.get("max_tokens") or 4096) * 2
                 continue
             return {"content": content, "tool_calls": tool_calls, "raw": resp}
@@ -601,6 +608,207 @@ def chat_stream(
                 tool_count=len(tc_acc),
                 error=error,
             )
+
+
+def _langchain_usage(raw: Any) -> tuple[int | None, int | None, int | None]:
+    usage = getattr(raw, "usage_metadata", None) or {}
+    metadata = getattr(raw, "response_metadata", None) or {}
+    token_usage = metadata.get("token_usage") if isinstance(metadata, dict) else {}
+    if not isinstance(token_usage, dict):
+        token_usage = {}
+
+    def value(*names: str) -> int | None:
+        for source in (usage, token_usage):
+            if not isinstance(source, dict):
+                continue
+            for name in names:
+                candidate = source.get(name)
+                if candidate is not None:
+                    try:
+                        return max(0, int(candidate))
+                    except (TypeError, ValueError):
+                        pass
+        return None
+
+    return (
+        value("input_tokens", "prompt_tokens"),
+        value("output_tokens", "completion_tokens"),
+        value("total_tokens"),
+    )
+
+
+def _parse_structured_content(
+    content: str,
+    schema: type[StructuredResultT],
+) -> StructuredResultT:
+    """Validate one complete JSON object without repairing malformed output."""
+    decoder = json.JSONDecoder()
+    last_error: Exception | None = None
+    for offset, character in enumerate(content):
+        if character != "{":
+            continue
+        try:
+            candidate, _end = decoder.raw_decode(content[offset:])
+            return schema.model_validate(candidate)
+        except Exception as exc:  # noqa: BLE001 - keep looking for one complete object.
+            last_error = exc
+    raise ValueError("模型未返回完整且符合结构约束的 JSON 对象") from last_error
+
+
+def structured_chat(
+    cfg: LLMConfig,
+    messages: list[dict[str, Any]],
+    schema: type[StructuredResultT],
+    *,
+    db: Session | None = None,
+    operation: str = "structured_chat",
+    request_timeout: float | None = None,
+    max_tokens: int = 512,
+    max_retries: int = 0,
+) -> StructuredResultT:
+    """Return provider-validated structured output through LangChain.
+
+    Official OpenAI endpoints first use native JSON Schema. Custom compatible
+    endpoints first use function calling, then JSON mode when available. Each
+    real attempt is independently budgeted and traced. Callers decide the
+    fail-closed product fallback after every strategy is exhausted.
+    """
+    capabilities = capabilities_of(cfg)
+    _ensure_callable(cfg)
+    base_url = str(cfg.base_url or "").strip().lower()
+    official_openai = str(cfg.provider or "").strip().lower() == "openai" and (
+        not base_url or base_url.startswith("https://api.openai.com")
+    )
+    if official_openai:
+        methods: list[tuple[str, bool | None]] = [("json_schema", True)]
+        if "tool" in capabilities:
+            methods.append(("function_calling", False))
+    elif "tool" in capabilities:
+        methods = [("function_calling", False), ("json_mode", None)]
+    else:
+        methods = [("json_mode", None)]
+
+    input_estimate = _estimate_tokens(_message_text(messages))
+    output_limit = max(64, min(int(max_tokens), 2048))
+    total_timeout = (
+        get_settings().llm_timeout
+        if request_timeout is None
+        else max(0.1, float(request_timeout))
+    )
+    deadline = time.monotonic() + total_timeout
+    last_error: Exception | None = None
+    for index, (method, strict) in enumerate(methods):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # Include the ordinary JSON fallback in the number of attempts still
+        # to run. A provider that accepts one structured mode but hangs while
+        # producing it must not consume the entire caller-owned deadline and
+        # prevent the more compatible fallback from being attempted.
+        attempts_left = len(methods) - index + 1
+        attempt_timeout = max(0.1, remaining / attempts_left)
+        started_at = time.perf_counter()
+        _assert_budget_available(
+            cfg,
+            db=db,
+            input_tokens=input_estimate,
+            output_tokens=output_limit,
+        )
+        raw: Any = None
+        try:
+            model = ChatOpenAI(
+                model=cfg.model,
+                base_url=cfg.base_url or None,
+                api_key=cfg.api_key or "sk-placeholder",
+                temperature=0,
+                timeout=attempt_timeout,
+                max_retries=max(0, int(max_retries)),
+                max_completion_tokens=output_limit,
+            )
+            structured = model.with_structured_output(
+                schema,
+                method=method,
+                include_raw=True,
+                strict=strict,
+            )
+            result = structured.invoke(messages)
+            raw = result.get("raw") if isinstance(result, dict) else None
+            parsed = result.get("parsed") if isinstance(result, dict) else result
+            parsing_error = result.get("parsing_error") if isinstance(result, dict) else None
+            if parsing_error is not None:
+                raise parsing_error
+            if not isinstance(parsed, schema):
+                parsed = schema.model_validate(parsed)
+            raw_input, raw_output, raw_total = _langchain_usage(raw)
+            output_estimate = _estimate_tokens(parsed.model_dump_json())
+            input_tokens = input_estimate if raw_input is None else raw_input
+            output_tokens = output_estimate if raw_output is None else raw_output
+            total_tokens = input_tokens + output_tokens if raw_total is None else raw_total
+            _record_trace(
+                cfg,
+                db=db,
+                capability="tool" if method == "function_calling" else "chat",
+                operation=operation,
+                status="succeeded",
+                started_at=started_at,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                tool_count=len(getattr(raw, "tool_calls", None) or []),
+            )
+            return parsed
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            raw_input, raw_output, raw_total = _langchain_usage(raw)
+            input_tokens = input_estimate if raw_input is None else raw_input
+            output_tokens = 0 if raw_output is None else raw_output
+            total_tokens = input_tokens + output_tokens if raw_total is None else raw_total
+            _record_trace(
+                cfg,
+                db=db,
+                capability="tool" if method == "function_calling" else "chat",
+                operation=operation,
+                status="failed",
+                started_at=started_at,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                tool_count=len(getattr(raw, "tool_calls", None) or []),
+                error=exc,
+            )
+    # Some OpenAI-compatible providers implement only ordinary chat
+    # completions. Keep semantic routing available for them by asking for JSON
+    # explicitly and validating it locally with langchain-core. Product code
+    # still fails closed if the provider ignores the schema instructions.
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("结构化模型调用超过总时限") from last_error
+    parser = PydanticOutputParser(pydantic_object=schema)
+    fallback_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Return only one JSON object matching this schema. Do not add "
+                "markdown or explanatory text.\n" + parser.get_format_instructions()
+            ),
+        },
+        *messages,
+    ]
+    result = chat(
+        cfg,
+        fallback_messages,
+        temperature=0,
+        max_tokens=output_limit,
+        request_timeout=remaining,
+        max_retries=max_retries,
+        retry_on_length=False,
+        db=db,
+        operation=operation,
+    )
+    return _parse_structured_content(
+        str(result.get("content") or ""),
+        schema,
+    )
 
 
 def embed(

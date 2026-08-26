@@ -59,6 +59,7 @@ async def _assistant_compilation_worker() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    logger.info("平台数据库、表结构和运行目录启动检查完成")
     # 启动时同步技能（含复制进来的 ocr-parser）
     from .database import SessionLocal
 

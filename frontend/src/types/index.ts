@@ -1182,7 +1182,7 @@ export interface AssistantProposal {
   }[]
   base_snapshot?: Record<string, any>
   requires_confirmation?: boolean
-  status?: 'pending' | 'in_progress' | 'completed_with_gaps' | 'partially_applied' | 'applied' | string
+  status?: 'pending' | 'in_progress' | 'completed_no_changes' | 'completed_with_gaps' | 'partially_applied' | 'applied' | string
   run_revision?: number
   applied_at?: string
   apply_result?: Record<string, any>
@@ -1217,14 +1217,27 @@ export interface AssistantModelTask {
     resolution_hint?: string
     affected_change_keys?: string[]
   }>
-  apply_result?: Record<string, any>
+  apply_result?: AssistantModelTaskApplyResult
   applied_at?: string
   completed_at?: string
 }
 
+export interface AssistantModelTaskApplyResult {
+  kind?: string
+  task_id?: string
+  task_status?: string
+  counts?: Record<string, number>
+  applied_change_keys?: string[]
+  safe_change_count?: number
+  partial?: boolean
+  deferred?: boolean
+  draft_preserved?: boolean
+  [key: string]: unknown
+}
+
 export interface AssistantModelExecutionSummary {
   final: boolean
-  status: 'running' | 'waiting_for_confirmation' | 'completed' | 'completed_with_gaps' | 'state_error' | string
+  status: 'running' | 'waiting_for_confirmation' | 'completed' | 'completed_no_changes' | 'completed_with_gaps' | 'state_error' | string
   message: string
   total_task_count: number
   completed_task_count: number

@@ -27,6 +27,7 @@ from app.models import (
 from app.routers import assistant
 from app.schemas import AssistantChatRequest
 from app.services import (
+    assistant_orchestrator,
     permission_service,
     release_service,
     scenario_model_compiler,
@@ -1102,39 +1103,19 @@ class ScenarioModelDraftContinuationTests(unittest.TestCase):
         )
         self.db.commit()
 
-        continuation_messages = (
-            "继续",
-            "继续吧",
-            "下一步",
-            "接着处理",
-            "把剩下的做完",
-            "继续优化",
-            "修正规则草稿",
-            "完善草稿",
-            "继续完成本体建模",
-            "接着把映射规则工作流做完",
-            "根据我刚才的修改继续",
-            "请继续完善当前草稿",
-            "基于当前草稿修正规则",
-            "重新校验 working draft",
-            "重新编译当前模型",
-            "接着做模型迭代",
-            "新增一个订单对象",
-            "再加一个供应商",
-            "补一个审批节点",
+        continuation = assistant_orchestrator.AssistantSemanticDecision(
+            goal="continue_work",
+            scope="scenario_model",
+            confidence="high",
+            reason="继续当前活动草稿",
         )
-        for message in continuation_messages:
-            with self.subTest(message=message):
-                self.assertEqual(
-                    assistant._request_intent(
-                        self.db,
-                        self.scenario,
-                        message=message,
-                        mode="ask",
-                        draft_kind="auto",
-                    ),
-                    "scenario_model",
-                )
+        self.assertEqual(
+            assistant_orchestrator.route_assistant_decision(
+                continuation,
+                has_active_model_drafts=True,
+            ).intent,
+            "scenario_model",
+        )
 
         scenario_model_draft_service.resolve_draft_atomic(
             self.db,
@@ -1146,18 +1127,13 @@ class ScenarioModelDraftContinuationTests(unittest.TestCase):
             resolved_resource_id="resolved-rule-target",
         )
         self.db.commit()
-        for message in continuation_messages:
-            with self.subTest(no_active_draft=message):
-                self.assertNotEqual(
-                    assistant._request_intent(
-                        self.db,
-                        self.scenario,
-                        message=message,
-                        mode="ask",
-                        draft_kind="auto",
-                    ),
-                    "scenario_model",
-                )
+        self.assertNotEqual(
+            assistant_orchestrator.route_assistant_decision(
+                continuation,
+                has_active_model_drafts=False,
+            ).intent,
+            "scenario_model",
+        )
 
     def test_sync_and_stream_compile_the_exact_active_revision(self) -> None:
         proposal = self._proposal(
@@ -1193,9 +1169,25 @@ class ScenarioModelDraftContinuationTests(unittest.TestCase):
             })
             return self._compiled_payload()
 
+        continuation_plan = assistant_orchestrator.AssistantRoutePlan(
+            intent="scenario_model",
+            decision=assistant_orchestrator.AssistantSemanticDecision(
+                goal="continue_work",
+                scope="scenario_model",
+                confidence="high",
+                reason="测试明确续作当前活动草稿",
+            ),
+            source="model",
+        )
+
         with (
             patch.object(assistant, "SessionLocal", self.factory),
             patch.object(assistant, "_llm", return_value=self.llm),
+            patch.object(
+                assistant,
+                "_request_route_plan",
+                return_value=continuation_plan,
+            ),
             patch.object(
                 assistant.scenario_model_compiler,
                 "compile_scenario_model",

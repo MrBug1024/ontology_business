@@ -77,9 +77,29 @@ class Settings(BaseSettings):
     mail_timeout_seconds: int = 20
 
 
+def ensure_runtime_directories(settings: Settings | None = None) -> None:
+    """Create the platform directories required before the API can start.
+
+    Directory creation is intentionally limited to known application-owned
+    paths.  It never removes or replaces an existing directory or database
+    file.  A custom SQLite URL is included because its parent is not
+    necessarily ``backend/data``.
+    """
+    configured = settings
+    directories = {DATA_DIR, BUCKETS_DIR, SKILLS_DIR}
+    if configured and configured.database_url.startswith("sqlite"):
+        from sqlalchemy.engine import make_url
+
+        database_path = make_url(configured.database_url).database
+        if database_path and database_path != ":memory:" and not str(database_path).startswith("file:"):
+            directories.add(Path(database_path).expanduser().parent)
+
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+
+
 @lru_cache
 def get_settings() -> Settings:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    BUCKETS_DIR.mkdir(parents=True, exist_ok=True)
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    return Settings()
+    settings = Settings()
+    ensure_runtime_directories(settings)
+    return settings

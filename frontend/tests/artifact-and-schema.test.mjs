@@ -80,15 +80,43 @@ test('action confirmation keeps original parameters when the preview is compacte
   assert.doesNotMatch(source, /params:\s*plan\.parameters\s*\|\|\s*\{\}/)
 })
 
-test('global assistant shows safe reference names and makes capability updates read-only', () => {
+test('global assistant shows safe references and keeps capability changes governed', () => {
   const source = readFileSync(
     new URL('../src/components/GlobalAssistant.vue', import.meta.url),
     'utf8',
   )
   assert.match(source, /reference\.display_name/)
-  assert.match(source, /修改或删除将切换为只读指导/)
+  assert.match(source, /仅本条聚焦新增业务能力/)
+  assert.match(source, /修改正式定义仍走专用编辑流程/)
   assert.match(source, /新增业务能力/)
   assert.doesNotMatch(source, /return '场景已有定义'/)
+})
+
+test('global assistant task scope applies to one send and never sticks to a page', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const sendStart = source.indexOf('function send(text?: string)')
+  const sendEnd = source.indexOf('\nasync function answerQuestion', sendStart)
+  assert.notEqual(sendStart, -1)
+  assert.notEqual(sendEnd, -1)
+  const sendSource = source.slice(sendStart, sendEnd)
+
+  const capture = sendSource.indexOf('const submittedPreset = taskPreset.value')
+  const route = sendSource.indexOf('requestRouteForPreset(submittedPreset)')
+  const reset = sendSource.indexOf("taskPreset.value = 'smart'", route)
+  const request = sendSource.indexOf('streamAssistantChat(', reset)
+  assert.ok(capture >= 0 && capture < route)
+  assert.ok(route < reset && reset < request)
+  assert.match(sendSource, /mode: requestRoute\.mode/)
+  assert.match(sendSource, /draft_kind: requestRoute\.draft_kind/)
+
+  const scenarioWatchStart = source.indexOf('watch(() => context.value.scenario_id')
+  const scenarioWatchEnd = source.indexOf('\nwatch(showLauncher', scenarioWatchStart)
+  const scenarioWatch = source.slice(scenarioWatchStart, scenarioWatchEnd)
+  assert.match(scenarioWatch, /taskPreset\.value = 'smart'/)
+  assert.doesNotMatch(scenarioWatch, /scenario_model|mode\.value|draftKind\.value/)
 })
 
 test('scenario modelling stays as a durable sequential plan until final summary', () => {
@@ -111,6 +139,147 @@ test('scenario modelling stays as a durable sequential plan until final summary'
   assert.match(source, /completed_with_gaps/)
   assert.doesNotMatch(source, /if \(modelRunAwaitingConfirmation\.value\) \{\s*ElMessage\.info/)
   assert.doesNotMatch(source, /先跳过，保留问题/)
+})
+
+test('scenario model write success requires a persisted mutation ledger', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const start = source.indexOf('function modelTaskHasPersistedWrites')
+  const end = source.indexOf('\nfunction modelFullyAppliedTaskCount', start)
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  const functionSource = source.slice(start, end)
+  const body = functionSource.slice(
+    functionSource.indexOf('{') + 1,
+    functionSource.lastIndexOf('}'),
+  )
+  const hasPersistedWrites = Function(`return function (task) {${body}}`)()
+  const result = (status, extra = {}) => ({
+    id: 'ontology',
+    status,
+    apply_result: {
+      kind: 'scenario_model',
+      task_id: 'ontology',
+      task_status: status,
+      ...extra,
+    },
+  })
+
+  assert.equal(hasPersistedWrites(result('applied', { applied_change_keys: ['entity.project'] })), true)
+  assert.equal(hasPersistedWrites(result('partially_applied', { counts: { entities_added: 1 } })), true)
+  assert.equal(hasPersistedWrites(result('applied')), false)
+  assert.equal(hasPersistedWrites(result('applied', { applied_change_keys: [], counts: { properties_skipped: 4 } })), false)
+  assert.equal(hasPersistedWrites(result('deferred', { applied_change_keys: ['entity.project'] })), false)
+  assert.equal(hasPersistedWrites({
+    ...result('applied', { applied_change_keys: ['entity.project'] }),
+    apply_result: {
+      kind: 'scenario_model', task_id: 'ontology', task_status: 'partially_applied', applied_change_keys: ['entity.project'],
+    },
+  }), false)
+})
+
+test('zero-write scenario model finals stay neutral and suppress false apply copy', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const template = source.slice(0, source.indexOf('<script setup'))
+  const finalHelpers = source.slice(
+    source.indexOf('function modelRunStatusType'),
+    source.indexOf('function modelNextAction'),
+  )
+
+  assert.match(template, /:content="assistantMessageContent\(message\)"/)
+  assert.doesNotMatch(template, /全部任务已完成/)
+  assert.match(template, /modelRunStatusType\(proposalOf\(message\)\)/)
+  assert.match(template, /modelRunSummaryTitle\(proposalOf\(message\)\)/)
+  assert.match(template, /正式写入任务/)
+  assert.match(finalHelpers, /modelRunFinishedWithoutPersistedWrites/)
+  assert.match(finalHelpers, /'建模计划已结束，无正式写入'/)
+  assert.match(finalHelpers, /'completed_without_writes'/)
+  assert.doesNotMatch(finalHelpers, /场景建模已完成并应用/)
+  assert.match(source, /\.model-run-summary\.is-success/)
+  assert.match(source, /\.model-run-summary\.is-warning/)
+  assert.doesNotMatch(
+    source,
+    /\.model-run-summary \{[^}]*var\(--success\)/,
+  )
+
+  const statusStart = source.indexOf('function modelRunStatusType')
+  const statusEnd = source.indexOf('\nfunction modelRunSummaryTitle', statusStart)
+  const statusSource = source.slice(statusStart, statusEnd)
+  const statusBody = statusSource.slice(statusSource.indexOf('{') + 1, statusSource.lastIndexOf('}'))
+  const statusType = Function(
+    'modelExecutionSummary',
+    'modelRunHasPersistedWrites',
+    'modelDraftOnlyTaskCount',
+    'modelPartiallyAppliedTaskCount',
+    `return function (proposal) {${statusBody}}`,
+  )(
+    (proposal) => proposal.summary,
+    (proposal) => proposal.persisted,
+    (proposal) => proposal.drafts,
+    (proposal) => proposal.partial,
+  )
+  assert.equal(statusType({ summary: { final: true, status: 'completed', remaining_issue_count: 0 }, persisted: false, drafts: 0, partial: 0 }), 'info')
+  assert.equal(statusType({ summary: { final: true, status: 'completed_with_gaps', remaining_issue_count: 1 }, persisted: false, drafts: 1, partial: 0 }), 'warning')
+  assert.equal(statusType({ summary: { final: true, status: 'completed', remaining_issue_count: 0 }, persisted: true, drafts: 0, partial: 0 }), 'success')
+
+  const contentStart = source.indexOf('function assistantMessageContent')
+  const contentEnd = source.indexOf('\nfunction proposalStatusType', contentStart)
+  const contentSource = source.slice(contentStart, contentEnd)
+  const contentBody = contentSource.slice(contentSource.indexOf('{') + 1, contentSource.lastIndexOf('}'))
+  const displayContent = Function(
+    'proposalOf',
+    'modelRunFinishedWithoutPersistedWrites',
+    'modelRunSummaryMessage',
+    `return function (message) {${contentBody}}`,
+  )(
+    (message) => message.proposal,
+    () => true,
+    () => '本轮未确认到正式资源写入；计划没有产生可应用的正式定义。',
+  )
+  const displayed = displayContent({
+    content: '**场景建模已完成并应用**',
+    proposal: { kind: 'scenario_model' },
+  })
+  assert.doesNotMatch(displayed, /已完成并应用/)
+  assert.match(displayed, /本轮未确认到正式资源写入/)
+})
+
+test('scenario task outcome only emits applied feedback for verified writes', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const outcome = source.slice(
+    source.indexOf('function announceModelTaskOutcome'),
+    source.indexOf('function beginModelTaskRecovery'),
+  )
+  const recovery = source.slice(
+    source.indexOf('function beginModelTaskRecovery'),
+    source.indexOf('async function applyModelTask'),
+  )
+  const apply = source.slice(
+    source.indexOf('async function applyModelTask'),
+    source.indexOf('async function applyProposal'),
+  )
+
+  assert.match(
+    outcome,
+    /if \(modelTaskHasPersistedWrites\(task\)\) \{[\s\S]*?assistant-proposal-applied[\s\S]*?ElMessage\.success/,
+  )
+  assert.equal((outcome.match(/assistant-proposal-applied/g) || []).length, 1)
+  assert.match(outcome, /task\.status === 'drafted_with_gaps'[\s\S]*?ElMessage\.warning/)
+  assert.match(outcome, /\['deferred', 'skipped'\]\.includes\(task\.status\)[\s\S]*?ElMessage\.info/)
+  assert.match(outcome, /task\.status === 'empty'[\s\S]*?ElMessage\.info/)
+  assert.doesNotMatch(recovery, /assistant-proposal-applied/)
+  assert.match(recovery, /announceModelTaskOutcome\(recoveredProposal, taskId, true\)/)
+  assert.doesNotMatch(apply, /assistant-proposal-applied/)
+  assert.match(apply, /announceModelTaskOutcome\(updatedProposal, task\.id, result\?\.status === 'replayed'\)/)
+  assert.doesNotMatch(apply, /本任务已确认并写入/)
 })
 
 test('only the active message card is actionable when two messages share a model proposal id', () => {

@@ -1339,6 +1339,51 @@ class AssistantThread(Base):
     )
 
 
+class AssistantRouteDecision(Base):
+    """Single-flight semantic decision for one explicit assistant send."""
+
+    __tablename__ = "assistant_route_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "created_by_user_id",
+            "request_id",
+            name="uq_assistant_route_decisions_request",
+        ),
+        Index(
+            "ix_assistant_route_decisions_status_lease",
+            "status",
+            "lease_expires_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    created_by_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    scenario_id: Mapped[str | None] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # The claim exists before a new thread does, so this cannot be a foreign
+    # key. The endpoint creates or reloads this exact owned thread afterward.
+    thread_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="planning", index=True)
+    route_plan: Mapped[dict] = mapped_column(JSON, default=dict)
+    lease_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
 class AssistantMessage(Base):
     """助手会话消息，同时保存上下文和 AI 生成的待确认变更。"""
 

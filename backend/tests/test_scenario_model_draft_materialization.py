@@ -32,6 +32,7 @@ from app.models import (
 )
 from app.routers import assistant, scenarios
 from app.services import (
+    assistant_orchestrator,
     permission_service,
     scenario_model_compiler,
     scenario_model_draft_service,
@@ -596,14 +597,17 @@ class ScenarioModelDraftMaterializationTests(unittest.TestCase):
                 self.scenario,
             )
         )
+        continuation = assistant_orchestrator.AssistantSemanticDecision(
+            goal="continue_work",
+            scope="scenario_model",
+            confidence="high",
+            reason="继续当前活动草稿",
+        )
         self.assertNotEqual(
-            assistant._request_intent(
-                self.db,
-                self.scenario,
-                message="继续优化当前草稿",
-                mode="ask",
-                draft_kind="auto",
-            ),
+            assistant_orchestrator.route_assistant_decision(
+                continuation,
+                has_active_model_drafts=False,
+            ).intent,
             "scenario_model",
         )
         self.db.info["user_id"] = self.owner.id

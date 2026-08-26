@@ -60,6 +60,10 @@ class WorkflowDeadlineExceeded(PolicyViolation):
     """Raised before a workflow starts another node after its run deadline."""
 
 
+class WorkflowGenerationError(ValueError):
+    """Raised when model output cannot become a valid, saveable workflow draft."""
+
+
 def _check_deadline(deadline_at: datetime | None) -> None:
     if deadline_at is None:
         return
@@ -204,7 +208,125 @@ def validate_workflow_references(
             raise PolicyViolation(f"工作流的{labels[kind]}节点缺少已配置的{labels[kind]}引用")
         resource = db.get(model, resource_id)
         if not resource or resource.scenario_id != scenario_id:
-            raise PolicyViolation(f"工作流引用的{labels[kind]}不存在或不属于当前业务场景")
+            raise PolicyViolation(
+                f"工作流引用的{labels[kind]}不存在或不属于当前业务场景：{resource_id}"
+            )
+
+
+def canonicalize_workflow_references(
+    db: Session,
+    scenario_id: str,
+    *,
+    steps: list[dict[str, Any]] | None = None,
+    nodes: list[dict[str, Any]] | None = None,
+) -> None:
+    """Bind exact IDs or unique names to formal resources in this scenario.
+
+    Model-generated labels are not resource identities. Only an exact ID or an
+    exact, unique resource name is accepted; fuzzy matching would silently bind
+    a workflow to the wrong side-effecting capability.
+    """
+    labels = {"action": "操作", "rule": "规则", "event": "事件"}
+    definitions = {
+        "action": (OntologyAction, "action_id"),
+        "rule": (OntologyRule, "rule_id"),
+        "event": (OntologyEvent, "event_id"),
+    }
+    references: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    for step in steps or []:
+        if isinstance(step, dict):
+            kind = str(step.get("type") or "")
+            if kind in definitions:
+                references.append((kind, step, step))
+    for node in nodes or []:
+        if not isinstance(node, dict):
+            continue
+        kind = str(node.get("type") or "")
+        if kind not in definitions:
+            continue
+        data = node.get("data")
+        if not isinstance(data, dict):
+            raise PolicyViolation(
+                f"工作流的{labels[kind]}节点“{node.get('name') or node.get('id') or '未命名'}”配置必须是对象"
+            )
+        references.append((kind, data, node))
+
+    if not references:
+        return
+
+    catalogs: dict[str, tuple[dict[str, Any], dict[str, list[Any]]]] = {}
+    for kind in {reference[0] for reference in references}:
+        model, _key = definitions[kind]
+        resources = db.execute(
+            select(model).where(model.scenario_id == scenario_id)
+        ).scalars().all()
+        by_id = {str(resource.id): resource for resource in resources}
+        by_name: dict[str, list[Any]] = {}
+        for resource in resources:
+            name = str(resource.name or "").strip()
+            if name:
+                by_name.setdefault(name, []).append(resource)
+        catalogs[kind] = (by_id, by_name)
+
+    for kind, data, container in references:
+        definition = definitions.get(kind)
+        if definition is None:
+            continue
+        _model, key = definition
+        by_id, by_name = catalogs[kind]
+        raw_reference = str(data.get(key) or "").strip()
+        candidates = [raw_reference] if raw_reference else []
+        candidates.extend(
+            str(value or "").strip()
+            for value in (
+                data.get("resource_ref"),
+                data.get("name"),
+                container.get("resource_ref"),
+                container.get("name"),
+                container.get("label"),
+            )
+            if str(value or "").strip()
+        )
+
+        matched_ids: set[str] = set()
+        ambiguous = False
+        for candidate in dict.fromkeys(candidates):
+            if candidate in by_id:
+                matched_ids.add(candidate)
+            name_matches = by_name.get(candidate) or []
+            if len(name_matches) > 1:
+                ambiguous = True
+            elif len(name_matches) == 1:
+                matched_ids.add(str(name_matches[0].id))
+
+        node_label = str(
+            container.get("name") or container.get("label") or container.get("id") or "未命名"
+        )
+        if len(matched_ids) == 1 and not ambiguous:
+            data[key] = next(iter(matched_ids))
+            continue
+
+        available_names = sorted(by_name)
+        if not by_id:
+            raise PolicyViolation(
+                f"当前业务场景没有可引用的正式{labels[kind]}，"
+                f"工作流节点“{node_label}”不能使用 {kind} 类型；"
+                "请先完成对应资源建模，或改用不依赖该资源的节点"
+            )
+        if ambiguous or len(matched_ids) > 1:
+            raise PolicyViolation(
+                f"工作流节点“{node_label}”的{labels[kind]}引用无法唯一解析；"
+                f"请使用明确的{labels[kind]} ID"
+            )
+        supplied = raw_reference or (candidates[0] if candidates else "未提供")
+        available_hint = "、".join(available_names[:8])
+        if len(available_names) > 8:
+            available_hint += f"等 {len(available_names)} 项"
+        raise PolicyViolation(
+            f"工作流节点“{node_label}”引用的{labels[kind]}“{supplied}”"
+            "不在当前业务场景的正式资源目录中；"
+            + (f"可用{labels[kind]}：{available_hint}" if available_hint else "请先创建对应资源")
+        )
 
 
 _HTTP_ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
@@ -2318,6 +2440,7 @@ def _try_parse_json(text: str) -> Any:
 # AI 生成可视化工作流（DAG 草稿，不落库）
 # ──────────────────────────────────────────────
 WORKFLOW_CONTEXT_MAX_CHARS = 100_000
+WORKFLOW_REFERENCE_CATALOG_MAX_ITEMS = 200
 
 
 _WF_GEN_PROMPT = """你是资深业务流程架构师，擅长把业务描述编排成可视化工作流（DAG）。
@@ -2331,11 +2454,13 @@ _WF_GEN_PROMPT = """你是资深业务流程架构师，擅长把业务描述编
   命中走 label="true" 的边，未命中走 label="false" 的边
 - llm：调用大模型，data: {"name":"节点名","prompt":"提示词，可用 {{params.x}} / {{n1.result}} 变量","system":"系统提示(可选)"}
 - event：发布事件，data: {"name":"节点名","event_id":"<事件ID>","payload":{}}
+- approval：人工审批，data: {"name":"节点名","timeout_seconds":3600,"on_timeout":"reject"}
 
 要求：
 1. 节点 id 用 n1、n2、n3…（start 节点 id 固定为 "start"，end 节点 id 固定为 "end"）。
 2. 每个 action/rule/llm/event/approval 节点必须配置 name（中文节点名）。
 3. 只能引用下面列出的操作/规则/事件 ID；涉及外部副作用时必须使用类型化 Action。
+{reference_policy}
 4. 连线 edges: [{"id":"e1","source":"start","target":"n1","label":""}]，分支节点必须同时给出 true 和 false 两条出边。
 5. 流程必须从 start 出发并最终到达 end。
 6. 只输出 JSON，不要输出任何解释文字。
@@ -2346,15 +2471,12 @@ _WF_GEN_PROMPT = """你是资深业务流程架构师，擅长把业务描述编
   "description": "一句话描述",
   "nodes": [
     {"id":"start","type":"start","name":"开始","data":{}},
-    {"id":"n1","type":"action","name":"查询违规数据","data":{"action_id":"...","params":{}}},
-    {"id":"n2","type":"rule","name":"是否命中规则","data":{"rule_id":"...","record":{"数量":"{{n1.result.rows.0.数量}}"}}},
+    {"id":"n1","type":"llm","name":"整理输入","data":{"prompt":"请整理输入：{{params.input}}"}},
     {"id":"end","type":"end","name":"结束","data":{"summary":"流程完成"}}
   ],
   "edges": [
     {"id":"e1","source":"start","target":"n1","label":""},
-    {"id":"e2","source":"n1","target":"n2","label":""},
-    {"id":"e3","source":"n2","target":"n3","label":"true"},
-    {"id":"e4","source":"n2","target":"end","label":"false"}
+    {"id":"e2","source":"n1","target":"end","label":""}
   ]
 }
 
@@ -2409,12 +2531,36 @@ def generate_workflow(db: Session, scenario: BusinessScenario, description: str)
     def _fmt(items: list) -> str:
         if not items:
             return "（暂无）"
-        return "\n".join(f"- {x.id}: {x.name}" for x in items[:30])
+        ordered = sorted(items, key=lambda item: (str(item.name or ""), str(item.id)))
+        visible = ordered[:WORKFLOW_REFERENCE_CATALOG_MAX_ITEMS]
+        lines = [f"- {item.id}: {item.name}" for item in visible]
+        if len(ordered) > len(visible):
+            lines.append(
+                f"（目录共 {len(ordered)} 项，此处稳定展示前 {len(visible)} 项；"
+                "未列出的资源不得猜测 ID，可使用用户明确给出的精确资源名称）"
+            )
+        return "\n".join(lines)
+
+    unavailable = [
+        label
+        for label, items in (("操作", actions), ("规则", rules), ("事件", events))
+        if not items
+    ]
+    reference_policy = (
+        "3.1 当前正式资源目录中没有"
+        + "、".join(unavailable)
+        + "；严禁虚构这些资源的 ID，也严禁生成对应类型的节点。"
+        "请改用 start/end/llm/approval 等不依赖缺失资源的节点，"
+        "或只生成当前资源目录能够完整支撑的流程。"
+        if unavailable
+        else "3.1 action/rule/event 的引用值必须逐字复制正式资源目录中的 ID，不得自造、缩写或猜测。"
+    )
 
     prompt = (
         _WF_GEN_PROMPT.replace("{actions}", _fmt(actions))
         .replace("{rules}", _fmt(rules))
         .replace("{events}", _fmt(events))
+        .replace("{reference_policy}", reference_policy)
         .replace("{description}", context)
     )
 
@@ -2422,12 +2568,19 @@ def generate_workflow(db: Session, scenario: BusinessScenario, description: str)
 
     last_err: Exception | None = None
     data: dict[str, Any] = {}
-    for _ in range(3):
+    for attempt in range(3):
+        attempt_prompt = prompt
+        if last_err is not None:
+            attempt_prompt += (
+                "\n\n上一次输出未通过平台预检，原因如下：\n"
+                f"{str(last_err)[:1200]}\n"
+                "请重新输出完整 JSON，并修正该问题。不要解释，不要沿用无效引用。"
+            )
         resp = llm_service.chat(
             llm,
             [
                 {"role": "system", "content": "你只输出 JSON。"},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": attempt_prompt},
             ],
             temperature=0.3,
             max_tokens=4096,
@@ -2435,40 +2588,71 @@ def generate_workflow(db: Session, scenario: BusinessScenario, description: str)
         )
         try:
             data = _extract_json(resp.get("content", ""))
-            if data.get("nodes"):
-                break
-            last_err = ValueError("AI 未返回有效节点")
+            nodes = data.get("nodes") or []
+            edges = data.get("edges") or []
+            if not isinstance(nodes, list) or not nodes:
+                raise ValueError("AI 未返回有效节点")
+            if not isinstance(edges, list):
+                raise ValueError("AI 返回的工作流连线不是列表")
+
+            node_ids: set[str] = set()
+            for i, node in enumerate(nodes):
+                if not isinstance(node, dict):
+                    raise ValueError("AI 返回的工作流节点不是对象")
+                node_id = str(node.get("id") or f"n{i + 1}")
+                node_type = str(node.get("type") or "action")
+                if node_type == "start":
+                    node_id = "start"
+                elif node_type == "end":
+                    node_id = "end"
+                node["id"] = node_id
+                node["type"] = node_type
+                node["name"] = str(node.get("name") or node_type)
+                node["data"] = node.get("data") or {}
+                node["position"] = node.get("position") or {"x": 0, "y": 0}
+                node_ids.add(node_id)
+
+            # Drop only edges that cannot name a real node, then let the DAG
+            # validator explain any resulting reachability or branch problem.
+            edges = [
+                edge
+                for edge in edges
+                if isinstance(edge, dict)
+                and edge.get("source") in node_ids
+                and edge.get("target") in node_ids
+            ]
+            for i, edge in enumerate(edges):
+                edge["id"] = str(edge.get("id") or f"e{i + 1}")
+                edge.setdefault("label", "")
+            data["nodes"] = nodes
+            data["edges"] = edges
+
+            validate_workflow_definition(nodes, edges)
+            canonicalize_workflow_references(
+                db,
+                scenario.id,
+                steps=[],
+                nodes=nodes,
+            )
+            validate_workflow_references(
+                db,
+                scenario.id,
+                steps=[],
+                nodes=nodes,
+            )
+            break
         except Exception as exc:  # noqa: BLE001
             last_err = exc
     else:
-        raise ValueError(f"AI 多次生成均失败: {last_err}")
+        raise WorkflowGenerationError(
+            f"AI 连续 3 次都未生成可安全保存的工作流：{last_err}。"
+            "系统没有创建可确认草稿，请补充所需节点或先完善当前场景资源后重试。"
+        ) from last_err
 
     nodes = data.get("nodes") or []
     edges = data.get("edges") or []
     if not nodes:
-        raise ValueError("AI 未返回有效节点，请补充业务描述后重试")
-
-    # 规范化：补 id / position / data
-    node_ids: set[str] = set()
-    for i, n in enumerate(nodes):
-        nid = str(n.get("id") or f"n{i + 1}")
-        ntype = str(n.get("type") or "action")
-        if ntype == "start":
-            nid = "start"
-        elif ntype == "end":
-            nid = "end"
-        n["id"] = nid
-        n["type"] = ntype
-        n["name"] = str(n.get("name") or ntype)
-        n["data"] = n.get("data") or {}
-        n["position"] = n.get("position") or {"x": 0, "y": 0}
-        node_ids.add(nid)
-
-    # 过滤悬空边
-    edges = [e for e in edges if e.get("source") in node_ids and e.get("target") in node_ids]
-    for i, e in enumerate(edges):
-        e["id"] = str(e.get("id") or f"e{i + 1}")
-        e.setdefault("label", "")
+        raise WorkflowGenerationError("AI 未返回有效节点，请补充业务描述后重试")
 
     return {
         "name": str(data.get("name") or "AI 生成工作流"),

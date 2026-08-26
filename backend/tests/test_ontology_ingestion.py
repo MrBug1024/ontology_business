@@ -13,18 +13,18 @@ from sqlalchemy.orm import Session
 from starlette.datastructures import Headers, UploadFile
 
 from app.database import Base
-from app.models import BusinessScenario, OntologyEntity, OntologyProperty, OntologyRelation
+from app.models import (
+    BusinessScenario,
+    OntologyAction,
+    OntologyEntity,
+    OntologyProperty,
+    OntologyRelation,
+)
 from app.routers import assistant
 from app.services import ontology_service, workflow_service
 
 
 class AssistantOntologyIngestionTests(unittest.TestCase):
-    def test_ontology_words_take_precedence_over_supporting_mapping_phrase(self) -> None:
-        message = "请生成本体建模草稿，覆盖核心实体、属性和关系，并补充后续数据映射所需的主键信息"
-
-        self.assertEqual(assistant._intent(message, "draft"), "ontology")
-        self.assertEqual(assistant._intent("请为订单表生成字段映射草稿", "draft"), "mapping")
-
     def test_attachment_context_preserves_tail_beyond_legacy_twelve_thousand_chars(self) -> None:
         marker = "TAIL-MARKER-AFTER-LEGACY-LIMIT"
         body = "建筑业务正文" * 3_000 + marker
@@ -192,6 +192,159 @@ class AssistantOntologyIngestionTests(unittest.TestCase):
 
         self.assertIn(marker, captured["prompt"])
         self.assertEqual(result["name"], "审批流程")
+
+    def test_generate_workflow_canonicalizes_unique_resource_name_to_id(self) -> None:
+        engine = create_engine("sqlite://")
+        Base.metadata.create_all(engine)
+        db = Session(engine)
+        db.info["tenant_id"] = "tenant-workflow-reference"
+        try:
+            scenario = BusinessScenario(
+                tenant_id="tenant-workflow-reference",
+                name="工作流引用",
+                status="draft",
+            )
+            entity = OntologyEntity(scenario=scenario, name="测试单")
+            action = OntologyAction(
+                scenario=scenario,
+                entity=entity,
+                name="初始化测试数据",
+                enabled=True,
+            )
+            db.add_all([scenario, entity, action])
+            db.commit()
+            llm = SimpleNamespace(id="llm-workflow-reference")
+            response = {
+                "content": json.dumps(
+                    {
+                        "name": "测试流程",
+                        "nodes": [
+                            {"id": "start", "type": "start", "name": "开始", "data": {}},
+                            {
+                                "id": "n1",
+                                "type": "action",
+                                "name": "初始化测试数据",
+                                "data": {"action_id": "test_init", "params": {}},
+                            },
+                            {"id": "end", "type": "end", "name": "结束", "data": {}},
+                        ],
+                        "edges": [
+                            {"source": "start", "target": "n1"},
+                            {"source": "n1", "target": "end"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            }
+            with (
+                patch.object(workflow_service.llm_service, "routable_configs", return_value=[llm]),
+                patch.object(workflow_service.llm_service, "chat", return_value=response),
+            ):
+                result = workflow_service.generate_workflow(db, scenario, "创建测试流程")
+
+            self.assertEqual(result["nodes"][1]["data"]["action_id"], action.id)
+        finally:
+            db.close()
+            engine.dispose()
+
+    def test_generate_workflow_retries_hallucinated_reference_before_returning_draft(self) -> None:
+        class EmptyResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        class FakeDb:
+            info = {"tenant_id": "tenant-workflow-retry"}
+
+            def execute(self, _statement):
+                return EmptyResult()
+
+        invalid = {
+            "name": "错误流程",
+            "nodes": [
+                {"id": "start", "type": "start", "data": {}},
+                {"id": "n1", "type": "action", "name": "虚构操作", "data": {"action_id": "made_up"}},
+                {"id": "end", "type": "end", "data": {}},
+            ],
+            "edges": [
+                {"source": "start", "target": "n1"},
+                {"source": "n1", "target": "end"},
+            ],
+        }
+        valid = {
+            "name": "可保存流程",
+            "nodes": [
+                {"id": "start", "type": "start", "data": {}},
+                {"id": "end", "type": "end", "data": {}},
+            ],
+            "edges": [{"source": "start", "target": "end"}],
+        }
+        prompts: list[str] = []
+
+        def fake_chat(_llm, messages, **_kwargs):
+            prompts.append(messages[-1]["content"])
+            payload = invalid if len(prompts) == 1 else valid
+            return {"content": json.dumps(payload, ensure_ascii=False)}
+
+        scenario = SimpleNamespace(id="scenario-workflow-retry", llm_config_id=None, description="")
+        llm = SimpleNamespace(id="llm-workflow-retry")
+        with (
+            patch.object(workflow_service.llm_service, "routable_configs", return_value=[llm]),
+            patch.object(workflow_service.llm_service, "chat", side_effect=fake_chat),
+        ):
+            result = workflow_service.generate_workflow(FakeDb(), scenario, "创建测试流程")
+
+        self.assertEqual(result["name"], "可保存流程")
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("没有可引用的正式操作", prompts[1])
+        self.assertIn("严禁虚构", prompts[0])
+
+    def test_generate_workflow_never_returns_persistently_invalid_reference(self) -> None:
+        class EmptyResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        class FakeDb:
+            info = {"tenant_id": "tenant-workflow-invalid"}
+
+            def execute(self, _statement):
+                return EmptyResult()
+
+        response = {
+            "content": json.dumps(
+                {
+                    "name": "错误流程",
+                    "nodes": [
+                        {"id": "start", "type": "start", "data": {}},
+                        {"id": "n1", "type": "action", "name": "虚构操作", "data": {"action_id": "made_up"}},
+                        {"id": "end", "type": "end", "data": {}},
+                    ],
+                    "edges": [
+                        {"source": "start", "target": "n1"},
+                        {"source": "n1", "target": "end"},
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        }
+        scenario = SimpleNamespace(id="scenario-workflow-invalid", llm_config_id=None, description="")
+        llm = SimpleNamespace(id="llm-workflow-invalid")
+        with (
+            patch.object(workflow_service.llm_service, "routable_configs", return_value=[llm]),
+            patch.object(workflow_service.llm_service, "chat", return_value=response) as chat_mock,
+        ):
+            with self.assertRaisesRegex(
+                workflow_service.WorkflowGenerationError,
+                "没有创建可确认草稿",
+            ):
+                workflow_service.generate_workflow(FakeDb(), scenario, "创建测试流程")
+
+        self.assertEqual(chat_mock.call_count, 3)
 
     def test_generated_ontology_extends_existing_type_and_keeps_relation_to_it(self) -> None:
         engine = create_engine("sqlite://")

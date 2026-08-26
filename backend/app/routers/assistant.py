@@ -8,15 +8,16 @@ import math
 import re
 import tempfile
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -28,6 +29,7 @@ from ..models import (
     AssistantCompilationJob,
     AssistantMessage,
     AssistantProposalApplication,
+    AssistantRouteDecision,
     AssistantThread,
     BusinessScenario,
     BucketFile,
@@ -58,6 +60,7 @@ from ..schemas import (
     ScenarioIn,
 )
 from ..services import (
+    assistant_orchestrator,
     assistant_compilation_job_service,
     doc_parser,
     datasource_service,
@@ -947,7 +950,11 @@ def _build_proposal(
         execution_status = str(data.get("execution_status") or "")
         proposal_status = (
             execution_status
-            if execution_status in {"completed", "completed_with_gaps"}
+            if execution_status in {
+                "completed",
+                "completed_with_gaps",
+                "completed_no_changes",
+            }
             else "in_progress"
         )
         requires_confirmation = bool(data.get("current_task_id"))
@@ -1350,10 +1357,13 @@ def _model_task_execution_summary(payload: dict[str, Any]) -> dict[str, Any]:
         for item in issue_groups
         if item.get("requires_followup")
     )
+    applied_count = statuses.count("applied")
     partial_count = statuses.count("partially_applied")
     draft_only_count = sum(
         status in _MODEL_TASK_DRAFT_ONLY_STATUSES for status in statuses
     )
+    empty_count = statuses.count("empty")
+    formal_write_task_count = applied_count + partial_count
     has_gaps = bool(
         blocking_issue_count
         or followup_issue_count
@@ -1363,21 +1373,41 @@ def _model_task_execution_summary(payload: dict[str, Any]) -> dict[str, Any]:
     status = (
         "completed_with_gaps"
         if final and has_gaps
+        else "completed_no_changes"
+        if final and formal_write_task_count == 0
         else "completed"
         if final
         else "waiting_for_confirmation"
         if current
         else "running"
     )
-    if final and has_gaps:
+    if final and formal_write_task_count == 0:
+        detail_parts = ["没有正式定义写入当前场景"]
+        if draft_only_count:
+            detail_parts.append(
+                f"{draft_only_count} 项任务的候选保留为停用、不可发布的待校验草稿"
+            )
+        if empty_count:
+            detail_parts.append(f"{empty_count} 项任务没有产生此类变更")
+        if issue_groups:
+            detail_parts.append(
+                f"仍有 {len(issue_groups)} 类问题或说明（共 {len(issues)} 项，已按根因合并）"
+            )
+        message = f"全部 {len(tasks)} 项任务均已推进；" + "；".join(detail_parts) + "。"
+    elif final and has_gaps:
         message = (
             f"全部 {len(tasks)} 项任务均已完成本轮确认；"
-            f"其中 {statuses.count('applied')} 项正式定义已应用、{partial_count} 项仅应用了安全部分、"
+            f"其中 {applied_count} 项任务的正式定义已写入、{partial_count} 项仅写入了安全部分、"
             f"{draft_only_count} 项没有可安全写入的正式定义，候选仍是停用且不可发布的待校验草稿；"
             f"仍有 {len(issue_groups)} 类问题或说明（共 {len(issues)} 项，已按根因合并）。"
         )
     elif final:
-        message = f"全部 {len(tasks)} 项任务均已完成，场景模型草稿已应用。"
+        message = (
+            f"全部 {len(tasks)} 项任务均已推进；"
+            f"{applied_count} 项任务的正式定义已写入当前场景"
+            + (f"，{empty_count} 项任务没有产生此类变更" if empty_count else "")
+            + "。"
+        )
     elif current:
         message = (
             f"计划仍在执行：已推进 {processed}/{len(tasks)} 项，当前停留在"
@@ -1397,10 +1427,10 @@ def _model_task_execution_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "message": message,
         "total_task_count": len(tasks),
         "completed_task_count": processed,
-        "applied_task_count": statuses.count("applied"),
+        "applied_task_count": applied_count,
         "partially_applied_task_count": partial_count,
         "draft_only_task_count": draft_only_count,
-        "empty_task_count": statuses.count("empty"),
+        "empty_task_count": empty_count,
         "current_task_id": str(current.get("id") or "") if current else "",
         "current_task_title": str(current.get("title") or "") if current else "",
         "remaining_issue_count": len(issues),
@@ -1410,6 +1440,21 @@ def _model_task_execution_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "remaining_issues": issues[:10],
         "resolution_hints": resolution_hints[:8],
     }
+
+
+def _model_run_context_status(summary: Any) -> str:
+    if isinstance(summary, dict) and summary.get("final"):
+        formal_write_task_count = (
+            _safe_nonnegative_int(summary.get("applied_task_count"))
+            + _safe_nonnegative_int(summary.get("partially_applied_task_count"))
+        )
+        if formal_write_task_count == 0:
+            return "no_changes"
+    return (
+        "success"
+        if isinstance(summary, dict) and summary.get("final")
+        else "waiting_confirmation"
+    )
 
 
 def _refresh_model_task_states(
@@ -1705,7 +1750,11 @@ def _refresh_model_task_states(
         result["next_action"] = {
             "type": "refine_model",
             "requires_confirmation": False,
-            "message": "可基于已应用模型和保留草稿继续补充资料或修正定义。",
+            "message": (
+                "本轮没有正式定义写入；可补充资料或调整要求后重新建模。"
+                if summary["status"] == "completed_no_changes"
+                else "可基于已写入模型和保留草稿继续补充资料或修正定义。"
+            ),
         }
     else:  # Defensive fallback; the malformed-plan branch above should own it.
         return finish_malformed_plan(
@@ -2191,7 +2240,11 @@ def _attach_draft_materialization(
     if str(result.get("status") or "") not in {"applied", "partially_applied"}:
         result["status"] = (
             execution_status
-            if execution_status in {"completed", "completed_with_gaps"}
+            if execution_status in {
+                "completed",
+                "completed_with_gaps",
+                "completed_no_changes",
+            }
             else "in_progress"
         )
     result["requires_confirmation"] = bool(payload.get("current_task_id"))
@@ -2548,7 +2601,11 @@ def _model_lifecycle_is_consistent(payload: Any) -> bool:
             and not actionable
             and not current_task_id
             and not summary_current
-            and execution_status in {"completed", "completed_with_gaps"}
+            and execution_status in {
+                "completed",
+                "completed_with_gaps",
+                "completed_no_changes",
+            }
             and action_type == "refine_model"
             and next_action.get("requires_confirmation") is False
         )
@@ -2788,10 +2845,17 @@ def _upgrade_saved_scenario_model_plan(
         message.proposal = copy.deepcopy(value)
         context.update({
             "status": (
-                "success"
+                _model_run_context_status(summary)
                 if summary.get("final")
-                or str(value.get("status") or "")
-                in {"applied", "partially_applied", "completed", "completed_with_gaps"}
+                else "success"
+                if str(value.get("status") or "")
+                in {
+                    "applied",
+                    "partially_applied",
+                    "completed",
+                    "completed_with_gaps",
+                    "completed_no_changes",
+                }
                 else "waiting_confirmation"
             ),
             "model_run_id": value.get("proposal_id"),
@@ -2953,7 +3017,11 @@ def _upgrade_saved_scenario_model_plan(
         "payload": upgraded_payload,
         "status": (
             execution_status
-            if execution_status in {"completed", "completed_with_gaps"}
+            if execution_status in {
+                "completed",
+                "completed_with_gaps",
+                "completed_no_changes",
+            }
             else "in_progress"
         ),
         "requires_confirmation": bool(upgraded_payload.get("current_task_id")),
@@ -3073,11 +3141,7 @@ def _reconcile_terminal_compilation_subscriptions(
         _update_compilation_subscription_messages(
             db,
             job,
-            status=(
-                "success"
-                if execution_summary.get("final")
-                else "waiting_confirmation"
-            ),
+            status=_model_run_context_status(execution_summary),
             content=(
                 str(execution_summary.get("message") or "").strip()
                 or "同一场景建模任务已经完成；请查看已连接的权威草稿。"
@@ -3425,11 +3489,7 @@ def _finalize_compilation_success(
             )
             if value
         )
-        message_status = (
-            "success"
-            if execution_summary.get("final")
-            else "waiting_confirmation"
-        )
+        message_status = _model_run_context_status(execution_summary)
         _save_message(
             finish_db,
             thread,
@@ -3865,8 +3925,9 @@ def _run_compilation_job_in_background(
         worker_db.rollback()
         _raise_if_compilation_lease_lost(heartbeat_lost)
         reply = (
-            "已根据业务资料完成本轮建模；所有可识别资源均已写入对应画布或模块，"
-            "不能运行的内容保持停用，具体缺口在最终总结中按根因合并。"
+            "已根据业务资料生成并持久化本轮完整业务模型的待审核草稿；"
+            "这不代表正式定义已经应用。任务需要逐项确认，不能安全写入的候选保持停用，"
+            "具体缺口在最终总结中按根因合并。"
         )
         final_thinking = [{
                 "id": "scenario-model",
@@ -4266,6 +4327,25 @@ def _assistant_message_out(
     context = message.context if isinstance(message.context, dict) else {}
     evidence = context.get("evidence") if isinstance(context.get("evidence"), dict) else {}
     uncertainties = evidence.get("uncertainties") if isinstance(evidence, dict) else []
+    routing = context.get("routing") if isinstance(context.get("routing"), dict) else {}
+    if (
+        message.role == "assistant"
+        and routing.get("source") == "model_fallback"
+        and not (message.proposal if isinstance(message.proposal, dict) else {})
+    ):
+        # Historic route failures sometimes continued into unconstrained chat,
+        # whose prose could contradict the persisted no-write route evidence.
+        # Keep the raw row for audit, but expose the authoritative route result.
+        public_notice = _route_fallback_public_notice()
+        result.content = public_notice
+        result.context = {**context, "status": "route_fallback"}
+        result.evidence = {
+            **evidence,
+            "uncertainties": [public_notice],
+        }
+        result.proposal = {}
+        result.action_preview = {}
+        return result
     if (
         message.role == "assistant"
         and context.get("draft_kind") == "scenario_model"
@@ -4299,282 +4379,337 @@ def _assistant_message_out(
     return result
 
 
-def _requests_existing_capability_change(message: str) -> bool:
-    """Conservatively detect edits/deletes that the add-only compiler cannot apply."""
-
-    text = str(message or "").lower()
-    update_terms = ("修改", "更新", "修正", "删除", "补充", "替换", "移除")
-    capability_terms = ("函数", "操作", "规则", "事件", "业务能力")
-    creation_terms = ("创建", "建立", "建设", "生成", "设计", "配置", "新增", "定义")
-    existing_terms = ("已有", "现有", "原有", "当前", "已存在")
-    definition_terms = ("定义", "配置", "名称", "描述", "条件", "逻辑", "契约")
-    update_positions = [
-        (index, term)
-        for term in update_terms
-        for index in range(len(text))
-        if text.startswith(term, index)
-    ]
-    capability_positions = [
-        (index, term)
-        for term in capability_terms
-        for index in range(len(text))
-        if text.startswith(term, index)
-    ]
-    for update_index, update_term in update_positions:
-        for capability_index, capability_term in capability_positions:
-            if update_index <= capability_index:
-                between = text[
-                    update_index + len(update_term):capability_index
-                ]
-                if len(between) > 30 or any(term in between for term in creation_terms):
-                    continue
-                clause_start = max(
-                    text.rfind(mark, 0, update_index) for mark in ("。", "；", ";", "\n")
-                ) + 1
-                clause_prefix = text[clause_start:update_index]
-                # “创建自动更新库存的规则” describes a new rule; it is not a
-                # request to overwrite a rule merely because the business verb
-                # 更新 appears before the resource noun.
-                if (
-                    any(term in clause_prefix for term in creation_terms)
-                    and not any(term in between for term in existing_terms)
-                    and not any(term in clause_prefix for term in capability_terms)
-                ):
-                    continue
-                return True
-            between = text[
-                capability_index + len(capability_term):update_index
-            ]
-            nearby = text[max(0, capability_index - 12):update_index]
-            if len(between) <= 30 and (
-                any(term in nearby for term in existing_terms)
-                or any(term in between for term in definition_terms)
-            ):
-                return True
-    return False
-
-
-def _requests_scenario_model_continuation(message: str) -> bool:
-    normalized = re.sub(r"\s+", "", str(message or "").lower())
-    if scenario_model_compiler.is_scenario_model_continuation_control(normalized):
-        return True
-    if any(marker in normalized for marker in (
-        "继续优化", "继续完善", "继续修正", "继续建模", "重新校验",
-        "重新编译", "基于当前草稿", "根据当前草稿", "当前staging草稿",
-        "当前workingdraft", "基于已修改草稿", "基于修订草稿",
-    )):
-        return True
-    draft_terms = (
-        "草稿", "staging", "workingdraft", "当前模型", "现有模型", "已修改模型",
-    )
-    continuation_actions = (
-        "继续", "完善", "优化", "修正", "修改", "校验", "验证", "编译",
-        "建模", "往下做", "接着做", "补全", "迭代",
-        "做完", "完成",
-    )
-    if (
-        any(term in normalized for term in draft_terms)
-        and any(term in normalized for term in continuation_actions)
-    ):
-        return True
-    model_targets = (
-        "场景模型", "业务模型", "模型", "本体", "对象类型", "映射", "函数", "操作",
-        "规则", "事件", "工作流", "流程", "建模任务",
-    )
-    deictic_edits = (
-        "刚才的修改", "我的修改", "上述修改", "前面的修改", "已做的修改",
-    )
-    if (
-        any(term in normalized for term in continuation_actions)
-        and (
-            any(term in normalized for term in model_targets)
-            or any(term in normalized for term in deictic_edits)
-        )
-    ):
-        return True
-    authoring_actions = (
-        "新增", "增加", "添加", "再加", "补一个", "补充", "建立", "创建",
-        "定义", "修改", "修正", "调整", "删除", "移除", "重命名", "更新",
-    )
-    authoring_targets = (
-        "场景模型", "业务模型", "本体", "对象类型", "对象", "实体", "属性",
-        "关系", "实例", "数据映射", "映射", "函数", "操作", "业务能力",
-        "规则", "事件", "工作流", "流程", "节点", "分支", "审批",
-    )
-    if (
-        any(term in normalized for term in authoring_actions)
-        and any(term in normalized for term in authoring_targets)
-    ):
-        return True
-    # With an active model, a short "add one X" follow-up names a new business
-    # object even when the user omits the word 对象. Keep platform resources on
-    # their dedicated routes.
-    if re.search(r"(?:新增|增加|添加|再加|补充?)一个[^，。；!?！？]{1,30}$", normalized):
-        return not any(term in normalized for term in (
-            "数据源", "附件", "文档", "用户", "成员", "模型配置", "llm",
-        ))
-    return False
-
-
-def _intent(
-    message: str,
-    mode: str,
-    draft_kind: str = "auto",
-    *,
-    has_active_model_drafts: bool = False,
-) -> str:
-    # Explicit modes take precedence over words in the prompt.  In particular,
-    # an ``explain`` request that happens to mention “创建/映射/执行” must never
-    # be routed into a proposal generator, and chat-level apply/execute never
-    # cross their dedicated governance boundaries.
-    if mode == "explain":
-        return "explain"
-    if mode == "apply":
-        return "apply_guidance"
-    if mode == "execute":
-        return "execute_guidance"
-    text = message.lower()
-    if has_active_model_drafts and _requests_scenario_model_continuation(text):
-        # A normal follow-up is the collaboration entry point after users edit
-        # staging.  It must beat the legacy add-only capability update guard.
-        return "scenario_model"
-    if _requests_existing_capability_change(text):
-        # Functions/actions/rules/events are deliberately add-only in the
-        # compound compiler.  This guard also precedes explicit draft presets,
-        # so the visible "capabilities" task cannot spend a model call on a
-        # proposal that deterministic preflight must reject.
-        return "capability_update_guidance"
-    if mode == "draft" and draft_kind != "auto":
-        return draft_kind
-    stripped = text.strip()
-    pure_explanation = stripped.startswith((
-        "什么是", "请解释", "解释一下", "请介绍", "介绍一下", "如何", "怎么",
-        "为什么", "有哪些", "请说明什么", "请说明如何", "请说明怎么",
-    )) or any(marker in stripped for marker in ("是什么", "有什么区别", "有哪些步骤", "如何理解"))
-    # Route compound authoring requests to the already-governed full model
-    # compiler.  Previously this intent was reachable only through an internal
-    # request field that the UI never exposed, so a document mentioning an
-    # ontology plus rules/workflows was silently reduced to one ontology draft.
-    compound_markers = (
-        "完整场景建模", "完整业务模型", "完整建模", "全量建模", "全部建模",
-        "端到端建模", "一体化建模", "场景整体建模", "场景建模",
-    )
-    authoring_verbs = (
-        "创建", "建立", "建设", "生成", "设计", "配置", "编排", "实现", "完成",
-        "编译", "修改", "更新", "修正", "进行", "开展", "搭建", "补充", "新增",
-    )
-    capability_creation_verbs = (
-        "创建", "建立", "建设", "生成", "设计", "配置", "实现", "搭建", "新增", "定义",
-    )
-    resource_groups = (
-        ("本体", "实体", "对象类型", "属性", "关系类型", "数据模型"),
-        ("数据映射", "字段映射", "关系映射", "列映射"),
-        ("函数", "操作", "规则", "事件", "业务能力"),
-        ("工作流", "审批流", "流程", "自动化"),
-    )
-    matched_groups = sum(any(term in text for term in group) for group in resource_groups)
-    ontology_is_context_only = (
-        any(term in text for term in ("基于已有本体", "根据已有本体", "结合已有本体", "使用已有本体"))
-        and not any(term in text for term in (
-            "本体建模", "建立本体", "构建本体", "创建本体", "生成本体", "设计本体",
-            "修改本体", "更新本体",
-        ))
-    )
-    if ontology_is_context_only and any(term in text for term in resource_groups[0]):
-        matched_groups = max(0, matched_groups - 1)
-    mapping_is_context_only = (
-        any(term in text for term in (
-            "后续数据映射", "后续字段映射", "数据映射所需", "字段映射所需",
-            "便于数据映射", "为数据映射准备",
-        ))
-        and not any(term in text for term in (
-            "创建数据映射", "建立数据映射", "生成数据映射", "配置数据映射",
-            "创建字段映射", "建立字段映射", "生成字段映射", "配置字段映射",
-        ))
-    )
-    if mapping_is_context_only and any(term in text for term in resource_groups[1]):
-        matched_groups = max(0, matched_groups - 1)
-    has_authoring_verb = any(term in text for term in authoring_verbs)
-    capability_terms_present = any(
-        term in text for term in ("函数", "操作", "规则", "事件", "业务能力")
-    )
-    capability_authoring = capability_terms_present and any(
-        term in text for term in capability_creation_verbs
-    )
-    compound_marker_requested = any(marker in text for marker in compound_markers) and (
-        has_authoring_verb or stripped in compound_markers
-    )
-    if not pure_explanation and (
-        compound_marker_requested
-        or (matched_groups >= 2 and has_authoring_verb)
-        or capability_authoring
-    ):
-        return "scenario_model"
-    if pure_explanation:
-        return "chat"
-    if any(k in text for k in ("创建场景", "新建场景", "建立场景", "业务场景草稿")):
-        return "scenario"
-    ontology_requested = any(k in text for k in ("本体", "实体", "关系", "建模", "数据模型", "对象类型"))
-    explicit_ontology_requested = any(
-        k in text
-        for k in (
-            "本体建模",
-            "本体模型",
-            "建立本体",
-            "构建本体",
-            "创建本体",
-            "生成本体",
-            "设计本体",
-        )
-    )
-    mapping_requested = any(k in text for k in ("数据映射", "字段映射", "映射草稿", "列映射"))
-    # An ontology brief commonly asks the model to preserve keys for a later
-    # data-mapping step.  That supporting phrase must not turn the whole draft
-    # into a mapping proposal.  A mapping-only request still routes normally.
-    if mapping_requested and not ontology_requested:
-        return "mapping"
-    # 复合实施文档通常会在本体建模要求中同时提到规则、事件和工作流；
-    # 这些下游章节不应把整份附件误送到单工作流生成器。
-    if explicit_ontology_requested:
-        return "ontology"
-    if any(k in text for k in ("工作流", "流程", "编排", "审批流", "自动化")):
-        return "workflow"
-    if mode == "draft" or ontology_requested:
-        return "ontology"
-    return "chat"
-
-
-def _request_intent(
+def _assistant_planner_context(
     db: Session,
     scenario: BusinessScenario | None,
-    *,
-    message: str,
-    mode: str,
-    draft_kind: str,
 ) -> str:
-    has_active = bool(
-        scenario
-        and _requests_scenario_model_continuation(message)
-        and scenario_model_draft_service.has_active_working_drafts(db, scenario)
+    if scenario is None:
+        return "当前没有绑定业务场景。"
+    visible_workflows = [
+        item for item in list(getattr(scenario, "workflows", []) or [])
+        if permission_service.check_workflow(db, item, "read").allowed
+    ]
+    visible_actions = [
+        item for item in list(getattr(scenario, "actions", []) or [])
+        if permission_service.check_action(db, item, "read").allowed
+    ]
+    return (
+        f"当前场景：{scenario.name}。"
+        f"正式资源统计：对象 {len(list(getattr(scenario, 'entities', []) or []))}，"
+        f"关系 {len(list(getattr(scenario, 'relations', []) or []))}，"
+        f"函数 {len(list(getattr(scenario, 'function_definitions', []) or []))}，"
+        f"操作 {len(visible_actions)}，"
+        f"规则 {len(list(getattr(scenario, 'rules', []) or []))}，"
+        f"事件 {len(list(getattr(scenario, 'events', []) or []))}，"
+        f"工作流 {len(visible_workflows)}。"
     )
-    return _intent(
-        message,
-        mode,
-        draft_kind,
-        has_active_model_drafts=has_active,
+
+
+def _request_route_plan(
+    db: Session,
+    scenario: BusinessScenario | None,
+    thread: AssistantThread | None,
+    payload: AssistantChatRequest,
+    *,
+    has_attachments: bool,
+    request_id: str,
+) -> assistant_orchestrator.AssistantRoutePlan:
+    history = _history_messages(db, thread, "") if thread is not None else []
+    active_draft_scopes = (
+        scenario_model_draft_service.active_working_draft_scopes(db, scenario)
+        if scenario
+        else []
     )
+    active_drafts = bool(active_draft_scopes)
+    previous_trace = db.info.get("llm_trace_context")
+    db.info["llm_trace_context"] = {
+        **dict(previous_trace or {}),
+        "correlation_id": request_id,
+        "scenario_id": scenario.id if scenario else None,
+    }
+    try:
+        return assistant_orchestrator.plan_assistant_request(
+            llm=_llm(db),
+            db=db,
+            message=payload.message,
+            history=history,
+            page=payload.page,
+            path=payload.path,
+            mode=payload.mode,
+            preferred_scope=payload.draft_kind,
+            has_scenario=scenario is not None,
+            has_attachments=has_attachments,
+            has_active_model_drafts=active_drafts,
+            active_draft_scopes=active_draft_scopes,
+            context_summary=_assistant_planner_context(db, scenario),
+        )
+    finally:
+        if previous_trace is None:
+            db.info.pop("llm_trace_context", None)
+        else:
+            db.info["llm_trace_context"] = previous_trace
+
+
+def _assistant_route_fingerprint(
+    payload: AssistantChatRequest,
+    *,
+    scope_key: str,
+) -> str:
+    canonical = {
+        "message": payload.message,
+        "scope_key": scope_key,
+        "scenario_id": payload.scenario_id or "",
+        "page": payload.page,
+        "selection": payload.selection,
+        "attachment_ids": sorted(set(payload.attachment_ids)),
+        "llm_config_id": payload.llm_config_id or "",
+        "skill_ids": sorted(set(payload.skill_ids)),
+        "mcp_ids": sorted(set(payload.mcp_ids)),
+        "mode": payload.mode,
+        "draft_kind": payload.draft_kind,
+    }
+    return hashlib.sha256(json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")).hexdigest()
+
+
+def _route_plan_from_claim(claim: AssistantRouteDecision) -> assistant_orchestrator.AssistantRoutePlan:
+    try:
+        return assistant_orchestrator.AssistantRoutePlan.model_validate(claim.route_plan)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, "已保存的助手语义决策无效，请使用新的 request_id 重试") from exc
+
+
+def _ensure_route_thread(
+    db: Session,
+    *,
+    thread_id: str,
+    scope_key: str,
+    payload: AssistantChatRequest,
+) -> None:
+    existing = db.execute(
+        select(AssistantThread).where(
+            AssistantThread.id == thread_id,
+            AssistantThread.tenant_id == _tenant(db),
+            AssistantThread.created_by_user_id == _current_user_id(db),
+        )
+    ).scalars().first()
+    if existing is not None:
+        _assert_thread_scope(existing, payload.scenario_id, payload.page, payload.path)
+        return
+    db.add(AssistantThread(
+        id=thread_id,
+        tenant_id=_tenant(db),
+        created_by_user_id=_current_user_id(db),
+        scenario_id=payload.scenario_id,
+        scope_key=scope_key,
+        title="新的助手任务",
+    ))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = db.execute(
+            select(AssistantThread).where(
+                AssistantThread.id == thread_id,
+                AssistantThread.tenant_id == _tenant(db),
+                AssistantThread.created_by_user_id == _current_user_id(db),
+            )
+        ).scalars().first()
+        if existing is None:
+            raise HTTPException(409, "助手会话初始化冲突，请使用新的 request_id 重试")
+        _assert_thread_scope(existing, payload.scenario_id, payload.page, payload.path)
+
+
+def _claimed_request_route_plan(
+    db: Session,
+    scenario: BusinessScenario | None,
+    thread: AssistantThread | None,
+    payload: AssistantChatRequest,
+    *,
+    scope_key: str,
+    request_id: str,
+    pending_thread_id: str,
+) -> tuple[
+    assistant_orchestrator.AssistantRoutePlan,
+    str,
+    list[AssistantAttachment],
+]:
+    """Single-flight one semantic decision and freeze it before generation."""
+    fingerprint = _assistant_route_fingerprint(payload, scope_key=scope_key)
+    tenant_id = _tenant(db)
+    user_id = _current_user_id(db)
+    candidate_thread_id = thread.id if thread is not None else pending_thread_id
+    # Reject unavailable attachments before creating a durable routing claim.
+    attachments = _safe_attachment_ids(
+        db,
+        payload.attachment_ids,
+        thread_id=candidate_thread_id,
+        consume=False,
+    )
+    wait_deadline = time.monotonic() + 22
+    lease_token = uuid.uuid4().hex
+    claim: AssistantRouteDecision | None = None
+    owns_claim = False
+
+    while True:
+        claim = db.execute(
+            select(AssistantRouteDecision).where(
+                AssistantRouteDecision.tenant_id == tenant_id,
+                AssistantRouteDecision.created_by_user_id == user_id,
+                AssistantRouteDecision.request_id == request_id,
+            )
+        ).scalars().first()
+        if claim is None:
+            claim = AssistantRouteDecision(
+                tenant_id=tenant_id,
+                created_by_user_id=user_id,
+                request_id=request_id,
+                request_fingerprint=fingerprint,
+                scenario_id=payload.scenario_id,
+                thread_id=candidate_thread_id,
+                status="planning",
+                route_plan={},
+                lease_token=lease_token,
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=20),
+            )
+            db.add(claim)
+            try:
+                db.commit()
+                owns_claim = True
+                break
+            except IntegrityError:
+                db.rollback()
+                continue
+
+        if claim.request_fingerprint != fingerprint:
+            raise HTTPException(409, "request_id 已用于不同的助手输入，请重新发送")
+        if payload.thread_id and claim.thread_id != payload.thread_id:
+            raise HTTPException(409, "request_id 已绑定到另一助手会话")
+        if thread is not None and claim.thread_id != thread.id:
+            raise HTTPException(409, "request_id 与当前助手会话不一致")
+        candidate_thread_id = claim.thread_id
+        attachments = _safe_attachment_ids(
+            db,
+            payload.attachment_ids,
+            thread_id=candidate_thread_id,
+            consume=False,
+        )
+        if claim.status == "decided":
+            _ensure_route_thread(
+                db,
+                thread_id=candidate_thread_id,
+                scope_key=scope_key,
+                payload=payload,
+            )
+            return _route_plan_from_claim(claim), candidate_thread_id, attachments
+
+        lease_expires_at = claim.lease_expires_at
+        if lease_expires_at.tzinfo is None:
+            lease_expires_at = lease_expires_at.replace(tzinfo=timezone.utc)
+        if lease_expires_at <= datetime.now(timezone.utc):
+            lease_token = uuid.uuid4().hex
+            takeover = db.execute(
+                update(AssistantRouteDecision)
+                .where(
+                    AssistantRouteDecision.id == claim.id,
+                    AssistantRouteDecision.status == "planning",
+                    AssistantRouteDecision.lease_token == claim.lease_token,
+                )
+                .values(
+                    lease_token=lease_token,
+                    lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=20),
+                )
+            )
+            db.commit()
+            if takeover.rowcount == 1:
+                claim = db.get(AssistantRouteDecision, claim.id)
+                owns_claim = True
+                break
+            continue
+        if time.monotonic() >= wait_deadline:
+            db.rollback()
+            raise HTTPException(409, "同一助手请求仍在进行语义规划，请稍后重试")
+        db.rollback()
+        time.sleep(0.05)
+
+    assert claim is not None and owns_claim
+    route_plan = _request_route_plan(
+        db,
+        scenario,
+        thread,
+        payload,
+        has_attachments=bool(attachments),
+        request_id=request_id,
+    )
+    persisted = db.execute(
+        update(AssistantRouteDecision)
+        .where(
+            AssistantRouteDecision.id == claim.id,
+            AssistantRouteDecision.status == "planning",
+            AssistantRouteDecision.lease_token == lease_token,
+        )
+        .values(
+            status="decided",
+            route_plan=route_plan.model_dump(mode="json"),
+            lease_expires_at=datetime.now(timezone.utc),
+        )
+    )
+    db.commit()
+    if persisted.rowcount != 1:
+        replay = db.get(AssistantRouteDecision, claim.id)
+        if replay is None or replay.status != "decided":
+            raise HTTPException(409, "助手语义规划所有权已变化，请稍后重试")
+        route_plan = _route_plan_from_claim(replay)
+    _ensure_route_thread(
+        db,
+        thread_id=candidate_thread_id,
+        scope_key=scope_key,
+        payload=payload,
+    )
+    return route_plan, candidate_thread_id, attachments
 
 
 def _mode_safety_context(mode: str) -> str:
     if mode == "explain":
         return "\n当前是解释模式：只读分析已授权上下文，不生成变更清单，不应用变更，不触发执行。"
     if mode == "draft":
-        return "\n当前是草稿模式：最多生成待审阅变更清单，确认前不得写入正式数据。"
+        return "\n当前选择了建模范围偏好：只有本条语义明确要求建设时才生成待审阅变更；提问仍直接回答。"
     if mode == "apply":
         return "\n当前是应用引导模式：聊天不能写入，只能引导用户在已保存的提案卡片显式确认。"
     if mode == "execute":
-        return "\n当前是执行引导模式：聊天不能触发副作用，只能说明影响、权限、预演和审批入口。"
-    return "\n当前是兼容问答模式：回答问题或生成待确认草稿，但不得直接应用或执行。"
+        return "\n当前选择了安全预演偏好：明确要求预演时只检查影响和权限；普通问题仍直接回答。"
+    return "\n当前是智能协助：按本条语义回答问题或准备待确认草稿，但不得直接应用或执行。"
+
+
+def _route_fallback_public_notice() -> str:
+    return (
+        "这次语义规划没有完成，我无法安全判断你是在提问还是要求建设内容。"
+        "本条已停止处理，没有调用回答或建模模型，也没有生成、应用或保存任何变更。"
+        "请重新发送本条请求；如果仍然失败，请先检查当前默认模型的连接和结构化输出能力。"
+    )
+
+
+def _route_fallback_notice(
+    route_plan: assistant_orchestrator.AssistantRoutePlan,
+) -> str:
+    return (
+        _route_fallback_public_notice()
+        if route_plan.source == "model_fallback"
+        else ""
+    )
+
+
+def _read_only_chat_contract() -> str:
+    return (
+        "\n本轮进入普通问答分支，平台没有创建 proposal、编译任务或应用结果。"
+        "可以回答和解释，但不得声称本轮已经创建、保存、写入、应用或执行了任何平台资源；"
+        "若用户要求的是建设或变更，应明确说明本轮没有产生变更。"
+    )
 
 
 def _assistant_evidence(
@@ -4597,6 +4732,10 @@ def _assistant_evidence(
         "capability_update_guidance": (
             "unsupported_capability_update_read_only",
             "已有函数、操作、规则和事件的修改或删除不进入只支持新增的复合编译器",
+        ),
+        "change_guidance": (
+            "existing_definition_change_read_only",
+            "已有正式定义的修改或删除必须进入专用编辑与确认流程，聊天不会生成替代资源",
         ),
         "explain": ("read_only", "解释模式只读取已授权上下文"),
         "chat": ("read_only", "问答不直接修改或执行平台资源"),
@@ -5117,6 +5256,12 @@ def _fallback_reply(intent: str, scenario: BusinessScenario | None) -> str:
             "请在场景建模页的对应资源编辑入口修改已有定义；"
             "若要创建新能力，请明确使用“新增”或“创建”后重新提交。"
         )
+    if intent == "change_guidance":
+        return (
+            "我理解你希望修改或删除已有正式定义。聊天不会把这类请求伪装成一个新的资源，"
+            "也不会直接覆盖现有配置。请在对应资源的编辑入口核对当前定义并提交；"
+            "涉及正式变更时仍需通过原有权限和确认流程。"
+        )
     if intent == "explain":
         if scenario:
             return (
@@ -5158,6 +5303,7 @@ def _safe_attachment_ids(
     ids: list[str],
     *,
     thread_id: str,
+    consume: bool = True,
 ) -> list[AssistantAttachment]:
     if not ids:
         return []
@@ -5193,13 +5339,43 @@ def _safe_attachment_ids(
         attachments.append(attachment)
     if invalid_owned or len(owned) != len(unique_ids):
         raise HTTPException(409, "附件不可用、已过期或无权访问，请重新上传")
+    if consume:
+        _consume_attachments(db, attachments, thread_id=thread_id)
+    return attachments
+
+
+def _consume_attachments(
+    db: Session,
+    attachments: list[AssistantAttachment],
+    *,
+    thread_id: str,
+) -> None:
+    if not attachments:
+        return
     _purge_expired_attachments(db)
     consumed_at = datetime.now(timezone.utc)
+    attachment_ids = [attachment.id for attachment in attachments]
+    claimed = db.execute(
+        update(AssistantAttachment)
+        .where(
+            AssistantAttachment.id.in_(attachment_ids),
+            AssistantAttachment.tenant_id == _tenant(db),
+            AssistantAttachment.created_by_user_id == _current_user_id(db),
+            AssistantAttachment.expires_at > consumed_at,
+            or_(
+                AssistantAttachment.thread_id.is_(None),
+                AssistantAttachment.thread_id == thread_id,
+            ),
+        )
+        .values(thread_id=thread_id, consumed_at=consumed_at)
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != len(attachment_ids):
+        raise HTTPException(409, "附件已被另一条消息占用，请重新上传")
     for attachment in attachments:
         attachment.thread_id = thread_id
         attachment.consumed_at = consumed_at
     db.flush()
-    return attachments
 
 
 def _save_message(
@@ -5497,11 +5673,7 @@ def get_compilation_job_result(
             else {}
         )
         context.update({
-            "status": (
-                "success"
-                if execution_summary.get("final")
-                else "waiting_confirmation"
-            ),
+            "status": _model_run_context_status(execution_summary),
             "model_run_id": canonical_proposal.get("proposal_id"),
             "run_revision": _safe_nonnegative_int(
                 canonical_proposal.get("run_revision")
@@ -5543,6 +5715,13 @@ def delete_thread(
 ):
     thread = _thread(db, thread_id)
     _assert_thread_scope(thread, scenario_id, page, path)
+    db.execute(
+        delete(AssistantRouteDecision).where(
+            AssistantRouteDecision.tenant_id == _tenant(db),
+            AssistantRouteDecision.created_by_user_id == _current_user_id(db),
+            AssistantRouteDecision.thread_id == thread.id,
+        )
+    )
     db.delete(thread)
     db.commit()
     return Msg(message="助手会话已删除")
@@ -5622,8 +5801,36 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
     scope_key = _context_scope(payload.scenario_id, payload.path)
     if thread:
         _assert_thread_scope(thread, payload.scenario_id, payload.page, payload.path)
+    pending_thread_id = thread.id if thread is not None else uuid.uuid4().hex
+    # Idempotency belongs to one explicit send, not to the user's wording.
+    effective_request_id = str(payload.request_id or uuid.uuid4().hex)
+    route_plan, pending_thread_id, attachments = _claimed_request_route_plan(
+        db,
+        scenario,
+        thread,
+        payload,
+        scope_key=scope_key,
+        request_id=effective_request_id,
+        pending_thread_id=pending_thread_id,
+    )
+    if thread is None:
+        thread = db.execute(
+            select(AssistantThread).where(
+                AssistantThread.id == pending_thread_id,
+                AssistantThread.tenant_id == _tenant(db),
+                AssistantThread.created_by_user_id == _current_user_id(db),
+            )
+        ).scalars().first()
+        if thread is not None:
+            _assert_thread_scope(thread, payload.scenario_id, payload.page, payload.path)
+    intent = route_plan.intent
+    if intent == "scenario_model" and scenario:
+        permission_service.require_scenario_permission(
+            db, scenario, "write", message="完整场景建模需要当前场景的编辑权限"
+        )
     if not thread:
         thread = AssistantThread(
+            id=pending_thread_id,
             tenant_id=_tenant(db),
             created_by_user_id=_current_user_id(db),
             scenario_id=payload.scenario_id,
@@ -5634,19 +5841,8 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         db.flush()
     elif thread.title == "新的助手任务":
         thread.title = payload.message[:80] or thread.title
-
-    intent = _request_intent(
-        db,
-        scenario,
-        message=payload.message,
-        mode=payload.mode,
-        draft_kind=payload.draft_kind,
-    )
-    if intent == "scenario_model" and scenario:
-        permission_service.require_scenario_permission(
-            db, scenario, "write", message="完整场景建模需要当前场景的编辑权限"
-        )
-    attachments = _safe_attachment_ids(db, payload.attachment_ids, thread_id=thread.id)
+    if attachments:
+        _consume_attachments(db, attachments, thread_id=thread.id)
     attachment_text, sources = _attachment_context(
         attachments,
         include_text=intent != "scenario_model",
@@ -5654,11 +5850,6 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
     )
     rag_context, rag_sources = _authorized_rag_context(db, scenario, payload.message)
     sources = [*sources, *rag_sources]
-    # Idempotency belongs to one explicit send, not to the user's wording.
-    # Modern clients reuse their request id only when retrying the same network
-    # operation.  A legacy client without one receives a fresh server id so a
-    # later identical prompt can never replay an old terminal compilation.
-    effective_request_id = str(payload.request_id or uuid.uuid4().hex)
     context = {
         "request_id": effective_request_id,
         "page": payload.page,
@@ -5670,6 +5861,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         "llm_config_id": payload.llm_config_id,
         "skill_ids": payload.skill_ids,
         "mcp_ids": payload.mcp_ids,
+        "routing": route_plan.public_context(),
     }
     attachment_meta = [{"id": x.id, "filename": x.filename, "status": x.status} for x in attachments]
     user_message = _save_message(db, thread, "user", payload.message, context, attachment_meta)
@@ -5704,6 +5896,12 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 "不直接修改数据，不绕过权限，不把 SQL 当作业务本体。回答简洁、可执行，"
                 "必要时用问题卡片澄清。\n\n"
                 + _mode_safety_context(payload.mode)
+                + (
+                    f"\n语义规划边界：{route_plan.policy_note}"
+                    if route_plan.policy_note
+                    else ""
+                )
+                + _read_only_chat_contract()
                 + _scenario_context(db, scenario)
                 + (f"\n\n当前页面：{payload.page}（{payload.path}）" if payload.page else "")
                 + (f"\n当前选择：{payload.selection}" if payload.selection else "")
@@ -5758,6 +5956,13 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 "evidence": evidence,
                 "action_preview": action_preview,
             }
+            if status == "route_fallback":
+                assistant_context["status"] = "route_fallback"
+            elif proposal.get("kind") == "scenario_model":
+                run_summary = (
+                    (proposal.get("payload") or {}).get("execution_summary") or {}
+                )
+                assistant_context["status"] = _model_run_context_status(run_summary)
             _save_message(
                 save_db,
                 saved_thread,
@@ -5811,6 +6016,9 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         action_preview: dict[str, Any] = {}
         suggestions: list[str] = []
         saved_status = "success"
+        route_notice = _route_fallback_notice(route_plan)
+        if route_notice:
+            saved_status = "route_fallback"
         compilation_queued = False
         owns_compilation_job = False
         try:
@@ -5836,14 +6044,23 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
             yield progress({"id": "context", "title": "理解当前上下文", "detail": "正在读取当前页面、业务场景和选中对象。", "status": "running"})
             yield progress({"id": "context", "title": "理解当前上下文", "detail": "当前上下文已准备完成。", "status": "done"})
 
-            if intent in {"apply_guidance", "capability_update_guidance"}:
+            if route_notice:
+                reply = route_notice
+                yield progress({
+                    "id": "routing",
+                    "title": "语义规划未完成",
+                    "detail": "已停止本轮处理，未进入问答、建模或应用链路。",
+                    "status": "error",
+                })
+                yield _sse("token", reply)
+            elif intent in {"apply_guidance", "capability_update_guidance", "change_guidance"}:
                 reply = _fallback_reply(intent, scenario)
                 yield progress({
                     "id": "governance",
                     "title": "确认安全边界",
                     "detail": (
                         "已转为已有业务能力的只读修改指导，未生成可应用提案。"
-                        if intent == "capability_update_guidance"
+                        if intent in {"capability_update_guidance", "change_guidance"}
                         else "已提供变更确认或执行预演的受控入口说明。"
                     ),
                     "status": "done",
@@ -6224,14 +6441,17 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 sources=sources,
                 llm_used=bool(
                     llm
+                    and not route_notice
                     and not compilation_queued
                     and intent not in (
                         "apply_guidance",
                         "execute_guidance",
                         "capability_update_guidance",
+                        "change_guidance",
                     )
                 ),
                 preview=action_preview,
+                uncertainties=[route_notice] if route_notice else [],
             )
             if not compilation_queued:
                 persist_result(reply, proposal, thinking, saved_status, evidence, action_preview)
@@ -6302,6 +6522,13 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                         exc
                     )
                 )
+            elif isinstance(exc, workflow_service.WorkflowGenerationError):
+                public_error = (
+                    assistant_compilation_job_service.PublicCompilationError(
+                        "workflow_generation_invalid",
+                        str(exc),
+                    )
+                )
             else:
                 public_error = (
                     assistant_compilation_job_service.PublicCompilationError(
@@ -6365,8 +6592,35 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     scope_key = _context_scope(payload.scenario_id, payload.path)
     if thread:
         _assert_thread_scope(thread, payload.scenario_id, payload.page, payload.path)
+    pending_thread_id = thread.id if thread is not None else uuid.uuid4().hex
+    effective_request_id = str(payload.request_id or uuid.uuid4().hex)
+    route_plan, pending_thread_id, attachments = _claimed_request_route_plan(
+        db,
+        scenario,
+        thread,
+        payload,
+        scope_key=scope_key,
+        request_id=effective_request_id,
+        pending_thread_id=pending_thread_id,
+    )
+    if thread is None:
+        thread = db.execute(
+            select(AssistantThread).where(
+                AssistantThread.id == pending_thread_id,
+                AssistantThread.tenant_id == _tenant(db),
+                AssistantThread.created_by_user_id == _current_user_id(db),
+            )
+        ).scalars().first()
+        if thread is not None:
+            _assert_thread_scope(thread, payload.scenario_id, payload.page, payload.path)
+    intent = route_plan.intent
+    if intent == "scenario_model" and scenario:
+        permission_service.require_scenario_permission(
+            db, scenario, "write", message="完整场景建模需要当前场景的编辑权限"
+        )
     if not thread:
         thread = AssistantThread(
+            id=pending_thread_id,
             tenant_id=_tenant(db),
             created_by_user_id=_current_user_id(db),
             scenario_id=payload.scenario_id,
@@ -6377,19 +6631,8 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         db.flush()
     elif thread.title == "新的助手任务":
         thread.title = payload.message[:80] or thread.title
-
-    intent = _request_intent(
-        db,
-        scenario,
-        message=payload.message,
-        mode=payload.mode,
-        draft_kind=payload.draft_kind,
-    )
-    if intent == "scenario_model" and scenario:
-        permission_service.require_scenario_permission(
-            db, scenario, "write", message="完整场景建模需要当前场景的编辑权限"
-        )
-    attachments = _safe_attachment_ids(db, payload.attachment_ids, thread_id=thread.id)
+    if attachments:
+        _consume_attachments(db, attachments, thread_id=thread.id)
     attachment_text, sources = _attachment_context(
         attachments,
         include_text=intent != "scenario_model",
@@ -6397,7 +6640,6 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     )
     rag_context, rag_sources = _authorized_rag_context(db, scenario, payload.message)
     sources = [*sources, *rag_sources]
-    effective_request_id = str(payload.request_id or uuid.uuid4().hex)
     context = {
         "request_id": effective_request_id,
         "page": payload.page,
@@ -6409,6 +6651,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         "llm_config_id": payload.llm_config_id,
         "skill_ids": payload.skill_ids,
         "mcp_ids": payload.mcp_ids,
+        "routing": route_plan.public_context(),
     }
     attachment_meta = [{"id": x.id, "filename": x.filename, "status": x.status} for x in attachments]
     user_message = _save_message(db, thread, "user", payload.message, context, attachment_meta)
@@ -6419,6 +6662,9 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     questions: list[dict[str, Any]] = []
     action_preview: dict[str, Any] = {}
     error_uncertainties: list[str] = []
+    route_notice = _route_fallback_notice(route_plan)
+    if route_notice:
+        error_uncertainties.append(route_notice)
     assistant_message_id = uuid.uuid4().hex
     tenant_id = _tenant(db)
     user_id = _current_user_id(db)
@@ -6436,6 +6682,10 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             message_id=assistant_message_id,
         )
         db.flush()
+    # Match the streamed transport: persist the user's accepted send before
+    # any downstream generation model runs, so SQLite does not hold a write
+    # transaction while waiting on the provider.
+    db.commit()
     suggestions = (
         ["创建业务场景草稿", "说明建模所需资料"]
         if not scenario
@@ -6443,7 +6693,9 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     )
 
     try:
-        if intent in {"apply_guidance", "capability_update_guidance"}:
+        if route_notice:
+            reply = route_notice
+        elif intent in {"apply_guidance", "capability_update_guidance", "change_guidance"}:
             reply = _fallback_reply(intent, scenario)
         elif intent == "execute_guidance":
             action_preview, question, reply = _assistant_action_preview(
@@ -6694,6 +6946,12 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                             "不直接修改数据，不绕过权限，不把 SQL 当作业务本体。回答简洁、可执行，"
                             "必要时用问题卡片澄清。\n\n"
                             + _mode_safety_context(payload.mode)
+                            + (
+                                f"\n语义规划边界：{route_plan.policy_note}"
+                                if route_plan.policy_note
+                                else ""
+                            )
+                            + _read_only_chat_contract()
                             + _scenario_context(db, scenario)
                             + (f"\n\n当前页面：{payload.page}（{payload.path}）" if payload.page else "")
                             + (f"\n当前选择：{payload.selection}" if payload.selection else "")
@@ -6716,6 +6974,11 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         if intent == "scenario_model":
             public_error = (
                 assistant_compilation_job_service.public_compilation_error(exc)
+            )
+        elif isinstance(exc, workflow_service.WorkflowGenerationError):
+            public_error = assistant_compilation_job_service.PublicCompilationError(
+                "workflow_generation_invalid",
+                str(exc),
             )
         else:
             public_error = assistant_compilation_job_service.PublicCompilationError(
@@ -6740,10 +7003,12 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         sources=sources,
         llm_used=bool(
             locals().get("llm")
+            and not route_notice
             and intent not in {
                 "apply_guidance",
                 "execute_guidance",
                 "capability_update_guidance",
+                "change_guidance",
             }
         ),
         preview=action_preview,
@@ -6754,10 +7019,12 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         "evidence": evidence,
         "action_preview": action_preview,
     }
+    if route_notice:
+        assistant_context["status"] = "route_fallback"
     if proposal.get("kind") == "scenario_model":
         run_summary = (proposal.get("payload") or {}).get("execution_summary") or {}
         assistant_context.update({
-            "status": "success" if run_summary.get("final") else "waiting_confirmation",
+            "status": _model_run_context_status(run_summary),
             "model_run_id": proposal.get("proposal_id"),
         })
     job_bound_message = (
@@ -6782,7 +7049,11 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             scenario_id=payload.scenario_id,
             thread_id=thread.id,
             operation="propose" if proposal else "chat",
-            status="success" if not questions or proposal else "needs_input",
+            status=(
+                "route_fallback"
+                if route_notice
+                else "success" if not questions or proposal else "needs_input"
+            ),
             context=assistant_context,
             result={"intent": intent, "sources": sources, "proposal_kind": proposal.get("kind", ""), "evidence": evidence},
         )
@@ -7021,6 +7292,12 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             nodes = data.get("nodes") or []
             edges = data.get("edges") or []
             workflow_service.validate_workflow_definition(nodes, edges)
+            workflow_service.canonicalize_workflow_references(
+                db,
+                scenario.id,
+                steps=[],
+                nodes=nodes,
+            )
             workflow_service.validate_workflow_references(
                 db,
                 scenario.id,
@@ -7329,6 +7606,9 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
                 }
         else:  # Defensive guard for legacy rows bypassing current schema.
             raise PolicyViolation("不支持的变更草稿类型")
+    except PolicyViolation as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
     except Exception:
         db.rollback()
         raise
@@ -7341,8 +7621,8 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
         updated_proposal["status"] = (
             "applied"
             if execution_status == "completed"
-            else "completed_with_gaps"
-            if execution_status == "completed_with_gaps"
+            else execution_status
+            if execution_status in {"completed_with_gaps", "completed_no_changes"}
             else "in_progress"
         )
         updated_proposal["requires_confirmation"] = bool(data.get("current_task_id"))
@@ -7481,10 +7761,8 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             else {}
         )
         proposal_context.update({
-            "status": (
-                "success"
-                if (data.get("execution_summary") or {}).get("final")
-                else "waiting_confirmation"
+            "status": _model_run_context_status(
+                data.get("execution_summary") or {}
             ),
             "model_run_id": updated_proposal.get("proposal_id"),
             "run_revision": _safe_nonnegative_int(data.get("execution_revision")),
@@ -7519,11 +7797,7 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
                 _update_compilation_subscription_messages(
                     db,
                     compilation_job,
-                    status=(
-                        "success"
-                        if execution_summary.get("final")
-                        else "waiting_confirmation"
-                    ),
+                    status=_model_run_context_status(execution_summary),
                     content=(
                         str(execution_summary.get("message") or "").strip()
                         or task_update_text

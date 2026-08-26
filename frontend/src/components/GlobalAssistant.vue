@@ -182,9 +182,10 @@
         </section>
         <div v-if="showQuickStarts" class="assistant-empty">
           <div class="empty-mark" aria-hidden="true"><el-icon :size="28"><ChatDotRound /></el-icon></div>
-          <h3>告诉我你要建设什么业务场景</h3>
-          <p>我会结合当前本体、业务说明和附件，生成带来源证据、冲突检查与变更清单的建模结果。</p>
+          <h3>可以直接提问，也可以协助建设当前场景</h3>
+          <p>普通问题会直接回答；明确提出建设要求时，才会准备带来源证据和冲突检查的待确认变更。</p>
           <div v-if="context.scenario_id" class="assistant-quick-start" aria-label="常用建模任务">
+            <button type="button" @click="chooseTask('explain')"><strong>询问当前场景</strong><span>只读回答，不生成变更</span></button>
             <button type="button" @click="chooseTask('scenario_model')"><strong>完整场景建模</strong><span>对象、关系、映射、函数、操作、规则、事件和工作流</span></button>
             <button type="button" @click="chooseTask('ontology')"><strong>本体模型</strong><span>对象类型、属性、关系与约束</span></button>
             <button type="button" @click="chooseTask('capabilities')"><strong>新增业务能力</strong><span>新增函数、操作、规则和事件；修改已有定义时仅提供只读指导</span></button>
@@ -212,7 +213,7 @@
               </div>
             </div>
             <div class="message-bubble" :class="{ user: message.role === 'user' }">
-              <SafeMarkdown v-if="message.role === 'assistant'" :content="message.content" />
+              <SafeMarkdown v-if="message.role === 'assistant'" :content="assistantMessageContent(message)" />
               <span v-if="message.role === 'assistant' && message.streaming" class="stream-cursor" aria-hidden="true">▍</span>
               <div v-else-if="message.role !== 'assistant'" class="user-content">{{ message.content }}</div>
             </div>
@@ -223,8 +224,8 @@
                   <div class="proposal-title"><el-icon aria-hidden="true"><DocumentChecked /></el-icon>{{ proposalOf(message)?.title }}</div>
                   <div class="proposal-summary">{{ proposalOf(message)?.summary }}</div>
                 </div>
-                <el-tag size="small" :type="['applied', 'completed'].includes(proposalOf(message)?.status || '') ? 'success' : proposalOf(message)?.status === 'completed_with_gaps' || proposalOf(message)?.status === 'partially_applied' ? 'warning' : 'primary'" effect="plain">
-                  {{ ['applied', 'completed'].includes(proposalOf(message)?.status || '') ? '已完成' : proposalOf(message)?.status === 'completed_with_gaps' ? '已完成草稿，待补全' : proposalOf(message)?.status === 'partially_applied' ? '已应用可用部分' : proposalOf(message)?.status === 'in_progress' ? '计划进行中 · 等待确认' : '待确认' }}
+                <el-tag size="small" :type="proposalStatusType(proposalOf(message))" effect="plain">
+                  {{ proposalStatusLabel(proposalOf(message)) }}
                 </el-tag>
               </div>
               <div class="proposal-preview">
@@ -268,7 +269,7 @@
                     <span v-if="!modelExecutionSummary(proposalOf(message))?.final">草稿生成阶段结束不代表计划结束；需要确认时会停留等待，确认后继续下一项。</span>
                     <span v-else>所有任务都已推进，下面保留了完成结果、缺失项、阻塞原因和解决建议。</span>
                   </div>
-                  <el-tag size="small" effect="plain" :type="modelExecutionSummary(proposalOf(message))?.final ? 'success' : 'primary'">
+                  <el-tag size="small" effect="plain" :type="modelRunStatusType(proposalOf(message))">
                     {{ modelTaskProgress(proposalOf(message)) }}
                   </el-tag>
                 </header>
@@ -277,14 +278,19 @@
                     <div class="model-task-head">
                       <span class="model-task-index">{{ task.order }}</span>
                       <div class="model-task-title"><strong>{{ task.title }}</strong><small>{{ modelTaskOutputCount(task) }} 项资源 · {{ task.description }}</small></div>
-                      <el-tag size="small" effect="plain" :type="modelTaskStatusType(task.status)">{{ modelTaskStatusLabel(task.status) }}</el-tag>
+                      <el-tag size="small" effect="plain" :type="modelTaskStatusType(task)">{{ modelTaskStatusLabel(task) }}</el-tag>
                     </div>
-                    <div v-if="['blocked', 'drafted_with_gaps', 'deferred', 'skipped'].includes(task.status) && task.issues?.length" class="model-task-blocker">
+                    <div v-if="task.status === 'blocked' && task.issues?.length" class="model-task-blocker">
                       <strong>草稿已落位：</strong><span>确认后会把本任务定义写入对应画布或模块。</span>
                       <small>{{ taskIssueCount(task) }} 项待补全内容只在助手最终汇总中展示。</small>
                     </div>
+                    <div v-else-if="['drafted_with_gaps', 'deferred', 'skipped'].includes(task.status) && task.issues?.length" class="model-task-blocker">
+                      <strong>待校验草稿：</strong><span>本轮未确认到正式写入，候选定义仍保持停用。</span>
+                      <small>{{ taskIssueCount(task) }} 项待补全内容与解决建议保留在助手最终汇总中。</small>
+                    </div>
                     <div v-else-if="task.status === 'waiting'" class="model-task-waiting">等待当前任务：{{ waitingTaskTitles(proposalOf(message), task).join('、') }}</div>
-                    <div v-else-if="task.status === 'partially_applied'" class="model-task-note">本任务已确认并写入；暂不能正式运行的定义仍以草稿形式保留。</div>
+                    <div v-else-if="task.status === 'partially_applied' && modelTaskHasPersistedWrites(task)" class="model-task-note">本任务的安全部分已确认写入；暂不能正式运行的定义仍以草稿形式保留。</div>
+                    <div v-else-if="modelTaskNeedsWriteVerification(task)" class="model-task-note">任务已结束，但暂未读取到可核验的正式写入结果。</div>
                     <div v-else-if="['deferred', 'drafted_with_gaps', 'skipped'].includes(task.status)" class="model-task-note">本任务草稿已经生成并保留；缺失与解决建议只在助手会话中汇总。</div>
                     <div v-if="blockedModelProposalId !== proposalOf(message)?.proposal_id && isActiveModelRun(message) && isCurrentModelTask(proposalOf(message), task) && modelNextAction(proposalOf(message))?.type === 'confirm_task'" class="model-task-actions">
                       <el-button v-if="modelNextAction(proposalOf(message))?.can_apply" size="small" type="primary" :loading="applyingIndex === index || recoveringModelProposalId === proposalOf(message)?.proposal_id" @click="applyModelTask(message, index, task, 'apply')">
@@ -297,13 +303,14 @@
                   <strong>计划未结束</strong>
                   <span>当前停留在「{{ modelExecutionSummary(proposalOf(message))?.current_task_title }}」等待确认。确认后会写入本任务的正式资源和可见草稿，再继续下一项。</span>
                 </div>
-                <section v-if="modelExecutionSummary(proposalOf(message))?.final" class="model-run-summary" aria-live="polite">
-                  <header><strong>{{ modelExecutionSummary(proposalOf(message))?.status === 'completed' ? '全部任务已完成' : '全部任务已推进，存在待补全项' }}</strong><el-tag size="small" effect="plain" :type="modelExecutionSummary(proposalOf(message))?.status === 'completed' ? 'success' : 'warning'">最终总结</el-tag></header>
-                  <p>{{ modelExecutionSummary(proposalOf(message))?.message }}</p>
+                <section v-if="modelExecutionSummary(proposalOf(message))?.final" class="model-run-summary" :class="`is-${modelRunStatusType(proposalOf(message))}`" aria-live="polite">
+                  <header><strong>{{ modelRunSummaryTitle(proposalOf(message)) }}</strong><el-tag size="small" effect="plain" :type="modelRunStatusType(proposalOf(message))">最终总结</el-tag></header>
+                  <p>{{ modelRunSummaryMessage(proposalOf(message)) }}</p>
                   <div class="model-run-summary-counts">
-                    <span>正式定义 {{ modelExecutionSummary(proposalOf(message))?.applied_task_count || 0 }}</span>
-                    <span>已写入待补全 {{ modelExecutionSummary(proposalOf(message))?.partially_applied_task_count || 0 }}</span>
-                    <span>已写入可见草稿 {{ modelExecutionSummary(proposalOf(message))?.draft_only_task_count || 0 }}</span>
+                    <span>正式写入任务 {{ modelFullyAppliedTaskCount(proposalOf(message)) }}</span>
+                    <span>部分写入任务 {{ modelPartiallyAppliedTaskCount(proposalOf(message)) }}</span>
+                    <span>仅保留草稿任务 {{ modelDraftOnlyTaskCount(proposalOf(message)) }}</span>
+                    <span>无变更任务 {{ modelEmptyTaskCount(proposalOf(message)) }}</span>
                     <span>问题/说明 {{ modelExecutionSummary(proposalOf(message))?.remaining_issue_count || 0 }}</span>
                   </div>
                   <div v-if="scenarioIssueGroups(proposalOf(message)).length" class="model-run-root-causes">
@@ -574,20 +581,20 @@
             <input ref="fileInput" type="file" multiple :disabled="uploadingFiles > 0" accept=".pdf,.docx,.xlsx,.xls,.pptx,.md,.txt,.csv,.json,.png,.jpg,.jpeg" @change="onFilesPicked" />
           </label>
           <div class="task-preset-control">
-            <label for="assistant-task-preset">任务</label>
-            <el-select id="assistant-task-preset" v-model="taskPreset" size="small" aria-label="选择助手任务" @change="onTaskPresetChange">
-              <el-option label="智能协助" value="smart" />
-              <el-option v-if="!context.scenario_id" label="创建业务场景" value="scenario" />
-              <el-option v-if="context.scenario_id" label="完整场景建模" value="scenario_model" />
-              <el-option v-if="context.scenario_id" label="本体模型" value="ontology" />
-              <el-option v-if="context.scenario_id" label="数据映射" value="mapping" />
-              <el-option v-if="context.scenario_id" label="新增业务能力" value="capabilities" />
-              <el-option v-if="context.scenario_id" label="工作流" value="workflow" />
-              <el-option label="只读解释" value="explain" />
-              <el-option v-if="context.scenario_id" label="操作安全预演" value="execute" />
+            <label for="assistant-task-preset">本条消息</label>
+            <el-select id="assistant-task-preset" v-model="taskPreset" size="small" aria-label="选择本条消息的协助方式">
+              <el-option label="智能协助（默认）" value="smart" />
+              <el-option v-if="!context.scenario_id" label="生成业务场景草稿" value="scenario" />
+              <el-option v-if="context.scenario_id" label="生成完整模型草稿" value="scenario_model" />
+              <el-option v-if="context.scenario_id" label="生成本体草稿" value="ontology" />
+              <el-option v-if="context.scenario_id" label="生成数据映射草稿" value="mapping" />
+              <el-option v-if="context.scenario_id" label="生成业务能力草稿" value="capabilities" />
+              <el-option v-if="context.scenario_id" label="生成工作流草稿" value="workflow" />
+              <el-option label="只读回答" value="explain" />
+              <el-option v-if="context.scenario_id" label="安全预演" value="execute" />
             </el-select>
           </div>
-          <span class="task-preset-hint">{{ taskPresetHint }}</span>
+          <span class="task-preset-hint" role="status" aria-live="polite">{{ taskPresetHint }}</span>
         </div>
         <div class="composer-input-row">
           <el-input
@@ -664,8 +671,6 @@ type AssistantTaskPreset = 'smart' | 'scenario' | 'scenario_model' | 'ontology' 
 const visible = ref(false)
 const loading = ref(false)
 const input = ref('')
-const mode = ref<AssistantMode>('ask')
-const draftKind = ref<AssistantDraftKind>('auto')
 const taskPreset = ref<AssistantTaskPreset>('smart')
 const messages = ref<AssistantMessage[]>([])
 const attachments = ref<AssistantAttachment[]>([])
@@ -719,15 +724,15 @@ const context = computed(() => ({
   scenario_id: props.context.scenario_id || '',
 }))
 const taskPresetHint = computed(() => ({
-  smart: '自动判断问答或建模任务',
-  scenario: '生成待确认的场景草稿',
-  scenario_model: '按计划逐项生成跨资源变更清单',
-  ontology: '只处理对象、属性、关系与约束',
-  mapping: '只使用已检查的真实表和字段',
-  capabilities: '仅新增业务能力；修改或删除将切换为只读指导',
-  workflow: '生成可审核的流程草稿',
-  explain: '只读分析，不生成变更',
-  execute: '仅做权限与副作用预演',
+  smart: '自动理解本条是提问还是建设要求；不会因为位于建模页就创建内容。',
+  scenario: '仅本条偏向生成场景草稿；发送后恢复智能协助。',
+  scenario_model: '仅本条偏向生成跨资源变更清单；发送后恢复智能协助。',
+  ontology: '仅本条聚焦对象、属性、关系与约束；发送后恢复智能协助。',
+  mapping: '仅本条聚焦已检查的真实表和字段；发送后恢复智能协助。',
+  capabilities: '仅本条聚焦新增业务能力；修改正式定义仍走专用编辑流程。',
+  workflow: '仅本条聚焦工作流草稿；发送后恢复智能协助。',
+  explain: '仅本条只读回答，不生成变更；发送后恢复智能协助。',
+  execute: '仅本条检查权限与副作用，不执行操作；发送后恢复智能协助。',
 } as Record<AssistantTaskPreset, string>)[taskPreset.value])
 const composerPlaceholder = computed(() => ({
   scenario_model: '介绍业务目标、范围与关键规则，或直接添加业务文档后发送',
@@ -842,6 +847,135 @@ function modelExecutionSummary(proposal: AssistantProposal | null): AssistantMod
     : null
 }
 
+function modelTaskHasPersistedWrites(task: AssistantModelTask | undefined) {
+  if (!task || !['applied', 'partially_applied'].includes(task.status)) return false
+  const result = task.apply_result
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return false
+  if (String(result.kind || '') !== 'scenario_model') return false
+  if (String(result.task_id || '') !== task.id) return false
+  if (String(result.task_status || '') !== task.status) return false
+  const appliedChangeKeys = Array.isArray(result.applied_change_keys)
+    ? result.applied_change_keys.map(String).filter(Boolean)
+    : []
+  if (appliedChangeKeys.length) return true
+  const counts = result.counts && typeof result.counts === 'object' && !Array.isArray(result.counts)
+    ? result.counts
+    : {}
+  return Object.entries(counts).some(([key, value]) => (
+    /_(?:added|updated|deleted|extended|filled)$/.test(key)
+    && Number.isFinite(Number(value))
+    && Number(value) > 0
+  ))
+}
+
+function modelFullyAppliedTaskCount(proposal: AssistantProposal | null) {
+  return modelTasks(proposal).filter((task) => task.status === 'applied' && modelTaskHasPersistedWrites(task)).length
+}
+
+function modelPartiallyAppliedTaskCount(proposal: AssistantProposal | null) {
+  return modelTasks(proposal).filter((task) => task.status === 'partially_applied' && modelTaskHasPersistedWrites(task)).length
+}
+
+function modelPersistedTaskCount(proposal: AssistantProposal | null) {
+  return modelFullyAppliedTaskCount(proposal) + modelPartiallyAppliedTaskCount(proposal)
+}
+
+function modelDraftOnlyTaskCount(proposal: AssistantProposal | null) {
+  return modelTasks(proposal).filter((task) => ['deferred', 'drafted_with_gaps', 'skipped'].includes(task.status)).length
+}
+
+function modelEmptyTaskCount(proposal: AssistantProposal | null) {
+  return modelTasks(proposal).filter((task) => task.status === 'empty').length
+}
+
+function modelRunHasPersistedWrites(proposal: AssistantProposal | null) {
+  return modelPersistedTaskCount(proposal) > 0
+}
+
+function modelRunFinishedWithoutPersistedWrites(proposal: AssistantProposal | null) {
+  return Boolean(modelExecutionSummary(proposal)?.final && !modelRunHasPersistedWrites(proposal))
+}
+
+function modelRunStatusType(proposal: AssistantProposal | null): 'primary' | 'success' | 'warning' | 'info' {
+  const summary = modelExecutionSummary(proposal)
+  if (!summary?.final) return 'primary'
+  if (!modelRunHasPersistedWrites(proposal)) {
+    return modelDraftOnlyTaskCount(proposal) || Number(summary.remaining_issue_count || 0) > 0
+      ? 'warning'
+      : 'info'
+  }
+  return summary.status === 'completed'
+    && modelPartiallyAppliedTaskCount(proposal) === 0
+    && modelDraftOnlyTaskCount(proposal) === 0
+    ? 'success'
+    : 'warning'
+}
+
+function modelRunSummaryTitle(proposal: AssistantProposal | null) {
+  if (modelRunFinishedWithoutPersistedWrites(proposal)) {
+    return modelDraftOnlyTaskCount(proposal)
+      ? '建模计划已结束，仅保留草稿'
+      : '建模计划已结束，无正式写入'
+  }
+  return modelRunStatusType(proposal) === 'success'
+    ? '建模计划已完成并写入'
+    : '全部任务已推进，存在待补全项'
+}
+
+function modelRunSummaryMessage(proposal: AssistantProposal | null) {
+  const summary = modelExecutionSummary(proposal)
+  if (!summary) return ''
+  if (!modelRunFinishedWithoutPersistedWrites(proposal)) return summary.message
+  const draftCount = modelDraftOnlyTaskCount(proposal)
+  return draftCount
+    ? `本轮未确认到正式资源写入；${draftCount} 项任务仅保留了停用草稿，请按问题说明补全后重新确认。`
+    : '本轮未确认到正式资源写入；计划没有产生可应用的正式定义。'
+}
+
+function modelRunContextStatus(proposal: AssistantProposal | null) {
+  if (!modelExecutionSummary(proposal)?.final) return 'waiting_confirmation'
+  return modelRunHasPersistedWrites(proposal) ? 'success' : 'completed_without_writes'
+}
+
+function assistantMessageContent(message: AssistantMessage) {
+  const content = String(message.content || '')
+  const proposal = proposalOf(message)
+  if (!modelRunFinishedWithoutPersistedWrites(proposal)) return content
+  // The durable proposal ledger is authoritative for a finished run. When it
+  // proves zero writes, do not expose older free-form completion prose that
+  // can contradict that structured result.
+  return modelRunSummaryMessage(proposal)
+}
+
+function proposalStatusType(proposal: AssistantProposal | null): 'primary' | 'success' | 'warning' | 'info' {
+  if (!proposal) return 'primary'
+  if (proposal.kind === 'scenario_model') {
+    if (modelExecutionSummary(proposal)?.final) return modelRunStatusType(proposal)
+    return ['completed_with_gaps', 'partially_applied'].includes(proposal.status || '') ? 'warning' : 'primary'
+  }
+  return ['applied', 'completed'].includes(proposal.status || '')
+    ? 'success'
+    : ['completed_with_gaps', 'partially_applied'].includes(proposal.status || '') ? 'warning' : 'primary'
+}
+
+function proposalStatusLabel(proposal: AssistantProposal | null) {
+  if (!proposal) return '待确认'
+  if (proposal.kind === 'scenario_model') {
+    if (modelRunFinishedWithoutPersistedWrites(proposal)) {
+      return modelDraftOnlyTaskCount(proposal) ? '已结束，仅保留草稿' : '已结束，无正式写入'
+    }
+    if (modelExecutionSummary(proposal)?.final) {
+      return modelRunStatusType(proposal) === 'success' ? '已完成并写入' : '已推进，存在待补全'
+    }
+    return proposal.status === 'in_progress' ? '计划进行中 · 等待确认' : '待确认'
+  }
+  return ['applied', 'completed'].includes(proposal.status || '')
+    ? '已完成'
+    : proposal.status === 'completed_with_gaps' ? '已完成草稿，待补全'
+      : proposal.status === 'partially_applied' ? '已应用可用部分'
+        : proposal.status === 'in_progress' ? '计划进行中 · 等待确认' : '待确认'
+}
+
 function modelNextAction(proposal: AssistantProposal | null): AssistantModelNextAction | null {
   if (proposal?.kind !== 'scenario_model') return null
   const action = proposal.payload?.next_action
@@ -878,6 +1012,14 @@ function modelTaskWasProcessed(proposal: AssistantProposal | null, taskId: strin
   return Boolean(task && ['applied', 'partially_applied', 'deferred', 'drafted_with_gaps', 'skipped', 'empty'].includes(task.status))
 }
 
+function modelTaskOf(proposal: AssistantProposal | null, taskId: string) {
+  return modelTasks(proposal).find((item) => item.id === taskId)
+}
+
+function modelTaskNeedsWriteVerification(task: AssistantModelTask) {
+  return ['applied', 'partially_applied'].includes(task.status) && !modelTaskHasPersistedWrites(task)
+}
+
 function isCurrentModelTask(proposal: AssistantProposal | null, task: AssistantModelTask) {
   return String(proposal?.payload?.current_task_id || '') === task.id
 }
@@ -900,7 +1042,9 @@ function modelTaskProgress(proposal: AssistantProposal | null) {
     : `${completed}/${tasks.length} 项 · 计划进行中`
 }
 
-function modelTaskStatusLabel(status: string) {
+function modelTaskStatusLabel(task: AssistantModelTask) {
+  if (modelTaskNeedsWriteVerification(task)) return '写入结果待核验'
+  const status = task.status
   return ({
     empty: '无此类变更',
     ready: '等待确认',
@@ -914,7 +1058,9 @@ function modelTaskStatusLabel(status: string) {
   } as Record<string, string>)[status] || '待处理'
 }
 
-function modelTaskStatusType(status: string) {
+function modelTaskStatusType(task: AssistantModelTask) {
+  if (modelTaskNeedsWriteVerification(task)) return 'warning'
+  const status = task.status
   return ({
     empty: 'info',
     ready: 'warning',
@@ -951,35 +1097,21 @@ function modelTaskOutputCount(task: AssistantModelTask) {
   return Math.trunc(Math.max(0, ...values))
 }
 
-function applyTaskPreset(preset: AssistantTaskPreset) {
-  if (preset === 'explain') {
-    mode.value = 'explain'
-    draftKind.value = 'auto'
-    return
+function requestRouteForPreset(preset: AssistantTaskPreset): { mode: AssistantMode; draft_kind: AssistantDraftKind } {
+  if (preset === 'explain') return { mode: 'explain', draft_kind: 'auto' }
+  if (preset === 'execute') return { mode: 'execute', draft_kind: 'auto' }
+  if (preset === 'smart') return { mode: 'ask', draft_kind: 'auto' }
+  return {
+    mode: 'draft',
+    draft_kind: preset === 'capabilities' ? 'scenario_model' : preset,
   }
-  if (preset === 'execute') {
-    mode.value = 'execute'
-    draftKind.value = 'auto'
-    return
-  }
-  if (preset === 'smart') {
-    mode.value = 'ask'
-    draftKind.value = 'auto'
-    return
-  }
-  mode.value = 'draft'
-  draftKind.value = preset === 'capabilities' ? 'scenario_model' : preset
-}
-
-function onTaskPresetChange(value: AssistantTaskPreset) {
-  applyTaskPreset(value)
 }
 
 function chooseTask(preset: AssistantTaskPreset) {
   taskPreset.value = preset
-  applyTaskPreset(preset)
   if (input.value.trim()) return
   input.value = ({
+    explain: '请概括当前场景已有的模型与能力，并回答我接下来的问题：',
     scenario_model: '请根据以下业务介绍和附件，完成当前场景的完整建模，并列出所有未识别、歧义和冲突项。\n\n业务介绍：',
     ontology: '请根据以下业务描述和附件，建立对象类型、属性、关系及约束。\n\n业务描述：',
     capabilities: '请根据以下业务描述和附件，新增所需函数、操作、规则和事件，并保持待审核状态。\n\n业务描述：',
@@ -1941,6 +2073,7 @@ async function createNewThread() {
     const thread = await api.createAssistantThread(apiContext())
     threads.value = [thread, ...threads.value.filter((item) => item.id !== thread.id)]
     threadId.value = thread.id
+    taskPreset.value = 'smart'
     localStorage.setItem(storageKey.value, thread.id)
     messages.value = [welcomeMessage()]
     attachments.value = []
@@ -1961,6 +2094,7 @@ async function selectThread(thread: AssistantThread) {
     scrollBottom()
     return
   }
+  taskPreset.value = 'smart'
   await loadThread(thread.id)
   if (!messages.value.length) messages.value = [welcomeMessage()]
 }
@@ -1982,6 +2116,7 @@ async function deleteThread(thread: AssistantThread) {
       clearModelTaskRecovery()
       localStorage.removeItem(storageKey.value)
       threadId.value = ''
+      taskPreset.value = 'smart'
       messages.value = threads.value[0] ? [] : [welcomeMessage()]
       if (threads.value[0]) await loadThread(threads.value[0].id, false)
       if (!messages.value.length) messages.value = [welcomeMessage()]
@@ -2137,6 +2272,7 @@ function finishStream(ai: AssistantMessage) {
 }
 
 function send(text?: string) {
+  const submittedPreset = taskPreset.value
   const attachmentOnlyPrompt = ({
     scenario: '请根据本次上传的业务文档生成一个待确认的业务场景草稿，并标明无法确定的信息。',
     scenario_model: '请逐段编译本次上传的完整业务文档，生成完整业务模型，并列出所有未识别、歧义和冲突项。',
@@ -2144,7 +2280,7 @@ function send(text?: string) {
     mapping: '请把本次上传文档作为业务语义参考，只根据当前场景中已经检查的真实数据源表和字段生成映射草稿。',
     capabilities: '请根据本次上传的完整业务文档，新增其中明确描述的函数、操作、规则和事件，并列出所有未识别、歧义和冲突项。',
     workflow: '请根据本次上传的业务文档生成待审核的工作流，明确触发条件、处理节点、分支和引用资源。',
-  } as Partial<Record<AssistantTaskPreset, string>>)[taskPreset.value] || ''
+  } as Partial<Record<AssistantTaskPreset, string>>)[submittedPreset] || ''
   const providedContent = text !== undefined ? text : input.value.trim()
   const content = (providedContent || (
     attachmentOnlyPrompt && attachments.value.length
@@ -2163,6 +2299,8 @@ function send(text?: string) {
   const ai = messages.value[aiIndex]
   input.value = ''
   loading.value = true
+  const requestRoute = requestRouteForPreset(submittedPreset)
+  taskPreset.value = 'smart'
   const generation = ++streamGeneration
   scrollBottom()
   streamController = streamAssistantChat(
@@ -2180,8 +2318,8 @@ function send(text?: string) {
       llm_config_id: assistantConfig.llmConfigId || undefined,
       skill_ids: [...assistantConfig.skillIds],
       mcp_ids: [...assistantConfig.mcpIds],
-      mode: mode.value,
-      draft_kind: mode.value === 'draft' ? draftKind.value : 'auto',
+      mode: requestRoute.mode,
+      draft_kind: requestRoute.draft_kind,
     },
     (event) => {
       if (generation !== streamGeneration || componentDisposed) return
@@ -2222,8 +2360,6 @@ async function answerQuestion(
   }
   if (option.value === 'draft_scenario') {
     taskPreset.value = 'scenario'
-    mode.value = 'draft'
-    draftKind.value = 'scenario'
     input.value = '请根据以下业务目标创建业务场景草稿：\n'
     return
   }
@@ -2248,8 +2384,6 @@ async function answerQuestion(
     // user edit the correction draft before explicitly submitting it.
     attachments.value = retryAttachmentsForMessage(messages.value, sourceMessage, threadId.value)
     taskPreset.value = 'scenario_model'
-    mode.value = 'draft'
-    draftKind.value = 'scenario_model'
     input.value = compilationRetryDraft(option.value, option.prompt)
     scrollBottom()
     return
@@ -2272,6 +2406,72 @@ function clearModelTaskRecovery(clearFailure = true) {
   if (clearFailure) {
     blockedModelProposalId.value = ''
     modelTaskRecoveryFailure.value = ''
+  }
+}
+
+function modelTaskOutcomeFallback(
+  task: AssistantModelTask | undefined,
+  taskTitle: string,
+  nextTask?: AssistantModelTask,
+) {
+  let update = ''
+  if (!task) {
+    update = `「${taskTitle}」已结束，但暂未读取到可核验的任务结果。`
+  } else if (modelTaskHasPersistedWrites(task)) {
+    update = task.status === 'partially_applied'
+      ? `「${task.title}」的安全部分已确认写入当前场景；其余定义仍作为待校验草稿保留。`
+      : `「${task.title}」已确认写入当前场景。`
+  } else if (task.status === 'drafted_with_gaps') {
+    update = `「${task.title}」本轮没有可核验的正式写入；待校验草稿已保留，计划继续推进。`
+  } else if (['deferred', 'skipped'].includes(task.status)) {
+    update = `「${task.title}」已保留为草稿，本次未写入正式模型。`
+  } else if (task.status === 'empty') {
+    update = `「${task.title}」没有可写入的正式变更，计划继续推进。`
+  } else {
+    update = `「${task.title}」已结束，但暂未读取到可核验的正式写入结果。`
+  }
+  if (nextTask) update += ` 下一步已停留在「${nextTask.title}」等待确认。`
+  return update
+}
+
+function announceModelTaskOutcome(
+  proposal: AssistantProposal,
+  taskId: string,
+  recovered = false,
+) {
+  const task = modelTaskOf(proposal, taskId)
+  if (!task) {
+    ElMessage.warning('任务已结束，但暂未读取到可核验的持久化结果')
+    return
+  }
+  if (modelTaskHasPersistedWrites(task)) {
+    window.dispatchEvent(new CustomEvent('assistant-proposal-applied', {
+      detail: { scenario_id: context.value.scenario_id, kind: 'scenario_model', task_id: taskId },
+    }))
+    ElMessage.success(
+      recovered
+        ? task.status === 'partially_applied'
+          ? '已恢复本任务的安全部分写入结果，计划将继续推进'
+          : '已恢复本任务的正式写入结果，计划将继续推进'
+        : task.status === 'partially_applied'
+          ? '本任务的安全部分已确认写入，计划已继续'
+          : '本任务已确认写入，计划已继续',
+    )
+    return
+  }
+  if (['deferred', 'drafted_with_gaps', 'skipped'].includes(task.status)) {
+    window.dispatchEvent(new CustomEvent('assistant-scenario-drafts-updated', {
+      detail: { scenario_id: context.value.scenario_id, proposal_id: proposal.proposal_id, task_id: taskId },
+    }))
+  }
+  if (task.status === 'drafted_with_gaps') {
+    ElMessage.warning('本任务未确认到正式写入；待校验草稿已保留，计划已继续')
+  } else if (['deferred', 'skipped'].includes(task.status)) {
+    ElMessage.info('本任务仅保留为草稿，未写入正式模型，计划已继续')
+  } else if (task.status === 'empty') {
+    ElMessage.info('本任务没有可写入的正式变更，计划已继续')
+  } else {
+    ElMessage.warning('任务状态已恢复，但暂未读取到可核验的正式写入结果')
   }
 }
 
@@ -2312,15 +2512,12 @@ function beginModelTaskRecovery(
         Object.assign(message, recoveredMessage, { streaming: false })
         message.context = {
           ...(message.context || {}),
-          status: modelExecutionSummary(recoveredProposal)?.final ? 'success' : 'waiting_confirmation',
+          status: modelRunContextStatus(recoveredProposal),
           run_revision: modelRunRevision(recoveredProposal),
         }
         clearModelTaskRecovery()
-        window.dispatchEvent(new CustomEvent('assistant-proposal-applied', {
-          detail: { scenario_id: context.value.scenario_id, kind: 'scenario_model', task_id: taskId },
-        }))
+        announceModelTaskOutcome(recoveredProposal, taskId, true)
         scrollBottom()
-        ElMessage.success('已从持久化计划恢复任务结果，计划将从下一确认点继续')
         return
       }
     } catch (error: any) {
@@ -2378,7 +2575,7 @@ async function applyModelTask(
   ) return
   const confirmation = action === 'defer'
     ? `本次不会写入“${task.title}”。已生成草稿、缺失项和解决建议都会保留，计划将继续推进其他任务。`
-    : `确认后会把“${task.title}”产生的正式资源和不完整定义一并写入场景；不影响画布展示的草稿也会落位，问题汇总只保留在助手会话，完成后再继续下一项任务。`
+    : `确认后会把“${task.title}”中通过校验的资源写入正式模型；不完整定义只会作为停用草稿保存，问题汇总保留在助手会话，完成后再继续下一项任务。`
   try {
     await ElMessageBox.confirm(
       confirmation,
@@ -2436,24 +2633,22 @@ async function applyModelTask(
       ElMessage.warning('任务已提交，正在自动恢复服务端最新计划；不会重复应用。')
       return
     }
-    const taskResult = result?.data || {}
-    const nextTask = (message.proposal as AssistantProposal)?.payload?.tasks?.find((item: AssistantModelTask) => ['ready', 'blocked'].includes(item.status))
+    const updatedProposal = message.proposal as AssistantProposal
+    const updatedTask = modelTaskOf(updatedProposal, task.id)
+    const nextTask = modelTasks(updatedProposal).find((item) => ['ready', 'blocked'].includes(item.status))
     const durableUpdate = String(result?.task_update_text || '').trim()
-    if (durableUpdate && !message.content.includes(durableUpdate)) message.content += `\n\n${durableUpdate}`
-    else if (!durableUpdate) {
-      message.content += action === 'defer'
-        ? `\n\n「${task.title}」已保留为草稿，计划继续推进。`
-        : `\n\n「${task.title}」已确认并写入当前场景；暂不能正式运行的定义已作为草稿落位。`
-      if (nextTask) message.content += ` 下一步已停留在「${nextTask.title}」等待确认。`
+    if (durableUpdate && !modelTaskNeedsWriteVerification(updatedTask || task) && !message.content.includes(durableUpdate)) {
+      message.content += `\n\n${durableUpdate}`
+    } else if (!durableUpdate || modelTaskNeedsWriteVerification(updatedTask || task)) {
+      const fallbackUpdate = modelTaskOutcomeFallback(updatedTask, task.title, nextTask)
+      if (!message.content.includes(fallbackUpdate)) message.content += `\n\n${fallbackUpdate}`
     }
     message.context = {
       ...(message.context || {}),
-      status: modelExecutionSummary(message.proposal as AssistantProposal)?.final ? 'success' : 'waiting_confirmation',
-      run_revision: modelRunRevision(message.proposal as AssistantProposal),
+      status: modelRunContextStatus(updatedProposal),
+      run_revision: modelRunRevision(updatedProposal),
     }
-    window.dispatchEvent(new CustomEvent('assistant-proposal-applied', { detail: { scenario_id: context.value.scenario_id, kind: 'scenario_model', task_id: task.id } }))
-    if (result?.status === 'replayed') ElMessage.info('该任务已处理过，已恢复任务结果')
-    else ElMessage.success(action === 'defer' ? '草稿已保留，计划已继续推进' : '本任务已确认并写入，计划已继续')
+    announceModelTaskOutcome(updatedProposal, task.id, result?.status === 'replayed')
   } catch (error: any) {
     const status = Number(error?.status || 0)
     const ambiguousOutcome = !status
@@ -2545,6 +2740,7 @@ watch(() => storageKey.value, async () => {
   detachCompilationRecovery()
   clearModelTaskRecovery()
   loading.value = false
+  taskPreset.value = 'smart'
   messages.value = []
   threads.value = []
   threadId.value = ''
@@ -2559,15 +2755,7 @@ watch(() => storageKey.value, async () => {
   }
 })
 watch(() => context.value.scenario_id, () => {
-  if (context.value.scenario_id) {
-    taskPreset.value = 'scenario_model'
-    mode.value = 'draft'
-    draftKind.value = 'scenario_model'
-  } else {
-    taskPreset.value = 'smart'
-    mode.value = 'ask'
-    draftKind.value = 'auto'
-  }
+  taskPreset.value = 'smart'
 }, { immediate: true })
 watch(showLauncher, (show) => {
   if (!show) visible.value = false
@@ -2712,7 +2900,9 @@ onBeforeUnmount(() => {
 .model-task-actions :deep(.el-button) { min-height: 36px; }
 .model-run-waiting { display: flex; align-items: flex-start; gap: 7px; padding: 8px 9px; border-radius: 9px; color: var(--primary-600); background: var(--primary-soft); font-size: 9.5px; line-height: 1.5; }
 .model-run-waiting strong { flex: 0 0 auto; color: var(--text); }
-.model-run-summary { display: grid; gap: 8px; padding: 10px; border: 1px solid color-mix(in srgb, var(--success) 34%, var(--border)); border-radius: 10px; background: color-mix(in srgb, var(--success-soft) 45%, var(--surface)); }
+.model-run-summary { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
+.model-run-summary.is-success { border-color: color-mix(in srgb, var(--success) 34%, var(--border)); background: color-mix(in srgb, var(--success-soft) 45%, var(--surface)); }
+.model-run-summary.is-warning { border-color: color-mix(in srgb, var(--warning) 38%, var(--border)); background: color-mix(in srgb, var(--warning-soft) 42%, var(--surface)); }
 .model-run-summary > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .model-run-summary > header strong { color: var(--text); font-size: 11px; }
 .model-run-summary p, .model-run-summary small { margin: 0; color: var(--text-2); font-size: 9.5px; line-height: 1.55; }
@@ -2962,10 +3152,10 @@ onBeforeUnmount(() => {
 .tool-button:hover, .tool-button:focus-within { border-color: var(--primary); color: var(--primary-600); background: var(--primary-soft); }
 .tool-button.disabled { cursor: wait; opacity: .72; }
 .tool-button input { display: none; }
-.task-preset-control { display: flex; align-items: center; gap: 5px; min-width: 0; }
-.task-preset-control > label { color: var(--text-3); font-size: 10px; font-weight: 700; }
-.task-preset-control :deep(.el-select) { width: 150px; }
-.task-preset-hint { min-width: 0; overflow: hidden; color: var(--text-3); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
+.task-preset-control { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; min-width: 0; }
+.task-preset-control > label { color: var(--text-3); font-size: 11px; font-weight: 700; white-space: nowrap; }
+.task-preset-control :deep(.el-select) { width: 168px; flex: 0 0 168px; }
+.task-preset-hint { min-width: 0; flex: 1 1 0; color: var(--text-3); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
 .composer-input-row { display: flex; align-items: flex-end; gap: 8px; }
 .composer-input-row :deep(.el-textarea__inner) { min-height: 74px !important; padding-right: 12px; }
 .send-button { width: 42px; height: 42px; padding: 0; flex: 0 0 auto; }
@@ -2996,8 +3186,8 @@ onBeforeUnmount(() => {
   .attachment-chip button { width: 44px; height: 44px; }
   .tool-button span { display: none; }
   .composer-tools { flex-wrap: wrap; }
-  .task-preset-control { flex: 1; }
-  .task-preset-control :deep(.el-select) { width: 100%; }
+  .task-preset-control { width: 100%; flex: 1 1 100%; }
+  .task-preset-control :deep(.el-select) { width: 100%; flex: 1 1 auto; }
   .task-preset-hint { width: 100%; padding-left: 1px; }
   .assistant-quick-start { grid-template-columns: 1fr; }
   .assistant-action-preview dl { grid-template-columns: 1fr; }

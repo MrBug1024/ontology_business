@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -17,7 +17,8 @@ from app.routers.llm_configs import (
     usage_summary,
 )
 from app.schemas import LLMEvaluationIn, LLMConfigIn
-from app.services import llm_service, permission_service
+from app.services import assistant_orchestrator, llm_service, permission_service
+from app.services.assistant_orchestrator import AssistantSemanticDecision
 
 
 class _CompletionClient:
@@ -222,6 +223,201 @@ class LLMManagementTests(unittest.TestCase):
             timeout=480.0,
             max_retries=0,
         )
+
+    def test_structured_chat_falls_back_to_validated_json_for_basic_compatible_models(self) -> None:
+        structured_model = Mock()
+        structured_model.with_structured_output.return_value.invoke.side_effect = RuntimeError(
+            "provider does not support structured output"
+        )
+        fallback_decision = AssistantSemanticDecision(
+            goal="answer",
+            scope="workflow",
+            confidence="high",
+            reason="用户询问已有工作流数量",
+        )
+        with (
+            patch("app.services.llm_service.ChatOpenAI", return_value=structured_model),
+            patch(
+                "app.services.llm_service.chat",
+                return_value={"content": fallback_decision.model_dump_json()},
+            ) as fallback_chat,
+        ):
+            result = llm_service.structured_chat(
+                self.config,
+                [{"role": "user", "content": "当前有多少个工作流？"}],
+                AssistantSemanticDecision,
+                db=self.db,
+                operation="assistant_route",
+                request_timeout=15,
+                max_tokens=384,
+                max_retries=0,
+            )
+
+        self.assertEqual(result, fallback_decision)
+        self.assertEqual(structured_model.with_structured_output.call_count, 2)
+        fallback_chat.assert_called_once()
+        fallback_call = fallback_chat.call_args
+        self.assertIn("Return only one JSON object", fallback_call.args[1][0]["content"])
+        self.assertEqual(fallback_call.kwargs["operation"], "assistant_route")
+        self.assertGreater(fallback_call.kwargs["request_timeout"], 0)
+        self.assertLessEqual(fallback_call.kwargs["request_timeout"], 15)
+        self.assertEqual(fallback_call.kwargs["max_retries"], 0)
+        self.assertFalse(fallback_call.kwargs["retry_on_length"])
+
+    def test_structured_chat_reserves_deadline_for_each_compatible_strategy(self) -> None:
+        structured_model = Mock()
+        structured_model.with_structured_output.return_value.invoke.side_effect = RuntimeError(
+            "structured mode unavailable"
+        )
+        fallback_decision = AssistantSemanticDecision(
+            goal="create",
+            scope="scenario_model",
+            confidence="high",
+            reason="用户明确要求创建完整场景模型",
+        )
+        with (
+            patch(
+                "app.services.llm_service.time.monotonic",
+                side_effect=[0.0, 0.0, 10.0, 20.0],
+            ),
+            patch(
+                "app.services.llm_service.ChatOpenAI",
+                return_value=structured_model,
+            ) as structured_client,
+            patch(
+                "app.services.llm_service.chat",
+                return_value={"content": fallback_decision.model_dump_json()},
+            ) as fallback_chat,
+        ):
+            result = llm_service.structured_chat(
+                self.config,
+                [{"role": "user", "content": "请完成整个业务场景的建模"}],
+                AssistantSemanticDecision,
+                db=self.db,
+                operation="assistant_route",
+                request_timeout=30,
+                max_tokens=1024,
+                max_retries=0,
+            )
+
+        self.assertEqual(result, fallback_decision)
+        self.assertEqual(structured_client.call_count, 2)
+        self.assertAlmostEqual(
+            structured_client.call_args_list[0].kwargs["timeout"], 10.0
+        )
+        self.assertAlmostEqual(
+            structured_client.call_args_list[1].kwargs["timeout"], 10.0
+        )
+        self.assertAlmostEqual(
+            fallback_chat.call_args.kwargs["request_timeout"], 10.0
+        )
+
+    def test_assistant_router_uses_reasoning_safe_completion_budget(self) -> None:
+        decision = AssistantSemanticDecision(
+            goal="create",
+            scope="scenario_model",
+            confidence="high",
+            reason="用户明确要求根据附件创建完整场景模型",
+        )
+        with patch.object(
+            assistant_orchestrator.llm_service,
+            "structured_chat",
+            return_value=decision,
+        ) as structured_chat:
+            plan = assistant_orchestrator.plan_assistant_request(
+                llm=self.config,
+                db=self.db,
+                message="请阅读附件并完成整个业务场景的场景建模",
+                history=[],
+                page="场景建模",
+                path="/scenarios/scenario-1",
+                mode="ask",
+                preferred_scope="auto",
+                has_scenario=True,
+                has_attachments=True,
+                has_active_model_drafts=False,
+                active_draft_scopes=[],
+                context_summary="当前场景尚无正式资源。",
+            )
+
+        self.assertEqual(plan.intent, "scenario_model")
+        call = structured_chat.call_args
+        self.assertEqual(call.kwargs["operation"], "assistant_route")
+        self.assertEqual(
+            call.kwargs["request_timeout"],
+            assistant_orchestrator.ROUTE_REQUEST_TIMEOUT_SECONDS,
+        )
+        self.assertGreater(call.kwargs["request_timeout"], 15)
+        self.assertEqual(
+            call.kwargs["max_tokens"],
+            assistant_orchestrator.ROUTE_MAX_COMPLETION_TOKENS,
+        )
+        self.assertGreaterEqual(call.kwargs["max_tokens"], 2048)
+        self.assertEqual(call.kwargs["max_retries"], 0)
+
+    def test_structured_chat_accepts_complete_json_after_provider_preamble(self) -> None:
+        structured_model = Mock()
+        structured_model.with_structured_output.return_value.invoke.side_effect = RuntimeError(
+            "structured mode unavailable"
+        )
+        decision = AssistantSemanticDecision(
+            goal="create",
+            scope="scenario_model",
+            confidence="high",
+            reason="用户明确要求创建完整场景模型",
+        )
+        provider_content = (
+            "路由结果如下：\n```json\n"
+            + decision.model_dump_json()
+            + "\n```\n请按该结构处理。"
+        )
+        with (
+            patch("app.services.llm_service.ChatOpenAI", return_value=structured_model),
+            patch(
+                "app.services.llm_service.chat",
+                return_value={"content": provider_content},
+            ),
+        ):
+            result = llm_service.structured_chat(
+                self.config,
+                [{"role": "user", "content": "请完成整个业务场景的建模"}],
+                AssistantSemanticDecision,
+                db=self.db,
+                operation="assistant_route",
+                request_timeout=20,
+                max_tokens=2048,
+                max_retries=0,
+            )
+
+        self.assertEqual(result, decision)
+
+    def test_structured_chat_does_not_repair_truncated_json(self) -> None:
+        structured_model = Mock()
+        structured_model.with_structured_output.return_value.invoke.side_effect = RuntimeError(
+            "structured mode unavailable"
+        )
+        truncated = (
+            '{"goal":"create","scope":"scenario_model",'
+            '"confidence":"high","reason":"未结束"'
+        )
+        with (
+            patch("app.services.llm_service.ChatOpenAI", return_value=structured_model),
+            patch(
+                "app.services.llm_service.chat",
+                return_value={"content": truncated},
+            ),
+            self.assertRaisesRegex(ValueError, "完整且符合结构约束"),
+        ):
+            llm_service.structured_chat(
+                self.config,
+                [{"role": "user", "content": "请完成整个业务场景的建模"}],
+                AssistantSemanticDecision,
+                db=self.db,
+                operation="assistant_route",
+                request_timeout=20,
+                max_tokens=2048,
+                max_retries=0,
+            )
 
     def test_stream_completion_and_failure_record_sanitized_traces(self) -> None:
         token_chunk = SimpleNamespace(
