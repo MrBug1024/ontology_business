@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from io import BytesIO
 import json
 import unittest
@@ -81,9 +82,30 @@ class AssistantOntologyIngestionTests(unittest.TestCase):
             patch.object(assistant, "_purge_expired_attachments"),
             patch.object(assistant, "_tenant", return_value="tenant-ingestion"),
             patch.object(assistant, "_current_user_id", return_value="user-ingestion"),
+            patch.object(assistant.datasource_service, "save_assistant_attachment_object"),
+            patch.object(
+                assistant.object_deletion_service,
+                "prepare_assistant_attachment_upload",
+                return_value=SimpleNamespace(object_key="managed-upload-key"),
+            ),
+            patch.object(
+                assistant.object_deletion_service,
+                "heartbeat_upload_intent",
+                return_value=nullcontext(
+                    SimpleNamespace(assert_active=lambda: None)
+                ),
+            ),
+            patch.object(
+                assistant.object_deletion_service,
+                "begin_upload_put",
+            ),
+            patch.object(
+                assistant.object_deletion_service,
+                "retain_assistant_attachment_upload",
+            ),
             patch.object(
                 assistant.doc_parser,
-                "parse_file",
+                "parse_bytes",
                 return_value={"status": "success", "text": parsed_text, "message": "ok"},
             ),
         ):

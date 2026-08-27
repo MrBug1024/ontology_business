@@ -24,6 +24,8 @@ from ..models import (
 )
 from . import (
     capability_readiness_service,
+    datasource_service,
+    object_deletion_service,
     permission_service,
     runtime_connector_service,
     runtime_definition_service,
@@ -1387,6 +1389,9 @@ def purge_expired_assistant_attachments(
         ).scalars().all()
     )
     for attachment in expired:
+        object_deletion_service.enqueue_assistant_attachment_deletion(
+            db, attachment
+        )
         db.delete(attachment)
     if expired:
         db.flush()
@@ -1400,6 +1405,9 @@ def worker_tick(*, limit: int = 8) -> int:
 
     db = SessionLocal()
     try:
+        object_deletion_service.process_object_deletion_jobs(
+            db, limit=max(50, limit * 25)
+        )
         expire_stale_operations(db)
         purge_expired_assistant_attachments(db, limit=max(50, limit * 25))
         rag_service.expire_stale_document_index_jobs(db)

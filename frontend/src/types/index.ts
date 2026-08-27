@@ -638,7 +638,7 @@ export interface DataSource {
   id?: string
   scenario_id?: string
   name: string
-  type: string // mysql / postgres / sqlite / file_bucket
+  type: string // mysql / postgres / sqlite / dataset / file_bucket
   config: Record<string, any>
   status?: string
   last_error?: string

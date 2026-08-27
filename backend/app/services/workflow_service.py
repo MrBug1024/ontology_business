@@ -738,7 +738,12 @@ def _clear_pending_template_files(db: Session, *, delete_files: bool) -> None:
         return
     for file in pending:
         if isinstance(file, BucketFile):
-            datasource_service.delete_bucket_file(file)
+            if datasource_service.is_managed_minio_file(file):
+                continue
+            source = db.get(DataSource, file.data_source_id)
+            if source is None:
+                raise RuntimeError("未提交生成文件所属数据源不存在")
+            datasource_service.delete_bucket_file(file, source)
 
 
 def _action_runtime_connector(
@@ -1496,6 +1501,49 @@ def _template_action_resources(
     return template_file, template_source, target_source, None, None
 
 
+def _lock_template_target_source(
+    db: Session,
+    action: Any,
+    observed: DataSource,
+) -> DataSource:
+    expected = (
+        observed.tenant_id,
+        observed.scenario_id,
+        observed.type,
+        dict(observed.config or {}),
+    )
+    tenant_id = tenant_service.current_tenant_id(db)
+    template_catalog_service.lock_scenarios_for_template_write(
+        db,
+        tenant_id=tenant_id,
+        scenario_ids=[action.scenario_id, observed.scenario_id],
+    )
+    locked = db.scalar(
+        select(DataSource)
+        .where(
+            DataSource.id == observed.id,
+            DataSource.tenant_id == tenant_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if locked is None:
+        raise PolicyViolation("附件目标资料库在执行期间已删除")
+    current = (
+        locked.tenant_id,
+        locked.scenario_id,
+        locked.type,
+        dict(locked.config or {}),
+    )
+    if current != expected:
+        raise PolicyViolation("附件目标资料库在执行期间已变更，请重试")
+    if locked.scenario_id not in (None, action.scenario_id):
+        raise PolicyViolation("附件目标不属于当前业务场景")
+    if locked.type != "file_bucket":
+        raise PolicyViolation("附件目标必须是文件桶数据源")
+    return locked
+
+
 def _exec_template(
     db: Session,
     action: Any,
@@ -1508,32 +1556,33 @@ def _exec_template(
     template_file, template_source, target_source, catalog_template, catalog_version = (
         _template_action_resources(db, action, cfg)
     )
+    target_source = _lock_template_target_source(db, action, target_source)
     created: BucketFile | None = None
     try:
-        created, result = template_artifact_service.generate_bucket_artifact(
-            template_file,
-            template_source,
-            target_source,
-            params,
-            output_filename=str(cfg.get("output_filename") or ""),
-            expected_template_sha256=str(cfg.get("template_sha256") or ""),
-            generated_by_action_log_id=(execution_log.id if execution_log else None),
-            origin_template_id=(catalog_template.id if catalog_template else None),
-            origin_template_version_id=(catalog_version.id if catalog_version else None),
-            origin_template_version=(catalog_version.version if catalog_version else None),
-        )
-        db.add(created)
-        db.flush()
-        rag_service.enqueue_document_index(db, created, parse_document=True)
+        with db.begin_nested():
+            created, result = template_artifact_service.generate_bucket_artifact(
+                template_file,
+                template_source,
+                target_source,
+                params,
+                output_filename=str(cfg.get("output_filename") or ""),
+                expected_template_sha256=str(cfg.get("template_sha256") or ""),
+                generated_by_action_log_id=(execution_log.id if execution_log else None),
+                origin_template_id=(catalog_template.id if catalog_template else None),
+                origin_template_version_id=(catalog_version.id if catalog_version else None),
+                origin_template_version=(catalog_version.version if catalog_version else None),
+                db=db,
+            )
+            db.add(created)
+            db.flush()
+            rag_service.enqueue_document_index(db, created, parse_document=True)
         _register_pending_template_file(db, created)
         return result
     except Exception:
-        if created is not None:
-            pending = db.info.get(_PENDING_TEMPLATE_FILES)
-            if isinstance(pending, list) and created in pending:
-                pending.remove(created)
-        if created is not None:
-            datasource_service.delete_bucket_file(created)
+        if created is not None and not datasource_service.is_managed_minio_file(
+            created
+        ):
+            datasource_service.delete_bucket_file(created, target_source)
         raise
 
 

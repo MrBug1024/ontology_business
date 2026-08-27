@@ -1,9 +1,11 @@
-"""Install the governed annual-audit delivery slice for the bookkeeping demo.
+"""Legacy SQLite/local-file bookkeeping bootstrap/recovery helper.
 
 This migration is intentionally additive and idempotent.  It repairs missing
 semantic mappings for the AP001 audit objects, adds navigable project links,
 uploads verified DOCX/XLSX templates, and exposes three confirmation-gated
-template Actions.  It never re-enables arbitrary Agent SQL.
+template Actions.  It never re-enables arbitrary Agent SQL.  Its CLI is
+deliberately disabled for the migrated MySQL/MinIO deployment; production
+changes require a versioned MySQL/MinIO migration.
 
 Run from ``backend``::
 
@@ -2220,6 +2222,14 @@ def main() -> None:
     parser.add_argument("--source-id", help="目标结构化 SQLite 数据源 ID")
     parser.add_argument("--file-bucket-id", help="目标模板/产出物文件桶 ID")
     args = parser.parse_args()
+    from app.config import get_settings
+
+    settings = get_settings()
+    if not settings.uses_sqlite_database or settings.minio_configured:
+        parser.error(
+            "此脚本仅供迁移前的隔离 SQLite fixture 使用；MySQL/MinIO 环境禁止运行，"
+            "请使用版本化 MySQL 数据迁移和 MinIO lifecycle 工具"
+        )
     init_db()
     db = SessionLocal()
     try:

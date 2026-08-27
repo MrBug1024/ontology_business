@@ -189,7 +189,10 @@ class RagRuntimeTests(unittest.TestCase):
         job.max_attempts = 1
         self.db.commit()
         with patch(
-            "app.services.doc_parser.parse_file",
+            "app.services.datasource_service.read_bucket_file",
+            return_value=(b"example", 7, "text/markdown; charset=utf-8"),
+        ), patch(
+            "app.services.doc_parser.parse_bytes",
             return_value={"status": "error", "text": "", "message": "不支持的示例格式"},
         ):
             rag_service.process_document_index_jobs(self.db)

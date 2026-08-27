@@ -1,6 +1,9 @@
 """Tenant-isolated management API for reusable artifact templates."""
 from __future__ import annotations
 
+from contextlib import nullcontext
+import uuid
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -25,6 +28,8 @@ from ..schemas import (
 )
 from ..services import (
     datasource_service,
+    object_deletion_service,
+    object_storage_service,
     permission_service,
     template_artifact_service,
     template_catalog_service,
@@ -198,8 +203,63 @@ def _remove_uncommitted_upload(db: Session, bucket_file: BucketFile) -> None:
     persisted_version = db.scalar(select(ArtifactTemplateVersion.id).where(
         ArtifactTemplateVersion.bucket_file_id == bucket_file.id
     ).limit(1))
-    if not persisted_version:
-        datasource_service.delete_bucket_file(bucket_file)
+    if not persisted_version and not datasource_service.is_managed_minio_file(
+        bucket_file
+    ):
+        source = db.get(DataSource, bucket_file.data_source_id)
+        if source is None:
+            raise RuntimeError("未提交模板文件所属数据源不存在")
+        datasource_service.delete_bucket_file(bucket_file, source)
+
+
+def _save_template_upload(
+    db: Session,
+    source: DataSource,
+    filename: str,
+    content: bytes,
+    *,
+    mime: str,
+) -> BucketFile:
+    file_id = uuid.uuid4().hex
+    claim = None
+    if datasource_service.is_managed_minio_source(source):
+        claim = object_deletion_service.prepare_bucket_file_upload(
+            source, file_id, filename
+        )
+    heartbeat = (
+        object_deletion_service.heartbeat_upload_intent(claim)
+        if claim is not None
+        else nullcontext()
+    )
+    with heartbeat as active_heartbeat:
+        if claim is not None:
+            object_deletion_service.begin_upload_put(claim)
+        saved = datasource_service.save_bucket_file(
+            source,
+            filename,
+            content,
+            mime=mime,
+            stable_file_id=file_id if claim is not None else None,
+            upload_object_key=claim.object_key if claim is not None else None,
+        )
+        if claim is not None:
+            object_deletion_service.assert_upload_active(
+                active_heartbeat, claim, saved
+            )
+    db.add(saved)
+    if claim is not None:
+        try:
+            object_deletion_service.retain_bucket_file_upload(
+                db, claim, saved, source
+            )
+        except object_deletion_service.UploadIntentLeaseLostError:
+            db.rollback()
+            object_deletion_service.schedule_abandoned_upload_best_effort(
+                claim,
+                saved,
+            )
+            raise
+    return saved
 
 
 def _version_out(db: Session, version: ArtifactTemplateVersion) -> ArtifactTemplateVersionOut:
@@ -494,13 +554,18 @@ async def upload_template(
     filename = file.filename or "template"
     try:
         metadata = template_artifact_service.inspect_template(filename, content)
-        saved = datasource_service.save_bucket_file(
-            source, filename, content, mime=str(metadata["mime"])
+        saved = _save_template_upload(
+            db,
+            source,
+            filename,
+            content,
+            mime=str(metadata["mime"]),
         )
     except (ValueError, template_artifact_service.TemplateArtifactError) as exc:
         raise HTTPException(400, str(exc)) from exc
+    except (RuntimeError, object_storage_service.ObjectStorageError) as exc:
+        raise HTTPException(503, "模板对象存储写入失败") from exc
     try:
-        db.add(saved)
         db.flush()
         return _create(
             db,
@@ -749,13 +814,18 @@ async def upload_template_version(
             db.commit()
         return _out(db, template, detail=True)
     try:
-        saved = datasource_service.save_bucket_file(
-            source, filename, content, mime=str(metadata["mime"])
+        saved = _save_template_upload(
+            db,
+            source,
+            filename,
+            content,
+            mime=str(metadata["mime"]),
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except (RuntimeError, object_storage_service.ObjectStorageError) as exc:
+        raise HTTPException(503, "模板对象存储写入失败") from exc
     try:
-        db.add(saved)
         db.flush()
         return _add_version(
             db,

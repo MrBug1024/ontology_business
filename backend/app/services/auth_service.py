@@ -161,7 +161,14 @@ def issue_email_code(db: Session, user: User, purpose: str) -> str:
         )
         .order_by(EmailVerificationCode.created_at.desc())
     ).scalars().first()
-    if latest and (now - latest.created_at.replace(tzinfo=timezone.utc)).total_seconds() < 60:
+    latest_created_at = latest.created_at if latest else None
+    if latest_created_at is not None:
+        latest_created_at = (
+            latest_created_at.replace(tzinfo=timezone.utc)
+            if latest_created_at.tzinfo is None
+            else latest_created_at.astimezone(timezone.utc)
+        )
+    if latest_created_at and (now - latest_created_at).total_seconds() < 60:
         raise HTTPException(429, "验证码发送过于频繁，请稍后再试")
     code = f"{secrets.randbelow(1_000_000):06d}"
     db.add(

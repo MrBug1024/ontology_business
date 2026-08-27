@@ -1924,14 +1924,16 @@ def _quoted_mapping_identifier(data_source_type: str, value: str, *, label: str)
     source_type = str(data_source_type or "").strip().lower()
     if source_type == "mysql":
         return "`" + identifier.replace("`", "``") + "`"
-    if source_type in {"sqlite", "postgres"}:
+    if source_type in {"sqlite", "postgres", "dataset"}:
         return '"' + identifier.replace('"', '""') + '"'
-    raise ValueError("数据映射仅支持 sqlite、postgres 和 mysql 数据源")
+    raise ValueError("数据映射仅支持 dataset、sqlite、postgres 和 mysql 数据源")
 
 
 def _quoted_mapping_table(table_name: str, data_source_type: str = "sqlite") -> str:
     """Quote an inspected physical table for its connector dialect."""
     value = str(table_name or "")
+    if str(data_source_type or "").strip().lower() == "dataset":
+        return _quoted_mapping_identifier(data_source_type, value, label="关系名")
     parts = value.split(".")
     if len(parts) > 3 or any(not part or part != part.strip() for part in parts):
         raise ValueError("表名格式不合法，请从数据源表结构中重新选择")

@@ -9,10 +9,10 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, String
+from sqlalchemy import JSON, ForeignKey, Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 
-from .database import Base
+from .database import Base, orm_datetime as DateTime
 
 
 def _uuid() -> str:

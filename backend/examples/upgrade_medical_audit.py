@@ -1,11 +1,13 @@
-"""Idempotently upgrade the demo medical-audit scenario to a domain ontology.
+"""Legacy SQLite-only medical-audit bootstrap/recovery helper.
 
 The original demo modeled upload mechanics (tables/fields/business-data) and
 then labelled raw charge rows as already-confirmed violations.  This upgrade is
 additive: it keeps historic objects intact, adds business-facing object/link
 types, binds them to governed SQLite views/tables, and retires only explicitly
-identified legacy demo resources.  It can be run repeatedly against
-``backend/data/platform.db``.
+identified legacy demo resources.  It can be run repeatedly only against an
+isolated pre-migration SQLite fixture.  The CLI is deliberately disabled when
+the deployed platform uses MySQL or MinIO; production changes require a
+versioned MySQL/MinIO migration.
 
 Run from ``backend``::
 
@@ -2504,6 +2506,14 @@ def main() -> None:
     parser.add_argument("--scenario-id", required=True)
     parser.add_argument("--source-id", required=True)
     args = parser.parse_args()
+    from app.config import get_settings
+
+    settings = get_settings()
+    if not settings.uses_sqlite_database or settings.minio_configured:
+        parser.error(
+            "此脚本仅供迁移前的隔离 SQLite fixture 使用；MySQL/MinIO 环境禁止运行，"
+            "请使用版本化 MySQL 数据迁移和 MinIO lifecycle 工具"
+        )
     init_db()
     db = SessionLocal()
     try:

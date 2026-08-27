@@ -32,6 +32,43 @@ _QUOTED_SELECT_SIDE_EFFECT_RE = re.compile(
     r'pg_wal_replay_(?:pause|resume)|pg_promote|lo_(?:import|export)|dblink_exec)"\s*\(',
     re.IGNORECASE,
 )
+_MYSQL_EXECUTABLE_COMMENT_RE = re.compile(r"/\*(?:!|M!)", re.IGNORECASE)
+_MYSQL_UNSAFE_FUNCTION_RE = re.compile(
+    r"\b(?:"
+    r"load_file|sleep|benchmark|get_lock|release_lock|release_all_locks|"
+    r"is_free_lock|is_used_lock|master_pos_wait|source_pos_wait|"
+    r"wait_for_executed_gtid_set|sql_thread_wait_after_gtids|sys_exec|sys_eval"
+    r")\s*\(",
+    re.IGNORECASE,
+)
+_MYSQL_QUOTED_UNSAFE_FUNCTION_RE = re.compile(
+    r"(?:`(?:load_file|sleep|benchmark|get_lock|release_lock|release_all_locks|"
+    r"is_free_lock|is_used_lock|master_pos_wait|source_pos_wait|"
+    r"wait_for_executed_gtid_set|sql_thread_wait_after_gtids|sys_exec|sys_eval)`|"
+    r'"(?:load_file|sleep|benchmark|get_lock|release_lock|release_all_locks|'
+    r'is_free_lock|is_used_lock|master_pos_wait|source_pos_wait|'
+    r'wait_for_executed_gtid_set|sql_thread_wait_after_gtids|sys_exec|sys_eval)")\s*\(',
+    re.IGNORECASE,
+)
+_MYSQL_FILE_EXPORT_RE = re.compile(r"\b(?:out|dump)file\b", re.IGNORECASE)
+_DUCKDB_UNSAFE_FUNCTION_RE = re.compile(
+    r"\b(?:"
+    r"sleep_ms|write_log|setseed|current_setting|current_query|"
+    r"read_[A-Za-z0-9_]*|glob|query|query_table|which_secret|"
+    r"sqlite_scan|postgres_scan|mysql_scan|iceberg_scan|delta_scan|"
+    r"arrow_scan|pandas_scan|parquet_(?:scan|metadata|schema|file_metadata)|"
+    r"pragma_[A-Za-z0-9_]*|duckdb_[A-Za-z0-9_]*"
+    r")\s*\(",
+    re.IGNORECASE,
+)
+_DUCKDB_QUOTED_UNSAFE_FUNCTION_RE = re.compile(
+    r'"(?:sleep_ms|write_log|setseed|current_setting|current_query|'
+    r'read_[A-Za-z0-9_]*|glob|query|query_table|which_secret|'
+    r'sqlite_scan|postgres_scan|mysql_scan|iceberg_scan|delta_scan|'
+    r'arrow_scan|pandas_scan|parquet_(?:scan|metadata|schema|file_metadata)|'
+    r'pragma_[A-Za-z0-9_]*|duckdb_[A-Za-z0-9_]*)"\s*\(',
+    re.IGNORECASE,
+)
 _AGENT_SQL_TOKEN_RE = re.compile(
     r"(?P<space>\s+)"
     r"|(?P<string>'(?:''|[^'])*')"
@@ -90,7 +127,7 @@ def _strip_sql_literals(sql: str) -> str:
     return "".join(out)
 
 
-def validate_read_only_sql(sql: str) -> str:
+def validate_read_only_sql(sql: str, *, dialect: str | None = None) -> str:
     """校验并规范化只读 SQL，拒绝多语句和写操作。"""
     if not isinstance(sql, str) or not sql.strip():
         raise PolicyViolation("SQL 不能为空")
@@ -101,6 +138,17 @@ def validate_read_only_sql(sql: str) -> str:
         statement = statement[:-1].rstrip()
     if ";" in statement:
         raise PolicyViolation("只读查询不允许执行多条 SQL 语句")
+
+    normalized_dialect = str(dialect or "").strip().casefold()
+    if normalized_dialect == "dataset":
+        normalized_dialect = "duckdb"
+    if normalized_dialect == "mysql" and _MYSQL_EXECUTABLE_COMMENT_RE.search(
+        statement
+    ):
+        # MySQL executes the body of /*! ... */ and MariaDB's /*M! ... */.
+        # Treating these as ordinary comments lets DDL/file-export tokens evade
+        # the scanner while the server still executes them.
+        raise PolicyViolation("MySQL 只读查询不允许可执行版本注释")
 
     # 去除注释后检查首关键字和 CTE 中的写操作。
     without_comments = re.sub(r"--[^\n]*|/\*.*?\*/", " ", statement, flags=re.S)
@@ -125,6 +173,17 @@ def validate_read_only_sql(sql: str) -> str:
         without_comments
     ):
         raise PolicyViolation("只读查询不允许调用有副作用或阻塞型数据库函数")
+    if normalized_dialect == "mysql" and (
+        _MYSQL_UNSAFE_FUNCTION_RE.search(scanned)
+        or _MYSQL_QUOTED_UNSAFE_FUNCTION_RE.search(without_comments)
+        or _MYSQL_FILE_EXPORT_RE.search(scanned)
+    ):
+        raise PolicyViolation("MySQL 只读查询不允许外部文件、锁等待或资源滥用函数")
+    if normalized_dialect == "duckdb" and (
+        _DUCKDB_UNSAFE_FUNCTION_RE.search(scanned)
+        or _DUCKDB_QUOTED_UNSAFE_FUNCTION_RE.search(without_comments)
+    ):
+        raise PolicyViolation("数据集查询不允许外部扫描、系统或副作用函数")
     return statement
 
 

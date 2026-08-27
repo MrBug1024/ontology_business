@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -17,25 +18,36 @@ _TEXT_EXTS = {"txt", "md", "markdown", "csv", "tsv", "json", "yaml", "yml", "xml
 
 
 def parse_file(path: str | Path, filename: str = "") -> dict[str, Any]:
-    """解析单个文件，返回 {"status": "success"|"error", "text": str, "message": str}。"""
+    """Compatibility wrapper for callers that still own a local path."""
     p = Path(path)
     name = filename or p.name
-    ext = p.suffix.lstrip(".").lower()
+    try:
+        return parse_bytes(p.read_bytes(), name)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "text": "", "message": f"解析失败: {exc}"}
+
+
+def parse_bytes(content: bytes, filename: str) -> dict[str, Any]:
+    """Parse one document directly from durable object bytes."""
+    if not isinstance(content, bytes):
+        return {"status": "error", "text": "", "message": "文件内容必须是字节数据"}
+    name = Path(str(filename or "")).name
+    ext = Path(name).suffix.lstrip(".").lower()
     try:
         if ext in _IMAGE_EXTS:
-            return _parse_image(p, name)
+            return _parse_image(content, name)
         if ext == "pdf":
-            return _parse_pdf(p, name)
+            return _parse_pdf(content, name)
         if ext in ("xlsx", "xlsm"):
-            return _parse_excel(p)
+            return _parse_excel(content)
         if ext == "xls":
-            return _parse_xls(p)
+            return _parse_xls(content)
         if ext in ("docx",):
-            return _parse_docx(p)
+            return _parse_docx(content)
         if ext == "pptx":
-            return _parse_pptx(p)
+            return _parse_pptx(content)
         if ext in _TEXT_EXTS:
-            return _parse_text(p)
+            return _parse_text(content)
         return {"status": "error", "text": "", "message": f"暂不支持的文件类型: .{ext}"}
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "text": "", "message": f"解析失败: {exc}"}
@@ -88,9 +100,9 @@ def _mime(name: str) -> str:
     return mimetypes.guess_type(name)[0] or "application/octet-stream"
 
 
-def _parse_pdf(p: Path, name: str) -> dict[str, Any]:
+def _parse_pdf(content: bytes, name: str) -> dict[str, Any]:
     if _ocr_available():
-        r = _ocr_parse(p.read_bytes(), name, is_image=False)
+        r = _ocr_parse(content, name, is_image=False)
         if r["status"] == "success":
             return r
         ocr_msg = r["message"]
@@ -100,7 +112,7 @@ def _parse_pdf(p: Path, name: str) -> dict[str, Any]:
     try:
         from pypdf import PdfReader
 
-        reader = PdfReader(str(p))
+        reader = PdfReader(BytesIO(content))
         pages = []
         for i, page in enumerate(reader.pages):
             t = page.extract_text() or ""
@@ -113,9 +125,9 @@ def _parse_pdf(p: Path, name: str) -> dict[str, Any]:
     return {"status": "error", "text": "", "message": f"PDF 解析失败（{ocr_msg}）"}
 
 
-def _parse_image(p: Path, name: str) -> dict[str, Any]:
+def _parse_image(content: bytes, name: str) -> dict[str, Any]:
     if _ocr_available():
-        r = _ocr_parse(p.read_bytes(), name, is_image=True)
+        r = _ocr_parse(content, name, is_image=True)
         if r["status"] == "success":
             return r
         return {"status": "error", "text": "", "message": f"图片 OCR 失败: {r['message']}"}
@@ -125,10 +137,10 @@ def _parse_image(p: Path, name: str) -> dict[str, Any]:
 # ──────────────────────────────────────────────
 # 表格 / 文档
 # ──────────────────────────────────────────────
-def _parse_excel(p: Path) -> dict[str, Any]:
+def _parse_excel(content: bytes) -> dict[str, Any]:
     from openpyxl import load_workbook
 
-    wb = load_workbook(str(p), read_only=True, data_only=True)
+    wb = load_workbook(BytesIO(content), read_only=True, data_only=True)
     parts: list[str] = []
     for ws in wb.worksheets:
         lines = [f"### 工作表: {ws.title}"]
@@ -141,11 +153,11 @@ def _parse_excel(p: Path) -> dict[str, Any]:
     return {"status": "success", "text": "\n\n".join(parts), "message": "Excel 解析完成"}
 
 
-def _parse_xls(p: Path) -> dict[str, Any]:
+def _parse_xls(content: bytes) -> dict[str, Any]:
     try:
         import xlrd  # type: ignore
 
-        book = xlrd.open_workbook(str(p))
+        book = xlrd.open_workbook(file_contents=content)
         parts = []
         for sh in book.sheets():
             lines = [f"### 工作表: {sh.name}"]
@@ -157,10 +169,10 @@ def _parse_xls(p: Path) -> dict[str, Any]:
         return {"status": "error", "text": "", "message": "缺少 xlrd 依赖，无法解析 .xls（请转换为 .xlsx）"}
 
 
-def _parse_docx(p: Path) -> dict[str, Any]:
+def _parse_docx(content: bytes) -> dict[str, Any]:
     from docx import Document
 
-    doc = Document(str(p))
+    doc = Document(BytesIO(content))
     parts: list[str] = []
     for para in doc.paragraphs:
         if para.text.strip():
@@ -172,10 +184,10 @@ def _parse_docx(p: Path) -> dict[str, Any]:
     return {"status": "success", "text": "\n".join(parts), "message": "Word 解析完成"}
 
 
-def _parse_pptx(p: Path) -> dict[str, Any]:
+def _parse_pptx(content: bytes) -> dict[str, Any]:
     from pptx import Presentation
 
-    prs = Presentation(str(p))
+    prs = Presentation(BytesIO(content))
     parts: list[str] = []
     for i, slide in enumerate(prs.slides, 1):
         parts.append(f"### 幻灯片 {i}")
@@ -188,8 +200,7 @@ def _parse_pptx(p: Path) -> dict[str, Any]:
     return {"status": "success", "text": "\n".join(parts), "message": "PPT 解析完成"}
 
 
-def _parse_text(p: Path) -> dict[str, Any]:
-    raw = p.read_bytes()
+def _parse_text(raw: bytes) -> dict[str, Any]:
     for enc in ("utf-8", "gbk", "utf-16"):
         try:
             text = raw.decode(enc)
@@ -206,13 +217,5 @@ def _parse_text(p: Path) -> dict[str, Any]:
 
 def parse_base64(b64: str, filename: str) -> dict[str, Any]:
     """解析 Base64 内容（供 skill 调用）。"""
-    import tempfile
-
     content = base64.b64decode(b64)
-    with tempfile.NamedTemporaryFile(suffix=f".{Path(filename).suffix.lstrip('.')}", delete=False) as f:
-        f.write(content)
-        tmp = f.name
-    try:
-        return parse_file(tmp, filename)
-    finally:
-        Path(tmp).unlink(missing_ok=True)
+    return parse_bytes(content, filename)

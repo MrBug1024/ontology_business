@@ -7,23 +7,26 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
-    DateTime,
     event,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     inspect,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects import mysql, postgresql
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .config import get_settings
-from .database import Base
+from .database import Base, orm_datetime as DateTime
 
 
 def _uuid() -> str:
@@ -32,6 +35,22 @@ def _uuid() -> str:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _json_document_type():
+    """Use PostgreSQL JSONB without giving up SQLite/MySQL test portability."""
+    return JSON().with_variant(postgresql.JSONB(none_as_null=True), "postgresql")
+
+
+def _sha256_check(column_name: str) -> str:
+    """Portable exact lowercase SHA-256 check for PostgreSQL/MySQL/SQLite."""
+    remainder = column_name
+    for character in "0123456789abcdef":
+        remainder = f"replace({remainder}, '{character}', '')"
+    return (
+        f"length({column_name}) = 64 AND {column_name} = lower({column_name}) "
+        f"AND {remainder} = ''"
+    )
 
 
 def _assistant_attachment_expiry() -> datetime:
@@ -251,6 +270,9 @@ class EmailVerificationCode(Base):
 # ──────────────────────────────────────────────
 class BusinessScenario(Base):
     __tablename__ = "business_scenarios"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_scenarios_id_tenant"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str | None] = mapped_column(
@@ -272,7 +294,7 @@ class BusinessScenario(Base):
         back_populates="scenario", cascade="all, delete-orphan"
     )
     data_sources: Mapped[list[DataSource]] = relationship(
-        back_populates="scenario", cascade="all, delete-orphan"
+        back_populates="scenario", passive_deletes=True
     )
     instances: Mapped[list[OntologyInstance]] = relationship(
         cascade="all, delete-orphan"
@@ -338,6 +360,9 @@ class OntologyEntity(Base):
     """本体中的实体类型（Object Type），例如对象、事项、资源等领域概念。"""
 
     __tablename__ = "ontology_entities"
+    __table_args__ = (
+        UniqueConstraint("id", "scenario_id", name="uq_entities_id_scenario"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     scenario_id: Mapped[str] = mapped_column(
@@ -385,6 +410,9 @@ class OntologyProperty(Base):
     """实体属性（Property）。"""
 
     __tablename__ = "ontology_properties"
+    __table_args__ = (
+        UniqueConstraint("id", "entity_id", name="uq_properties_id_entity"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     entity_id: Mapped[str] = mapped_column(
@@ -418,6 +446,16 @@ class OntologyRelation(Base):
     """实体间关系（Link Type）。"""
 
     __tablename__ = "ontology_relations"
+    __table_args__ = (
+        UniqueConstraint(
+            "id",
+            "scenario_id",
+            "source_entity_id",
+            "target_entity_id",
+            name="uq_relations_id_scope",
+        ),
+        UniqueConstraint("id", "scenario_id", name="uq_relations_id_scenario"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     scenario_id: Mapped[str] = mapped_column(
@@ -464,6 +502,9 @@ class OntologyInstance(Base):
     """实体实例（Object）：本体中某个实体类型的一条真实业务记录。"""
 
     __tablename__ = "ontology_instances"
+    __table_args__ = (
+        UniqueConstraint("id", "scenario_id", name="uq_instances_id_scenario"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     scenario_id: Mapped[str] = mapped_column(
@@ -557,6 +598,13 @@ class DataMapping(Base):
     # 解析到该环境已发布、已验签的连接器，不能据此直接选中 dev 数据源。
     data_source_binding_key: Mapped[str] = mapped_column(String(180), default="")
     data_source_binding_ref: Mapped[dict] = mapped_column(JSON, default=dict)
+    # New catalog-backed mappings point at a stable logical relation.  The
+    # legacy table_name remains a compatibility label, not storage ownership.
+    dataset_relation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("dataset_relations.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     table_name: Mapped[str] = mapped_column(String(300), default="")
     column_map: Mapped[dict] = mapped_column(JSON, default=dict)  # {本体属性名: 表列名}
     transform_rules: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -574,6 +622,7 @@ class DataMapping(Base):
     scenario: Mapped[BusinessScenario] = relationship(back_populates="data_mappings")
     entity: Mapped[OntologyEntity] = relationship()
     data_source: Mapped[DataSource] = relationship()
+    dataset_relation: Mapped["DatasetRelation | None"] = relationship()
     source_relation_mappings: Mapped[list["RelationDataMapping"]] = relationship(
         foreign_keys="RelationDataMapping.source_mapping_id",
         back_populates="source_mapping",
@@ -593,6 +642,9 @@ class DataSource(Base):
     """数据源：关系型数据库（mysql/postgres/sqlite）或文件桶（file_bucket）。"""
 
     __tablename__ = "data_sources"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_data_sources_id_tenant"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str | None] = mapped_column(
@@ -600,7 +652,7 @@ class DataSource(Base):
     )
     is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     scenario_id: Mapped[str | None] = mapped_column(
-        ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True, nullable=True
+        ForeignKey("business_scenarios.id", ondelete="SET NULL"), index=True, nullable=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     type: Mapped[str] = mapped_column(String(30), nullable=False)  # mysql / postgres / sqlite / file_bucket
@@ -633,6 +685,9 @@ class BucketFile(Base):
 
     __tablename__ = "bucket_files"
     __table_args__ = (
+        UniqueConstraint(
+            "id", "data_source_id", name="uq_bucket_files_id_source"
+        ),
         Index(
             "uq_bucket_files_generated_action_log",
             "generated_by_action_log_id",
@@ -645,8 +700,22 @@ class BucketFile(Base):
         ForeignKey("data_sources.id", ondelete="CASCADE"), index=True
     )
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
-    stored_path: Mapped[str] = mapped_column(String(1000), nullable=False)
-    size: Mapped[int] = mapped_column(Integer, default=0)
+    stored_path: Mapped[str] = mapped_column(String(4096), nullable=False)
+    # ``stored_path`` remains for rolling upgrades and local test storage.
+    # Managed objects use the structured fields below and mirror their stable
+    # ``minio://`` URI into ``stored_path`` for legacy callers.
+    storage_provider: Mapped[str] = mapped_column(
+        String(20), default="local", nullable=False
+    )
+    bucket_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    object_key: Mapped[str] = mapped_column(String(2048), default="", nullable=False)
+    object_version_id: Mapped[str] = mapped_column(
+        String(255), default="", nullable=False
+    )
+    etag: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    # This is a durable object identity, never an expiring presigned URL.
+    object_url: Mapped[str] = mapped_column(String(4096), default="", nullable=False)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
     mime: Mapped[str] = mapped_column(String(200), default="")
     # Raw-file integrity and generation lineage are durable BucketFile facts,
     # not merely transient fields in an Action response.  Legacy uploads keep
@@ -665,7 +734,9 @@ class BucketFile(Base):
     )
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / parsed / error
     error: Mapped[str] = mapped_column(Text, default="")
-    parsed_text: Mapped[str] = mapped_column(Text, default="")
+    parsed_text: Mapped[str] = mapped_column(
+        Text().with_variant(mysql.LONGTEXT(), "mysql"), default=""
+    )
     # P1 RAG 索引：解析文本变化后按内容哈希增量重建分块向量。
     index_status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / queued / indexed / partial / error
     index_error: Mapped[str] = mapped_column(Text, default="")
@@ -677,7 +748,65 @@ class BucketFile(Base):
 
     data_source: Mapped[DataSource] = relationship(back_populates="files")
     document_chunks: Mapped[list["DocumentChunk"]] = relationship(
-        back_populates="bucket_file", cascade="all, delete-orphan"
+        back_populates="bucket_file",
+        cascade="all, delete-orphan",
+        foreign_keys="DocumentChunk.bucket_file_id",
+    )
+
+
+class ObjectDeletionJob(Base):
+    """Transactional outbox for durable object deletion.
+
+    The job deliberately has no foreign key to its origin row: that row and
+    any owning parent may be deleted in the same transaction that creates the
+    job.  Completed rows are retained as a compact deletion audit trail.
+    """
+
+    __tablename__ = "object_deletion_jobs"
+    __table_args__ = (
+        Index(
+            "ix_object_deletion_jobs_ready",
+            "status",
+            "next_attempt_at",
+            "created_at",
+        ),
+        Index(
+            "ix_object_deletion_jobs_origin",
+            "origin_type",
+            "origin_id",
+        ),
+    )
+
+    # A SHA-256 of provider + immutable object identity is both the primary
+    # key and the deduplication key without requiring an oversized MySQL index.
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    bucket_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    object_key: Mapped[str] = mapped_column(String(2048), default="", nullable=False)
+    object_version_id: Mapped[str] = mapped_column(
+        String(255), default="", nullable=False
+    )
+    object_url: Mapped[str] = mapped_column(String(4096), default="", nullable=False)
+    origin_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    origin_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    scenario_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_token: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    lease_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 
@@ -709,7 +838,13 @@ class ArtifactTemplate(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
     current_version_id: Mapped[str | None] = mapped_column(
-        ForeignKey("artifact_template_versions.id", ondelete="SET NULL"), nullable=True
+        ForeignKey(
+            "artifact_template_versions.id",
+            name="fk_artifact_templates_current_version",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
     )
     created_by_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
@@ -777,6 +912,9 @@ class DocumentChunk(Base):
 
     __tablename__ = "document_chunks"
     __table_args__ = (
+        UniqueConstraint(
+            "id", "data_source_id", name="uq_document_chunks_id_source"
+        ),
         Index("ix_document_chunks_source_file", "data_source_id", "bucket_file_id"),
         Index("uq_document_chunks_file_ordinal", "bucket_file_id", "ordinal", unique=True),
     )
@@ -835,6 +973,11 @@ class RelationDataMapping(Base):
     )
     data_source_binding_key: Mapped[str] = mapped_column(String(180), default="")
     data_source_binding_ref: Mapped[dict] = mapped_column(JSON, default=dict)
+    dataset_relation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("dataset_relations.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     table_name: Mapped[str] = mapped_column(String(300), default="")
     foreign_key_column: Mapped[str] = mapped_column(String(300), default="")
     source_key_column: Mapped[str] = mapped_column(String(300), default="")
@@ -855,6 +998,7 @@ class RelationDataMapping(Base):
         foreign_keys=[target_mapping_id], back_populates="target_relation_mappings"
     )
     data_source: Mapped[DataSource] = relationship()
+    dataset_relation: Mapped["DatasetRelation | None"] = relationship()
 
 
 class DataMappingRefreshJob(Base):
@@ -1627,7 +1771,7 @@ class ScenarioModelDraftResource(Base):
 
 
 class AssistantAttachment(Base):
-    """助手临时附件：只保存解析后的文本，用户确认后再提升为正式数据源。"""
+    """助手临时附件：原始字节在 MinIO，解析文本用于限时会话上下文。"""
 
     __tablename__ = "assistant_attachments"
 
@@ -1648,8 +1792,22 @@ class AssistantAttachment(Base):
     # Hash the uploaded bytes before parsing so retries key off the actual
     # attachment content without copying the binary into the job ledger.
     content_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    # Legacy rows whose original bytes were discarded are explicitly ``none``.
+    # Every new upload records a stable managed MinIO identity instead.
+    storage_provider: Mapped[str] = mapped_column(
+        String(20), default="none", nullable=False
+    )
+    bucket_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    object_key: Mapped[str] = mapped_column(String(2048), default="", nullable=False)
+    object_version_id: Mapped[str] = mapped_column(
+        String(255), default="", nullable=False
+    )
+    etag: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    object_url: Mapped[str] = mapped_column(String(4096), default="", nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / parsed / error
-    parsed_text: Mapped[str] = mapped_column(Text, default="")
+    parsed_text: Mapped[str] = mapped_column(
+        Text().with_variant(mysql.LONGTEXT(), "mysql"), default=""
+    )
     error: Mapped[str] = mapped_column(Text, default="")
     consumed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -1932,10 +2090,24 @@ class OntologyBranch(Base):
     # active / merged / archived
     status: Mapped[str] = mapped_column(String(20), default="active")
     base_snapshot_id: Mapped[str | None] = mapped_column(
-        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+        ForeignKey(
+            "ontology_snapshots.id",
+            name="fk_ontology_branches_base_snapshot",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
     )
     head_snapshot_id: Mapped[str | None] = mapped_column(
-        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+        ForeignKey(
+            "ontology_snapshots.id",
+            name="fk_ontology_branches_head_snapshot",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
     )
     created_by_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
@@ -1962,6 +2134,9 @@ class OntologySnapshot(Base):
 
     __tablename__ = "ontology_snapshots"
     __table_args__ = (
+        UniqueConstraint(
+            "id", "tenant_id", "scenario_id", name="uq_snapshots_id_tenant_scenario"
+        ),
         Index("ix_ontology_snapshots_scenario_created", "scenario_id", "created_at"),
         Index("ix_ontology_snapshots_branch_created", "branch_id", "created_at"),
     )
@@ -2077,6 +2252,13 @@ class OntologyRelease(Base):
 
     __tablename__ = "ontology_releases"
     __table_args__ = (
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            "scenario_id",
+            "snapshot_id",
+            name="uq_releases_id_tenant_scenario_snapshot",
+        ),
         Index("ix_ontology_releases_scenario_environment", "scenario_id", "environment", "created_at"),
     )
 
@@ -2231,7 +2413,14 @@ class WorkflowRun(Base):
     # manual / scheduled / event / approval / retry
     trigger_source: Mapped[str] = mapped_column(String(30), default="manual")
     event_envelope_id: Mapped[str | None] = mapped_column(
-        ForeignKey("event_envelopes.id", ondelete="SET NULL"), nullable=True, index=True
+        ForeignKey(
+            "event_envelopes.id",
+            name="fk_workflow_runs_event_envelope",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
     )
     # 事件和调度投递以此键去重；手动运行不填写，允许重复提交。
     dedupe_key: Mapped[str | None] = mapped_column(String(180), nullable=True)
@@ -2363,6 +2552,9 @@ class ActionExecutionLog(Base):
 
     __tablename__ = "action_execution_logs"
     __table_args__ = (
+        UniqueConstraint(
+            "id", "scenario_id", name="uq_action_logs_id_scenario"
+        ),
         Index(
             "uq_action_execution_logs_idempotency",
             "scenario_id",
@@ -2388,8 +2580,10 @@ class ActionExecutionLog(Base):
     target_name: Mapped[str] = mapped_column(String(200), default="")
     # 输入参数
     input_params: Mapped[dict] = mapped_column(JSON, default=dict)
-    # 执行状态: running / success / failed / confirmation_required / dry_run
-    status: Mapped[str] = mapped_column(String(20), default="running")
+    # 执行状态: running / success / failed / confirmation_required / dry_run /
+    # awaiting_approval.  Keep headroom beyond the longest canonical value so
+    # strict MySQL cannot reject an audit row that SQLite historically accepted.
+    status: Mapped[str] = mapped_column(String(32), default="running")
     # execute / dry_run / confirmation
     mode: Mapped[str] = mapped_column(String(20), default="execute")
     # 同一个业务请求的幂等键；预演和确认提醒不要求填写。
@@ -2448,3 +2642,2591 @@ class ActionExecutionLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship()
+
+
+# ------------------------------------------------------------
+# Tenant-owned data catalog and immutable dataset versions
+# ------------------------------------------------------------
+class PlatformMigrationRun(Base):
+    """Durable, credential-free state for one recoverable platform migration."""
+
+    __tablename__ = "platform_migration_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "migration_name",
+            "plan_digest",
+            name="uq_platform_migration_runs_plan",
+        ),
+        CheckConstraint(
+            "status IN ('running', 'failed', 'verified', 'cutover')",
+            name="ck_platform_migration_runs_status",
+        ),
+        CheckConstraint(
+            "current_phase IN ('plan', 'bootstrap', 'archive', 'import', "
+            "'verify', 'cutover')",
+            name="ck_platform_migration_runs_phase",
+        ),
+        CheckConstraint(_sha256_check("plan_digest"), name="ck_platform_runs_plan_sha"),
+        CheckConstraint(
+            _sha256_check("source_fingerprint"), name="ck_platform_runs_source_sha"
+        ),
+        Index("ix_platform_migration_runs_status", "status", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    migration_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    current_phase: Mapped[str] = mapped_column(String(24), nullable=False)
+    manifest: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+
+    checkpoints: Mapped[list["PlatformMigrationCheckpoint"]] = relationship(
+        back_populates="migration_run",
+        order_by="PlatformMigrationCheckpoint.completed_at",
+    )
+
+
+class PlatformMigrationCheckpoint(Base):
+    """Idempotent content checkpoint for a migration stage and logical item."""
+
+    __tablename__ = "platform_migration_checkpoints"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('complete', 'verified')",
+            name="ck_platform_migration_checkpoints_status",
+        ),
+        CheckConstraint(
+            "row_count IS NULL OR row_count >= 0",
+            name="ck_platform_migration_checkpoints_rows",
+        ),
+        CheckConstraint(
+            _sha256_check("payload_sha256"), name="ck_platform_checkpoints_payload_sha"
+        ),
+        Index(
+            "ix_platform_migration_checkpoints_status",
+            "run_id",
+            "status",
+            "completed_at",
+        ),
+    )
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_migration_runs.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    stage: Mapped[str] = mapped_column(String(40), primary_key=True)
+    item_key: Mapped[str] = mapped_column(String(300), primary_key=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    row_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    payload: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    migration_run: Mapped[PlatformMigrationRun] = relationship(
+        back_populates="checkpoints"
+    )
+
+
+class DataAsset(Base):
+    """Stable, tenant-owned identity for an external or generated data asset.
+
+    Assets deliberately have no scenario foreign key. Scenarios consume
+    datasets through explicit bindings and can be retired without destroying
+    source evidence.
+    """
+
+    __tablename__ = "data_assets"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "key", name="uq_data_assets_tenant_key"),
+        UniqueConstraint("id", "tenant_id", name="uq_data_assets_id_tenant"),
+        CheckConstraint(
+            "kind IN ('file', 'stream', 'api', 'database', 'generated', 'other')",
+            name="ck_data_assets_kind",
+        ),
+        CheckConstraint(
+            "lifecycle_status IN ('active', 'retired')",
+            name="ck_data_assets_lifecycle",
+        ),
+        Index("ix_data_assets_tenant_lifecycle", "tenant_id", "lifecycle_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    key: Mapped[str] = mapped_column(String(180), nullable=False)
+    name: Mapped[str] = mapped_column(String(300), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    kind: Mapped[str] = mapped_column(String(30), default="file", nullable=False)
+    media_type: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(20), default="active", nullable=False
+    )
+    labels: Mapped[dict] = mapped_column(_json_document_type(), default=dict, nullable=False)
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    versions: Mapped[list["DataAssetVersion"]] = relationship(
+        back_populates="asset",
+        order_by="DataAssetVersion.version_number",
+        foreign_keys="DataAssetVersion.asset_id",
+    )
+
+
+class DataAssetVersion(Base):
+    """Immutable content version of a catalog asset."""
+
+    __tablename__ = "data_asset_versions"
+    __table_args__ = (
+        UniqueConstraint("asset_id", "version_number", name="uq_asset_versions_number"),
+        UniqueConstraint("id", "tenant_id", name="uq_asset_versions_id_tenant"),
+        ForeignKeyConstraint(
+            ["asset_id", "tenant_id"],
+            ["data_assets.id", "data_assets.tenant_id"],
+            name="fk_asset_versions_asset_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["bucket_file_id", "bucket_data_source_id"],
+            ["bucket_files.id", "bucket_files.data_source_id"],
+            name="fk_asset_versions_file_source",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["bucket_data_source_id", "tenant_id"],
+            ["data_sources.id", "data_sources.tenant_id"],
+            name="fk_asset_versions_source_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("version_number > 0", name="ck_asset_versions_number"),
+        CheckConstraint("byte_size >= 0", name="ck_asset_versions_size"),
+        CheckConstraint(
+            "provenance_kind IN ('upload', 'connector', 'import', "
+            "'reconstruction', 'generated')",
+            name="ck_asset_versions_provenance",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'ready', 'failed', 'retired')",
+            name="ck_asset_versions_status",
+        ),
+        CheckConstraint(
+            _sha256_check("content_sha256"), name="ck_asset_versions_content_sha"
+        ),
+        Index("ix_asset_versions_asset_status", "asset_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    asset_id: Mapped[str] = mapped_column(
+        ForeignKey("data_assets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    version_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    bucket_file_id: Mapped[str] = mapped_column(
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    bucket_data_source_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    provenance_kind: Mapped[str] = mapped_column(
+        String(30), default="upload", nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    byte_size: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    source_locator: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    version_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    asset: Mapped[DataAsset] = relationship(
+        back_populates="versions", foreign_keys=[asset_id]
+    )
+    bucket_file: Mapped[BucketFile] = relationship(foreign_keys=[bucket_file_id])
+
+
+class LogicalDataset(Base):
+    """Tenant-owned logical data product independent of any business scene."""
+
+    __tablename__ = "logical_datasets"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "key", name="uq_logical_datasets_tenant_key"),
+        UniqueConstraint("id", "tenant_id", name="uq_logical_datasets_id_tenant"),
+        CheckConstraint(
+            "lifecycle_status IN ('active', 'retired')",
+            name="ck_logical_datasets_lifecycle",
+        ),
+        Index("ix_logical_datasets_tenant_lifecycle", "tenant_id", "lifecycle_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    key: Mapped[str] = mapped_column(String(180), nullable=False)
+    name: Mapped[str] = mapped_column(String(300), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(20), default="active", nullable=False
+    )
+    labels: Mapped[dict] = mapped_column(_json_document_type(), default=dict, nullable=False)
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    schemas: Mapped[list["DatasetSchema"]] = relationship(
+        back_populates="dataset",
+        order_by="DatasetSchema.schema_version",
+        foreign_keys="DatasetSchema.dataset_id",
+    )
+    versions: Mapped[list["DatasetVersion"]] = relationship(
+        back_populates="dataset",
+        order_by="DatasetVersion.version_number",
+        foreign_keys="DatasetVersion.dataset_id",
+    )
+    heads: Mapped[list["DatasetHead"]] = relationship(
+        back_populates="dataset", foreign_keys="DatasetHead.dataset_id"
+    )
+
+
+class DatasetSchema(Base):
+    """Immutable schema contract for one logical dataset."""
+
+    __tablename__ = "dataset_schemas"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "schema_version", name="uq_dataset_schemas_version"),
+        UniqueConstraint("dataset_id", "schema_hash", name="uq_dataset_schemas_hash"),
+        UniqueConstraint("id", "dataset_id", name="uq_dataset_schemas_id_dataset"),
+        UniqueConstraint(
+            "id", "dataset_id", "tenant_id", name="uq_dataset_schemas_id_scope"
+        ),
+        ForeignKeyConstraint(
+            ["dataset_id", "tenant_id"],
+            ["logical_datasets.id", "logical_datasets.tenant_id"],
+            name="fk_dataset_schemas_dataset_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("schema_version > 0", name="ck_dataset_schemas_version"),
+        CheckConstraint(
+            _sha256_check("schema_hash"), name="ck_dataset_schemas_hash_sha"
+        ),
+        CheckConstraint(
+            "compatibility IN ('none', 'backward', 'forward', 'full')",
+            name="ck_dataset_schemas_compatibility",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("logical_datasets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    schema_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    schema_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    compatibility: Mapped[str] = mapped_column(
+        String(20), default="none", nullable=False
+    )
+    schema_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    dataset: Mapped[LogicalDataset] = relationship(
+        back_populates="schemas", foreign_keys=[dataset_id]
+    )
+    relations: Mapped[list["DatasetRelation"]] = relationship(
+        back_populates="schema",
+        order_by="DatasetRelation.ordinal",
+        foreign_keys="DatasetRelation.schema_id",
+    )
+
+
+class DatasetRelation(Base):
+    """Named relation within a versioned dataset schema."""
+
+    __tablename__ = "dataset_relations"
+    __table_args__ = (
+        UniqueConstraint("schema_id", "relation_key", name="uq_dataset_relations_key"),
+        UniqueConstraint("schema_id", "ordinal", name="uq_dataset_relations_ordinal"),
+        UniqueConstraint("id", "schema_id", name="uq_dataset_relations_id_schema"),
+        UniqueConstraint(
+            "id",
+            "schema_id",
+            "dataset_id",
+            "tenant_id",
+            name="uq_dataset_relations_id_scope",
+        ),
+        ForeignKeyConstraint(
+            ["schema_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_schemas.id",
+                "dataset_schemas.dataset_id",
+                "dataset_schemas.tenant_id",
+            ],
+            name="fk_dataset_relations_schema_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_dataset_relations_ordinal"),
+        CheckConstraint(
+            "kind IN ('table', 'view', 'stream', 'document')",
+            name="ck_dataset_relations_kind",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    schema_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_schemas.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    relation_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), default="table", nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+
+    schema: Mapped[DatasetSchema] = relationship(
+        back_populates="relations", foreign_keys=[schema_id]
+    )
+    fields: Mapped[list["DatasetField"]] = relationship(
+        back_populates="dataset_relation",
+        order_by="DatasetField.ordinal",
+        foreign_keys="DatasetField.dataset_relation_id",
+    )
+
+
+class DatasetField(Base):
+    """Stable field identity and physical/logical typing for a relation."""
+
+    __tablename__ = "dataset_fields"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_relation_id", "field_key", name="uq_dataset_fields_key"
+        ),
+        UniqueConstraint(
+            "dataset_relation_id", "ordinal", name="uq_dataset_fields_ordinal"
+        ),
+        UniqueConstraint(
+            "id",
+            "dataset_relation_id",
+            "schema_id",
+            "dataset_id",
+            "tenant_id",
+            name="uq_dataset_fields_id_scope",
+        ),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            "dataset_relation_id",
+            name="uq_dataset_fields_id_tenant_relation",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_relation_id", "schema_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_relations.id",
+                "dataset_relations.schema_id",
+                "dataset_relations.dataset_id",
+                "dataset_relations.tenant_id",
+            ],
+            name="fk_dataset_fields_relation_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_dataset_fields_ordinal"),
+        CheckConstraint(
+            "key_ordinal IS NULL OR key_ordinal >= 0",
+            name="ck_dataset_fields_key_ordinal",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    schema_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    dataset_relation_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_relations.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    field_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    source_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    logical_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    physical_type: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    nullable: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    key_ordinal: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    semantic_role: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    field_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+
+    dataset_relation: Mapped[DatasetRelation] = relationship(
+        back_populates="fields", foreign_keys=[dataset_relation_id]
+    )
+
+
+class DatasetVersion(Base):
+    """Immutable, content-addressed materialization of a logical dataset."""
+
+    __tablename__ = "dataset_versions"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "version_number", name="uq_dataset_versions_number"),
+        UniqueConstraint("dataset_id", "content_hash", name="uq_dataset_versions_hash"),
+        UniqueConstraint("id", "dataset_id", name="uq_dataset_versions_id_dataset"),
+        UniqueConstraint("id", "schema_id", name="uq_dataset_versions_id_schema"),
+        UniqueConstraint("id", "tenant_id", name="uq_dataset_versions_id_tenant"),
+        UniqueConstraint(
+            "id", "dataset_id", "tenant_id", name="uq_dataset_versions_id_dataset_tenant"
+        ),
+        UniqueConstraint(
+            "id",
+            "schema_id",
+            "dataset_id",
+            "tenant_id",
+            name="uq_dataset_versions_id_scope",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_id", "tenant_id"],
+            ["logical_datasets.id", "logical_datasets.tenant_id"],
+            name="fk_dataset_versions_dataset_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["schema_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_schemas.id",
+                "dataset_schemas.dataset_id",
+                "dataset_schemas.tenant_id",
+            ],
+            name="fk_dataset_versions_schema_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["schema_id", "dataset_id"],
+            ["dataset_schemas.id", "dataset_schemas.dataset_id"],
+            name="fk_dataset_versions_schema_dataset",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["parent_version_id", "dataset_id"],
+            ["dataset_versions.id", "dataset_versions.dataset_id"],
+            name="fk_dataset_versions_parent_dataset",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["manifest_bucket_file_id", "manifest_data_source_id"],
+            ["bucket_files.id", "bucket_files.data_source_id"],
+            name="fk_dataset_versions_manifest_source",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["manifest_data_source_id", "tenant_id"],
+            ["data_sources.id", "data_sources.tenant_id"],
+            name="fk_dataset_versions_source_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "(manifest_bucket_file_id IS NULL) = (manifest_data_source_id IS NULL)",
+            name="ck_dataset_versions_manifest_pair",
+        ),
+        CheckConstraint("version_number > 0", name="ck_dataset_versions_number"),
+        CheckConstraint(
+            "status IN ('assembling', 'validating', 'ready', 'failed', 'retired')",
+            name="ck_dataset_versions_status",
+        ),
+        CheckConstraint("record_count >= 0", name="ck_dataset_versions_records"),
+        CheckConstraint("fragment_count >= 0", name="ck_dataset_versions_fragments"),
+        CheckConstraint("byte_size >= 0", name="ck_dataset_versions_size"),
+        CheckConstraint(
+            _sha256_check("content_hash"), name="ck_dataset_versions_content_sha"
+        ),
+        Index("ix_dataset_versions_dataset_status", "dataset_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("logical_datasets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    schema_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    version_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    parent_version_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), default="assembling", nullable=False
+    )
+    record_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    fragment_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    manifest_bucket_file_id: Mapped[str | None] = mapped_column(
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    manifest_data_source_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    dataset: Mapped[LogicalDataset] = relationship(
+        back_populates="versions", foreign_keys=[dataset_id]
+    )
+    schema: Mapped[DatasetSchema] = relationship(
+        primaryjoin="DatasetVersion.schema_id == DatasetSchema.id",
+        foreign_keys=[schema_id],
+        overlaps="dataset,versions",
+    )
+    parent_version: Mapped["DatasetVersion | None"] = relationship(
+        remote_side=[id], foreign_keys=[parent_version_id]
+    )
+    manifest_bucket_file: Mapped[BucketFile | None] = relationship(
+        foreign_keys=[manifest_bucket_file_id]
+    )
+    fragments: Mapped[list["DatasetFragment"]] = relationship(
+        primaryjoin="DatasetVersion.id == DatasetFragment.dataset_version_id",
+        back_populates="dataset_version",
+        order_by="DatasetFragment.ordinal",
+        foreign_keys="DatasetFragment.dataset_version_id",
+    )
+
+
+class DatasetVersionAsset(Base):
+    """Input asset versions pinned into a dataset version."""
+
+    __tablename__ = "dataset_version_assets"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_version_id",
+            "asset_version_id",
+            "role",
+            name="uq_dataset_version_assets_role",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_versions.id",
+                "dataset_versions.dataset_id",
+                "dataset_versions.tenant_id",
+            ],
+            name="fk_version_assets_version_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["asset_version_id", "tenant_id"],
+            ["data_asset_versions.id", "data_asset_versions.tenant_id"],
+            name="fk_version_assets_asset_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_dataset_version_assets_ordinal"),
+        CheckConstraint(
+            "role IN ('source', 'reference', 'rules', 'evidence', 'manifest')",
+            name="ck_dataset_version_assets_role",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    dataset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    asset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("data_asset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(20), default="source", nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    binding_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    dataset_version: Mapped[DatasetVersion] = relationship(
+        foreign_keys=[dataset_version_id]
+    )
+    asset_version: Mapped[DataAssetVersion] = relationship(
+        foreign_keys=[asset_version_id]
+    )
+
+
+class DatasetFragment(Base):
+    """One immutable MinIO-backed fragment of a dataset relation."""
+
+    __tablename__ = "dataset_fragments"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_version_id",
+            "dataset_relation_id",
+            "ordinal",
+            name="uq_dataset_fragments_ordinal",
+        ),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            "dataset_relation_id",
+            name="uq_dataset_fragments_id_tenant_relation",
+        ),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            "dataset_version_id",
+            "dataset_relation_id",
+            name="uq_dataset_fragments_id_evidence_scope",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "schema_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_versions.id",
+                "dataset_versions.schema_id",
+                "dataset_versions.dataset_id",
+                "dataset_versions.tenant_id",
+            ],
+            name="fk_dataset_fragments_version_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_relation_id", "schema_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_relations.id",
+                "dataset_relations.schema_id",
+                "dataset_relations.dataset_id",
+                "dataset_relations.tenant_id",
+            ],
+            name="fk_dataset_fragments_relation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["bucket_file_id", "bucket_data_source_id"],
+            ["bucket_files.id", "bucket_files.data_source_id"],
+            name="fk_dataset_fragments_file_source",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["bucket_data_source_id", "tenant_id"],
+            ["data_sources.id", "data_sources.tenant_id"],
+            name="fk_dataset_fragments_source_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "schema_id"],
+            ["dataset_versions.id", "dataset_versions.schema_id"],
+            name="fk_dataset_fragments_version_schema",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_relation_id", "schema_id"],
+            ["dataset_relations.id", "dataset_relations.schema_id"],
+            name="fk_dataset_fragments_relation_schema",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_dataset_fragments_ordinal"),
+        CheckConstraint("row_count >= 0", name="ck_dataset_fragments_rows"),
+        CheckConstraint("byte_size >= 0", name="ck_dataset_fragments_size"),
+        CheckConstraint(
+            "format IN ('parquet', 'arrow', 'jsonl', 'csv')",
+            name="ck_dataset_fragments_format",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'ready', 'failed', 'retired')",
+            name="ck_dataset_fragments_status",
+        ),
+        CheckConstraint(
+            _sha256_check("content_sha256"), name="ck_dataset_fragments_content_sha"
+        ),
+        Index(
+            "ix_dataset_fragments_query",
+            "dataset_version_id",
+            "dataset_relation_id",
+            "status",
+            "ordinal",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    dataset_version_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    dataset_relation_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    schema_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    bucket_file_id: Mapped[str] = mapped_column(
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    bucket_data_source_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    format: Mapped[str] = mapped_column(String(20), default="parquet", nullable=False)
+    compression: Mapped[str] = mapped_column(String(30), default="zstd", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    row_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    statistics: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    dataset_version: Mapped[DatasetVersion] = relationship(
+        primaryjoin="DatasetFragment.dataset_version_id == DatasetVersion.id",
+        back_populates="fragments",
+        foreign_keys=[dataset_version_id],
+    )
+    dataset_relation: Mapped[DatasetRelation] = relationship(
+        primaryjoin="DatasetFragment.dataset_relation_id == DatasetRelation.id",
+        foreign_keys=[dataset_relation_id],
+        overlaps="dataset_version,fragments",
+    )
+    bucket_file: Mapped[BucketFile] = relationship(foreign_keys=[bucket_file_id])
+
+
+class DatasetHead(Base):
+    """Atomic environment pointer to the active immutable dataset version."""
+
+    __tablename__ = "dataset_heads"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "environment", name="uq_dataset_heads_environment"),
+        UniqueConstraint("id", "dataset_id", name="uq_dataset_heads_id_dataset"),
+        UniqueConstraint(
+            "id", "dataset_id", "tenant_id", name="uq_dataset_heads_id_scope"
+        ),
+        ForeignKeyConstraint(
+            ["dataset_id", "tenant_id"],
+            ["logical_datasets.id", "logical_datasets.tenant_id"],
+            name="fk_dataset_heads_dataset_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_versions.id",
+                "dataset_versions.dataset_id",
+                "dataset_versions.tenant_id",
+            ],
+            name="fk_dataset_heads_version_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "dataset_id"],
+            ["dataset_versions.id", "dataset_versions.dataset_id"],
+            name="fk_dataset_heads_version_dataset",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "environment IN ('dev', 'staging', 'prod')",
+            name="ck_dataset_heads_environment",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("logical_datasets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    environment: Mapped[str] = mapped_column(String(20), nullable=False)
+    dataset_version_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    updated_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    dataset: Mapped[LogicalDataset] = relationship(
+        back_populates="heads", foreign_keys=[dataset_id]
+    )
+    dataset_version: Mapped[DatasetVersion] = relationship(
+        primaryjoin="DatasetHead.dataset_version_id == DatasetVersion.id",
+        foreign_keys=[dataset_version_id],
+        overlaps="dataset,heads",
+    )
+
+
+class IngestionRun(Base):
+    """Auditable, resumable production of one dataset version."""
+
+    __tablename__ = "ingestion_runs"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_ingestion_runs_idempotency"),
+        UniqueConstraint("id", "tenant_id", name="uq_ingestion_runs_id_tenant"),
+        ForeignKeyConstraint(
+            ["dataset_id", "tenant_id"],
+            ["logical_datasets.id", "logical_datasets.tenant_id"],
+            name="fk_ingestion_runs_dataset_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["output_version_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_versions.id",
+                "dataset_versions.dataset_id",
+                "dataset_versions.tenant_id",
+            ],
+            name="fk_ingestion_runs_output_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["trace_bucket_file_id", "trace_data_source_id"],
+            ["bucket_files.id", "bucket_files.data_source_id"],
+            name="fk_ingestion_runs_trace_source",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["trace_data_source_id", "tenant_id"],
+            ["data_sources.id", "data_sources.tenant_id"],
+            name="fk_ingestion_runs_source_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "(trace_bucket_file_id IS NULL) = (trace_data_source_id IS NULL)",
+            name="ck_ingestion_runs_trace_pair",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')",
+            name="ck_ingestion_runs_status",
+        ),
+        CheckConstraint("records_read >= 0", name="ck_ingestion_runs_read"),
+        CheckConstraint("records_written >= 0", name="ck_ingestion_runs_written"),
+        CheckConstraint("bytes_written >= 0", name="ck_ingestion_runs_bytes"),
+        Index("ix_ingestion_runs_dataset_status", "dataset_id", "status", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("logical_datasets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    output_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("dataset_versions.id", ondelete="RESTRICT"),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
+    pipeline_kind: Mapped[str] = mapped_column(String(50), nullable=False)
+    pipeline_version: Mapped[str] = mapped_column(String(100), default="", nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    requested_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    records_read: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    records_written: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    bytes_written: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    checkpoint: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    lease_token: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    trace_bucket_file_id: Mapped[str | None] = mapped_column(
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    trace_data_source_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    dataset: Mapped[LogicalDataset] = relationship(foreign_keys=[dataset_id])
+    output_version: Mapped[DatasetVersion | None] = relationship(
+        foreign_keys=[output_version_id]
+    )
+    trace_bucket_file: Mapped[BucketFile | None] = relationship(
+        foreign_keys=[trace_bucket_file_id]
+    )
+    inputs: Mapped[list["IngestionRunInput"]] = relationship(
+        back_populates="ingestion_run",
+        order_by="IngestionRunInput.ordinal",
+        foreign_keys="IngestionRunInput.ingestion_run_id",
+    )
+
+
+class IngestionRunInput(Base):
+    """Exact immutable inputs used by an ingestion run."""
+
+    __tablename__ = "ingestion_run_inputs"
+    __table_args__ = (
+        UniqueConstraint("ingestion_run_id", "ordinal", name="uq_ingestion_inputs_ordinal"),
+        ForeignKeyConstraint(
+            ["ingestion_run_id", "tenant_id"],
+            ["ingestion_runs.id", "ingestion_runs.tenant_id"],
+            name="fk_ingestion_inputs_run_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["asset_version_id", "tenant_id"],
+            ["data_asset_versions.id", "data_asset_versions.tenant_id"],
+            name="fk_ingestion_inputs_asset_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "tenant_id"],
+            ["dataset_versions.id", "dataset_versions.tenant_id"],
+            name="fk_ingestion_inputs_version_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_ingestion_inputs_ordinal"),
+        CheckConstraint(
+            "(CASE WHEN asset_version_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN dataset_version_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN external_ref IS NULL THEN 0 ELSE 1 END) = 1",
+            name="ck_ingestion_inputs_one_source",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ingestion_run_id: Mapped[str] = mapped_column(
+        ForeignKey("ingestion_runs.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(40), default="source", nullable=False)
+    asset_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("data_asset_versions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    dataset_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("dataset_versions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    external_ref: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    input_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+
+    ingestion_run: Mapped[IngestionRun] = relationship(
+        back_populates="inputs", foreign_keys=[ingestion_run_id]
+    )
+    asset_version: Mapped[DataAssetVersion | None] = relationship(
+        foreign_keys=[asset_version_id]
+    )
+    dataset_version: Mapped[DatasetVersion | None] = relationship(
+        foreign_keys=[dataset_version_id]
+    )
+
+
+class DatasetLineageEdge(Base):
+    """Version-to-version lineage independent of scenario consumption."""
+
+    __tablename__ = "dataset_lineage_edges"
+    __table_args__ = (
+        UniqueConstraint(
+            "upstream_version_id",
+            "downstream_version_id",
+            "kind",
+            "transformation_hash",
+            name="uq_dataset_lineage_identity",
+        ),
+        ForeignKeyConstraint(
+            ["upstream_version_id", "tenant_id"],
+            ["dataset_versions.id", "dataset_versions.tenant_id"],
+            name="fk_lineage_upstream_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["downstream_version_id", "tenant_id"],
+            ["dataset_versions.id", "dataset_versions.tenant_id"],
+            name="fk_lineage_downstream_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["ingestion_run_id", "tenant_id"],
+            ["ingestion_runs.id", "ingestion_runs.tenant_id"],
+            name="fk_lineage_run_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "upstream_version_id <> downstream_version_id",
+            name="ck_dataset_lineage_not_self",
+        ),
+        CheckConstraint(
+            "kind IN ('copied', 'filtered', 'joined', 'aggregated', 'derived', 'manual')",
+            name="ck_dataset_lineage_kind",
+        ),
+        CheckConstraint(
+            _sha256_check("transformation_hash"), name="ck_dataset_lineage_transform_sha"
+        ),
+        Index("ix_dataset_lineage_downstream", "downstream_version_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    upstream_version_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    downstream_version_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    ingestion_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ingestion_runs.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    transformation_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    lineage_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    upstream_version: Mapped[DatasetVersion] = relationship(
+        primaryjoin="DatasetLineageEdge.upstream_version_id == DatasetVersion.id",
+        foreign_keys=[upstream_version_id],
+    )
+    downstream_version: Mapped[DatasetVersion] = relationship(
+        primaryjoin="DatasetLineageEdge.downstream_version_id == DatasetVersion.id",
+        foreign_keys=[downstream_version_id],
+    )
+    ingestion_run: Mapped[IngestionRun | None] = relationship(
+        primaryjoin="DatasetLineageEdge.ingestion_run_id == IngestionRun.id",
+        foreign_keys=[ingestion_run_id],
+    )
+
+
+class ScenarioDatasetBinding(Base):
+    """A scenario's revocable reference to a dataset head or pinned version."""
+
+    __tablename__ = "scenario_dataset_bindings"
+    __table_args__ = (
+        UniqueConstraint("scenario_id", "binding_key", name="uq_scenario_dataset_binding_key"),
+        UniqueConstraint(
+            "id",
+            "scenario_id",
+            "tenant_id",
+            "dataset_id",
+            name="uq_scenario_bindings_id_scope",
+        ),
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"],
+            ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_scenario_bindings_scenario_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_id", "tenant_id"],
+            ["logical_datasets.id", "logical_datasets.tenant_id"],
+            name="fk_scenario_bindings_dataset_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "role IN ('input', 'reference', 'rules', 'output')",
+            name="ck_scenario_dataset_bindings_role",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'disabled', 'error')",
+            name="ck_scenario_dataset_bindings_status",
+        ),
+        CheckConstraint(
+            "(binding_mode = 'head' AND dataset_head_id IS NOT NULL "
+            "AND dataset_version_id IS NULL) OR "
+            "(binding_mode = 'pinned' AND dataset_version_id IS NOT NULL "
+            "AND dataset_head_id IS NULL)",
+            name="ck_scenario_dataset_bindings_target",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_head_id", "dataset_id"],
+            ["dataset_heads.id", "dataset_heads.dataset_id"],
+            name="fk_scenario_bindings_head_dataset",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "dataset_id"],
+            ["dataset_versions.id", "dataset_versions.dataset_id"],
+            name="fk_scenario_bindings_version_dataset",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_head_id", "dataset_id", "tenant_id"],
+            ["dataset_heads.id", "dataset_heads.dataset_id", "dataset_heads.tenant_id"],
+            name="fk_scenario_bindings_head_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_versions.id",
+                "dataset_versions.dataset_id",
+                "dataset_versions.tenant_id",
+            ],
+            name="fk_scenario_bindings_version_scope",
+            ondelete="RESTRICT",
+        ),
+        Index("ix_scenario_dataset_bindings_dataset", "dataset_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("logical_datasets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    binding_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), default="input", nullable=False)
+    binding_mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    dataset_head_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    dataset_version_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    is_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
+    config: Mapped[dict] = mapped_column(_json_document_type(), default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(foreign_keys=[scenario_id])
+    dataset: Mapped[LogicalDataset] = relationship(foreign_keys=[dataset_id])
+    dataset_head: Mapped[DatasetHead | None] = relationship(
+        primaryjoin="ScenarioDatasetBinding.dataset_head_id == DatasetHead.id",
+        foreign_keys=[dataset_head_id],
+        overlaps="dataset",
+    )
+    dataset_version: Mapped[DatasetVersion | None] = relationship(
+        primaryjoin="ScenarioDatasetBinding.dataset_version_id == DatasetVersion.id",
+        foreign_keys=[dataset_version_id],
+        overlaps="dataset,dataset_head",
+    )
+
+
+class ServingProjection(Base):
+    """Rebuildable serving acceleration; never the canonical dataset truth."""
+
+    __tablename__ = "serving_projections"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_version_id",
+            "engine",
+            "projection_kind",
+            "locator_hash",
+            name="uq_serving_projections_identity",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "tenant_id"],
+            ["dataset_versions.id", "dataset_versions.tenant_id"],
+            name="fk_serving_projections_version_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "projection_kind IN ('query', 'search', 'vector', 'cache')",
+            name="ck_serving_projections_kind",
+        ),
+        CheckConstraint(
+            "status IN ('provisioning', 'ready', 'stale', 'failed', 'retired')",
+            name="ck_serving_projections_status",
+        ),
+        CheckConstraint(
+            _sha256_check("locator_hash"), name="ck_serving_projections_locator_sha"
+        ),
+        CheckConstraint(
+            _sha256_check("schema_hash"), name="ck_serving_projections_schema_sha"
+        ),
+        Index("ix_serving_projections_ready", "dataset_version_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    engine: Mapped[str] = mapped_column(String(40), nullable=False)
+    projection_kind: Mapped[str] = mapped_column(String(20), default="query", nullable=False)
+    locator: Mapped[dict] = mapped_column(_json_document_type(), default=dict, nullable=False)
+    locator_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), default="provisioning", nullable=False
+    )
+    is_rebuildable: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    watermark: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    last_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    dataset_version: Mapped[DatasetVersion] = relationship(
+        foreign_keys=[dataset_version_id]
+    )
+
+
+class SemanticMapping(Base):
+    """Scenario ontology entity bound to a catalog relation, never a table name."""
+
+    __tablename__ = "semantic_mappings"
+    __table_args__ = (
+        UniqueConstraint("scenario_id", "mapping_key", name="uq_semantic_mappings_key"),
+        UniqueConstraint(
+            "scenario_id", "entity_id", "scenario_dataset_binding_id",
+            name="uq_semantic_mappings_entity_binding",
+        ),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            "scenario_id",
+            "dataset_id",
+            "dataset_schema_id",
+            "dataset_relation_id",
+            "entity_id",
+            name="uq_semantic_mappings_id_scope",
+        ),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            "scenario_id",
+            "dataset_id",
+            "dataset_schema_id",
+            "dataset_relation_id",
+            "entity_id",
+            "scenario_dataset_binding_id",
+            name="uq_semantic_mappings_id_binding_scope",
+        ),
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"],
+            ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_semantic_mappings_scenario_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["entity_id", "scenario_id"],
+            ["ontology_entities.id", "ontology_entities.scenario_id"],
+            name="fk_semantic_mappings_entity_scenario",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            [
+                "scenario_dataset_binding_id",
+                "scenario_id",
+                "tenant_id",
+                "dataset_id",
+            ],
+            [
+                "scenario_dataset_bindings.id",
+                "scenario_dataset_bindings.scenario_id",
+                "scenario_dataset_bindings.tenant_id",
+                "scenario_dataset_bindings.dataset_id",
+            ],
+            name="fk_semantic_mappings_binding_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_schema_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_schemas.id",
+                "dataset_schemas.dataset_id",
+                "dataset_schemas.tenant_id",
+            ],
+            name="fk_semantic_mappings_schema_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_relation_id", "dataset_schema_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_relations.id",
+                "dataset_relations.schema_id",
+                "dataset_relations.dataset_id",
+                "dataset_relations.tenant_id",
+            ],
+            name="fk_semantic_mappings_relation_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'active', 'error', 'retired')",
+            name="ck_semantic_mappings_status",
+        ),
+        Index("ix_semantic_mappings_relation", "dataset_relation_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    entity_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_entities.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_dataset_binding_id: Mapped[str] = mapped_column(
+        ForeignKey("scenario_dataset_bindings.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    dataset_schema_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_schemas.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    dataset_relation_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_relations.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    mapping_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False)
+    identifier_strategy: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    filter_expression: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(foreign_keys=[scenario_id])
+    entity: Mapped[OntologyEntity] = relationship(foreign_keys=[entity_id])
+    scenario_dataset_binding: Mapped[ScenarioDatasetBinding] = relationship(
+        foreign_keys=[scenario_dataset_binding_id]
+    )
+    dataset_schema: Mapped[DatasetSchema] = relationship(
+        foreign_keys=[dataset_schema_id]
+    )
+    dataset_relation: Mapped[DatasetRelation] = relationship(
+        foreign_keys=[dataset_relation_id]
+    )
+    field_mappings: Mapped[list["SemanticFieldMapping"]] = relationship(
+        back_populates="semantic_mapping",
+        order_by="SemanticFieldMapping.ordinal",
+        foreign_keys="SemanticFieldMapping.semantic_mapping_id",
+    )
+
+
+class SemanticFieldMapping(Base):
+    """Typed property-to-field mapping with structured transformations."""
+
+    __tablename__ = "semantic_field_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "semantic_mapping_id",
+            "ontology_property_id",
+            name="uq_semantic_field_mappings_property",
+        ),
+        UniqueConstraint(
+            "semantic_mapping_id", "ordinal", name="uq_semantic_field_mappings_ordinal"
+        ),
+        ForeignKeyConstraint(
+            [
+                "semantic_mapping_id",
+                "tenant_id",
+                "scenario_id",
+                "dataset_id",
+                "dataset_schema_id",
+                "dataset_relation_id",
+                "ontology_entity_id",
+            ],
+            [
+                "semantic_mappings.id",
+                "semantic_mappings.tenant_id",
+                "semantic_mappings.scenario_id",
+                "semantic_mappings.dataset_id",
+                "semantic_mappings.dataset_schema_id",
+                "semantic_mappings.dataset_relation_id",
+                "semantic_mappings.entity_id",
+            ],
+            name="fk_semantic_fields_mapping_scope",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["ontology_property_id", "ontology_entity_id"],
+            ["ontology_properties.id", "ontology_properties.entity_id"],
+            name="fk_semantic_fields_property_entity",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            [
+                "dataset_field_id",
+                "dataset_relation_id",
+                "dataset_schema_id",
+                "dataset_id",
+                "tenant_id",
+            ],
+            [
+                "dataset_fields.id",
+                "dataset_fields.dataset_relation_id",
+                "dataset_fields.schema_id",
+                "dataset_fields.dataset_id",
+                "dataset_fields.tenant_id",
+            ],
+            name="fk_semantic_fields_field_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_semantic_field_mappings_ordinal"),
+        CheckConstraint(
+            "direction IN ('input', 'output', 'bidirectional')",
+            name="ck_semantic_field_mappings_direction",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    dataset_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    dataset_schema_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    dataset_relation_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    ontology_entity_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    semantic_mapping_id: Mapped[str] = mapped_column(
+        ForeignKey("semantic_mappings.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ontology_property_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_properties.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_field_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_fields.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    direction: Mapped[str] = mapped_column(
+        String(20), default="input", nullable=False
+    )
+    is_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    transform: Mapped[dict] = mapped_column(_json_document_type(), default=dict, nullable=False)
+
+    semantic_mapping: Mapped[SemanticMapping] = relationship(
+        back_populates="field_mappings", foreign_keys=[semantic_mapping_id]
+    )
+    ontology_property: Mapped[OntologyProperty] = relationship(
+        foreign_keys=[ontology_property_id]
+    )
+    dataset_field: Mapped[DatasetField] = relationship(
+        foreign_keys=[dataset_field_id]
+    )
+
+
+class SemanticRelationMapping(Base):
+    """Ontology relation mapped through catalog field identities."""
+
+    __tablename__ = "semantic_relation_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "ontology_relation_id", name="uq_semantic_relation_mappings_relation"
+        ),
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"],
+            ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_semantic_relations_scenario_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            [
+                "ontology_relation_id",
+                "scenario_id",
+                "source_entity_id",
+                "target_entity_id",
+            ],
+            [
+                "ontology_relations.id",
+                "ontology_relations.scenario_id",
+                "ontology_relations.source_entity_id",
+                "ontology_relations.target_entity_id",
+            ],
+            name="fk_semantic_relations_ontology_scope",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            [
+                "scenario_dataset_binding_id",
+                "scenario_id",
+                "tenant_id",
+                "dataset_id",
+            ],
+            [
+                "scenario_dataset_bindings.id",
+                "scenario_dataset_bindings.scenario_id",
+                "scenario_dataset_bindings.tenant_id",
+                "scenario_dataset_bindings.dataset_id",
+            ],
+            name="fk_semantic_relations_binding_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_relation_id", "dataset_schema_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_relations.id",
+                "dataset_relations.schema_id",
+                "dataset_relations.dataset_id",
+                "dataset_relations.tenant_id",
+            ],
+            name="fk_semantic_relations_relation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "source_semantic_mapping_id",
+                "tenant_id",
+                "scenario_id",
+                "dataset_id",
+                "dataset_schema_id",
+                "source_dataset_relation_id",
+                "source_entity_id",
+                "scenario_dataset_binding_id",
+            ],
+            [
+                "semantic_mappings.id",
+                "semantic_mappings.tenant_id",
+                "semantic_mappings.scenario_id",
+                "semantic_mappings.dataset_id",
+                "semantic_mappings.dataset_schema_id",
+                "semantic_mappings.dataset_relation_id",
+                "semantic_mappings.entity_id",
+                "semantic_mappings.scenario_dataset_binding_id",
+            ],
+            name="fk_semantic_relations_source_mapping",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "target_semantic_mapping_id",
+                "tenant_id",
+                "scenario_id",
+                "dataset_id",
+                "dataset_schema_id",
+                "target_dataset_relation_id",
+                "target_entity_id",
+                "scenario_dataset_binding_id",
+            ],
+            [
+                "semantic_mappings.id",
+                "semantic_mappings.tenant_id",
+                "semantic_mappings.scenario_id",
+                "semantic_mappings.dataset_id",
+                "semantic_mappings.dataset_schema_id",
+                "semantic_mappings.dataset_relation_id",
+                "semantic_mappings.entity_id",
+                "semantic_mappings.scenario_dataset_binding_id",
+            ],
+            name="fk_semantic_relations_target_mapping",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "source_field_id",
+                "source_dataset_relation_id",
+                "dataset_schema_id",
+                "dataset_id",
+                "tenant_id",
+            ],
+            [
+                "dataset_fields.id",
+                "dataset_fields.dataset_relation_id",
+                "dataset_fields.schema_id",
+                "dataset_fields.dataset_id",
+                "dataset_fields.tenant_id",
+            ],
+            name="fk_semantic_relations_source_field",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "target_field_id",
+                "target_dataset_relation_id",
+                "dataset_schema_id",
+                "dataset_id",
+                "tenant_id",
+            ],
+            [
+                "dataset_fields.id",
+                "dataset_fields.dataset_relation_id",
+                "dataset_fields.schema_id",
+                "dataset_fields.dataset_id",
+                "dataset_fields.tenant_id",
+            ],
+            name="fk_semantic_relations_target_field",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "mode IN ('foreign_key', 'join_relation', 'computed')",
+            name="ck_semantic_relation_mappings_mode",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'active', 'error', 'retired')",
+            name="ck_semantic_relation_mappings_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    dataset_schema_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    source_dataset_relation_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    target_dataset_relation_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    source_entity_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    target_entity_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ontology_relation_id: Mapped[str] = mapped_column(
+        ForeignKey("ontology_relations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_dataset_binding_id: Mapped[str] = mapped_column(
+        ForeignKey("scenario_dataset_bindings.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    dataset_relation_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_relations.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    source_semantic_mapping_id: Mapped[str] = mapped_column(
+        ForeignKey("semantic_mappings.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    target_semantic_mapping_id: Mapped[str] = mapped_column(
+        ForeignKey("semantic_mappings.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    source_field_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_fields.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    target_field_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_fields.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    mode: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False)
+    condition_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(foreign_keys=[scenario_id])
+    ontology_relation: Mapped[OntologyRelation] = relationship(
+        foreign_keys=[ontology_relation_id]
+    )
+    scenario_dataset_binding: Mapped[ScenarioDatasetBinding] = relationship(
+        foreign_keys=[scenario_dataset_binding_id]
+    )
+    dataset_relation: Mapped[DatasetRelation] = relationship(
+        foreign_keys=[dataset_relation_id]
+    )
+    source_semantic_mapping: Mapped[SemanticMapping] = relationship(
+        foreign_keys=[source_semantic_mapping_id]
+    )
+    target_semantic_mapping: Mapped[SemanticMapping] = relationship(
+        foreign_keys=[target_semantic_mapping_id]
+    )
+    source_field: Mapped[DatasetField] = relationship(foreign_keys=[source_field_id])
+    target_field: Mapped[DatasetField] = relationship(foreign_keys=[target_field_id])
+
+
+# ------------------------------------------------------------
+# Append-only reasoning and reverse-derivation evidence
+# ------------------------------------------------------------
+class ReasoningTerm(Base):
+    """Canonical subject/object identity used by observed and derived facts."""
+
+    __tablename__ = "reasoning_terms"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "canonical_hash", name="uq_reasoning_terms_hash"),
+        UniqueConstraint("id", "tenant_id", name="uq_reasoning_terms_id_tenant"),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            "scenario_scope_key",
+            name="uq_reasoning_terms_id_scope_key",
+        ),
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"],
+            ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_reasoning_terms_scenario_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["ontology_instance_id", "scenario_id"],
+            ["ontology_instances.id", "ontology_instances.scenario_id"],
+            name="fk_reasoning_terms_instance_scenario",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["ontology_entity_id", "scenario_id"],
+            ["ontology_entities.id", "ontology_entities.scenario_id"],
+            name="fk_reasoning_terms_entity_scenario",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "tenant_id"],
+            ["dataset_versions.id", "dataset_versions.tenant_id"],
+            name="fk_reasoning_terms_version_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "kind IN ('ontology_instance', 'ontology_entity', 'dataset_record', "
+            "'iri', 'literal')",
+            name="ck_reasoning_terms_kind",
+        ),
+        CheckConstraint(
+            "(dataset_version_id IS NULL AND record_locator IS NULL) OR "
+            "(dataset_version_id IS NOT NULL AND record_locator IS NOT NULL)",
+            name="ck_reasoning_terms_record_pair",
+        ),
+        CheckConstraint(
+            "(CASE WHEN ontology_instance_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN ontology_entity_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN dataset_version_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN iri IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN literal_value IS NULL THEN 0 ELSE 1 END) = 1",
+            name="ck_reasoning_terms_one_identity",
+        ),
+        CheckConstraint(
+            "(kind = 'ontology_instance' AND ontology_instance_id IS NOT NULL "
+            "AND scenario_id IS NOT NULL) OR "
+            "(kind = 'ontology_entity' AND ontology_entity_id IS NOT NULL "
+            "AND scenario_id IS NOT NULL) OR "
+            "(kind = 'dataset_record' AND dataset_version_id IS NOT NULL "
+            "AND scenario_id IS NULL) OR "
+            "(kind = 'iri' AND iri IS NOT NULL AND scenario_id IS NULL) OR "
+            "(kind = 'literal' AND literal_value IS NOT NULL AND scenario_id IS NULL)",
+            name="ck_reasoning_terms_kind_identity",
+        ),
+        CheckConstraint(
+            "scenario_scope_key = coalesce(scenario_id, '')",
+            name="ck_reasoning_terms_scenario_scope_key",
+        ),
+        CheckConstraint(
+            _sha256_check("canonical_hash"), name="ck_reasoning_terms_canonical_sha"
+        ),
+        Index("ix_reasoning_terms_dataset", "dataset_version_id", "canonical_hash"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_id: Mapped[str | None] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    scenario_scope_key: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", index=True
+    )
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    ontology_instance_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_instances.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    ontology_entity_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_entities.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    dataset_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("dataset_versions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    record_locator: Mapped[dict | None] = mapped_column(
+        _json_document_type(), nullable=True
+    )
+    iri: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    literal_value: Mapped[object | None] = mapped_column(
+        _json_document_type(), nullable=True
+    )
+    datatype_iri: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
+    canonical_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    ontology_instance: Mapped[OntologyInstance | None] = relationship(
+        foreign_keys=[ontology_instance_id]
+    )
+    ontology_entity: Mapped[OntologyEntity | None] = relationship(
+        foreign_keys=[ontology_entity_id]
+    )
+    dataset_version: Mapped[DatasetVersion | None] = relationship(
+        foreign_keys=[dataset_version_id]
+    )
+
+
+class DerivationRun(Base):
+    """Pinned and reproducible forward, reverse, or hybrid reasoning run."""
+
+    __tablename__ = "derivation_runs"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_derivation_runs_idempotency"),
+        UniqueConstraint("id", "tenant_id", name="uq_derivation_runs_id_tenant"),
+        UniqueConstraint(
+            "id", "tenant_id", "scenario_id", name="uq_derivation_runs_id_scope"
+        ),
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"],
+            ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_derivation_runs_scenario_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["ontology_snapshot_id", "tenant_id", "scenario_id"],
+            [
+                "ontology_snapshots.id",
+                "ontology_snapshots.tenant_id",
+                "ontology_snapshots.scenario_id",
+            ],
+            name="fk_derivation_runs_snapshot_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["ontology_release_id", "tenant_id", "scenario_id", "ontology_snapshot_id"],
+            [
+                "ontology_releases.id",
+                "ontology_releases.tenant_id",
+                "ontology_releases.scenario_id",
+                "ontology_releases.snapshot_id",
+            ],
+            name="fk_derivation_runs_release_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["trace_bucket_file_id", "trace_data_source_id"],
+            ["bucket_files.id", "bucket_files.data_source_id"],
+            name="fk_derivation_runs_trace_source",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["trace_data_source_id", "tenant_id"],
+            ["data_sources.id", "data_sources.tenant_id"],
+            name="fk_derivation_runs_source_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "ontology_snapshot_id IS NULL OR scenario_id IS NOT NULL",
+            name="ck_derivation_runs_snapshot_scenario",
+        ),
+        CheckConstraint(
+            "ontology_release_id IS NULL OR "
+            "(scenario_id IS NOT NULL AND ontology_snapshot_id IS NOT NULL)",
+            name="ck_derivation_runs_release_snapshot",
+        ),
+        CheckConstraint(
+            "(trace_bucket_file_id IS NULL) = (trace_data_source_id IS NULL)",
+            name="ck_derivation_runs_trace_pair",
+        ),
+        CheckConstraint(
+            "mode IN ('forward', 'reverse', 'hybrid')",
+            name="ck_derivation_runs_mode",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')",
+            name="ck_derivation_runs_status",
+        ),
+        CheckConstraint("assertion_count >= 0", name="ck_derivation_runs_assertions"),
+        CheckConstraint("evidence_count >= 0", name="ck_derivation_runs_evidence"),
+        CheckConstraint(
+            _sha256_check("ontology_content_hash"),
+            name="ck_derivation_runs_ontology_sha",
+        ),
+        CheckConstraint(
+            _sha256_check("rule_set_hash"), name="ck_derivation_runs_rules_sha"
+        ),
+        CheckConstraint(
+            _sha256_check("input_fingerprint"), name="ck_derivation_runs_input_sha"
+        ),
+        Index("ix_derivation_runs_scenario_status", "scenario_id", "status", "created_at"),
+        Index("ix_derivation_runs_fingerprint", "tenant_id", "input_fingerprint"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_id: Mapped[str | None] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    ontology_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    ontology_release_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_releases.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    ontology_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    engine: Mapped[str] = mapped_column(String(100), nullable=False)
+    engine_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    rule_set_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    requested_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    lease_token: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    assertion_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    evidence_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    trace_bucket_file_id: Mapped[str | None] = mapped_column(
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    trace_data_source_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    run_config: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    scenario: Mapped[BusinessScenario | None] = relationship(
+        foreign_keys=[scenario_id]
+    )
+    ontology_snapshot: Mapped[OntologySnapshot | None] = relationship(
+        foreign_keys=[ontology_snapshot_id]
+    )
+    ontology_release: Mapped[OntologyRelease | None] = relationship(
+        foreign_keys=[ontology_release_id]
+    )
+    trace_bucket_file: Mapped[BucketFile | None] = relationship(
+        foreign_keys=[trace_bucket_file_id]
+    )
+    inputs: Mapped[list["DerivationRunInput"]] = relationship(
+        back_populates="derivation_run",
+        order_by="DerivationRunInput.ordinal",
+        foreign_keys="DerivationRunInput.derivation_run_id",
+    )
+
+
+class DerivationRunInput(Base):
+    """Exact dataset versions pinned as reasoning inputs."""
+
+    __tablename__ = "derivation_run_inputs"
+    __table_args__ = (
+        UniqueConstraint(
+            "derivation_run_id", "dataset_version_id", "role",
+            name="uq_derivation_run_inputs_version",
+        ),
+        UniqueConstraint(
+            "derivation_run_id", "ordinal", name="uq_derivation_run_inputs_ordinal"
+        ),
+        UniqueConstraint(
+            "derivation_run_id",
+            "tenant_id",
+            "dataset_version_id",
+            name="uq_derivation_inputs_run_tenant_version",
+        ),
+        ForeignKeyConstraint(
+            ["derivation_run_id", "tenant_id"],
+            ["derivation_runs.id", "derivation_runs.tenant_id"],
+            name="fk_derivation_inputs_run_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "tenant_id"],
+            ["dataset_versions.id", "dataset_versions.tenant_id"],
+            name="fk_derivation_inputs_version_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_derivation_run_inputs_ordinal"),
+        CheckConstraint(
+            "role IN ('input', 'rules', 'context', 'reference')",
+            name="ck_derivation_run_inputs_role",
+        ),
+        CheckConstraint(
+            _sha256_check("content_hash"), name="ck_derivation_inputs_content_sha"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    derivation_run_id: Mapped[str] = mapped_column(
+        ForeignKey("derivation_runs.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    dataset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("dataset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(20), default="input", nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    derivation_run: Mapped[DerivationRun] = relationship(
+        back_populates="inputs", foreign_keys=[derivation_run_id]
+    )
+    dataset_version: Mapped[DatasetVersion] = relationship(
+        foreign_keys=[dataset_version_id]
+    )
+
+
+class Assertion(Base):
+    """Append-only observed fact, derived conclusion, or reverse hypothesis."""
+
+    __tablename__ = "assertions"
+    __table_args__ = (
+        UniqueConstraint(
+            "derivation_run_id", "canonical_hash", name="uq_assertions_run_hash"
+        ),
+        UniqueConstraint("id", "tenant_id", name="uq_assertions_id_tenant"),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            "derivation_run_id",
+            name="uq_assertions_id_tenant_run",
+        ),
+        ForeignKeyConstraint(
+            ["derivation_run_id", "tenant_id"],
+            ["derivation_runs.id", "derivation_runs.tenant_id"],
+            name="fk_assertions_run_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["derivation_run_id", "tenant_id", "scenario_id"],
+            ["derivation_runs.id", "derivation_runs.tenant_id", "derivation_runs.scenario_id"],
+            name="fk_assertions_run_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"],
+            ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_assertions_scenario_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["subject_term_id", "tenant_id"],
+            ["reasoning_terms.id", "reasoning_terms.tenant_id"],
+            name="fk_assertions_subject_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["subject_term_id", "tenant_id", "subject_scenario_scope_key"],
+            [
+                "reasoning_terms.id",
+                "reasoning_terms.tenant_id",
+                "reasoning_terms.scenario_scope_key",
+            ],
+            name="fk_assertions_subject_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["object_term_id", "tenant_id"],
+            ["reasoning_terms.id", "reasoning_terms.tenant_id"],
+            name="fk_assertions_object_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["object_term_id", "tenant_id", "object_scenario_scope_key"],
+            [
+                "reasoning_terms.id",
+                "reasoning_terms.tenant_id",
+                "reasoning_terms.scenario_scope_key",
+            ],
+            name="fk_assertions_object_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["predicate_property_id", "predicate_entity_id"],
+            ["ontology_properties.id", "ontology_properties.entity_id"],
+            name="fk_assertions_property_entity",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["predicate_entity_id", "scenario_id"],
+            ["ontology_entities.id", "ontology_entities.scenario_id"],
+            name="fk_assertions_entity_scenario",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["predicate_relation_id", "scenario_id"],
+            ["ontology_relations.id", "ontology_relations.scenario_id"],
+            name="fk_assertions_relation_scenario",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["supersedes_assertion_id", "tenant_id"],
+            ["assertions.id", "assertions.tenant_id"],
+            name="fk_assertions_supersedes_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "(CASE WHEN predicate_property_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN predicate_relation_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN predicate_key IS NULL THEN 0 ELSE 1 END) = 1",
+            name="ck_assertions_one_predicate",
+        ),
+        CheckConstraint(
+            "(predicate_property_id IS NOT NULL AND predicate_entity_id IS NOT NULL "
+            "AND scenario_id IS NOT NULL) OR "
+            "(predicate_relation_id IS NOT NULL AND predicate_entity_id IS NULL "
+            "AND scenario_id IS NOT NULL) OR "
+            "(predicate_key IS NOT NULL AND predicate_entity_id IS NULL)",
+            name="ck_assertions_predicate_scope",
+        ),
+        CheckConstraint(
+            "(subject_scenario_scope_key = '' OR "
+            "(scenario_id IS NOT NULL AND subject_scenario_scope_key = scenario_id)) "
+            "AND (object_scenario_scope_key = '' OR "
+            "(scenario_id IS NOT NULL AND object_scenario_scope_key = scenario_id))",
+            name="ck_assertions_term_scenario_scope",
+        ),
+        CheckConstraint(
+            "assertion_kind IN ('observed', 'derived', 'hypothesis')",
+            name="ck_assertions_kind",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'retracted', 'rejected')",
+            name="ck_assertions_status",
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_assertions_confidence",
+        ),
+        CheckConstraint(
+            "valid_to IS NULL OR valid_from IS NULL OR valid_to > valid_from",
+            name="ck_assertions_valid_period",
+        ),
+        CheckConstraint(
+            "system_to IS NULL OR system_to > system_from",
+            name="ck_assertions_system_period",
+        ),
+        CheckConstraint(
+            "supersedes_assertion_id IS NULL OR supersedes_assertion_id <> id",
+            name="ck_assertions_not_self_supersede",
+        ),
+        CheckConstraint(
+            _sha256_check("canonical_hash"), name="ck_assertions_canonical_sha"
+        ),
+        Index("ix_assertions_subject_predicate", "subject_term_id", "predicate_key"),
+        Index("ix_assertions_run_status", "derivation_run_id", "status"),
+        Index("ix_assertions_validity", "valid_from", "valid_to"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_id: Mapped[str | None] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    derivation_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("derivation_runs.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    subject_term_id: Mapped[str] = mapped_column(
+        ForeignKey("reasoning_terms.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    subject_scenario_scope_key: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", index=True
+    )
+    predicate_property_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_properties.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    predicate_entity_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    predicate_relation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_relations.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    predicate_key: Mapped[str | None] = mapped_column(String(300), nullable=True, index=True)
+    object_term_id: Mapped[str] = mapped_column(
+        ForeignKey("reasoning_terms.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    object_scenario_scope_key: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", index=True
+    )
+    polarity: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    confidence: Mapped[float] = mapped_column(
+        Numeric(7, 6), default=1, nullable=False
+    )
+    assertion_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
+    canonical_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    supersedes_assertion_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assertions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    valid_from: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    valid_to: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    system_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    system_to: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    assertion_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    derivation_run: Mapped[DerivationRun | None] = relationship(
+        foreign_keys=[derivation_run_id]
+    )
+    subject_term: Mapped[ReasoningTerm] = relationship(foreign_keys=[subject_term_id])
+    object_term: Mapped[ReasoningTerm] = relationship(foreign_keys=[object_term_id])
+    predicate_property: Mapped[OntologyProperty | None] = relationship(
+        foreign_keys=[predicate_property_id]
+    )
+    predicate_relation: Mapped[OntologyRelation | None] = relationship(
+        foreign_keys=[predicate_relation_id]
+    )
+    supersedes_assertion: Mapped["Assertion | None"] = relationship(
+        remote_side=[id], foreign_keys=[supersedes_assertion_id]
+    )
+
+
+class DerivationEvidence(Base):
+    """Typed evidence edge supporting one assertion, with immutable locators."""
+
+    __tablename__ = "derivation_evidence"
+    __table_args__ = (
+        UniqueConstraint("assertion_id", "ordinal", name="uq_derivation_evidence_ordinal"),
+        ForeignKeyConstraint(
+            ["assertion_id", "tenant_id"],
+            ["assertions.id", "assertions.tenant_id"],
+            name="fk_derivation_evidence_assertion_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["assertion_id", "tenant_id", "derivation_run_id"],
+            ["assertions.id", "assertions.tenant_id", "assertions.derivation_run_id"],
+            name="fk_derivation_evidence_assertion_run",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["derivation_run_id", "tenant_id"],
+            ["derivation_runs.id", "derivation_runs.tenant_id"],
+            name="fk_derivation_evidence_run_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["evidence_assertion_id", "tenant_id"],
+            ["assertions.id", "assertions.tenant_id"],
+            name="fk_derivation_evidence_support_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_fragment_id", "tenant_id", "dataset_relation_id"],
+            [
+                "dataset_fragments.id",
+                "dataset_fragments.tenant_id",
+                "dataset_fragments.dataset_relation_id",
+            ],
+            name="fk_derivation_evidence_fragment_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "dataset_fragment_id",
+                "tenant_id",
+                "dataset_version_id",
+                "dataset_relation_id",
+            ],
+            [
+                "dataset_fragments.id",
+                "dataset_fragments.tenant_id",
+                "dataset_fragments.dataset_version_id",
+                "dataset_fragments.dataset_relation_id",
+            ],
+            name="fk_derivation_evidence_fragment_input",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["derivation_run_id", "tenant_id", "dataset_version_id"],
+            [
+                "derivation_run_inputs.derivation_run_id",
+                "derivation_run_inputs.tenant_id",
+                "derivation_run_inputs.dataset_version_id",
+            ],
+            name="fk_derivation_evidence_pinned_input",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_version_id", "tenant_id"],
+            ["dataset_versions.id", "dataset_versions.tenant_id"],
+            name="fk_derivation_evidence_version_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_field_id", "tenant_id", "dataset_relation_id"],
+            [
+                "dataset_fields.id",
+                "dataset_fields.tenant_id",
+                "dataset_fields.dataset_relation_id",
+            ],
+            name="fk_derivation_evidence_field_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["document_chunk_id", "document_data_source_id"],
+            ["document_chunks.id", "document_chunks.data_source_id"],
+            name="fk_derivation_evidence_chunk_source",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["document_data_source_id", "tenant_id"],
+            ["data_sources.id", "data_sources.tenant_id"],
+            name="fk_derivation_evidence_source_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["action_execution_log_id", "action_scenario_id"],
+            ["action_execution_logs.id", "action_execution_logs.scenario_id"],
+            name="fk_derivation_evidence_action_scenario",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["action_scenario_id", "tenant_id"],
+            ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_derivation_evidence_action_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_derivation_evidence_ordinal"),
+        CheckConstraint(
+            "score IS NULL OR (score >= 0 AND score <= 1)",
+            name="ck_derivation_evidence_score",
+        ),
+        CheckConstraint(
+            "(CASE WHEN evidence_assertion_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN dataset_fragment_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN document_chunk_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN action_execution_log_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN external_locator IS NULL THEN 0 ELSE 1 END) = 1",
+            name="ck_derivation_evidence_one_source",
+        ),
+        CheckConstraint(
+            "evidence_assertion_id IS NULL OR evidence_assertion_id <> assertion_id",
+            name="ck_derivation_evidence_not_self",
+        ),
+        CheckConstraint(
+            "(dataset_fragment_id IS NULL AND dataset_field_id IS NULL "
+            "AND dataset_relation_id IS NULL AND dataset_version_id IS NULL) OR "
+            "(dataset_fragment_id IS NOT NULL AND dataset_relation_id IS NOT NULL "
+            "AND dataset_version_id IS NOT NULL AND derivation_run_id IS NOT NULL)",
+            name="ck_derivation_evidence_dataset_scope",
+        ),
+        CheckConstraint(
+            "(document_chunk_id IS NULL) = (document_data_source_id IS NULL)",
+            name="ck_derivation_evidence_document_pair",
+        ),
+        CheckConstraint(
+            "(action_execution_log_id IS NULL) = (action_scenario_id IS NULL)",
+            name="ck_derivation_evidence_action_pair",
+        ),
+        CheckConstraint(
+            _sha256_check("content_hash"), name="ck_derivation_evidence_content_sha"
+        ),
+        Index("ix_derivation_evidence_fragment", "dataset_fragment_id", "dataset_field_id"),
+        Index("ix_derivation_evidence_hash", "content_hash"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    derivation_run_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    assertion_id: Mapped[str] = mapped_column(
+        ForeignKey("assertions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    evidence_assertion_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assertions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    dataset_fragment_id: Mapped[str | None] = mapped_column(
+        ForeignKey("dataset_fragments.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    dataset_field_id: Mapped[str | None] = mapped_column(
+        ForeignKey("dataset_fields.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    dataset_relation_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    dataset_version_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    record_locator: Mapped[dict | None] = mapped_column(
+        _json_document_type(), nullable=True
+    )
+    document_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_chunks.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    document_data_source_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    action_execution_log_id: Mapped[str | None] = mapped_column(
+        ForeignKey("action_execution_logs.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    action_scenario_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    external_locator: Mapped[dict | None] = mapped_column(
+        _json_document_type(), nullable=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    excerpt: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    score: Mapped[float | None] = mapped_column(Numeric(7, 6), nullable=True)
+    evidence_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    assertion: Mapped[Assertion] = relationship(
+        foreign_keys=[assertion_id]
+    )
+    derivation_run: Mapped[DerivationRun | None] = relationship(
+        foreign_keys=[derivation_run_id]
+    )
+    evidence_assertion: Mapped[Assertion | None] = relationship(
+        foreign_keys=[evidence_assertion_id]
+    )
+    dataset_fragment: Mapped[DatasetFragment | None] = relationship(
+        primaryjoin="DerivationEvidence.dataset_fragment_id == DatasetFragment.id",
+        foreign_keys=[dataset_fragment_id]
+    )
+    dataset_version: Mapped[DatasetVersion | None] = relationship(
+        foreign_keys=[dataset_version_id]
+    )
+    dataset_field: Mapped[DatasetField | None] = relationship(
+        foreign_keys=[dataset_field_id]
+    )
+    document_chunk: Mapped[DocumentChunk | None] = relationship(
+        foreign_keys=[document_chunk_id]
+    )
+    action_execution_log: Mapped[ActionExecutionLog | None] = relationship(
+        foreign_keys=[action_execution_log_id]
+    )

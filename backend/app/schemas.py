@@ -513,7 +513,7 @@ class ScenarioDetail(ScenarioOut):
 # ──────────────────────────────────────────────
 class DataSourceIn(BaseModel):
     name: str
-    type: Literal["mysql", "postgres", "sqlite", "file_bucket"] = "mysql"
+    type: Literal["mysql", "postgres", "sqlite", "file_bucket", "dataset"] = "mysql"
     scenario_id: str | None = None
     config: dict = Field(default_factory=dict)
 
@@ -535,6 +535,13 @@ class BucketFileOut(BaseModel):
     id: str
     data_source_id: str
     filename: str
+    storage_provider: str = "local"
+    bucket_name: str = ""
+    object_key: str = ""
+    object_version_id: str = ""
+    etag: str = ""
+    # Stable ``minio://`` identity. This is never an expiring presigned URL.
+    object_url: str = ""
     size: int
     mime: str
     content_sha256: str = ""
@@ -1342,6 +1349,12 @@ class AssistantAttachmentOut(BaseModel):
     filename: str
     mime: str = ""
     size: int = 0
+    storage_provider: str = "none"
+    bucket_name: str = ""
+    object_key: str = ""
+    object_version_id: str = ""
+    etag: str = ""
+    object_url: str = ""
     status: str = "pending"
     error: str = ""
     created_at: datetime

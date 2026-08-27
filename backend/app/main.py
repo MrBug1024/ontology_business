@@ -8,9 +8,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from .config import get_settings
-from .database import init_db
+from .database import engine, init_db
 from .routers import (
     agents,
     assistant,
@@ -26,7 +28,9 @@ from .routers import (
     templates,
 )
 from .services import (
+    cache_service,
     datasource_service,
+    object_storage_service,
     operations_service,
     permission_service,
     skill_service,
@@ -60,6 +64,13 @@ async def _assistant_compilation_worker() -> None:
 async def lifespan(_: FastAPI):
     init_db()
     logger.info("平台数据库、表结构和运行目录启动检查完成")
+    configured_storage = object_storage_service.configuration()
+    if configured_storage.configured:
+        await asyncio.to_thread(
+            object_storage_service.ensure_bucket,
+            configured_storage.bucket_name,
+        )
+        logger.info("MinIO 托管文件桶启动检查完成")
     # 启动时同步技能（含复制进来的 ocr-parser）
     from .database import SessionLocal
 
@@ -129,4 +140,74 @@ def root():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        database_ok = True
+    except Exception:  # noqa: BLE001 - never expose a connection diagnostic.
+        database_ok = False
+
+    minio_requested = any(
+        str(value or "").strip()
+        for value in (
+            settings.minio_aliyun_endpoint,
+            settings.minio_aliyun_access_key_id,
+            settings.minio_aliyun_access_key_secret,
+            settings.minio_bucketname,
+        )
+    )
+    minio_required = not settings.uses_sqlite_database
+    try:
+        minio_configured = object_storage_service.configuration().configured
+        minio_declared = minio_configured or minio_requested
+        minio_ok = (
+            object_storage_service.healthcheck()
+            if minio_configured
+            else not minio_required and not minio_requested
+        )
+    except object_storage_service.ObjectStorageError:
+        # An unsafe/incomplete storage endpoint is a failed dependency, but its
+        # configuration details never belong in an unauthenticated health body.
+        minio_configured = False
+        minio_declared = True
+        minio_ok = False
+
+    redis_configured = settings.redis_configured
+    redis_ok = cache_service.healthcheck() if redis_configured else True
+    critical_ok = database_ok and minio_ok
+    status = (
+        "unavailable"
+        if not critical_ok
+        else "degraded"
+        if redis_configured and not redis_ok
+        else "ok"
+    )
+    payload = {
+        "status": status,
+        "dependencies": {
+            "database": {
+                "configured": True,
+                "status": "ok" if database_ok else "error",
+                "backend": engine.dialect.name,
+            },
+            "redis": {
+                "configured": redis_configured,
+                "status": (
+                    "ok" if redis_configured and redis_ok
+                    else "error" if redis_configured
+                    else "disabled"
+                ),
+                "authoritative": False,
+            },
+            "minio": {
+                "configured": minio_configured,
+                "required": minio_required,
+                "status": (
+                    "ok" if minio_configured and minio_ok
+                    else "error" if minio_declared or minio_required
+                    else "disabled"
+                ),
+            }
+        },
+    }
+    return JSONResponse(payload, status_code=200 if critical_ok else 503)

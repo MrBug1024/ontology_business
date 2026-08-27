@@ -38,8 +38,168 @@ from app.services.agent_engine import AgentContext
 from examples import upgrade_bookkeeping_audit, upgrade_medical_audit
 
 
+class MedicalAuditMySQLAdapterTests(unittest.TestCase):
+    def test_daily_overstay_cte_is_valid_mysql_sql(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Result:
+            def mappings(self):
+                return self
+
+            @staticmethod
+            def all():
+                return [{
+                    "__violation_count": 0,
+                    "__affected_encounter_count": 0,
+                    "__affected_patient_count": 0,
+                    "__violation_amount": 0,
+                    "__excess_quantity": 0,
+                    "__audited_scope_count": 0,
+                    "__present": None,
+                }]
+
+        class Connection:
+            @staticmethod
+            def exec_driver_sql(sql, params):
+                captured["sql"] = sql
+                captured["params"] = params
+                return Result()
+
+        adapter = object.__new__(medical_audit_service._AuditConnection)
+        adapter.dialect = "mysql"
+        adapter._sqlite = None
+        adapter._sqlalchemy = Connection()
+        source = DataSource(id="medical-mysql", type="mysql", config={})
+        schema = medical_audit_service._SourceSchema(
+            source=source,
+            path=None,
+            tables={"charge": "charges", "encounter": "encounters"},
+            columns={
+                "charge": {
+                    "encounter_id": "encounter_id",
+                    "facility_name": "facility_name",
+                    "service_name": "service_name",
+                    "quantity": "quantity",
+                    "amount": "amount",
+                    "patient_id": "patient_id",
+                    "unit_price": "unit_price",
+                },
+                "encounter": {
+                    "encounter_id": "encounter_id",
+                    "stay_days": "stay_days",
+                    "patient_id": "patient_id",
+                    "diagnosis_name": "diagnosis_name",
+                },
+            },
+        )
+
+        result = medical_audit_service._daily_overstay(
+            adapter,
+            schema,
+            {"service_names": ["daily-service"]},
+            facility_name=None,
+            limit=10,
+            offset=0,
+            property_access=medical_audit_service.access_policy(
+                medical_audit_service._ALL_MEDICAL_PROPERTIES
+            ),
+        )
+
+        sql = str(captured["sql"])
+        self.assertNotIn("AS MATERIALIZED", sql)
+        self.assertIn("SELECT 1 AS __present, violations.*", sql)
+        self.assertNotIn("AS __present, *", sql)
+        self.assertEqual(captured["params"], ("daily-service", 10, 0))
+        self.assertEqual(result["summary"]["violation_count"], 0)
+
+    def test_duplicate_service_join_keeps_source_column_collation(self) -> None:
+        captured: list[tuple[str, tuple[object, ...]]] = []
+
+        class Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def mappings(self):
+                return self
+
+            def all(self):
+                return self._rows
+
+        class Connection:
+            @staticmethod
+            def exec_driver_sql(sql, params):
+                captured.append((sql, params))
+                if "audited_scope_count FROM included_encounters" in sql:
+                    return Result([{"audited_scope_count": 0}])
+                return Result([{
+                    "violation_count": 0,
+                    "affected_encounter_count": 0,
+                    "affected_patient_count": 0,
+                    "violation_amount": 0,
+                }])
+
+        adapter = object.__new__(medical_audit_service._AuditConnection)
+        adapter.dialect = "mysql"
+        adapter._sqlite = None
+        adapter._sqlalchemy = Connection()
+        schema = medical_audit_service._SourceSchema(
+            source=DataSource(id="medical-mysql", type="mysql", config={}),
+            path=None,
+            tables={"charge": "charges"},
+            columns={
+                "charge": {
+                    "charge_id": "charge_id",
+                    "encounter_id": "encounter_id",
+                    "facility_name": "facility_name",
+                    "service_name": "service_name",
+                    "quantity": "quantity",
+                    "amount": "amount",
+                },
+            },
+        )
+
+        result = medical_audit_service._included_service_duplicate(
+            adapter,
+            schema,
+            {
+                "included_service": "included-service",
+                "duplicate_service": "duplicate-service",
+            },
+            facility_name=None,
+            limit=10,
+            offset=0,
+            property_access=medical_audit_service.access_policy(
+                medical_audit_service._ALL_MEDICAL_PROPERTIES
+            ),
+        )
+
+        assert len(captured) == 2
+        summary_sql = captured[0][0]
+        self.assertIn(
+            "SELECT DISTINCT p.`encounter_id` AS encounter_id", summary_sql
+        )
+        self.assertIn("ON i.encounter_id = c.`encounter_id`", summary_sql)
+        self.assertNotIn("CAST(p.`encounter_id` AS CHAR)", summary_sql)
+        self.assertEqual(
+            captured[0][1],
+            ("included-service", "included-service", "duplicate-service"),
+        )
+        self.assertEqual(captured[1][1], ("included-service",))
+        self.assertEqual(result["summary"]["violation_count"], 0)
+
+
 class MedicalAuditBusinessTaskTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._datasource_settings_patch = patch.object(
+            datasource_service,
+            "get_settings",
+            return_value=SimpleNamespace(
+                uses_sqlite_database=True,
+                max_query_rows=200,
+            ),
+        )
+        self._datasource_settings_patch.start()
+        self.addCleanup(self._datasource_settings_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.source_path = Path(self.temp.name) / "medical-audit.db"
         self._build_source(self.source_path)

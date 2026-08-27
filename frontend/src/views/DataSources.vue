@@ -3,7 +3,7 @@
     <div class="page-header">
       <div>
         <h1>数据源</h1>
-        <div class="sub">接入数据库（MySQL / PostgreSQL / SQLite）或文件桶（Excel / Word / PDF / 图片…）</div>
+        <div class="sub">接入数据库、版本化数据集或托管文件桶</div>
       </div>
       <div class="data-source-header-actions">
         <el-button v-if="returnPath" @click="returnToPreviousFlow"><el-icon><ArrowLeft /></el-icon> 返回上一步</el-button>
@@ -32,7 +32,7 @@
               </div>
               <div class="ds-info">
                 <div class="ds-name">{{ ds.name }}</div>
-                <div class="muted">{{ typeLabel(ds.type) }} · {{ ds.config.host || ds.config.path || '本地' }}</div>
+                <div class="muted">{{ typeLabel(ds.type) }} · {{ dataSourceLocationLabel(ds) }}</div>
               </div>
               <el-tag v-if="ds.status === 'ok'" size="small" type="success">正常</el-tag>
               <el-tag v-else-if="ds.status === 'error'" size="small" type="danger">异常</el-tag>
@@ -197,7 +197,6 @@
           <el-radio-group v-model="form.type" @change="onTypeChange">
             <el-radio value="mysql">MySQL</el-radio>
             <el-radio value="postgres">PostgreSQL</el-radio>
-            <el-radio value="sqlite">SQLite</el-radio>
             <el-radio value="file_bucket">文件桶</el-radio>
           </el-radio-group>
         </el-form-item>
@@ -256,6 +255,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { api } from '@/api'
 import type { DataSource, Scenario, TableInfo, BucketFile, RagCitation } from '@/types'
+import { dataSourceLocationLabel } from '@/utils/dataSources'
 
 const dataSources = ref<DataSource[]>([])
 const scenarios = ref<Scenario[]>([])
@@ -309,7 +309,7 @@ let testRequest = 0
 let textRequest = 0
 
 const TYPE_LABELS: Record<string, string> = {
-  mysql: 'MySQL', postgres: 'PostgreSQL', sqlite: 'SQLite', file_bucket: '文件桶',
+  mysql: 'MySQL', postgres: 'PostgreSQL', sqlite: 'SQLite', dataset: '数据集', file_bucket: '文件桶',
 }
 function typeLabel(t: string) { return TYPE_LABELS[t] || t }
 function fmtSize(n: number) {

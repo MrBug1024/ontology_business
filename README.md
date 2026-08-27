@@ -18,7 +18,8 @@
 
 - **业务场景 / 本体建模**：使用行业通用术语定义对象类型、属性、关系类型、对象实例与关系实例，支持命名空间、主键、枚举、约束、生命周期和来源信息。
 - **数据源**：
-  - 关系型数据库：MySQL / PostgreSQL / SQLite（表浏览 + SQL 查询）。
+  - 版本化数据集：PostgreSQL Catalog 管理元数据，MinIO 保存不可变文件与 Parquet，DuckDB 执行只读查询。
+  - 外部关系型连接器：MySQL / PostgreSQL / SQLite（表浏览 + 受控只读 SQL），不作为平台控制面存储。
   - 文件桶（file bucket）：上传 Excel / Word / Markdown / PDF / 图片，自动解析入库用于 RAG 检索。
 - **技能（Skill）**：安装受控的本地能力，供已配置的操作或工作流调用；内置 `ocr-parser`（OCR 文档解析）与 `data-analyzer`。
 - **MCP 服务**：接入 Model Context Protocol 工具服务（SSE / Streamable HTTP，以及由运维显式开启的 stdio）；支持表单配置请求头，也支持批量导入常见客户端的 `mcpServers` JSON。
@@ -34,7 +35,7 @@
 | --- | --- |
 | 前端 | Vue 3 + TypeScript + Vite + Pinia + Vue Router + Element Plus + axios + marked |
 | 后端 | Python 3.12 + FastAPI + SQLAlchemy 2.0 + Pydantic v2 + OpenAI SDK + mcp SDK + httpx |
-| 存储 | SQLite（平台元数据）+ 各业务数据源（MySQL/PostgreSQL/SQLite/文件桶） |
+| 存储 | PostgreSQL（控制面与 Catalog）+ MinIO（文件与业务数据版本）+ Redis（可失效缓存）+ DuckDB（无状态查询） |
 
 ## 目录结构
 
@@ -58,7 +59,7 @@ project-root
 │   │   ├── ocr-parser/        # OCR 文档解析技能（已内置）
 │   │   └── data-analyzer/     # 数据分析技能
 │   ├── tests/                 # 平台策略与核心行为回归测试
-│   ├── data/                  # platform.db + buckets/（文件桶存储）
+│   ├── data/                  # 仅限测试/历史兼容；远端运行时不保存业务数据
 │   ├── .env.example           # 无密钥配置模板；复制为 .env 后按需填写
 │   └── requirements.txt
 └── frontend/
@@ -100,6 +101,9 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 ```
 
 > 后端 API 文档：http://127.0.0.1:8001/docs
+
+后端启动前，PostgreSQL 必须已升级到 Alembic head。当前存储边界、首次建库、迁移和回退要求见
+[PostgreSQL / MinIO 通用数据资产架构](./docs/PostgreSQL-MinIO-通用数据资产架构.md)。`init_db()` 只校验迁移版本，不会在生产库隐式建表。
 
 ### 2. 前端（Node.js）
 
@@ -197,7 +201,7 @@ MAIL_TIMEOUT_SECONDS=20
 平台只有一套导航和一条主链路：
 
 1. **创建业务场景并建立本体骨架**：先定义对象类型、属性、主键和关系类型；也可以上传业务文档，由 AI 生成可检查的变更清单，确认后才写入。
-2. **接入并测试数据源**：数据库先读取表结构，文件桶先完成解析与索引。没有真实字段时不能创建数据映射。
+2. **接入并测试数据源**：版本化数据集先固定 Schema 和 MinIO 资产版本；外部数据库读取表结构，文件桶完成解析与索引。没有真实字段时不能创建数据映射。
 3. **配置数据映射**：把源表/文件字段映射到对象属性，预览、测试并刷新为对象实例。顺序是“本体骨架 → 数据源 → 映射”，不是在数据源和映射之间二选一。
 4. **配置业务能力**：按需定义函数、操作、规则、事件和工作流。函数用于无副作用计算；操作用于写入或外部调用并要求预演/确认。
 5. **创建 Agent 并进入对话**：绑定场景、模型及映射所用数据源，让 Agent 基于本体语义和受治理能力完成业务需求。
@@ -207,8 +211,8 @@ MAIL_TIMEOUT_SECONDS=20
 | 工具 | 说明 |
 | --- | --- |
 | `list_data_sources` | 列出 Agent 绑定的数据源 |
-| `list_tables` | 列出某数据库数据源的表结构 |
-| `run_sql` | 在指定数据源执行 SQL 查询 |
+| `list_tables` | 列出版本化数据集或外部数据库的逻辑关系与字段结构 |
+| `run_sql` | 对固定数据集版本或外部连接器执行受控只读 SQL |
 | `search_documents` | 在文件桶中做 RAG 语义/关键词检索 |
 | `read_document` | 读取指定文档全文 |
 | `list_functions` / `run_function` | 查看并调用无副作用的确定性业务函数 |
@@ -219,7 +223,7 @@ MAIL_TIMEOUT_SECONDS=20
 ## 平台边界与安全策略
 
 - `backend/app` 只实现通用平台能力；零售、医疗、财务等具体业务数据和提示词只放在 `backend/examples` 或由用户在界面中配置。
-- 数据源、Agent、本体扩展和工作流引用都会校验资源是否存在以及是否属于当前业务场景，避免跨场景串用。
+- 数据源、Agent、本体扩展和工作流引用都会校验资源是否存在以及是否属于当前业务场景；Catalog、语义映射和推导证据还通过数据库复合外键约束租户与数据集作用域。
 - Agent 与工作流中的 SQL 仅允许单条只读查询，并受最大返回行数限制；脚本节点默认关闭，只有受控部署显式开启后才可执行。
 - LLM API Key、数据源密码等凭据不会通过 API 回显；编辑时留空表示保留原凭据。
 - 工作流 DAG 保存/执行前会校验开始结束节点、可达性、环路和规则分支完整性。
@@ -229,6 +233,7 @@ MAIL_TIMEOUT_SECONDS=20
 ```powershell
 $env:PYTHONPATH=(Resolve-Path .\backend).Path
 python -m pytest .\backend\tests -q
+python .\backend\scripts\verify_postgresql_runtime.py
 npm --prefix .\frontend run build
 ```
 

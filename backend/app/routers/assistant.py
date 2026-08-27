@@ -6,7 +6,6 @@ import hashlib
 import copy
 import math
 import re
-import tempfile
 import threading
 import time
 import uuid
@@ -67,6 +66,8 @@ from ..services import (
     llm_service,
     mapping_refresh_service,
     ontology_service,
+    object_deletion_service,
+    object_storage_service,
     permission_service,
     rag_service,
     release_service,
@@ -281,8 +282,13 @@ def _current_user_id(db: Session) -> str:
     return permission_service.require_principal(db).user_id
 
 
-def _thread(db: Session, thread_id: str) -> AssistantThread:
-    thread = db.execute(
+def _thread(
+    db: Session,
+    thread_id: str,
+    *,
+    for_update: bool = False,
+) -> AssistantThread:
+    statement = (
         select(AssistantThread).where(
             AssistantThread.id == thread_id,
             AssistantThread.tenant_id == _tenant(db),
@@ -290,7 +296,11 @@ def _thread(db: Session, thread_id: str) -> AssistantThread:
             # ownership from tenant scope would reintroduce cross-user leaks.
             AssistantThread.created_by_user_id == _current_user_id(db),
         )
-    ).scalars().first()
+        .execution_options(populate_existing=for_update)
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    thread = db.execute(statement).scalars().first()
     if not thread:
         raise HTTPException(404, "助手会话不存在")
     if thread.scenario_id:
@@ -5293,6 +5303,9 @@ def _purge_expired_attachments(db: Session) -> None:
         )
     ).scalars().all()
     for attachment in expired:
+        object_deletion_service.enqueue_assistant_attachment_deletion(
+            db, attachment
+        )
         db.delete(attachment)
     if expired:
         db.flush()
@@ -5352,6 +5365,10 @@ def _consume_attachments(
 ) -> None:
     if not attachments:
         return
+    # Thread deletion takes this same lock before enumerating attachments.
+    # Holding it through the attachment claim prevents a late bind from being
+    # cascaded without a corresponding object-deletion outbox row.
+    _thread(db, thread_id, for_update=True)
     _purge_expired_attachments(db)
     consumed_at = datetime.now(timezone.utc)
     attachment_ids = [attachment.id for attachment in attachments]
@@ -5713,7 +5730,7 @@ def delete_thread(
     path: str = "",
     db: Session = Depends(get_tenant_db),
 ):
-    thread = _thread(db, thread_id)
+    thread = _thread(db, thread_id, for_update=True)
     _assert_thread_scope(thread, scenario_id, page, path)
     db.execute(
         delete(AssistantRouteDecision).where(
@@ -5722,8 +5739,35 @@ def delete_thread(
             AssistantRouteDecision.thread_id == thread.id,
         )
     )
+    attachments = list(
+        db.scalars(
+            select(AssistantAttachment)
+            .where(
+                AssistantAttachment.tenant_id == _tenant(db),
+                AssistantAttachment.created_by_user_id == _current_user_id(db),
+                AssistantAttachment.thread_id == thread.id,
+            )
+            .order_by(AssistantAttachment.id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        ).all()
+    )
+    try:
+        deletion_job_ids = [
+            job_id
+            for attachment in attachments
+            if (
+                job_id
+                := object_deletion_service.enqueue_assistant_attachment_deletion(
+                    db, attachment
+                )
+            )
+        ]
+    except (ValueError, object_storage_service.ObjectStorageError) as exc:
+        raise HTTPException(409, "会话附件对象身份校验失败") from exc
     db.delete(thread)
     db.commit()
+    object_deletion_service.drain_jobs_best_effort(db, deletion_job_ids)
     return Msg(message="助手会话已删除")
 
 
@@ -5735,9 +5779,12 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
     if len(content) > settings.max_upload_bytes:
         raise HTTPException(413, f"附件超过 {settings.max_upload_bytes // 1024 // 1024}MB 限制")
 
-    filename = Path(file.filename or "附件").name[:500]
-    suffix = Path(filename).suffix or ".bin"
+    try:
+        filename = datasource_service.validate_bucket_filename(file.filename or "附件")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     attachment = AssistantAttachment(
+        id=uuid.uuid4().hex,
         tenant_id=_tenant(db),
         created_by_user_id=_current_user_id(db),
         filename=filename,
@@ -5746,15 +5793,33 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
         content_hash=hashlib.sha256(content).hexdigest(),
         status="pending",
     )
-    db.add(attachment)
-    db.flush()
-
-    temp_path = ""
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(content)
-            temp_path = tmp.name
-        parsed = doc_parser.parse_file(temp_path, filename)
+        upload_claim = (
+            object_deletion_service.prepare_assistant_attachment_upload(
+                attachment
+            )
+        )
+        with object_deletion_service.heartbeat_upload_intent(
+            upload_claim
+        ) as upload_heartbeat:
+            object_deletion_service.begin_upload_put(upload_claim)
+            datasource_service.save_assistant_attachment_object(
+                attachment,
+                content,
+                upload_object_key=upload_claim.object_key,
+            )
+            object_deletion_service.assert_upload_active(
+                upload_heartbeat, upload_claim, attachment
+            )
+    except Exception as exc:  # noqa: BLE001 - storage service exposes safe errors.
+        raise HTTPException(503, "助手附件对象存储写入失败") from exc
+    try:
+        db.add(attachment)
+        object_deletion_service.retain_assistant_attachment_upload(
+            db, upload_claim, attachment
+        )
+        db.flush()
+        parsed = doc_parser.parse_bytes(content, filename)
         attachment.status = "parsed" if parsed.get("status") == "success" else "error"
         parsed_text = str(parsed.get("text") or "")
         if attachment.status == "parsed" and len(parsed_text) > ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS:
@@ -5766,11 +5831,21 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
             )
         attachment.parsed_text = parsed_text
         attachment.error = "" if attachment.status == "parsed" else str(parsed.get("message") or "解析失败")
-    finally:
-        if temp_path:
-            Path(temp_path).unlink(missing_ok=True)
-
-    db.commit()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        if isinstance(
+            exc,
+            object_deletion_service.UploadIntentLeaseLostError,
+        ):
+            object_deletion_service.schedule_abandoned_upload_best_effort(
+                upload_claim,
+                attachment,
+            )
+        # The independent upload intent is authoritative after an ambiguous
+        # commit response: its worker retains a committed reference or removes
+        # every object version when no metadata transaction became durable.
+        raise
     db.refresh(attachment)
     return attachment
 
@@ -5778,16 +5853,30 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
 @router.delete("/attachments/{attachment_id}", response_model=Msg)
 def delete_attachment(attachment_id: str, db: Session = Depends(get_tenant_db)):
     attachment = db.execute(
-        select(AssistantAttachment).where(
+        select(AssistantAttachment)
+        .where(
             AssistantAttachment.id == attachment_id,
             AssistantAttachment.tenant_id == _tenant(db),
             AssistantAttachment.created_by_user_id == _current_user_id(db),
         )
+        .execution_options(populate_existing=True)
+        .with_for_update()
     ).scalars().first()
     if not attachment:
         raise HTTPException(404, "附件不存在")
+    try:
+        deletion_job_id = (
+            object_deletion_service.enqueue_assistant_attachment_deletion(
+                db, attachment
+            )
+        )
+    except (ValueError, object_storage_service.ObjectStorageError) as exc:
+        raise HTTPException(409, "附件对象身份校验失败") from exc
     db.delete(attachment)
     db.commit()
+    object_deletion_service.drain_jobs_best_effort(
+        db, [deletion_job_id] if deletion_job_id else []
+    )
     return Msg(message="附件已移除")
 
 

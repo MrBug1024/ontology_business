@@ -6,10 +6,27 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import re
 import uuid
 
 from fastapi import Request
-from sqlalchemy import Index, MetaData, Table, create_engine, event, inspect, text
+from sqlalchemy import (
+    DateTime as SQLAlchemyDateTime,
+    Index,
+    MetaData,
+    Table,
+    column,
+    create_engine,
+    event,
+    exists,
+    inspect,
+    literal,
+    select,
+    table,
+    text,
+    update,
+)
+from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import ensure_runtime_directories, get_settings
@@ -19,21 +36,65 @@ class Base(DeclarativeBase):
     pass
 
 
+MYSQL_DATETIME_PRECISION = 6
+
+
+def orm_datetime(*, timezone: bool = True):
+    """Use microsecond-preserving DATETIME on MySQL and native DateTime elsewhere."""
+    return SQLAlchemyDateTime(timezone=timezone).with_variant(
+        mysql.DATETIME(fsp=MYSQL_DATETIME_PRECISION),
+        "mysql",
+    )
+
+
 logger = logging.getLogger(__name__)
+POSTGRESQL_SCHEMA_REVISION = "20260827_04"
 
 _settings = get_settings()
-connect_args = {"check_same_thread": False} if _settings.database_url.startswith("sqlite") else {}
-engine = create_engine(_settings.database_url, connect_args=connect_args, pool_pre_ping=True)
+engine_options: dict[str, object] = {"pool_pre_ping": True}
+if _settings.uses_sqlite_database:
+    engine_options["connect_args"] = {"check_same_thread": False}
+elif _settings.uses_postgresql_database:
+    engine_options.update(
+        {
+            "connect_args": {
+                "application_name": "ontology-platform-api",
+                "options": (
+                    "-c timezone=UTC "
+                    f"-c statement_timeout={_settings.database_statement_timeout_ms} "
+                    f"-c lock_timeout={_settings.database_lock_timeout_ms}"
+                ),
+            },
+            "pool_size": _settings.database_pool_size,
+            "max_overflow": _settings.database_max_overflow,
+            "pool_timeout": _settings.database_pool_timeout_seconds,
+            "pool_recycle": 1800,
+        }
+    )
+engine = create_engine(_settings.database_url, **engine_options)
 
 
-if _settings.database_url.startswith("sqlite"):
-    @event.listens_for(engine, "connect")
-    def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
-        cursor = dbapi_connection.cursor()
-        try:
-            cursor.execute("PRAGMA foreign_keys=ON")
-        finally:
-            cursor.close()
+def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
+
+
+def _set_mysql_session_defaults(dbapi_connection, _connection_record) -> None:
+    """Keep platform tables transactional even on MyISAM-default servers."""
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("SET SESSION default_storage_engine=InnoDB")
+    finally:
+        cursor.close()
+
+
+if engine.dialect.name == "sqlite":
+    event.listen(engine, "connect", _enable_sqlite_foreign_keys)
+elif engine.dialect.name == "mysql":
+    event.listen(engine, "connect", _set_mysql_session_defaults)
 
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -139,9 +200,17 @@ def _migrate_workflows_dag() -> None:
             return
         cols = {column["name"] for column in inspector.get_columns("ontology_workflows")}
         if "nodes" not in cols:
-            conn.exec_driver_sql("ALTER TABLE ontology_workflows ADD COLUMN nodes JSON DEFAULT '[]'")
+            conn.exec_driver_sql("ALTER TABLE ontology_workflows ADD COLUMN nodes JSON")
         if "edges" not in cols:
-            conn.exec_driver_sql("ALTER TABLE ontology_workflows ADD COLUMN edges JSON DEFAULT '[]'")
+            conn.exec_driver_sql("ALTER TABLE ontology_workflows ADD COLUMN edges JSON")
+        # MySQL versions before 8.0.13 reject defaults on JSON columns.  ORM
+        # writes supply application defaults; legacy rows are repaired here.
+        conn.exec_driver_sql(
+            "UPDATE ontology_workflows SET nodes = '[]' WHERE nodes IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE ontology_workflows SET edges = '[]' WHERE edges IS NULL"
+        )
 
 
 def _migrate_data_mapping_status() -> None:
@@ -155,18 +224,29 @@ def _migrate_data_mapping_status() -> None:
             return
         columns = {
             "data_source_binding_key": "VARCHAR(180) DEFAULT ''",
-            "data_source_binding_ref": "JSON DEFAULT '{}'",
+            "data_source_binding_ref": "JSON",
             "status": "VARCHAR(20) DEFAULT 'unknown'",
-            "last_error": "TEXT DEFAULT ''",
+            "last_error": "TEXT",
             "last_checked_at": "TIMESTAMP",
             "last_refreshed_at": "TIMESTAMP",
             "last_row_count": "INTEGER DEFAULT 0",
             "last_imported_count": "INTEGER DEFAULT 0",
-            "environment_status": "JSON DEFAULT '{}'",
+            "environment_status": "JSON",
         }
         for name, definition in columns.items():
             if name not in existing:
                 conn.exec_driver_sql(f"ALTER TABLE data_mappings ADD COLUMN {name} {definition}")
+        conn.exec_driver_sql(
+            "UPDATE data_mappings SET data_source_binding_ref = '{}' "
+            "WHERE data_source_binding_ref IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE data_mappings SET environment_status = '{}' "
+            "WHERE environment_status IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE data_mappings SET last_error = '' WHERE last_error IS NULL"
+        )
 
 
 def _migrate_data_mapping_runtime_bindings() -> None:
@@ -328,6 +408,11 @@ def _migrate_action_safety() -> None:
                     conn.exec_driver_sql(
                         f"ALTER TABLE action_execution_logs ADD COLUMN {name} {definition}"
                     )
+            _widen_mysql_varchar_columns(
+                conn,
+                "action_execution_logs",
+                {"status": (32, "NOT NULL")},
+            )
             conn.exec_driver_sql(
                 "UPDATE action_execution_logs SET connector_audit = '[]' "
                 "WHERE connector_audit IS NULL"
@@ -454,7 +539,11 @@ def _migrate_assistant_scopes() -> None:
         else:
             message_columns = set()
         if message_columns and "thinking" not in message_columns:
-            conn.exec_driver_sql("ALTER TABLE assistant_messages ADD COLUMN thinking JSON DEFAULT '[]'")
+            conn.exec_driver_sql("ALTER TABLE assistant_messages ADD COLUMN thinking JSON")
+        if message_columns:
+            conn.exec_driver_sql(
+                "UPDATE assistant_messages SET thinking = '[]' WHERE thinking IS NULL"
+            )
 
 
 def _migrate_assistant_thread_ownership() -> None:
@@ -477,14 +566,19 @@ def _migrate_assistant_thread_ownership() -> None:
                 "SELECT id FROM assistant_threads WHERE created_by_user_id IS NULL"
             ).fetchall()
             for (thread_id,) in rows:
-                owner = conn.exec_driver_sql(
-                    "SELECT user_id FROM assistant_audit_logs "
-                    "WHERE thread_id = :thread_id ORDER BY created_at ASC LIMIT 1",
+                owner = conn.execute(
+                    text(
+                        "SELECT user_id FROM assistant_audit_logs "
+                        "WHERE thread_id = :thread_id ORDER BY created_at ASC LIMIT 1"
+                    ),
                     {"thread_id": thread_id},
                 ).fetchone()
                 if owner and owner[0]:
-                    conn.exec_driver_sql(
-                        "UPDATE assistant_threads SET created_by_user_id = :user_id WHERE id = :thread_id",
+                    conn.execute(
+                        text(
+                            "UPDATE assistant_threads SET created_by_user_id = :user_id "
+                            "WHERE id = :thread_id"
+                        ),
                         {"user_id": owner[0], "thread_id": thread_id},
                     )
 
@@ -582,6 +676,229 @@ def _migrate_document_index() -> None:
                 pass
 
 
+def _widen_mysql_varchar_columns(
+    conn,
+    table_name: str,
+    definitions: dict[str, tuple[int, str]],
+) -> None:
+    """Idempotently expand managed VARCHAR columns without narrowing data."""
+    if conn.dialect.name != "mysql":
+        return
+    installed = {
+        column_definition["name"]: column_definition
+        for column_definition in inspect(conn).get_columns(table_name)
+    }
+    quote = conn.dialect.identifier_preparer.quote
+    for column_name, (target_length, suffix) in definitions.items():
+        column_definition = installed.get(column_name)
+        if column_definition is None:
+            continue
+        current_length = getattr(column_definition["type"], "length", None)
+        if current_length is not None and int(current_length) >= target_length:
+            continue
+        conn.exec_driver_sql(
+            f"ALTER TABLE {quote(table_name)} MODIFY COLUMN {quote(column_name)} "
+            f"VARCHAR({target_length}) {suffix}"
+        )
+
+
+_CURRENT_TIMESTAMP_EXPRESSION = re.compile(
+    r"^current_timestamp(?:\(([0-6]?)\))?$",
+    re.IGNORECASE,
+)
+_ON_UPDATE_CURRENT_TIMESTAMP = re.compile(
+    r"\bon\s+update\s+(current_timestamp(?:\([0-6]?\))?)(?=$|\s)",
+    re.IGNORECASE,
+)
+
+
+def _mysql_datetime_expression(value: object) -> str | None:
+    match = _CURRENT_TIMESTAMP_EXPRESSION.fullmatch(str(value or "").strip())
+    if match is None:
+        return None
+    # MySQL requires CURRENT_TIMESTAMP/ON UPDATE precision to match the
+    # fractional precision of the DATETIME column being rebuilt below.
+    return f"CURRENT_TIMESTAMP({MYSQL_DATETIME_PRECISION})"
+
+
+def _mysql_literal(conn, value: object) -> str:
+    return str(
+        literal(value).compile(
+            dialect=conn.dialect,
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+
+def _mysql_datetime_column_definition(conn, row: dict[str, object]) -> str:
+    """Rebuild one DATETIME column without dropping its installed attributes."""
+    quote = conn.dialect.identifier_preparer.quote
+    column_name = str(row["column_name"])
+    nullable = str(row.get("is_nullable") or "").upper() == "YES"
+    default = row.get("column_default")
+    extra = str(row.get("extra") or "").strip()
+    generated_default = bool(
+        re.search(r"\bDEFAULT_GENERATED\b", extra, re.IGNORECASE)
+    )
+    remaining_extra = re.sub(
+        r"\bDEFAULT_GENERATED\b",
+        " ",
+        extra,
+        flags=re.IGNORECASE,
+    )
+
+    on_update_matches = _ON_UPDATE_CURRENT_TIMESTAMP.findall(remaining_extra)
+    if len(on_update_matches) > 1:
+        raise RuntimeError(
+            f"MySQL 时间列 {row['table_name']}.{column_name} 包含重复 ON UPDATE 定义"
+        )
+    remaining_extra = _ON_UPDATE_CURRENT_TIMESTAMP.sub(" ", remaining_extra)
+    invisible = bool(re.search(r"\bINVISIBLE\b", remaining_extra, re.IGNORECASE))
+    remaining_extra = re.sub(
+        r"\bINVISIBLE\b",
+        " ",
+        remaining_extra,
+        flags=re.IGNORECASE,
+    )
+    if remaining_extra.strip():
+        raise RuntimeError(
+            f"MySQL 时间列 {row['table_name']}.{column_name} 包含不支持的 EXTRA 属性"
+        )
+
+    parts = [
+        f"{quote(column_name)} DATETIME({MYSQL_DATETIME_PRECISION})",
+        "NULL" if nullable else "NOT NULL",
+    ]
+    if default is None:
+        if nullable:
+            parts.append("DEFAULT NULL")
+    else:
+        default_expression = _mysql_datetime_expression(default)
+        if generated_default and default_expression is None:
+            raise RuntimeError(
+                f"MySQL 时间列 {row['table_name']}.{column_name} 使用了不支持的生成默认值"
+            )
+        parts.append(
+            "DEFAULT "
+            + (
+                default_expression
+                if default_expression is not None
+                else _mysql_literal(conn, default)
+            )
+        )
+    if on_update_matches:
+        expression = _mysql_datetime_expression(on_update_matches[0])
+        if expression is None:  # pragma: no cover - constrained by the regex.
+            raise RuntimeError("MySQL 时间列 ON UPDATE 表达式无效")
+        parts.append(f"ON UPDATE {expression}")
+    if invisible:
+        parts.append("INVISIBLE")
+    comment = str(row.get("column_comment") or "")
+    if comment:
+        parts.append(f"COMMENT {_mysql_literal(conn, comment)}")
+    return " ".join(parts)
+
+
+def _widen_mysql_datetime_precision(conn) -> None:
+    """Expand every installed ORM DATETIME to microseconds without narrowing."""
+    if conn.dialect.name != "mysql":
+        return
+
+    managed_columns = {
+        (table.name, column.name)
+        for table in Base.metadata.tables.values()
+        for column in table.columns
+        if str(column.type.compile(dialect=conn.dialect)).upper()
+        == f"DATETIME({MYSQL_DATETIME_PRECISION})"
+    }
+    installed = conn.execute(
+        text(
+            "SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name, "
+            "DATA_TYPE AS data_type, DATETIME_PRECISION AS datetime_precision, "
+            "IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, "
+            "EXTRA AS extra, COLUMN_COMMENT AS column_comment "
+            "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()"
+        )
+    ).mappings()
+    modifications: dict[str, list[str]] = {}
+    for raw_row in installed:
+        row = dict(raw_row)
+        table_name = str(row.get("table_name") or "")
+        column_name = str(row.get("column_name") or "")
+        if (table_name, column_name) not in managed_columns:
+            continue
+        if str(row.get("data_type") or "").casefold() != "datetime":
+            raise RuntimeError(
+                f"MySQL ORM 时间列 {table_name}.{column_name} 不是 DATETIME，已中止精度升级"
+            )
+        precision = int(row.get("datetime_precision") or 0)
+        if precision >= MYSQL_DATETIME_PRECISION:
+            continue
+        modifications.setdefault(table_name, []).append(
+            _mysql_datetime_column_definition(conn, row)
+        )
+
+    quote = conn.dialect.identifier_preparer.quote
+    for table_name in sorted(modifications):
+        clauses = ", ".join(
+            f"MODIFY COLUMN {definition}"
+            for definition in modifications[table_name]
+        )
+        conn.exec_driver_sql(f"ALTER TABLE {quote(table_name)} {clauses}")
+
+
+def _migrate_mysql_datetime_precision() -> None:
+    if engine.dialect.name != "mysql":
+        return
+    with engine.begin() as conn:
+        _widen_mysql_datetime_precision(conn)
+
+
+def _migrate_bucket_storage_metadata() -> None:
+    """Add durable object-storage identity while preserving legacy local rows."""
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if not inspector.has_table("bucket_files"):
+            return
+        existing = {column["name"] for column in inspector.get_columns("bucket_files")}
+        columns = {
+            "storage_provider": "VARCHAR(20) NOT NULL DEFAULT 'local'",
+            "bucket_name": "VARCHAR(255) NOT NULL DEFAULT ''",
+            "object_key": "VARCHAR(2048) NOT NULL DEFAULT ''",
+            "object_version_id": "VARCHAR(255) NOT NULL DEFAULT ''",
+            "etag": "VARCHAR(128) NOT NULL DEFAULT ''",
+            "object_url": "VARCHAR(4096) NOT NULL DEFAULT ''",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE bucket_files ADD COLUMN {name} {definition}"
+                )
+        _widen_mysql_varchar_columns(
+            conn,
+            "bucket_files",
+            {
+                "stored_path": (4096, "NOT NULL"),
+                "object_key": (2048, "NOT NULL DEFAULT ''"),
+                "object_url": (4096, "NOT NULL DEFAULT ''"),
+            },
+        )
+        conn.exec_driver_sql(
+            "UPDATE bucket_files SET storage_provider = 'local' "
+            "WHERE storage_provider IS NULL OR TRIM(storage_provider) = ''"
+        )
+        for name in (
+            "bucket_name",
+            "object_key",
+            "object_version_id",
+            "etag",
+            "object_url",
+        ):
+            conn.exec_driver_sql(
+                f"UPDATE bucket_files SET {name} = '' WHERE {name} IS NULL"
+            )
+
+
 def _migrate_document_index_active_key() -> None:
     """给既有索引队列补充跨请求去重键。"""
     with engine.begin() as conn:
@@ -609,15 +926,19 @@ def _migrate_document_index_active_key() -> None:
             "GROUP BY tenant_id, active_key HAVING COUNT(*) > 1"
         ).fetchall()
         for tenant_id, active_key in duplicates:
-            rows = conn.exec_driver_sql(
-                "SELECT id FROM document_index_jobs WHERE tenant_id = :tenant_id "
-                "AND active_key = :active_key ORDER BY created_at DESC, id DESC",
+            rows = conn.execute(
+                text(
+                    "SELECT id FROM document_index_jobs WHERE tenant_id = :tenant_id "
+                    "AND active_key = :active_key ORDER BY created_at DESC, id DESC"
+                ),
                 {"tenant_id": tenant_id, "active_key": active_key},
             ).fetchall()
             for (job_id,) in rows[1:]:
-                conn.exec_driver_sql(
-                    "UPDATE document_index_jobs SET status = 'failed', active_key = NULL, "
-                    "error = '已由较新的同文件索引任务替代' WHERE id = :job_id",
+                conn.execute(
+                    text(
+                        "UPDATE document_index_jobs SET status = 'failed', active_key = NULL, "
+                        "error = '已由较新的同文件索引任务替代' WHERE id = :job_id"
+                    ),
                     {"job_id": job_id},
                 )
         # 兼容 SQLite / PostgreSQL / MySQL 的基础建索引语法；重复索引错误仅代表
@@ -1176,6 +1497,43 @@ def _migrate_action_decision_chain() -> None:
                 )
 
 
+def _relation_duplicate_groups_statement():
+    return text(
+        "SELECT COUNT(*) FROM ("
+        "SELECT relation_id, source_instance_id, target_instance_id "
+        "FROM relation_instances "
+        "GROUP BY relation_id, source_instance_id, target_instance_id "
+        "HAVING COUNT(*) > 1"
+        ") AS duplicate_edges"
+    )
+
+
+def _promote_legacy_title_keys(conn) -> None:
+    candidate_ids = conn.execute(
+        text(
+            "SELECT MIN(candidate.id) FROM ontology_properties candidate "
+            "WHERE candidate.is_key = :true_value AND NOT EXISTS ("
+            "SELECT 1 FROM ontology_properties titled "
+            "WHERE titled.entity_id = candidate.entity_id "
+            "AND titled.is_title = :true_value"
+            ") GROUP BY candidate.entity_id"
+        ),
+        {"true_value": True},
+    ).scalars().all()
+    if not candidate_ids:
+        return
+    properties = table(
+        "ontology_properties",
+        column("id"),
+        column("is_title"),
+    )
+    conn.execute(
+        update(properties)
+        .where(properties.c.id.in_(candidate_ids))
+        .values(is_title=True)
+    )
+
+
 def _migrate_ontology_runtime_metadata() -> None:
     """Add the P0 namespace/constraint/state/validity/quality/mapping metadata."""
     columns_by_table = {
@@ -1228,9 +1586,11 @@ def _migrate_ontology_runtime_metadata() -> None:
             ("relation_instances", "source_ref", ""),
         ):
             if inspector.has_table(table):
-                conn.exec_driver_sql(
-                    f"UPDATE {table} SET {column} = :value "
-                    f"WHERE {column} IS NULL OR TRIM({column}) = ''",
+                conn.execute(
+                    text(
+                        f"UPDATE {table} SET {column} = :value "
+                        f"WHERE {column} IS NULL OR TRIM({column}) = ''"
+                    ),
                     {"value": value},
                 )
         for table, column in (
@@ -1249,27 +1609,18 @@ def _migrate_ontology_runtime_metadata() -> None:
                 column["name"] for column in inspect(conn).get_columns("ontology_properties")
             }
             if "is_title" in property_columns:
-                conn.exec_driver_sql(
-                    "UPDATE ontology_properties SET is_title = :false_value "
-                    "WHERE is_title IS NULL",
+                conn.execute(
+                    text(
+                        "UPDATE ontology_properties SET is_title = :false_value "
+                        "WHERE is_title IS NULL"
+                    ),
                     {"false_value": False},
                 )
             if {"entity_id", "is_key", "is_title"}.issubset(property_columns):
                 # Legacy object types used their primary key as the display
                 # label. Preserve that deterministic behaviour while making
                 # title-key semantics explicit and independently editable.
-                conn.exec_driver_sql(
-                    "UPDATE ontology_properties SET is_title = :true_value "
-                    "WHERE id IN ("
-                    "SELECT MIN(candidate.id) FROM ontology_properties candidate "
-                    "WHERE candidate.is_key = :true_value AND NOT EXISTS ("
-                    "SELECT 1 FROM ontology_properties titled "
-                    "WHERE titled.entity_id = candidate.entity_id "
-                    "AND titled.is_title = :true_value"
-                    ") GROUP BY candidate.entity_id"
-                    ")",
-                    {"true_value": True},
-                )
+                _promote_legacy_title_keys(conn)
         if inspector.has_table("ontology_instances"):
             indexes = {
                 index["name"] for index in inspect(conn).get_indexes("ontology_instances")
@@ -1291,14 +1642,7 @@ def _migrate_ontology_runtime_metadata() -> None:
             }
             if edge_columns.issubset(relation_columns):
                 duplicate_count = conn.execute(
-                    text(
-                        "SELECT COUNT(*) FROM ("
-                        "SELECT relation_id, source_instance_id, target_instance_id "
-                        "FROM relation_instances "
-                        "GROUP BY relation_id, source_instance_id, target_instance_id "
-                        "HAVING COUNT(*) > 1"
-                        ")"
-                    )
+                    _relation_duplicate_groups_statement()
                 ).scalar_one()
                 unique_names = {
                     item.get("name")
@@ -1339,14 +1683,45 @@ def _migrate_assistant_attachment_lifecycle() -> None:
             ("thread_id", "VARCHAR(32)"),
             ("consumed_at", "DATETIME"),
             ("expires_at", "DATETIME"),
+            ("storage_provider", "VARCHAR(20) NOT NULL DEFAULT 'none'"),
+            ("bucket_name", "VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("object_key", "VARCHAR(2048) NOT NULL DEFAULT ''"),
+            ("object_version_id", "VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("etag", "VARCHAR(128) NOT NULL DEFAULT ''"),
+            ("object_url", "VARCHAR(4096) NOT NULL DEFAULT ''"),
         ):
             if name not in existing:
                 conn.exec_driver_sql(
                     f"ALTER TABLE assistant_attachments ADD COLUMN {name} {definition}"
                 )
-        expiry = datetime.now(timezone.utc)
+        _widen_mysql_varchar_columns(
+            conn,
+            "assistant_attachments",
+            {
+                "object_key": (2048, "NOT NULL DEFAULT ''"),
+                "object_url": (4096, "NOT NULL DEFAULT ''"),
+            },
+        )
         conn.exec_driver_sql(
-            "UPDATE assistant_attachments SET expires_at = :expiry WHERE expires_at IS NULL",
+            "UPDATE assistant_attachments SET storage_provider = 'none' "
+            "WHERE storage_provider IS NULL OR TRIM(storage_provider) = ''"
+        )
+        for name in (
+            "bucket_name",
+            "object_key",
+            "object_version_id",
+            "etag",
+            "object_url",
+        ):
+            conn.exec_driver_sql(
+                f"UPDATE assistant_attachments SET {name} = '' WHERE {name} IS NULL"
+            )
+        expiry = datetime.now(timezone.utc)
+        conn.execute(
+            text(
+                "UPDATE assistant_attachments SET expires_at = :expiry "
+                "WHERE expires_at IS NULL"
+            ),
             {"expiry": expiry},
         )
         if inspector.has_table("assistant_threads"):
@@ -1355,31 +1730,33 @@ def _migrate_assistant_attachment_lifecycle() -> None:
             # install equivalent fail-closed/cascade triggers for upgraded
             # databases.  Fresh databases already have the real FK; the
             # idempotent triggers are harmless there.
-            conn.exec_driver_sql(
-                "UPDATE assistant_attachments SET thread_id = NULL "
-                "WHERE thread_id IS NOT NULL AND NOT EXISTS ("
-                "SELECT 1 FROM assistant_threads WHERE assistant_threads.id = assistant_attachments.thread_id"
-                ")"
+            conn.execute(
+                _nullable_orphan_repair_statement(
+                    "assistant_attachments",
+                    "thread_id",
+                    "assistant_threads",
+                )
             )
-            conn.exec_driver_sql(
-                "CREATE TRIGGER IF NOT EXISTS trg_assistant_attachment_thread_insert "
-                "BEFORE INSERT ON assistant_attachments "
-                "WHEN NEW.thread_id IS NOT NULL AND NOT EXISTS ("
-                "SELECT 1 FROM assistant_threads WHERE id = NEW.thread_id"
-                ") BEGIN SELECT RAISE(ABORT, 'invalid assistant attachment thread'); END"
-            )
-            conn.exec_driver_sql(
-                "CREATE TRIGGER IF NOT EXISTS trg_assistant_attachment_thread_update "
-                "BEFORE UPDATE OF thread_id ON assistant_attachments "
-                "WHEN NEW.thread_id IS NOT NULL AND NOT EXISTS ("
-                "SELECT 1 FROM assistant_threads WHERE id = NEW.thread_id"
-                ") BEGIN SELECT RAISE(ABORT, 'invalid assistant attachment thread'); END"
-            )
-            conn.exec_driver_sql(
-                "CREATE TRIGGER IF NOT EXISTS trg_assistant_attachment_thread_delete "
-                "AFTER DELETE ON assistant_threads BEGIN "
-                "DELETE FROM assistant_attachments WHERE thread_id = OLD.id; END"
-            )
+            if conn.dialect.name == "sqlite":
+                conn.exec_driver_sql(
+                    "CREATE TRIGGER IF NOT EXISTS trg_assistant_attachment_thread_insert "
+                    "BEFORE INSERT ON assistant_attachments "
+                    "WHEN NEW.thread_id IS NOT NULL AND NOT EXISTS ("
+                    "SELECT 1 FROM assistant_threads WHERE id = NEW.thread_id"
+                    ") BEGIN SELECT RAISE(ABORT, 'invalid assistant attachment thread'); END"
+                )
+                conn.exec_driver_sql(
+                    "CREATE TRIGGER IF NOT EXISTS trg_assistant_attachment_thread_update "
+                    "BEFORE UPDATE OF thread_id ON assistant_attachments "
+                    "WHEN NEW.thread_id IS NOT NULL AND NOT EXISTS ("
+                    "SELECT 1 FROM assistant_threads WHERE id = NEW.thread_id"
+                    ") BEGIN SELECT RAISE(ABORT, 'invalid assistant attachment thread'); END"
+                )
+                conn.exec_driver_sql(
+                    "CREATE TRIGGER IF NOT EXISTS trg_assistant_attachment_thread_delete "
+                    "AFTER DELETE ON assistant_threads BEGIN "
+                    "DELETE FROM assistant_attachments WHERE thread_id = OLD.id; END"
+                )
         indexes = {
             index["name"] for index in inspect(conn).get_indexes("assistant_attachments")
         }
@@ -1424,9 +1801,11 @@ def _migrate_assistant_compilation_jobs() -> None:
                 legacy_hash = hashlib.sha256(
                     str(parsed_text or "").encode("utf-8")
                 ).hexdigest()
-                conn.exec_driver_sql(
-                    "UPDATE assistant_attachments SET content_hash = :hash "
-                    "WHERE id = :id",
+                conn.execute(
+                    text(
+                        "UPDATE assistant_attachments SET content_hash = :hash "
+                        "WHERE id = :id"
+                    ),
                     {"hash": legacy_hash, "id": attachment_id},
                 )
             attachment_indexes = {
@@ -1486,9 +1865,11 @@ def _migrate_assistant_compilation_jobs() -> None:
             legacy_fingerprint = hashlib.sha256(
                 f"legacy-assistant-compilation-job:{job_id}".encode("utf-8")
             ).hexdigest()
-            conn.exec_driver_sql(
-                "UPDATE assistant_compilation_jobs "
-                "SET request_fingerprint = :fingerprint WHERE id = :id",
+            conn.execute(
+                text(
+                    "UPDATE assistant_compilation_jobs "
+                    "SET request_fingerprint = :fingerprint WHERE id = :id"
+                ),
                 {"fingerprint": legacy_fingerprint, "id": job_id},
             )
         conn.exec_driver_sql(
@@ -1560,7 +1941,7 @@ def _migrate_scenario_model_draft_resources() -> None:
         timestamp_definition = (
             "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
             if engine.dialect.name == "postgresql"
-            else "DATETIME DEFAULT CURRENT_TIMESTAMP"
+            else f"DATETIME({MYSQL_DATETIME_PRECISION})"
             if engine.dialect.name == "mysql"
             else "DATETIME"
         )
@@ -1579,16 +1960,37 @@ def _migrate_scenario_model_draft_resources() -> None:
             "UPDATE scenario_model_draft_resources "
             "SET lineage_started_at = COALESCE(lineage_started_at, created_at)"
         )
-        if engine.dialect.name == "postgresql":
+        refreshed_columns = {
+            column["name"]: column
+            for column in inspect(conn).get_columns(table_name)
+        }
+        lineage_column = refreshed_columns.get("lineage_started_at")
+        if lineage_column is None:
+            raise RuntimeError(f"{table_name} 缺少 lineage_started_at")
+        if engine.dialect.name == "postgresql" and bool(
+            lineage_column.get("nullable", True)
+        ):
             conn.exec_driver_sql(
                 "ALTER TABLE scenario_model_draft_resources "
                 "ALTER COLUMN lineage_started_at SET NOT NULL"
             )
         elif engine.dialect.name == "mysql":
-            conn.exec_driver_sql(
-                "ALTER TABLE scenario_model_draft_resources "
-                "MODIFY lineage_started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            installed_type = lineage_column.get("type")
+            compiled_type = (
+                str(installed_type.compile(dialect=conn.dialect)).upper()
+                if installed_type is not None
+                else ""
             )
+            if (
+                bool(lineage_column.get("nullable", True))
+                or compiled_type != f"DATETIME({MYSQL_DATETIME_PRECISION})"
+                or lineage_column.get("default") is not None
+            ):
+                conn.exec_driver_sql(
+                    "ALTER TABLE scenario_model_draft_resources "
+                    f"MODIFY lineage_started_at DATETIME({MYSQL_DATETIME_PRECISION}) "
+                    "NOT NULL"
+                )
         inspector = inspect(conn)
         required_columns = {
             "id", "tenant_id", "scenario_id", "created_by_user_id",
@@ -1722,10 +2124,12 @@ def _migrate_external_api_key_audit() -> None:
             # generating a cross-tenant event during migration.
             if not tenant_id:
                 continue
-            conn.exec_driver_sql(
-                "INSERT INTO external_api_key_audit_events "
-                "(id, api_key_id, tenant_id, subject_user_id, actor_user_id, event_type, details, created_at) "
-                "VALUES (:id, :api_key_id, :tenant_id, :subject_user_id, NULL, :event_type, :details, :created_at)",
+            conn.execute(
+                text(
+                    "INSERT INTO external_api_key_audit_events "
+                    "(id, api_key_id, tenant_id, subject_user_id, actor_user_id, event_type, details, created_at) "
+                    "VALUES (:id, :api_key_id, :tenant_id, :subject_user_id, NULL, :event_type, :details, :created_at)"
+                ),
                 {
                     "id": uuid.uuid4().hex,
                     "api_key_id": key_id,
@@ -1751,7 +2155,7 @@ def _migrate_function_runtimes() -> None:
             )
         if "runtime_config" not in existing:
             conn.exec_driver_sql(
-                "ALTER TABLE function_definitions ADD COLUMN runtime_config JSON DEFAULT '{}'"
+                "ALTER TABLE function_definitions ADD COLUMN runtime_config JSON"
             )
         conn.exec_driver_sql(
             "UPDATE function_definitions SET runtime_kind = 'contract' "
@@ -1776,6 +2180,13 @@ def _migrate_agent_capability_scope() -> None:
         existing = {column["name"] for column in inspector.get_columns("agents")}
         if "capability_scope" not in existing:
             conn.exec_driver_sql("ALTER TABLE agents ADD COLUMN capability_scope JSON")
+
+
+def _add_column_ddl(conn, table_name: str, column_name: str, ddl: str) -> str:
+    quote = conn.dialect.identifier_preparer.quote
+    return (
+        f"ALTER TABLE {quote(table_name)} ADD COLUMN {quote(column_name)} {ddl}"
+    )
 
 
 def _migrate_ontology_api_names() -> None:
@@ -1816,7 +2227,7 @@ def _migrate_ontology_api_names() -> None:
             for column_name, ddl in definitions.items():
                 if column_name not in existing:
                     conn.exec_driver_sql(
-                        f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {ddl}'
+                        _add_column_ddl(conn, table_name, column_name, ddl)
                     )
 
         def migrated_name(
@@ -2026,6 +2437,25 @@ def _migrate_artifact_template_catalog() -> None:
             raise
 
 
+def _nullable_orphan_repair_statement(
+    child_table_name: str,
+    child_column_name: str,
+    parent_table_name: str,
+):
+    """Build a dialect-quoted orphan repair without interpolating SQL names."""
+    child = table(child_table_name, column(child_column_name))
+    parent = table(parent_table_name, column("id"))
+    child_reference = child.c[child_column_name]
+    parent_exists = exists(
+        select(parent.c.id).where(parent.c.id == child_reference)
+    )
+    return (
+        update(child)
+        .where(child_reference.is_not(None), ~parent_exists)
+        .values({child_column_name: None})
+    )
+
+
 def _repair_nullable_orphan_references() -> None:
     """Preserve legacy history while repairing nullable foreign-key links.
 
@@ -2057,13 +2487,44 @@ def _repair_nullable_orphan_references() -> None:
             if column is None or not bool(column.get("nullable", True)):
                 continue
             conn.execute(
-                text(
-                    f'UPDATE "{child_table}" SET "{child_column}" = NULL '
-                    f'WHERE "{child_column}" IS NOT NULL AND NOT EXISTS ('
-                    f'SELECT 1 FROM "{parent_table}" AS parent '
-                    f'WHERE parent.id = "{child_table}"."{child_column}")'
+                _nullable_orphan_repair_statement(
+                    child_table,
+                    child_column,
+                    parent_table,
                 )
             )
+
+
+def _verify_mysql_storage_engine(conn) -> None:
+    """Reject mixed/non-transactional platform schemas before altering them."""
+    if conn.dialect.name != "mysql":
+        return
+
+    configured_engine = str(
+        conn.execute(text("SELECT @@SESSION.default_storage_engine")).scalar_one()
+        or ""
+    )
+    if configured_engine.casefold() != "innodb":
+        raise RuntimeError("MySQL 会话未能启用 InnoDB，已中止数据库初始化")
+
+    platform_tables = set(Base.metadata.tables)
+    installed = conn.execute(
+        text(
+            "SELECT table_name, engine FROM information_schema.tables "
+            "WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'"
+        )
+    ).all()
+    incompatible = sorted(
+        str(table_name)
+        for table_name, storage_engine in installed
+        if str(table_name) in platform_tables
+        and str(storage_engine or "").casefold() != "innodb"
+    )
+    if incompatible:
+        raise RuntimeError(
+            "检测到非 InnoDB 平台表，禁止在混合存储引擎上启动："
+            + ", ".join(incompatible)
+        )
 
 
 def init_db() -> None:
@@ -2077,10 +2538,21 @@ def init_db() -> None:
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
+            _verify_mysql_storage_engine(conn)
+    except RuntimeError:
+        raise
     except Exception as exc:  # noqa: BLE001 - keep DSNs and credentials out of errors.
         raise RuntimeError(
             "平台数据库连接失败，请检查 DATABASE_URL、数据库服务和账号权限"
         ) from exc
+
+    # PostgreSQL is the governed production control plane. Schema changes are
+    # applied once by Alembic with a migration identity, never concurrently by
+    # API workers holding the restricted runtime role.
+    if engine.dialect.name == "postgresql":
+        _verify_postgresql_schema_revision()
+        _verify_schema()
+        return
 
     Base.metadata.create_all(bind=engine)
     _migrate_ontology_api_names()
@@ -2097,6 +2569,7 @@ def init_db() -> None:
     _migrate_assistant_thread_ownership()
     _migrate_conversation_ownership()
     _migrate_document_index()
+    _migrate_bucket_storage_metadata()
     _migrate_document_index_active_key()
     _migrate_llm_management()
     _migrate_llm_trace_context()
@@ -2119,7 +2592,29 @@ def init_db() -> None:
     _migrate_external_api_key_audit()
     _migrate_artifact_template_catalog()
     _repair_nullable_orphan_references()
+    _migrate_mysql_datetime_precision()
     _verify_schema()
+
+
+def _verify_postgresql_schema_revision() -> None:
+    with engine.connect() as conn:
+        inspector = inspect(conn)
+        if not inspector.has_table("alembic_version"):
+            raise RuntimeError(
+                "PostgreSQL 平台库尚未执行版本化迁移；请先运行 Alembic upgrade head"
+            )
+        revisions = {
+            str(value)
+            for value in conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalars()
+        }
+        if revisions != {POSTGRESQL_SCHEMA_REVISION}:
+            installed = ", ".join(sorted(revisions)) or "<empty>"
+            raise RuntimeError(
+                "PostgreSQL schema 版本不匹配："
+                f"当前 {installed}，应用需要 {POSTGRESQL_SCHEMA_REVISION}"
+            )
 
 
 def _verify_schema() -> None:
@@ -2135,11 +2630,16 @@ def _verify_schema() -> None:
         missing_tables: list[str] = []
         missing_columns: dict[str, list[str]] = {}
         for table_name, table in Base.metadata.tables.items():
-            if not inspector.has_table(table_name):
+            physical_name = table.name
+            if not inspector.has_table(physical_name, schema=table.schema):
                 missing_tables.append(table_name)
                 continue
             installed_columns = {
-                column["name"] for column in inspector.get_columns(table_name)
+                column["name"]
+                for column in inspector.get_columns(
+                    physical_name,
+                    schema=table.schema,
+                )
             }
             missing = sorted(
                 column.name

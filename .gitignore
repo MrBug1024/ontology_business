@@ -1,5 +1,8 @@
 # 环境与密钥
 .env
+/backend/.env.pre-*.bak
+/backend/migration-manifests/
+/backend/migration-backups/
 
 # 运行期数据（业务场景、上传文件、技能库、对话记录）
 /backend/data/

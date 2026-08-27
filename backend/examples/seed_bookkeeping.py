@@ -1281,6 +1281,14 @@ def _ensure_agent(db, scenario: BusinessScenario, ds_sqlite: DataSource, ds_buck
 # 主入口
 # ══════════════════════════════════════════════
 def main() -> None:
+    from app.config import get_settings
+
+    settings = get_settings()
+    if not settings.uses_sqlite_database or settings.minio_configured:
+        raise RuntimeError(
+            "seed_bookkeeping 仅供迁移前的隔离 SQLite fixture 使用；"
+            "MySQL/MinIO 环境禁止运行，请使用版本化迁移"
+        )
     init_db()
     db = SessionLocal()
     try:

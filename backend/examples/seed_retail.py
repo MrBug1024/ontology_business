@@ -239,6 +239,14 @@ def _ensure_llm(db) -> None:
 
 
 def main() -> None:
+    from app.config import get_settings
+
+    settings = get_settings()
+    if not settings.uses_sqlite_database or settings.minio_configured:
+        raise RuntimeError(
+            "seed_retail 已在仅保留医保审计和代理记账的远端部署中封存；"
+            "只能用于隔离 SQLite fixture"
+        )
     init_db()
     db = SessionLocal()
     try:

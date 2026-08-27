@@ -25,6 +25,7 @@ import {
 import { buildRelationConstraints, relationConstraintForm } from '../src/utils/relationConstraints.ts'
 import { safeInternalReturnPath } from '../src/utils/navigation.ts'
 import { parseStandardMCPConfig } from '../src/utils/mcpConfig.ts'
+import { dataSourceLocationLabel } from '../src/utils/dataSources.ts'
 import {
   buildRelationMappingPayload,
   missingRelationMappingFields,
@@ -49,6 +50,29 @@ function memoryStorage() {
     removeItem: (key) => values.delete(key),
   }
 }
+
+test('data source labels report the configured storage authority', () => {
+  assert.equal(
+    dataSourceLocationLabel({ type: 'file_bucket', config: { storage_backend: 'minio' } }),
+    'MinIO',
+  )
+  assert.equal(
+    dataSourceLocationLabel({ type: 'file_bucket', config: { storage_backend: 'LOCAL' } }),
+    '本地',
+  )
+  assert.equal(
+    dataSourceLocationLabel({ type: 'file_bucket', config: {} }),
+    '托管存储',
+  )
+  assert.equal(
+    dataSourceLocationLabel({ type: 'mysql', config: { host: 'db.internal' } }),
+    'db.internal',
+  )
+  assert.equal(
+    dataSourceLocationLabel({ type: 'sqlite', config: { path: 'data/source.db' } }),
+    'data/source.db',
+  )
+})
 
 test('action confirmation keeps original parameters when the preview is compacted', () => {
   const params = { report_name: 'annual-audit', payload: 'x'.repeat(9000) }

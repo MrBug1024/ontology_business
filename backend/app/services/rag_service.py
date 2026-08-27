@@ -10,6 +10,7 @@ import hashlib
 import math
 import re
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 from sqlalchemy import delete, select, update
@@ -17,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models import BucketFile, DataSource, DocumentChunk, DocumentIndexJob, LLMConfig
-from . import llm_service, tenant_service
+from . import datasource_service, llm_service, tenant_service
 
 
 EMBEDDING_MODEL = "local-semantic-hash-192-v1"
@@ -528,7 +529,33 @@ def process_document_index_jobs(
             file = db.get(BucketFile, job.bucket_file_id)
             if not file or file.data_source_id != job.data_source_id:
                 raise RuntimeError("待处理文件不存在或不属于目标资料库")
-            stored_path, filename = file.stored_path, file.filename
+            source = db.get(DataSource, job.data_source_id)
+            if not source or source.type != "file_bucket":
+                raise RuntimeError("待处理文件所属资料库不存在")
+            # Snapshot only the storage contract so no SQLAlchemy attribute
+            # access re-opens a transaction during remote object I/O.
+            file_storage = SimpleNamespace(
+                id=file.id,
+                data_source_id=file.data_source_id,
+                filename=file.filename,
+                stored_path=file.stored_path,
+                storage_provider=file.storage_provider,
+                bucket_name=file.bucket_name,
+                object_key=file.object_key,
+                object_version_id=file.object_version_id,
+                etag=file.etag,
+                object_url=file.object_url,
+                size=file.size,
+                mime=file.mime,
+                content_sha256=file.content_sha256,
+            )
+            source_storage = SimpleNamespace(
+                id=source.id,
+                tenant_id=source.tenant_id,
+                scenario_id=source.scenario_id,
+                type=source.type,
+                config=dict(source.config or {}),
+            )
             # 完成读取后立即释放事务，再执行可能耗时的文件解析。
             db.commit()
 
@@ -536,7 +563,11 @@ def process_document_index_jobs(
             if job.parse_document:
                 from . import doc_parser
 
-                parsed = doc_parser.parse_file(stored_path, filename)
+                content, _size, _mime = datasource_service.read_bucket_file(
+                    file_storage,
+                    source_storage,
+                )
+                parsed = doc_parser.parse_bytes(content, file_storage.filename)
 
             file = db.get(BucketFile, job.bucket_file_id)
             if not file:

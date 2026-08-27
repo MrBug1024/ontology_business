@@ -109,6 +109,8 @@ from ..services import (
     function_definition_service,
     mapping_refresh_service,
     ontology_service,
+    object_deletion_service,
+    object_storage_service,
     operations_service,
     permission_service,
     release_service,
@@ -2153,9 +2155,51 @@ def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
         template_catalog_service.prepare_scenario_deletion(db, s)
     except template_catalog_service.TemplateCatalogError as exc:
         raise HTTPException(409, str(exc)) from exc
+    # Uploads lock their owning DataSource before writing MinIO and committing
+    # BucketFile metadata.  Lock the same rows before the current-read below so
+    # a concurrent upload either finishes and is queued here, or starts after
+    # the scenario has gone and cannot commit an untracked object.
+    scenario_sources = list(
+        db.scalars(
+            select(DataSource)
+            .where(DataSource.scenario_id == s.id)
+            .order_by(DataSource.id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        ).all()
+    )
+    source_by_id = {source.id: source for source in scenario_sources}
+    source_ids = list(source_by_id)
+    locked_files = (
+        list(
+            db.scalars(
+                select(BucketFile)
+                .where(BucketFile.data_source_id.in_(source_ids))
+                .order_by(BucketFile.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            ).all()
+        )
+        if source_ids
+        else []
+    )
+    bucket_files = [
+        (bucket_file, source_by_id[bucket_file.data_source_id])
+        for bucket_file in locked_files
+    ]
+    try:
+        deletion_job_ids = [
+            object_deletion_service.enqueue_bucket_file_deletion(
+                db, bucket_file, data_source
+            )
+            for bucket_file, data_source in bucket_files
+        ]
+    except (ValueError, object_storage_service.ObjectStorageError) as exc:
+        raise HTTPException(409, str(exc)) from exc
     _delete_scenario_governance_history(db, s)
     db.delete(s)
     db.commit()
+    object_deletion_service.drain_jobs_best_effort(db, deletion_job_ids)
     return Msg(message="已删除")
 
 

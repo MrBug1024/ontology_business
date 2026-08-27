@@ -123,14 +123,20 @@ def quote_identifier(data_source_type: str, identifier: Any) -> str:
     source_type = str(data_source_type or "").strip().lower()
     if source_type == "mysql":
         return "`" + value.replace("`", "``") + "`"
-    if source_type in {"sqlite", "postgres"}:
+    if source_type in {"sqlite", "postgres", "dataset"}:
         return '"' + value.replace('"', '""') + '"'
-    raise MappedQueryError("确定性映射查询仅支持 sqlite、postgres 和 mysql 数据源")
+    raise MappedQueryError(
+        "确定性映射查询仅支持 dataset、sqlite、postgres 和 mysql 数据源"
+    )
 
 
 def quote_table(data_source_type: str, table_name: Any) -> str:
     """Quote a possibly schema-qualified table, component by component."""
     value = _safe_identifier(table_name, "映射表名")
+    if str(data_source_type or "").strip().lower() == "dataset":
+        # Catalog relation keys are one logical identifier. A dot is data,
+        # never an external database schema separator.
+        return quote_identifier(data_source_type, value)
     parts = value.split(".")
     if len(parts) > 3 or any(not part or part != part.strip() for part in parts):
         raise MappedQueryError("映射表名不是有效的限定标识符")
@@ -217,8 +223,15 @@ def _resolve_mapping_and_source(
         or getattr(source, "scenario_id", None) not in (None, scenario.id)
     ):
         raise MappedQueryError("数据映射的数据源不属于当前租户或业务场景")
-    if str(getattr(source, "type", "") or "") not in {"sqlite", "postgres", "mysql"}:
-        raise MappedQueryError("确定性映射查询仅支持 sqlite、postgres 和 mysql 数据源")
+    if str(getattr(source, "type", "") or "") not in {
+        "dataset",
+        "sqlite",
+        "postgres",
+        "mysql",
+    }:
+        raise MappedQueryError(
+            "确定性映射查询仅支持 dataset、sqlite、postgres 和 mysql 数据源"
+        )
     _safe_identifier(getattr(mapping, "table_name", None), "映射表名")
     return mapping, source
 

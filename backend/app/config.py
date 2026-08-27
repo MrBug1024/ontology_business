@@ -5,13 +5,16 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL, make_url
 
 # Project root (backend/)
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = BACKEND_ROOT / "data"
 SKILLS_DIR = BACKEND_ROOT / "skills"
 BUCKETS_DIR = DATA_DIR / "buckets"
+DEFAULT_POSTGRESQL_DATABASE = "ontology_platform"
 
 
 class Settings(BaseSettings):
@@ -25,8 +28,52 @@ class Settings(BaseSettings):
     api_prefix: str = "/api"
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
-    # Storage
-    database_url: str = f"sqlite:///{DATA_DIR / 'platform.db'}"
+    # Storage. DATABASE_URL remains the explicit override used by tests and
+    # one-off deployments. When both managed database groups are present,
+    # DATABASE_BACKEND is mandatory so the application never guesses which
+    # authoritative store should receive writes.
+    database_url: str = ""
+    database_backend: Literal["auto", "postgresql", "mysql", "sqlite"] = "auto"
+
+    postgresql_host: str = ""
+    postgresql_port: int = Field(default=5432, ge=1, le=65535)
+    postgresql_database: str = ""
+    postgresql_user: str = ""
+    postgresql_password: str = ""
+    postgresql_maintenance_database: str = "postgres"
+    postgresql_admin_user: str = ""
+    postgresql_admin_password: str = ""
+
+    annual_mysql_host: str = ""
+    annual_mysql_port: int = Field(default=3306, ge=1, le=65535)
+    annual_mysql_database: str = ""
+    annual_mysql_user: str = ""
+    annual_mysql_password: str = ""
+
+    database_pool_size: int = Field(default=10, ge=1, le=200)
+    database_max_overflow: int = Field(default=20, ge=0, le=400)
+    database_pool_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    database_statement_timeout_ms: int = Field(default=120_000, ge=1_000, le=3_600_000)
+    database_lock_timeout_ms: int = Field(default=10_000, ge=100, le=300_000)
+
+    redis_host: str = ""
+    redis_port: int = Field(default=6379, ge=1, le=65535)
+    redis_password: str = ""
+
+    minio_aliyun_endpoint: str = ""
+    minio_aliyun_access_key_id: str = ""
+    minio_aliyun_access_key_secret: str = ""
+    minio_aliyun_file_path: str = ""
+    minio_bucketname: str = ""
+    # A durable upload intent protects the process-crash window between MinIO
+    # PUT and the authoritative MySQL metadata commit.  Requests must finish
+    # inside this generous lease or fail closed when the worker claims it.
+    minio_upload_intent_timeout_seconds: int = Field(
+        default=3600, ge=300, le=604800
+    )
+    minio_late_put_cleanup_grace_seconds: int = Field(
+        default=600, ge=300, le=3600
+    )
 
     # OCR service (used by the ocr-parser skill and PDF/image fallback)
     ocr_base_url: str = "https://ocr.rhzy.ai"
@@ -35,6 +82,31 @@ class Settings(BaseSettings):
     # Agent runtime
     max_tool_rounds: int = 20
     max_query_rows: int = 200
+    dataset_query_timeout_seconds: float = Field(default=30.0, ge=0.1, le=600.0)
+    dataset_query_max_concurrency: int = Field(default=4, ge=1, le=64)
+    dataset_duckdb_memory_limit_bytes: int = Field(
+        default=512 * 1024 * 1024, ge=64 * 1024 * 1024, le=64 * 1024 * 1024 * 1024
+    )
+    dataset_duckdb_threads: int = Field(default=2, ge=1, le=32)
+    dataset_duckdb_temp_directory: str = ""
+    dataset_duckdb_max_temp_directory_bytes: int = Field(
+        default=1024 * 1024 * 1024,
+        ge=64 * 1024 * 1024,
+        le=256 * 1024 * 1024 * 1024,
+    )
+    dataset_cache_max_object_bytes: int = Field(
+        default=1024 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=256 * 1024 * 1024 * 1024,
+    )
+    dataset_cache_max_bytes: int = Field(
+        default=10 * 1024 * 1024 * 1024,
+        ge=64 * 1024 * 1024,
+        le=1024 * 1024 * 1024 * 1024,
+    )
+    dataset_cache_max_age_seconds: int = Field(
+        default=7 * 24 * 60 * 60, ge=60, le=365 * 24 * 60 * 60
+    )
     llm_timeout: float = 120.0
     scenario_model_llm_timeout: float = 600.0
     # Hard ceiling for one compound document compilation, including malformed
@@ -76,6 +148,129 @@ class Settings(BaseSettings):
     mail_use_credentials: bool = True
     mail_timeout_seconds: int = 20
 
+    @model_validator(mode="after")
+    def resolve_database_url(self) -> "Settings":
+        explicit_url = self.database_url.strip()
+        if explicit_url:
+            self.database_url = explicit_url
+            return self
+
+        postgres_values = (
+            self.postgresql_host.strip(),
+            self.postgresql_database.strip(),
+            self.postgresql_user.strip(),
+            self.postgresql_password,
+        )
+        postgres_configured = any(postgres_values)
+
+        mysql_values = (
+            self.annual_mysql_host.strip(),
+            self.annual_mysql_database.strip(),
+            self.annual_mysql_user.strip(),
+            self.annual_mysql_password,
+        )
+        mysql_configured = any(mysql_values)
+
+        selected_backend = self.database_backend
+        if selected_backend == "auto":
+            if postgres_configured and mysql_configured:
+                raise ValueError(
+                    "PostgreSQL 与 MySQL 配置同时存在时必须显式设置 "
+                    "DATABASE_BACKEND"
+                )
+            selected_backend = (
+                "postgresql"
+                if postgres_configured
+                else "mysql"
+                if mysql_configured
+                else "sqlite"
+            )
+
+        if selected_backend == "postgresql":
+            host = self.postgresql_host.strip()
+            database = (
+                self.postgresql_database.strip() or DEFAULT_POSTGRESQL_DATABASE
+            )
+            user = self.postgresql_user.strip()
+            password = self.postgresql_password
+            missing = [
+                name
+                for name, value in (
+                    ("POSTGRESQL_HOST", host),
+                    ("POSTGRESQL_USER", user),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError("PostgreSQL 配置不完整，缺少：" + ", ".join(missing))
+            self.postgresql_database = database
+            url = URL.create(
+                "postgresql+psycopg",
+                username=user,
+                password=password,
+                host=host,
+                port=self.postgresql_port,
+                database=database,
+            )
+            self.database_url = url.render_as_string(hide_password=False)
+            return self
+
+        if selected_backend == "mysql":
+            if not mysql_configured:
+                raise ValueError("DATABASE_BACKEND=mysql，但未提供 ANNUAL_MYSQL_* 配置")
+            host, database, user, password = mysql_values
+            missing = [
+                name
+                for name, value in (
+                    ("ANNUAL_MYSQL_HOST", host),
+                    ("ANNUAL_MYSQL_DATABASE", database),
+                    ("ANNUAL_MYSQL_USER", user),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError("MySQL 配置不完整，缺少：" + ", ".join(missing))
+            url = URL.create(
+                "mysql+pymysql",
+                username=user,
+                password=password,
+                host=host,
+                port=self.annual_mysql_port,
+                database=database,
+                query={"charset": "utf8mb4"},
+            )
+            self.database_url = url.render_as_string(hide_password=False)
+            return self
+
+        if selected_backend != "sqlite":
+            raise ValueError(f"不支持的数据库后端：{selected_backend}")
+        self.database_url = f"sqlite:///{DATA_DIR / 'platform.db'}"
+        return self
+
+    @property
+    def redis_configured(self) -> bool:
+        return bool(self.redis_host.strip())
+
+    @property
+    def minio_configured(self) -> bool:
+        return all(
+            value.strip()
+            for value in (
+                self.minio_aliyun_endpoint,
+                self.minio_aliyun_access_key_id,
+                self.minio_aliyun_access_key_secret,
+                self.minio_bucketname,
+            )
+        )
+
+    @property
+    def uses_sqlite_database(self) -> bool:
+        return make_url(self.database_url).get_backend_name() == "sqlite"
+
+    @property
+    def uses_postgresql_database(self) -> bool:
+        return make_url(self.database_url).get_backend_name() == "postgresql"
+
 
 def ensure_runtime_directories(settings: Settings | None = None) -> None:
     """Create the platform directories required before the API can start.
@@ -86,10 +281,19 @@ def ensure_runtime_directories(settings: Settings | None = None) -> None:
     necessarily ``backend/data``.
     """
     configured = settings
-    directories = {DATA_DIR, BUCKETS_DIR, SKILLS_DIR}
-    if configured and configured.database_url.startswith("sqlite"):
-        from sqlalchemy.engine import make_url
-
+    directories = {SKILLS_DIR}
+    configured_url = str(getattr(configured, "database_url", "") or "")
+    uses_local_database = (
+        configured is None
+        or not configured_url
+        or make_url(configured_url).get_backend_name() == "sqlite"
+    )
+    uses_local_file_storage = configured is None or not bool(
+        getattr(configured, "minio_configured", False)
+    )
+    if uses_local_file_storage:
+        directories.update({DATA_DIR, BUCKETS_DIR})
+    if configured and uses_local_database:
         database_path = make_url(configured.database_url).database
         if database_path and database_path != ":memory:" and not str(database_path).startswith("file:"):
             directories.add(Path(database_path).expanduser().parent)

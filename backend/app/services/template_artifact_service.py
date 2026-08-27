@@ -15,6 +15,7 @@ import io
 import json
 import math
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -22,9 +23,11 @@ from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile, ZipInfo
 
+from sqlalchemy.orm import Session
+
 from ..config import get_settings
 from ..models import BucketFile, DataSource
-from . import datasource_service
+from . import datasource_service, object_deletion_service
 
 
 class TemplateArtifactError(ValueError):
@@ -871,10 +874,9 @@ def _placeholder_paths(filename: str, content: bytes) -> set[str]:
 
 def load_bucket_template(template_file: BucketFile, template_source: DataSource) -> bytes:
     """Read a template only from its declared file-bucket root."""
-    path, _size, _mime = datasource_service.validate_bucket_file_for_download(
+    content, _size, _mime = datasource_service.read_bucket_file(
         template_file, template_source
     )
-    content = path.read_bytes()
     inspect_template(template_file.filename, content)
     return content
 
@@ -891,6 +893,7 @@ def generate_bucket_artifact(
     origin_template_id: str | None = None,
     origin_template_version_id: str | None = None,
     origin_template_version: int | None = None,
+    db: Session | None = None,
 ) -> tuple[BucketFile, dict[str, Any]]:
     """Generate and persist one attachment in an owned target file bucket."""
     rendered = preview_bucket_artifact(
@@ -901,13 +904,51 @@ def generate_bucket_artifact(
         output_filename=output_filename,
         expected_template_sha256=expected_template_sha256,
     )
-    bucket_file = datasource_service.save_bucket_file(
-        target_source,
-        rendered.filename,
-        rendered.content,
-        mime=rendered.mime,
-        stable_file_id=generated_by_action_log_id,
-    )
+    claim = None
+    file_id = generated_by_action_log_id or uuid.uuid4().hex
+    if datasource_service.is_managed_minio_source(target_source):
+        if db is None:
+            raise TemplateArtifactError("托管模板产出缺少上传事务")
+        claim = object_deletion_service.prepare_bucket_file_upload(
+            target_source,
+            file_id,
+            rendered.filename,
+        )
+    if claim is not None:
+        with object_deletion_service.heartbeat_upload_intent(
+            claim
+        ) as upload_heartbeat:
+            object_deletion_service.begin_upload_put(claim)
+            bucket_file = datasource_service.save_bucket_file(
+                target_source,
+                rendered.filename,
+                rendered.content,
+                mime=rendered.mime,
+                stable_file_id=file_id,
+                upload_object_key=claim.object_key,
+            )
+            object_deletion_service.assert_upload_active(
+                upload_heartbeat, claim, bucket_file
+            )
+        try:
+            object_deletion_service.retain_bucket_file_upload(
+                db, claim, bucket_file, target_source
+            )
+        except object_deletion_service.UploadIntentLeaseLostError:
+            db.rollback()
+            object_deletion_service.schedule_abandoned_upload_best_effort(
+                claim,
+                bucket_file,
+            )
+            raise
+    else:
+        bucket_file = datasource_service.save_bucket_file(
+            target_source,
+            rendered.filename,
+            rendered.content,
+            mime=rendered.mime,
+            stable_file_id=generated_by_action_log_id,
+        )
     bucket_file.origin_template_file_id = template_file.id
     bucket_file.origin_template_sha256 = rendered.template_sha256
     bucket_file.origin_template_id = origin_template_id

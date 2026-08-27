@@ -11,12 +11,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
-from sqlalchemy import create_engine, select, text
-from sqlalchemy.engine import Engine
+from sqlalchemy import MetaData, Table, create_engine, func, inspect, select, text
+from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import Session
 
 from ..config import BUCKETS_DIR, get_settings
-from ..models import BucketFile, DataSource
+from ..models import AssistantAttachment, BucketFile, DataSource
+from . import cache_service, dataset_query_service, object_storage_service
 from .policies import validate_read_only_sql
 
 _engine_cache: dict[str, Engine] = {}
@@ -27,30 +28,44 @@ _engine_cache: dict[str, Engine] = {}
 CONNECTION_TEST_FAILURE_MESSAGE = "连接测试失败，请检查数据源配置和网络可达性"
 
 
-def _db_url(ds: DataSource) -> str:
+def _schema_cache_key(ds: DataSource) -> str:
+    revision = int(getattr(ds, "connector_revision", 0) or 0)
+    return f"data-source-schema:{ds.id}:revision:{revision}"
+
+
+def _db_url(ds: DataSource) -> URL:
     cfg = ds.config or {}
     if ds.type == "mysql":
-        user = cfg.get("user", "root")
-        pwd = cfg.get("password", "")
-        host = cfg.get("host", "127.0.0.1")
-        port = cfg.get("port", 3306)
-        db = cfg.get("database", "")
-        return f"mysql+pymysql://{user}:{pwd}@{host}:{port}/{db}?charset=utf8mb4"
+        return URL.create(
+            "mysql+pymysql",
+            username=str(cfg.get("user") or "root"),
+            password=str(cfg.get("password") or ""),
+            host=str(cfg.get("host") or "127.0.0.1"),
+            port=int(cfg.get("port") or 3306),
+            database=str(cfg.get("database") or ""),
+            query={"charset": str(cfg.get("charset") or "utf8mb4")},
+        )
     if ds.type == "postgres":
-        user = cfg.get("user", "postgres")
-        pwd = cfg.get("password", "")
-        host = cfg.get("host", "127.0.0.1")
-        port = cfg.get("port", 5432)
-        db = cfg.get("database", "")
-        return f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}"
+        return URL.create(
+            "postgresql+psycopg",
+            username=str(cfg.get("user") or "postgres"),
+            password=str(cfg.get("password") or ""),
+            host=str(cfg.get("host") or "127.0.0.1"),
+            port=int(cfg.get("port") or 5432),
+            database=str(cfg.get("database") or ""),
+        )
     if ds.type == "sqlite":
-        path = cfg.get("path", "")
-        return f"sqlite:///{path}"
+        if not get_settings().uses_sqlite_database:
+            raise ValueError("远端部署禁止访问本地 SQLite 数据源")
+        return URL.create("sqlite", database=str(cfg.get("path") or ""))
     raise ValueError(f"未知数据库类型: {ds.type}")
 
 
 def get_engine(ds: DataSource) -> Engine:
-    key = f"{ds.id}:{json.dumps(ds.config, sort_keys=True, default=str)}"
+    config_digest = hashlib.sha256(
+        json.dumps(ds.config or {}, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    key = f"{ds.id}:{config_digest}"
     if key not in _engine_cache:
         _engine_cache[key] = create_engine(_db_url(ds), pool_pre_ping=True)
     return _engine_cache[key]
@@ -63,11 +78,15 @@ def invalidate_engine(ds: DataSource) -> None:
         if key.startswith(prefix):
             cached.dispose()
             _engine_cache.pop(key, None)
+    cache_service.delete(_schema_cache_key(ds))
 
 
 def test_connection(ds: DataSource) -> tuple[bool, str]:
     """测试数据库连接，返回 (ok, message)。"""
     try:
+        if ds.type == "dataset":
+            dataset_query_service.test_connection(ds)
+            return True, "连接成功"
         engine = get_engine(ds)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -77,44 +96,57 @@ def test_connection(ds: DataSource) -> tuple[bool, str]:
 
 
 def list_tables(ds: DataSource) -> list[dict[str, Any]]:
-    """列出数据库中的表及其列信息。"""
+    """列出当前数据库的表/视图；Redis 仅保存可重建的短期结果。"""
+    cache_key = _schema_cache_key(ds)
+    cached = cache_service.get_json(cache_key)
+    if isinstance(cached, list) and all(
+        isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and isinstance(item.get("columns"), list)
+        for item in cached
+    ):
+        return cached
+
+    if ds.type == "dataset":
+        tables = dataset_query_service.list_tables(ds)
+        cache_service.set_json(cache_key, tables, ttl_seconds=120)
+        return tables
+
     engine = get_engine(ds)
     tables: list[dict[str, Any]] = []
     with engine.connect() as conn:
-        if ds.type == "sqlite":
-            rows = conn.execute(
-                text("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-            ).fetchall()
-            names = [r[0] for r in rows]
-        else:
-            rows = conn.execute(
-                text("SELECT table_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','pg_catalog')")
-            ).fetchall()
-            names = [r[0] for r in rows]
+        inspector = inspect(conn)
+        names = sorted(
+            set(inspector.get_table_names()) | set(inspector.get_view_names())
+        )
         for name in names:
-            cols: list[dict[str, Any]] = []
             try:
-                if ds.type == "sqlite":
-                    col_rows = conn.execute(text(f'PRAGMA table_info("{name}")')).fetchall()
-                    for r in col_rows:
-                        cols.append({"name": r[1], "type": r[2], "pk": bool(r[5])})
-                else:
-                    col_rows = conn.execute(
-                        text(
-                            "SELECT column_name, data_type FROM information_schema.columns "
-                            "WHERE table_name = :t AND table_schema NOT IN ('information_schema','performance_schema','mysql','pg_catalog')"
-                        ),
-                        {"t": name},
-                    ).fetchall()
-                    cols = [{"name": r[0], "type": r[1], "pk": False} for r in col_rows]
+                primary_key = set(
+                    inspector.get_pk_constraint(name).get("constrained_columns") or []
+                )
+                cols = [
+                    {
+                        "name": str(column["name"]),
+                        "type": str(column["type"]),
+                        "pk": str(column["name"]) in primary_key,
+                    }
+                    for column in inspector.get_columns(name)
+                ]
             except Exception:  # noqa: BLE001
                 cols = []
             row_count = -1
             try:
-                row_count = conn.execute(text(f'SELECT COUNT(*) FROM "{name}"')).scalar()
+                # The inspector already supplied this identifier. Avoid reflecting
+                # it a second time: some MySQL views cannot be reflected as a
+                # SQLAlchemy Table even though they are directly queryable.
+                reflected = Table(name, MetaData(), quote=True)
+                row_count = int(
+                    conn.execute(select(func.count()).select_from(reflected)).scalar_one()
+                )
             except Exception:  # noqa: BLE001
                 pass
             tables.append({"name": name, "columns": cols, "row_count": row_count})
+    cache_service.set_json(cache_key, tables, ttl_seconds=120)
     return tables
 
 
@@ -133,10 +165,12 @@ def run_query(
     """
     if ds.type == "file_bucket":
         raise ValueError("文件桶数据源不支持 SQL 查询")
-    sql = validate_read_only_sql(sql)
+    sql = validate_read_only_sql(sql, dialect=ds.type)
     configured_max_rows = get_settings().max_query_rows
     caller_max_rows = configured_max_rows if max_rows is None else max(1, int(max_rows))
     limit = max(1, min(int(limit or caller_max_rows), caller_max_rows))
+    if ds.type == "dataset":
+        return dataset_query_service.run_query(ds, sql, limit=limit)
     engine = get_engine(ds)
     with engine.connect() as conn:
         result = conn.execute(text(sql))
@@ -166,13 +200,20 @@ def run_parameterized_query(
     """
     if ds.type == "file_bucket":
         raise ValueError("文件桶数据源不支持 SQL 查询")
-    statement = validate_read_only_sql(sql)
+    statement = validate_read_only_sql(sql, dialect=ds.type)
     if not isinstance(parameters, Mapping) or any(
         not isinstance(key, str) or not key for key in parameters
     ):
         raise ValueError("参数化查询的绑定参数无效")
     max_rows = get_settings().max_query_rows
     resolved_limit = max(1, min(int(limit or max_rows), max_rows))
+    if ds.type == "dataset":
+        return dataset_query_service.run_query(
+            ds,
+            statement,
+            parameters=parameters,
+            limit=resolved_limit,
+        )
     engine = get_engine(ds)
     with engine.connect() as conn:
         result = conn.execute(text(statement), dict(parameters))
@@ -200,6 +241,280 @@ def _jsonable(v: Any) -> Any:
 # ──────────────────────────────────────────────
 # 文件桶
 # ──────────────────────────────────────────────
+def normalize_file_bucket_config(config: Mapping[str, Any] | None = None) -> dict[str, str]:
+    """Return the only file-bucket configuration accepted by the API.
+
+    MinIO credentials stay in process settings.  A data-source row records only
+    the durable storage policy needed to locate and validate its objects.
+    ``config`` is intentionally not merged because it is user-controlled and
+    must not select another bucket, prefix, endpoint, or credential set.
+    """
+    del config
+    configured = object_storage_service.require_configuration()
+    return {
+        "storage_backend": "minio",
+        "bucket_name": configured.bucket_name,
+        "prefix": configured.prefix,
+    }
+
+
+def _is_minio_source(ds: DataSource) -> bool:
+    return str((ds.config or {}).get("storage_backend") or "").strip().lower() == "minio"
+
+
+def is_managed_minio_source(ds: DataSource) -> bool:
+    """Return whether a file-bucket source uses the managed MinIO backend."""
+    return ds.type == "file_bucket" and _is_minio_source(ds)
+
+
+def managed_minio_location(ds: DataSource) -> tuple[str, str]:
+    if ds.type != "file_bucket" or not _is_minio_source(ds):
+        raise ValueError("数据源未配置为 MinIO 文件桶")
+    configured = object_storage_service.require_configuration()
+    source_config = ds.config or {}
+    bucket_name = str(source_config.get("bucket_name") or configured.bucket_name).strip()
+    prefix = object_storage_service.normalize_prefix(
+        str(source_config.get("prefix") or configured.prefix)
+    )
+    if bucket_name != configured.bucket_name or prefix != configured.prefix:
+        raise ValueError("文件桶配置与服务端托管存储不一致")
+    return bucket_name, prefix
+
+
+def ensure_file_bucket_storage(ds: DataSource) -> None:
+    """Verify that a managed file bucket exists and is writable by this service."""
+    bucket_name, _prefix = managed_minio_location(ds)
+    object_storage_service.ensure_bucket(bucket_name)
+
+
+def _object_scope_segment(value: Any, fallback: str) -> str:
+    segment = str(value or fallback).strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", segment):
+        raise ValueError("文件桶对象作用域标识无效")
+    return segment
+
+
+def _upload_generation_segment(value: str) -> str:
+    segment = str(value or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{32}", segment):
+        raise ValueError("对象上传批次标识必须是 32 位十六进制字符串")
+    return segment
+
+
+def build_bucket_object_key(
+    ds: DataSource,
+    file_id: str,
+    filename: str,
+    *,
+    upload_id: str | None = None,
+) -> str:
+    """Build a legacy key or a generation-scoped key for a bucket-file row."""
+    _bucket_name, prefix = managed_minio_location(ds)
+    safe_name = validate_bucket_filename(filename)
+    parts = [
+        *([prefix] if prefix else []),
+        "tenants",
+        _object_scope_segment(ds.tenant_id, "public"),
+        "scenarios",
+        _object_scope_segment(ds.scenario_id, "global"),
+        "data-sources",
+        _object_scope_segment(ds.id, "source"),
+        "files",
+        _object_scope_segment(file_id, "file"),
+    ]
+    if upload_id is not None:
+        parts.extend(("uploads", _upload_generation_segment(upload_id)))
+    parts.append(safe_name)
+    return "/".join(parts)
+
+
+def build_assistant_attachment_object_key(
+    tenant_id: str,
+    attachment_id: str,
+    filename: str,
+    *,
+    upload_id: str | None = None,
+) -> str:
+    """Build a legacy or generation-scoped assistant attachment key."""
+    configured = object_storage_service.require_configuration()
+    safe_name = validate_bucket_filename(filename)
+    parts = [
+        *([configured.prefix] if configured.prefix else []),
+        "tenants",
+        _object_scope_segment(tenant_id, "public"),
+        "scenarios",
+        "global",
+        "assistant-attachments",
+        _object_scope_segment(attachment_id, "attachment"),
+    ]
+    if upload_id is not None:
+        parts.extend(("uploads", _upload_generation_segment(upload_id)))
+    parts.append(safe_name)
+    return "/".join(parts)
+
+
+def is_generation_scoped_object_key(object_key: str) -> bool:
+    """Return whether a managed key carries a one-use upload generation."""
+    parts = str(object_key or "").strip("/").split("/")
+    return (
+        len(parts) >= 3
+        and parts[-3] == "uploads"
+        and re.fullmatch(r"[a-f0-9]{32}", parts[-2]) is not None
+    )
+
+
+def _matches_generation_scoped_key(recorded_key: str, legacy_key: str) -> bool:
+    base, safe_name = legacy_key.rsplit("/", 1)
+    prefix = f"{base}/uploads/"
+    suffix = f"/{safe_name}"
+    if not recorded_key.startswith(prefix) or not recorded_key.endswith(suffix):
+        return False
+    generation = recorded_key[len(prefix) : -len(suffix)]
+    return re.fullmatch(r"[a-f0-9]{32}", generation) is not None
+
+
+def _validate_bucket_object_key(
+    object_key: str,
+    ds: DataSource,
+    file_id: str,
+    filename: str,
+    *,
+    require_generation: bool,
+) -> str:
+    recorded = str(object_key or "").strip("/")
+    legacy = build_bucket_object_key(ds, file_id, filename)
+    if _matches_generation_scoped_key(recorded, legacy):
+        return recorded
+    if not require_generation and recorded == legacy:
+        return recorded
+    raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
+
+
+def _validate_assistant_attachment_object_key(
+    object_key: str,
+    tenant_id: str,
+    attachment_id: str,
+    filename: str,
+    *,
+    require_generation: bool,
+) -> str:
+    recorded = str(object_key or "").strip("/")
+    legacy = build_assistant_attachment_object_key(
+        tenant_id,
+        attachment_id,
+        filename,
+    )
+    if _matches_generation_scoped_key(recorded, legacy):
+        return recorded
+    if not require_generation and recorded == legacy:
+        return recorded
+    raise ValueError("助手附件对象不属于托管存储作用域")
+
+
+def save_assistant_attachment_object(
+    attachment: AssistantAttachment,
+    content: bytes,
+    *,
+    upload_object_key: str | None = None,
+) -> None:
+    """Persist raw temporary attachment bytes and populate its durable identity."""
+    if not isinstance(content, bytes):
+        raise ValueError("附件内容必须是字节数据")
+    configured = object_storage_service.require_configuration()
+    object_key = (
+        _validate_assistant_attachment_object_key(
+            upload_object_key,
+            attachment.tenant_id,
+            attachment.id,
+            attachment.filename,
+            require_generation=True,
+        )
+        if upload_object_key is not None
+        else build_assistant_attachment_object_key(
+            attachment.tenant_id,
+            attachment.id,
+            attachment.filename,
+            upload_id=uuid.uuid4().hex,
+        )
+    )
+    digest = hashlib.sha256(content).hexdigest()
+    uploaded = object_storage_service.put_object(
+        configured.bucket_name,
+        object_key,
+        content,
+        content_type=attachment.mime or _guess_mime(attachment.filename),
+        sha256=digest,
+    )
+    object_url = object_storage_service.stable_object_url(
+        configured.bucket_name,
+        object_key,
+    )
+    attachment.content_hash = digest
+    attachment.size = len(content)
+    attachment.mime = attachment.mime or _guess_mime(attachment.filename)
+    attachment.storage_provider = "minio"
+    attachment.bucket_name = configured.bucket_name
+    attachment.object_key = object_key
+    attachment.object_version_id = uploaded.version_id
+    attachment.etag = uploaded.etag
+    attachment.object_url = object_url
+    attachment._managed_object_created = True
+
+
+def assistant_attachment_object_identity(
+    attachment: AssistantAttachment,
+) -> tuple[str, str, str] | None:
+    """Return a validated managed identity; legacy text-only rows have none."""
+    provider = str(getattr(attachment, "storage_provider", "none") or "none").lower()
+    object_url = str(getattr(attachment, "object_url", "") or "")
+    if provider == "none" and not object_url:
+        return None
+    if provider != "minio" and not object_url.lower().startswith("minio://"):
+        raise ValueError("助手附件存储提供方无效")
+    configured = object_storage_service.require_configuration()
+    url_bucket = ""
+    url_key = ""
+    if object_url:
+        url_bucket, url_key = object_storage_service.parse_object_url(object_url)
+    bucket_name = str(getattr(attachment, "bucket_name", "") or url_bucket)
+    object_key = str(getattr(attachment, "object_key", "") or url_key)
+    if (url_bucket and url_bucket != bucket_name) or (url_key and url_key != object_key):
+        raise ValueError("助手附件对象字段与地址不一致")
+    try:
+        _validate_assistant_attachment_object_key(
+            object_key,
+            attachment.tenant_id,
+            attachment.id,
+            attachment.filename,
+            require_generation=False,
+        )
+    except ValueError as exc:
+        raise ValueError("助手附件对象不属于托管存储作用域") from exc
+    if bucket_name != configured.bucket_name:
+        raise ValueError("助手附件对象不属于托管存储作用域")
+    return (
+        bucket_name,
+        object_key,
+        str(getattr(attachment, "object_version_id", "") or ""),
+    )
+
+
+def delete_assistant_attachment_object(attachment: AssistantAttachment) -> None:
+    """Direct compensation for an attachment whose DB transaction did not commit.
+
+    Persisted attachment deletion must go through ``object_deletion_service``.
+    """
+    identity = assistant_attachment_object_identity(attachment)
+    if identity is None:
+        return
+    bucket_name, object_key, version_id = identity
+    object_storage_service.delete_object(
+        bucket_name,
+        object_key,
+        version_id=version_id,
+    )
+
+
 def bucket_dir(ds: DataSource) -> Path:
     d = BUCKETS_DIR / ds.id
     d.mkdir(parents=True, exist_ok=True)
@@ -254,20 +569,72 @@ def save_bucket_file(
     *,
     mime: str | None = None,
     stable_file_id: str | None = None,
+    upload_object_key: str | None = None,
 ) -> BucketFile:
     """Save a file inside one file-bucket root.
 
-    Ordinary uploads keep their collision-resistant visible-name behavior.
-    Confirmed template executions may provide a stable 32-hex id: their bytes
-    are atomically written below a private per-execution directory.  If the
-    process dies after the filesystem write but before the database commit, a
-    retry reuses the same path/id instead of leaking ``name (2).ext`` files.
+    A stable id is a logical database identity only. Managed object-storage
+    uploads always receive a fresh physical key; legacy local template output
+    keeps its private per-execution directory behavior.
     """
     if ds.type != "file_bucket":
         raise ValueError("只有文件桶数据源可以保存文件")
     if not isinstance(content, bytes):
         raise ValueError("文件内容必须是字节数据")
     requested_name = validate_bucket_filename(filename)
+    if stable_file_id is not None:
+        stable_file_id = str(stable_file_id).lower()
+        if not re.fullmatch(r"[a-f0-9]{32}", stable_file_id):
+            raise ValueError("稳定文件标识必须是 32 位十六进制字符串")
+
+    if is_managed_minio_source(ds):
+        file_id = stable_file_id or uuid.uuid4().hex
+        bucket_name, _prefix = managed_minio_location(ds)
+        object_key = (
+            _validate_bucket_object_key(
+                upload_object_key,
+                ds,
+                file_id,
+                requested_name,
+                require_generation=True,
+            )
+            if upload_object_key is not None
+            else build_bucket_object_key(
+                ds,
+                file_id,
+                requested_name,
+                upload_id=uuid.uuid4().hex,
+            )
+        )
+        resolved_mime = mime or _guess_mime(requested_name)
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        uploaded = object_storage_service.put_object(
+            bucket_name,
+            object_key,
+            content,
+            content_type=resolved_mime,
+            sha256=content_sha256,
+        )
+        object_url = object_storage_service.stable_object_url(bucket_name, object_key)
+        bucket_file = BucketFile(
+            id=file_id,
+            data_source_id=ds.id,
+            filename=requested_name,
+            stored_path=object_url,
+            storage_provider="minio",
+            bucket_name=bucket_name,
+            object_key=object_key,
+            object_version_id=uploaded.version_id,
+            etag=uploaded.etag,
+            object_url=object_url,
+            size=len(content),
+            mime=resolved_mime,
+            content_sha256=content_sha256,
+            status="pending",
+        )
+        bucket_file._managed_object_created = True
+        return bucket_file
+
     root = bucket_dir(ds)
     storage_root = BUCKETS_DIR.resolve()
     if root.is_symlink():
@@ -277,9 +644,6 @@ def save_bucket_file(
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError("文件桶存储目录越界") from exc
     if stable_file_id is not None:
-        stable_file_id = str(stable_file_id).lower()
-        if not re.fullmatch(r"[a-f0-9]{32}", stable_file_id):
-            raise ValueError("稳定文件标识必须是 32 位十六进制字符串")
         generated_root = root / ".generated"
         if generated_root.is_symlink():
             raise ValueError("生成附件目录不能是符号链接")
@@ -369,13 +733,30 @@ def save_bucket_file(
     )
 
 
+def _validated_bucket_mime(filename: str, recorded_mime: str) -> str:
+    canonical_mime = _OFFICE_MIMES.get(Path(filename).suffix.lower())
+    recorded_base = str(recorded_mime or "").split(";", 1)[0].strip().lower()
+    canonical_base = str(canonical_mime or "").split(";", 1)[0].strip().lower()
+    # Historic seed/import paths stored Office files as octet-stream and
+    # Markdown without an explicit charset. Treat those as compatible while
+    # rejecting a contradictory typed MIME.
+    compatible_legacy = recorded_base in {"", "application/octet-stream"}
+    if canonical_mime and not compatible_legacy and recorded_base != canonical_base:
+        raise ValueError("附件 MIME 与文件格式不一致")
+    return canonical_mime or recorded_mime or _guess_mime(filename)
+
+
 def validate_bucket_file_for_download(
     bf: BucketFile,
     ds: DataSource,
 ) -> tuple[Path, int, str]:
-    """Resolve and verify a persisted attachment before serving its bytes."""
+    """Resolve and verify a legacy local attachment before serving its bytes."""
     if bf.data_source_id != ds.id or ds.type != "file_bucket":
         raise ValueError("附件不属于指定文件桶")
+    if str(getattr(bf, "storage_provider", "") or "").lower() == "minio" or str(
+        getattr(bf, "object_url", "") or bf.stored_path or ""
+    ).lower().startswith("minio://"):
+        raise ValueError("MinIO 附件必须通过对象存储读取")
     safe_name = validate_bucket_filename(bf.filename)
     root = bucket_dir(ds).resolve()
     try:
@@ -398,25 +779,141 @@ def validate_bucket_file_for_download(
                 digest.update(chunk)
         if digest.hexdigest() != bf.content_sha256:
             raise ValueError("附件内容哈希与文件记录不一致")
-    canonical_mime = _OFFICE_MIMES.get(path.suffix.lower())
-    recorded_mime = str(bf.mime or "").split(";", 1)[0].strip().lower()
-    canonical_base = str(canonical_mime or "").split(";", 1)[0].strip().lower()
-    # Historic seed/import paths stored Office files as octet-stream and
-    # Markdown without an explicit charset.  Treat those as compatible while
-    # still rejecting a contradictory typed MIME (for example XLSX bytes
-    # recorded as DOCX).
-    compatible_legacy = recorded_mime in {"", "application/octet-stream"}
-    if canonical_mime and not compatible_legacy and recorded_mime != canonical_base:
-        raise ValueError("附件 MIME 与文件格式不一致")
-    return path, actual_size, canonical_mime or bf.mime or _guess_mime(safe_name)
+    return path, actual_size, _validated_bucket_mime(safe_name, bf.mime)
 
 
-def delete_bucket_file(bf: BucketFile) -> None:
-    delete_bucket_file_path(bf.stored_path)
+def minio_file_identity(bf: BucketFile, ds: DataSource) -> tuple[str, str, str]:
+    if bf.data_source_id != ds.id or ds.type != "file_bucket":
+        raise ValueError("附件不属于指定文件桶")
+    safe_name = validate_bucket_filename(bf.filename)
+    bucket_name, _prefix = managed_minio_location(ds)
+    object_url = str(getattr(bf, "object_url", "") or bf.stored_path or "")
+    url_bucket = ""
+    url_key = ""
+    if object_url:
+        url_bucket, url_key = object_storage_service.parse_object_url(object_url)
+    recorded_bucket = str(getattr(bf, "bucket_name", "") or url_bucket).strip()
+    recorded_key = str(getattr(bf, "object_key", "") or url_key).strip("/")
+    if not recorded_bucket or not recorded_key:
+        raise ValueError("MinIO 附件缺少对象身份记录")
+    if (url_bucket and url_bucket != recorded_bucket) or (url_key and url_key != recorded_key):
+        raise ValueError("MinIO 附件对象字段与地址不一致")
+    try:
+        _validate_bucket_object_key(
+            recorded_key,
+            ds,
+            bf.id,
+            safe_name,
+            require_generation=False,
+        )
+    except ValueError as exc:
+        raise ValueError("MinIO 附件对象不属于指定文件桶作用域") from exc
+    if recorded_bucket != bucket_name:
+        raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
+    return recorded_bucket, recorded_key, safe_name
+
+
+def read_bucket_file(bf: BucketFile, ds: DataSource) -> tuple[bytes, int, str]:
+    """Read and integrity-check either a managed MinIO or legacy local file."""
+    provider = str(getattr(bf, "storage_provider", "") or "").strip().lower()
+    durable_url = str(getattr(bf, "object_url", "") or bf.stored_path or "")
+    if provider == "minio" or durable_url.lower().startswith("minio://"):
+        bucket_name, object_key, safe_name = minio_file_identity(bf, ds)
+        version_id = str(getattr(bf, "object_version_id", "") or "")
+        current = object_storage_service.stat_object(
+            bucket_name,
+            object_key,
+            version_id=version_id,
+        )
+        recorded_etag = str(getattr(bf, "etag", "") or "").strip('"')
+        if recorded_etag and current.etag and current.etag != recorded_etag:
+            raise ValueError("附件 ETag 与文件记录不一致")
+        if bf.size > 0 and current.size != bf.size:
+            raise ValueError("附件大小与文件记录不一致")
+        content = object_storage_service.get_object(
+            bucket_name,
+            object_key,
+            version_id=version_id,
+        )
+        if current.size != len(content) or (bf.size > 0 and len(content) != bf.size):
+            raise ValueError("附件大小与对象内容不一致")
+        if bf.content_sha256 and hashlib.sha256(content).hexdigest() != bf.content_sha256:
+            raise ValueError("附件内容哈希与文件记录不一致")
+        return content, len(content), _validated_bucket_mime(safe_name, bf.mime)
+
+    path, actual_size, media_type = validate_bucket_file_for_download(bf, ds)
+    return path.read_bytes(), actual_size, media_type
+
+
+def bucket_file_deletion_identity(
+    bf: BucketFile,
+    ds: DataSource,
+) -> tuple[str, str, str, str]:
+    """Validate and return provider/bucket-or-path/key/version for deletion."""
+    provider = str(getattr(bf, "storage_provider", "") or "").strip().lower()
+    durable_url = str(getattr(bf, "object_url", "") or bf.stored_path or "")
+    if provider == "minio" or durable_url.lower().startswith("minio://"):
+        bucket_name, object_key, _safe_name = minio_file_identity(bf, ds)
+        return (
+            "minio",
+            bucket_name,
+            object_key,
+            str(getattr(bf, "object_version_id", "") or ""),
+        )
+    if bf.data_source_id != ds.id or ds.type != "file_bucket":
+        raise ValueError("附件不属于指定文件桶")
+    safe_name = validate_bucket_filename(bf.filename)
+    path = Path(str(bf.stored_path or ""))
+    try:
+        resolved = path.resolve(strict=False)
+        source_root = (BUCKETS_DIR / ds.id).resolve(strict=False)
+        resolved.relative_to(source_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("附件存储路径不属于指定文件桶") from exc
+    if resolved.name != safe_name:
+        raise ValueError("附件存储路径与文件记录不一致")
+    return "local", str(resolved), "", ""
+
+
+def is_managed_minio_file(bucket_file: BucketFile) -> bool:
+    provider = str(
+        getattr(bucket_file, "storage_provider", "") or ""
+    ).strip().lower()
+    durable_url = str(
+        getattr(bucket_file, "object_url", "") or bucket_file.stored_path or ""
+    )
+    return provider == "minio" or durable_url.lower().startswith("minio://")
+
+
+def managed_object_was_created(
+    record: BucketFile | AssistantAttachment,
+) -> bool:
+    return bool(getattr(record, "_managed_object_created", False))
+
+
+def delete_bucket_file(bf: BucketFile, ds: DataSource) -> None:
+    """Direct compensation for an object whose DB transaction did not commit.
+
+    Persisted file deletion must go through ``object_deletion_service``.
+    """
+    provider, bucket_or_path, object_key, version_id = (
+        bucket_file_deletion_identity(bf, ds)
+    )
+    if provider == "minio":
+        object_storage_service.delete_object(
+            bucket_or_path,
+            object_key,
+            version_id=version_id,
+        )
+        return
+    delete_bucket_file_path(bucket_or_path)
 
 
 def delete_bucket_file_path(stored_path: str) -> None:
-    """Safely unlink a captured bucket path after its DB row is committed away."""
+    """Delete a durable MinIO URI or safely unlink a legacy local path."""
+    if str(stored_path or "").lower().startswith("minio://"):
+        object_storage_service.delete_object_url(stored_path)
+        return
     # Deletion callers already authorise the owning data source.  Avoid
     # following a corrupt/symlinked record outside the platform bucket root.
     p = Path(stored_path)

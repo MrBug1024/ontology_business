@@ -9,14 +9,21 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.exc import SQLAlchemyError
+
 from ..models import DataSource
+from . import dataset_query_service, datasource_service
 
 
 AUDIT_VERSION = "medical-audit-v1"
@@ -347,7 +354,7 @@ class MedicalAuditError(ValueError):
 @dataclass(frozen=True)
 class _SourceSchema:
     source: DataSource
-    path: Path
+    path: Path | None
     tables: dict[str, str]
     columns: dict[str, dict[str, str]]
 
@@ -391,8 +398,10 @@ class MedicalAuditMappingContract:
     source: DataSource
     source_id: str
     source_name: str
+    source_type: str
     connector_revision: int
-    path: Path
+    connector_config_hash: str
+    path: Path | None
     tables: dict[str, str]
     columns: dict[str, dict[str, str]]
     mapping_ids: dict[str, str]
@@ -407,6 +416,102 @@ class MedicalAuditMappingContract:
             "mapping_ids": dict(sorted(self.mapping_ids.items())),
             "definition": dict(self.definition_provenance),
         }
+
+
+class _AuditResult:
+    """Small result facade shared by sqlite3 and SQLAlchemy connections."""
+
+    def __init__(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        self._rows = list(rows)
+
+    def fetchone(self) -> Mapping[str, Any] | None:
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self) -> list[Mapping[str, Any]]:
+        return list(self._rows)
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+_MYSQL_IDENTIFIER = re.compile(r'"((?:[^"\r\n]|"")*)"')
+
+
+class _AuditConnection:
+    """Read-only query facade over relational and immutable dataset sources."""
+
+    def __init__(self, source: DataSource) -> None:
+        self.dialect = str(source.type or "").lower()
+        self._sqlite: sqlite3.Connection | None = None
+        self._sqlalchemy = None
+        self._dataset: dataset_query_service.DatasetConnection | None = None
+        if self.dialect == "sqlite":
+            raw_path = str((source.config or {}).get("path") or "").strip()
+            path = Path(raw_path).expanduser().resolve()
+            connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+            self._sqlite = connection
+        elif self.dialect == "mysql":
+            self._sqlalchemy = datasource_service.get_engine(source).connect()
+        elif self.dialect == "dataset":
+            self._dataset = dataset_query_service.open_connection(source)
+        else:
+            raise MedicalAuditError(
+                "INVALID_QUERY",
+                "医保审计仅支持受管数据集或兼容的关系型数据源。",
+                retryable=False,
+            )
+
+    @staticmethod
+    def _mysql_sql(sql: str) -> str:
+        def quote(match: re.Match[str]) -> str:
+            value = match.group(1).replace('""', '"').replace("`", "``")
+            return f"`{value}`"
+
+        translated = _MYSQL_IDENTIFIER.sub(quote, sql)
+        translated = re.sub(r"\bAS\s+MATERIALIZED\s*\(", "AS (", translated, flags=re.I)
+        translated = re.sub(r"\s+AS\s+TEXT\)", " AS CHAR)", translated, flags=re.I)
+        translated = re.sub(
+            r"\s+AS\s+REAL\)",
+            " AS DECIMAL(30, 8))",
+            translated,
+            flags=re.I,
+        )
+        return translated.replace("?", "%s")
+
+    def execute(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+    ) -> _AuditResult:
+        values = tuple(params or ())
+        if self._sqlite is not None:
+            cursor = self._sqlite.execute(sql, values)
+            return _AuditResult(cursor.fetchall())
+        dataset = getattr(self, "_dataset", None)
+        if dataset is not None:
+            columns, rows = dataset.execute(sql, values)
+            return _AuditResult(
+                [dict(zip(columns, row, strict=True)) for row in rows]
+            )
+        if self._sqlalchemy is None:
+            raise RuntimeError("医保审计连接已关闭")
+        result = self._sqlalchemy.exec_driver_sql(self._mysql_sql(sql), values)
+        return _AuditResult(result.mappings().all())
+
+    def close(self) -> None:
+        if self._sqlite is not None:
+            self._sqlite.close()
+            self._sqlite = None
+        if self._sqlalchemy is not None:
+            self._sqlalchemy.rollback()
+            self._sqlalchemy.close()
+            self._sqlalchemy = None
+        dataset = getattr(self, "_dataset", None)
+        if dataset is not None:
+            dataset.close()
+            self._dataset = None
 
 
 def resolve_mapping_contract(
@@ -503,8 +608,9 @@ def resolve_mapping_contract(
             raise _mapping_contract_error(
                 f"对象类型 {entity_api_name} 的运行映射未绑定到当前 Agent 可用数据源。"
             )
-        if str(getattr(source, "type", "") or "") != "sqlite":
-            raise _mapping_contract_error("医保审计运行映射必须绑定 SQLite 数据源。")
+        source_type = str(getattr(source, "type", "") or "").lower()
+        if source_type not in {"sqlite", "mysql", "dataset"}:
+            raise _mapping_contract_error("医保审计运行映射必须绑定受管数据集或兼容关系型数据源。")
         if selected_source is not None and str(selected_source.id) != source_id:
             raise _mapping_contract_error("医保审计对象映射跨越多个物理数据源，拒绝执行关联审计。")
         selected_source = source
@@ -545,6 +651,11 @@ def resolve_mapping_contract(
             _field(mapping, "data_source_binding_ref", {}),
             f"对象类型 {entity_api_name} 的逻辑数据源绑定",
         )
+        binding_adapter = str(binding_ref.get("adapter") or "").lower()
+        if binding_adapter and binding_adapter != source_type:
+            raise _mapping_contract_error(
+                f"对象类型 {entity_api_name} 的逻辑绑定与运行数据源方言不一致。"
+            )
         transform_rules = _plain_json_object(
             _field(mapping, "transform_rules", {}),
             f"对象类型 {entity_api_name} 的转换规则",
@@ -587,21 +698,38 @@ def resolve_mapping_contract(
         )
     source_id = str(getattr(selected_source, "id", "") or "").strip()
     source_name = str(getattr(selected_source, "name", "") or "")
+    source_type = str(getattr(selected_source, "type", "") or "").lower()
     connector_revision = int(getattr(selected_source, "connector_revision", 0) or 0)
-    raw_path = str((getattr(selected_source, "config", None) or {}).get("path") or "").strip()
-    if not raw_path:
-        raise _mapping_contract_error("医保审计映射绑定的数据源缺少 SQLite 路径。")
-    path = Path(raw_path).expanduser().resolve()
-    if not path.is_file():
-        raise MedicalAuditError(
-            "RESOURCE_NOT_FOUND",
-            "医保审计映射绑定的 SQLite 数据源不存在或不可读取。",
-            retryable=False,
-        )
+    source_config = _plain_json_object(
+        getattr(selected_source, "config", None) or {}, "医保审计数据源配置"
+    )
+    connector_config_hash = _payload_sha256(source_config)
+    path: Path | None = None
+    if source_type == "sqlite":
+        raw_path = str(source_config.get("path") or "").strip()
+        if not raw_path:
+            raise _mapping_contract_error("医保审计映射绑定的数据源缺少 SQLite 路径。")
+        path = Path(raw_path).expanduser().resolve()
+        if not path.is_file():
+            raise MedicalAuditError(
+                "RESOURCE_NOT_FOUND",
+                "医保审计映射绑定的 SQLite 数据源不存在或不可读取。",
+                retryable=False,
+            )
+    elif source_type == "dataset":
+        if not str(source_config.get("dataset_version_id") or "").strip():
+            raise _mapping_contract_error("医保审计映射绑定的数据集缺少固定版本标识。")
+    elif not all(
+        str(source_config.get(key) or "").strip()
+        for key in ("host", "database", "user")
+    ):
+        raise _mapping_contract_error("医保审计映射绑定的 MySQL 数据源配置不完整。")
     payload = _mapping_contract_payload(
         source_id=source_id,
         source_name=source_name,
+        source_type=source_type,
         connector_revision=connector_revision,
+        connector_config_hash=connector_config_hash,
         path=path,
         tables=tables,
         columns=columns,
@@ -613,7 +741,9 @@ def resolve_mapping_contract(
         source=selected_source,
         source_id=source_id,
         source_name=source_name,
+        source_type=source_type,
         connector_revision=connector_revision,
+        connector_config_hash=connector_config_hash,
         path=path,
         tables=tables,
         columns=columns,
@@ -734,7 +864,9 @@ def _mapping_contract_payload(
     *,
     source_id: str,
     source_name: str = "",
+    source_type: str = "sqlite",
     connector_revision: int,
+    connector_config_hash: str = "",
     path: Path | None = None,
     tables: Mapping[str, str],
     columns: Mapping[str, Mapping[str, str]],
@@ -745,7 +877,9 @@ def _mapping_contract_payload(
         "contract_version": MAPPING_CONTRACT_VERSION,
         "source_id": source_id,
         "source_name": source_name,
+        "source_type": source_type,
         "connector_revision": connector_revision,
+        "connector_config_hash": connector_config_hash,
         "path": str(path) if path is not None else "",
         "tables": dict(sorted(tables.items())),
         "columns": {
@@ -787,20 +921,28 @@ def _validate_mapping_contract(contract: MedicalAuditMappingContract) -> None:
     if (
         str(getattr(contract.source, "id", "") or "") != contract.source_id
         or str(getattr(contract.source, "name", "") or "") != contract.source_name
-        or str(getattr(contract.source, "type", "") or "") != "sqlite"
+        or str(getattr(contract.source, "type", "") or "").lower()
+        != contract.source_type
+        or contract.source_type not in {"sqlite", "mysql", "dataset"}
         or int(getattr(contract.source, "connector_revision", 0) or 0)
         != contract.connector_revision
     ):
         raise _mapping_contract_error("医保审计数据源已偏离已解析的运行映射契约。")
-    current_path = Path(
-        str((getattr(contract.source, "config", None) or {}).get("path") or "")
-    ).expanduser().resolve()
-    if current_path != contract.path or not current_path.is_file():
-        raise MedicalAuditError(
-            "RESOURCE_NOT_FOUND",
-            "医保审计数据源路径已变化或不可读取。",
-            retryable=False,
-        )
+    current_config = _plain_json_object(
+        getattr(contract.source, "config", None) or {}, "医保审计数据源配置"
+    )
+    if _payload_sha256(current_config) != contract.connector_config_hash:
+        raise _mapping_contract_error("医保审计数据源配置已偏离已解析的运行映射契约。")
+    if contract.source_type == "sqlite":
+        current_path = Path(str(current_config.get("path") or "")).expanduser().resolve()
+        if current_path != contract.path or not current_path.is_file():
+            raise MedicalAuditError(
+                "RESOURCE_NOT_FOUND",
+                "医保审计数据源路径已变化或不可读取。",
+                retryable=False,
+            )
+    elif contract.path is not None:
+        raise _mapping_contract_error("远端医保审计契约不能携带本地数据库路径。")
     for logical_name, table_name in contract.tables.items():
         _mapped_identifier(table_name, f"{logical_name} 映射表名")
         for column in contract.columns[logical_name].values():
@@ -819,7 +961,9 @@ def _validate_mapping_contract(contract: MedicalAuditMappingContract) -> None:
     payload = _mapping_contract_payload(
         source_id=contract.source_id,
         source_name=contract.source_name,
+        source_type=contract.source_type,
         connector_revision=contract.connector_revision,
+        connector_config_hash=contract.connector_config_hash,
         path=contract.path,
         tables=contract.tables,
         columns=contract.columns,
@@ -932,7 +1076,7 @@ def run_medical_audit(
         "limited_drug_duration": _limited_drug_duration,
     }
     try:
-        with closing(_connect_read_only(schema.path)) as connection:
+        with closing(_connect_read_only(schema.source)) as connection:
             result = runners[strategy](
                 connection,
                 schema,
@@ -944,7 +1088,7 @@ def run_medical_audit(
             )
     except MedicalAuditError:
         raise
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, SQLAlchemyError, dataset_query_service.DatasetQueryError) as exc:
         raise MedicalAuditError(
             "TOOL_EXECUTION_FAILED",
             "医保审计查询执行失败，请检查数据源结构和字段类型。",
@@ -1375,26 +1519,30 @@ def _expected_evidence_parameters(args: Mapping[str, Any]) -> dict[str, Any]:
 def _source_schema(contract: MedicalAuditMappingContract) -> _SourceSchema:
     _validate_mapping_contract(contract)
     try:
-        with closing(_connect_read_only(contract.path)) as connection:
+        if contract.source_type == "dataset":
+            described = datasource_service.list_tables(contract.source)
             objects = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
-                )
+                str(item.get("name") or "")
+                for item in described
+                if isinstance(item, Mapping)
+            }
+            columns_by_relation = {
+                str(item.get("name") or ""): {
+                    str(column.get("name") or "")
+                    for column in (item.get("columns") or [])
+                    if isinstance(column, Mapping)
+                }
+                for item in described
+                if isinstance(item, Mapping)
             }
             for logical_name, table_name in contract.tables.items():
                 if table_name not in objects:
                     raise MedicalAuditError(
                         "RESOURCE_NOT_FOUND",
-                        f"医保审计映射声明的 {logical_name} 物理表不存在。",
+                        f"医保审计映射声明的 {logical_name} 逻辑关系不存在。",
                         retryable=False,
                     )
-                actual_columns = {
-                    str(row[1])
-                    for row in connection.execute(
-                        f"PRAGMA table_info({_quote_identifier(table_name)})"
-                    )
-                }
+                actual_columns = columns_by_relation.get(table_name, set())
                 missing_columns = sorted(
                     column
                     for column in contract.columns.get(logical_name, {}).values()
@@ -1406,12 +1554,39 @@ def _source_schema(contract: MedicalAuditMappingContract) -> _SourceSchema:
                         f"医保审计映射声明的 {logical_name} 字段在物理表中不存在。",
                         retryable=False,
                     )
+        else:
+            engine = datasource_service.get_engine(contract.source)
+            with engine.connect() as connection:
+                inspector = sa_inspect(connection)
+                objects = set(inspector.get_table_names()) | set(inspector.get_view_names())
+                for logical_name, table_name in contract.tables.items():
+                    if table_name not in objects:
+                        raise MedicalAuditError(
+                            "RESOURCE_NOT_FOUND",
+                            f"医保审计映射声明的 {logical_name} 物理表不存在。",
+                            retryable=False,
+                        )
+                    actual_columns = {
+                        str(column["name"])
+                        for column in inspector.get_columns(table_name)
+                    }
+                    missing_columns = sorted(
+                        column
+                        for column in contract.columns.get(logical_name, {}).values()
+                        if column not in actual_columns
+                    )
+                    if missing_columns:
+                        raise MedicalAuditError(
+                            "RESOURCE_NOT_FOUND",
+                            f"医保审计映射声明的 {logical_name} 字段在物理表中不存在。",
+                            retryable=False,
+                        )
     except MedicalAuditError:
         raise
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, SQLAlchemyError, dataset_query_service.DatasetQueryError) as exc:
         raise MedicalAuditError(
             "RESOURCE_NOT_FOUND",
-            "无法核验医保审计运行映射对应的 SQLite 结构。",
+            "无法核验医保审计运行映射对应的关系型数据源结构。",
             retryable=False,
         ) from exc
     return _SourceSchema(
@@ -1422,11 +1597,8 @@ def _source_schema(contract: MedicalAuditMappingContract) -> _SourceSchema:
     )
 
 
-def _connect_read_only(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only = ON")
-    return connection
+def _connect_read_only(source: DataSource) -> _AuditConnection:
+    return _AuditConnection(source)
 
 
 def find_facility_names_in_text(
@@ -1460,12 +1632,12 @@ def find_facility_names_in_text(
         LIMIT ?
     """
     try:
-        with closing(_connect_read_only(schema.path)) as connection:
+        with closing(_connect_read_only(schema.source)) as connection:
             rows = connection.execute(
                 query,
                 (user_message, MAX_FACILITY_SCOPE_MATCHES + 1),
             ).fetchall()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, SQLAlchemyError, dataset_query_service.DatasetQueryError) as exc:
         raise MedicalAuditError(
             "TOOL_EXECUTION_FAILED",
             "无法核验用户指定的医保机构范围。",
@@ -1489,7 +1661,7 @@ def find_facility_names_in_text(
 
 
 def _charge_threshold(
-    connection: sqlite3.Connection,
+    connection: _AuditConnection,
     schema: _SourceSchema,
     args: Mapping[str, Any],
     *,
@@ -1601,7 +1773,7 @@ def _charge_threshold(
 
 
 def _daily_overstay(
-    connection: sqlite3.Connection,
+    connection: _AuditConnection,
     schema: _SourceSchema,
     args: Mapping[str, Any],
     *,
@@ -1662,6 +1834,10 @@ def _daily_overstay(
         params.append(facility_name)
     if stay_days:
         stay_expression = f"CAST(e.{_q(stay_days)} AS REAL)"
+    elif connection.dialect == "mysql":
+        stay_expression = (
+            f"DATEDIFF(DATE(e.{_q(ended_at)}), DATE(e.{_q(started_at)})) + 1"
+        )
     else:
         stay_expression = (
             f"julianday(date(e.{_q(ended_at)})) - "
@@ -1729,7 +1905,7 @@ def _daily_overstay(
             SELECT COUNT(*) AS audited_scope_count FROM grouped
         ),
         page AS MATERIALIZED (
-            SELECT 1 AS __present, *
+            SELECT 1 AS __present, violations.*
             FROM violations
             ORDER BY violation_amount DESC, encounter_id ASC, service_name ASC
             LIMIT ? OFFSET ?
@@ -1821,7 +1997,7 @@ def _daily_overstay(
 
 
 def _included_service_duplicate(
-    connection: sqlite3.Connection,
+    connection: _AuditConnection,
     schema: _SourceSchema,
     args: Mapping[str, Any],
     *,
@@ -1873,7 +2049,7 @@ def _included_service_duplicate(
         child_where.append(f"c.{_q(required['facility_name'])} = ?")
         params.append(facility_name)
     included_cte = f"""
-        SELECT DISTINCT CAST(p.{_q(required['encounter_id'])} AS TEXT) AS encounter_id
+        SELECT DISTINCT p.{_q(required['encounter_id'])} AS encounter_id
         FROM {_q(table)} AS p
         WHERE {' AND '.join(parent_where)}
     """
@@ -1949,7 +2125,7 @@ def _included_service_duplicate(
 
 
 def _limited_drug_duration(
-    connection: sqlite3.Connection,
+    connection: _AuditConnection,
     schema: _SourceSchema,
     args: Mapping[str, Any],
     *,
@@ -2148,7 +2324,7 @@ def _limited_drug_duration(
 
 
 def _summary(
-    connection: sqlite3.Connection,
+    connection: _AuditConnection,
     base_sql: str,
     params: Sequence[Any],
     *,
@@ -2182,7 +2358,7 @@ def _summary(
 
 
 def _page(
-    connection: sqlite3.Connection,
+    connection: _AuditConnection,
     base_sql: str,
     params: Sequence[Any],
     *,
@@ -2201,7 +2377,7 @@ def _page(
 
 
 def _page_if_present(
-    connection: sqlite3.Connection,
+    connection: _AuditConnection,
     base_sql: str,
     params: Sequence[Any],
     *,
@@ -2366,6 +2542,8 @@ def _clean_number(value: Any) -> int | float:
 
 
 def _clean_value(value: Any) -> Any:
-    if isinstance(value, float):
+    if isinstance(value, (float, Decimal)):
         return _clean_number(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
     return value
