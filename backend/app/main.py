@@ -13,7 +13,9 @@ from sqlalchemy import text
 
 from .config import get_settings
 from .database import engine, init_db
+from . import agent_mcp_server
 from .routers import (
+    agent_mcp,
     agents,
     assistant,
     auth,
@@ -87,23 +89,24 @@ async def lifespan(_: FastAPI):
         await asyncio.to_thread(assistant.recover_expired_compilation_jobs)
     except Exception:  # noqa: BLE001
         logger.exception("AI 场景建模任务启动恢复失败")
-    operations_worker = asyncio.create_task(
-        _operations_worker(),
-        name="ontology-operations-worker",
-    )
-    compilation_worker = asyncio.create_task(
-        _assistant_compilation_worker(),
-        name="assistant-compilation-recovery-worker",
-    )
-    try:
-        yield
-    finally:
-        operations_worker.cancel()
-        compilation_worker.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await operations_worker
-        with contextlib.suppress(asyncio.CancelledError):
-            await compilation_worker
+    async with agent_mcp_server.mcp_server.session_manager.run():
+        operations_worker = asyncio.create_task(
+            _operations_worker(),
+            name="ontology-operations-worker",
+        )
+        compilation_worker = asyncio.create_task(
+            _assistant_compilation_worker(),
+            name="assistant-compilation-recovery-worker",
+        )
+        try:
+            yield
+        finally:
+            operations_worker.cancel()
+            compilation_worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await operations_worker
+            with contextlib.suppress(asyncio.CancelledError):
+                await compilation_worker
 
 
 settings = get_settings()
@@ -131,6 +134,7 @@ app.include_router(operations.operations_router, prefix=settings.api_prefix)
 app.include_router(functions.router, prefix=settings.api_prefix)
 app.include_router(external_api.management_router, prefix=settings.api_prefix)
 app.include_router(external_api.router, prefix=settings.api_prefix)
+app.include_router(agent_mcp.router, prefix=settings.api_prefix)
 
 
 @app.get("/")
@@ -211,3 +215,7 @@ def health():
         },
     }
     return JSONResponse(payload, status_code=200 if critical_ok else 503)
+
+
+# Keep the gateway mount last: its root mount must not shadow browser/API routes.
+app.mount("/", agent_mcp_server.mcp_app)

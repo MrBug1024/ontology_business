@@ -3,6 +3,10 @@ import type {
   FunctionRun,
   Agent,
   AgentCapabilityCatalog,
+  AgentMCPCandidate,
+  AgentMCPService,
+  AgentMCPServiceCreated,
+  AgentMCPServiceTest,
   AssistantAttachment,
   AssistantCompilationJobResult,
   AssistantCompilationJobStatus,
@@ -372,6 +376,19 @@ export const api = {
   deleteMCP: (id: string) => http.delete(`/mcp/${id}`),
   testMCP: (id: string) => http.post(`/mcp/${id}/test`),
   mcpTools: (id: string) => http.get<MCPTool[]>(`/mcp/${id}/tools`),
+
+  // Agent MCP publication
+  listAgentMCPServices: () => http.get<AgentMCPService[]>('/agent-mcp-services'),
+  listAgentMCPCandidates: () => http.get<AgentMCPCandidate[]>('/agent-mcp-services/candidates'),
+  createAgentMCPService: (d: { name: string; agent_id: string; expires_in_days: number }) =>
+    http.post<AgentMCPServiceCreated>('/agent-mcp-services', d),
+  updateAgentMCPService: (id: string, enabled: boolean) =>
+    http.put<AgentMCPService>(`/agent-mcp-services/${id}`, { enabled }),
+  rotateAgentMCPToken: (id: string, expiresInDays = 365) =>
+    http.post<AgentMCPServiceCreated>(`/agent-mcp-services/${id}/rotate-token`, { expires_in_days: expiresInDays }),
+  testAgentMCPService: (id: string) =>
+    http.post<AgentMCPServiceTest>(`/agent-mcp-services/${id}/test`),
+  deleteAgentMCPService: (id: string) => http.delete(`/agent-mcp-services/${id}`),
 
   // Agent
   listAgents: () => http.get<Agent[]>('/agents'),

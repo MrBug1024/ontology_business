@@ -3,13 +3,20 @@
     <div class="page-header">
       <div>
         <h1>MCP 服务</h1>
-        <div class="sub">接入本地或远程 Model Context Protocol 工具服务，供操作和工作流调用</div>
+        <div class="sub">{{ activeSection === 'connected' ? '接入外部工具服务，供操作和工作流调用' : '把已验证 Agent 发布为第三方可直接调用的 MCP 服务' }}</div>
       </div>
-      <div v-if="canManage" class="page-actions">
+      <div v-if="canManage && activeSection === 'connected'" class="page-actions">
         <el-button plain @click="openImport"><el-icon><DocumentAdd /></el-icon> 导入 mcpServers 配置</el-button>
         <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
       </div>
     </div>
+
+    <el-tabs v-model="activeSection" class="mcp-sections">
+      <el-tab-pane label="接入的 MCP" name="connected" />
+      <el-tab-pane label="Agent 发布" name="published" />
+    </el-tabs>
+
+    <section v-if="activeSection === 'connected'">
 
     <el-alert
       v-if="!canManage"
@@ -54,6 +61,9 @@
         <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
       </div>
     </div>
+    </section>
+
+    <AgentMCPPublications v-else :can-manage="canManage" />
 
     <el-dialog v-if="canManage" v-model="dlg" :title="form.id ? '编辑 MCP' : '新建 MCP'" width="min(720px, 94vw)" @closed="clearFormErrors">
       <div v-if="formError" ref="formErrorRef" class="form-error-summary" role="alert" tabindex="-1">
@@ -196,6 +206,7 @@ import { api } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 import type { MCPConfig, MCPImportResult, MCPTool } from '@/types'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
+import AgentMCPPublications from '@/components/AgentMCPPublications.vue'
 import { parseStandardMCPConfig } from '@/utils/mcpConfig'
 
 type MCPForm = {
@@ -212,6 +223,7 @@ type MCPForm = {
 
 const auth = useAuthStore()
 const canManage = computed(() => auth.user?.can_manage === true)
+const activeSection = ref<'connected' | 'published'>('connected')
 const mcps = ref<(MCPConfig & { _testing?: boolean })[]>([])
 const dlg = ref(false)
 const saving = ref(false)
@@ -497,6 +509,7 @@ onMounted(load)
 
 <style scoped>
 .page-actions, .empty-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mcp-sections { min-width: 0; }
 .mcp-card { margin-bottom: 16px; transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease), border-color var(--dur) var(--ease); }
 .mcp-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); border-color: var(--border-strong); }
 .mc-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }

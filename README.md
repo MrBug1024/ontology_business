@@ -172,6 +172,34 @@ MCP_PRIVATE_HOST_ALLOWLIST=
 MCP_OPERATION_TIMEOUT_SECONDS=90
 ```
 
+### 将 Agent 发布为 MCP 服务
+
+「能力配置 → MCP 服务 → Agent 发布」可以把一个已经完成就绪检查的 Agent 发布给第三方。
+创建发布时平台自动生成仅绑定该发布的 `agt_sk_...` 不透明令牌，并且只在创建响应中展示一次；
+后续如丢失配置，需要轮换令牌，旧配置会立即失效。第三方使用固定的 Streamable HTTP 地址：
+
+```json
+{
+  "mcpServers": {
+    "医保违规审计助手": {
+      "type": "http",
+      "url": "https://api.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer agt_sk_xxx"
+      }
+    }
+  }
+}
+```
+
+网关只暴露 `invoke_agent`，但工具内部复用平台 Agent 对话的完整运行上下文、能力白名单、
+数据权限、LLM 工具循环、引用和审计记录。生产部署应显式配置对外地址与反向代理 Host：
+
+```env
+AGENT_MCP_PUBLIC_URL=https://api.example.com/mcp
+AGENT_MCP_ALLOWED_HOSTS=api.example.com
+```
+
 请求头和环境变量在 API 中按只写值处理，但当前仓库不内置数据库静态加密或外部 Secret Manager。
 生产部署应启用数据库/磁盘加密并限制备份访问；安全基线要求更高时，应在连接器密钥服务中统一实施信封加密和密钥轮换。
 

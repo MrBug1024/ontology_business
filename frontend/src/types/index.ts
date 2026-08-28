@@ -872,6 +872,50 @@ export interface MCPTool {
   input_schema?: Record<string, any>
 }
 
+export interface AgentMCPCandidate {
+  id: string
+  name: string
+  scenario_name: string
+  ready: boolean
+  missing: string[]
+}
+
+export interface AgentMCPService {
+  id: string
+  name: string
+  agent_id: string
+  agent_name: string
+  scenario_name: string
+  enabled: boolean
+  ready: boolean
+  stale: boolean
+  missing: string[]
+  endpoint_url: string
+  key_prefix: string
+  token_hint: string
+  expires_at?: string | null
+  last_used_at?: string | null
+  runtime_environment: string
+  definition_hash: string
+  created_at: string
+  updated_at: string
+}
+
+export interface AgentMCPServiceCreated extends AgentMCPService {
+  token: string
+  config: Record<string, unknown>
+  config_json: string
+}
+
+export interface AgentMCPServiceTest {
+  ok: boolean
+  message: string
+  tool_name: string
+  agent_name: string
+  runtime_environment: string
+  definition_hash: string
+}
+
 export type AgentCapabilityCategory = 'functions' | 'actions' | 'rules' | 'events' | 'workflows'
 
 export interface AgentCapabilitySelection {

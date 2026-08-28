@@ -127,6 +127,10 @@ class Settings(BaseSettings):
     allow_insecure_mcp_http: bool = False
     mcp_private_host_allowlist: str = ""
     mcp_operation_timeout_seconds: float = 90.0
+    # Agent publications share one authenticated Streamable HTTP endpoint.
+    # Production deployments should set the public URL and exact proxy Host.
+    agent_mcp_public_url: str = ""
+    agent_mcp_allowed_hosts: str = "localhost,localhost:*,127.0.0.1,127.0.0.1:*,testserver"
 
     # A process is deployed to exactly one governed runtime environment.  This
     # value is deliberately server-side: callers cannot select prod/staging by

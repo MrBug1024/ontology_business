@@ -48,7 +48,7 @@ def orm_datetime(*, timezone: bool = True):
 
 
 logger = logging.getLogger(__name__)
-POSTGRESQL_SCHEMA_REVISION = "20260827_04"
+POSTGRESQL_SCHEMA_REVISION = "20260828_05"
 
 _settings = get_settings()
 engine_options: dict[str, object] = {"pool_pre_ping": True}

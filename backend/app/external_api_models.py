@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, ForeignKey, Index, String
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base, orm_datetime as DateTime
@@ -102,3 +102,83 @@ class ExternalApiKeyAuditEvent(Base):
     event_type: Mapped[str] = mapped_column(String(20), nullable=False)
     details: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+
+class AgentMCPService(Base):
+    """One externally callable MCP credential bound to exactly one Agent."""
+
+    __tablename__ = "agent_mcp_services"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name_key", name="uq_agent_mcp_services_tenant_name"),
+        Index("ix_agent_mcp_services_tenant_enabled", "tenant_id", "enabled"),
+        Index("ix_agent_mcp_services_agent_enabled", "agent_id", "enabled"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    agent_id: Mapped[str] = mapped_column(
+        ForeignKey("agents.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    execution_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    name_key: Mapped[str] = mapped_column(String(240), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    key_prefix: Mapped[str] = mapped_column(String(20), nullable=False)
+    token_hint: Mapped[str] = mapped_column(String(8), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    agent_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    definition_snapshot_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    release_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    definition_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    runtime_environment: Mapped[str] = mapped_column(String(20), nullable=False, default="dev")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, onupdate=_now
+    )
+
+
+class AgentMCPInvocation(Base):
+    """Durable audit envelope for one external ``invoke_agent`` tool call."""
+
+    __tablename__ = "agent_mcp_invocations"
+    __table_args__ = (
+        Index("ix_agent_mcp_invocations_service_created", "service_id", "created_at"),
+        Index("ix_agent_mcp_invocations_tenant_created", "tenant_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    service_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_mcp_services.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    agent_id: Mapped[str] = mapped_column(
+        ForeignKey("agents.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    execution_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    trace_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="running")
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_call_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    result: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    error_code: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

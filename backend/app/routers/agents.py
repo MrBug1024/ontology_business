@@ -1074,3 +1074,145 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
                 yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+def invoke_agent_once(
+    agent_id: str,
+    *,
+    message: str,
+    conversation_id: str | None,
+    db: Session,
+) -> dict[str, Any]:
+    """Run one durable Agent turn for a non-browser transport.
+
+    The MCP adapter deliberately enters the same authorization context, model
+    routing, history replay and ``agent_engine.run_agent`` loop as browser chat.
+    Only the transport envelope differs: this function returns one structured
+    result instead of yielding SSE frames.
+    """
+    a = _agent(db, agent_id)
+    conv = None
+    if conversation_id:
+        conv = _conversation(db, conversation_id)
+        if conv.agent_id != agent_id:
+            raise HTTPException(400, "对话不属于当前 Agent")
+
+    runtime_context = _authorization_context(db, a)
+    if runtime_context is None:
+        raise HTTPException(409, "Agent 当前运行定义、发布快照或环境连接器不完整，已阻止对话")
+    missing = _agent_readiness_missing(db, a, runtime_context=runtime_context)
+    if missing:
+        raise HTTPException(409, "Agent 尚未就绪，请先完成：" + "、".join(missing))
+    requires_tools = bool(runtime_context.build_tools())
+    if a.llm_config_id:
+        llm = tenant_service.get_visible(db, LLMConfig, a.llm_config_id)
+        if not llm or not llm_service.supports_capability(llm, "chat"):
+            raise HTTPException(409, "Agent 绑定的 LLM 不可用或未启用聊天能力，请重新配置")
+        if requires_tools and not llm_service.supports_capability(llm, "tool"):
+            raise HTTPException(409, "Agent 需要工具调用，但绑定的 LLM 未启用工具能力")
+    else:
+        candidates = llm_service.routable_configs(db, "tool" if requires_tools else "chat")
+        llm = candidates[0] if candidates else None
+    if not llm:
+        raise HTTPException(400, "请先为 Agent 配置 LLM（或设置默认 LLM）")
+    runtime_context.llm = llm
+
+    if conv is None:
+        conv = Conversation(
+            agent_id=agent_id,
+            created_by_user_id=_current_user_id(db),
+            title=message[:50] or "新对话",
+        )
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+
+    scenario = tenant_service.get_visible(db, BusinessScenario, a.scenario_id) if a.scenario_id else None
+    scenario_name = scenario.name if scenario else ""
+    ontology_summary = agent_engine.ontology_summary_for(scenario, db=db)
+    user_message = Message(conversation_id=conv.id, role="user", content=message)
+    assistant_message_id = uuid.uuid4().hex
+    assistant_message = Message(
+        id=assistant_message_id,
+        conversation_id=conv.id,
+        role="assistant",
+        content="正在准备受控工具调用。",
+        stream_finalized=False,
+    )
+    db.add_all([user_message, assistant_message])
+    db.commit()
+
+    trace_id = uuid.uuid4().hex
+    trace_context = {
+        "correlation_id": trace_id,
+        "assistant_message_id": assistant_message_id,
+        "agent_id": a.id,
+        "conversation_id": conv.id,
+        "scenario_id": a.scenario_id or "",
+        "user_id": str(db.info.get("user_id") or "") or None,
+    }
+    history = _model_history(
+        db,
+        conv.id,
+        a,
+        runtime_context,
+        excluded_message_ids={str(user_message.id), assistant_message_id},
+    )
+    content = ""
+    tool_calls: list[dict[str, Any]] = []
+    tool_results: list[dict[str, Any]] = []
+    citations: list[dict[str, Any]] = []
+    try:
+        for event in agent_engine.run_agent(
+            db,
+            a,
+            llm,
+            history,
+            message,
+            scenario_name,
+            ontology_summary,
+            trace_context=trace_context,
+            runtime_context=runtime_context,
+        ):
+            event_type = event["type"]
+            data = event.get("data")
+            if event_type == "token":
+                content += str(data or "")
+            elif event_type == "tool_call" and isinstance(data, dict):
+                tool_calls.append(data)
+            elif event_type == "tool_result" and isinstance(data, dict):
+                tool_results.append(data)
+                db.commit()
+            elif event_type == "citations" and isinstance(data, list):
+                citations = data
+        assistant_message.content = content
+        assistant_message.tool_calls = tool_calls
+        assistant_message.tool_results = tool_results
+        assistant_message.citations = citations
+        assistant_message.stream_finalized = True
+        db.commit()
+    except Exception as exc:
+        assistant_message.content = _stream_error_content(content, str(exc))
+        assistant_message.tool_calls = tool_calls
+        assistant_message.tool_results = tool_results
+        assistant_message.citations = citations
+        assistant_message.stream_finalized = True
+        db.commit()
+        raise
+
+    definition = runtime_context.runtime_definition
+    return {
+        "answer": content,
+        "conversation_id": conv.id,
+        "trace_id": trace_id,
+        "assistant_message_id": assistant_message_id,
+        "citations": citations,
+        "tool_calls": tool_calls,
+        "tool_results": tool_results,
+        "runtime": {
+            "environment": definition.environment if definition else "",
+            "definition_snapshot_id": definition.snapshot_id if definition else None,
+            "release_id": definition.release_id if definition else None,
+            "definition_hash": definition.definition_hash if definition else "",
+        },
+    }
