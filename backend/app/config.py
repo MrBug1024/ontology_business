@@ -109,6 +109,10 @@ class Settings(BaseSettings):
     )
     llm_timeout: float = 120.0
     scenario_model_llm_timeout: float = 600.0
+    # Independent document slices within one staged modelling task are safe to
+    # analyse concurrently.  Keep this bounded so one long attachment cannot
+    # monopolise the provider or database connection pool.
+    scenario_model_max_parallel_chunks: int = Field(default=3, ge=1, le=4)
     # Hard ceiling for one compound document compilation, including malformed
     # JSON retries, timeout fallback chunks and recursive truncation splits.
     # A job that reaches this limit fails closed and is not retried under the

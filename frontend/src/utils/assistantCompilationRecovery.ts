@@ -178,12 +178,3 @@ export function selectCompilationJobForRecovery(
     || scoped.find((job) => job.status === 'running')
     || null
 }
-
-/** Hidden tabs poll much less often; transient GET errors also back off. */
-export function compilationPollDelay(hidden: boolean, consecutiveErrors = 0) {
-  // A foreground task should feel live immediately after the submit ACK;
-  // hidden tabs still back off aggressively to avoid background polling.
-  const base = hidden ? 15_000 : 1_000
-  const multiplier = 2 ** Math.min(Math.max(Math.trunc(consecutiveErrors), 0), 3)
-  return Math.min(base * multiplier, hidden ? 60_000 : 20_000)
-}

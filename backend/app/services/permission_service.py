@@ -96,16 +96,38 @@ def _context_value(db: Session, key: str) -> str:
     return str(db.info.get(key) or "").strip()
 
 
+def _request_permission_cache(db: Session) -> dict[tuple[object, ...], object]:
+    """Reuse immutable permission reads within one request/session.
+
+    Runtime list endpoints may authorize dozens of rows at once. The policy is
+    unchanged, but resolving the same principal, scenario grant, and property
+    grant repeatedly turns a bounded page into an N+1 query cascade.
+    """
+    cache = db.info.get("permission_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        db.info["permission_cache"] = cache
+    return cache
+
+
 def _resolve_principal(db: Session) -> tuple[Principal | None, str, int]:
     """返回已验证主体；第三个值是错误时应返回的 HTTP 状态。"""
     tenant_id = _context_value(db, "tenant_id")
     user_id = _context_value(db, "user_id")
+    cache = _request_permission_cache(db)
+    principal_key = ("principal", tenant_id, user_id)
+    if principal_key in cache:
+        return cache[principal_key]  # type: ignore[return-value]
     if not tenant_id or not user_id:
-        return None, "缺少经过认证的租户与用户上下文", 401
+        result = (None, "缺少经过认证的租户与用户上下文", 401)
+        cache[principal_key] = result
+        return result
 
     user = db.get(User, user_id)
     if not user or user.status != "active" or user.tenant_id != tenant_id:
-        return None, "当前用户不属于请求租户或已失效", 403
+        result = (None, "当前用户不属于请求租户或已失效", 403)
+        cache[principal_key] = result
+        return result
 
     member = db.execute(
         select(OrganizationMember)
@@ -119,8 +141,10 @@ def _resolve_principal(db: Session) -> tuple[Principal | None, str, int]:
         .limit(1)
     ).scalars().first()
     if not member or not member.role:
-        return None, "当前用户没有有效的组织成员身份", 403
-    return (
+        result = (None, "当前用户没有有效的组织成员身份", 403)
+        cache[principal_key] = result
+        return result
+    result = (
         Principal(
             tenant_id=tenant_id,
             user_id=user_id,
@@ -132,6 +156,8 @@ def _resolve_principal(db: Session) -> tuple[Principal | None, str, int]:
         "",
         200,
     )
+    cache[principal_key] = result
+    return result
 
 
 def require_principal(db: Session) -> Principal:
@@ -155,6 +181,18 @@ def _grant_effect(
     verb: str,
 ) -> str | None:
     """取得精确 ACL 的效果，``deny`` 始终优先于 ``allow``。"""
+    cache = _request_permission_cache(db)
+    grant_key = (
+        "grant",
+        principal.organization_id,
+        principal.role_id,
+        principal.user_id,
+        resource_type,
+        resource_id,
+        verb,
+    )
+    if grant_key in cache:
+        return cache[grant_key]  # type: ignore[return-value]
     grants = db.execute(
         select(AuthorizationGrant.effect).where(
             AuthorizationGrant.organization_id == principal.organization_id,
@@ -169,9 +207,12 @@ def _grant_effect(
     ).scalars().all()
     normalized = {str(effect or "").lower() for effect in grants}
     if "deny" in normalized:
+        cache[grant_key] = "deny"
         return "deny"
     if "allow" in normalized:
+        cache[grant_key] = "allow"
         return "allow"
+    cache[grant_key] = None
     return None
 
 
@@ -383,9 +424,15 @@ def filter_instance_attributes(db: Session, instance: OntologyInstance) -> dict:
     values = dict(instance.attributes or {})
     if not values:
         return values
-    properties = db.execute(
-        select(OntologyProperty).where(OntologyProperty.entity_id == instance.entity_id)
-    ).scalars().all()
+    # Object search eagerly loads the entity properties for the whole page.
+    # Reuse that relationship instead of querying the same property definition
+    # once per runtime object.
+    if instance.entity is not None:
+        properties = list(instance.entity.properties or [])
+    else:
+        properties = db.execute(
+            select(OntologyProperty).where(OntologyProperty.entity_id == instance.entity_id)
+        ).scalars().all()
     by_name = {prop.name: prop for prop in properties}
     return {
         name: value

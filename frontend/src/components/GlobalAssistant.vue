@@ -1,21 +1,28 @@
 <template>
   <button
-    v-if="showLauncher"
+    v-if="showLauncher && !visible"
     class="assistant-launcher"
+    :class="{ 'is-working': advisorWorking }"
     type="button"
-    aria-label="打开全局 AI 助手"
-    title="打开全局 AI 助手"
+    :aria-label="advisorWorking ? `打开智能业务顾问，${launcherStatus}` : '打开智能业务顾问'"
+    :title="advisorWorking ? launcherStatus : '打开智能业务顾问'"
     @click="openAssistant"
   >
-    <span class="assistant-launcher-icon" aria-hidden="true"><el-icon><MagicStick /></el-icon></span>
-    <span>AI 助手</span>
+    <span class="assistant-launcher-icon" aria-hidden="true">
+      <el-icon v-if="advisorWorking" class="is-loading"><Loading /></el-icon>
+      <el-icon v-else><MagicStick /></el-icon>
+    </span>
+    <span class="assistant-launcher-copy" aria-live="polite">
+      <strong>智能业务顾问</strong>
+      <small v-if="advisorWorking">{{ launcherStatus }}</small>
+    </span>
     <span class="assistant-live-dot" aria-hidden="true"></span>
   </button>
 
   <el-drawer
     v-model="visible"
     direction="rtl"
-    size="min(480px, 100vw)"
+    size="min(560px, 100vw)"
     :with-header="false"
     append-to-body
     class="assistant-drawer"
@@ -26,8 +33,8 @@
         <div class="assistant-title-wrap">
           <div class="assistant-avatar" aria-hidden="true"><el-icon :size="19"><MagicStick /></el-icon></div>
           <div>
-            <div class="assistant-title">全局 AI 助手 <el-tag size="small" type="success" effect="plain">上下文感知</el-tag></div>
-            <div class="assistant-subtitle">理解业务资料，生成完整模型并受控执行</div>
+            <div class="assistant-title">智能业务顾问 <el-tag size="small" type="success" effect="plain">上下文感知</el-tag></div>
+            <div class="assistant-subtitle">理解业务资料，拆解任务并受控建设模型</div>
           </div>
         </div>
         <div class="assistant-head-actions">
@@ -57,7 +64,7 @@
               <p class="assistant-settings-note">这里选择的是模型参考配置；只有平台为本轮明确注册工具时才会调用。外部调用、写入和高风险操作仍遵循权限、预演与确认流程。</p>
             </section>
           </el-popover>
-          <el-button text circle aria-label="关闭 AI 助手" title="关闭" @click="visible = false">
+          <el-button text circle aria-label="关闭智能业务顾问" title="关闭" @click="visible = false">
             <el-icon aria-hidden="true"><Close /></el-icon>
           </el-button>
         </div>
@@ -84,25 +91,6 @@
           </el-button>
         </div>
       </div>
-
-      <section
-        v-if="activeCompilationJob && compilationRecoveryThreadId === threadId"
-        class="compilation-recovery"
-        :class="`is-${activeCompilationJob.status}`"
-        role="status"
-        aria-live="polite"
-      >
-        <el-icon v-if="activeCompilationJob.status !== 'failed'" class="is-loading" aria-hidden="true"><Loading /></el-icon>
-        <el-icon v-else aria-hidden="true"><WarningFilled /></el-icon>
-        <div>
-          <strong>{{ activeCompilationJob.status === 'running' ? '正在恢复完整业务模型编译' : activeCompilationJob.status === 'succeeded' ? '正在恢复完整业务模型结果' : '完整业务模型编译未完成' }}</strong>
-          <span v-if="activeCompilationJob.status !== 'failed'">{{ activeCompilationJob.status === 'succeeded' ? '服务端任务已完成，正在读取持久化变更清单并重载会话。' : (activeCompilationJob.progress?.detail || '任务仍在服务端运行；页面恢复不会重新提交聊天请求。') }}</span>
-          <span v-else>{{ activeCompilationJob.error_message || '系统已保持零写入。请修改附件或描述后显式重试。' }}</span>
-        </div>
-        <el-tag v-if="activeCompilationJob.status === 'running'" size="small" type="info" effect="plain">{{ compilationCallSummary }}</el-tag>
-        <el-tag v-else-if="activeCompilationJob.status === 'succeeded'" size="small" type="success" effect="plain">正在恢复结果</el-tag>
-        <el-button v-else size="small" text type="danger" @click="dismissCompilationFailure">知道了</el-button>
-      </section>
 
       <section v-if="historyVisible" class="assistant-history" aria-label="当前上下文的会话历史">
         <div class="history-head">
@@ -134,94 +122,58 @@
       </section>
 
       <main v-else ref="messageRef" class="assistant-messages">
-        <section
-          v-if="activeCompilationJob && compilationRecoveryThreadId === threadId"
-          class="compilation-plan-card"
-          :class="`is-${activeCompilationJob.status}`"
-          aria-label="AI 建模执行计划"
-        >
-          <header class="compilation-plan-head">
-            <div class="compilation-plan-heading">
-              <span class="compilation-plan-kicker"><el-icon aria-hidden="true"><List /></el-icon>AI 正在按计划执行</span>
-              <strong>{{ compilationPlanHeadline }}</strong>
-              <span>{{ compilationProgressDetail(activeCompilationJob) }}</span>
-            </div>
-            <div class="compilation-plan-count" aria-live="polite">
-              <b>{{ compilationCompletedSteps }}</b><span>/ {{ compilationPlanSteps.length }} 项</span>
-            </div>
-          </header>
-          <div v-if="planExpanded" class="compilation-plan-steps" role="list">
-            <div v-for="step in compilationPlanSteps" :key="step.id" class="compilation-plan-step" :class="`is-${step.status}`" role="listitem">
-              <span class="compilation-plan-step-icon" aria-hidden="true">
-                <el-icon v-if="step.status === 'done'"><CircleCheckFilled /></el-icon>
-                <el-icon v-else-if="step.status === 'error'"><CircleCloseFilled /></el-icon>
-                <el-icon v-else-if="step.status === 'running'" class="is-loading"><Loading /></el-icon>
-                <span v-else>{{ compilationStepIndex(step.id) }}</span>
-              </span>
-              <div class="compilation-plan-step-copy">
-                <strong>{{ step.title }}</strong>
-                <span>{{ step.detail }}</span>
-              </div>
-              <el-tag v-if="step.status === 'done'" size="small" type="success" effect="plain">完成</el-tag>
-              <el-tag v-else-if="step.status === 'error'" size="small" type="danger" effect="plain">需处理</el-tag>
-              <el-tag v-else-if="step.status === 'running'" size="small" type="primary" effect="plain">执行中</el-tag>
-            </div>
-          </div>
-          <div v-if="compilationStageResults.length" class="compilation-stage-results" aria-label="已完成阶段结果">
-            <div class="compilation-stage-results-label">已完成的阶段结果</div>
-            <div v-for="result in compilationStageResults" :key="result.step_id" class="compilation-stage-result">
-              <el-icon aria-hidden="true"><CircleCheckFilled /></el-icon><span>{{ result.summary }}</span>
-            </div>
-          </div>
-          <footer class="compilation-plan-footer">
-            <span>{{ compilationCallSummary }} · 结果会持续追加到当前会话</span>
-            <button type="button" class="compilation-plan-toggle" :aria-expanded="planExpanded" @click="planExpanded = !planExpanded">
-              {{ planExpanded ? '收起计划' : '展开计划' }}<el-icon aria-hidden="true"><ArrowDown /></el-icon>
-            </button>
-          </footer>
-        </section>
         <div v-if="showQuickStarts" class="assistant-empty">
           <div class="empty-mark" aria-hidden="true"><el-icon :size="28"><ChatDotRound /></el-icon></div>
-          <h3>可以直接提问，也可以协助建设当前场景</h3>
-          <p>普通问题会直接回答；明确提出建设要求时，才会准备带来源证据和冲突检查的待确认变更。</p>
-          <div v-if="context.scenario_id" class="assistant-quick-start" aria-label="常用建模任务">
-            <button type="button" @click="chooseTask('explain')"><strong>询问当前场景</strong><span>只读回答，不生成变更</span></button>
-            <button type="button" @click="chooseTask('scenario_model')"><strong>完整场景建模</strong><span>对象、关系、映射、函数、操作、规则、事件和工作流</span></button>
-            <button type="button" @click="chooseTask('ontology')"><strong>本体模型</strong><span>对象类型、属性、关系与约束</span></button>
-            <button type="button" @click="chooseTask('capabilities')"><strong>新增业务能力</strong><span>新增函数、操作、规则和事件；修改已有定义时仅提供只读指导</span></button>
-            <button type="button" @click="chooseTask('workflow')"><strong>工作流</strong><span>触发条件、节点、分支与审批</span></button>
-          </div>
+          <h3>直接描述要完成的工作</h3>
+          <p>智能业务顾问会结合当前页面、附件和会话上下文自动规划处理路径。</p>
         </div>
 
         <article v-for="(message, index) in messages" :key="message.id || index" class="assistant-message" :class="message.role">
           <div v-if="message.role === 'assistant'" class="message-avatar assistant-message-avatar" aria-hidden="true"><el-icon><MagicStick /></el-icon></div>
           <div class="message-content">
             <div v-if="message.role === 'user'" class="message-label">你</div>
-            <div v-else class="message-label">平台 AI 助手</div>
-            <div v-if="message.role === 'assistant' && message.thinking?.length" class="thinking-summary">
-              <button type="button" class="thinking-toggle" :aria-expanded="isThinkingExpanded(message, index)" @click="toggleThinking(message, index)">
-                <span class="thinking-toggle-main"><el-icon aria-hidden="true"><Cpu /></el-icon><span>{{ thinkingSummary(message) }}</span></span>
-                <span v-if="message.streaming" class="thinking-live" role="status" aria-live="polite">处理中</span>
-                <el-icon class="thinking-chevron" :class="{ rotated: isThinkingExpanded(message, index) }" aria-hidden="true"><ArrowDown /></el-icon>
-              </button>
-              <div v-show="isThinkingExpanded(message, index)" class="thinking-body">
-                <div v-for="step in message.thinking" :key="step.id" class="thinking-step" :class="`is-${step.status || 'pending'}`">
-                  <span class="thinking-step-dot" aria-hidden="true"></span>
-                  <div><strong>{{ step.title }}</strong><span>{{ step.detail }}</span></div>
+            <div v-else class="message-label">智能业务顾问</div>
+            <section v-if="shouldShowWorkLog(message)" class="assistant-worklog" :class="{ 'is-active': message.streaming }" aria-label="助手工作过程" aria-live="polite">
+              <header class="worklog-head">
+                <span><el-icon aria-hidden="true"><Operation /></el-icon>工作过程</span>
+                <span class="worklog-summary">{{ workLogSummary(message) }}</span>
+                <span v-if="message.streaming" class="worklog-live" role="status">进行中</span>
+              </header>
+              <div class="worklog-body">
+                <div v-for="entry in workTranscriptEntries(message)" :key="entry.id" class="worklog-entry" :class="`is-${entry.status}`">
+                  <span class="worklog-step-dot" aria-hidden="true"></span>
+                  <div><strong>{{ entry.title }}</strong><span>{{ entry.detail }}</span></div>
+                  <small>{{ activityKindLabel(entry.kind) }}</small>
                 </div>
-                <div class="thinking-note">这里展示的是可审计的处理摘要，不是模型的原始隐藏思考内容。</div>
+                <div v-if="compilationLiveEntries(message).length" class="worklog-live-feed" aria-label="实时工作播报">
+                  <div
+                    v-for="(entry, liveIndex) in compilationLiveEntries(message)"
+                    :key="`${entry.job_id}:${entry.emitted_at}`"
+                    class="worklog-live-entry"
+                    :class="{ 'is-latest': liveIndex === compilationLiveEntries(message).length - 1, 'is-disconnected': entry.stream_state === 'disconnected' }"
+                    :role="liveIndex === compilationLiveEntries(message).length - 1 ? 'status' : undefined"
+                    :aria-live="liveIndex === compilationLiveEntries(message).length - 1 ? 'polite' : undefined"
+                  >
+                    <time :datetime="entry.emitted_at">{{ formatLivenessClock(entry.emitted_at) }}</time>
+                    <div>
+                      <strong>{{ entry.stream_state === 'disconnected' ? '任务流连接已中断' : `仍在「${entry.stage_title}」` }}</strong>
+                      <span>{{ entry.message }}</span>
+                    </div>
+                    <small>{{ formatElapsedSeconds(entry.elapsed_seconds) }}</small>
+                  </div>
+                </div>
+                <div class="worklog-note">仅展示可验证、可回看的工作信息，不包含模型的隐藏推理。</div>
               </div>
-            </div>
+            </section>
             <div class="message-bubble" :class="{ user: message.role === 'user' }">
               <SafeMarkdown v-if="message.role === 'assistant'" :content="assistantMessageContent(message)" />
               <span v-if="message.role === 'assistant' && message.streaming" class="stream-cursor" aria-hidden="true">▍</span>
               <div v-else-if="message.role !== 'assistant'" class="user-content">{{ message.content }}</div>
             </div>
-
-            <div v-if="proposalOf(message)" class="proposal-card">
+            <div v-if="proposalOf(message)" class="proposal-card" :class="{ 'is-model-result': proposalOf(message)?.kind === 'scenario_model' }">
               <div class="proposal-head">
                 <div>
-                  <div class="proposal-title"><el-icon aria-hidden="true"><DocumentChecked /></el-icon>{{ proposalOf(message)?.title }}</div>
+                  <div class="proposal-title"><el-icon aria-hidden="true"><DocumentChecked /></el-icon>{{ proposalOf(message)?.kind === 'scenario_model' ? '建模产物' : proposalOf(message)?.title }}</div>
                   <div class="proposal-summary">{{ proposalOf(message)?.summary }}</div>
                 </div>
                 <el-tag size="small" :type="proposalStatusType(proposalOf(message))" effect="plain">
@@ -256,24 +208,44 @@
                   :aria-expanded="Boolean(expandedProposal[index])"
                   :aria-controls="proposalDetailId(message, index)"
                   @click="toggleProposal(index)"
-                >{{ expandedProposal[index] ? '收起详情' : '查看详情' }}</button>
+                >{{ expandedProposal[index] ? '收起详情' : proposalOf(message)?.kind === 'scenario_model' ? '查看建模产物' : '查看详情' }}</button>
               </div>
               <section
-                v-if="modelTasks(proposalOf(message)).length"
-                class="model-task-board"
+                v-if="modelTasks(proposalOf(message)).length && Boolean(expandedProposal[index])"
+                class="model-task-plan"
                 aria-label="完整场景建模任务"
               >
-                <header class="model-task-board-head">
-                  <div>
-                    <strong>持续执行计划</strong>
-                    <span v-if="!modelExecutionSummary(proposalOf(message))?.final">草稿生成阶段结束不代表计划结束；需要确认时会停留等待，确认后继续下一项。</span>
-                    <span v-else>所有任务都已推进，下面保留了完成结果、缺失项、阻塞原因和解决建议。</span>
-                  </div>
+                <button type="button" class="model-task-plan-toggle" :aria-expanded="isModelPlanExpanded(message, index)" @click="toggleModelPlan(message, index)">
+                  <span class="model-task-plan-copy">
+                    <strong>场景建模计划</strong>
+                    <small>{{ modelPlanSummary(proposalOf(message)) }}</small>
+                  </span>
                   <el-tag size="small" effect="plain" :type="modelRunStatusType(proposalOf(message))">
                     {{ modelTaskProgress(proposalOf(message)) }}
                   </el-tag>
-                </header>
-                <div class="model-task-list">
+                  <span class="model-task-plan-action">{{ isModelPlanExpanded(message, index) ? '收起' : '查看计划' }}<el-icon class="worklog-chevron" :class="{ rotated: isModelPlanExpanded(message, index) }" aria-hidden="true"><ArrowDown /></el-icon></span>
+                </button>
+                <article v-if="currentModelTask(proposalOf(message)) && !isModelPlanExpanded(message, index)" class="model-current-task" :class="`is-${currentModelTask(proposalOf(message))?.status}`">
+                  <div class="model-task-head">
+                    <span class="model-task-index">{{ currentModelTask(proposalOf(message))?.order }}</span>
+                    <div class="model-task-title"><strong>{{ currentModelTask(proposalOf(message))?.title }}</strong><small>{{ modelTaskOutputCount(currentModelTask(proposalOf(message))) }} 项资源 · {{ currentModelTask(proposalOf(message))?.description }}</small></div>
+                    <el-tag size="small" effect="plain" :type="modelTaskStatusType(currentModelTask(proposalOf(message)))">{{ modelTaskStatusLabel(currentModelTask(proposalOf(message))) }}</el-tag>
+                  </div>
+                  <p v-if="currentModelTask(proposalOf(message))?.status === 'blocked'">草稿已准备完成，确认后会将本任务写入对应画布或模块。</p>
+                  <p v-else-if="currentModelTask(proposalOf(message))?.status === 'awaiting_generation'">前置任务已处理。原始资料和已确认定义会保留；由你决定何时开始生成本任务。</p>
+                  <p v-else-if="currentModelTask(proposalOf(message))?.status === 'waiting'">正在等待前一项任务完成。</p>
+                  <div v-if="blockedModelProposalId !== proposalOf(message)?.proposal_id && isActiveModelRun(message) && modelNextAction(proposalOf(message))?.type === 'confirm_task'" class="model-task-actions">
+                    <el-button v-if="modelNextAction(proposalOf(message))?.can_apply" size="small" type="primary" :loading="applyingIndex === index || recoveringModelProposalId === proposalOf(message)?.proposal_id" @click="applyCurrentModelTask(message, index)">
+                      <el-icon aria-hidden="true"><Check /></el-icon>应用本任务并继续
+                    </el-button>
+                  </div>
+                  <div v-if="blockedModelProposalId !== proposalOf(message)?.proposal_id && isActiveModelRun(message) && modelNextAction(proposalOf(message))?.type === 'generate_task'" class="model-task-actions">
+                    <el-button v-if="modelNextAction(proposalOf(message))?.can_generate" size="small" type="primary" :loading="startingModelTaskId === `${proposalOf(message)?.proposal_id}:${currentModelTask(proposalOf(message))?.id}` || compilationBusy" @click="generateCurrentModelTask(message, index)">
+                      <el-icon aria-hidden="true"><Promotion /></el-icon>开始生成本任务
+                    </el-button>
+                  </div>
+                </article>
+                <div v-show="isModelPlanExpanded(message, index)" class="model-task-list">
                   <article v-for="task in modelTasks(proposalOf(message))" :key="task.id" class="model-task" :class="[`is-${task.status}`, { 'is-current': isCurrentModelTask(proposalOf(message), task) }]">
                     <div class="model-task-head">
                       <span class="model-task-index">{{ task.order }}</span>
@@ -289,6 +261,7 @@
                       <small>{{ taskIssueCount(task) }} 项待补全内容与解决建议保留在助手最终汇总中。</small>
                     </div>
                     <div v-else-if="task.status === 'waiting'" class="model-task-waiting">等待当前任务：{{ waitingTaskTitles(proposalOf(message), task).join('、') }}</div>
+                    <div v-else-if="task.status === 'awaiting_generation'" class="model-task-note">前置任务已处理；原始资料和已确认定义会保留，等待你开始生成本任务。</div>
                     <div v-else-if="task.status === 'partially_applied' && modelTaskHasPersistedWrites(task)" class="model-task-note">本任务的安全部分已确认写入；暂不能正式运行的定义仍以草稿形式保留。</div>
                     <div v-else-if="modelTaskNeedsWriteVerification(task)" class="model-task-note">任务已结束，但暂未读取到可核验的正式写入结果。</div>
                     <div v-else-if="['deferred', 'drafted_with_gaps', 'skipped'].includes(task.status)" class="model-task-note">本任务草稿已经生成并保留；缺失与解决建议只在助手会话中汇总。</div>
@@ -297,13 +270,18 @@
                         <el-icon aria-hidden="true"><Check /></el-icon>应用本任务并继续
                       </el-button>
                     </div>
+                    <div v-if="blockedModelProposalId !== proposalOf(message)?.proposal_id && isActiveModelRun(message) && isCurrentModelTask(proposalOf(message), task) && modelNextAction(proposalOf(message))?.type === 'generate_task'" class="model-task-actions">
+                      <el-button v-if="modelNextAction(proposalOf(message))?.can_generate" size="small" type="primary" :loading="startingModelTaskId === `${proposalOf(message)?.proposal_id}:${task.id}` || compilationBusy" @click="generateModelTask(message, index, task)">
+                        <el-icon aria-hidden="true"><Promotion /></el-icon>开始生成本任务
+                      </el-button>
+                    </div>
                   </article>
                 </div>
                 <div v-if="!modelExecutionSummary(proposalOf(message))?.final && modelExecutionSummary(proposalOf(message))?.current_task_title" class="model-run-waiting" aria-live="polite">
-                  <strong>计划未结束</strong>
-                  <span>当前停留在「{{ modelExecutionSummary(proposalOf(message))?.current_task_title }}」等待确认。确认后会写入本任务的正式资源和可见草稿，再继续下一项。</span>
+                  <template v-if="modelNextAction(proposalOf(message))?.type === 'generate_task'">当前停留在「{{ modelExecutionSummary(proposalOf(message))?.current_task_title }}」；前置任务已处理，等待你开始生成。</template>
+                  <template v-else>当前停留在「{{ modelExecutionSummary(proposalOf(message))?.current_task_title }}」等待确认；确认后会写入本任务并继续下一项。</template>
                 </div>
-                <section v-if="modelExecutionSummary(proposalOf(message))?.final" class="model-run-summary" :class="`is-${modelRunStatusType(proposalOf(message))}`" aria-live="polite">
+                <section v-if="isModelPlanExpanded(message, index) && modelExecutionSummary(proposalOf(message))?.final" class="model-run-summary" :class="`is-${modelRunStatusType(proposalOf(message))}`" aria-live="polite">
                   <header><strong>{{ modelRunSummaryTitle(proposalOf(message)) }}</strong><el-tag size="small" effect="plain" :type="modelRunStatusType(proposalOf(message))">最终总结</el-tag></header>
                   <p>{{ modelRunSummaryMessage(proposalOf(message)) }}</p>
                   <div class="model-run-summary-counts">
@@ -503,17 +481,14 @@
               </button>
             </div>
 
-            <section v-if="hasAssistantEvidence(message)" class="answer-evidence" aria-label="回答的规则、工具与不确定项">
-              <header>
-                <span><el-icon aria-hidden="true"><DocumentChecked /></el-icon>回答证据</span>
-                <el-tag size="small" effect="plain" :type="confidenceType(message.evidence?.confidence)">置信度 {{ confidencePercent(message.evidence?.confidence) }}</el-tag>
-              </header>
+            <details v-if="hasAssistantEvidence(message) && proposalOf(message)?.kind !== 'scenario_model'" class="answer-evidence">
+              <summary><span><el-icon aria-hidden="true"><DocumentChecked /></el-icon>查看回答依据</span><small>置信度 {{ confidencePercent(message.evidence?.confidence) }}</small></summary>
               <div class="evidence-meta-grid">
                 <div v-if="message.evidence?.rules_used?.length"><b>使用规则</b><span>{{ message.evidence.rules_used.map((item) => item.result || item.name).join('；') }}</span></div>
                 <div v-if="message.evidence?.tools_called?.length"><b>调用工具</b><span>{{ message.evidence.tools_called.map((item) => `${item.name}${item.purpose ? ` · ${item.purpose}` : ''}`).join('；') }}</span></div>
               </div>
               <div v-if="message.evidence?.uncertainties?.length" class="evidence-uncertainties"><b>仍需确认</b><ul><li v-for="item in message.evidence.uncertainties" :key="item">{{ item }}</li></ul></div>
-            </section>
+            </details>
 
             <section v-if="hasActionPreview(message)" class="assistant-action-preview" aria-label="操作影响与预演结果">
               <header>
@@ -580,21 +555,6 @@
             <el-icon v-else aria-hidden="true"><Paperclip /></el-icon><span>{{ uploadingFiles ? `正在解析 ${uploadingFiles} 个文件` : '添加附件' }}</span>
             <input ref="fileInput" type="file" multiple :disabled="uploadingFiles > 0" accept=".pdf,.docx,.xlsx,.xls,.pptx,.md,.txt,.csv,.json,.png,.jpg,.jpeg" @change="onFilesPicked" />
           </label>
-          <div class="task-preset-control">
-            <label for="assistant-task-preset">本条消息</label>
-            <el-select id="assistant-task-preset" v-model="taskPreset" size="small" aria-label="选择本条消息的协助方式">
-              <el-option label="智能协助（默认）" value="smart" />
-              <el-option v-if="!context.scenario_id" label="生成业务场景草稿" value="scenario" />
-              <el-option v-if="context.scenario_id" label="生成完整模型草稿" value="scenario_model" />
-              <el-option v-if="context.scenario_id" label="生成本体草稿" value="ontology" />
-              <el-option v-if="context.scenario_id" label="生成数据映射草稿" value="mapping" />
-              <el-option v-if="context.scenario_id" label="生成业务能力草稿" value="capabilities" />
-              <el-option v-if="context.scenario_id" label="生成工作流草稿" value="workflow" />
-              <el-option label="只读回答" value="explain" />
-              <el-option v-if="context.scenario_id" label="安全预演" value="execute" />
-            </el-select>
-          </div>
-          <span class="task-preset-hint" role="status" aria-live="polite">{{ taskPresetHint }}</span>
         </div>
         <div class="composer-input-row">
           <el-input
@@ -604,11 +564,11 @@
             resize="none"
             maxlength="12000"
             show-word-limit
-            :placeholder="modelTaskRecoveryBusy ? '正在恢复已提交任务的最新进度' : modelRunAwaitingConfirmation ? '说明要修正或新增的内容，助手会基于当前草稿继续' : composerPlaceholder"
-            :disabled="modelTaskRecoveryBusy"
+            :placeholder="modelTaskRecoveryBusy ? '正在恢复已提交任务的最新进度' : compilationRunning ? '补充、纠正或删除要求；将在当前安全检查点后继续' : modelRunAwaitingConfirmation ? '说明要修正或新增的内容，智能业务顾问会基于当前草稿继续' : composerPlaceholder"
+            :disabled="modelTaskRecoveryBusy || (compilationRunning && !compilationAcceptingGuidance)"
             @keydown.enter.exact.prevent="send()"
           />
-          <el-button class="send-button" type="primary" :loading="loading || compilationBusy || modelTaskRecoveryBusy" :disabled="!canSend || uploadingFiles > 0 || compilationBusy || modelTaskRecoveryBusy" aria-label="发送消息" title="发送" @click="send()">
+          <el-button class="send-button" type="primary" :loading="guidanceSubmitting || (!compilationRunning && (loading || modelTaskRecoveryBusy))" :disabled="!canSend || uploadingFiles > 0 || modelTaskRecoveryBusy || (compilationRunning && !compilationAcceptingGuidance)" :aria-label="compilationRunning ? '向当前任务补充指导' : '发送消息'" :title="compilationRunning ? '补充指导' : '发送'" @click="send()">
             <el-icon aria-hidden="true"><Promotion /></el-icon>
           </el-button>
         </div>
@@ -633,21 +593,19 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { isNavigationFailure, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api, streamAssistantChat } from '@/api'
+import { api, streamAssistantChat, streamAssistantCompilationJob } from '@/api'
 import { useAuthStore } from '@/stores/auth'
-import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationJobStatus, AssistantCompilationStageResult, AssistantCompilationStep, AssistantMessage, AssistantModelExecutionSummary, AssistantModelNextAction, AssistantModelTask, AssistantProposal, AssistantProposalApplyResult, AssistantQuestion, AssistantSource, AssistantThread, AssistantThought, LLMConfig, MCPConfig, Skill } from '@/types'
+import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationActivity, AssistantCompilationJobStatus, AssistantCompilationLiveness, AssistantCompilationStep, AssistantMessage, AssistantModelExecutionSummary, AssistantModelNextAction, AssistantModelTask, AssistantProposal, AssistantProposalApplyResult, AssistantQuestion, AssistantSource, AssistantThread, AssistantThought, LLMConfig, MCPConfig, Skill } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import {
   clearCompilationJobBookmark,
   clearPendingCompilationJobBookmark,
   compilationJobMatchesScenario,
-  compilationPollDelay,
   readCompilationJobBookmark,
   readPendingCompilationJobBookmark,
   saveCompilationJobBookmark,
   savePendingCompilationJobBookmark,
-  selectCompilationJobForRecovery,
   type CompilationRecoveryOwnerScope,
   type CompilationRecoveryThreadScope,
 } from '@/utils/assistantCompilationRecovery'
@@ -665,13 +623,9 @@ const props = withDefaults(defineProps<{ context: AssistantContext; hideLauncher
 })
 const router = useRouter()
 const auth = useAuthStore()
-type AssistantMode = 'ask' | 'explain' | 'draft' | 'apply' | 'execute'
-type AssistantDraftKind = 'auto' | 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'
-type AssistantTaskPreset = 'smart' | 'scenario' | 'scenario_model' | 'ontology' | 'mapping' | 'capabilities' | 'workflow' | 'explain' | 'execute'
 const visible = ref(false)
 const loading = ref(false)
 const input = ref('')
-const taskPreset = ref<AssistantTaskPreset>('smart')
 const messages = ref<AssistantMessage[]>([])
 const attachments = ref<AssistantAttachment[]>([])
 const threadId = ref('')
@@ -681,15 +635,17 @@ const threadsLoading = ref(false)
 const messageRef = ref<HTMLElement>()
 const fileInput = ref<HTMLInputElement>()
 const uploadingFiles = ref(0)
+const guidanceSubmitting = ref(false)
 const applyingIndex = ref<number | null>(null)
+const startingModelTaskId = ref('')
 const sourcePreviewVisible = ref(false)
 const sourcePreviewLoading = ref(false)
 const sourcePreview = ref<AssistantSource | null>(null)
 const sourcePreviewText = ref('')
 const expandedProposal = reactive<Record<number, boolean>>({})
+const expandedModelPlans = reactive<Record<string, boolean>>({})
 const expandedChangeLists = reactive<Record<string, boolean>>({})
 const expandedIssueGroups = reactive<Record<string, boolean>>({})
-const expandedThinking = reactive<Record<string, boolean>>({})
 const selection = reactive<{ label: string; kind: string; id: string }>({ label: '', kind: '', id: '' })
 const assistantConfig = reactive<{ llmConfigId: string; skillIds: string[]; mcpIds: string[] }>({
   llmConfigId: '',
@@ -702,16 +658,14 @@ const assistantMCPs = ref<MCPConfig[]>([])
 const capabilitiesLoading = ref(false)
 const capabilitiesLoaded = ref(false)
 const activeCompilationJob = ref<AssistantCompilationJobStatus | null>(null)
-const planExpanded = ref(true)
 const compilationRecoveryThreadId = ref('')
+const compilationLiveness = reactive<Record<string, AssistantCompilationLiveness[]>>({})
 const recoveringModelProposalId = ref('')
 const blockedModelProposalId = ref('')
 const modelTaskRecoveryFailure = ref('')
-let compilationPollTimer: number | null = null
-let modelTaskRecoveryTimer: number | null = null
+let compilationStreamController: AbortController | null = null
 let compilationRecoveryEpoch = 0
-let compilationPollErrors = 0
-let modelTaskRecoveryErrors = 0
+let lastProjectedCheckpoint = ''
 let modelTaskRecoveryGeneration = 0
 let streamGeneration = 0
 let componentDisposed = false
@@ -723,35 +677,10 @@ const context = computed(() => ({
   path: props.context.path || '',
   scenario_id: props.context.scenario_id || '',
 }))
-const taskPresetHint = computed(() => ({
-  smart: '自动理解本条是提问还是建设要求；不会因为位于建模页就创建内容。',
-  scenario: '仅本条偏向生成场景草稿；发送后恢复智能协助。',
-  scenario_model: '仅本条偏向生成跨资源变更清单；发送后恢复智能协助。',
-  ontology: '仅本条聚焦对象、属性、关系与约束；发送后恢复智能协助。',
-  mapping: '仅本条聚焦已检查的真实表和字段；发送后恢复智能协助。',
-  capabilities: '仅本条聚焦新增业务能力；修改正式定义仍走专用编辑流程。',
-  workflow: '仅本条聚焦工作流草稿；发送后恢复智能协助。',
-  explain: '仅本条只读回答，不生成变更；发送后恢复智能协助。',
-  execute: '仅本条检查权限与副作用，不执行操作；发送后恢复智能协助。',
-} as Record<AssistantTaskPreset, string>)[taskPreset.value])
-const composerPlaceholder = computed(() => ({
-  scenario_model: '介绍业务目标、范围与关键规则，或直接添加业务文档后发送',
-  capabilities: '描述要新增的计算、业务动作、判断规则和业务事件',
-  ontology: '描述核心对象、属性、关系、基数和业务约束',
-  mapping: '说明目标对象及期望映射；系统只会选择真实存在的表和字段',
-  workflow: '描述触发条件、处理步骤、判断分支、动作与最终结果',
-  explain: '询问当前业务、本体、映射或流程，我只做只读解释',
-  execute: '说明要预演的已配置操作及参数，不会直接产生副作用',
-  scenario: '描述场景名称、行业、业务目标和边界',
-  smart: '描述你要完成的工作，助手会结合当前业务上下文自动判断',
-} as Record<AssistantTaskPreset, string>)[taskPreset.value])
+const composerPlaceholder = '描述你要完成的工作，智能业务顾问会结合当前页面和上下文自动判断下一步'
 const canSend = computed(() => Boolean(
   input.value.trim()
-  || (
-    ['scenario', 'scenario_model', 'ontology', 'mapping', 'capabilities', 'workflow'].includes(taskPreset.value)
-    && attachments.value.length
-    && attachments.value.every((item) => item.status === 'parsed')
-  )
+  || (attachments.value.length && attachments.value.every((item) => item.status === 'parsed'))
 ))
 const assistantScopeKey = computed(() => `${context.value.scenario_id || 'global'}|${normalizedAssistantPath(context.value.path)}`)
 const storageKey = computed(() => `ontology-assistant-thread:${encodeURIComponent(assistantScopeKey.value)}`)
@@ -767,6 +696,26 @@ const compilationRunning = computed(() => activeCompilationJob.value?.status ===
 const compilationBusy = computed(() => Boolean(activeCompilationJob.value)
   && activeCompilationJob.value?.status !== 'failed'
   && compilationRecoveryThreadId.value === threadId.value)
+const compilationAcceptingGuidance = computed(() => (
+  compilationRunning.value
+  && activeCompilationJob.value?.progress?.accepting_guidance !== false
+))
+const advisorWorking = computed(() => Boolean(
+  compilationRunning.value || loading.value || modelTaskRecoveryBusy.value,
+))
+const launcherStatus = computed(() => {
+  const job = activeCompilationJob.value
+  if (compilationRunning.value && job) {
+    const current = job.progress?.steps?.find((step) => step.status === 'running')
+    const count = Number(job.progress?.draft_resource_count || 0)
+    const liveness = latestCompilationLiveness(job.id)
+    const elapsed = liveness ? formatElapsedSeconds(liveness.elapsed_seconds) : ''
+    if (count > 0) return `${current?.title || '正在建模'} · 已同步 ${count} 项 · ${elapsed || '持续运行中'}`
+    return `${current?.title || '正在建设场景模型'} · ${elapsed || '持续运行中'}`
+  }
+  if (modelTaskRecoveryBusy.value) return '正在恢复任务'
+  return '正在回复'
+})
 const latestModelRunMessage = computed(() => [...messages.value].reverse().find(
   (message) => proposalOf(message)?.kind === 'scenario_model',
 ))
@@ -782,34 +731,15 @@ const modelRunAwaitingConfirmation = computed(() => Boolean(activeModelRunMessag
   && blockedModelProposalId.value !== proposalOf(activeModelRunMessage.value as AssistantMessage)?.proposal_id
   && modelNextAction(proposalOf(activeModelRunMessage.value as AssistantMessage))?.type === 'confirm_task')
 const modelTaskRecoveryBusy = computed(() => Boolean(recoveringModelProposalId.value))
-const compilationCallSummary = computed(() => {
-  const job = activeCompilationJob.value
-  if (!job || job.status !== 'running') return ''
-  const used = Number(job.llm_calls_used ?? job.progress?.calls_used ?? 0)
-  const budget = Number(job.llm_call_budget ?? job.progress?.call_budget ?? 0)
-  return budget > 0 ? `模型调用 ${used}/${budget}` : '正在等待服务端进度'
-})
 const fallbackCompilationSteps: AssistantCompilationStep[] = [
   { id: 'analyze', title: '分析业务资料', detail: '正在读取附件和用户补充描述。', status: 'running' },
   { id: 'plan', title: '制定建模任务', detail: '正在拆解建模范围和执行顺序。', status: 'pending' },
-  { id: 'ontology', title: '建立本体与业务能力', detail: '等待执行。', status: 'pending' },
+  { id: 'ontology', title: '建设本体模型', detail: '等待执行。', status: 'pending' },
   { id: 'mapping', title: '整理数据映射', detail: '等待执行。', status: 'pending' },
   { id: 'rules', title: '校验规则、事件与工作流', detail: '等待执行。', status: 'pending' },
   { id: 'review', title: '生成待审核变更清单', detail: '等待执行。', status: 'pending' },
   { id: 'result', title: '汇总执行结果', detail: '等待执行。', status: 'pending' },
 ]
-const compilationPlanSteps = computed<AssistantCompilationStep[]>(() => {
-  const steps = activeCompilationJob.value?.progress?.steps
-  return steps?.length ? steps : fallbackCompilationSteps
-})
-const compilationCompletedSteps = computed(() => compilationPlanSteps.value.filter((step) => step.status === 'done').length)
-const compilationStageResults = computed<AssistantCompilationStageResult[]>(() => activeCompilationJob.value?.progress?.results || [])
-const compilationPlanHeadline = computed(() => {
-  const current = compilationPlanSteps.value.find((step) => step.status === 'running')
-  if (activeCompilationJob.value?.status === 'failed') return '任务在当前步骤停止，未写入正式模型'
-  if (current) return `${current.title}（第 ${compilationStepIndex(current.id) }/${compilationPlanSteps.value.length} 项）`
-  return activeCompilationJob.value?.status === 'succeeded' ? '草稿生成阶段完成，正在进入任务确认' : '准备执行任务'
-})
 // The Agent chat owns the bottom-right composer controls. A persistent global
 // launcher must not cover its primary send action or keyboard focus target.
 const showLauncher = computed(() => {
@@ -927,9 +857,26 @@ function modelRunSummaryMessage(proposal: AssistantProposal | null) {
   if (!summary) return ''
   if (!modelRunFinishedWithoutPersistedWrites(proposal)) return summary.message
   const draftCount = modelDraftOnlyTaskCount(proposal)
-  return draftCount
-    ? `本轮未确认到正式资源写入；${draftCount} 项任务仅保留了停用草稿，请按问题说明补全后重新确认。`
-    : '本轮未确认到正式资源写入；计划没有产生可应用的正式定义。'
+  const sourceCount = Number(proposal?.payload?.coverage_summary?.total || 0)
+  const taskTitles = modelTasks(proposal)
+    .filter((task) => ['drafted_with_gaps', 'deferred', 'skipped'].includes(task.status))
+    .map((task) => task.title)
+  const causes = [...new Set(
+    scenarioIssueGroups(proposal)
+      .map((group) => `${scenarioModelIssueLabel(group.code)}（${group.count} 项）`),
+  )].slice(0, 3)
+  const lines = [
+    sourceCount
+      ? `我已完成对 **${sourceCount} 个来源段落** 的分析，并把结果整理为可继续编辑的场景建模草稿。`
+      : '我已完成本轮资料分析，并把结果整理为可继续编辑的场景建模草稿。',
+    draftCount
+      ? `- 已形成 ${draftCount} 项任务草稿：${taskTitles.join('、') || '各场景建模任务'}`
+      : '- 本轮没有形成可用的任务草稿',
+    '- 正式写入：0 项；当前场景中的正式定义没有被修改',
+  ]
+  if (causes.length) lines.push(`- 主要待补全：${causes.join('；')}`)
+  lines.push('下一步：展开下方“建模产物”查看具体来源、草稿和问题；补充信息后可以直接在当前对话继续。')
+  return lines.join('\n')
 }
 
 function modelRunContextStatus(proposal: AssistantProposal | null) {
@@ -1042,7 +989,8 @@ function modelTaskProgress(proposal: AssistantProposal | null) {
     : `${completed}/${tasks.length} 项 · 计划进行中`
 }
 
-function modelTaskStatusLabel(task: AssistantModelTask) {
+function modelTaskStatusLabel(task?: AssistantModelTask) {
+  if (!task) return '待处理'
   if (modelTaskNeedsWriteVerification(task)) return '写入结果待核验'
   const status = task.status
   return ({
@@ -1050,6 +998,7 @@ function modelTaskStatusLabel(task: AssistantModelTask) {
     ready: '等待确认',
     blocked: '有缺口，等待确认',
     waiting: '等待当前任务',
+    awaiting_generation: '等待开始生成',
     applied: '已应用',
     partially_applied: '已应用安全部分',
     deferred: '草稿已保留',
@@ -1058,7 +1007,8 @@ function modelTaskStatusLabel(task: AssistantModelTask) {
   } as Record<string, string>)[status] || '待处理'
 }
 
-function modelTaskStatusType(task: AssistantModelTask) {
+function modelTaskStatusType(task?: AssistantModelTask) {
+  if (!task) return 'info'
   if (modelTaskNeedsWriteVerification(task)) return 'warning'
   const status = task.status
   return ({
@@ -1066,6 +1016,7 @@ function modelTaskStatusType(task: AssistantModelTask) {
     ready: 'warning',
     blocked: 'warning',
     waiting: 'info',
+    awaiting_generation: 'primary',
     applied: 'success',
     partially_applied: 'warning',
     deferred: 'info',
@@ -1088,35 +1039,14 @@ function taskIssueCount(task: AssistantModelTask) {
   )
 }
 
-function modelTaskOutputCount(task: AssistantModelTask) {
+function modelTaskOutputCount(task?: AssistantModelTask) {
+  if (!task) return 0
   const values = [
     Number((task as any).output_count),
     Number((task as any).draft_candidate_count),
     Number(task.change_count),
   ].filter((value) => Number.isFinite(value) && value >= 0)
   return Math.trunc(Math.max(0, ...values))
-}
-
-function requestRouteForPreset(preset: AssistantTaskPreset): { mode: AssistantMode; draft_kind: AssistantDraftKind } {
-  if (preset === 'explain') return { mode: 'explain', draft_kind: 'auto' }
-  if (preset === 'execute') return { mode: 'execute', draft_kind: 'auto' }
-  if (preset === 'smart') return { mode: 'ask', draft_kind: 'auto' }
-  return {
-    mode: 'draft',
-    draft_kind: preset === 'capabilities' ? 'scenario_model' : preset,
-  }
-}
-
-function chooseTask(preset: AssistantTaskPreset) {
-  taskPreset.value = preset
-  if (input.value.trim()) return
-  input.value = ({
-    explain: '请概括当前场景已有的模型与能力，并回答我接下来的问题：',
-    scenario_model: '请根据以下业务介绍和附件，完成当前场景的完整建模，并列出所有未识别、歧义和冲突项。\n\n业务介绍：',
-    ontology: '请根据以下业务描述和附件，建立对象类型、属性、关系及约束。\n\n业务描述：',
-    capabilities: '请根据以下业务描述和附件，新增所需函数、操作、规则和事件，并保持待审核状态。\n\n业务描述：',
-    workflow: '请根据以下业务描述和附件，设计触发条件、处理节点、判断分支和审批流程。\n\n业务描述：',
-  } as Partial<Record<AssistantTaskPreset, string>>)[preset] || ''
 }
 
 function restoreAssistantConfig() {
@@ -1328,10 +1258,6 @@ function hasAssistantEvidence(message: AssistantMessage) {
   return Boolean(evidence && (evidence.rules_used?.length || evidence.tools_called?.length || evidence.uncertainties?.length || evidence.confidence > 0))
 }
 function confidencePercent(value?: number) { return `${Math.round(Math.max(0, Math.min(Number(value || 0), 1)) * 100)}%` }
-function confidenceType(value?: number): 'success' | 'warning' | 'danger' {
-  const score = Number(value || 0)
-  return score >= .8 ? 'success' : score >= .6 ? 'warning' : 'danger'
-}
 function hasActionPreview(message: AssistantMessage) { return Boolean(message.action_preview && Object.keys(message.action_preview).length) }
 function assistantPermissionLabel(permission?: Record<string, unknown>) {
   if (!permission || !Object.keys(permission).length) return '尚未检查'
@@ -1452,34 +1378,121 @@ function messageKey(message: AssistantMessage, index: number) {
   return message.id || `message-${index}`
 }
 
-function isThinkingExpanded(message: AssistantMessage, index: number) {
-  return expandedThinking[messageKey(message, index)] ?? Boolean(message.streaming)
+function modelPlanKey(message: AssistantMessage, index: number) {
+  return `${messageKey(message, index)}::__model-plan__`
 }
 
-function toggleThinking(message: AssistantMessage, index: number) {
-  const key = messageKey(message, index)
-  expandedThinking[key] = !isThinkingExpanded(message, index)
+function isModelPlanExpanded(message: AssistantMessage, index: number) {
+  return Boolean(expandedModelPlans[modelPlanKey(message, index)])
 }
 
-function thinkingSummary(message: AssistantMessage) {
+function toggleModelPlan(message: AssistantMessage, index: number) {
+  const key = modelPlanKey(message, index)
+  expandedModelPlans[key] = !isModelPlanExpanded(message, index)
+}
+
+function currentModelTask(proposal: AssistantProposal | null) {
+  const tasks = modelTasks(proposal)
+  return tasks.find((task) => isCurrentModelTask(proposal, task))
+    || tasks.find((task) => ['ready', 'blocked', 'awaiting_generation'].includes(task.status))
+}
+
+function modelPlanSummary(proposal: AssistantProposal | null) {
+  const summary = modelExecutionSummary(proposal)
+  if (summary?.final) return '已完成的任务、草稿和待补全项仍可随时查看。'
+  if (modelNextAction(proposal)?.type === 'generate_task' && summary?.current_task_title) {
+    return `前置任务已处理，等待你开始生成「${summary.current_task_title}」。`
+  }
+  if (summary?.current_task_title) return `当前停在「${summary.current_task_title}」，等待你的确认。`
+  return '按依赖顺序执行；需要写入时会明确向你确认。'
+}
+
+function hasToolWork(message: AssistantMessage) {
+  const routing = (message.context as Record<string, any> | undefined)?.routing
+  return Boolean(
+    message.context?.compilation_job_id
+    || proposalOf(message)?.kind === 'scenario_model'
+    || routing?.intent === 'scenario_model'
+    || assistantMessageActivities(message).length,
+  )
+}
+
+function visibleWorkSteps(message: AssistantMessage) {
   const steps = message.thinking || []
+  if (message.streaming || hasToolWork(message)) return steps
+  return steps.filter((step) => (
+    !['routing', 'context', 'response'].includes(String(step.id))
+    || step.status === 'error'
+  ))
+}
+
+function workTranscriptEntries(message: AssistantMessage): AssistantCompilationActivity[] {
+  const activities = assistantMessageActivities(message)
+  if (!activities.length) {
+    return visibleWorkSteps(message).map((step) => ({
+      id: `step:${step.id}`,
+      kind: 'stage' as const,
+      step_id: step.id,
+      title: step.title,
+      detail: String(step.detail || ''),
+      status: step.status || 'pending',
+    }))
+  }
+  const grouped = new Map<string, AssistantCompilationActivity & { count?: number }>()
+  for (const activity of activities) {
+    const key = `${activity.kind}:${activity.step_id || activity.id}`
+    const existing = grouped.get(key)
+    if (!existing) {
+      grouped.set(key, activity.kind === 'model'
+        ? {
+            ...activity,
+            title: '模型分析',
+            detail: activity.status === 'running'
+              ? '正在处理当前阶段；本阶段已发起 1 次受控模型调用。'
+              : '当前阶段的 1 次受控模型调用已经结束。',
+            count: 1,
+          }
+        : { ...activity, count: 1 })
+      continue
+    }
+    const count = Number(existing.count || 1) + 1
+    Object.assign(existing, activity, { count })
+    if (activity.kind === 'model') {
+      existing.title = '模型分析'
+      existing.detail = activity.status === 'running'
+        ? `正在处理当前阶段；本阶段已发起 ${count} 次受控模型调用。`
+        : `当前阶段的 ${count} 次受控模型调用已经结束。`
+    }
+  }
+  return [...grouped.values()].map(({ count: _count, ...entry }) => entry).slice(-16)
+}
+
+function shouldShowWorkLog(message: AssistantMessage) {
+  return message.role === 'assistant' && Boolean(
+    message.streaming
+    || visibleWorkSteps(message).length
+    || assistantMessageActivities(message).length,
+  )
+}
+
+function workLogSummary(message: AssistantMessage) {
+  const steps = visibleWorkSteps(message)
   const running = steps.find((step) => step.status === 'running')
   if (running) return running.title
   const error = steps.find((step) => step.status === 'error')
   if (error) return error.title
   const pending = steps.find((step) => step.status === 'pending')
   if (pending) return `等待执行：${pending.title}`
-  return message.streaming ? '正在处理当前请求' : `已完成 ${steps.length} 个处理步骤`
+  if (assistantMessageActivities(message).length) return '本次建模的工作记录'
+  return message.streaming ? '正在理解你的请求' : `已完成 ${steps.length} 个处理步骤`
 }
 
-function upsertThinking(message: AssistantMessage, step: AssistantThought, index: number) {
+function upsertThinking(message: AssistantMessage, step: AssistantThought) {
   const thinking = (message.thinking || []) as AssistantThought[]
   const existing = thinking.find((item) => item.id === step.id)
   if (existing) Object.assign(existing, step)
   else thinking.push(step)
   message.thinking = thinking
-  const key = messageKey(message, index)
-  if (!(key in expandedThinking)) expandedThinking[key] = true
 }
 
 function scrollBottom() {
@@ -1527,17 +1540,20 @@ function safeScenarioAssistantPath(path: string | null | undefined, scenarioId: 
   return normalized === `/scenarios/${encodeURIComponent(scenarioId)}` ? normalized : ''
 }
 
-function clearCompilationPollTimer() {
-  if (compilationPollTimer) window.clearTimeout(compilationPollTimer)
-  compilationPollTimer = null
+function clearCompilationStream() {
+  compilationStreamController?.abort()
+  compilationStreamController = null
 }
 
 function detachCompilationRecovery(clearStatus = true) {
-  clearCompilationPollTimer()
+  clearCompilationStream()
   compilationRecoveryEpoch += 1
-  compilationPollErrors = 0
   compilationRecoveryThreadId.value = ''
-  if (clearStatus) activeCompilationJob.value = null
+  if (clearStatus) {
+    const jobId = activeCompilationJob.value?.id
+    if (jobId) delete compilationLiveness[jobId]
+    activeCompilationJob.value = null
+  }
 }
 
 function compilationRecoveryIsCurrent(epoch: number, scope: CompilationRecoveryThreadScope) {
@@ -1552,12 +1568,6 @@ function compilationRecoveryIsCurrent(epoch: number, scope: CompilationRecoveryT
     && compilationRecoveryThreadId.value === scope.threadId
 }
 
-function dismissCompilationFailure() {
-  if (activeCompilationJob.value?.status !== 'failed') return
-  activeCompilationJob.value = null
-  compilationRecoveryThreadId.value = ''
-}
-
 function compilationProgressDetail(job: AssistantCompilationJobStatus) {
   const detail = String(job.progress?.detail || '').trim()
   if (detail) return detail
@@ -1566,9 +1576,120 @@ function compilationProgressDetail(job: AssistantCompilationJobStatus) {
   return job.error_message || '系统已保持零写入。请修改附件或描述后显式重试。'
 }
 
-function compilationStepIndex(stepId: string) {
-  const index = compilationPlanSteps.value.findIndex((step) => step.id === stepId)
-  return index >= 0 ? index + 1 : 1
+function compilationElapsedSeconds(job: AssistantCompilationJobStatus) {
+  const startedAt = Date.parse(String(job.started_at || ''))
+  const completedAt = Date.parse(String(job.completed_at || ''))
+  if (!Number.isFinite(startedAt)) return 0
+  const endedAt = job.status === 'running' || !Number.isFinite(completedAt)
+    ? Date.now()
+    : completedAt
+  return Math.max(0, Math.floor((endedAt - startedAt) / 1000))
+}
+
+function formatElapsedSeconds(rawSeconds: number) {
+  const seconds = Math.max(0, Math.floor(Number(rawSeconds) || 0))
+  if (seconds < 60) return `已运行 ${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  const remainder = seconds % 60
+  return `已运行 ${minutes} 分 ${remainder} 秒`
+}
+
+function compilationElapsedLabel(job: AssistantCompilationJobStatus) {
+  if (!job.started_at) return ''
+  return formatElapsedSeconds(compilationElapsedSeconds(job)).replace('已运行', '已耗时')
+}
+
+function compilationRuntimeSummary(job: AssistantCompilationJobStatus) {
+  const elapsed = compilationElapsedLabel(job)
+  const used = Number(job.llm_calls_used || job.progress?.calls_used || 0)
+  const budget = Number(job.llm_call_budget || job.progress?.call_budget || 0)
+  const calls = budget > 0 ? `模型调用 ${used}/${budget}` : ''
+  return [elapsed, calls].filter(Boolean).join(' · ')
+}
+
+function compilationNarrative(job: AssistantCompilationJobStatus) {
+  const steps = job.progress?.steps?.length ? job.progress.steps : fallbackCompilationSteps
+  const completed = steps.filter((step) => step.status === 'done').map((step) => step.title)
+  const current = steps.find((step) => step.status === 'running')
+    || steps.find((step) => step.status === 'error')
+  const detail = compilationProgressDetail(job)
+  const runtime = compilationRuntimeSummary(job)
+  if (job.status === 'failed') {
+    return `这次场景建模在「${current?.title || '当前阶段'}」停止，未写入正式资源。\n\n${[runtime, detail].filter(Boolean).join('；')}\n\n我已保留本次可恢复的上下文；补充资料或调整要求后，可以从当前会话重新发起。`
+  }
+  if (job.status === 'succeeded') {
+    return `业务资料分析和草稿生成已经完成。\n\n${[runtime, detail].filter(Boolean).join('；')}\n\n我正在读取可核对的结果；涉及正式写入时，会在对应任务处明确等待你的确认。`
+  }
+  const completedText = completed.length ? `已完成：${completed.join('、')}。` : '我正在先梳理资料和建模范围。'
+  const currentText = current ? `当前在处理「${current.title}」：${current.detail}` : detail
+  const progressBoundary = '我会持续回显真实阶段和调用记录；如果资料需要分段处理，会明确说明当前正在处理哪一部分。'
+  return `我正在处理这份业务资料。\n\n${completedText}\n${currentText}\n\n${[runtime, detail].filter(Boolean).join('；')}\n\n${progressBoundary}\n\n每个需要正式写入的任务都会先在这里说明影响并等待你的确认。`
+}
+
+function activityKindLabel(kind: string) {
+  if (kind === 'model') return '模型调用'
+  if (kind === 'tool') return '工具调用'
+  return '阶段'
+}
+
+function assistantMessageActivities(message: AssistantMessage): AssistantCompilationActivity[] {
+  const raw = message.context?.compilation_progress?.activities
+  if (!Array.isArray(raw)) return []
+  return raw.slice(-12) as AssistantCompilationActivity[]
+}
+
+function latestCompilationLiveness(jobId: string) {
+  const entries = compilationLiveness[jobId] || []
+  return entries[entries.length - 1]
+}
+
+function compilationLiveEntries(message: AssistantMessage) {
+  const jobId = String(message.context?.compilation_job_id || '').trim()
+  return jobId ? compilationLiveness[jobId] || [] : []
+}
+
+function formatLivenessClock(value: string) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '刚刚'
+  return date.toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
+}
+
+function recordCompilationLiveness(raw: Record<string, any>) {
+  const job = activeCompilationJob.value
+  const jobId = String(raw.job_id || '').trim()
+  const scenarioId = String(raw.scenario_id || '').trim()
+  if (!job || !jobId || job.id !== jobId) return
+  if (scenarioId && scenarioId !== context.value.scenario_id) return
+  const emittedAt = Number.isFinite(Date.parse(String(raw.emitted_at || '')))
+    ? String(raw.emitted_at)
+    : new Date().toISOString()
+  const entry: AssistantCompilationLiveness = {
+    job_id: jobId,
+    thread_id: raw.thread_id || job.thread_id || null,
+    scenario_id: scenarioId || job.scenario_id || null,
+    status: 'running',
+    stream_state: raw.stream_state === 'disconnected' ? 'disconnected' : 'connected',
+    emitted_at: emittedAt,
+    elapsed_seconds: Math.max(0, Number(raw.elapsed_seconds ?? compilationElapsedSeconds(job)) || 0),
+    phase: String(raw.phase || job.progress?.phase || ''),
+    current_step: String(raw.current_step || job.progress?.current_step || ''),
+    stage_title: String(raw.stage_title || job.progress?.steps?.find((step) => step.status === 'running')?.title || '场景建模'),
+    message: String(raw.message || '服务端任务仍在运行，新的阶段结果会立即同步到当前对话。'),
+    calls_used: Math.max(0, Number(raw.calls_used ?? job.llm_calls_used) || 0),
+    call_budget: Math.max(0, Number(raw.call_budget ?? job.llm_call_budget) || 0),
+    draft_checkpoint_revision: Math.max(0, Number(raw.draft_checkpoint_revision ?? job.progress?.draft_checkpoint_revision) || 0),
+    draft_resource_count: Math.max(0, Number(raw.draft_resource_count ?? job.progress?.draft_resource_count) || 0),
+    guidance_pending_count: Math.max(0, Number(raw.guidance_pending_count ?? job.progress?.guidance_pending_count) || 0),
+  }
+  const previous = compilationLiveness[jobId] || []
+  if (previous.some((item) => item.emitted_at === entry.emitted_at)) return
+  compilationLiveness[jobId] = [...previous, entry].slice(-4)
+  scrollBottom()
 }
 
 function markCompilationMessage(job: AssistantCompilationJobStatus, scope: CompilationRecoveryThreadScope) {
@@ -1587,11 +1708,15 @@ function markCompilationMessage(job: AssistantCompilationJobStatus, scope: Compi
   }
   if (index < 0) return
   const message = messages.value[index]
-  message.streaming = job.status !== 'failed'
+  message.streaming = job.status === 'running'
   message.context = {
     ...(message.context || {}),
     compilation_job_id: job.id,
     status: job.status === 'running' ? 'processing' : job.status,
+    compilation_progress: job.progress,
+  }
+  if (!message.proposal) {
+    message.content = compilationNarrative(job)
   }
   const steps = job.progress?.steps || []
   if (steps.length) {
@@ -1600,57 +1725,150 @@ function markCompilationMessage(job: AssistantCompilationJobStatus, scope: Compi
       title: step.title,
       detail: step.detail,
       status: step.status,
-    }, index))
+    }))
   } else {
     upsertThinking(message, {
       id: 'scenario-model',
       title: job.status === 'running' ? '执行完整场景建模' : job.status === 'succeeded' ? '完整场景建模已完成' : '完整场景建模未完成',
       detail: compilationProgressDetail(job),
       status: job.status === 'running' ? 'running' : job.status === 'succeeded' ? 'done' : 'error',
-    }, index)
+    })
   }
   scrollBottom()
 }
 
-function scheduleCompilationPoll(jobId: string, epoch: number, scope: CompilationRecoveryThreadScope) {
-  if (!compilationRecoveryIsCurrent(epoch, scope)) return
-  clearCompilationPollTimer()
-  compilationPollTimer = window.setTimeout(
-    () => { void pollCompilationJob(jobId, epoch, scope) },
-    compilationPollDelay(document.hidden, compilationPollErrors),
-  )
+function projectDraftCheckpoint(data: Record<string, any>) {
+  const scenarioId = String(data.scenario_id || context.value.scenario_id || '').trim()
+  const jobId = String(data.job_id || activeCompilationJob.value?.id || '').trim()
+  const revision = Math.max(0, Number(data.revision || data.draft_checkpoint_revision || 0))
+  if (!scenarioId || scenarioId !== context.value.scenario_id || !jobId || revision <= 0) return
+  const identity = `${jobId}:${revision}`
+  if (identity === lastProjectedCheckpoint) return
+  lastProjectedCheckpoint = identity
+  window.dispatchEvent(new CustomEvent('assistant-scenario-drafts-updated', {
+    detail: {
+      scenario_id: scenarioId,
+      job_id: jobId,
+      revision,
+      resource_count: Number(data.resource_count || data.draft_resource_count || 0),
+      live: true,
+    },
+  }))
 }
 
-async function pollCompilationJob(jobId: string, epoch: number, scope: CompilationRecoveryThreadScope) {
-  if (!compilationRecoveryIsCurrent(epoch, scope)) return
-  compilationPollTimer = null
-  try {
-    const job = await api.getAssistantCompilationJob(jobId)
-    if (!compilationRecoveryIsCurrent(epoch, scope)) return
-    compilationPollErrors = 0
-    await consumeCompilationJob(job, epoch, scope)
-  } catch (error: any) {
-    if (!compilationRecoveryIsCurrent(epoch, scope)) return
-    if (error?.status === 403 || error?.status === 404) {
-      clearCompilationJobBookmark(localStorage, scope)
-      activeCompilationJob.value = null
-      compilationRecoveryThreadId.value = ''
-      ElMessage.warning('当前账号或场景已无法访问这项编译任务，已停止恢复。')
-      return
-    }
-    compilationPollErrors += 1
-    if (activeCompilationJob.value?.status === 'running') {
-      activeCompilationJob.value = {
-        ...activeCompilationJob.value,
-        progress: {
-          ...(activeCompilationJob.value.progress || {}),
-          detail: '暂时无法刷新任务进度；系统不会重新提交请求，将继续安全重试状态查询。',
-        },
-      }
-      markCompilationMessage(activeCompilationJob.value, scope)
-    }
-    scheduleCompilationPoll(jobId, epoch, scope)
+function applyCompilationSnapshot(
+  data: Record<string, any>,
+  scope: CompilationRecoveryThreadScope,
+) {
+  const job = data?.job as AssistantCompilationJobStatus | undefined
+  if (!job || !compilationJobMatchesScenario(job, scope.scenarioId)) {
+    clearCompilationJobBookmark(localStorage, scope)
+    detachCompilationRecovery()
+    ElMessage.error('检测到跨场景的建模事件，已拒绝关联。')
+    return
   }
+  projectDraftCheckpoint({
+    scenario_id: scope.scenarioId,
+    job_id: job.id,
+    draft_checkpoint_revision: job.progress?.draft_checkpoint_revision,
+    draft_resource_count: job.progress?.draft_resource_count,
+  })
+  activeCompilationJob.value = job
+  markCompilationMessage(job, scope)
+  const durable = data?.message as AssistantMessage | undefined
+  if (durable?.role === 'assistant') {
+    const message = messages.value.find((item) => (
+      item.context?.compilation_job_id === job.id
+      || (durable.id && item.id === durable.id)
+    ))
+    if (message) {
+      Object.assign(message, durable, { streaming: job.status === 'running' })
+    } else {
+      messages.value.push({ ...durable, streaming: job.status === 'running' })
+    }
+  }
+  if (job.status === 'running') {
+    saveCompilationJobBookmark(localStorage, scope, job.id)
+    return
+  }
+  delete compilationLiveness[job.id]
+  clearCompilationJobBookmark(localStorage, scope)
+  const owner = compilationOwnerScope()
+  if (owner) clearPendingCompilationJobBookmark(localStorage, owner)
+  clearCompilationStream()
+  compilationRecoveryThreadId.value = ''
+  compilationRecoveryEpoch += 1
+  loading.value = false
+  const proposal = durable ? proposalOf(durable) : null
+  if (proposal?.kind === 'scenario_model') {
+    window.dispatchEvent(new CustomEvent('assistant-scenario-drafts-updated', {
+      detail: { scenario_id: scope.scenarioId, proposal_id: proposal.proposal_id },
+    }))
+  }
+  if (job.status === 'succeeded') {
+    activeCompilationJob.value = null
+  } else {
+    ElMessage.error(job.error_message || '完整业务模型编译未完成，系统已保持零写入。')
+  }
+  scrollBottom()
+}
+
+function attachCompilationEventStream(
+  job: AssistantCompilationJobStatus,
+  scope: CompilationRecoveryThreadScope,
+) {
+  clearCompilationStream()
+  compilationRecoveryEpoch += 1
+  const epoch = compilationRecoveryEpoch
+  compilationRecoveryThreadId.value = scope.threadId
+  activeCompilationJob.value = job
+  saveCompilationJobBookmark(localStorage, scope, job.id)
+  markCompilationMessage(job, scope)
+  let controller: AbortController | null = null
+  controller = streamAssistantCompilationJob(
+    job.id,
+    (event) => {
+      if (!controller || compilationStreamController !== controller) return
+      if (!compilationRecoveryIsCurrent(epoch, scope)) return
+      if (event.type === 'compilation_liveness') {
+        recordCompilationLiveness(event.data || {})
+      } else if (event.type === 'compilation_progress' || event.type === 'compilation_result') {
+        applyCompilationSnapshot(event.data || {}, scope)
+      }
+    },
+    () => {
+      if (controller && compilationStreamController === controller) {
+        compilationStreamController = null
+      }
+    },
+    (error) => {
+      if (!controller || compilationStreamController !== controller) return
+      compilationStreamController = null
+      if (!compilationRecoveryIsCurrent(epoch, scope)) return
+      if (activeCompilationJob.value?.status === 'running') {
+        recordCompilationLiveness({
+          job_id: activeCompilationJob.value.id,
+          thread_id: activeCompilationJob.value.thread_id,
+          scenario_id: activeCompilationJob.value.scenario_id,
+          stream_state: 'disconnected',
+          emitted_at: new Date().toISOString(),
+          elapsed_seconds: compilationElapsedSeconds(activeCompilationJob.value),
+          stage_title: activeCompilationJob.value.progress?.steps?.find((step) => step.status === 'running')?.title || '场景建模',
+          message: '没有收到新的服务端事件；任务记录仍已保留，重新打开会话即可续接同一次执行。',
+        })
+        activeCompilationJob.value = {
+          ...activeCompilationJob.value,
+          progress: {
+            ...(activeCompilationJob.value.progress || {}),
+            detail: '对话事件流暂时中断；服务端任务仍会继续。重新打开会话即可续接同一条事件流。',
+          },
+        }
+        markCompilationMessage(activeCompilationJob.value, scope)
+      }
+      ElMessage.warning(error.message || '场景建模事件流已中断')
+    },
+  )
+  compilationStreamController = controller
 }
 
 async function recoverSucceededCompilation(
@@ -1658,7 +1876,7 @@ async function recoverSucceededCompilation(
   epoch: number,
   scope: CompilationRecoveryThreadScope,
 ) {
-  clearCompilationPollTimer()
+  clearCompilationStream()
   const result = await api.getAssistantCompilationJobResult(job.id)
   if (!compilationRecoveryIsCurrent(epoch, scope)) return
   if (result.job_id !== job.id || result.scenario_id !== scope.scenarioId) {
@@ -1756,7 +1974,7 @@ async function recoverFailedCompilation(
   epoch: number,
   scope: CompilationRecoveryThreadScope,
 ) {
-  clearCompilationPollTimer()
+  clearCompilationStream()
   try {
     const recoveredMessages = await api.listAssistantMessages(scope.threadId, apiContext())
     if (compilationRecoveryIsCurrent(epoch, scope)) messages.value = recoveredMessages
@@ -1791,7 +2009,7 @@ async function consumeCompilationJob(
   markCompilationMessage(job, scope)
   if (job.status === 'running') {
     saveCompilationJobBookmark(localStorage, scope, job.id)
-    scheduleCompilationPoll(job.id, epoch, scope)
+    attachCompilationEventStream(job, scope)
     return
   }
   if (job.status === 'succeeded') {
@@ -1801,13 +2019,11 @@ async function consumeCompilationJob(
   await recoverFailedCompilation(job, epoch, scope)
 }
 
-async function discoverCompilationForThread(id: string, retry = false) {
+async function discoverCompilationForThread(id: string) {
   const scope = compilationThreadScope(id)
   if (!scope) return
-  clearCompilationPollTimer()
+  clearCompilationStream()
   compilationRecoveryEpoch += 1
-  if (!retry) compilationPollErrors = 0
-  const epoch = compilationRecoveryEpoch
   compilationRecoveryThreadId.value = id
   const bookmarkedJobId = readCompilationJobBookmark(localStorage, scope)
   const pendingJobId = readPendingCompilationJobBookmark(localStorage, scope)
@@ -1819,74 +2035,28 @@ async function discoverCompilationForThread(id: string, retry = false) {
     ))?.context?.compilation_job_id || '',
   ).trim()
   const knownJobId = bookmarkedJobId || pendingJobId || placeholderJobId
-  if (knownJobId && (!activeCompilationJob.value || activeCompilationJob.value.id !== knownJobId)) {
-    activeCompilationJob.value = optimisticCompilationJob({
-      job_id: knownJobId,
-      thread_id: id,
-      progress: {
-        phase: 'recovering',
-        detail: '正在从服务端恢复持续建模计划；不会重复提交建模请求。',
-        steps: fallbackCompilationSteps,
-      },
-    })
-  } else if (!retry) {
+  if (!knownJobId) {
     activeCompilationJob.value = null
+    compilationRecoveryThreadId.value = ''
+    return
   }
-  try {
-    const jobs = await api.listAssistantCompilationJobs(id, apiContext())
-    if (!compilationRecoveryIsCurrent(epoch, scope)) return
-    let job = selectCompilationJobForRecovery(jobs, scope.scenarioId, knownJobId)
-    if (!job && knownJobId) {
-      const pending = await api.getAssistantCompilationJob(knownJobId)
-      if (!compilationRecoveryIsCurrent(epoch, scope)) return
-      if (pending.thread_id === id && compilationJobMatchesScenario(pending, scope.scenarioId)) job = pending
-    }
-    if (!job) {
-      activeCompilationJob.value = null
-      compilationRecoveryThreadId.value = ''
-      if (bookmarkedJobId) clearCompilationJobBookmark(localStorage, scope)
-      if (pendingJobId) clearPendingCompilationJobBookmark(localStorage, scope)
-      return
-    }
-    saveCompilationJobBookmark(localStorage, scope, job.id)
-    if (pendingJobId === job.id) clearPendingCompilationJobBookmark(localStorage, scope)
-    await consumeCompilationJob(job, epoch, scope)
-  } catch (error: any) {
-    if (!compilationRecoveryIsCurrent(epoch, scope)) return
-    if (error?.status === 403 || error?.status === 404) {
-      clearCompilationJobBookmark(localStorage, scope)
-      if (pendingJobId) clearPendingCompilationJobBookmark(localStorage, scope)
-      activeCompilationJob.value = null
-      compilationRecoveryThreadId.value = ''
-      ElMessage.warning('当前账号或场景已无法访问编译任务，已停止恢复。')
-      return
-    }
-    compilationPollErrors += 1
-    const recoveryJobId = knownJobId
-    activeCompilationJob.value = optimisticCompilationJob({
-      job_id: recoveryJobId || `discover-${id}`,
-      thread_id: id,
-      progress: {
-        phase: 'recovering',
-        detail: '暂时无法读取编译任务列表；计划仍保留，系统将继续重试，不会重复提交建模请求。',
-        steps: fallbackCompilationSteps,
-      },
-    })
-    if (compilationPollErrors === 1) ElMessage.warning('暂时无法恢复编译任务进度；系统会保留计划并自动重试。')
-    if (recoveryJobId) {
-      scheduleCompilationPoll(recoveryJobId, epoch, scope)
-    } else {
-      compilationPollTimer = window.setTimeout(
-        () => {
-          if (compilationRecoveryIsCurrent(epoch, scope)) void discoverCompilationForThread(id, true)
-        },
-        compilationPollDelay(document.hidden, compilationPollErrors),
-      )
-    }
-  }
+  const job = optimisticCompilationJob({
+    job_id: knownJobId,
+    thread_id: id,
+    scenario_id: scope.scenarioId,
+    progress: {
+      phase: 'recovering',
+      detail: '正在续接同一个场景建模事件流；不会重复提交聊天或建模请求。',
+      steps: fallbackCompilationSteps,
+    },
+  })
+  activeCompilationJob.value = job
+  saveCompilationJobBookmark(localStorage, scope, job.id)
+  if (pendingJobId === job.id) clearPendingCompilationJobBookmark(localStorage, scope)
+  attachCompilationEventStream(job, scope)
 }
 
-async function beginCompilationRecoveryFromEvent(data: Record<string, any>) {
+function beginCompilationRecoveryFromEvent(data: Record<string, any>) {
   const owner = compilationOwnerScope()
   const jobId = String(data?.job_id || '').trim()
   if (!owner || !jobId) return
@@ -1901,45 +2071,7 @@ async function beginCompilationRecoveryFromEvent(data: Record<string, any>) {
   if (existingScope) {
     compilationRecoveryThreadId.value = existingScope.threadId
     saveCompilationJobBookmark(localStorage, existingScope, jobId)
-  }
-  clearCompilationPollTimer()
-  compilationRecoveryEpoch += 1
-  compilationPollErrors = 0
-  const lookupEpoch = compilationRecoveryEpoch
-  try {
-    const job = await api.getAssistantCompilationJob(jobId)
-    const currentOwner = compilationOwnerScope()
-    if (lookupEpoch !== compilationRecoveryEpoch
-      || !currentOwner
-      || currentOwner.tenantId !== owner.tenantId
-      || currentOwner.userId !== owner.userId
-      || currentOwner.scenarioId !== owner.scenarioId) return
-    if (!compilationJobMatchesScenario(job, owner.scenarioId)) {
-      clearPendingCompilationJobBookmark(localStorage, owner)
-      if (existingScope) clearCompilationJobBookmark(localStorage, existingScope)
-      ElMessage.error('服务端返回了其他场景的编译任务，已拒绝关联。')
-      return
-    }
-    const targetThreadId = String(data?.thread_id || threadId.value || job.thread_id || '').trim()
-    const scope = compilationThreadScope(targetThreadId)
-    if (!scope) return
-    if (!threadId.value) {
-      threadId.value = targetThreadId
-      localStorage.setItem(storageKey.value, targetThreadId)
-      syncThread(targetThreadId, '完整业务模型编译')
-    }
-    const epoch = lookupEpoch
-    compilationRecoveryThreadId.value = targetThreadId
-    saveCompilationJobBookmark(localStorage, scope, job.id)
-    clearPendingCompilationJobBookmark(localStorage, owner)
-    await consumeCompilationJob(job, epoch, scope)
-  } catch {
-    // Keep the optimistic plan visible and retry the status lookup.  A slow
-    // first GET must not make a newly-created task appear to end immediately.
-    if (existingScope && lookupEpoch === compilationRecoveryEpoch) {
-      compilationRecoveryThreadId.value = existingScope.threadId
-      scheduleCompilationPoll(jobId, lookupEpoch, existingScope)
-    }
+    activeCompilationJob.value = optimisticCompilationJob(data)
   }
 }
 
@@ -1956,23 +2088,11 @@ function settleCompilationFromStream(proposal?: AssistantProposal | Record<strin
 }
 
 function onCompilationVisibilityChange() {
+  if (document.hidden || compilationStreamController) return
   const job = activeCompilationJob.value
   const scope = compilationThreadScope(compilationRecoveryThreadId.value)
   if (!job || job.status !== 'running' || !scope) return
-  if (job.id === `discover-${scope.threadId}`) {
-    clearCompilationPollTimer()
-    const epoch = compilationRecoveryEpoch
-    compilationPollTimer = window.setTimeout(
-      () => {
-        if (compilationRecoveryIsCurrent(epoch, scope)) {
-          void discoverCompilationForThread(scope.threadId, true)
-        }
-      },
-      compilationPollDelay(document.hidden, compilationPollErrors),
-    )
-    return
-  }
-  scheduleCompilationPoll(job.id, compilationRecoveryEpoch, scope)
+  attachCompilationEventStream(job, scope)
 }
 
 function formatThreadTime(value?: string) {
@@ -1986,8 +2106,8 @@ function welcomeMessage(): AssistantMessage {
   return {
     role: 'assistant',
     content: context.value.scenario_id
-      ? `我已进入「${context.value.page}」工作区。选择“完整场景建模”并提供业务介绍或附件，我会先分析资料、列出任务计划，再逐项生成对象、映射、函数、操作、规则、事件和工作流的待审核变更清单。`
-      : '我可以先根据业务介绍创建场景草稿；打开具体场景后，可继续完成完整业务模型建设。',
+      ? `我已进入「${context.value.page}」工作区。你可以直接提问，也可以提供附件或描述建模目标；我会结合上下文判断是否需要调用资料解析、场景建模或其他内部能力。`
+      : '你可以直接咨询业务问题，也可以描述需要建设的场景；我会根据上下文选择合适的内部能力，并在产生变更前明确说明。',
   }
 }
 
@@ -2002,7 +2122,6 @@ async function loadThread(id: string, closeHistory = true) {
     Object.keys(expandedProposal).forEach((key) => delete expandedProposal[Number(key)])
     Object.keys(expandedChangeLists).forEach((key) => delete expandedChangeLists[key])
     Object.keys(expandedIssueGroups).forEach((key) => delete expandedIssueGroups[key])
-    Object.keys(expandedThinking).forEach((key) => delete expandedThinking[key])
     if (closeHistory) historyVisible.value = false
     scrollBottom()
     await discoverCompilationForThread(id)
@@ -2057,7 +2176,13 @@ async function loadContext() {
 async function openAssistant() {
   if (!auth.initialized) await auth.initialize()
   visible.value = true
-  await loadContext()
+  if (!threadId.value) {
+    await loadContext()
+    return
+  }
+  historyVisible.value = false
+  onCompilationVisibilityChange()
+  scrollBottom()
 }
 
 async function toggleHistory() {
@@ -2073,14 +2198,12 @@ async function createNewThread() {
     const thread = await api.createAssistantThread(apiContext())
     threads.value = [thread, ...threads.value.filter((item) => item.id !== thread.id)]
     threadId.value = thread.id
-    taskPreset.value = 'smart'
     localStorage.setItem(storageKey.value, thread.id)
     messages.value = [welcomeMessage()]
     attachments.value = []
     Object.keys(expandedProposal).forEach((key) => delete expandedProposal[Number(key)])
     Object.keys(expandedChangeLists).forEach((key) => delete expandedChangeLists[key])
     Object.keys(expandedIssueGroups).forEach((key) => delete expandedIssueGroups[key])
-    Object.keys(expandedThinking).forEach((key) => delete expandedThinking[key])
     historyVisible.value = false
     scrollBottom()
   } catch (error: any) {
@@ -2094,7 +2217,6 @@ async function selectThread(thread: AssistantThread) {
     scrollBottom()
     return
   }
-  taskPreset.value = 'smart'
   await loadThread(thread.id)
   if (!messages.value.length) messages.value = [welcomeMessage()]
 }
@@ -2116,7 +2238,6 @@ async function deleteThread(thread: AssistantThread) {
       clearModelTaskRecovery()
       localStorage.removeItem(storageKey.value)
       threadId.value = ''
-      taskPreset.value = 'smart'
       messages.value = threads.value[0] ? [] : [welcomeMessage()]
       if (threads.value[0]) await loadThread(threads.value[0].id, false)
       if (!messages.value.length) messages.value = [welcomeMessage()]
@@ -2197,7 +2318,7 @@ function optimisticCompilationJob(data: Record<string, any>): AssistantCompilati
   }
 }
 
-function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantMessage, index: number) {
+function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantMessage) {
   switch (event.type) {
     case 'compilation_job':
       if (event.data?.job_id) {
@@ -2223,11 +2344,48 @@ function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantM
           compilation_job_id: String(event.data.job_id),
           status: 'processing',
         }
+        if (event.data.assistant_message_id) ai.id = String(event.data.assistant_message_id)
       }
-      void beginCompilationRecoveryFromEvent(event.data || {})
+      beginCompilationRecoveryFromEvent(event.data || {})
       break
+    case 'tool_event': {
+      const activity = event.data?.activity || {}
+      const status = activity.status === 'error'
+        ? 'error'
+        : activity.status === 'done' || activity.status === 'completed'
+          ? 'done'
+          : 'running'
+      upsertThinking(ai, {
+        id: `tool-${String(activity.id || activity.step_id || Date.now())}`,
+        title: `${String(event.data?.tool_label || '内部能力')} · ${String(activity.title || '执行工具')}`,
+        detail: String(activity.detail || ''),
+        status,
+      })
+      break
+    }
+    case 'draft_checkpoint':
+      projectDraftCheckpoint(event.data || {})
+      break
+    case 'compilation_liveness':
+      recordCompilationLiveness(event.data || {})
+      break
+    case 'compilation_progress':
+    case 'compilation_result': {
+      const eventThreadId = String(event.data?.job?.thread_id || threadId.value || '').trim()
+      const scope = compilationThreadScope(eventThreadId)
+      if (scope) applyCompilationSnapshot(event.data || {}, scope)
+      break
+    }
     case 'progress':
-      upsertThinking(ai, event.data as AssistantThought, index)
+      if (event.data?.id !== 'routing' && ai.thinking?.some((step) => step.id === 'routing' && step.status === 'running')) {
+        upsertThinking(ai, {
+          id: 'routing',
+          title: '规划当前任务',
+          detail: '处理路径已确定，开始执行对应任务。',
+          status: 'done',
+        })
+      }
+      upsertThinking(ai, event.data as AssistantThought)
       break
     case 'token':
       ai.content += String(event.data || '')
@@ -2258,7 +2416,7 @@ function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantM
     }
     case 'error':
       ai.content += `${ai.content ? '\n\n' : ''}这次请求没有完成：${String(event.data || '未知错误')}`
-      upsertThinking(ai, { id: 'error', title: '处理未完成', detail: '助手遇到问题，请检查配置后重试。', status: 'error' }, index)
+      upsertThinking(ai, { id: 'error', title: '处理未完成', detail: '助手遇到问题，请检查配置后重试。', status: 'error' })
       break
   }
   scrollBottom()
@@ -2271,22 +2429,56 @@ function finishStream(ai: AssistantMessage) {
   scrollBottom()
 }
 
+async function submitCompilationGuidance(content: string) {
+  const job = activeCompilationJob.value
+  const scope = compilationThreadScope(compilationRecoveryThreadId.value || threadId.value)
+  if (!job || job.status !== 'running' || !scope || guidanceSubmitting.value) return
+  const currentAttachments = [...attachments.value]
+  guidanceSubmitting.value = true
+  try {
+    const response = await api.submitAssistantCompilationGuidance(job.id, {
+      request_id: typeof crypto?.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `guidance-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      message: content,
+      attachment_ids: currentAttachments.map((item) => item.id),
+    })
+    input.value = ''
+    attachments.value = []
+    activeCompilationJob.value = response.job
+    if (response.message) {
+      messages.value.push({ ...response.message, streaming: false })
+    } else if (response.accepted) {
+      messages.value.push({
+        role: 'user',
+        content,
+        attachments: currentAttachments,
+        context: { compilation_job_id: job.id, status: 'queued_guidance' },
+      })
+    }
+    markCompilationMessage(response.job, scope)
+    if (response.accepted) {
+      ElMessage.success('补充指导已加入当前任务，将在安全检查点后继续')
+    }
+    scrollBottom()
+  } catch (error: any) {
+    ElMessage.warning(error.message || '当前任务暂时无法接收补充指导')
+  } finally {
+    guidanceSubmitting.value = false
+  }
+}
+
 function send(text?: string) {
-  const submittedPreset = taskPreset.value
-  const attachmentOnlyPrompt = ({
-    scenario: '请根据本次上传的业务文档生成一个待确认的业务场景草稿，并标明无法确定的信息。',
-    scenario_model: '请逐段编译本次上传的完整业务文档，生成完整业务模型，并列出所有未识别、歧义和冲突项。',
-    ontology: '请根据本次上传的业务文档建立对象类型、属性、关系与约束，并列出无法从原文确定的信息。',
-    mapping: '请把本次上传文档作为业务语义参考，只根据当前场景中已经检查的真实数据源表和字段生成映射草稿。',
-    capabilities: '请根据本次上传的完整业务文档，新增其中明确描述的函数、操作、规则和事件，并列出所有未识别、歧义和冲突项。',
-    workflow: '请根据本次上传的业务文档生成待审核的工作流，明确触发条件、处理节点、分支和引用资源。',
-  } as Partial<Record<AssistantTaskPreset, string>>)[submittedPreset] || ''
   const providedContent = text !== undefined ? text : input.value.trim()
   const content = (providedContent || (
-    attachmentOnlyPrompt && attachments.value.length
-      ? attachmentOnlyPrompt
+    attachments.value.length
+      ? '请分析本次上传的业务资料，先整理可见任务计划；根据语义判断需要建设哪些业务模型，存在歧义时先向我确认。'
       : ''
   )).trim()
+  if (content && compilationRunning.value) {
+    void submitCompilationGuidance(content)
+    return
+  }
   if (!content || loading.value || compilationBusy.value || modelTaskRecoveryBusy.value || uploadingFiles.value > 0) return
   clearModelTaskRecovery()
   if (activeCompilationJob.value?.status === 'failed') detachCompilationRecovery()
@@ -2297,10 +2489,14 @@ function send(text?: string) {
   // 从响应式数组中重新取出消息，避免直接修改未被 Vue 代理的原始对象。
   const aiIndex = messages.value.length - 1
   const ai = messages.value[aiIndex]
+  upsertThinking(ai, {
+    id: 'routing',
+    title: '规划当前任务',
+    detail: '正在结合消息、附件、当前页面和历史草稿确定处理路径。',
+    status: 'running',
+  })
   input.value = ''
   loading.value = true
-  const requestRoute = requestRouteForPreset(submittedPreset)
-  taskPreset.value = 'smart'
   const generation = ++streamGeneration
   scrollBottom()
   streamController = streamAssistantChat(
@@ -2318,26 +2514,40 @@ function send(text?: string) {
       llm_config_id: assistantConfig.llmConfigId || undefined,
       skill_ids: [...assistantConfig.skillIds],
       mcp_ids: [...assistantConfig.mcpIds],
-      mode: requestRoute.mode,
-      draft_kind: requestRoute.draft_kind,
+      // Route by the LangGraph/LLM semantic planner. The client only sends
+      // the user's intent and context; it does not select a hidden task mode.
+      mode: 'ask',
+      draft_kind: 'auto',
     },
     (event) => {
       if (generation !== streamGeneration || componentDisposed) return
-      handleAssistantEvent(event, ai, aiIndex)
+      handleAssistantEvent(event, ai)
       if (event.type === 'meta') attachments.value = []
     },
     () => {
-      if (generation === streamGeneration && !componentDisposed) finishStream(ai)
+      if (generation === streamGeneration && !componentDisposed) {
+        finishStream(ai)
+        const job = activeCompilationJob.value
+        const scope = compilationThreadScope(compilationRecoveryThreadId.value)
+        if (job?.status === 'running' && scope && !compilationStreamController) {
+          attachCompilationEventStream(job, scope)
+        }
+      }
     },
     (error) => {
       if (generation !== streamGeneration || componentDisposed) return
       ai.content += compilationRunning.value
-        ? `${ai.content ? '\n\n' : ''}连接已中断，但完整业务模型仍由服务端任务处理；页面会继续查询任务状态，不会自动重发请求。`
+        ? `${ai.content ? '\n\n' : ''}当前对话连接已中断；服务端会继续同一个建模任务，我正在重新订阅它的事件流，不会重新提交请求。`
         : `${ai.content ? '\n\n' : ''}这次请求没有完成：${error.message || '请求失败'}`
       ai.streaming = false
       loading.value = false
       streamController = null
-      if (compilationRunning.value) ElMessage.warning('连接已中断，正在从服务端恢复编译任务')
+      if (compilationRunning.value) {
+        const job = activeCompilationJob.value
+        const scope = compilationThreadScope(compilationRecoveryThreadId.value)
+        if (job && scope) attachCompilationEventStream(job, scope)
+        ElMessage.warning('连接已中断，正在续接同一条建模事件流')
+      }
       else ElMessage.error(error.message || '助手请求失败')
       scrollBottom()
     },
@@ -2359,7 +2569,6 @@ async function answerQuestion(
     return
   }
   if (option.value === 'draft_scenario') {
-    taskPreset.value = 'scenario'
     input.value = '请根据以下业务目标创建业务场景草稿：\n'
     return
   }
@@ -2383,7 +2592,6 @@ async function answerQuestion(
     // parsed attachment set paired with this assistant response, then let the
     // user edit the correction draft before explicitly submitting it.
     attachments.value = retryAttachmentsForMessage(messages.value, sourceMessage, threadId.value)
-    taskPreset.value = 'scenario_model'
     input.value = compilationRetryDraft(option.value, option.prompt)
     scrollBottom()
     return
@@ -2398,9 +2606,6 @@ async function answerQuestion(
 }
 
 function clearModelTaskRecovery(clearFailure = true) {
-  if (modelTaskRecoveryTimer) window.clearTimeout(modelTaskRecoveryTimer)
-  modelTaskRecoveryTimer = null
-  modelTaskRecoveryErrors = 0
   modelTaskRecoveryGeneration += 1
   recoveringModelProposalId.value = ''
   if (clearFailure) {
@@ -2430,7 +2635,11 @@ function modelTaskOutcomeFallback(
   } else {
     update = `「${task.title}」已结束，但暂未读取到可核验的正式写入结果。`
   }
-  if (nextTask) update += ` 下一步已停留在「${nextTask.title}」等待确认。`
+  if (nextTask) {
+    update += nextTask.status === 'awaiting_generation'
+      ? ` 下一步是「${nextTask.title}」；原始资料和已确认定义已保留，等待开始生成。`
+      : ` 下一步已停留在「${nextTask.title}」等待确认。`
+  }
   return update
 }
 
@@ -2499,6 +2708,14 @@ function beginModelTaskRecovery(
   const recover = async () => {
     if (!isCurrent()) return
     try {
+      // Resolve one ambiguous POST once through its idempotent server claim.
+      // Do not turn the browser into a task runner or status poller.
+      await retryRequest()
+    } catch {
+      // The original request may already be committed; verify it once below.
+    }
+    if (!isCurrent()) return
+    try {
       const recoveredMessages = await api.listAssistantMessages(proposalThreadId, recoveryContext)
       if (!isCurrent()) return
       const recoveredMessage = latestProposalMessage(recoveredMessages, proposalId)
@@ -2521,8 +2738,6 @@ function beginModelTaskRecovery(
         return
       }
     } catch (error: any) {
-      // The confirmation may already be committed. A temporary read failure
-      // must keep the task recovering instead of re-enabling the old action.
       if (!isCurrent()) return
       const status = Number(error?.status || 0)
       if ([403, 404, 409].includes(status)) {
@@ -2534,24 +2749,82 @@ function beginModelTaskRecovery(
       }
     }
     if (!isCurrent()) return
-    if (modelTaskRecoveryErrors > 0 && modelTaskRecoveryErrors % 3 === 0) {
-      try {
-        // The user already confirmed this exact task. The server-side claim is
-        // idempotent, so retrying the same request safely resolves ambiguous
-        // timeout/5xx outcomes without asking the user to click twice.
-        await retryRequest()
-      } catch {
-        // Continue reading the durable message; another request may own the claim.
-      }
-      if (!isCurrent()) return
-    }
-    modelTaskRecoveryErrors += 1
-    modelTaskRecoveryTimer = window.setTimeout(
-      () => { if (isCurrent()) void recover() },
-      compilationPollDelay(document.hidden, modelTaskRecoveryErrors),
-    )
+    clearModelTaskRecovery(false)
+    blockedModelProposalId.value = proposalId
+    modelTaskRecoveryFailure.value = '任务已提交，但本次没有读取到可验证的新版本；重新打开会话即可读取服务端权威结果。'
+    ElMessage.warning('任务已提交；请重新打开会话查看服务端权威结果。')
   }
   void recover()
+}
+
+function applyCurrentModelTask(message: AssistantMessage, index: number) {
+  const task = currentModelTask(proposalOf(message))
+  if (!task) return
+  void applyModelTask(message, index, task, 'apply')
+}
+
+function generateCurrentModelTask(message: AssistantMessage, index: number) {
+  const task = currentModelTask(proposalOf(message))
+  if (!task) return
+  void generateModelTask(message, index, task)
+}
+
+async function generateModelTask(
+  message: AssistantMessage,
+  _index: number,
+  task: AssistantModelTask,
+) {
+  const proposal = proposalOf(message)
+  const nextAction = modelNextAction(proposal)
+  if (
+    !proposal
+    || proposal.kind !== 'scenario_model'
+    || !proposal.proposal_id
+    || !threadId.value
+    || !context.value.scenario_id
+    || compilationBusy.value
+    || startingModelTaskId.value
+    || !isActiveModelRun(message)
+    || task.status !== 'awaiting_generation'
+    || nextAction?.type !== 'generate_task'
+    || nextAction.task_id !== task.id
+  ) return
+  const operationId = `${proposal.proposal_id}:${task.id}`
+  startingModelTaskId.value = operationId
+  try {
+    const job = await api.continueAssistantModelTask({
+      scenario_id: context.value.scenario_id,
+      thread_id: String(message.context?.proposal_thread_id || threadId.value),
+      proposal_id: proposal.proposal_id,
+      task_id: task.id,
+    })
+    message.streaming = job.status === 'running'
+    message.context = {
+      ...(message.context || {}),
+      compilation_job_id: job.id,
+      status: job.status === 'running' ? 'processing' : job.status,
+      continuation_task_id: task.id,
+      compilation_progress: job.progress,
+    }
+    upsertThinking(message, {
+      id: `stage-${task.id}`,
+      title: `生成${task.title}`,
+      detail: '已接收继续请求，正在基于原始资料和已确认定义生成候选。',
+      status: job.status === 'failed' ? 'error' : job.status === 'succeeded' ? 'done' : 'running',
+    })
+    beginCompilationRecoveryFromEvent({
+      job_id: job.id,
+      thread_id: job.thread_id || threadId.value,
+      scenario_id: context.value.scenario_id,
+    })
+    const scope = compilationThreadScope(String(job.thread_id || threadId.value))
+    if (scope && job.status === 'running') attachCompilationEventStream(job, scope)
+    if (job.status !== 'failed') ElMessage.success(`已开始生成「${task.title}」`)
+  } catch (error: any) {
+    ElMessage.error(error.message || '无法开始生成下一项建模任务')
+  } finally {
+    if (startingModelTaskId.value === operationId) startingModelTaskId.value = ''
+  }
 }
 
 async function applyModelTask(
@@ -2635,7 +2908,7 @@ async function applyModelTask(
     }
     const updatedProposal = message.proposal as AssistantProposal
     const updatedTask = modelTaskOf(updatedProposal, task.id)
-    const nextTask = modelTasks(updatedProposal).find((item) => ['ready', 'blocked'].includes(item.status))
+    const nextTask = modelTasks(updatedProposal).find((item) => ['ready', 'blocked', 'awaiting_generation'].includes(item.status))
     const durableUpdate = String(result?.task_update_text || '').trim()
     if (durableUpdate && !modelTaskNeedsWriteVerification(updatedTask || task) && !message.content.includes(durableUpdate)) {
       message.content += `\n\n${durableUpdate}`
@@ -2740,7 +3013,6 @@ watch(() => storageKey.value, async () => {
   detachCompilationRecovery()
   clearModelTaskRecovery()
   loading.value = false
-  taskPreset.value = 'smart'
   messages.value = []
   threads.value = []
   threadId.value = ''
@@ -2749,14 +3021,11 @@ watch(() => storageKey.value, async () => {
   sourcePreviewVisible.value = false
   Object.keys(expandedChangeLists).forEach((key) => delete expandedChangeLists[key])
   Object.keys(expandedIssueGroups).forEach((key) => delete expandedIssueGroups[key])
-  Object.keys(expandedThinking).forEach((key) => delete expandedThinking[key])
+  Object.keys(expandedModelPlans).forEach((key) => delete expandedModelPlans[key])
   if (visible.value) {
     await loadContext()
   }
 })
-watch(() => context.value.scenario_id, () => {
-  taskPreset.value = 'smart'
-}, { immediate: true })
 watch(showLauncher, (show) => {
   if (!show) visible.value = false
 })
@@ -2770,7 +3039,7 @@ onBeforeUnmount(() => {
   componentDisposed = true
   streamGeneration += 1
   streamController = null
-  clearCompilationPollTimer()
+  clearCompilationStream()
   clearModelTaskRecovery()
   window.removeEventListener('ontology-selection-change', onSelection)
   document.removeEventListener('visibilitychange', onCompilationVisibilityChange)
@@ -2800,6 +3069,11 @@ onBeforeUnmount(() => {
   font-weight: 750;
   transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease), border-color var(--dur) var(--ease);
 }
+.assistant-launcher.is-working {
+  max-width: min(340px, calc(100vw - 28px));
+  border-color: color-mix(in srgb, var(--primary) 58%, var(--border));
+  background: var(--surface);
+}
 .assistant-launcher:hover { transform: translateY(-2px); border-color: var(--primary); box-shadow: var(--shadow-lg); }
 .assistant-launcher:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 38%, transparent); outline-offset: 3px; }
 .assistant-launcher-icon {
@@ -2812,7 +3086,11 @@ onBeforeUnmount(() => {
   color: #fff;
   background: var(--grad);
 }
+.assistant-launcher-copy { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; line-height: 1.25; }
+.assistant-launcher-copy strong { font-size: 13px; font-weight: 750; white-space: nowrap; }
+.assistant-launcher-copy small { display: block; max-width: 240px; overflow: hidden; color: var(--text-2); font-size: 11px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .assistant-live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.assistant-launcher.is-working .assistant-live-dot { background: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
 
 .assistant-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--bg); }
 :global(.assistant-drawer .el-drawer__body) { min-height: 0; padding: 0; overflow: hidden; }
@@ -2839,82 +3117,46 @@ onBeforeUnmount(() => {
 .session-label { color: var(--text-3); font-size: 10px; }
 .session-actions { display: flex; align-items: center; flex: 0 0 auto; gap: 6px; }
 .session-actions :deep(.el-button) { min-height: 32px; }
-.compilation-recovery { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 9px 18px; border-bottom: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border)); color: var(--primary-600); background: var(--primary-soft); }
-.compilation-recovery.is-failed { border-bottom-color: color-mix(in srgb, var(--danger) 35%, var(--border)); color: var(--danger); background: var(--danger-soft); }
-.compilation-recovery > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.compilation-recovery strong { color: var(--text); font-size: 11px; }
-.compilation-recovery span { overflow: hidden; color: var(--text-2); font-size: 9.5px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
-.compilation-plan-card { margin: 0 0 16px; overflow: hidden; border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border)); border-radius: 14px; background: linear-gradient(145deg, var(--primary-soft), var(--surface)); box-shadow: var(--shadow-sm); }
-.compilation-plan-card.is-failed { border-color: color-mix(in srgb, var(--danger) 38%, var(--border)); background: linear-gradient(145deg, var(--danger-soft), var(--surface)); }
-.compilation-plan-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 14px 14px 11px; }
-.compilation-plan-heading { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
-.compilation-plan-kicker { display: inline-flex; align-items: center; gap: 5px; color: var(--primary-600); font-size: 10px; font-weight: 800; letter-spacing: .02em; }
-.compilation-plan-card.is-failed .compilation-plan-kicker { color: var(--danger); }
-.compilation-plan-heading strong { color: var(--text); font-size: 13px; line-height: 1.35; }
-.compilation-plan-heading > span:last-child { overflow-wrap: anywhere; color: var(--text-2); font-size: 10.5px; line-height: 1.5; }
-.compilation-plan-count { display: flex; flex: 0 0 auto; align-items: baseline; gap: 3px; padding: 5px 8px; border: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border)); border-radius: 9px; color: var(--text-3); background: var(--surface); white-space: nowrap; }
-.compilation-plan-count b { color: var(--primary-600); font-size: 17px; font-variant-numeric: tabular-nums; }
-.compilation-plan-count span { font-size: 9px; }
-.compilation-plan-steps { display: grid; gap: 7px; padding: 0 14px 12px; }
-.compilation-plan-step { display: flex; align-items: flex-start; gap: 8px; min-width: 0; padding: 8px 9px; border: 1px solid var(--border); border-radius: 9px; background: color-mix(in srgb, var(--surface) 88%, transparent); }
-.compilation-plan-step.is-running { border-color: color-mix(in srgb, var(--primary) 48%, var(--border)); background: var(--surface); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 10%, transparent); }
-.compilation-plan-step.is-done { background: color-mix(in srgb, var(--success) 7%, var(--surface)); }
-.compilation-plan-step.is-error { border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); background: var(--danger-soft); }
-.compilation-plan-step-icon { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; flex: 0 0 auto; border-radius: 7px; color: var(--text-3); background: var(--surface-2); font-size: 10px; font-variant-numeric: tabular-nums; }
-.compilation-plan-step.is-running .compilation-plan-step-icon { color: var(--primary-600); background: var(--primary-soft); }
-.compilation-plan-step.is-done .compilation-plan-step-icon { color: var(--success); background: var(--success-soft); }
-.compilation-plan-step.is-error .compilation-plan-step-icon { color: var(--danger); background: var(--danger-soft); }
-.compilation-plan-step-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
-.compilation-plan-step-copy strong { color: var(--text); font-size: 11px; line-height: 1.35; }
-.compilation-plan-step-copy span { overflow-wrap: anywhere; color: var(--text-3); font-size: 9.5px; line-height: 1.45; }
-.compilation-stage-results { display: grid; gap: 5px; padding: 10px 14px 12px; border-top: 1px dashed color-mix(in srgb, var(--primary) 20%, var(--border)); }
-.compilation-stage-results-label { color: var(--text-2); font-size: 10px; font-weight: 800; }
-.compilation-stage-result { display: flex; align-items: flex-start; gap: 5px; color: var(--text-2); font-size: 9.5px; line-height: 1.5; }
-.compilation-stage-result .el-icon { flex: 0 0 auto; margin-top: 2px; color: var(--success); }
-.compilation-plan-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 14px; border-top: 1px solid var(--border); color: var(--text-3); font-size: 9.5px; }
-.compilation-plan-toggle { display: inline-flex; align-items: center; gap: 3px; min-height: 30px; padding: 3px 6px; border: 0; color: var(--primary-600); background: transparent; cursor: pointer; font: inherit; font-weight: 700; }
-.compilation-plan-toggle:hover, .compilation-plan-toggle:focus-visible { color: var(--primary); text-decoration: underline; outline: none; text-underline-offset: 3px; }
-.model-task-board { display: grid; gap: 9px; margin: 12px 0 4px; padding: 11px; border: 1px solid color-mix(in srgb, var(--primary) 26%, var(--border)); border-radius: 12px; background: color-mix(in srgb, var(--primary-soft) 42%, var(--surface)); }
-.model-task-board-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-.model-task-board-head > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
-.model-task-board-head strong { color: var(--text); font-size: 11.5px; }
-.model-task-board-head span { color: var(--text-3); font-size: 9.5px; line-height: 1.45; }
-.model-task-list { display: grid; gap: 7px; }
-.model-task { display: grid; gap: 7px; padding: 9px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
-.model-task.is-current { border-color: color-mix(in srgb, var(--primary) 62%, var(--border)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 12%, transparent); }
-.model-task.is-ready { border-color: color-mix(in srgb, var(--warning) 32%, var(--border)); }
-.model-task.is-blocked { border-color: color-mix(in srgb, var(--warning) 60%, var(--border)); background: color-mix(in srgb, var(--warning-soft) 46%, var(--surface)); }
-.model-task.is-waiting, .model-task.is-empty { opacity: .78; }
-.model-task.is-applied { border-color: color-mix(in srgb, var(--success) 40%, var(--border)); background: color-mix(in srgb, var(--success-soft) 48%, var(--surface)); }
-.model-task.is-partially_applied { border-color: color-mix(in srgb, var(--warning) 48%, var(--border)); background: color-mix(in srgb, var(--warning-soft) 38%, var(--surface)); }
-.model-task.is-drafted_with_gaps, .model-task.is-deferred, .model-task.is-skipped { border-style: dashed; border-color: color-mix(in srgb, var(--warning) 42%, var(--border)); }
+.model-task-plan { margin: 10px 0 2px; border-top: 1px solid var(--border); }
+.model-task-plan-toggle { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 50px; padding: 8px 0; border: 0; color: var(--text-2); background: transparent; cursor: pointer; font: inherit; text-align: left; }
+.model-task-plan-toggle:hover, .model-task-plan-toggle:focus-visible { color: var(--primary-600); outline: none; }
+.model-task-plan-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.model-task-plan-copy strong { color: var(--text); font-size: 11.5px; }
+.model-task-plan-copy small { overflow-wrap: anywhere; color: var(--text-3); font-size: 9.5px; line-height: 1.4; }
+.model-task-plan-action { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 3px; color: var(--primary-600); font-size: 10px; font-weight: 700; }
+.model-current-task { display: grid; gap: 7px; padding: 8px 0 5px 10px; border-left: 2px solid var(--primary); }
+.model-current-task.is-blocked { border-left-color: var(--warning); }
+.model-current-task.is-awaiting_generation { border-left-color: var(--primary-600); }
+.model-current-task p { margin: 0; color: var(--text-2); font-size: 9.5px; line-height: 1.5; }
+.model-task-list { display: grid; margin-top: 2px; border-top: 1px solid var(--border); }
+.model-task { display: grid; gap: 7px; padding: 9px 0; border-bottom: 1px solid var(--border); background: transparent; }
+.model-task.is-current { padding-left: 10px; border-left: 2px solid var(--primary); }
+.model-task.is-blocked { border-left-color: var(--warning); }
+.model-task.is-waiting, .model-task.is-empty { opacity: .72; }
 .model-task-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .model-task-index { display: inline-flex; align-items: center; justify-content: center; width: 21px; height: 21px; flex: 0 0 auto; border-radius: 7px; color: var(--primary-600); background: var(--primary-soft); font-size: 10px; font-weight: 800; }
 .model-task-title { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
 .model-task-title strong { overflow: hidden; color: var(--text); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
 .model-task-title small { overflow-wrap: anywhere; color: var(--text-3); font-size: 9px; line-height: 1.4; }
-.model-task-blocker { display: grid; gap: 3px; padding: 7px 8px; border-left: 3px solid var(--warning); color: var(--text-2); background: var(--warning-soft); font-size: 9.5px; line-height: 1.45; }
+.model-task-blocker { display: grid; gap: 3px; padding-left: 8px; border-left: 2px solid var(--warning); color: var(--text-2); font-size: 9.5px; line-height: 1.45; }
 .model-task-blocker strong { color: var(--warning-700, var(--warning)); }
 .model-task-blocker small, .model-task-note, .model-task-waiting { color: var(--text-3); font-size: 9px; line-height: 1.45; }
 .model-task-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
 .model-task-actions :deep(.el-button) { min-height: 36px; }
-.model-run-waiting { display: flex; align-items: flex-start; gap: 7px; padding: 8px 9px; border-radius: 9px; color: var(--primary-600); background: var(--primary-soft); font-size: 9.5px; line-height: 1.5; }
-.model-run-waiting strong { flex: 0 0 auto; color: var(--text); }
-.model-run-summary { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
-.model-run-summary.is-success { border-color: color-mix(in srgb, var(--success) 34%, var(--border)); background: color-mix(in srgb, var(--success-soft) 45%, var(--surface)); }
-.model-run-summary.is-warning { border-color: color-mix(in srgb, var(--warning) 38%, var(--border)); background: color-mix(in srgb, var(--warning-soft) 42%, var(--surface)); }
+.model-run-waiting { margin-top: 6px; color: var(--primary-600); font-size: 9.5px; line-height: 1.5; }
+.model-run-summary { display: grid; gap: 8px; padding: 10px 0 0; border-top: 1px dashed var(--border); }
+.model-run-summary.is-success > header strong { color: var(--success); }
+.model-run-summary.is-warning > header strong { color: var(--warning); }
 .model-run-summary > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .model-run-summary > header strong { color: var(--text); font-size: 11px; }
 .model-run-summary p, .model-run-summary small { margin: 0; color: var(--text-2); font-size: 9.5px; line-height: 1.55; }
 .model-run-summary-counts { display: flex; flex-wrap: wrap; gap: 5px; }
-.model-run-summary-counts span { padding: 4px 6px; border-radius: 6px; color: var(--text-2); background: var(--surface); font-size: 9px; font-variant-numeric: tabular-nums; }
+.model-run-summary-counts span { color: var(--text-2); font-size: 9px; font-variant-numeric: tabular-nums; }
 .model-run-root-causes { display: grid; gap: 5px; }
 .model-run-root-causes article { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding: 6px 0; border-top: 1px solid color-mix(in srgb, var(--warning) 26%, var(--border)); }
 .model-run-root-causes strong { color: var(--text); font-size: 10px; }
 .model-run-root-causes span { color: var(--warning); font-size: 9px; font-variant-numeric: tabular-nums; }
 .model-run-root-causes small { grid-column: 1 / -1; }
-.model-run-solutions { display: grid; gap: 4px; color: var(--text-2); font-size: 9.5px; }
-.model-run-solutions ul { display: grid; gap: 3px; margin: 0; padding-left: 16px; line-height: 1.5; }
 .thread-count { display: inline-flex; align-items: center; justify-content: center; min-width: 17px; height: 17px; margin-left: 4px; padding: 0 4px; border-radius: 9px; color: var(--primary-600); background: var(--primary-soft); font-size: 10px; }
 .assistant-history { flex: 1; min-height: 0; overflow: auto; padding: 18px; background: var(--bg); }
 .history-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
@@ -2947,36 +3189,48 @@ onBeforeUnmount(() => {
 .assistant-message.user { justify-content: flex-end; }
 .assistant-message-avatar { width: 30px; height: 30px; border-radius: 10px; margin-top: 21px; }
 .message-content { max-width: 88%; min-width: 0; }
+.assistant-message.assistant .message-content { width: calc(100% - 39px); max-width: calc(100% - 39px); }
 .assistant-message.user .message-content { max-width: 82%; }
 .message-label { margin: 0 4px 5px; color: var(--text-3); font-size: 10.5px; font-weight: 700; }
 .assistant-message.user .message-label { text-align: right; }
-.thinking-summary { margin-bottom: 7px; overflow: hidden; border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--border)); border-radius: 10px; background: var(--surface-2); }
-.thinking-toggle { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; min-height: 38px; padding: 8px 10px; border: 0; color: var(--text-2); background: transparent; cursor: pointer; font: inherit; font-size: 11px; text-align: left; }
-.thinking-toggle:hover, .thinking-toggle:focus-visible { color: var(--primary-600); background: var(--primary-soft); outline: none; }
-.thinking-toggle-main { display: inline-flex; align-items: center; min-width: 0; gap: 6px; }
-.thinking-toggle-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.thinking-live { flex: 0 0 auto; color: var(--primary-600); font-size: 10px; }
-.thinking-chevron { flex: 0 0 auto; color: var(--text-3); transition: transform 160ms ease; }
-.thinking-chevron.rotated { transform: rotate(180deg); }
-.thinking-body { padding: 2px 10px 10px 28px; border-top: 1px solid var(--border); }
-.thinking-step { position: relative; display: flex; gap: 8px; padding: 8px 0 0; color: var(--text-2); font-size: 11px; line-height: 1.45; }
-.thinking-step-dot { width: 7px; height: 7px; flex: 0 0 auto; margin-top: 5px; border-radius: 50%; background: var(--text-3); }
-.thinking-step.is-running .thinking-step-dot { background: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
-.thinking-step.is-error .thinking-step-dot { background: var(--danger); }
-.thinking-step div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.thinking-step strong { color: var(--text); font-weight: 700; }
-.thinking-step span:not(.thinking-step-dot) { color: var(--text-3); }
-.thinking-note { margin-top: 9px; color: var(--text-3); font-size: 10px; line-height: 1.5; }
+.assistant-worklog { margin: 0 0 10px; padding-left: 10px; border-left: 2px solid color-mix(in srgb, var(--primary) 46%, var(--border)); }
+.assistant-worklog.is-active { border-left-color: var(--primary); }
+.worklog-head { display: flex; align-items: center; gap: 8px; min-height: 28px; color: var(--text-2); font-size: 11px; }
+.worklog-head > span:first-child { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; color: var(--text); font-weight: 750; }
+.worklog-summary { min-width: 0; flex: 1; overflow: hidden; color: var(--text-3); text-overflow: ellipsis; white-space: nowrap; }
+.worklog-live { flex: 0 0 auto; color: var(--primary-600); font-size: 10px; }
+.worklog-body { display: grid; gap: 7px; padding: 4px 0 2px; }
+.worklog-entry { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; align-items: start; gap: 7px; color: var(--text-2); font-size: 10px; line-height: 1.45; }
+.worklog-step-dot { width: 7px; height: 7px; margin-top: 4px; border-radius: 50%; background: var(--text-3); }
+.worklog-entry.is-running .worklog-step-dot { background: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+.worklog-entry.is-error .worklog-step-dot { background: var(--danger); }
+.worklog-entry div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.worklog-entry strong { color: var(--text); font-weight: 700; }
+.worklog-entry span { color: var(--text-3); overflow-wrap: anywhere; }
+.worklog-entry small { color: var(--text-3); font-size: 9px; white-space: nowrap; }
+.worklog-live-feed { display: grid; gap: 6px; margin-top: 2px; padding-top: 7px; border-top: 1px dashed var(--border); }
+.worklog-live-entry { display: grid; grid-template-columns: 52px minmax(0, 1fr) auto; align-items: start; gap: 7px; color: var(--text-3); font-size: 9.5px; line-height: 1.45; }
+.worklog-live-entry time, .worklog-live-entry > small { color: var(--text-3); font-size: 9px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.worklog-live-entry > div { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.worklog-live-entry strong { color: var(--text-2); font-size: 9.5px; font-weight: 700; }
+.worklog-live-entry span { overflow-wrap: anywhere; }
+.worklog-live-entry.is-latest time, .worklog-live-entry.is-latest strong { color: var(--primary-600); }
+.worklog-live-entry.is-disconnected time, .worklog-live-entry.is-disconnected strong { color: var(--warning); }
+.worklog-note { padding-top: 2px; color: var(--text-3); font-size: 9px; line-height: 1.45; }
 .message-bubble { padding: 10px 12px; border: 1px solid var(--border); border-radius: 13px 13px 13px 4px; background: var(--surface); box-shadow: var(--shadow-xs); }
+.assistant-message.assistant .message-bubble { padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
 .message-bubble.user { border-color: var(--border-strong); border-radius: 13px 13px 4px 13px; color: var(--primary-600); background: var(--primary-soft); white-space: pre-wrap; }
 .user-content { line-height: 1.65; font-size: 13px; }
 .stream-cursor { display: inline-block; margin-left: 2px; color: var(--primary); animation: stream-cursor-blink 900ms steps(2, jump-none) infinite; }
 @keyframes stream-cursor-blink { 50% { opacity: 0; } }
 .proposal-card { margin-top: 9px; overflow: hidden; border: 1px solid color-mix(in srgb, var(--warning) 38%, var(--border)); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow-xs); }
+.proposal-card.is-model-result { margin-top: 12px; overflow: visible; border: 0; border-top: 1px solid var(--border); border-radius: 0; background: transparent; box-shadow: none; }
 .proposal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 11px 12px 8px; background: var(--warning-soft); }
+.is-model-result .proposal-head { padding: 12px 0 5px; background: transparent; }
 .proposal-title { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 12.5px; font-weight: 800; }
 .proposal-summary { margin-top: 4px; color: var(--text-2); font-size: 11.5px; line-height: 1.5; }
 .proposal-preview { display: flex; align-items: center; gap: 10px; padding: 9px 12px; color: var(--text-2); font-size: 11.5px; }
+.is-model-result .proposal-preview { flex-wrap: wrap; padding: 6px 0 0; }
 .preview-toggle { min-height: 28px; margin-left: auto; padding: 3px 0; border: 0; color: var(--primary-600); background: transparent; cursor: pointer; font: inherit; }
 .preview-toggle:hover, .preview-toggle:focus-visible { color: var(--primary); text-decoration: underline; outline: none; text-underline-offset: 3px; }
 .proposal-disclosure { margin: 0 12px 10px; overflow: hidden; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); }
@@ -2996,6 +3250,7 @@ onBeforeUnmount(() => {
 .proposal-change-copy strong { color: var(--text); font-size: 11px; font-weight: 750; line-height: 1.4; }
 .proposal-change-copy span { color: var(--text-3); font-size: 10.5px; line-height: 1.45; }
 .proposal-detail { display: grid; gap: 10px; margin: 0 12px 10px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); }
+.is-model-result .proposal-detail { margin: 10px 0 0; padding: 12px 0 0; border: 0; border-top: 1px dashed var(--border); border-radius: 0; background: transparent; }
 .proposal-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 0; }
 .proposal-summary-grid div { padding: 7px 8px; border-radius: 7px; background: var(--surface); }
 .proposal-summary-grid dt { color: var(--text-3); font-size: 9.5px; }
@@ -3104,9 +3359,14 @@ onBeforeUnmount(() => {
 .question-card { display: flex; flex-direction: column; gap: 4px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; color: var(--text-2); background: var(--surface-2); font-size: 11.5px; line-height: 1.5; }
 .question-card b { color: var(--text); }
 .question-card .el-button { align-self: flex-start; padding-left: 0; }
-.answer-evidence, .assistant-action-preview { margin-top: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); color: var(--text-2); font-size: 11px; }
-.answer-evidence > header, .assistant-action-preview > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 9px; }
-.answer-evidence > header > span { display: inline-flex; align-items: center; gap: 5px; color: var(--text); font-weight: 750; }
+.answer-evidence { margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--border); color: var(--text-2); font-size: 11px; }
+.answer-evidence > summary { display: flex; align-items: center; justify-content: space-between; gap: 9px; min-height: 30px; color: var(--text-3); cursor: pointer; list-style: none; }
+.answer-evidence > summary::-webkit-details-marker { display: none; }
+.answer-evidence > summary:hover, .answer-evidence > summary:focus-visible { color: var(--primary-600); outline: none; }
+.answer-evidence > summary > span { display: inline-flex; align-items: center; gap: 5px; font-weight: 700; }
+.answer-evidence > summary > small { font-size: 9.5px; }
+.assistant-action-preview { margin-top: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); color: var(--text-2); font-size: 11px; }
+.assistant-action-preview > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 9px; }
 .evidence-meta-grid { display: grid; gap: 6px; margin-top: 8px; }
 .evidence-meta-grid > div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 7px; }
 .evidence-meta-grid b, .evidence-uncertainties b { color: var(--text-3); font-size: 10px; }
@@ -3152,10 +3412,6 @@ onBeforeUnmount(() => {
 .tool-button:hover, .tool-button:focus-within { border-color: var(--primary); color: var(--primary-600); background: var(--primary-soft); }
 .tool-button.disabled { cursor: wait; opacity: .72; }
 .tool-button input { display: none; }
-.task-preset-control { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; min-width: 0; }
-.task-preset-control > label { color: var(--text-3); font-size: 11px; font-weight: 700; white-space: nowrap; }
-.task-preset-control :deep(.el-select) { width: 168px; flex: 0 0 168px; }
-.task-preset-hint { min-width: 0; flex: 1 1 0; color: var(--text-3); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
 .composer-input-row { display: flex; align-items: flex-end; gap: 8px; }
 .composer-input-row :deep(.el-textarea__inner) { min-height: 74px !important; padding-right: 12px; }
 .send-button { width: 42px; height: 42px; padding: 0; flex: 0 0 auto; }
@@ -3167,7 +3423,7 @@ onBeforeUnmount(() => {
 .source-preview-text { min-height: 170px; margin: 12px 0 0; padding: 14px; border-radius: 10px; color: var(--text-2); background: var(--surface-2); font: 12px/1.75 'Cascadia Code', Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 @media (prefers-reduced-motion: reduce) {
-  .thinking-chevron, .disclosure-chevron, .stream-cursor { transition: none; animation: none; }
+  .worklog-chevron, .disclosure-chevron, .stream-cursor { transition: none; animation: none; }
 }
 
 @media (max-width: 560px) {
@@ -3176,9 +3432,6 @@ onBeforeUnmount(() => {
   .assistant-session-bar { align-items: flex-start; flex-direction: column; }
   .session-actions { width: 100%; }
   .session-actions :deep(.el-button) { flex: 1; }
-  .compilation-recovery { grid-template-columns: auto minmax(0, 1fr); padding: 9px 14px; }
-  .compilation-recovery > :deep(.el-tag), .compilation-recovery > :deep(.el-button) { grid-column: 2; justify-self: start; }
-  .compilation-recovery > :deep(.el-button) { min-height: 44px; }
   .assistant-messages { padding: 14px; }
   .assistant-history { padding: 14px; }
   .assistant-composer { padding: 9px 10px 12px; }
@@ -3186,9 +3439,6 @@ onBeforeUnmount(() => {
   .attachment-chip button { width: 44px; height: 44px; }
   .tool-button span { display: none; }
   .composer-tools { flex-wrap: wrap; }
-  .task-preset-control { width: 100%; flex: 1 1 100%; }
-  .task-preset-control :deep(.el-select) { width: 100%; flex: 1 1 auto; }
-  .task-preset-hint { width: 100%; padding-left: 1px; }
   .assistant-quick-start { grid-template-columns: 1fr; }
   .assistant-action-preview dl { grid-template-columns: 1fr; }
   .assistant-action-next { align-items: stretch; flex-direction: column; }

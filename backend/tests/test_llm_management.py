@@ -313,17 +313,26 @@ class LLMManagementTests(unittest.TestCase):
         )
 
     def test_assistant_router_uses_reasoning_safe_completion_budget(self) -> None:
-        decision = AssistantSemanticDecision(
-            goal="create",
-            scope="scenario_model",
-            confidence="high",
-            reason="用户明确要求根据附件创建完整场景模型",
-        )
+        response = {
+            "content": "",
+            "tool_calls": [{
+                "id": "call-route",
+                "type": "function",
+                "function": {
+                    "name": "compile_scenario_model",
+                    "arguments": {
+                        "goal": "create",
+                        "confidence": "high",
+                        "reason": "用户明确要求根据附件创建完整场景模型",
+                    },
+                },
+            }],
+        }
         with patch.object(
             assistant_orchestrator.llm_service,
-            "structured_chat",
-            return_value=decision,
-        ) as structured_chat:
+            "chat",
+            return_value=response,
+        ) as route_chat:
             plan = assistant_orchestrator.plan_assistant_request(
                 llm=self.config,
                 db=self.db,
@@ -341,19 +350,121 @@ class LLMManagementTests(unittest.TestCase):
             )
 
         self.assertEqual(plan.intent, "scenario_model")
-        call = structured_chat.call_args
+        self.assertEqual(plan.capability, "compile_scenario_model")
+        self.assertEqual(plan.public_context()["capability_label"], "附件理解与场景建模")
+        call = route_chat.call_args
         self.assertEqual(call.kwargs["operation"], "assistant_route")
         self.assertEqual(
             call.kwargs["request_timeout"],
             assistant_orchestrator.ROUTE_REQUEST_TIMEOUT_SECONDS,
         )
-        self.assertGreater(call.kwargs["request_timeout"], 15)
+        self.assertGreater(call.kwargs["request_timeout"], 10)
         self.assertEqual(
             call.kwargs["max_tokens"],
             assistant_orchestrator.ROUTE_MAX_COMPLETION_TOKENS,
         )
-        self.assertGreaterEqual(call.kwargs["max_tokens"], 2048)
+        self.assertGreaterEqual(call.kwargs["max_tokens"], 768)
+        self.assertEqual(call.kwargs["tool_choice"], "required")
+        self.assertFalse(call.kwargs["retry_on_length"])
         self.assertEqual(call.kwargs["max_retries"], 0)
+        self.assertIn(
+            "compile_scenario_model",
+            {tool["function"]["name"] for tool in call.kwargs["tools"]},
+        )
+
+    def test_assistant_router_keeps_attachment_request_read_only_when_planner_times_out(self) -> None:
+        with patch.object(
+            assistant_orchestrator.llm_service,
+            "chat",
+            side_effect=TimeoutError("route timeout"),
+        ) as route_chat:
+            plan = assistant_orchestrator.plan_assistant_request(
+                llm=self.config,
+                db=self.db,
+                message="请根据上传资料完成当前场景的完整建设",
+                history=[],
+                page="场景建模",
+                path="/scenarios/scenario-1",
+                mode="ask",
+                preferred_scope="auto",
+                has_scenario=True,
+                has_attachments=True,
+                has_active_model_drafts=False,
+                active_draft_scopes=[],
+                context_summary="当前场景尚无正式资源。",
+            )
+
+        self.assertEqual(plan.intent, "chat")
+        self.assertEqual(plan.capability, "answer_question")
+        self.assertEqual(plan.source, "model_fallback")
+        self.assertIn("附件不会自动触发建模", plan.policy_note)
+        self.assertEqual(route_chat.call_args.kwargs["max_retries"], 0)
+
+    def test_assistant_router_accepts_provider_tool_selection_without_arguments(self) -> None:
+        with patch.object(
+            assistant_orchestrator.llm_service,
+            "chat",
+            return_value={
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-route",
+                    "type": "function",
+                    "function": {
+                        "name": "compile_scenario_model",
+                        "arguments": {},
+                    },
+                }],
+            },
+        ):
+            plan = assistant_orchestrator.plan_assistant_request(
+                llm=self.config,
+                db=self.db,
+                message="请根据附件创建完整场景模型草稿",
+                history=[],
+                page="场景建模",
+                path="/scenarios/scenario-1",
+                mode="ask",
+                preferred_scope="auto",
+                has_scenario=True,
+                has_attachments=True,
+                has_active_model_drafts=False,
+                active_draft_scopes=[],
+                context_summary="附件包含业务对象和处置流程。",
+            )
+
+        self.assertEqual(plan.intent, "scenario_model")
+        self.assertEqual(plan.capability, "compile_scenario_model")
+        self.assertEqual(plan.decision.goal, "create")
+        self.assertEqual(plan.decision.confidence, "high")
+        self.assertEqual(plan.source, "model")
+
+    def test_assistant_router_does_not_resume_model_draft_for_publish_question_after_timeout(self) -> None:
+        with patch.object(
+            assistant_orchestrator.llm_service,
+            "chat",
+            side_effect=TimeoutError("route timeout"),
+        ):
+            plan = assistant_orchestrator.plan_assistant_request(
+                llm=self.config,
+                db=self.db,
+                message="如果需要达到可发布状态，我现在需要做些什么？",
+                history=[],
+                page="场景建模",
+                path="/scenarios/scenario-1",
+                mode="ask",
+                preferred_scope="auto",
+                has_scenario=True,
+                has_attachments=False,
+                has_active_model_drafts=True,
+                active_draft_scopes=["scenario_model"],
+                context_summary="当前场景存在一份待确认的完整建模草稿。",
+            )
+
+        self.assertEqual(plan.intent, "chat")
+        self.assertEqual(plan.decision.goal, "answer")
+        self.assertEqual(plan.source, "model_fallback")
+        self.assertIn("普通回答", plan.policy_note)
+        self.assertIn("发布前需要什么", assistant_orchestrator._ROUTER_SYSTEM_PROMPT)
 
     def test_structured_chat_accepts_complete_json_after_provider_preamble(self) -> None:
         structured_model = Mock()

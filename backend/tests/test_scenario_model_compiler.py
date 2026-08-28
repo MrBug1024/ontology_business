@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1075,7 +1076,10 @@ class ScenarioModelCompilerTests(unittest.TestCase):
             )
 
         self.assertEqual(chat.call_count, 3)
-        self.assertEqual(chat.call_args_list[0].kwargs["max_tokens"], 20_000)
+        self.assertEqual(
+            chat.call_args_list[0].kwargs["max_tokens"],
+            scenario_model_compiler.MAX_OUTPUT_TOKENS,
+        )
         self.assertTrue(all(
             call.kwargs["max_tokens"]
             == scenario_model_compiler.FALLBACK_MAX_OUTPUT_TOKENS
@@ -1379,10 +1383,13 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 llm=object(),
             )
 
-        # One full call followed by exactly two chunk calls: no second 20k
+        # One full call followed by exactly two chunk calls: no second
         # whole-document retry is allowed after finish_reason=length.
         self.assertEqual(chat.call_count, 3)
-        self.assertEqual(chat.call_args_list[0].kwargs["max_tokens"], 20_000)
+        self.assertEqual(
+            chat.call_args_list[0].kwargs["max_tokens"],
+            scenario_model_compiler.MAX_OUTPUT_TOKENS,
+        )
         self.assertEqual(
             [call.kwargs["max_tokens"] for call in chat.call_args_list[1:]],
             [scenario_model_compiler.FALLBACK_MAX_OUTPUT_TOKENS] * 2,
@@ -1760,14 +1767,92 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 llm=object(),
             )
         self.assertEqual(chat.call_count, 5)
-        self.assertEqual(payload["changes"], [])
+        self.assertTrue(payload["changes"])
         entity_drafts = [
             item for item in payload["draft_candidates"]
             if item["resource_kind"] == "entity"
         ]
         self.assertEqual(len(entity_drafts), 1)
         self.assertEqual(entity_drafts[0]["resource_key"], "entity.project")
-        self.assertEqual(payload["coverage_summary"]["ambiguous"], 2)
+        self.assertEqual(len(payload["entities"]), 1)
+        self.assertEqual(payload["coverage_summary"]["modeled"], 1)
+        self.assertEqual(payload["coverage_summary"]["ambiguous"], 1)
+        self.assertIn(
+            "COMPILER_CONTRACT_ERROR",
+            {
+                item.get("reported_code") or item["code"]
+                for item in payload["unresolved"]
+            },
+        )
+        self.assertGreater(payload["applyability"]["safe_change_count"], 0)
+        with self.assertRaises(PolicyViolation):
+            scenario_model_compiler.preflight_scenario_model(
+                self.db,
+                self.scenario,
+                payload,
+                inspect_mappings=False,
+            )
+
+    def test_staged_ontology_generation_keeps_full_contract_and_hides_unrun_stages(self) -> None:
+        raw = self._raw()
+        progress: list[tuple[str, str, str, str]] = []
+        with patch.object(
+            scenario_model_compiler.llm_service,
+            "chat",
+            return_value={"content": json.dumps(raw, ensure_ascii=False)},
+        ) as chat:
+            payload = scenario_model_compiler.compile_scenario_model(
+                self.db,
+                self.scenario,
+                message="请先完成本体模型建设",
+                documents=[{
+                    "id": "construction-brief",
+                    "filename": "建筑项目实施文档.md",
+                    "text": "项目以项目编号唯一标识。项目可包含子项目。审批操作校验项目状态。",
+                }],
+                llm=object(),
+                task_scope="ontology",
+                on_progress=lambda step, detail, status, result: progress.append(
+                    (step, detail, status, result)
+                ),
+            )
+
+        prompt = chat.call_args.args[1][1]["content"]
+        self.assertIn("当前只建设“本体模型”阶段", prompt)
+        self.assertIn("本阶段只有 entities 和 relations 可以非空", prompt)
+        self.assertEqual(payload["generation"], {
+            "mode": "staged",
+            "generated_task_ids": ["ontology"],
+        })
+        self.assertTrue(payload["entities"])
+        self.assertTrue(payload["relations"])
+        for section in (
+            "instances", "functions", "actions", "rules", "events", "workflows",
+            "mappings", "relation_mappings", "conceptual_mappings",
+        ):
+            self.assertEqual(payload[section], [], section)
+        progressed_steps = [step for step, _detail, _status, _result in progress]
+        self.assertNotIn("mapping", progressed_steps)
+        self.assertNotIn("rules", progressed_steps)
+
+    def test_later_stage_uses_a_compact_task_specific_contract(self) -> None:
+        prompt = scenario_model_compiler._compiler_prompt(
+            self.scenario,
+            message="请继续生成对象实例",
+            paragraphs=[{
+                "ref": "construction-brief:p0001",
+                "source_id": "construction-brief",
+                "text": "项目编号为 P-001 的项目存在欠薪预警。",
+            }],
+            mapping_catalog=[],
+            db=self.db,
+            task_scope="instances",
+        )
+
+        self.assertIn("当前只建设“对象实例”阶段", prompt)
+        self.assertIn("instances: [{key,entity_ref,display_name,values,evidence_refs,confidence}]", prompt)
+        self.assertIn("entities, relations, functions", prompt)
+        self.assertNotIn("目标：把附件与用户补充描述/修正建议共同编译", prompt)
 
     def test_source_chunks_preserve_ref_order_without_overlap(self) -> None:
         paragraphs = [
@@ -1779,6 +1864,295 @@ class ScenarioModelCompilerTests(unittest.TestCase):
         self.assertGreater(len(chunks), 1)
         self.assertEqual(flattened_refs, [item["ref"] for item in paragraphs])
         self.assertEqual(len(flattened_refs), len(set(flattened_refs)))
+
+    def test_full_model_chunks_use_conservative_boundary(self) -> None:
+        self.assertEqual(scenario_model_compiler.FALLBACK_SOURCE_CHARS, 12_000)
+        self.assertEqual(
+            scenario_model_compiler.STAGED_FALLBACK_SOURCE_CHARS,
+            24_000,
+        )
+
+    def test_postgres_chunk_workers_respect_configured_bound(self) -> None:
+        db = SimpleNamespace(get_bind=lambda: SimpleNamespace(
+            dialect=SimpleNamespace(name="postgresql")
+        ))
+        with patch.object(
+            scenario_model_compiler,
+            "get_settings",
+            return_value=SimpleNamespace(scenario_model_max_parallel_chunks=3),
+        ):
+            self.assertEqual(
+                scenario_model_compiler._chunk_parallel_worker_count(db, 8),
+                3,
+            )
+            self.assertEqual(
+                scenario_model_compiler._chunk_parallel_worker_count(db, 2),
+                2,
+            )
+
+    def test_chunk_extraction_runs_in_parallel_with_deterministic_merge(self) -> None:
+        document = {
+            "id": "parallel-source",
+            "filename": "并行建模资料.md",
+            "text": "第一段业务资料。\n\n第二段业务资料。\n\n第三段业务资料。",
+        }
+        source_bundle = scenario_model_compiler.build_source_bundle(
+            "请编译附件", [document]
+        )
+        paragraphs = source_bundle["paragraphs"]
+        refs = [item["ref"] for item in paragraphs]
+        self.assertEqual(len(paragraphs), 3)
+        barrier = threading.Barrier(3)
+        used_calls: list[int] = []
+        checkpoints: list[dict] = []
+
+        def fake_isolated_worker(*_args, **kwargs):
+            kwargs["call_budget"].consume("chunk_provider_call")
+            barrier.wait(timeout=5)
+            source_ref = kwargs["paragraphs"][0]["ref"]
+            raw = {
+                "schema_version": "scenario_model.v1",
+                **{
+                    section: []
+                    for section in scenario_model_compiler._MODEL_OUTPUT_RESOURCE_SECTIONS
+                },
+                "unresolved": [],
+                "coverage": [{
+                    "source_ref": source_ref,
+                    "status": "context",
+                    "reason": "并行分段覆盖",
+                    "change_keys": [],
+                }],
+            }
+            return raw
+
+        budget = scenario_model_compiler.LLMCallBudget(
+            3,
+            on_consume=lambda used, _total, _phase: used_calls.append(used),
+        )
+        normalize_model = scenario_model_compiler.normalize_scenario_model
+
+        with (
+            patch.object(
+                scenario_model_compiler,
+                "_source_chunks",
+                return_value=[[item] for item in paragraphs],
+            ),
+            patch.object(
+                scenario_model_compiler,
+                "_chunk_parallel_worker_count",
+                return_value=3,
+            ),
+            patch.object(
+                scenario_model_compiler,
+                "_extract_chunk_once_in_isolated_session",
+                side_effect=fake_isolated_worker,
+            ) as worker,
+            patch.object(
+                scenario_model_compiler,
+                "normalize_scenario_model",
+                side_effect=normalize_model,
+            ) as normalize,
+        ):
+            payload = scenario_model_compiler._compile_scenario_model_in_chunks(
+                self.db,
+                self.scenario,
+                message="请编译附件",
+                llm=object(),
+                source_bundle=source_bundle,
+                mapping_catalog=[],
+                columns={},
+                call_budget=budget,
+                on_checkpoint=lambda data, _detail: checkpoints.append(data),
+            )
+
+        self.assertEqual(worker.call_count, 3)
+        self.assertGreaterEqual(len(checkpoints), 1)
+        self.assertLessEqual(len(checkpoints), 3)
+        self.assertEqual(normalize.call_count, len(checkpoints))
+        self.assertEqual(used_calls, [1, 2, 3])
+        self.assertEqual(
+            [item["source_ref"] for item in payload["coverage"]],
+            refs,
+        )
+        self.assertEqual(payload["coverage_summary"]["total"], 3)
+
+    def test_recursive_splits_reenter_the_bounded_parallel_queue(self) -> None:
+        document = {
+            "id": "parallel-recursive-source",
+            "filename": "递归并行建模资料.md",
+            "text": "第一段。\n\n第二段。\n\n第三段。\n\n第四段。",
+        }
+        source_bundle = scenario_model_compiler.build_source_bundle(
+            "请编译附件", [document]
+        )
+        paragraphs = source_bundle["paragraphs"]
+        refs = [item["ref"] for item in paragraphs]
+        initial_barrier = threading.Barrier(3)
+        child_barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+        labels: list[str] = []
+        checkpoints: list[dict] = []
+
+        def fake_leaf_worker(*_args, **kwargs):
+            nonlocal active, max_active
+            label = kwargs["chunk_label"]
+            kwargs["call_budget"].consume("chunk_provider_call")
+            with lock:
+                labels.append(label)
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                if label in {"1", "2", "3"}:
+                    initial_barrier.wait(timeout=5)
+                if label == "1":
+                    raise scenario_model_compiler._CompilerOutputTruncated(
+                        "需要二分"
+                    )
+                if label in {"1.1", "1.2"}:
+                    child_barrier.wait(timeout=5)
+                return {
+                    "schema_version": "scenario_model.v1",
+                    **{
+                        section: []
+                        for section in scenario_model_compiler._MODEL_OUTPUT_RESOURCE_SECTIONS
+                    },
+                    "unresolved": [],
+                    "coverage": [
+                        {
+                            "source_ref": item["ref"],
+                            "status": "context",
+                            "reason": "动态并行分段覆盖",
+                            "change_keys": [],
+                        }
+                        for item in kwargs["paragraphs"]
+                    ],
+                }
+            finally:
+                with lock:
+                    active -= 1
+
+        budget = scenario_model_compiler.LLMCallBudget(5)
+        with (
+            patch.object(
+                scenario_model_compiler,
+                "_source_chunks",
+                return_value=[paragraphs[:2], [paragraphs[2]], [paragraphs[3]]],
+            ),
+            patch.object(
+                scenario_model_compiler,
+                "_chunk_parallel_worker_count",
+                return_value=3,
+            ),
+            patch.object(
+                scenario_model_compiler,
+                "_extract_chunk_once_in_isolated_session",
+                side_effect=fake_leaf_worker,
+            ),
+        ):
+            payload = scenario_model_compiler._compile_scenario_model_in_chunks(
+                self.db,
+                self.scenario,
+                message="请编译附件",
+                llm=object(),
+                source_bundle=source_bundle,
+                mapping_catalog=[],
+                columns={},
+                call_budget=budget,
+                on_checkpoint=lambda data, _detail: checkpoints.append(data),
+            )
+
+        self.assertEqual(set(labels), {"1", "1.1", "1.2", "2", "3"})
+        self.assertEqual(max_active, 3)
+        self.assertGreaterEqual(len(checkpoints), 1)
+        self.assertEqual(checkpoints[-1]["coverage_summary"]["total"], 4)
+        self.assertEqual(
+            [item["source_ref"] for item in payload["coverage"]],
+            refs,
+        )
+
+    def test_parallel_failed_chunk_does_not_replace_completed_resources(self) -> None:
+        document = {
+            "id": "parallel-partial-source",
+            "filename": "部分失败并行资料.md",
+            "text": "项目对象。\n\n背景说明。\n\n暂不可用来源。",
+        }
+        source_bundle = scenario_model_compiler.build_source_bundle(
+            "请编译附件", [document]
+        )
+        paragraphs = source_bundle["paragraphs"]
+        refs = [item["ref"] for item in paragraphs]
+        checkpoints: list[dict] = []
+
+        def fake_leaf_worker(*_args, **kwargs):
+            label = kwargs["chunk_label"]
+            source_ref = kwargs["paragraphs"][0]["ref"]
+            if label == "3":
+                raise TimeoutError("第三分段暂不可用")
+            raw = self._raw()
+            for section in scenario_model_compiler._MODEL_OUTPUT_RESOURCE_SECTIONS:
+                raw[section] = []
+            if label == "1":
+                entity = self._raw()["entities"][0]
+                entity["evidence_refs"] = [source_ref]
+                raw["entities"] = [entity]
+                status = "modeled"
+                change_keys = [entity["key"]]
+            else:
+                status = "context"
+                change_keys = []
+            raw["unresolved"] = []
+            raw["coverage"] = [{
+                "source_ref": source_ref,
+                "status": status,
+                "reason": "并行部分结果",
+                "change_keys": change_keys,
+            }]
+            return raw
+
+        with (
+            patch.object(
+                scenario_model_compiler,
+                "_source_chunks",
+                return_value=[[item] for item in paragraphs],
+            ),
+            patch.object(
+                scenario_model_compiler,
+                "_chunk_parallel_worker_count",
+                return_value=3,
+            ),
+            patch.object(
+                scenario_model_compiler,
+                "_extract_chunk_once_in_isolated_session",
+                side_effect=fake_leaf_worker,
+            ),
+        ):
+            payload = scenario_model_compiler._compile_scenario_model_in_chunks(
+                self.db,
+                self.scenario,
+                message="请编译附件",
+                llm=object(),
+                source_bundle=source_bundle,
+                mapping_catalog=[],
+                columns={},
+                on_checkpoint=lambda data, _detail: checkpoints.append(data),
+            )
+
+        self.assertEqual(len(payload["entities"]), 1)
+        self.assertTrue(payload["draft_candidates"])
+        self.assertEqual(payload["coverage_summary"]["modeled"], 1)
+        self.assertEqual(payload["coverage_summary"]["context"], 1)
+        self.assertEqual(payload["coverage_summary"]["ambiguous"], 1)
+        self.assertEqual(checkpoints[-1]["entities"], payload["entities"])
+        self.assertIn(
+            "COMPILER_CONTRACT_ERROR",
+            {
+                item.get("reported_code") or item["code"]
+                for item in payload["unresolved"]
+            },
+        )
 
     def test_large_source_skips_full_call_and_starts_with_bounded_chunks(self) -> None:
         document = {

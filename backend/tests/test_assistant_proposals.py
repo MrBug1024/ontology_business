@@ -135,6 +135,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         change_count: int = 1,
         safe_change_count: int | None = None,
         issues: list[dict] | None = None,
+        generation_status: str = "generated",
     ) -> dict:
         safe_count = change_count if safe_change_count is None else safe_change_count
         task_issues = list(issues or [])
@@ -146,6 +147,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             "sections": [task_id],
             "depends_on": list(depends_on or []),
             "status": "pending",
+            "generation_status": generation_status,
             "change_keys": [f"{task_id}.{index}" for index in range(change_count)],
             "safe_change_keys": [
                 f"{task_id}.{index}" for index in range(min(change_count, safe_count))
@@ -675,6 +677,144 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             item["status"] in assistant._MODEL_TASK_TERMINAL_STATUSES
             for item in final["tasks"]
         ))
+
+    def test_staged_model_task_waits_for_an_explicit_next_generation(self) -> None:
+        payload = {
+            "tasks": [
+                self._model_task("ontology", 1),
+                self._model_task(
+                    "instances",
+                    2,
+                    depends_on=["ontology"],
+                    generation_status="pending",
+                ),
+                self._model_task(
+                    "mapping",
+                    3,
+                    depends_on=["ontology"],
+                    generation_status="pending",
+                ),
+                self._model_task(
+                    "capabilities",
+                    4,
+                    depends_on=["ontology"],
+                    generation_status="pending",
+                ),
+                self._model_task(
+                    "rules",
+                    5,
+                    depends_on=["ontology", "capabilities"],
+                    generation_status="pending",
+                ),
+                self._model_task(
+                    "workflows",
+                    6,
+                    depends_on=["ontology", "capabilities", "rules"],
+                    generation_status="pending",
+                ),
+            ],
+            "unresolved": [],
+        }
+
+        initial = assistant._refresh_model_task_states(payload)
+        self.assertEqual(initial["current_task_id"], "ontology")
+        self.assertEqual(initial["next_action"]["type"], "confirm_task")
+
+        after_ontology = assistant._refresh_model_task_states(
+            initial,
+            applied_task_id="ontology",
+            applied_status="applied",
+        )
+        by_id = {item["id"]: item for item in after_ontology["tasks"]}
+        self.assertEqual(after_ontology["execution_status"], "waiting_for_generation")
+        self.assertEqual(after_ontology["current_task_id"], "instances")
+        self.assertEqual(after_ontology["next_action"]["type"], "generate_task")
+        self.assertFalse(after_ontology["next_action"]["requires_confirmation"])
+        self.assertEqual(by_id["instances"]["status"], "awaiting_generation")
+        self.assertEqual(by_id["mapping"]["status"], "waiting")
+
+    def test_staged_merge_preserves_prior_stage_coverage_and_evidence(self) -> None:
+        base = {
+            section: [] for section in assistant._SCENARIO_MODEL_RESOURCE_SECTIONS
+        }
+        current = {
+            **base,
+            "entities": [{
+                "key": "entity.project",
+                "evidence_refs": ["brief:p0001"],
+            }],
+            "changes": [{"change_id": "entity.project", "operation": "add"}],
+            "unresolved": [],
+            "source_refs": ["brief:p0001", "brief:p0002"],
+            "source_paragraph_count": 2,
+            "coverage": [
+                {
+                    "source_ref": "brief:p0001",
+                    "status": "modeled",
+                    "reason": "项目对象定义",
+                    "change_keys": ["entity.project"],
+                },
+                {
+                    "source_ref": "brief:p0002",
+                    "status": "context",
+                    "reason": "留待后续实例任务",
+                    "change_keys": [],
+                },
+            ],
+            "generation": {"mode": "staged", "generated_task_ids": ["ontology"]},
+        }
+        stage = {
+            **base,
+            "instances": [{
+                "key": "instance.project.001",
+                "entity_ref": "entity.project",
+                "evidence_refs": ["brief:p0001"],
+            }],
+            "changes": [],
+            "unresolved": [],
+            "source_refs": ["brief:p0001", "brief:p0002"],
+            "source_paragraph_count": 2,
+            "coverage": [
+                {
+                    "source_ref": "brief:p0001",
+                    "status": "modeled",
+                    "reason": "项目实例候选",
+                    "change_keys": ["instance.project.001"],
+                },
+                {
+                    "source_ref": "brief:p0002",
+                    "status": "context",
+                    "reason": "仍留待映射任务",
+                    "change_keys": [],
+                },
+            ],
+            "generation": {"mode": "staged", "generated_task_ids": ["instances"]},
+        }
+
+        merged = assistant._merge_staged_compilation_payload(
+            current,
+            stage,
+            task_id="instances",
+        )
+
+        coverage = {item["source_ref"]: item for item in merged["coverage"]}
+        self.assertEqual(
+            coverage["brief:p0001"]["change_keys"],
+            ["entity.project", "instance.project.001"],
+        )
+        self.assertEqual(coverage["brief:p0001"]["status"], "modeled")
+        self.assertEqual(merged["coverage_summary"]["modeled"], 1)
+        self.assertEqual(merged["generation"]["generated_task_ids"], ["ontology", "instances"])
+
+        ontology_apply_payload = scenario_model_compiler.task_payload_for_apply(
+            merged,
+            "ontology",
+        )
+        ontology_coverage = {
+            item["source_ref"]: item for item in ontology_apply_payload["coverage"]
+        }
+        self.assertEqual(ontology_coverage["brief:p0001"]["status"], "modeled")
+        self.assertEqual(ontology_coverage["brief:p0001"]["change_keys"], ["entity.project"])
 
     def test_all_empty_model_tasks_finish_without_claiming_any_write(self) -> None:
         result = assistant._refresh_model_task_states({
@@ -1900,6 +2040,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             ]
             observed["tenant_id"] = db.info.get("tenant_id")
             observed["user_id"] = db.info.get("user_id")
+            observed["task_scope"] = _kwargs.get("task_scope")
             return {
                 "schema_version": "scenario_model.v1",
                 "source_manifest": [],
@@ -1978,6 +2119,11 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.assertEqual(observed["functions"], ["计算风险分"])
         self.assertEqual(observed["tenant_id"], tenant_id)
         self.assertEqual(observed["user_id"], user_id)
+        self.assertEqual(observed["task_scope"], "")
+        self.assertTrue(
+            {"ontology", "mapping", "rules", "review", "result"}
+            .issubset({item["id"] for item in (job.progress.get("steps") or [])})
+        )
 
     def test_workflow_count_question_never_generates_a_workflow_proposal(self) -> None:
         scenario = BusinessScenario(
@@ -1997,24 +2143,33 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         )
         self.db.add_all([scenario, llm])
         self.db.commit()
-        decision = assistant_orchestrator.AssistantSemanticDecision(
-            goal="answer",
-            scope="workflow",
-            confidence="high",
-            reason="用户正在询问已有工作流数量",
-        )
+        route_response = {
+            "content": "",
+            "tool_calls": [{
+                "id": "call-route",
+                "type": "function",
+                "function": {
+                    "name": "answer_question",
+                    "arguments": {
+                        "goal": "answer",
+                        "confidence": "high",
+                        "reason": "用户正在询问已有工作流数量",
+                    },
+                },
+            }],
+        }
+
+        def chat_side_effect(*args, **kwargs):
+            if kwargs.get("operation") == "assistant_route":
+                return route_response
+            return {"content": "当前业务场景有 0 个正式工作流。"}
 
         with (
             patch.object(
                 assistant.llm_service,
-                "structured_chat",
-                return_value=decision,
-            ) as classify,
-            patch.object(
-                assistant.llm_service,
                 "chat",
-                return_value={"content": "当前业务场景有 0 个正式工作流。"},
-            ) as answer,
+                side_effect=chat_side_effect,
+            ) as model_chat,
             patch.object(
                 assistant.workflow_service,
                 "generate_workflow",
@@ -2048,8 +2203,15 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.assertEqual(replay.reply, reply.reply)
         self.assertEqual(replay.thread_id, reply.thread_id)
         self.assertEqual(reply.proposal, {})
-        classify.assert_called_once()
-        self.assertEqual(answer.call_count, 2)
+        self.assertEqual(
+            sum(
+                1
+                for call in model_chat.call_args_list
+                if call.kwargs.get("operation") == "assistant_route"
+            ),
+            1,
+        )
+        self.assertEqual(model_chat.call_count, 3)
         generate_workflow.assert_not_called()
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(AssistantRouteDecision)),
@@ -2105,10 +2267,13 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         with (
             patch.object(
                 assistant.llm_service,
-                "structured_chat",
-                side_effect=TimeoutError("route timeout"),
-            ),
-            patch.object(assistant.llm_service, "chat") as ordinary_chat,
+                "chat",
+                side_effect=lambda *args, **kwargs: (
+                    (_ for _ in ()).throw(TimeoutError("route timeout"))
+                    if kwargs.get("operation") == "assistant_route"
+                    else {"content": "已由普通回答链路恢复"}
+                ),
+            ) as ordinary_chat,
             patch.object(assistant.scenario_model_compiler, "compile_scenario_model") as compile_model,
         ):
             reply = assistant.chat(
@@ -2122,11 +2287,10 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 self.db,
             )
 
-        ordinary_chat.assert_not_called()
+        self.assertEqual(ordinary_chat.call_count, 2)
         compile_model.assert_not_called()
         self.assertEqual(reply.proposal, {})
-        self.assertIn("语义规划没有完成", reply.reply)
-        self.assertIn("没有生成、应用或保存任何变更", reply.reply)
+        self.assertEqual(reply.reply, "已由普通回答链路恢复")
         saved = self.db.execute(
             select(AssistantMessage)
             .where(
@@ -2137,8 +2301,8 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         ).scalars().first()
         self.assertIsNotNone(saved)
         self.assertEqual(saved.proposal, {})
-        self.assertEqual(saved.context["status"], "route_fallback")
         self.assertEqual(saved.context["routing"]["source"], "model_fallback")
+        self.assertTrue(saved.context["routing"]["recovered"])
 
     def test_historic_route_fallback_content_is_serialized_from_route_evidence(self) -> None:
         thread = AssistantThread(
@@ -2178,7 +2342,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.assertEqual(public.proposal, {})
         self.assertEqual(message.content, raw_content)
 
-    def test_route_failure_stops_before_streaming_chat(self) -> None:
+    def test_route_failure_recovers_into_streaming_chat(self) -> None:
         scenario = BusinessScenario(
             tenant_id=self.tenant.id,
             name="薪莫愁流式",
@@ -2202,10 +2366,14 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             patch.object(assistant, "SessionLocal", factory),
             patch.object(
                 assistant.llm_service,
-                "structured_chat",
+                "chat",
                 side_effect=TimeoutError("route timeout"),
             ),
-            patch.object(assistant.llm_service, "chat_stream") as ordinary_chat_stream,
+            patch.object(
+                assistant.llm_service,
+                "chat_stream",
+                return_value=iter([{"type": "token", "content": "已恢复回答"}]),
+            ) as ordinary_chat_stream,
             patch.object(assistant.scenario_model_compiler, "compile_scenario_model") as compile_model,
         ):
             response = assistant.stream_chat(
@@ -2220,21 +2388,21 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             )
             body = asyncio.run(self._consume_until(response))
 
-        ordinary_chat_stream.assert_not_called()
+        ordinary_chat_stream.assert_called_once()
         compile_model.assert_not_called()
-        self.assertIn("语义规划没有完成", body)
-        self.assertIn("没有生成、应用或保存任何变更", body)
+        self.assertIn("已恢复回答", body)
         saved = self.db.execute(
             select(AssistantMessage)
             .where(
                 AssistantMessage.role == "assistant",
-                AssistantMessage.content.contains("语义规划没有完成"),
+                AssistantMessage.content.contains("已恢复回答"),
             )
             .order_by(AssistantMessage.created_at.desc())
         ).scalars().first()
         self.assertIsNotNone(saved)
         self.assertEqual(saved.proposal, {})
-        self.assertEqual(saved.context["status"], "route_fallback")
+        self.assertEqual(saved.context["routing"]["source"], "model_fallback")
+        self.assertTrue(saved.context["routing"]["recovered"])
 
     def test_temporary_attachment_is_bound_to_one_thread_and_expired_rows_are_purged(self) -> None:
         first = AssistantThread(

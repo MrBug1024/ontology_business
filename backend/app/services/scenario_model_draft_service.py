@@ -18,7 +18,11 @@ from . import datasource_service, release_service
 
 
 MAX_DRAFT_PAYLOAD_CHARS = 1_000_000
-MAX_WORKING_DRAFT_CONTEXT_CHARS = 100_000
+# Prior drafts are advisory context, while the current message and attachments
+# are authoritative for the new turn.  A tighter budget prevents repeated
+# historical runs from multiplying provider chunks and making a fresh request
+# wait minutes before its own evidence is processed.
+MAX_WORKING_DRAFT_CONTEXT_CHARS = 24_000
 PENDING_CONFIRMATION_STATUS = "pending_confirmation"
 APPLYABLE_DRAFT_STATUSES = frozenset({
     PENDING_CONFIRMATION_STATUS,
@@ -280,12 +284,16 @@ def _candidate_issues(
 def _compiler_candidates(model_payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Return sidecar candidates plus a compatibility fallback for old runs."""
     result: list[dict[str, Any]] = []
+    live_checkpoint = bool(model_payload.get("live_checkpoint"))
     sidecar = model_payload.get("draft_candidates")
     if isinstance(sidecar, list):
         for raw in sidecar:
             if isinstance(raw, dict) and normalize_resource_kind(raw.get("resource_kind")):
                 item = _json_copy(raw, {})
-                item["materialization_source"] = "compiler_sidecar"
+                item["materialization_source"] = (
+                    "live_checkpoint" if live_checkpoint else "compiler_sidecar"
+                )
+                item["_sidecar_candidate"] = True
                 result.append(item)
 
     for section, kind in _SECTION_KINDS.items():
@@ -302,7 +310,10 @@ def _compiler_candidates(model_payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "payload": _json_copy(value, {}),
                 "evidence_refs": _json_copy(value.get("evidence_refs"), []),
                 "validation_issues": [],
-                "materialization_source": "compiled_payload",
+                "materialization_source": (
+                    "live_checkpoint" if live_checkpoint else "compiled_payload"
+                ),
+                "_sidecar_candidate": False,
             })
     return result
 
@@ -453,8 +464,8 @@ def _normalized_candidates(model_payload: dict[str, Any]) -> list[dict[str, Any]
         }
         current = by_identity.get(identity)
         if current is None or (
-            current.get("materialization_source") != "compiler_sidecar"
-            and normalized.get("materialization_source") == "compiler_sidecar"
+            not bool(current.get("_sidecar_candidate"))
+            and bool(normalized.get("_sidecar_candidate"))
         ):
             by_identity[identity] = normalized
     return list(by_identity.values())
@@ -836,6 +847,7 @@ def materialize_draft_resources(
     created_by_user_id: str | None = None,
     lineage_started_at: datetime | None = None,
     consumed_draft_revisions: dict[str, int] | None = None,
+    replace_live_checkpoints: bool = False,
 ) -> dict[str, Any]:
     """Idempotently materialize every compiler candidate into inert staging."""
     if proposal.get("kind") != "scenario_model":
@@ -883,7 +895,6 @@ def materialize_draft_resources(
             ScenarioModelDraftResource.scenario_id == scenario.id,
             ScenarioModelDraftResource.created_by_user_id == owner_user_id,
             ScenarioModelDraftResource.proposal_id == proposal_id,
-            ScenarioModelDraftResource.resource_identity.in_(identities or [""]),
         )
         .with_for_update()
     ).all())
@@ -1024,7 +1035,27 @@ def materialize_draft_resources(
             )
             if row.predecessor_revision < 0 and predecessor_revision >= 0:
                 row.predecessor_revision = predecessor_revision
-            row.validation_issues = _merge_issues(row.validation_issues, issues)
+            incoming_source = str(
+                candidate.get("materialization_source") or "compiler"
+            )[:30]
+            # A live checkpoint may be replaced by a later, more complete
+            # checkpoint only while nobody has edited it.  User changes bump
+            # revision and therefore always win over subsequent model output.
+            if row.materialization_source == "live_checkpoint" and row.revision == 0:
+                row.title = str(
+                    candidate.get("display_name")
+                    or candidate_payload.get("display_name")
+                    or candidate_payload.get("name")
+                    or resource_key
+                )[:300]
+                row.source_payload = _json_copy(candidate_payload, {})
+                row.payload = _json_copy(candidate_payload, {})
+                row.validation_issues = issues
+                row.source_refs = source_refs
+                row.materialization_source = incoming_source
+                row.draft_status = draft_status
+            else:
+                row.validation_issues = _merge_issues(row.validation_issues, issues)
             merged_source_refs, dropped_merged_refs = _bounded_source_refs([
                 *[str(value) for value in (row.source_refs or [])],
                 *source_refs,
@@ -1042,15 +1073,36 @@ def materialize_draft_resources(
             row.enabled = False
             row.publishable = False
 
-    _reconcile_active_lineage(
-        db,
-        tenant_id=tenant_id,
-        scenario_id=scenario.id,
-        proposal_id=proposal_id,
-        created_by_user_id=owner_user_id,
-        identities=identities,
-        consumed_draft_revisions=consumed_revisions,
-    )
+    if replace_live_checkpoints:
+        active_identities = set(identities)
+        for row in existing_rows:
+            if (
+                not bool(model_payload.get("live_checkpoint"))
+                and row.materialization_source == "live_checkpoint"
+                and row.revision > 0
+            ):
+                row.materialization_source = "user_checkpoint_edit"
+            if (
+                row.resource_identity not in active_identities
+                and row.materialization_source == "live_checkpoint"
+                and row.revision == 0
+                and row.draft_status in OPEN_DRAFT_STATUSES
+            ):
+                db.delete(row)
+
+    # A live checkpoint is a temporary page projection, not a successor
+    # decision. It must not mutate an existing working-draft lineage before
+    # the compiler reaches a final result.
+    if not bool(model_payload.get("live_checkpoint")):
+        _reconcile_active_lineage(
+            db,
+            tenant_id=tenant_id,
+            scenario_id=scenario.id,
+            proposal_id=proposal_id,
+            created_by_user_id=owner_user_id,
+            identities=identities,
+            consumed_draft_revisions=consumed_revisions,
+        )
 
     rows = list(db.scalars(
         select(ScenarioModelDraftResource).where(
@@ -1061,6 +1113,37 @@ def materialize_draft_resources(
         )
     ).all())
     return draft_summary(rows)
+
+
+def discard_pristine_live_checkpoints(
+    db: Session,
+    *,
+    tenant_id: str,
+    scenario_id: str,
+    created_by_user_id: str,
+    compilation_job_id: str,
+) -> int:
+    """Remove untouched projections and promote user-edited checkpoints."""
+    rows = list(db.scalars(
+        select(ScenarioModelDraftResource)
+        .where(
+            ScenarioModelDraftResource.tenant_id == tenant_id,
+            ScenarioModelDraftResource.scenario_id == scenario_id,
+            ScenarioModelDraftResource.created_by_user_id == created_by_user_id,
+            ScenarioModelDraftResource.compilation_job_id == compilation_job_id,
+            ScenarioModelDraftResource.materialization_source == "live_checkpoint",
+            ScenarioModelDraftResource.draft_status.in_(OPEN_DRAFT_STATUSES),
+        )
+        .with_for_update()
+    ).all())
+    deleted = 0
+    for row in rows:
+        if row.revision == 0:
+            db.delete(row)
+            deleted += 1
+        else:
+            row.materialization_source = "user_checkpoint_edit"
+    return deleted
 
 
 def draft_summary(
@@ -1280,7 +1363,13 @@ def active_working_draft_context(
     db: Session,
     scenario: BusinessScenario,
 ) -> list[dict[str, Any]]:
-    """Return one redacted, latest active working revision per resource identity."""
+    """Return a bounded set of redacted, latest working revisions.
+
+    Drafts are advisory context for a new request, not a reason to block it.
+    When repeated prior runs exceed the compiler context budget, retain the
+    freshest complete resource snapshots that fit and leave omitted revisions
+    open and untouched for later review.
+    """
     tenant_id = str(scenario.tenant_id or db.info.get("tenant_id") or "")
     user_id = str(db.info.get("user_id") or "")
     if not user_id:
@@ -1291,6 +1380,7 @@ def active_working_draft_context(
             ScenarioModelDraftResource.scenario_id == scenario.id,
             ScenarioModelDraftResource.created_by_user_id == user_id,
             ScenarioModelDraftResource.draft_status.in_(OPEN_DRAFT_STATUSES),
+            ScenarioModelDraftResource.materialization_source != "live_checkpoint",
         )
     ).all())
     by_identity: dict[str, ScenarioModelDraftResource] = {}
@@ -1313,12 +1403,8 @@ def active_working_draft_context(
         if current is None or row_order > current_order:
             by_identity[row.resource_identity] = row
 
-    result: list[dict[str, Any]] = []
-    total = 0
-    for row in sorted(
-        by_identity.values(),
-        key=lambda item: (item.resource_kind, item.resource_key, item.id),
-    ):
+    candidates: list[tuple[ScenarioModelDraftResource, dict[str, Any], str]] = []
+    for row in by_identity.values():
         payload = release_service.safe_snapshot_content(_payload_dict(row.payload))
         source_payload = release_service.safe_snapshot_content(
             _payload_dict(row.source_payload)
@@ -1350,15 +1436,39 @@ def active_working_draft_context(
         canonical = json.dumps(
             item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
-        total += len(canonical)
-        if total > MAX_WORKING_DRAFT_CONTEXT_CHARS:
-            raise ValueError(
-                "活动场景草稿超过 100,000 字符的单次编译边界；"
-                "请先解决部分草稿或拆分建模范围后继续"
-            )
+        candidates.append((row, item, canonical))
+
+    # Prefer the drafts the user touched most recently.  Selection is by
+    # whole snapshot—never truncate JSON in the middle—and the final output is
+    # sorted by stable resource identity so its fingerprint remains
+    # deterministic for an unchanged database state.
+    candidates.sort(
+        key=lambda value: (
+            _utc(value[0].updated_at),
+            value[0].revision,
+            _utc(value[0].lineage_started_at),
+            value[0].proposal_id,
+            value[0].id,
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    total = 0
+    for _row, item, canonical in candidates:
+        size = len(canonical)
+        if size > MAX_WORKING_DRAFT_CONTEXT_CHARS - total:
+            continue
         item["snapshot_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        result.append(item)
-    return result
+        selected.append(item)
+        total += size
+    selected.sort(
+        key=lambda item: (
+            str(item.get("resource_kind") or ""),
+            str(item.get("resource_key") or ""),
+            str(item.get("draft_id") or ""),
+        )
+    )
+    return selected
 
 
 def has_active_working_drafts(db: Session, scenario: BusinessScenario) -> bool:
@@ -1372,6 +1482,7 @@ def has_active_working_drafts(db: Session, scenario: BusinessScenario) -> bool:
             ScenarioModelDraftResource.scenario_id == scenario.id,
             ScenarioModelDraftResource.created_by_user_id == user_id,
             ScenarioModelDraftResource.draft_status.in_(OPEN_DRAFT_STATUSES),
+            ScenarioModelDraftResource.materialization_source != "live_checkpoint",
         ).limit(1)
     ).first() is not None
 
@@ -1391,6 +1502,7 @@ def active_working_draft_scopes(
             ScenarioModelDraftResource.scenario_id == scenario.id,
             ScenarioModelDraftResource.created_by_user_id == user_id,
             ScenarioModelDraftResource.draft_status.in_(OPEN_DRAFT_STATUSES),
+            ScenarioModelDraftResource.materialization_source != "live_checkpoint",
         ).distinct()
     ).all())
     if not kinds:

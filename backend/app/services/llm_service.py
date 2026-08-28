@@ -389,6 +389,7 @@ def chat(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     *,
+    tool_choice: str | dict[str, Any] | None = None,
     request_timeout: float | None = None,
     max_retries: int | None = None,
     retry_on_length: bool = True,
@@ -408,7 +409,7 @@ def chat(
     }
     if tools:
         kwargs["tools"] = tools
-        kwargs["tool_choice"] = "auto"
+        kwargs["tool_choice"] = tool_choice or "auto"
     # 推理模型的思考过程会占用 max_tokens；若首轮仅长度截断则放大一次。每一轮
     # 都是独立的真实 provider 调用，必须各自计费、追踪和预算检查。
     for attempt in range(2 if retry_on_length else 1):

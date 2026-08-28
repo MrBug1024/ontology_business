@@ -77,8 +77,8 @@
       <el-tab-pane label="实例数据" name="instances" lazy>
         <div class="tab-toolbar">
           <div class="tab-stats">
-            <span class="stat">对象实例 <b>{{ detail.instances.length + scenarioDraftsOf('instance').length }}</b></span>
-            <span class="stat">关系实例 <b>{{ detail.relation_instances.length }}</b></span>
+            <span class="stat">对象实例 <b>{{ detail.runtime_instance_count || objectTotal + scenarioDraftsOf('instance').length }}</b></span>
+            <span class="stat">关系实例 <b>{{ relationInstanceTotalIsExact ? relationInstanceTotal : `约 ${relationInstanceTotal}` }}</b></span>
             <span class="stat stat-runtime">运行时对象 <b>{{ objectTotal }}</b></span>
           </div>
           <div class="tab-actions">
@@ -144,6 +144,7 @@
               <button
                 v-for="item in objectItems"
                 :key="item.id"
+                v-memo="[item.id, selectedObjectId === item.id]"
                 type="button"
                 class="object-row"
                 :class="{ active: selectedObjectId === item.id }"
@@ -615,7 +616,7 @@
         </el-form>
       </template>
       <el-divider content-position="left">已有关系实例</el-divider>
-      <el-table class="relation-instance-table" :data="detail.relation_instances" size="small" empty-text="暂无关系实例">
+      <el-table v-loading="relationInstancesLoading" class="relation-instance-table" :data="relationInstanceRows" size="small" empty-text="暂无关系实例">
         <el-table-column prop="relation_name" label="关系类型" min-width="130" />
         <el-table-column prop="source_instance_name" label="来源对象" min-width="140" />
         <el-table-column label="" width="38" align="center"><template #default>→</template></el-table-column>
@@ -625,11 +626,11 @@
         </el-table-column>
       </el-table>
       <div class="relation-instance-cards">
-        <article v-for="row in detail.relation_instances" :key="row.id" class="relation-instance-card">
+        <article v-for="row in relationInstanceRows" :key="row.id" class="relation-instance-card">
           <div><b>{{ row.relation_name }}</b><span>{{ row.source_instance_name }} → {{ row.target_instance_name }}</span></div>
           <el-button text type="danger" size="small" @click="removeRelationInstance(row)">删除</el-button>
         </article>
-        <div v-if="!detail.relation_instances.length" class="muted">暂无关系实例</div>
+        <div v-if="!relationInstancesLoading && !relationInstanceRows.length" class="muted">暂无关系实例</div>
       </div>
     </el-dialog>
 
@@ -1405,6 +1406,8 @@ const objectTotal = ref(0)
 const objectLoading = ref(false)
 const objectLoadingMore = ref(false)
 const objectNextOffset = ref(0)
+const objectHasMore = ref(false)
+const objectTotalIsExact = ref(true)
 const objectAppliedKey = ref('')
 const selectedObjectId = ref<string | null>(null)
 const objectDetail = ref<ObjectDetail | null>(null)
@@ -1412,6 +1415,11 @@ const OBJECT_PAGE_SIZE = 50
 let objectRequestId = 0
 let objectSearchViewDisposed = false
 let objectPendingKey = ''
+const relationInstanceRows = ref<RelationInstance[]>([])
+const relationInstanceTotal = ref(0)
+const relationInstancesLoading = ref(false)
+const relationInstanceTotalIsExact = ref(true)
+let relationInstanceRequestId = 0
 
 const graphPalette = ['#27b9b0', '#438be5', '#65a9df', '#4aa9c1', '#52c3a1', '#6f93d7']
 function visualColor(color: string | undefined, index: number) {
@@ -1424,14 +1432,16 @@ function visualColor(color: string | undefined, index: number) {
 // ── 悬浮编辑面板状态 ──
 const editor = ref<{ kind: 'entity' | 'relation' | 'instance'; id?: string; form: any } | null>(null)
 const draftPropertyEditorIndex = ref<number | null>(null)
-// 切换 tab 时关闭悬浮编辑器，避免跨 tab 状态残留；进入实例页时刷新对象运行时列表。
+// 切换 tab 时关闭悬浮编辑器，避免跨 tab 状态残留；实例页只读取独立的
+// 分页运行时接口，不重新请求整个场景详情。
 watch(tab, (value, previousValue) => {
-  const wasInstances = previousValue === 'instances'
   editor.value = null
   draftPropertyEditorIndex.value = null
   clearActiveScenarioDraftPromotion()
-  if (value === 'instances') searchObjects()
-  if (value === 'instances' || wasInstances) void load()
+  if (value === 'instances' && previousValue !== 'instances') {
+    void searchObjects()
+    void loadRelationInstances()
+  }
   if (route.query.stage !== value) {
     void router.replace({ query: { ...route.query, stage: value } })
   }
@@ -1593,14 +1603,17 @@ const schemaGraph = computed<GraphData>(() => {
 const instanceGraph = computed<GraphData>(() => {
   const ents = (instFilter.value ? detail.value.entities.filter((e) => e.id === instFilter.value) : detail.value.entities).filter((e) => e.id)
   const entIds = new Set(ents.map((e) => e.id as string))
+  // The explorer can keep paging, but the canvas stays a bounded overview so
+  // a very large runtime dataset never turns the graph into a second bulk UI.
+  const loadedInstances = objectItems.value.slice(0, 200)
   const nodes: GraphNode[] = []
   const entNode = new Map<string, string>()
   for (const [index, e] of ents.entries()) {
     const id = `ent:${e.id}`
     entNode.set(e.id as string, id)
-    nodes.push({ id, label: e.name, type: 'entity', color: visualColor(e.color, index), meta: { count: detail.value.instances.filter((i) => i.entity_id === e.id).length, entity_name: e.name } })
+    nodes.push({ id, label: e.name, type: 'entity', color: visualColor(e.color, index), meta: { count: loadedInstances.filter((i) => i.entity_id === e.id).length, entity_name: e.name } })
   }
-  for (const i of detail.value.instances) {
+  for (const i of loadedInstances) {
     if (!i.id || !entIds.has(i.entity_id)) continue
     const entityIndex = detail.value.entities.findIndex((e) => e.id === i.entity_id)
     const entity = detail.value.entities.find((e) => e.id === i.entity_id)
@@ -1626,7 +1639,7 @@ const instanceGraph = computed<GraphData>(() => {
     })
   }
   const edges: GraphEdge[] = []
-  for (const i of detail.value.instances) {
+  for (const i of loadedInstances) {
     if (!i.id || !entIds.has(i.entity_id)) continue
     edges.push({ id: `ie:${i.id}`, source: entNode.get(i.entity_id)!, target: i.id, type: 'belongs' })
   }
@@ -1639,7 +1652,7 @@ const instanceGraph = computed<GraphData>(() => {
     }
   }
   const nodeIds = new Set(nodes.map((n) => n.id))
-  for (const ri of detail.value.relation_instances) {
+  for (const ri of relationInstanceRows.value) {
     if (ri.id && nodeIds.has(ri.source_instance_id) && nodeIds.has(ri.target_instance_id)) {
       edges.push({ id: ri.id, source: ri.source_instance_id, target: ri.target_instance_id, label: ri.relation_name || detail.value.relations.find((r) => r.id === ri.relation_id)?.name || '', type: 'rel' })
     }
@@ -1651,15 +1664,18 @@ function objectSearchKey() {
   return JSON.stringify([objectQuery.value.trim(), instFilter.value || ''])
 }
 const objectFilterPending = computed(() => Boolean(objectAppliedKey.value) && objectAppliedKey.value !== objectSearchKey())
-const hasMoreObjects = computed(() => !objectFilterPending.value && objectNextOffset.value < objectTotal.value)
+const hasMoreObjects = computed(() => !objectFilterPending.value && objectHasMore.value)
+function objectTotalLabel() {
+  return objectTotalIsExact.value ? String(objectTotal.value) : `约 ${objectTotal.value}`
+}
 const objectResultStatus = computed(() => {
   if (objectLoading.value) return '正在加载对象列表…'
-  if (objectLoadingMore.value) return `正在加载更多对象；已加载 ${objectItems.value.length} / ${objectTotal.value} 个结果`
-  if (objectFilterPending.value) return `当前显示 ${objectItems.value.length} / ${objectTotal.value} 个结果；搜索条件已变更，按回车应用`
+  if (objectLoadingMore.value) return `正在加载更多对象；已加载 ${objectItems.value.length} / ${objectTotalLabel()} 个结果`
+  if (objectFilterPending.value) return `当前显示 ${objectItems.value.length} / ${objectTotalLabel()} 个结果；搜索条件已变更，按回车应用`
   if (!objectTotal.value) return objectQuery.value.trim() ? '没有匹配对象' : '暂无可浏览对象'
   return hasMoreObjects.value
-    ? `已加载 ${objectItems.value.length} / ${objectTotal.value} 个结果，可继续加载更多`
-    : `已加载全部 ${objectTotal.value} 个结果`
+    ? `已加载 ${objectItems.value.length} / ${objectTotalLabel()} 个结果，可继续加载更多`
+    : objectTotalIsExact.value ? `已加载全部 ${objectTotal.value} 个结果` : `已加载当前可见结果`
 })
 
 function entName(id: string) { return detail.value.entities.find((e) => e.id === id)?.name || '—' }
@@ -1688,7 +1704,9 @@ async function searchObjects() {
     if (objectSearchViewDisposed || requestId !== objectRequestId || requestKey !== objectSearchKey()) return
     objectItems.value = result.items
     objectTotal.value = result.total
-    objectNextOffset.value = result.offset + result.items.length
+    objectNextOffset.value = result.next_offset ?? (result.offset + result.items.length)
+    objectHasMore.value = Boolean(result.has_more)
+    objectTotalIsExact.value = result.total_is_exact !== false
     objectAppliedKey.value = requestKey
     if (selectedObjectId.value && !result.items.some((item) => item.id === selectedObjectId.value)) {
       selectedObjectId.value = null
@@ -1728,7 +1746,9 @@ async function loadMoreObjects() {
     const appended = result.items.filter((item) => !knownIds.has(item.id))
     objectItems.value = [...objectItems.value, ...appended]
     objectTotal.value = result.total
-    objectNextOffset.value = Math.max(objectNextOffset.value, result.offset + result.items.length)
+    objectNextOffset.value = result.next_offset ?? Math.max(objectNextOffset.value, result.offset + result.items.length)
+    objectHasMore.value = Boolean(result.has_more)
+    objectTotalIsExact.value = result.total_is_exact !== false
   } catch (e: any) {
     if (!objectSearchViewDisposed && requestId === objectRequestId) {
       ElMessage.error(e?.response?.data?.detail || e?.message || '加载更多对象失败')
@@ -1840,7 +1860,7 @@ function openInstance(id?: string) {
   if (!canWrite.value) return
   clearActiveScenarioDraftPromotion()
   draftPropertyEditorIndex.value = null
-  const i = id ? detail.value.instances.find((x) => x.id === id) : null
+  const i = id ? objectItems.value.find((x) => x.id === id) : null
   editor.value = {
     kind: 'instance',
     id: i?.id,
@@ -1854,8 +1874,8 @@ const relationInstanceDlg = ref(false)
 const relationInstanceSaving = ref(false)
 const relationInstanceForm = ref<Partial<RelationInstance>>({ relation_id: '', source_instance_id: '', target_instance_id: '', attributes: {} })
 const selectedRelationDefinition = computed(() => detail.value.relations.find((relation) => relation.id === relationInstanceForm.value.relation_id))
-const relationSourceInstances = computed(() => detail.value.instances.filter((instance) => instance.entity_id === selectedRelationDefinition.value?.source_entity_id))
-const relationTargetInstances = computed(() => detail.value.instances.filter((instance) => instance.entity_id === selectedRelationDefinition.value?.target_entity_id))
+const relationSourceInstances = computed(() => objectItems.value.filter((instance) => instance.entity_id === selectedRelationDefinition.value?.source_entity_id))
+const relationTargetInstances = computed(() => objectItems.value.filter((instance) => instance.entity_id === selectedRelationDefinition.value?.target_entity_id))
 const canCreateRelationInstance = computed(() => Boolean(
   relationInstanceForm.value.relation_id
   && relationInstanceForm.value.source_instance_id
@@ -1865,6 +1885,23 @@ function resetRelationInstanceEndpoints() {
   relationInstanceForm.value.source_instance_id = relationSourceInstances.value[0]?.id || ''
   relationInstanceForm.value.target_instance_id = relationTargetInstances.value[0]?.id || ''
   relationInstanceForm.value.attributes = {}
+}
+async function loadRelationInstances() {
+  const requestId = ++relationInstanceRequestId
+  relationInstancesLoading.value = true
+  try {
+    const result = await api.listRelationInstances(sid, { limit: 100, offset: 0 })
+    if (requestId !== relationInstanceRequestId || objectSearchViewDisposed) return
+    relationInstanceRows.value = result.items || []
+    relationInstanceTotal.value = Number(result.total || 0)
+    relationInstanceTotalIsExact.value = result.total_is_exact !== false
+  } catch (e: any) {
+    if (requestId === relationInstanceRequestId && !objectSearchViewDisposed) {
+      ElMessage.error(e?.response?.data?.detail || e?.message || '关系实例加载失败')
+    }
+  } finally {
+    if (requestId === relationInstanceRequestId) relationInstancesLoading.value = false
+  }
 }
 function openRelationInstanceManager() {
   if (!canWrite.value) return
@@ -1876,6 +1913,7 @@ function openRelationInstanceManager() {
   }
   resetRelationInstanceEndpoints()
   relationInstanceDlg.value = true
+  void loadRelationInstances()
 }
 async function saveRelationInstance() {
   if (!canWrite.value || !canCreateRelationInstance.value) return
@@ -3928,7 +3966,10 @@ async function load() {
   scenarioAccessDenied.value = false
   scenarioLoadError.value = ''
   try {
-    const loaded = await api.getScenario(sid, { include_runtime_facts: tab.value === 'instances' })
+    // Scenario detail is a schema projection. Runtime objects and relations
+    // are always fetched through bounded pages below, so a large dataset can
+    // never hold the whole page hostage.
+    const loaded = await api.getScenario(sid, { include_runtime_facts: false })
     detail.value = { ...loaded, relation_mappings: loaded.relation_mappings || [] }
   } catch (e: any) {
     if (Number(e?.status || e?.response?.status) === 403) {
@@ -3955,7 +3996,10 @@ async function load() {
   }
   // The object explorer is only visible on the instances tab. Avoid doing a
   // runtime object scan while the ontology tab is becoming interactive.
-  if (tab.value === 'instances') void searchObjects()
+  if (tab.value === 'instances') {
+    void searchObjects()
+    void loadRelationInstances()
+  }
 }
 function goBack() { void router.push(returnPath.value) }
 function goToDataSources() {

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import cast, delete, func, or_, select, String
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload, load_only
 
@@ -86,6 +86,7 @@ from ..schemas import (
     RelationDataMappingIn,
     RelationDataMappingOut,
     RelationDataMappingPreviewOut,
+    RelationInstancePageOut,
     RuleIn,
     RuleOut,
     ScenarioDetail,
@@ -130,6 +131,15 @@ router = APIRouter(
     tags=["scenarios"],
     dependencies=[Depends(get_current_user)],
 )
+
+# Runtime facts are intentionally read through bounded endpoints.  A scenario
+# detail request is a model/schema projection, not a request to serialize an
+# entire production dataset.
+INLINE_RUNTIME_FACT_LIMIT = 500
+# Keep ACL checks bounded as well as the SQL result.  The cursor advances over
+# the candidate window, so filtered rows are never materialized just to fill a
+# cosmetic page size.
+OBJECT_SEARCH_CANDIDATE_LIMIT = 100
 
 
 def _entity_in_scenario(db: Session, scenario_id: str, entity_id: str | None) -> OntologyEntity | None:
@@ -1912,6 +1922,19 @@ def get_scenario(
     ]
     from ..schemas import DataSourceOut
 
+    visible_data_source_ids = [
+        d.id
+        for d in s.data_sources
+        if d.tenant_id == tenant_service.current_tenant_id(db) or d.is_public
+    ]
+    file_counts = {
+        str(source_id): int(count)
+        for source_id, count in db.execute(
+            select(BucketFile.data_source_id, func.count())
+            .where(BucketFile.data_source_id.in_(visible_data_source_ids))
+            .group_by(BucketFile.data_source_id)
+        ).all()
+    } if visible_data_source_ids else {}
     ds_out = [
         DataSourceOut(
             id=d.id,
@@ -1922,12 +1945,29 @@ def get_scenario(
             status=d.status,
             last_error=d.last_error,
             created_at=d.created_at,
-            file_count=len(d.files),
+            file_count=file_counts.get(d.id, 0),
         )
         for d in s.data_sources
         if d.tenant_id == tenant_service.current_tenant_id(db) or d.is_public
     ]
-    if include_runtime_facts:
+    runtime_instance_count = db.scalar(
+        select(func.count())
+        .select_from(OntologyInstance)
+        .where(OntologyInstance.scenario_id == scenario_id)
+    ) or 0
+    runtime_relation_count = db.scalar(
+        select(func.count())
+        .select_from(RelationInstance)
+        .where(RelationInstance.scenario_id == scenario_id)
+    ) or 0
+    runtime_facts_truncated = bool(
+        include_runtime_facts
+        and (
+            runtime_instance_count > INLINE_RUNTIME_FACT_LIMIT
+            or runtime_relation_count > INLINE_RUNTIME_FACT_LIMIT
+        )
+    )
+    if include_runtime_facts and not runtime_facts_truncated:
         visible_instances = [
             instance
             for instance in s.instances
@@ -1979,6 +2019,9 @@ def get_scenario(
         data_sources=ds_out,
         instances=instances,
         relation_instances=rel_instances,
+        runtime_instance_count=int(runtime_instance_count),
+        runtime_relation_count=int(runtime_relation_count),
+        runtime_facts_truncated=runtime_facts_truncated,
         mappings=mappings,
         relation_mappings=relation_mappings,
         functions=functions,
@@ -2015,24 +2058,60 @@ def search_objects(
     scenario = _scenario_for_request(db, scenario_id)
     definition = _runtime_definition_for_scenario(db, scenario)
     filters = [OntologyInstance.scenario_id == scenario_id]
+    active_entity_ids = [str(item) for item in definition.entities]
+    if not active_entity_ids:
+        return ObjectSearchOut(
+            items=[],
+            total=0,
+            limit=limit,
+            offset=offset,
+            query=q.strip().lower(),
+            entity_id=entity_id,
+            has_more=False,
+            next_offset=None,
+            total_is_exact=True,
+        )
+    filters.append(OntologyInstance.entity_id.in_(active_entity_ids))
     if entity_id:
         _entity_in_scenario(db, scenario_id, entity_id)
         filters.append(OntologyInstance.entity_id == entity_id)
     query = q.strip().lower()
+    if query:
+        # Search in SQL first.  The old implementation loaded every runtime
+        # object and only then filtered in Python, which made a large imported
+        # dataset look like a page that never finishes loading.
+        search_pattern = f"%{query}%"
+        filters.append(
+            or_(
+                func.lower(OntologyInstance.name).like(search_pattern),
+                cast(OntologyInstance.attributes, String).ilike(search_pattern),
+            )
+        )
     candidates = db.execute(
         select(OntologyInstance)
-        .options(joinedload(OntologyInstance.entity))
+        .options(
+            joinedload(OntologyInstance.entity).selectinload(OntologyEntity.properties),
+            joinedload(OntologyInstance.scenario),
+        )
         .where(*filters)
         .order_by(OntologyInstance.created_at.desc(), OntologyInstance.name.asc())
+        .offset(offset)
+        .limit(OBJECT_SEARCH_CANDIDATE_LIMIT + 1)
     ).scalars().all()
-    # 先做对象 ACL 与属性脱敏，再用安全的字段做查询；否则敏感值即使不返回也会被
-    # 搜索命中侧信道泄露。对象查询的分页也必须在 ACL 过滤之后计算总数。
+    has_candidate_more = len(candidates) > OBJECT_SEARCH_CANDIDATE_LIMIT
+    candidates = candidates[:OBJECT_SEARCH_CANDIDATE_LIMIT]
+    # Runtime definition and ACL are still checked in Python.  SQL is only a
+    # coarse candidate filter; it must never become a side-channel around
+    # object visibility or attribute masking.
     visible_candidates = [
         instance
         for instance in candidates
         if _instance_in_current_runtime(instance, definition)
         and permission_service.check_object(db, instance, "read").allowed
     ]
+    # Keep the existing masked-attribute search semantics.  SQL JSON text
+    # matching above only narrows candidates; the final check prevents a
+    # forbidden attribute from producing a visible hit.
     if query:
         visible_candidates = [
             instance
@@ -2040,8 +2119,22 @@ def search_objects(
             if query in instance.name.lower()
             or query in str(permission_service.filter_instance_attributes(db, instance)).lower()
         ]
-    total = len(visible_candidates)
-    instances = visible_candidates[offset : offset + limit]
+    instances = visible_candidates[:limit]
+    consumed = 0
+    if instances:
+        last_id = instances[-1].id
+        consumed = next(
+            (index + 1 for index, item in enumerate(candidates) if item.id == last_id),
+            len(candidates),
+        )
+    elif candidates:
+        consumed = len(candidates)
+    has_more = has_candidate_more or len(visible_candidates) > limit
+    next_offset = offset + consumed if has_more and consumed else None
+    # Exact global totals would require scanning and ACL-checking the entire
+    # dataset.  Return a useful bounded estimate and a cursor instead; the UI
+    # labels estimates as such and can continue fetching without blocking.
+    total = offset + len(visible_candidates) + (1 if has_candidate_more else 0)
     instance_ids = [instance.id for instance in instances]
     visible_instance_ids = {instance.id for instance in visible_candidates}
     mappings_by_entity: dict[str, DataMapping] = {}
@@ -2098,6 +2191,9 @@ def search_objects(
         offset=offset,
         query=query,
         entity_id=entity_id,
+        has_more=has_more,
+        next_offset=next_offset,
+        total_is_exact=not has_candidate_more,
     )
 
 
@@ -2722,6 +2818,57 @@ def delete_instance(instance_id: str, db: Session = Depends(get_db)):
 
 
 # ── 关系实例 ──────────────────────────────────
+@router.get(
+    "/{scenario_id}/relation-instances",
+    response_model=RelationInstancePageOut,
+)
+def list_relation_instances(
+    scenario_id: str,
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """Return a bounded relation-instance page for the instance workspace."""
+    scenario = _scenario_for_request(db, scenario_id)
+    definition = _runtime_definition_for_scenario(db, scenario)
+    candidates = db.execute(
+        select(RelationInstance)
+        .options(
+            joinedload(RelationInstance.relation),
+            joinedload(RelationInstance.source_instance).joinedload(OntologyInstance.entity),
+            joinedload(RelationInstance.target_instance).joinedload(OntologyInstance.entity),
+        )
+        .where(RelationInstance.scenario_id == scenario_id)
+        .order_by(RelationInstance.created_at.desc(), RelationInstance.id.asc())
+        .offset(offset)
+        .limit(limit + 1)
+    ).scalars().all()
+    has_candidate_more = len(candidates) > limit
+    candidates = candidates[:limit]
+    visible = [
+        row
+        for row in candidates
+        if row.source_instance
+        and row.target_instance
+        and _relation_in_current_runtime(row, definition)
+        and _instance_in_current_runtime(row.source_instance, definition)
+        and _instance_in_current_runtime(row.target_instance, definition)
+        and permission_service.check_object(db, row.source_instance, "read").allowed
+        and permission_service.check_object(db, row.target_instance, "read").allowed
+    ]
+    has_more = has_candidate_more
+    next_offset = offset + len(candidates) if has_more and candidates else None
+    return RelationInstancePageOut(
+        items=[_rel_instance_out(row) for row in visible],
+        total=offset + len(visible) + (1 if has_candidate_more else 0),
+        limit=limit,
+        offset=offset,
+        has_more=has_more,
+        next_offset=next_offset,
+        total_is_exact=not has_candidate_more,
+    )
+
+
 @router.post("/{scenario_id}/relation-instances", response_model=RelationInstanceOut)
 def create_relation_instance(scenario_id: str, payload: RelationInstanceIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)

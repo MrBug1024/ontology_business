@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import hashlib
 import copy
 import math
@@ -48,9 +49,12 @@ from ..models import (
 from ..schemas import (
     AssistantAttachmentOut,
     AssistantChatRequest,
+    AssistantCompilationGuidanceOut,
+    AssistantCompilationGuidanceRequest,
     AssistantCompilationJobResultOut,
     AssistantCompilationJobStatusOut,
     AssistantMessageOut,
+    AssistantModelTaskContinuationRequest,
     AssistantProposalApplyRequest,
     AssistantReplyOut,
     AssistantThreadOut,
@@ -61,6 +65,7 @@ from ..schemas import (
 from ..services import (
     assistant_orchestrator,
     assistant_compilation_job_service,
+    assistant_compilation_stream_service,
     doc_parser,
     datasource_service,
     llm_service,
@@ -82,6 +87,7 @@ from ..services.auth_service import get_tenant_db
 from ..services.policies import PolicyViolation
 
 router = APIRouter(prefix="/assistant", tags=["assistant"])
+logger = logging.getLogger(__name__)
 
 
 # Temporary assistant attachments are fed directly to draft generators rather
@@ -93,10 +99,10 @@ ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS = 1_000_000
 ASSISTANT_ATTACHMENT_CONTEXT_MAX_CHARS = 80_000
 
 # Compound compilation is proposal-only and each job has a durable single-
-# flight claim. A small process-local pool lets the HTTP/SSE request return
-# immediately while the existing status/result endpoints remain the recovery
-# boundary. Production deployments can replace this executor with a queue
-# worker without changing the job or proposal contract.
+# flight claim. A small process-local pool keeps provider work independent of
+# client disconnects. Active clients receive committed checkpoints over one SSE
+# conversation stream; status/result endpoints remain diagnostics and durable
+# recovery surfaces, not the browser's live transport.
 _COMPILATION_WORKER_COUNT = 4
 _COMPILATION_EXECUTOR = ThreadPoolExecutor(
     max_workers=_COMPILATION_WORKER_COUNT,
@@ -109,6 +115,8 @@ _COMPILATION_HEARTBEAT_SECONDS = max(
     1,
     assistant_compilation_job_service.DEFAULT_LEASE_SECONDS // 3,
 )
+_COMPILATION_STREAM_REFRESH_SECONDS = 1.0
+_COMPILATION_STREAM_LIVENESS_SECONDS = 8.0
 
 
 def _durable_prepared_context(value: dict[str, Any]) -> dict[str, Any]:
@@ -222,9 +230,18 @@ def _load_compilation_execution_input(
         raise ValueError("持久化编译任务执行策略格式无效")
     if recovery_issue is not None and not isinstance(recovery_issue, dict):
         raise ValueError("持久化编译任务恢复问题格式无效")
-    if set(execution_policy) != {
+    required_policy_fields = {
         "llm_call_budget", "request_timeout", "assistant_scope_key",
-    }:
+    }
+    # ``max_runtime_seconds`` was persisted by a short-lived implementation
+    # and remains accepted for replay compatibility. It is intentionally not
+    # used to cut a high-quality compiler run off into an empty result.
+    allowed_policy_fields = required_policy_fields | {
+        "max_runtime_seconds", "task_scope", "continuation_proposal_id",
+    }
+    if not required_policy_fields.issubset(execution_policy) or not set(
+        execution_policy
+    ).issubset(allowed_policy_fields):
         raise ValueError("持久化编译任务执行策略字段无效")
     if (
         assistant_compilation_job_service.execution_policy_fingerprint(
@@ -252,9 +269,24 @@ def _load_compilation_execution_input(
         raise ValueError("持久化编译任务的请求超时必须是有限正数")
     if not isinstance(execution_policy.get("assistant_scope_key"), str):
         raise ValueError("持久化编译任务缺少助手会话范围")
+    task_scope = str(execution_policy.get("task_scope") or "")
+    try:
+        task_scope = scenario_model_compiler.normalize_model_task_scope(task_scope)
+    except ValueError as exc:
+        raise ValueError("持久化编译任务范围无效") from exc
+    continuation_proposal_id = str(
+        execution_policy.get("continuation_proposal_id") or ""
+    ).strip()
+    if continuation_proposal_id and (
+        len(continuation_proposal_id) > 64
+        or not re.fullmatch(r"[A-Za-z0-9_-]+", continuation_proposal_id)
+    ):
+        raise ValueError("持久化编译任务续作标识无效")
     execution_policy = {
         **execution_policy,
         "request_timeout": request_timeout,
+        "task_scope": task_scope,
+        "continuation_proposal_id": continuation_proposal_id,
     }
     result = {
         "compiler_message": compiler_message,
@@ -967,7 +999,11 @@ def _build_proposal(
             }
             else "in_progress"
         )
-        requires_confirmation = bool(data.get("current_task_id"))
+        next_action = data.get("next_action") if isinstance(data.get("next_action"), dict) else {}
+        requires_confirmation = bool(
+            data.get("current_task_id")
+            and next_action.get("type") == "confirm_task"
+        )
     return {
         "proposal_id": proposal_id,
         "kind": kind,
@@ -1187,6 +1223,9 @@ def _model_task_fields_are_well_formed(tasks: list[dict[str, Any]]) -> bool:
             or not all(isinstance(value, str) for value in change_keys)
         ):
             return False
+        generation_status = str(task.get("generation_status") or "generated")
+        if generation_status not in {"generated", "pending"}:
+            return False
         for field in counter_fields:
             if field not in task or task.get(field) is None:
                 continue
@@ -1308,7 +1347,10 @@ def _model_task_execution_summary(payload: dict[str, Any]) -> dict[str, Any]:
     statuses = [str(item.get("status") or "pending") for item in tasks]
     processed = sum(status in _MODEL_TASK_TERMINAL_STATUSES for status in statuses)
     current = next(
-        (item for item in tasks if item.get("status") in {"ready", "blocked"}),
+        (
+            item for item in tasks
+            if item.get("status") in {"ready", "blocked", "awaiting_generation"}
+        ),
         None,
     )
 
@@ -1387,6 +1429,8 @@ def _model_task_execution_summary(payload: dict[str, Any]) -> dict[str, Any]:
         if final and formal_write_task_count == 0
         else "completed"
         if final
+        else "waiting_for_generation"
+        if current and current.get("status") == "awaiting_generation"
         else "waiting_for_confirmation"
         if current
         else "running"
@@ -1419,9 +1463,15 @@ def _model_task_execution_summary(payload: dict[str, Any]) -> dict[str, Any]:
             + "。"
         )
     elif current:
+        waiting_for_generation = current.get("status") == "awaiting_generation"
         message = (
             f"计划仍在执行：已推进 {processed}/{len(tasks)} 项，当前停留在"
-            f"「{current.get('title') or '当前任务'}」等待确认；确认前不会结束本计划。"
+            f"「{current.get('title') or '当前任务'}」"
+            + (
+                "等待你开始生成；原始资料和已确认定义会一并保留。"
+                if waiting_for_generation
+                else "等待确认；确认前不会结束本计划。"
+            )
         )
     else:
         message = f"计划仍在执行：已推进 {processed}/{len(tasks)} 项，正在准备下一任务。"
@@ -1669,6 +1719,43 @@ def _refresh_model_task_states(
         )
         item.pop("waiting_for", None)
 
+        generation_status = str(item.get("generation_status") or "generated")
+        if generation_status == "pending":
+            # Later stages have not been sent to the provider.  Treating them
+            # as empty would silently end a plan and lose the user's source
+            # material; instead expose exactly one eligible next generation
+            # after its confirmed prerequisites are terminal.
+            item["issues"] = []
+            item["issue_count"] = 0
+            item["safe_change_count"] = 0
+            item["blocked_issue_count"] = 0
+            item["compiled_safe_change_count"] = 0
+            item["compiled_blocked_issue_count"] = 0
+            item["change_keys"] = []
+            item["safe_change_keys"] = []
+            item["change_count"] = 0
+            item["output_count"] = 0
+            item["draft_output_count"] = 0
+            item["draft_candidate_count"] = 0
+            dependencies = [str(value) for value in (item.get("depends_on") or [])]
+            unfinished_dependencies = [
+                dependency
+                for dependency in dependencies
+                if str((task_by_id.get(dependency) or {}).get("status") or "pending")
+                not in _MODEL_TASK_TERMINAL_STATUSES
+            ]
+            if unfinished_dependencies:
+                item["status"] = "waiting"
+                item["waiting_for"] = unfinished_dependencies
+                continue
+            if active_task_id:
+                item["status"] = "waiting"
+                item["waiting_for"] = [active_task_id]
+                continue
+            item["status"] = "awaiting_generation"
+            active_task_id = str(item.get("id") or "")
+            continue
+
         output_count = _safe_nonnegative_int(
             item.get("output_count", item.get("change_count", 0))
         )
@@ -1745,17 +1832,27 @@ def _refresh_model_task_states(
     if current_task is not None:
         safe_count = _safe_nonnegative_int(current_task.get("safe_change_count"))
         output_count = _safe_nonnegative_int(current_task.get("output_count"))
-        result["next_action"] = {
-            "type": "confirm_task",
-            "task_id": str(current_task.get("id") or ""),
-            "task_title": str(current_task.get("title") or ""),
-            "requires_confirmation": True,
-            "can_apply": output_count > 0,
-            "can_apply_partial": (
-                current_task.get("status") == "blocked" and safe_count > 0
-            ),
-            "can_defer": True,
-        }
+        if current_task.get("status") == "awaiting_generation":
+            result["next_action"] = {
+                "type": "generate_task",
+                "task_id": str(current_task.get("id") or ""),
+                "task_title": str(current_task.get("title") or ""),
+                "requires_confirmation": False,
+                "can_generate": True,
+                "message": "上一项已处理。请确认开始生成本任务；原始资料和已确认定义会一并作为依据。",
+            }
+        else:
+            result["next_action"] = {
+                "type": "confirm_task",
+                "task_id": str(current_task.get("id") or ""),
+                "task_title": str(current_task.get("title") or ""),
+                "requires_confirmation": True,
+                "can_apply": output_count > 0,
+                "can_apply_partial": (
+                    current_task.get("status") == "blocked" and safe_count > 0
+                ),
+                "can_defer": True,
+            }
     elif summary["final"]:
         result["next_action"] = {
             "type": "refine_model",
@@ -2274,6 +2371,7 @@ def _materialize_scenario_model_proposal(
     compilation_job_id: str = "",
     lineage_started_at: datetime | None = None,
     consumed_draft_revisions: dict[str, int] | None = None,
+    replace_live_checkpoints: bool = False,
 ) -> dict[str, Any]:
     lineage = (
         proposal.get("draft_lineage")
@@ -2305,6 +2403,7 @@ def _materialize_scenario_model_proposal(
         created_by_user_id=str(db.info.get("user_id") or "") or None,
         lineage_started_at=lineage_started_at,
         consumed_draft_revisions=consumed_draft_revisions,
+        replace_live_checkpoints=replace_live_checkpoints,
     )
     return _attach_draft_materialization(proposal, materialization)
 
@@ -2334,6 +2433,12 @@ def _owned_compilation_job(db: Session, job_id: str) -> AssistantCompilationJob:
 
 def _public_compilation_progress(job: AssistantCompilationJob) -> dict[str, Any]:
     raw = job.progress if isinstance(job.progress, dict) else {}
+    raw_draft_resource_kinds = raw.get("draft_resource_kinds")
+    draft_resource_kinds = (
+        raw_draft_resource_kinds
+        if isinstance(raw_draft_resource_kinds, list)
+        else []
+    )
     result = {
         "phase": str(raw.get("phase") or job.status),
         "detail": str(raw.get("detail") or "")[:500],
@@ -2346,6 +2451,27 @@ def _public_compilation_progress(job: AssistantCompilationJob) -> dict[str, Any]
         "results": assistant_compilation_job_service.normalize_progress_results(
             raw.get("results")
         ),
+        "activities": assistant_compilation_job_service.normalize_progress_activities(
+            raw.get("activities")
+        ),
+        "guidance": assistant_compilation_job_service.normalize_progress_guidance(
+            raw.get("guidance")
+        ),
+        "guidance_pending_count": max(
+            0, int(raw.get("guidance_pending_count") or 0)
+        ),
+        "accepting_guidance": raw.get("accepting_guidance") is not False,
+        "draft_checkpoint_revision": max(
+            0, int(raw.get("draft_checkpoint_revision") or 0)
+        ),
+        "draft_resource_count": max(
+            0, int(raw.get("draft_resource_count") or 0)
+        ),
+        "draft_resource_kinds": [
+            str(value)[:40]
+            for value in draft_resource_kinds[:20]
+            if str(value).strip()
+        ],
     }
     if job.status == "failed":
         public_error = assistant_compilation_job_service.public_compilation_error(
@@ -2356,6 +2482,105 @@ def _public_compilation_progress(job: AssistantCompilationJob) -> dict[str, Any]
         result["detail"] = public_error.message[:500]
         result["error_code"] = public_error.code[:100]
     return result
+
+
+def _compilation_thinking_from_progress(
+    progress: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Project durable execution stages into the history-safe thinking summary."""
+    steps = progress.get("steps") if isinstance(progress, dict) else []
+    return [
+        {
+            "id": str(step.get("id") or "step")[:80],
+            "title": str(step.get("title") or "处理阶段")[:160],
+            "detail": str(step.get("detail") or "")[:500],
+            "status": str(step.get("status") or "pending")[:20],
+        }
+        for step in steps
+        if isinstance(step, dict)
+    ]
+
+
+def _compilation_trace_context(
+    progress: dict[str, Any],
+    *,
+    status: str = "processing",
+) -> dict[str, Any]:
+    """Return the persisted, auditable trace shown in live and history views."""
+    return {
+        "status": status,
+        "compilation_progress": progress,
+        "evidence": {
+            "rules_used": [
+                {
+                    "id": "scenario_baseline",
+                    "name": "场景基线校验",
+                    "result": "基于当前场景基线生成候选变更",
+                },
+                {
+                    "id": "explicit_confirmation",
+                    "name": "显式确认边界",
+                    "result": "正式写入前保留用户确认与权限校验",
+                },
+            ],
+            "tools_called": [
+                {"name": "语义任务规划器", "status": "completed", "purpose": "根据对话选择本轮内部能力"},
+                {"name": "附件理解与场景建模", "status": "running" if status == "processing" else "completed", "purpose": "解析来源并生成可审核的场景模型草稿"},
+            ],
+            "confidence": 0.78,
+            "note": "这是可审计的处理摘要，不包含模型原始隐藏思考。",
+        },
+    }
+
+
+def _compilation_progress_narrative(progress: dict[str, Any]) -> str:
+    """Turn durable checkpoints into conversation copy, not a status-card label."""
+    steps = assistant_compilation_job_service.normalize_progress_steps(
+        progress.get("steps") if isinstance(progress, dict) else []
+    )
+    completed = [step["title"] for step in steps if step["status"] == "done"]
+    current = next(
+        (step for step in steps if step["status"] in {"running", "error"}),
+        None,
+    ) or next((step for step in steps if step["status"] == "pending"), None)
+    results = assistant_compilation_job_service.normalize_progress_results(
+        progress.get("results") if isinstance(progress, dict) else []
+    )
+    lines = ["我正在使用「附件理解与场景建模」能力处理这次请求。"]
+    if completed:
+        lines.append(f"已完成：{'、'.join(completed)}。")
+    if current:
+        prefix = "当前遇到问题" if current["status"] == "error" else "当前处理"
+        lines.append(f"{prefix}「{current['title']}」：{current['detail']}")
+    elif progress.get("detail"):
+        lines.append(str(progress["detail"])[:500])
+    if results:
+        lines.append("阶段结果：" + "；".join(item["summary"] for item in results[-3:]))
+    lines.append("正式资源尚未写入；需要写入时，我会在对话中说明影响并等待你的确认。")
+    return "\n\n".join(lines)
+
+
+def _sync_compilation_message_progress(
+    db: Session,
+    job: AssistantCompilationJob,
+) -> None:
+    """Project each worker checkpoint into the canonical assistant message."""
+    if not job.message_id:
+        return
+    message = db.get(AssistantMessage, job.message_id)
+    if not message or message.role != "assistant" or message.thread_id != job.thread_id:
+        return
+    progress = _public_compilation_progress(job)
+    existing_context = message.context if isinstance(message.context, dict) else {}
+    message.context = {
+        **existing_context,
+        **_compilation_trace_context(progress, status="processing"),
+        "compilation_job_id": job.id,
+    }
+    message.thinking = _compilation_thinking_from_progress(progress)
+    if not message.proposal:
+        message.content = _compilation_progress_narrative(progress)
+    db.commit()
 
 
 def _compilation_status_out(
@@ -2379,6 +2604,214 @@ def _compilation_status_out(
         completed_at=job.completed_at,
         updated_at=job.updated_at,
     )
+
+
+def _compilation_stream_snapshot(
+    db: Session,
+    job: AssistantCompilationJob,
+) -> dict[str, Any]:
+    """Build one owner-scoped live event from committed durable state."""
+    message_payload: dict[str, Any] = {}
+    if job.thread_id and job.message_id:
+        thread = db.execute(
+            select(AssistantThread).where(
+                AssistantThread.id == job.thread_id,
+                AssistantThread.tenant_id == job.tenant_id,
+                AssistantThread.created_by_user_id == job.created_by_user_id,
+                AssistantThread.scenario_id == job.scenario_id,
+            )
+        ).scalars().first()
+        message = db.get(AssistantMessage, job.message_id)
+        if (
+            thread is not None
+            and message is not None
+            and message.thread_id == thread.id
+            and message.role == "assistant"
+        ):
+            message_payload = _assistant_message_out(
+                db, thread, message
+            ).model_dump(mode="json")
+    return {
+        "job": _compilation_status_out(job).model_dump(mode="json"),
+        "message": message_payload,
+    }
+
+
+def _compilation_activity_identity(activity: dict[str, Any]) -> str:
+    return "|".join(
+        str(activity.get(key) or "")
+        for key in ("id", "kind", "step_id", "status", "detail", "created_at")
+    )
+
+
+def _compilation_liveness_payload(
+    job: AssistantCompilationJob,
+    progress: dict[str, Any],
+) -> dict[str, Any]:
+    """Describe a quiet running interval without exposing model reasoning."""
+    now = datetime.now(timezone.utc)
+    started_at = job.started_at or job.created_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    else:
+        started_at = started_at.astimezone(timezone.utc)
+    elapsed_seconds = max(0, int((now - started_at).total_seconds()))
+    steps = assistant_compilation_job_service.normalize_progress_steps(
+        progress.get("steps") if isinstance(progress, dict) else []
+    )
+    current = next(
+        (step for step in steps if step["status"] == "running"),
+        None,
+    ) or next((step for step in steps if step["status"] == "pending"), None)
+    activities = assistant_compilation_job_service.normalize_progress_activities(
+        progress.get("activities") if isinstance(progress, dict) else []
+    )
+    waiting_for_model = any(
+        activity.get("kind") == "model" and activity.get("status") == "running"
+        for activity in activities[-8:]
+    )
+    stage_title = str(
+        (current or {}).get("title")
+        or progress.get("current_step")
+        or "场景建模"
+    )[:160]
+    draft_resource_count = max(
+        0, int(progress.get("draft_resource_count") or 0)
+    )
+    if waiting_for_model:
+        message = (
+            "当前模型调用仍在运行；返回后会立即校验结果，并同步可验证的场景草稿。"
+        )
+    elif draft_resource_count:
+        message = (
+            f"服务端正在继续处理下一项工作；场景页面已同步 {draft_resource_count} 项草稿。"
+        )
+    else:
+        message = "服务端任务仍在运行；产生新的阶段结果后会立即同步到当前对话。"
+    return {
+        "job_id": job.id,
+        "thread_id": job.thread_id,
+        "scenario_id": job.scenario_id,
+        "status": "running",
+        "stream_state": "connected",
+        "emitted_at": now.isoformat(),
+        "elapsed_seconds": elapsed_seconds,
+        "phase": str(progress.get("phase") or "running")[:80],
+        "current_step": str(progress.get("current_step") or "")[:80],
+        "stage_title": stage_title,
+        "message": message,
+        "calls_used": max(0, int(progress.get("calls_used") or 0)),
+        "call_budget": max(0, int(progress.get("call_budget") or 0)),
+        "draft_checkpoint_revision": max(
+            0, int(progress.get("draft_checkpoint_revision") or 0)
+        ),
+        "draft_resource_count": draft_resource_count,
+        "guidance_pending_count": max(
+            0, int(progress.get("guidance_pending_count") or 0)
+        ),
+    }
+
+
+def _iter_compilation_stream_events(
+    *,
+    job_id: str,
+    tenant_id: str,
+    user_id: str,
+):
+    """Yield live capability events until the durable job becomes terminal.
+
+    Worker callbacks wake the stream immediately. The one-second authoritative
+    refresh is a server-side missed-event repair (including multi-process
+    deployments), never a browser polling protocol.
+    """
+    subscription = assistant_compilation_stream_service.subscribe(job_id)
+    stream_db = SessionLocal()
+    stream_db.info["tenant_id"] = tenant_id
+    stream_db.info["user_id"] = user_id
+    last_signature = ""
+    seen_activities: set[str] = set()
+    last_checkpoint_revision = 0
+    last_emit_at = time.monotonic()
+    try:
+        while True:
+            stream_db.expire_all()
+            job = stream_db.execute(
+                select(AssistantCompilationJob).where(
+                    AssistantCompilationJob.id == job_id,
+                    AssistantCompilationJob.tenant_id == tenant_id,
+                    AssistantCompilationJob.created_by_user_id == user_id,
+                ).execution_options(populate_existing=True)
+            ).scalars().first()
+            if job is None:
+                raise RuntimeError("编译任务在事件流中不可用")
+            snapshot = _compilation_stream_snapshot(stream_db, job)
+            signature = json.dumps(
+                snapshot["job"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if signature != last_signature:
+                progress = snapshot["job"].get("progress", {})
+                activities = (
+                    progress.get("activities", [])
+                )
+                for activity in activities:
+                    if not isinstance(activity, dict):
+                        continue
+                    identity = _compilation_activity_identity(activity)
+                    if identity in seen_activities:
+                        continue
+                    seen_activities.add(identity)
+                    yield "tool_event", {
+                        "job_id": job_id,
+                        "tool": "compile_scenario_model",
+                        "tool_label": "附件理解与场景建模",
+                        "activity": activity,
+                    }
+                checkpoint_revision = max(
+                    0, int(progress.get("draft_checkpoint_revision") or 0)
+                )
+                if checkpoint_revision > last_checkpoint_revision:
+                    yield "draft_checkpoint", {
+                        "job_id": job_id,
+                        "thread_id": job.thread_id,
+                        "scenario_id": job.scenario_id,
+                        "revision": checkpoint_revision,
+                        "resource_count": max(
+                            0, int(progress.get("draft_resource_count") or 0)
+                        ),
+                        "resource_kinds": list(
+                            progress.get("draft_resource_kinds") or []
+                        ),
+                        "detail": str(progress.get("detail") or "")[:500],
+                    }
+                    last_checkpoint_revision = checkpoint_revision
+                event_type = (
+                    "compilation_result"
+                    if job.status in {"succeeded", "failed"}
+                    else "compilation_progress"
+                )
+                yield event_type, snapshot
+                last_signature = signature
+                last_emit_at = time.monotonic()
+            if job.status in {"succeeded", "failed"}:
+                return
+            subscription = assistant_compilation_stream_service.wait(
+                subscription,
+                timeout=_COMPILATION_STREAM_REFRESH_SECONDS,
+            )
+            if (
+                time.monotonic() - last_emit_at
+                >= _COMPILATION_STREAM_LIVENESS_SECONDS
+            ):
+                yield "compilation_liveness", _compilation_liveness_payload(
+                    job,
+                    _public_compilation_progress(job),
+                )
+                last_emit_at = time.monotonic()
+    finally:
+        stream_db.close()
 
 
 def _public_model_issue_group_rows(raw_groups: Any) -> list[dict[str, Any]]:
@@ -2584,7 +3017,7 @@ def _model_lifecycle_is_consistent(payload: Any) -> bool:
     actionable = [
         task_ids[index]
         for index, status in enumerate(statuses)
-        if status in {"ready", "blocked"}
+        if status in {"ready", "blocked", "awaiting_generation"}
     ]
     current_task_id = str(payload.get("current_task_id") or "")
     summary_current = str(summary.get("current_task_id") or "")
@@ -2594,9 +3027,9 @@ def _model_lifecycle_is_consistent(payload: Any) -> bool:
     for task_id, task in task_by_id.items():
         status = str(task.get("status") or "pending")
         dependencies = [str(value) for value in (task.get("depends_on") or [])]
-        if status in {"ready", "blocked"} and any(
+        if status in {"ready", "blocked", "awaiting_generation"} and any(
             str(task_by_id[value].get("status") or "pending")
-            not in _MODEL_TASK_APPLIED_STATUSES | {"empty"}
+            not in _MODEL_TASK_TERMINAL_STATUSES
             for value in dependencies
         ):
             return False
@@ -2619,15 +3052,26 @@ def _model_lifecycle_is_consistent(payload: Any) -> bool:
             and action_type == "refine_model"
             and next_action.get("requires_confirmation") is False
         )
-    return bool(
+    if not (
         summary.get("final") is False
         and not all_terminal
         and len(actionable) == 1
         and current_task_id == actionable[0]
         and summary_current == current_task_id
-        and execution_status == "waiting_for_confirmation"
-        and action_type == "confirm_task"
         and str(next_action.get("task_id") or "") == current_task_id
+    ):
+        return False
+    current_status = str(task_by_id[current_task_id].get("status") or "")
+    if current_status == "awaiting_generation":
+        return bool(
+            execution_status == "waiting_for_generation"
+            and action_type == "generate_task"
+            and next_action.get("requires_confirmation") is False
+            and next_action.get("can_generate") is True
+        )
+    return bool(
+        execution_status == "waiting_for_confirmation"
+        and action_type == "confirm_task"
         and next_action.get("requires_confirmation") is True
     )
 
@@ -3124,6 +3568,7 @@ def _update_compilation_subscription_messages(
             "status": status,
             "compilation_job_id": job.id,
             "canonical_message_id": canonical_message_id,
+            "compilation_progress": _public_compilation_progress(job),
         }
         if model_run_id:
             next_context["model_run_id"] = model_run_id
@@ -3136,6 +3581,9 @@ def _update_compilation_subscription_messages(
         message.context = next_context
         message.content = content
         message.proposal = {}
+        message.thinking = _compilation_thinking_from_progress(
+            _public_compilation_progress(job)
+        )
 
 
 def _reconcile_terminal_compilation_subscriptions(
@@ -3258,6 +3706,11 @@ def _record_compilation_progress(
             lease_token=lease_token or None,
             lease_attempt=lease_attempt if lease_token else None,
         )
+        progress_db.expire_all()
+        job = progress_db.get(AssistantCompilationJob, job_id)
+        if job:
+            _sync_compilation_message_progress(progress_db, job)
+            assistant_compilation_stream_service.publish(job_id)
     finally:
         progress_db.close()
 
@@ -3281,7 +3734,7 @@ def _record_compilation_stage(
     titles = {
         "analyze": "分析业务资料",
         "plan": "制定建模任务",
-        "ontology": "建立本体与业务能力",
+        "ontology": "建设本体模型",
         "mapping": "整理数据映射",
         "rules": "校验规则、事件与工作流",
         "review": "生成待审核变更清单",
@@ -3299,8 +3752,120 @@ def _record_compilation_stage(
             lease_token=lease_token or None,
             lease_attempt=lease_attempt if lease_token else None,
         )
+        progress_db.expire_all()
+        job = progress_db.get(AssistantCompilationJob, job_id)
+        if job:
+            _sync_compilation_message_progress(progress_db, job)
+            assistant_compilation_stream_service.publish(job_id)
     finally:
         progress_db.close()
+
+
+def _live_compilation_proposal_id(
+    job_id: str,
+    continuation_proposal_id: str = "",
+) -> str:
+    del continuation_proposal_id
+    return f"live-{job_id}"[:64]
+
+
+def _persist_compilation_draft_checkpoint(
+    *,
+    tenant_id: str,
+    user_id: str,
+    job_id: str,
+    scenario_id: str,
+    thread_id: str,
+    assistant_message_id: str,
+    data: dict[str, Any],
+    detail: str,
+    prepared_context: dict[str, Any],
+    lease_token: str,
+    lease_attempt: int,
+    continuation_proposal_id: str = "",
+) -> None:
+    """Commit one inert draft revision before publishing its SSE checkpoint."""
+    checkpoint_db = SessionLocal()
+    checkpoint_db.info["tenant_id"] = tenant_id
+    checkpoint_db.info["user_id"] = user_id
+    try:
+        job = checkpoint_db.execute(
+            select(AssistantCompilationJob).where(
+                AssistantCompilationJob.id == job_id,
+                AssistantCompilationJob.tenant_id == tenant_id,
+                AssistantCompilationJob.created_by_user_id == user_id,
+                AssistantCompilationJob.status == "running",
+                AssistantCompilationJob.lease_token == lease_token,
+                AssistantCompilationJob.lease_attempt == lease_attempt,
+                AssistantCompilationJob.lease_expires_at.is_not(None),
+                AssistantCompilationJob.lease_expires_at > datetime.now(timezone.utc),
+            )
+        ).scalars().first()
+        if job is None:
+            raise assistant_compilation_job_service.CompilationLeaseLost(
+                "编译任务租约已失效，拒绝发布实时草稿"
+            )
+        scenario = checkpoint_db.execute(
+            select(BusinessScenario)
+            .where(
+                BusinessScenario.id == scenario_id,
+                BusinessScenario.tenant_id == tenant_id,
+            )
+            .with_for_update()
+        ).scalars().first()
+        if scenario is None:
+            raise RuntimeError("实时草稿所属业务场景不存在")
+        proposal = _build_proposal("scenario_model", copy.deepcopy(data), scenario)
+        proposal_id = _live_compilation_proposal_id(
+            job.id, continuation_proposal_id
+        )
+        proposal["proposal_id"] = proposal_id
+        proposal["payload"]["run_id"] = proposal_id
+        proposal["payload"]["live_checkpoint"] = True
+        consumed_revisions = (
+            prepared_context.get("consumed_draft_revisions")
+            if isinstance(prepared_context, dict)
+            and isinstance(prepared_context.get("consumed_draft_revisions"), dict)
+            else {}
+        )
+        proposal["draft_lineage"] = {
+            "started_at": job.started_at.isoformat(),
+            "consumed_draft_revisions": copy.deepcopy(consumed_revisions),
+        }
+        proposal = _materialize_scenario_model_proposal(
+            checkpoint_db,
+            scenario,
+            proposal,
+            source_thread_id=thread_id,
+            source_message_id=assistant_message_id,
+            compilation_job_id=job.id,
+            lineage_started_at=job.started_at,
+            consumed_draft_revisions=consumed_revisions,
+            replace_live_checkpoints=True,
+        )
+        materialization = proposal.get("payload", {}).get(
+            "draft_materialization", {}
+        )
+        resource_ids_by_task = materialization.get("resource_ids_by_task") or {}
+        resource_count = int(materialization.get("resource_count") or sum(
+            len(values) for values in resource_ids_by_task.values()
+            if isinstance(values, list)
+        ))
+        assistant_compilation_job_service.record_draft_checkpoint(
+            checkpoint_db,
+            job.id,
+            resource_count=resource_count,
+            resource_kinds=(materialization.get("by_kind") or {}).keys(),
+            detail=detail,
+            lease_token=lease_token,
+            lease_attempt=lease_attempt,
+        )
+        assistant_compilation_stream_service.publish(job.id)
+    except Exception:
+        checkpoint_db.rollback()
+        raise
+    finally:
+        checkpoint_db.close()
 
 
 def _fail_compilation_job(
@@ -3326,7 +3891,7 @@ def _fail_compilation_job(
         public_error = assistant_compilation_job_service.public_compilation_error(
             error
         )
-        assistant_compilation_job_service.mark_failed(
+        failed_job = assistant_compilation_job_service.mark_failed(
             failure_db,
             job_id,
             error=error,
@@ -3346,7 +3911,11 @@ def _fail_compilation_job(
                 "status": "error",
                 "compilation_job_id": job.id,
                 "error_code": public_error.code,
+                "compilation_progress": _public_compilation_progress(failed_job),
             }
+            message.thinking = _compilation_thinking_from_progress(
+                _public_compilation_progress(failed_job)
+            )
             message.proposal = {}
         _update_compilation_subscription_messages(
             failure_db,
@@ -3357,11 +3926,175 @@ def _fail_compilation_job(
             error_code=public_error.code,
         )
         failure_db.commit()
+        assistant_compilation_stream_service.publish(job_id)
     except Exception:
         failure_db.rollback()
         raise
     finally:
         failure_db.close()
+
+
+def _merge_staged_compilation_payload(
+    current_payload: dict[str, Any],
+    staged_payload: dict[str, Any],
+    *,
+    task_id: str,
+) -> dict[str, Any]:
+    """Merge one newly generated stage into the same durable modelling run."""
+    sections = set(scenario_model_compiler.model_task_sections(task_id))
+    result = copy.deepcopy(current_payload)
+    stage = copy.deepcopy(staged_payload)
+    for section in _SCENARIO_MODEL_RESOURCE_SECTIONS:
+        if section in sections:
+            result[section] = [
+                copy.deepcopy(item)
+                for item in (stage.get(section) or [])
+                if isinstance(item, dict)
+            ]
+
+    current_candidates = [
+        copy.deepcopy(item)
+        for item in (result.get("draft_candidates") or [])
+        if isinstance(item, dict) and str(item.get("task_id") or "") != task_id
+    ]
+    stage_candidates = [
+        copy.deepcopy(item)
+        for item in (stage.get("draft_candidates") or [])
+        if isinstance(item, dict) and str(item.get("task_id") or "") == task_id
+    ]
+    result["draft_candidates"] = [*current_candidates, *stage_candidates]
+
+    changes_by_id: dict[str, dict[str, Any]] = {}
+    anonymous_changes: list[dict[str, Any]] = []
+    for item in [*(result.get("changes") or []), *(stage.get("changes") or [])]:
+        if not isinstance(item, dict):
+            continue
+        change_id = str(item.get("change_id") or "")
+        if change_id:
+            changes_by_id[change_id] = copy.deepcopy(item)
+        else:
+            anonymous_changes.append(copy.deepcopy(item))
+    result["changes"] = [*changes_by_id.values(), *anonymous_changes]
+
+    def merge_issues(*values: Any) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, tuple[str, ...]]] = set()
+        for value in values:
+            for item in value if isinstance(value, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                identity = (
+                    str(item.get("code") or ""),
+                    str(item.get("message") or ""),
+                    tuple(str(ref) for ref in (item.get("source_refs") or [])),
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                merged.append(copy.deepcopy(item))
+        return merged
+
+    result["unresolved"] = merge_issues(
+        result.get("unresolved"), stage.get("unresolved")
+    )
+    # Every stage reads the same original source bundle.  Replacing the
+    # previous ledger with the newest stage's ledger would erase evidence and
+    # change keys from already-confirmed work, making historical review (and
+    # later task-level validation) inaccurate.  Merge by source ref instead.
+    coverage_order: list[str] = []
+    coverage_by_ref: dict[str, list[dict[str, Any]]] = {}
+    for collection in (result.get("coverage"), stage.get("coverage")):
+        for item in collection if isinstance(collection, list) else []:
+            if not isinstance(item, dict):
+                continue
+            source_ref = str(item.get("source_ref") or "").strip()
+            if not source_ref:
+                continue
+            if source_ref not in coverage_by_ref:
+                coverage_by_ref[source_ref] = []
+                coverage_order.append(source_ref)
+            coverage_by_ref[source_ref].append(copy.deepcopy(item))
+
+    coverage_priority = {
+        "irrelevant": 1,
+        "context": 2,
+        "modeled": 3,
+        "ambiguous": 4,
+    }
+    merged_coverage: list[dict[str, Any]] = []
+    for source_ref in coverage_order:
+        entries = coverage_by_ref[source_ref]
+        status = max(
+            (str(item.get("status") or "context") for item in entries),
+            key=lambda value: coverage_priority.get(value, 4),
+        )
+        change_keys = list(dict.fromkeys(
+            str(key)
+            for item in entries
+            for key in (item.get("change_keys") or [])
+            if str(key)
+        ))
+        reasons = list(dict.fromkeys(
+            str(item.get("reason") or "").strip()
+            for item in entries
+            if str(item.get("reason") or "").strip()
+        ))
+        merged_coverage.append({
+            "source_ref": source_ref,
+            "status": status,
+            "reason": "；".join(reasons)[:1_500] or "已保留该来源在分阶段建模中的上下文。",
+            "change_keys": change_keys,
+        })
+    if merged_coverage:
+        result["coverage"] = merged_coverage
+        result["coverage_summary"] = {
+            "total": len(merged_coverage),
+            "modeled": sum(item["status"] == "modeled" for item in merged_coverage),
+            "context": sum(item["status"] == "context" for item in merged_coverage),
+            "irrelevant": sum(item["status"] == "irrelevant" for item in merged_coverage),
+            "ambiguous": sum(item["status"] == "ambiguous" for item in merged_coverage),
+        }
+    if isinstance(stage.get("source_manifest"), list):
+        result["source_manifest"] = copy.deepcopy(stage["source_manifest"])
+
+    previous_generation = result.get("generation")
+    staged_generation = stage.get("generation")
+    generated_ids = [
+        str(value)
+        for value in (
+            previous_generation.get("generated_task_ids")
+            if isinstance(previous_generation, dict)
+            and isinstance(previous_generation.get("generated_task_ids"), list)
+            else []
+        )
+    ]
+    generated_ids.extend(
+        str(value)
+        for value in (
+            staged_generation.get("generated_task_ids")
+            if isinstance(staged_generation, dict)
+            and isinstance(staged_generation.get("generated_task_ids"), list)
+            else [task_id]
+        )
+    )
+    result["generation"] = {
+        "mode": "staged",
+        "generated_task_ids": list(dict.fromkeys(
+            value for value in generated_ids
+            if value in {
+                str(item.get("id") or "")
+                for item in scenario_model_compiler.model_task_definitions()
+            }
+        )),
+    }
+    # Keep prior terminal task outcomes. ``attach_model_task_plan`` rebuilds
+    # all counts from the merged payload and retains those immutable outcomes.
+    result["tasks"] = copy.deepcopy(current_payload.get("tasks") or [])
+    result.pop("current_task_id", None)
+    result.pop("execution_summary", None)
+    result.pop("execution_status", None)
+    result.pop("next_action", None)
+    return result
 
 
 def _finalize_compilation_success(
@@ -3380,6 +4113,8 @@ def _finalize_compilation_success(
     prepared_context: dict[str, Any] | None = None,
     lease_token: str = "",
     lease_attempt: int = 0,
+    continuation_proposal_id: str = "",
+    continuation_task_id: str = "",
 ) -> dict[str, Any]:
     """Atomically bind the recoverable message and terminal job result."""
     finish_db = SessionLocal()
@@ -3456,8 +4191,48 @@ def _finalize_compilation_success(
         ).scalars().first()
         if not thread:
             raise RuntimeError("编译任务所属助手会话不存在")
+        existing_continuation_message: AssistantMessage | None = None
+        if continuation_proposal_id:
+            if not continuation_task_id:
+                raise RuntimeError("分阶段续作缺少任务范围")
+            existing_continuation_message = finish_db.get(
+                AssistantMessage, assistant_message_id
+            )
+            existing_proposal = (
+                existing_continuation_message.proposal
+                if existing_continuation_message
+                and isinstance(existing_continuation_message.proposal, dict)
+                else {}
+            )
+            if (
+                not existing_continuation_message
+                or existing_continuation_message.thread_id != thread.id
+                or existing_proposal.get("kind") != "scenario_model"
+                or str(existing_proposal.get("proposal_id") or "")
+                != continuation_proposal_id
+            ):
+                raise RuntimeError("分阶段续作找不到当前权威建模计划")
+            previous_payload = (
+                existing_proposal.get("payload")
+                if isinstance(existing_proposal.get("payload"), dict)
+                else {}
+            )
+            data = _merge_staged_compilation_payload(
+                previous_payload,
+                data,
+                task_id=continuation_task_id,
+            )
         inert_salvage = _is_inert_compilation_salvage(data)
         proposal = _build_proposal("scenario_model", data, scenario)
+        if continuation_proposal_id:
+            proposal["proposal_id"] = continuation_proposal_id
+            proposal["payload"]["run_id"] = str(
+                previous_payload.get("run_id") or continuation_proposal_id
+            )
+        else:
+            proposal["proposal_id"] = _live_compilation_proposal_id(job.id)
+            proposal["payload"]["run_id"] = proposal["proposal_id"]
+        proposal["payload"].pop("live_checkpoint", None)
         consumed_revisions = (
             prepared_context.get("consumed_draft_revisions")
             if isinstance(prepared_context, dict)
@@ -3480,7 +4255,16 @@ def _finalize_compilation_success(
             compilation_job_id=job.id,
             lineage_started_at=job.started_at,
             consumed_draft_revisions=consumed_revisions,
+            replace_live_checkpoints=True,
         )
+        if continuation_proposal_id:
+            scenario_model_draft_service.discard_pristine_live_checkpoints(
+                finish_db,
+                tenant_id=tenant_id,
+                scenario_id=scenario.id,
+                created_by_user_id=user_id,
+                compilation_job_id=job.id,
+            )
         if baseline_changed:
             proposal = _complete_baseline_changed_proposal(
                 proposal,
@@ -3491,6 +4275,19 @@ def _finalize_compilation_success(
         execution_summary = (
             (proposal.get("payload") or {}).get("execution_summary") or {}
         )
+        generation = (
+            (proposal.get("payload") or {}).get("generation")
+            if isinstance((proposal.get("payload") or {}).get("generation"), dict)
+            else {}
+        )
+        # The root stage alone retains its private source input while the user
+        # still has unfinished tasks. Continuation jobs always read that root;
+        # their own input can be discarded on completion as usual.
+        retain_root_source_input = bool(
+            not continuation_proposal_id
+            and generation.get("mode") == "staged"
+            and not execution_summary.get("final")
+        )
         durable_reply = "\n\n".join(
             value
             for value in (
@@ -3499,7 +4296,17 @@ def _finalize_compilation_success(
             )
             if value
         )
+        if existing_continuation_message is not None:
+            previous_reply = str(existing_continuation_message.content or "").strip()
+            if previous_reply and durable_reply:
+                durable_reply = f"{previous_reply}\n\n{durable_reply}"
+            elif previous_reply:
+                durable_reply = previous_reply
         message_status = _model_run_context_status(execution_summary)
+        trace_progress = _public_compilation_progress(job)
+        trace_thinking = _compilation_thinking_from_progress(trace_progress)
+        if not trace_thinking:
+            trace_thinking = thinking
         _save_message(
             finish_db,
             thread,
@@ -3507,13 +4314,14 @@ def _finalize_compilation_success(
             durable_reply,
             {
                 **context,
+                **_compilation_trace_context(trace_progress, status=message_status),
                 "status": message_status,
                 "compilation_job_id": job.id,
                 "model_run_id": proposal.get("proposal_id"),
             },
             sources,
             proposal,
-            thinking,
+            trace_thinking,
             message_id=assistant_message_id,
         )
         _update_compilation_subscription_messages(
@@ -3535,7 +4343,7 @@ def _finalize_compilation_success(
         # pending attributes with their pre-finalize values in autoflush=False
         # sessions.
         finish_db.flush()
-        assistant_compilation_job_service.mark_succeeded(
+        completed_job = assistant_compilation_job_service.mark_succeeded(
             finish_db,
             job.id,
             result=proposal,
@@ -3546,8 +4354,36 @@ def _finalize_compilation_success(
             commit=False,
             lease_token=lease_token or None,
             lease_attempt=lease_attempt if lease_token else None,
+            retain_execution_input=retain_root_source_input,
         )
+        # The terminal transition adds the final result activity. Update the
+        # same canonical message once more so history contains the complete
+        # trace, including the terminal checkpoint.
+        completed_message = finish_db.get(AssistantMessage, assistant_message_id)
+        if completed_message and completed_message.role == "assistant":
+            completed_progress = _public_compilation_progress(completed_job)
+            completed_message.context = {
+                **(completed_message.context if isinstance(completed_message.context, dict) else {}),
+                **_compilation_trace_context(completed_progress, status=message_status),
+                "compilation_job_id": completed_job.id,
+                "model_run_id": proposal.get("proposal_id"),
+            }
+            completed_message.thinking = _compilation_thinking_from_progress(
+                completed_progress
+            )
+            _update_compilation_subscription_messages(
+                finish_db,
+                completed_job,
+                status=message_status,
+                content=(
+                    str(execution_summary.get("message") or "").strip()
+                    or "同一场景建模任务已有新的权威草稿结果。"
+                ),
+                canonical_message_id=assistant_message_id,
+                model_run_id=str(proposal.get("proposal_id") or ""),
+            )
         finish_db.commit()
+        assistant_compilation_stream_service.publish(job_id)
         return proposal
     except Exception:
         finish_db.rollback()
@@ -3826,6 +4662,15 @@ def _run_compilation_job_in_background(
         sources = execution["sources"]
         execution_policy = execution["execution_policy"]
         llm_config_id = execution["llm_config_id"]
+        task_scope = str(execution_policy.get("task_scope") or "")
+        continuation_proposal_id = str(
+            execution_policy.get("continuation_proposal_id") or ""
+        )
+        worker_db.info["llm_trace_context"] = {
+            "correlation_id": job_id,
+            "conversation_id": thread_id,
+            "scenario_id": scenario_id,
+        }
         if llm_config_id:
             worker_db.info["assistant_llm_config_id"] = llm_config_id
         scenario = _scenario(worker_db, scenario_id, writable=True)
@@ -3870,6 +4715,103 @@ def _run_compilation_job_in_background(
                 lease_attempt=lease_attempt,
             )
 
+        last_checkpoint_signature = ""
+
+        def record_compilation_checkpoint(
+            checkpoint_data: dict[str, Any],
+            detail: str,
+        ) -> None:
+            nonlocal last_checkpoint_signature
+            _raise_if_compilation_lease_lost(heartbeat_lost)
+            signature = hashlib.sha256(json.dumps(
+                checkpoint_data,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")).hexdigest()
+            if signature == last_checkpoint_signature:
+                return
+            _persist_compilation_draft_checkpoint(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                job_id=job_id,
+                scenario_id=scenario_id,
+                thread_id=thread_id,
+                assistant_message_id=assistant_message_id,
+                data=checkpoint_data,
+                detail=detail,
+                prepared_context=prepared_context,
+                lease_token=lease_token,
+                lease_attempt=lease_attempt,
+                continuation_proposal_id=continuation_proposal_id,
+            )
+            last_checkpoint_signature = signature
+
+        def claim_compilation_guidance() -> list[dict[str, Any]]:
+            guidance_db = SessionLocal()
+            guidance_db.info["tenant_id"] = tenant_id
+            guidance_db.info["user_id"] = user_id
+            try:
+                claimed = assistant_compilation_job_service.claim_pending_guidance(
+                    guidance_db,
+                    job_id,
+                    token=lease_token,
+                    attempt=lease_attempt,
+                )
+                if claimed:
+                    assistant_compilation_stream_service.publish(job_id)
+                return claimed
+            finally:
+                guidance_db.close()
+
+        def close_compilation_guidance_window() -> bool:
+            guidance_db = SessionLocal()
+            guidance_db.info["tenant_id"] = tenant_id
+            guidance_db.info["user_id"] = user_id
+            try:
+                closed = assistant_compilation_job_service.close_guidance_window(
+                    guidance_db,
+                    job_id,
+                    token=lease_token,
+                    attempt=lease_attempt,
+                )
+                assistant_compilation_stream_service.publish(job_id)
+                return closed
+            finally:
+                guidance_db.close()
+
+        def defer_compilation_guidance() -> list[dict[str, Any]]:
+            guidance_db = SessionLocal()
+            guidance_db.info["tenant_id"] = tenant_id
+            guidance_db.info["user_id"] = user_id
+            try:
+                deferred = assistant_compilation_job_service.defer_pending_guidance(
+                    guidance_db,
+                    job_id,
+                    token=lease_token,
+                    attempt=lease_attempt,
+                )
+                if deferred:
+                    assistant_compilation_stream_service.publish(job_id)
+                return deferred
+            finally:
+                guidance_db.close()
+
+        try:
+            record_compilation_checkpoint(
+                scenario_model_compiler.live_compilation_placeholder(
+                    message=compiler_message,
+                    documents=compiler_documents,
+                    prepared_context=prepared_context,
+                ),
+                "已在场景页面建立可见的工作草稿，正在逐步补全业务定义。",
+            )
+        except assistant_compilation_job_service.CompilationLeaseLost:
+            raise
+        except Exception:  # noqa: BLE001 - compilation remains valid without an early placeholder.
+            logger.exception("Failed to publish initial live compilation checkpoint")
+
         recovery_issue = execution.get("recovery_issue")
         if isinstance(recovery_issue, dict):
             data = _unavailable_worker_draft(
@@ -3907,19 +4849,58 @@ def _run_compilation_job_in_background(
                 on_consume=record_compilation_call,
             )
             try:
-                data = scenario_model_compiler.compile_scenario_model(
-                    worker_db,
-                    scenario,
-                    message=compiler_message,
-                    documents=compiler_documents,
-                    llm=llm,
-                    call_budget=budget,
-                    prepared_context=prepared_context,
-                    request_timeout=float(execution_policy["request_timeout"]),
-                    on_progress=record_compilation_stage,
-                )
-                if worker_db.new or worker_db.dirty or worker_db.deleted:
-                    raise RuntimeError("完整业务模型编译器产生了未授权数据库变更")
+                active_message = compiler_message
+                active_documents = copy.deepcopy(compiler_documents)
+                while True:
+                    data = scenario_model_compiler.compile_scenario_model(
+                        worker_db,
+                        scenario,
+                        message=active_message,
+                        documents=active_documents,
+                        llm=llm,
+                        call_budget=budget,
+                        prepared_context=prepared_context,
+                        request_timeout=float(execution_policy["request_timeout"]),
+                        on_progress=record_compilation_stage,
+                        on_checkpoint=record_compilation_checkpoint,
+                        task_scope=task_scope,
+                    )
+                    if worker_db.new or worker_db.dirty or worker_db.deleted:
+                        raise RuntimeError("完整业务模型编译器产生了未授权数据库变更")
+                    record_compilation_checkpoint(
+                        data,
+                        "本轮可验证定义已写入场景草稿；正在检查是否有新的用户指导。",
+                    )
+                    guidance = claim_compilation_guidance()
+                    if not guidance:
+                        if close_compilation_guidance_window():
+                            break
+                        guidance = claim_compilation_guidance()
+                        if not guidance:
+                            continue
+                    guidance_blocks: list[str] = []
+                    for item in guidance:
+                        guidance_id = str(item.get("id") or "guidance")
+                        guidance_message = str(item.get("message") or "").strip()
+                        if guidance_message:
+                            guidance_blocks.append(guidance_message)
+                        attachment_text = str(item.get("attachment_text") or "").strip()
+                        if attachment_text:
+                            active_documents.append({
+                                "id": f"guidance-{hashlib.sha256(guidance_id.encode('utf-8')).hexdigest()[:40]}",
+                                "filename": "运行中补充资料",
+                                "status": "parsed",
+                                "error": "",
+                                "text": attachment_text,
+                            })
+                    if guidance_blocks:
+                        active_message = (
+                            f"{active_message}\n\n"
+                            "【用户在建模过程中补充的最新指导；与旧要求冲突时以此为准】\n"
+                            + "\n".join(
+                                f"- {value}" for value in guidance_blocks
+                            )
+                        )
             except assistant_compilation_job_service.CompilationLeaseLost:
                 raise
             except Exception:  # noqa: BLE001 - unexpected compiler failures still yield drafts.
@@ -3932,10 +4913,44 @@ def _run_compilation_job_in_background(
                     code="COMPILER_EXECUTION_INTERRUPTED",
                     message="结构化编译执行中断；系统已基于冻结来源建立分阶段占位草稿，正式模型保持不变。",
                 )
+        deferred_guidance: list[dict[str, Any]] = []
+        if not close_compilation_guidance_window():
+            deferred_guidance = defer_compilation_guidance()
+            close_compilation_guidance_window()
+        if deferred_guidance:
+            data = copy.deepcopy(data)
+            unresolved = [
+                copy.deepcopy(item)
+                for item in (data.get("unresolved") or [])
+                if isinstance(item, dict)
+            ]
+            unresolved.append({
+                "code": "GUIDANCE_DEFERRED_AFTER_COMPILATION_STOPPED",
+                "message": (
+                    f"本轮停止继续调用模型前收到了 {len(deferred_guidance)} 条补充指导；"
+                    "这些内容已保留在会话中，但未标记为已应用。"
+                ),
+                "blocking": True,
+                "source_refs": [],
+                "affected_change_keys": [],
+                "resolution_hint": "请基于本轮草稿继续发送修正要求。",
+            })
+            data["unresolved"] = unresolved
+        record_compilation_checkpoint(
+            data,
+            "已将当前可验证结果同步到场景草稿，正在生成本轮总结。",
+        )
         worker_db.rollback()
         _raise_if_compilation_lease_lost(heartbeat_lost)
+        task_definition = (
+            scenario_model_compiler._model_task_definition(task_scope)
+            if task_scope else None
+        )
         reply = (
-            "已根据业务资料生成并持久化本轮完整业务模型的待审核草稿；"
+            f"「{task_definition['title']}」的候选草稿已生成。请先核对并确认本任务；"
+            "后续任务尚未生成，原始资料和已确认定义会保留，等待你继续。"
+            if task_definition is not None
+            else "已根据业务资料生成并持久化本轮完整业务模型的待审核草稿；"
             "这不代表正式定义已经应用。任务需要逐项确认，不能安全写入的候选保持停用，"
             "具体缺口在最终总结中按根因合并。"
         )
@@ -3958,6 +4973,8 @@ def _run_compilation_job_in_background(
             "prepared_context": prepared_context,
             "lease_token": lease_token,
             "lease_attempt": lease_attempt,
+            "continuation_proposal_id": continuation_proposal_id,
+            "continuation_task_id": task_scope if continuation_proposal_id else "",
         }
         try:
             _finalize_compilation_success(data=data, reply=reply, **finalize_kwargs)
@@ -4341,6 +5358,7 @@ def _assistant_message_out(
     if (
         message.role == "assistant"
         and routing.get("source") == "model_fallback"
+        and routing.get("recovered") is not True
         and not (message.proposal if isinstance(message.proposal, dict) else {})
     ):
         # Historic route failures sometimes continued into unconstrained chat,
@@ -4707,11 +5725,10 @@ def _route_fallback_public_notice() -> str:
 def _route_fallback_notice(
     route_plan: assistant_orchestrator.AssistantRoutePlan,
 ) -> str:
-    return (
-        _route_fallback_public_notice()
-        if route_plan.source == "model_fallback"
-        else ""
-    )
+    # A failed semantic provider is recoverable. The LangGraph route plan has
+    # already selected either a context-safe continuation or ordinary chat;
+    # stopping here would discard a valid document-driven modelling request.
+    return ""
 
 
 def _read_only_chat_contract() -> str:
@@ -5618,6 +6635,112 @@ def get_compilation_job(
     return _compilation_status_out(_owned_compilation_job(db, job_id))
 
 
+@router.get("/compilation-jobs/{job_id}/stream")
+def stream_compilation_job(
+    job_id: str,
+    db: Session = Depends(get_tenant_db),
+):
+    """Reconnect one durable capability execution to the conversation SSE."""
+    job = _owned_compilation_job(db, job_id)
+    tenant_id = str(job.tenant_id or "")
+    user_id = str(job.created_by_user_id or "")
+    initial = _compilation_status_out(job).model_dump(mode="json")
+
+    def event_stream():
+        yield _sse("compilation_job", {
+            "job_id": job_id,
+            "thread_id": initial.get("thread_id"),
+            "scenario_id": initial.get("scenario_id"),
+            "status": initial.get("status"),
+            "progress": initial.get("progress") or {},
+            "llm_calls_used": initial.get("llm_calls_used", 0),
+            "llm_call_budget": initial.get("llm_call_budget", 0),
+            "reconnected": True,
+        })
+        for event_type, event_data in _iter_compilation_stream_events(
+            job_id=job_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        ):
+            yield _sse(event_type, event_data)
+        yield _sse("done", {"job_id": job_id, "thread_id": initial.get("thread_id")})
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@router.post(
+    "/compilation-jobs/{job_id}/guidance",
+    response_model=AssistantCompilationGuidanceOut,
+)
+def submit_compilation_guidance(
+    job_id: str,
+    payload: AssistantCompilationGuidanceRequest,
+    db: Session = Depends(get_tenant_db),
+):
+    """Queue a correction into the current run without launching a second job."""
+    job = _owned_compilation_job(db, job_id)
+    thread_id = str(job.thread_id or "").strip()
+    if not thread_id:
+        raise HTTPException(409, "编译任务尚未绑定可继续指导的会话")
+    thread = _thread(db, thread_id, for_update=True)
+    attachments = _safe_attachment_ids(
+        db,
+        payload.attachment_ids,
+        thread_id=thread.id,
+        consume=False,
+    )
+    attachment_text, sources = _attachment_context(attachments)
+    try:
+        queued_job, accepted = assistant_compilation_job_service.enqueue_guidance(
+            db,
+            job.id,
+            tenant_id=_tenant(db),
+            created_by_user_id=_current_user_id(db),
+            guidance_id=payload.request_id,
+            message=payload.message,
+            attachment_text=attachment_text,
+            sources=sources,
+        )
+    except (LookupError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    message: AssistantMessage | None = None
+    if accepted:
+        _consume_attachments(db, attachments, thread_id=thread.id)
+        message = _save_message(
+            db,
+            thread,
+            "user",
+            payload.message,
+            {
+                "status": "queued_guidance",
+                "compilation_job_id": job.id,
+                "guidance_id": payload.request_id,
+            },
+            sources,
+        )
+    db.commit()
+    db.refresh(queued_job)
+    assistant_compilation_stream_service.publish(job.id)
+    return AssistantCompilationGuidanceOut(
+        accepted=accepted,
+        guidance_id=payload.request_id,
+        job=_compilation_status_out(queued_job),
+        message=(
+            _assistant_message_out(db, thread, message)
+            if message is not None else None
+        ),
+    )
+
+
 @router.get(
     "/compilation-jobs/{job_id}/result",
     response_model=AssistantCompilationJobResultOut,
@@ -5981,7 +7104,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         {
             "role": "system",
             "content": (
-                "你是本体智能平台的全局 AI 助手。你必须区分事实、推测和待确认项；"
+                "你是本体智能平台的智能业务顾问。你必须区分事实、推测和待确认项；"
                 "不直接修改数据，不绕过权限，不把 SQL 当作业务本体。回答简洁、可执行，"
                 "必要时用问题卡片澄清。\n\n"
                 + _mode_safety_context(payload.mode)
@@ -6081,7 +7204,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
             save_db.close()
 
     def event_stream():
-        nonlocal compilation_job_id
+        nonlocal compilation_job_id, sources
         # FastAPI may finalize ``get_tenant_db`` before an SSE generator starts
         # iterating.  Reusing ORM objects captured from the request therefore
         # leaves unloaded relationships detached (for example
@@ -6132,6 +7255,56 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
 
             yield progress({"id": "context", "title": "理解当前上下文", "detail": "正在读取当前页面、业务场景和选中对象。", "status": "running"})
             yield progress({"id": "context", "title": "理解当前上下文", "detail": "当前上下文已准备完成。", "status": "done"})
+            yield progress({
+                "id": "routing",
+                "title": "选择处理能力",
+                "detail": f"已选择「{route_plan.capability_label}」：{route_plan.decision.reason}",
+                "status": "done",
+            })
+            if attachments:
+                attachment_detail = (
+                    f"已读取并校验 {len(attachments)} 个会话附件，正文只用于本轮已授权上下文。"
+                )
+                yield _sse("tool_event", {
+                    "tool": "read_attachments",
+                    "tool_label": "附件解析与理解",
+                    "activity": {
+                        "id": "tool-read-attachments",
+                        "kind": "tool",
+                        "step_id": "attachments",
+                        "title": "读取会话附件",
+                        "detail": attachment_detail,
+                        "status": "done",
+                    },
+                })
+                yield progress({
+                    "id": "attachments",
+                    "title": "读取会话附件",
+                    "detail": attachment_detail,
+                    "status": "done",
+                })
+            if rag_sources:
+                retrieval_detail = (
+                    f"已从当前账号可访问的正式资料中检索 {len(rag_sources)} 条依据。"
+                )
+                yield _sse("tool_event", {
+                    "tool": "search_authorized_knowledge",
+                    "tool_label": "授权知识检索",
+                    "activity": {
+                        "id": "tool-authorized-knowledge",
+                        "kind": "tool",
+                        "step_id": "retrieval",
+                        "title": "检索正式资料",
+                        "detail": retrieval_detail,
+                        "status": "done",
+                    },
+                })
+                yield progress({
+                    "id": "retrieval",
+                    "title": "检索正式资料",
+                    "detail": retrieval_detail,
+                    "status": "done",
+                })
 
             if route_notice:
                 reply = route_notice
@@ -6292,8 +7465,8 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 })
                 yield progress({
                     "id": "ontology",
-                    "title": "建立本体与业务能力",
-                    "detail": "任务已排队，下一步将逐段识别对象、关系、函数和操作。",
+                    "title": "建设本体模型",
+                    "detail": "完整建模任务已排队，将先识别对象、属性、关系和约束，再继续映射、能力、规则事件和工作流。",
                     "status": "running",
                 })
                 compilation_settings = get_settings()
@@ -6301,6 +7474,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     "llm_call_budget": compilation_settings.scenario_model_max_llm_calls,
                     "request_timeout": compilation_settings.scenario_model_llm_timeout,
                     "assistant_scope_key": scope_key,
+                    "task_scope": "",
                 }
                 identity = assistant_compilation_job_service.build_compilation_identity(
                     tenant_id=tenant_id,
@@ -6354,6 +7528,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield _sse("compilation_job", {
                     "job_id": job.id,
                     "thread_id": thread_id,
+                    "assistant_message_id": assistant_message_id,
                     "scenario_id": scenario.id,
                     "status": job.status,
                     "progress": _public_compilation_progress(job),
@@ -6361,72 +7536,101 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     "llm_call_budget": job.llm_call_budget,
                     "replayed": not owns_compilation_job,
                 })
+                follow_compilation_stream = True
                 if not owns_compilation_job and job.status == "succeeded":
-                    proposal = dict(job.result or {})
-                    if proposal.get("kind") != "scenario_model":
-                        raise RuntimeError("已完成编译任务缺少可重放的复合变更清单")
-                    data = proposal.get("payload") or {}
-                    run_summary = data.get("execution_summary") or {}
-                    reply = "\n\n".join(value for value in (
-                        "已恢复同一次发送此前完成的完整业务模型；没有重复调用模型。",
-                        str(run_summary.get("message") or "").strip(),
-                    ) if value)
-                    yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "已重放同一执行指纹的复合变更清单。", "status": "done"})
-                    yield _sse("proposal", _public_recovery_proposal(proposal))
+                    reply = "已恢复同一次发送此前完成的场景建模结果；没有重复调用模型。"
                     yield _sse("token", reply)
                 elif not owns_compilation_job and job.status == "failed":
-                    saved_status = "error"
-                    public_failure = _public_compilation_progress(job)
-                    reply = (
-                        "同一次发送此前已编译失败，系统没有重复调用模型。"
-                        f"{public_failure.get('detail') or '系统已保持零写入，请显式重试。'}"
-                    )
-                    questions.append({
-                        "id": "failed-compilation",
-                        "title": "编译任务已失败",
-                        "message": "相同执行指纹不会自动重跑；请先改变导致失败的输入。",
-                        "options": [
-                            {"label": "修改输入后重试", "value": "revise_and_retry", "impact": "形成新的执行指纹和独立调用预算。", "recommended": True},
-                            {"label": "保留失败记录", "value": "keep_failed", "impact": "不调用模型、不生成或应用任何变更。"},
-                        ],
-                    })
-                    yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "相同执行指纹已失败，未自动重跑。", "status": "error"})
+                    reply = "同一次发送此前已失败；系统没有重复调用模型，也没有执行任何正式写入。"
                     yield _sse("token", reply)
-                elif not owns_compilation_job:
-                    saved_status = "processing"
-                    reply = (
-                        "同一次发送的完整业务模型正在由已有任务编译；"
-                        "系统没有启动第二套模型调用，将继续恢复这一个任务。"
-                    )
-                    yield progress({"id": "scenario-model", "title": "编译完整业务模型", "detail": "已连接到持久任务状态；已有任务仍在运行。", "status": "running"})
-                    yield _sse("token", reply)
-                else:
-                    job_id = job.id
-                    # The request now only claims and queues the durable job.
-                    # The browser immediately receives a recoverable task id;
-                    # the worker later persists the exact proposal and the
-                    # existing poller loads it from the result endpoint.
-                    saved_status = "processing"
-                    reply = "我已先完成资料分析并列出建模计划，正在按任务顺序执行；每完成一项都会回传阶段结果，最终再生成待审核变更清单。"
-                    # Persist the placeholder before the worker can finish;
-                    # otherwise a fast test/mock provider could race the
-                    # common stream finalizer and overwrite the proposal.
-                    persist_result(
-                        reply,
-                        proposal,
-                        thinking,
-                        saved_status,
-                        {},
-                        {},
-                        write_audit=False,
-                    )
+                if job.status == "running":
                     compilation_queued = True
-                    _submit_compilation_job(
-                        job_id=job_id,
-                    )
-                    owns_compilation_job = False
-                    yield progress({"id": "ontology", "title": "建立本体与业务能力", "detail": "任务已进入后台，正在逐项执行并持续回传阶段结果。", "status": "running"})
+                    saved_status = "processing"
+                    if owns_compilation_job:
+                        reply = (
+                            "我已完成资料分析和任务规划，现在调用「附件理解与场景建模」能力。"
+                            "接下来会在这条回复里持续输出真实阶段、工具活动和阶段结果。"
+                        )
+                        # Persist the subscription before a fast worker can
+                        # publish its first checkpoint or terminal result.
+                        persist_result(
+                            reply,
+                            proposal,
+                            thinking,
+                            saved_status,
+                            {},
+                            {},
+                            write_audit=False,
+                        )
+                        follow_compilation_stream = _submit_compilation_job(
+                            job_id=job.id,
+                        )
+                        owns_compilation_job = False
+                    else:
+                        reply = (
+                            "我已重新连接到同一次场景建模执行；不会重复调用模型。"
+                            "后续进展继续通过当前对话流输出。"
+                        )
                     yield _sse("token", reply)
+
+                if follow_compilation_stream:
+                    for event_type, event_data in _iter_compilation_stream_events(
+                        job_id=job.id,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                    ):
+                        yield _sse(event_type, event_data)
+                        if event_type == "compilation_progress":
+                            stream_job = event_data.get("job") or {}
+                            stream_progress = stream_job.get("progress") or {}
+                            thinking = _compilation_thinking_from_progress(
+                                stream_progress
+                            )
+                            reply = _compilation_progress_narrative(
+                                stream_progress
+                            )
+                            continue
+                        if event_type != "compilation_result":
+                            continue
+                        stream_job = event_data.get("job") or {}
+                        stream_message = event_data.get("message") or {}
+                        if stream_message:
+                            reply = str(stream_message.get("content") or reply)
+                            proposal = dict(stream_message.get("proposal") or {})
+                            thinking = list(stream_message.get("thinking") or thinking)
+                            evidence = dict(stream_message.get("evidence") or {})
+                            sources = list(stream_message.get("attachments") or sources)
+                        if stream_job.get("status") == "succeeded":
+                            saved_status = "success"
+                            if proposal:
+                                yield _sse("proposal", proposal)
+                        else:
+                            saved_status = "error"
+                            public_message = (
+                                str(stream_job.get("error_message") or "")
+                                or "场景建模任务未完成，系统已保持零写入。"
+                            )
+                            reply = reply or public_message
+                            questions.append({
+                                "id": "failed-compilation",
+                                "title": "建模没有完成",
+                                "message": public_message,
+                                "options": [
+                                    {"label": "修改输入后重试", "value": "revise_and_retry", "impact": "形成新的执行指纹和独立调用预算。", "recommended": True},
+                                    {"label": "保留失败记录", "value": "keep_failed", "impact": "不调用模型、不生成或应用任何变更。"},
+                                ],
+                            })
+                            yield _sse("error", public_message)
+                else:
+                    # Executor saturation is uncommon and recoverable. End the
+                    # current send cleanly; reopening the conversation attaches
+                    # one SSE subscription to the durable queued job.
+                    yield progress({
+                        "id": "scenario-model",
+                        "title": "等待场景建模执行器",
+                        "detail": "任务已可靠保存，当前执行槽繁忙；恢复时将续接同一任务，不会重复提交。",
+                        "status": "running",
+                    })
             elif intent == "ontology" and scenario:
                 yield progress({"id": "ontology", "title": "生成本体草稿", "detail": "正在整理实体、属性和关系建议。", "status": "running"})
                 description = (
@@ -6569,6 +7773,10 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     # worker will reclaim it after any partial submit failure.
             raise
         except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "assistant streaming request failed",
+                extra={"assistant_intent": intent, "assistant_request_id": context.get("request_id")},
+            )
             saved_status = "error"
             compilation_will_resume = False
             if owns_compilation_job and compilation_job_id:
@@ -6626,6 +7834,10 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     )
                 )
             error_message = public_error.message
+            context["diagnostic"] = {
+                "code": public_error.code,
+                "type": type(exc).__name__[:120],
+            }
             questions.append({
                 "id": "retry",
                 "title": "任务未完成",
@@ -6866,6 +8078,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 "llm_call_budget": compilation_settings.scenario_model_max_llm_calls,
                 "request_timeout": compilation_settings.scenario_model_llm_timeout,
                 "assistant_scope_key": thread.scope_key,
+                "task_scope": "",
             }
             identity = assistant_compilation_job_service.build_compilation_identity(
                 tenant_id=_tenant(db),
@@ -7031,7 +8244,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                     {
                         "role": "system",
                         "content": (
-                            "你是本体智能平台的全局 AI 助手。你必须区分事实、推测和待确认项；"
+                            "你是本体智能平台的智能业务顾问。你必须区分事实、推测和待确认项；"
                             "不直接修改数据，不绕过权限，不把 SQL 当作业务本体。回答简洁、可执行，"
                             "必要时用问题卡片澄清。\n\n"
                             + _mode_safety_context(payload.mode)
@@ -7060,6 +8273,10 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             else:
                 reply = _fallback_reply(intent, scenario)
     except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "assistant request failed",
+            extra={"assistant_intent": intent, "assistant_request_id": context.get("request_id")},
+        )
         if intent == "scenario_model":
             public_error = (
                 assistant_compilation_job_service.public_compilation_error(exc)
@@ -7075,6 +8292,10 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 "这次助手请求未完成，系统未执行任何变更；服务端已保留诊断记录，请稍后重试。",
             )
         reply = public_error.message
+        context["diagnostic"] = {
+            "code": public_error.code,
+            "type": type(exc).__name__[:120],
+        }
         error_uncertainties = [public_error.message]
         questions.append({
             "id": "retry",
@@ -7159,6 +8380,178 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         evidence=evidence,
         action_preview=action_preview,
     )
+
+
+@router.post(
+    "/proposals/continue-model-task",
+    response_model=AssistantCompilationJobStatusOut,
+)
+def continue_model_task(
+    payload: AssistantModelTaskContinuationRequest,
+    db: Session = Depends(get_tenant_db),
+):
+    """Start exactly the next user-approved stage using the original sources."""
+    thread, proposal_message, saved_proposal = _find_saved_proposal(
+        db, payload.thread_id, payload.proposal_id
+    )
+    if saved_proposal.get("kind") != "scenario_model":
+        raise HTTPException(409, "只有完整场景建模计划可以继续生成下一任务")
+    if str(thread.scenario_id or "") != str(payload.scenario_id):
+        raise HTTPException(409, "建模计划不属于当前业务场景")
+    scenario = _scenario(db, payload.scenario_id, writable=True)
+    assert scenario is not None
+    data = saved_proposal.get("payload") if isinstance(saved_proposal.get("payload"), dict) else {}
+    next_action = data.get("next_action") if isinstance(data.get("next_action"), dict) else {}
+    task_id = str(payload.task_id or "").strip()
+    if (
+        next_action.get("type") != "generate_task"
+        or str(next_action.get("task_id") or "") != task_id
+    ):
+        raise HTTPException(409, "当前计划尚未到达该任务；请先完成或保留前置任务")
+    task = next(
+        (item for item in (data.get("tasks") or []) if isinstance(item, dict) and item.get("id") == task_id),
+        None,
+    )
+    if not task or str(task.get("status") or "") != "awaiting_generation":
+        raise HTTPException(409, "该任务已经生成、处理或尚未满足前置条件")
+    try:
+        scenario_model_compiler.normalize_model_task_scope(task_id)
+    except ValueError as exc:
+        raise HTTPException(422, "建模任务范围无效") from exc
+
+    proposal_context = (
+        proposal_message.context
+        if isinstance(proposal_message.context, dict)
+        else {}
+    )
+    source_job_id = str(
+        proposal_context.get("root_compilation_job_id")
+        or proposal_context.get("source_compilation_job_id")
+        or proposal_context.get("compilation_job_id")
+        or ""
+    ).strip()
+    if not source_job_id:
+        raise HTTPException(409, "原始建模资料已不可恢复，请重新发送资料后开始新的计划")
+    try:
+        source_execution = assistant_compilation_job_service.load_owner_continuation_input(
+            db,
+            source_job_id,
+            tenant_id=_tenant(db),
+            created_by_user_id=_current_user_id(db),
+        )
+    except LookupError as exc:
+        raise HTTPException(409, "原始建模资料已不可恢复，请重新发送资料后开始新的计划") from exc
+    compiler_message = source_execution.get("compiler_message")
+    compiler_documents = source_execution.get("compiler_documents")
+    if not isinstance(compiler_message, str) or not isinstance(compiler_documents, list) or not all(
+        isinstance(item, dict) for item in compiler_documents
+    ):
+        raise HTTPException(409, "原始建模资料格式无效，请重新发送资料后开始新的计划")
+    if source_execution.get("recovery_issue"):
+        raise HTTPException(409, "原始资料尚不可完整读取，请先补充或重新上传后再继续")
+
+    prepared_context = scenario_model_compiler.prepare_compilation_context(db, scenario)
+    source_bundle, recovery_issue = _source_bundle_preview_with_recovery(
+        compiler_message=compiler_message,
+        compiler_documents=compiler_documents,
+        prepared_context=prepared_context,
+    )
+    llm = _llm(db)
+    settings = get_settings()
+    continuation_context = {
+        **copy.deepcopy(proposal_context),
+        "root_compilation_job_id": source_job_id,
+        "source_compilation_job_id": source_job_id,
+        "continuation_task_id": task_id,
+        "model_run_id": saved_proposal.get("proposal_id"),
+    }
+    execution_policy = {
+        "llm_call_budget": settings.scenario_model_max_llm_calls,
+        "request_timeout": settings.scenario_model_llm_timeout,
+        "assistant_scope_key": thread.scope_key,
+        "task_scope": task_id,
+        "continuation_proposal_id": str(saved_proposal.get("proposal_id") or ""),
+    }
+    identity_attachments = [
+        {
+            "filename": str(item.get("filename") or item.get("id") or "业务资料"),
+            "parsed_text": str(item.get("text") or ""),
+            "status": "parsed",
+        }
+        for item in compiler_documents
+    ]
+    run_revision = _safe_nonnegative_int(data.get("execution_revision"))
+    identity = assistant_compilation_job_service.build_compilation_identity(
+        tenant_id=_tenant(db),
+        user_id=_current_user_id(db),
+        scenario_id=scenario.id,
+        message=compiler_message,
+        attachments=identity_attachments,
+        llm=llm,
+        compiler_version=scenario_model_compiler.COMPILER_VERSION,
+        scenario_baseline=_scenario_revision(scenario),
+        request_id=(
+            f"continue:{saved_proposal.get('proposal_id')}:{run_revision}:{task_id}"
+        ),
+        mapping_context_fingerprint=prepared_context["fingerprint"],
+        execution_policy=execution_policy,
+    )
+    execution_input = _compilation_execution_input(
+        compiler_message=compiler_message,
+        compiler_documents=copy.deepcopy(compiler_documents),
+        prepared_context=prepared_context,
+        llm_config_id=str(getattr(llm, "id", "") or ""),
+        context=continuation_context,
+        sources=copy.deepcopy(source_execution.get("sources") or []),
+        execution_policy=execution_policy,
+        recovery_issue=recovery_issue,
+    )
+    plan = assistant_compilation_job_service.compilation_plan(
+        document_count=len(source_bundle["documents"]),
+        source_count=len(source_bundle["paragraphs"]),
+        total_characters=int(source_bundle["total_characters"]),
+    )
+    plan = [item for item in plan if item["id"] not in {"mapping", "rules"}]
+    definition = next(
+        item for item in scenario_model_compiler.model_task_definitions()
+        if item["id"] == task_id
+    )
+    for item in plan:
+        if item["id"] == "analyze":
+            item["status"] = "done"
+            item["detail"] = "已恢复原始资料及已确认的场景定义。"
+        elif item["id"] == "plan":
+            item["status"] = "done"
+            item["detail"] = f"已确认继续生成“{definition['title']}”。"
+        elif item["id"] == "ontology":
+            item["title"] = f"生成{definition['title']}"
+            item["detail"] = "正在逐段读取原始资料并结合已确认定义生成候选。"
+    job, acquired = assistant_compilation_job_service.claim_compilation(
+        db,
+        identity=identity,
+        tenant_id=_tenant(db),
+        user_id=_current_user_id(db),
+        scenario_id=scenario.id,
+        thread_id=thread.id,
+        message_id=proposal_message.id,
+        compiler_version=scenario_model_compiler.COMPILER_VERSION,
+        scenario_baseline=_scenario_revision(scenario),
+        llm_call_budget=settings.scenario_model_max_llm_calls,
+        plan=plan,
+        execution_input=execution_input,
+    )
+    continuation_context["compilation_job_id"] = job.id
+    _link_compilation_placeholder(
+        tenant_id=_tenant(db),
+        user_id=_current_user_id(db),
+        thread_id=thread.id,
+        assistant_message_id=proposal_message.id,
+        job_id=job.id,
+        context=continuation_context,
+    )
+    if acquired:
+        _submit_compilation_job(job_id=job.id)
+    return _compilation_status_out(job)
 
 
 @router.post("/proposals/apply")
@@ -7714,7 +9107,15 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             if execution_status in {"completed_with_gaps", "completed_no_changes"}
             else "in_progress"
         )
-        updated_proposal["requires_confirmation"] = bool(data.get("current_task_id"))
+        next_action_for_confirmation = (
+            data.get("next_action")
+            if isinstance(data.get("next_action"), dict)
+            else {}
+        )
+        updated_proposal["requires_confirmation"] = bool(
+            data.get("current_task_id")
+            and next_action_for_confirmation.get("type") == "confirm_task"
+        )
         updated_proposal["run_revision"] = _safe_nonnegative_int(
             data.get("execution_revision")
         )
@@ -7755,6 +9156,11 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             task_update_text += (
                 f" 下一步已停留在「{next_action.get('task_title') or '下一任务'}」"
                 "等待确认，整个计划仍保持进行中。"
+            )
+        elif next_action.get("type") == "generate_task":
+            task_update_text += (
+                f" 下一步是「{next_action.get('task_title') or '下一任务'}」；"
+                "原始资料和已确认定义已保留，等待你开始生成该任务。"
             )
         result = {
             **result,
@@ -7895,6 +9301,25 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
                     canonical_message_id=proposal_message.id,
                     model_run_id=str(updated_proposal.get("proposal_id") or ""),
                 )
+    if task_id and bool((data.get("execution_summary") or {}).get("final")):
+        final_context = (
+            proposal_message.context
+            if isinstance(proposal_message.context, dict)
+            else {}
+        )
+        source_job_id = str(
+            final_context.get("root_compilation_job_id")
+            or final_context.get("source_compilation_job_id")
+            or final_context.get("compilation_job_id")
+            or ""
+        ).strip()
+        if source_job_id:
+            assistant_compilation_job_service.discard_owner_execution_input(
+                db,
+                source_job_id,
+                tenant_id=_tenant(db),
+                created_by_user_id=_current_user_id(db),
+            )
     assert claim is not None
     claim.status = "applied"
     claim.result = result

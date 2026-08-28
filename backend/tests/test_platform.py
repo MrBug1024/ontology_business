@@ -444,6 +444,17 @@ class ObjectRuntimeTests(unittest.TestCase):
         self.assertIn("/api/scenarios/{scenario_id}/objects", paths)
         self.assertIn("/api/scenarios/{scenario_id}/objects/{object_id}", paths)
 
+    def test_relation_instance_runtime_route_exposes_read_and_write_methods(self) -> None:
+        routes = [
+            route
+            for route in app.routes
+            if route.path == "/api/scenarios/{scenario_id}/relation-instances"
+        ]
+        methods = {method for route in routes for method in route.methods}
+        self.assertEqual(methods, {"GET", "POST"})
+        self.assertEqual(sorted(routes[0].methods), ["GET"])
+        self.assertEqual(sorted(routes[1].methods), ["POST"])
+
     def test_object_runtime_contract_keeps_provenance_and_relation_count(self) -> None:
         item = ObjectSearchItemOut(
             id="object-1",

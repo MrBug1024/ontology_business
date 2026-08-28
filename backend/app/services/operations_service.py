@@ -1401,7 +1401,11 @@ def purge_expired_assistant_attachments(
 def worker_tick(*, limit: int = 8) -> int:
     """供应用生命周期后台协程调用的一次无状态轮询。"""
     from ..database import SessionLocal
-    from . import mapping_refresh_service, rag_service
+    from . import (
+        assistant_compilation_job_service,
+        mapping_refresh_service,
+        rag_service,
+    )
 
     db = SessionLocal()
     try:
@@ -1410,6 +1414,10 @@ def worker_tick(*, limit: int = 8) -> int:
         )
         expire_stale_operations(db)
         purge_expired_assistant_attachments(db, limit=max(50, limit * 25))
+        assistant_compilation_job_service.purge_expired_completed_execution_inputs(
+            db,
+            limit=max(50, limit * 25),
+        )
         rag_service.expire_stale_document_index_jobs(db)
         mapping_refresh_service.expire_stale_mapping_refresh_jobs(db)
         enqueue_due_schedules(db)

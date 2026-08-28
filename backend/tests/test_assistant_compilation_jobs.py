@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -40,7 +41,11 @@ from app.models import (
     User,
 )
 from app.routers import assistant
-from app.schemas import AssistantChatRequest
+from app.schemas import (
+    AssistantChatRequest,
+    AssistantCompilationGuidanceRequest,
+    AssistantModelTaskContinuationRequest,
+)
 from app.services import (
     assistant_compilation_job_service as job_service,
     llm_service,
@@ -209,6 +214,119 @@ class AssistantCompilationJobTests(unittest.TestCase):
                 llm_call_budget=4,
             )
 
+    def test_quiet_compilation_stream_emits_public_liveness_event(self) -> None:
+        thread_id, message_id = self._claim_fixture()
+        job, acquired = job_service.claim_compilation(
+            self.db,
+            identity=self._identity(request_id="stream-liveness"),
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+            scenario_id=self.scenario.id,
+            thread_id=thread_id,
+            message_id=message_id,
+            compiler_version=scenario_model_compiler.COMPILER_VERSION,
+            scenario_baseline="baseline-v1",
+            llm_call_budget=4,
+        )
+        self.assertTrue(acquired)
+        job.started_at = job.started_at - timedelta(seconds=65)
+        job.progress = {
+            "phase": "ontology",
+            "current_step": "ontology",
+            "calls_used": 2,
+            "call_budget": 4,
+            "draft_resource_count": 3,
+            "steps": [{
+                "id": "ontology",
+                "title": "建设本体模型",
+                "detail": "正在分析当前文档分段。",
+                "status": "running",
+            }],
+            "activities": [{
+                "id": "model-2",
+                "kind": "model",
+                "step_id": "ontology",
+                "title": "模型分析",
+                "detail": "等待当前模型调用返回。",
+                "status": "running",
+            }],
+        }
+        self.db.commit()
+
+        iterator = assistant._iter_compilation_stream_events(
+            job_id=job.id,
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+        )
+        try:
+            with (
+                patch.object(assistant, "SessionLocal", self.factory),
+                patch.object(
+                    assistant.assistant_compilation_stream_service,
+                    "wait",
+                    side_effect=lambda subscription, **_kwargs: subscription,
+                ),
+                patch.object(assistant, "_COMPILATION_STREAM_LIVENESS_SECONDS", 0.0),
+            ):
+                events = [next(iterator) for _ in range(3)]
+        finally:
+            iterator.close()
+
+        event_type, payload = next(
+            event for event in events if event[0] == "compilation_liveness"
+        )
+        self.assertEqual(event_type, "compilation_liveness")
+        self.assertEqual(payload["job_id"], job.id)
+        self.assertEqual(payload["scenario_id"], self.scenario.id)
+        self.assertEqual(payload["stream_state"], "connected")
+        self.assertEqual(payload["stage_title"], "建设本体模型")
+        self.assertGreaterEqual(payload["elapsed_seconds"], 65)
+        self.assertEqual(payload["draft_resource_count"], 3)
+        self.assertIn("当前模型调用仍在运行", payload["message"])
+        self.assertNotIn("等待当前模型调用返回。", payload["message"])
+
+    def test_provider_call_preserves_latest_draft_checkpoint_metadata(self) -> None:
+        thread_id, message_id = self._claim_fixture()
+        job, acquired = job_service.claim_compilation(
+            self.db,
+            identity=self._identity(request_id="checkpoint-survives-provider-call"),
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+            scenario_id=self.scenario.id,
+            thread_id=thread_id,
+            message_id=message_id,
+            compiler_version=scenario_model_compiler.COMPILER_VERSION,
+            scenario_baseline="baseline-v1",
+            llm_call_budget=4,
+        )
+        self.assertTrue(acquired)
+        job_service.record_draft_checkpoint(
+            self.db,
+            job.id,
+            resource_count=17,
+            resource_kinds=["entity", "property", "relation"],
+            detail="已同步首批草稿",
+            lease_token=job.lease_token,
+            lease_attempt=job.lease_attempt,
+        )
+        job_service.record_provider_call(
+            self.db,
+            job.id,
+            used=1,
+            budget=4,
+            phase="chunk_provider_call",
+            lease_token=job.lease_token,
+            lease_attempt=job.lease_attempt,
+        )
+
+        refreshed = self.db.get(AssistantCompilationJob, job.id)
+        self.assertEqual(refreshed.progress["draft_checkpoint_revision"], 1)
+        self.assertEqual(refreshed.progress["draft_resource_count"], 17)
+        self.assertEqual(
+            refreshed.progress["draft_resource_kinds"],
+            ["entity", "property", "relation"],
+        )
+
     def _succeeded_canonical_job(
         self,
     ) -> tuple[AssistantCompilationJob, AssistantThread, AssistantMessage]:
@@ -317,18 +435,11 @@ class AssistantCompilationJobTests(unittest.TestCase):
             self.db,
         )
         body = asyncio.run(self._consume(response))
-        # Compound compilation is intentionally asynchronous now. Keep the
-        # fixture deterministic by waiting on the same durable job API that a
-        # browser uses, then append the terminal event for legacy assertions.
+        # One assistant SSE now contains the durable job handle, live tool
+        # checkpoints and the terminal proposal/error. The wait only reloads
+        # the database fixture for assertions; it does not manufacture events.
         job = self._wait_for_terminal_job()
-        if job.status == "succeeded":
-            message_row = self.db.get(AssistantMessage, job.message_id)
-            body += assistant._sse("proposal", message_row.proposal)
-        else:
-            body += assistant._sse(
-                "error",
-                (job.progress or {}).get("detail") or "任务失败",
-            )
+        self.assertIn(f'"job_id": "{job.id}"', body)
         return body
 
     def _wait_for_terminal_job(self, timeout: float = 10.0) -> AssistantCompilationJob:
@@ -425,7 +536,6 @@ class AssistantCompilationJobTests(unittest.TestCase):
             and candidate.get("publishable") is False
             for candidate in payload["draft_candidates"]
         ))
-
         rows = list(self.db.scalars(
             select(ScenarioModelDraftResource).where(
                 ScenarioModelDraftResource.compilation_job_id == job.id
@@ -458,6 +568,213 @@ class AssistantCompilationJobTests(unittest.TestCase):
         ))
         if formal_counts_before is not None:
             self.assertEqual(formal_counts_before, self._formal_model_counts())
+
+    def test_staged_source_input_is_private_until_final_task_or_expiry(self) -> None:
+        thread_id, message_id = self._claim_fixture()
+        source_input = {
+            "version": 1,
+            "compiler_message": "根据附件先建设本体模型",
+            "compiler_documents": [{
+                "id": "brief",
+                "filename": "建筑业务说明.md",
+                "text": "项目以项目编号唯一标识。",
+            }],
+            "prepared_context": {},
+            "llm_config_id": self.llm.id,
+            "context": {},
+            "sources": [],
+            "execution_policy": {"task_scope": "ontology"},
+        }
+        job, acquired = job_service.claim_compilation(
+            self.db,
+            identity=self._identity(request_id="staged-source-retention"),
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+            scenario_id=self.scenario.id,
+            thread_id=thread_id,
+            message_id=message_id,
+            compiler_version=scenario_model_compiler.COMPILER_VERSION,
+            scenario_baseline="baseline-v1",
+            llm_call_budget=4,
+            execution_input=source_input,
+        )
+        self.assertTrue(acquired)
+        job_service.mark_succeeded(
+            self.db,
+            job.id,
+            result={"proposal_id": "staged-source-retention"},
+            retain_execution_input=True,
+        )
+
+        retained = job_service.load_owner_continuation_input(
+            self.db,
+            job.id,
+            tenant_id=self.tenant.id,
+            created_by_user_id=self.user.id,
+        )
+        self.assertEqual(retained["compiler_message"], source_input["compiler_message"])
+        self.assertEqual(retained["compiler_documents"], source_input["compiler_documents"])
+        self.assertTrue(job_service.discard_owner_execution_input(
+            self.db,
+            job.id,
+            tenant_id=self.tenant.id,
+            created_by_user_id=self.user.id,
+        ))
+        with self.assertRaises(LookupError):
+            job_service.load_owner_continuation_input(
+                self.db,
+                job.id,
+                tenant_id=self.tenant.id,
+                created_by_user_id=self.user.id,
+            )
+
+        expired_job, acquired = job_service.claim_compilation(
+            self.db,
+            identity=self._identity(request_id="staged-source-expiry"),
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+            scenario_id=self.scenario.id,
+            thread_id=thread_id,
+            message_id=message_id,
+            compiler_version=scenario_model_compiler.COMPILER_VERSION,
+            scenario_baseline="baseline-v1",
+            llm_call_budget=4,
+            execution_input=source_input,
+        )
+        self.assertTrue(acquired)
+        job_service.mark_succeeded(
+            self.db,
+            expired_job.id,
+            result={"proposal_id": "staged-source-expiry"},
+            retain_execution_input=True,
+        )
+        self.assertEqual(
+            job_service.purge_expired_completed_execution_inputs(
+                self.db,
+                now=(
+                    expired_job.completed_at
+                    + job_service.CONTINUATION_INPUT_RETENTION
+                    + timedelta(seconds=1)
+                ),
+            ),
+            1,
+        )
+        with self.assertRaises(LookupError):
+            job_service.load_owner_continuation_input(
+                self.db,
+                expired_job.id,
+                tenant_id=self.tenant.id,
+                created_by_user_id=self.user.id,
+            )
+
+    def test_continue_model_task_reuses_retained_source_and_scopes_next_job(self) -> None:
+        thread_id, message_id = self._claim_fixture()
+        thread = self.db.get(AssistantThread, thread_id)
+        message = self.db.get(AssistantMessage, message_id)
+        assert thread is not None and message is not None
+
+        source_input = {
+            "version": 1,
+            "compiler_message": "根据附件建设建筑项目预警模型",
+            "compiler_documents": [{
+                "id": "brief",
+                "filename": "建筑预警说明.md",
+                "text": "项目以项目编号唯一标识，并记录欠薪预警实例。",
+            }],
+            "prepared_context": {},
+            "llm_config_id": self.llm.id,
+            "context": {},
+            "sources": [],
+            "execution_policy": {"task_scope": "ontology"},
+        }
+        source_job, acquired = job_service.claim_compilation(
+            self.db,
+            identity=self._identity(request_id="continue-model-root"),
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+            scenario_id=self.scenario.id,
+            thread_id=thread.id,
+            message_id=message.id,
+            compiler_version=scenario_model_compiler.COMPILER_VERSION,
+            scenario_baseline="baseline-v1",
+            llm_call_budget=4,
+            execution_input=source_input,
+        )
+        self.assertTrue(acquired)
+
+        initial = self._compiled_payload()
+        initial["entities"] = [{"key": "entity.project", "name": "项目"}]
+        initial["changes"] = [{"change_id": "entity.project", "operation": "add"}]
+        initial["generation"] = {
+            "mode": "staged",
+            "generated_task_ids": ["ontology"],
+        }
+        proposal = assistant._build_proposal("scenario_model", initial, self.scenario)
+        proposal["payload"] = assistant._refresh_model_task_states(
+            proposal["payload"],
+            applied_task_id="ontology",
+            applied_status="applied",
+        )
+        proposal["status"] = "in_progress"
+        proposal["requires_confirmation"] = False
+        self.assertEqual(proposal["payload"]["next_action"]["type"], "generate_task")
+        self.assertEqual(proposal["payload"]["next_action"]["task_id"], "instances")
+        message.role = "assistant"
+        message.content = "本体模型已确认，等待开始实例任务。"
+        message.context = {"compilation_job_id": source_job.id}
+        message.proposal = copy.deepcopy(proposal)
+        self.db.commit()
+        job_service.mark_succeeded(
+            self.db,
+            source_job.id,
+            result=copy.deepcopy(proposal),
+            retain_execution_input=True,
+        )
+
+        with (
+            patch.object(assistant, "SessionLocal", self.factory),
+            patch.object(assistant, "_submit_compilation_job") as submit,
+        ):
+            status = assistant.continue_model_task(
+                AssistantModelTaskContinuationRequest(
+                    scenario_id=self.scenario.id,
+                    thread_id=thread.id,
+                    proposal_id=proposal["proposal_id"],
+                    task_id="instances",
+                ),
+                self.db,
+            )
+
+        self.assertEqual(status.status, "running")
+        self.db.expire_all()
+        continuation = self.db.execute(
+            select(AssistantCompilationJob)
+            .where(AssistantCompilationJob.id != source_job.id)
+            .order_by(AssistantCompilationJob.created_at.desc())
+        ).scalars().first()
+        self.assertIsNotNone(continuation)
+        assert continuation is not None
+        self.assertEqual(continuation.thread_id, thread.id)
+        self.assertEqual(continuation.message_id, message.id)
+        self.assertEqual(continuation.execution_input["execution_policy"]["task_scope"], "instances")
+        self.assertEqual(
+            continuation.execution_input["execution_policy"]["continuation_proposal_id"],
+            proposal["proposal_id"],
+        )
+        self.assertEqual(
+            self.db.get(AssistantMessage, message.id).context["root_compilation_job_id"],
+            source_job.id,
+        )
+        submit.assert_called_once_with(job_id=continuation.id)
+        self.assertEqual(
+            job_service.load_owner_continuation_input(
+                self.db,
+                source_job.id,
+                tenant_id=self.tenant.id,
+                created_by_user_id=self.user.id,
+            )["compiler_documents"],
+            source_input["compiler_documents"],
+        )
 
     def _assert_inert_compiler_payload(
         self,
@@ -862,6 +1179,127 @@ class AssistantCompilationJobTests(unittest.TestCase):
             formal_counts_before=counts_before,
         )
 
+    def test_chat_stream_carries_tool_progress_and_terminal_result_without_status_poll(self) -> None:
+        def fake_compile(*_args, call_budget=None, **_kwargs):
+            call_budget.consume("streamed_provider_call")
+            return self._compiled_payload()
+
+        with (
+            patch.object(assistant, "SessionLocal", self.factory),
+            patch.object(assistant, "_llm", return_value=self.llm),
+            patch.object(
+                assistant.scenario_model_compiler,
+                "compile_scenario_model",
+                side_effect=fake_compile,
+            ),
+        ):
+            response = assistant.stream_chat(
+                AssistantChatRequest(
+                    message="在同一条对话流中完成场景建模",
+                    request_id="single-sse-capability-stream",
+                    scenario_id=self.scenario.id,
+                    path=f"/scenarios/{self.scenario.id}",
+                    mode="draft",
+                    draft_kind="scenario_model",
+                ),
+                self.db,
+            )
+            body = asyncio.run(self._consume(response))
+
+        job_index = body.index('"type": "compilation_job"')
+        progress_index = body.index('"type": "compilation_progress"')
+        tool_index = body.index('"type": "tool_event"')
+        checkpoint_index = body.index('"type": "draft_checkpoint"')
+        result_index = body.index('"type": "compilation_result"')
+        proposal_index = body.index('"type": "proposal"')
+        done_index = body.index('"type": "done"')
+        self.assertLess(job_index, tool_index)
+        self.assertLess(tool_index, progress_index)
+        self.assertLess(progress_index, checkpoint_index)
+        self.assertLess(checkpoint_index, result_index)
+        self.assertLess(progress_index, result_index)
+        self.assertLess(result_index, proposal_index)
+        self.assertLess(proposal_index, done_index)
+        self.assertTrue(body.rstrip().endswith("data: [DONE]"))
+        self.assertNotIn("/compilation-jobs/", body)
+
+    def test_running_compilation_accepts_guidance_and_reuses_the_same_job(self) -> None:
+        first_call_started = threading.Event()
+        release_first_call = threading.Event()
+        compiler_messages: list[str] = []
+        stream_body: list[str] = []
+
+        def fake_compile(*_args, message="", call_budget=None, **_kwargs):
+            call_budget.consume("guided_provider_call")
+            compiler_messages.append(message)
+            if len(compiler_messages) == 1:
+                first_call_started.set()
+                self.assertTrue(release_first_call.wait(timeout=5))
+            return self._compiled_payload()
+
+        def consume_stream() -> None:
+            with self.factory() as request_db:
+                request_db.info["tenant_id"] = self.tenant.id
+                request_db.info["user_id"] = self.user.id
+                response = assistant.stream_chat(
+                    AssistantChatRequest(
+                        message="先建立建筑项目场景模型",
+                        request_id="guided-live-compilation",
+                        scenario_id=self.scenario.id,
+                        path=f"/scenarios/{self.scenario.id}",
+                        mode="draft",
+                        draft_kind="scenario_model",
+                    ),
+                    request_db,
+                )
+                stream_body.append(asyncio.run(self._consume(response)))
+
+        with (
+            patch.object(assistant, "SessionLocal", self.factory),
+            patch.object(assistant, "_llm", return_value=self.llm),
+            patch.object(
+                assistant.scenario_model_compiler,
+                "compile_scenario_model",
+                side_effect=fake_compile,
+            ),
+        ):
+            stream_thread = threading.Thread(target=consume_stream)
+            stream_thread.start()
+            self.assertTrue(first_call_started.wait(timeout=5))
+            with self.factory() as guidance_db:
+                guidance_db.info["tenant_id"] = self.tenant.id
+                guidance_db.info["user_id"] = self.user.id
+                job = guidance_db.scalar(select(AssistantCompilationJob))
+                self.assertIsNotNone(job)
+                response = assistant.submit_compilation_guidance(
+                    job.id,
+                    AssistantCompilationGuidanceRequest(
+                        request_id="guidance-add-contractor",
+                        message="补充施工企业对象，并建立其承建项目关系。",
+                    ),
+                    guidance_db,
+                )
+                self.assertTrue(response.accepted)
+                self.assertEqual(response.job.id, job.id)
+            release_first_call.set()
+            stream_thread.join(timeout=15)
+            self.assertFalse(stream_thread.is_alive())
+
+        self.assertEqual(len(compiler_messages), 2)
+        self.assertIn("补充施工企业对象", compiler_messages[1])
+        self.assertEqual(self.db.scalar(select(func.count()).select_from(AssistantCompilationJob)), 1)
+        body = stream_body[0]
+        self.assertIn('"type": "draft_checkpoint"', body)
+        self.assertIn("采纳补充指导", body)
+        self.db.expire_all()
+        saved_guidance = self.db.scalars(
+            select(AssistantMessage).where(
+                AssistantMessage.role == "user",
+                AssistantMessage.content.like("补充施工企业对象%"),
+            )
+        ).all()
+        self.assertEqual(len(saved_guidance), 1)
+
     def test_stream_and_sync_source_preview_errors_create_durable_inert_drafts(
         self,
     ) -> None:
@@ -1042,6 +1480,8 @@ class AssistantCompilationJobTests(unittest.TestCase):
             prepared_context,
             request_timeout,
             on_progress,
+            on_checkpoint,
+            task_scope,
         ):
             captured.update({
                 "message": message,
@@ -1050,6 +1490,8 @@ class AssistantCompilationJobTests(unittest.TestCase):
                 "prepared_context": copy.deepcopy(prepared_context),
                 "request_timeout": request_timeout,
                 "has_progress": callable(on_progress),
+                "has_checkpoint": callable(on_checkpoint),
+                "task_scope": task_scope,
             })
             call_budget.consume("recovered_provider_call")
             return self._compiled_payload()
@@ -1074,6 +1516,7 @@ class AssistantCompilationJobTests(unittest.TestCase):
         self.assertEqual(terminal.lease_token, "")
         self.assertIsNone(terminal.lease_expires_at)
         self.assertEqual(captured["message"], private_input["compiler_message"])
+        self.assertEqual(captured["task_scope"], "")
         self.assertEqual(
             captured["documents"],
             private_input["compiler_documents"],
@@ -1506,15 +1949,35 @@ class AssistantCompilationJobTests(unittest.TestCase):
                 mode="draft",
                 draft_kind="scenario_model",
             )
+            def consume_request() -> str:
+                with self.factory() as request_db:
+                    request_db.info["tenant_id"] = self.tenant.id
+                    request_db.info["user_id"] = self.user.id
+                    return asyncio.run(self._consume(
+                        assistant.stream_chat(request, request_db)
+                    ))
+
             try:
-                first_body = asyncio.run(self._consume(
-                    assistant.stream_chat(request, self.db)
-                ))
-                self.assertTrue(compile_started.wait(timeout=5))
-                second_body = asyncio.run(self._consume(
-                    assistant.stream_chat(request, self.db)
-                ))
-                self.assertIn('"replayed": true', second_body)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    first_future = pool.submit(consume_request)
+                    self.assertTrue(compile_started.wait(timeout=5))
+                    second_future = pool.submit(consume_request)
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        with self.factory() as inspect_db:
+                            linked_count = inspect_db.scalar(
+                                select(func.count()).select_from(AssistantMessage).where(
+                                    AssistantMessage.role == "assistant",
+                                )
+                            )
+                        if linked_count >= 2:
+                            break
+                        time.sleep(0.01)
+                    self.assertGreaterEqual(linked_count, 2)
+                    allow_finish.set()
+                    first_body = first_future.result(timeout=10)
+                    second_body = second_future.result(timeout=10)
+                    self.assertIn('"replayed": true', second_body)
             finally:
                 allow_finish.set()
             job = self._wait_for_terminal_job()

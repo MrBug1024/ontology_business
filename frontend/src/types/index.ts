@@ -177,6 +177,19 @@ export interface ObjectSearchResult {
   offset: number
   query: string
   entity_id?: string
+  has_more?: boolean
+  next_offset?: number | null
+  total_is_exact?: boolean
+}
+
+export interface RelationInstanceSearchResult {
+  items: RelationInstance[]
+  total: number
+  limit: number
+  offset: number
+  has_more?: boolean
+  next_offset?: number | null
+  total_is_exact?: boolean
 }
 
 export interface ObjectDetail extends ObjectSearchItem {
@@ -531,6 +544,9 @@ export interface ScenarioDetail extends Scenario {
   data_sources: DataSource[]
   instances: OntologyInstance[]
   relation_instances: RelationInstance[]
+  runtime_instance_count?: number
+  runtime_relation_count?: number
+  runtime_facts_truncated?: boolean
   mappings: DataMapping[]
   relation_mappings: RelationDataMapping[]
   functions: FunctionDefinition[]
@@ -1070,6 +1086,43 @@ export interface AssistantCompilationStageResult {
   summary: string
 }
 
+export interface AssistantCompilationActivity {
+  id: string
+  kind: 'stage' | 'model' | 'tool' | string
+  step_id?: string
+  title: string
+  detail: string
+  status: 'pending' | 'running' | 'done' | 'error' | string
+  created_at?: string
+}
+
+export interface AssistantCompilationGuidance {
+  id: string
+  summary: string
+  attachment_names: string[]
+  status: 'queued' | 'applied'
+  created_at?: string
+}
+
+export interface AssistantCompilationLiveness {
+  job_id: string
+  thread_id?: string | null
+  scenario_id?: string | null
+  status: 'running'
+  stream_state: 'connected' | 'disconnected'
+  emitted_at: string
+  elapsed_seconds: number
+  phase?: string
+  current_step?: string
+  stage_title: string
+  message: string
+  calls_used: number
+  call_budget: number
+  draft_checkpoint_revision: number
+  draft_resource_count: number
+  guidance_pending_count: number
+}
+
 /** Public, owner-scoped state for recovering a long-running scenario compilation. */
 export interface AssistantCompilationJobStatus {
   id: string
@@ -1085,6 +1138,13 @@ export interface AssistantCompilationJobStatus {
     current_step?: string
     steps?: AssistantCompilationStep[]
     results?: AssistantCompilationStageResult[]
+    activities?: AssistantCompilationActivity[]
+    guidance?: AssistantCompilationGuidance[]
+    guidance_pending_count?: number
+    accepting_guidance?: boolean
+    draft_checkpoint_revision?: number
+    draft_resource_count?: number
+    draft_resource_kinds?: string[]
   }
   llm_calls_used: number
   llm_call_budget: number
@@ -1094,6 +1154,13 @@ export interface AssistantCompilationJobStatus {
   started_at: string
   completed_at?: string | null
   updated_at: string
+}
+
+export interface AssistantCompilationGuidanceResult {
+  accepted: boolean
+  guidance_id: string
+  job: AssistantCompilationJobStatus
+  message?: AssistantMessage | null
 }
 
 /** Server-owned proposal locator returned only after a compilation succeeds. */
@@ -1239,7 +1306,8 @@ export interface AssistantModelTask {
   description: string
   sections: string[]
   depends_on: string[]
-  status: 'empty' | 'ready' | 'blocked' | 'waiting' | 'applied' | 'partially_applied' | 'deferred' | 'drafted_with_gaps' | 'skipped' | string
+  status: 'empty' | 'ready' | 'blocked' | 'waiting' | 'awaiting_generation' | 'applied' | 'partially_applied' | 'deferred' | 'drafted_with_gaps' | 'skipped' | string
+  generation_status?: 'generated' | 'pending' | string
   waiting_for?: string[]
   change_keys: string[]
   safe_change_keys: string[]
@@ -1281,7 +1349,7 @@ export interface AssistantModelTaskApplyResult {
 
 export interface AssistantModelExecutionSummary {
   final: boolean
-  status: 'running' | 'waiting_for_confirmation' | 'completed' | 'completed_no_changes' | 'completed_with_gaps' | 'state_error' | string
+  status: 'running' | 'waiting_for_confirmation' | 'waiting_for_generation' | 'completed' | 'completed_no_changes' | 'completed_with_gaps' | 'state_error' | string
   message: string
   total_task_count: number
   completed_task_count: number
@@ -1308,13 +1376,14 @@ export interface AssistantModelExecutionSummary {
 }
 
 export interface AssistantModelNextAction {
-  type: 'confirm_task' | 'refine_model' | 'rebuild_plan' | string
+  type: 'confirm_task' | 'generate_task' | 'refine_model' | 'rebuild_plan' | string
   task_id?: string
   task_title?: string
   requires_confirmation?: boolean
   can_apply?: boolean
   can_apply_partial?: boolean
   can_defer?: boolean
+  can_generate?: boolean
   message?: string
 }
 

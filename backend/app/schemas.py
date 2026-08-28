@@ -268,6 +268,22 @@ class ObjectSearchOut(BaseModel):
     offset: int = 0
     query: str = ""
     entity_id: str | None = None
+    # Runtime object search is deliberately bounded per request.  ``total``
+    # may be an estimate when ACL filtering is applied to a large candidate
+    # window, while ``has_more`` keeps the client moving through the dataset.
+    has_more: bool = False
+    next_offset: int | None = None
+    total_is_exact: bool = True
+
+
+class RelationInstancePageOut(BaseModel):
+    items: list[RelationInstanceOut] = []
+    total: int = 0
+    limit: int = 100
+    offset: int = 0
+    has_more: bool = False
+    next_offset: int | None = None
+    total_is_exact: bool = True
 
 
 class ObjectDetailOut(ObjectSearchItemOut):
@@ -499,6 +515,9 @@ class ScenarioDetail(ScenarioOut):
     data_sources: list["DataSourceOut"] = []
     instances: list[InstanceOut] = []
     relation_instances: list[RelationInstanceOut] = []
+    runtime_instance_count: int = 0
+    runtime_relation_count: int = 0
+    runtime_facts_truncated: bool = False
     mappings: list[DataMappingOut] = []
     relation_mappings: list[RelationDataMappingOut] = []
     functions: list[FunctionDefinitionOut] = []
@@ -1418,6 +1437,23 @@ class AssistantProposalApplyRequest(BaseModel):
     payload: dict = Field(default_factory=dict)
 
 
+class AssistantModelTaskContinuationRequest(BaseModel):
+    """Explicit user action to generate the next declared model task."""
+
+    scenario_id: str = Field(min_length=1, max_length=64)
+    thread_id: str = Field(min_length=1, max_length=64)
+    proposal_id: str = Field(min_length=1, max_length=64)
+    task_id: str = Field(min_length=1, max_length=100)
+
+
+class AssistantCompilationGuidanceRequest(BaseModel):
+    """A user correction queued into an already running compilation."""
+
+    request_id: str = Field(min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=12000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=20)
+
+
 class AssistantQuestionOptionOut(BaseModel):
     label: str
     value: str
@@ -1466,6 +1502,13 @@ class AssistantCompilationJobStatusOut(BaseModel):
     started_at: datetime
     completed_at: datetime | None = None
     updated_at: datetime
+
+
+class AssistantCompilationGuidanceOut(BaseModel):
+    accepted: bool
+    guidance_id: str
+    job: AssistantCompilationJobStatusOut
+    message: AssistantMessageOut | None = None
 
 
 class AssistantCompilationJobResultOut(BaseModel):

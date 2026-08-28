@@ -203,6 +203,61 @@ class ScenarioModelDraftContinuationTests(unittest.TestCase):
             )
         return "".join(chunks)
 
+    def test_user_edited_live_checkpoint_becomes_normal_working_context(self) -> None:
+        started_at = datetime.now(timezone.utc)
+        proposal = self._proposal(
+            "live-job-user-edit",
+            [("entity.checkpoint", "Checkpoint")],
+        )
+        proposal["payload"]["live_checkpoint"] = True
+        scenario_model_draft_service.materialize_draft_resources(
+            self.db,
+            self.scenario,
+            proposal,
+            source_thread_id="thread-live-checkpoint",
+            source_message_id="message-live-checkpoint",
+            compilation_job_id="job-live-checkpoint",
+            created_by_user_id=self.user.id,
+            lineage_started_at=started_at,
+            replace_live_checkpoints=True,
+        )
+        self.db.commit()
+        row = self._row(proposal["proposal_id"], "entity.checkpoint")
+        self._update(
+            row,
+            expected_revision=0,
+            payload={**row.payload, "name": "User checkpoint edit"},
+        )
+        self.db.commit()
+
+        final_proposal = copy.deepcopy(proposal)
+        final_proposal["payload"].pop("live_checkpoint", None)
+        final_proposal["payload"]["draft_candidates"][0]["payload"]["name"] = (
+            "Model final value"
+        )
+        scenario_model_draft_service.materialize_draft_resources(
+            self.db,
+            self.scenario,
+            final_proposal,
+            source_thread_id="thread-live-checkpoint",
+            source_message_id="message-live-checkpoint",
+            compilation_job_id="job-live-checkpoint",
+            created_by_user_id=self.user.id,
+            lineage_started_at=started_at,
+            replace_live_checkpoints=True,
+        )
+        self.db.commit()
+        self.db.expire_all()
+
+        row = self._row(proposal["proposal_id"], "entity.checkpoint")
+        self.assertEqual(row.payload["name"], "User checkpoint edit")
+        self.assertEqual(row.materialization_source, "user_checkpoint_edit")
+        active = scenario_model_draft_service.active_working_draft_context(
+            self.db,
+            self.scenario,
+        )
+        self.assertEqual([item["draft_id"] for item in active], [row.id])
+
     def _wait_for_terminal_job(
         self,
         *,
@@ -362,6 +417,42 @@ class ScenarioModelDraftContinuationTests(unittest.TestCase):
         )
         self.assertEqual(empty_context["working_drafts"], [])
         self.assertEqual(empty_context["consumed_draft_revisions"], {})
+
+    def test_active_context_keeps_fresh_complete_drafts_when_budget_is_exceeded(self) -> None:
+        started_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        proposal = self._proposal(
+            "proposal-bounded-working-context",
+            [
+                ("entity.old-one", "Old one"),
+                ("entity.old-two", "Old two"),
+                ("entity.fresh", "Fresh"),
+            ],
+        )
+        self._materialize(proposal, started_at=started_at)
+        fresh = self._row(proposal["proposal_id"], "entity.fresh")
+        self._update(
+            fresh,
+            expected_revision=0,
+            payload={
+                **fresh.payload,
+                "description": "fresh user-authored definition " + ("x" * 700),
+            },
+        )
+        self.db.commit()
+
+        with patch.object(
+            scenario_model_draft_service,
+            "MAX_WORKING_DRAFT_CONTEXT_CHARS",
+            2_000,
+        ):
+            active = scenario_model_draft_service.active_working_draft_context(
+                self.db,
+                self.scenario,
+            )
+
+        self.assertLess(len(active), 3)
+        self.assertIn("entity.fresh", {item["resource_key"] for item in active})
+        self.assertTrue(all(item.get("snapshot_sha256") for item in active))
 
     def test_successor_consumes_exact_revision_but_preserves_concurrent_patch(self) -> None:
         first_started = datetime.now(timezone.utc) - timedelta(minutes=2)

@@ -15,7 +15,6 @@ import {
 } from '../src/utils/scenarioModelDrafts.ts'
 import {
   clearCompilationJobBookmark,
-  compilationPollDelay,
   readCompilationJobBookmark,
   readPendingCompilationJobBookmark,
   saveCompilationJobBookmark,
@@ -110,13 +109,14 @@ test('global assistant shows safe references and keeps capability changes govern
     'utf8',
   )
   assert.match(source, /reference\.display_name/)
-  assert.match(source, /仅本条聚焦新增业务能力/)
-  assert.match(source, /修改正式定义仍走专用编辑流程/)
-  assert.match(source, /新增业务能力/)
+  assert.match(source, /智能业务顾问/)
+  assert.match(source, /自动判断下一步/)
+  assert.doesNotMatch(source, /assistant-task-preset|本条消息/)
+  assert.match(source, /拆解任务并受控建设模型/)
   assert.doesNotMatch(source, /return '场景已有定义'/)
 })
 
-test('global assistant task scope applies to one send and never sticks to a page', () => {
+test('global assistant delegates task routing to the semantic planner', () => {
   const source = readFileSync(
     new URL('../src/components/GlobalAssistant.vue', import.meta.url),
     'utf8',
@@ -127,20 +127,12 @@ test('global assistant task scope applies to one send and never sticks to a page
   assert.notEqual(sendEnd, -1)
   const sendSource = source.slice(sendStart, sendEnd)
 
-  const capture = sendSource.indexOf('const submittedPreset = taskPreset.value')
-  const route = sendSource.indexOf('requestRouteForPreset(submittedPreset)')
-  const reset = sendSource.indexOf("taskPreset.value = 'smart'", route)
-  const request = sendSource.indexOf('streamAssistantChat(', reset)
-  assert.ok(capture >= 0 && capture < route)
-  assert.ok(route < reset && reset < request)
-  assert.match(sendSource, /mode: requestRoute\.mode/)
-  assert.match(sendSource, /draft_kind: requestRoute\.draft_kind/)
+  assert.doesNotMatch(sendSource, /submittedPreset|requestRouteForPreset|taskPreset/)
+  assert.match(sendSource, /mode: 'ask'/)
+  assert.match(sendSource, /draft_kind: 'auto'/)
+  assert.match(sendSource, /LangGraph\/LLM semantic planner/)
 
-  const scenarioWatchStart = source.indexOf('watch(() => context.value.scenario_id')
-  const scenarioWatchEnd = source.indexOf('\nwatch(showLauncher', scenarioWatchStart)
-  const scenarioWatch = source.slice(scenarioWatchStart, scenarioWatchEnd)
-  assert.match(scenarioWatch, /taskPreset\.value = 'smart'/)
-  assert.doesNotMatch(scenarioWatch, /scenario_model|mode\.value|draftKind\.value/)
+  assert.doesNotMatch(source, /watch\(\(\) => context\.value\.scenario_id/)
 })
 
 test('scenario modelling stays as a durable sequential plan until final summary', () => {
@@ -148,8 +140,10 @@ test('scenario modelling stays as a durable sequential plan until final summary'
     new URL('../src/components/GlobalAssistant.vue', import.meta.url),
     'utf8',
   )
-  assert.match(source, /持续执行计划/)
-  assert.match(source, /草稿生成阶段结束不代表计划结束/)
+  assert.match(source, /场景建模计划/)
+  assert.match(source, /按依赖顺序执行；需要写入时会明确向你确认/)
+  assert.match(source, /modelPlanSummary/)
+  assert.match(source, /applyCurrentModelTask/)
   assert.match(source, /当前持续任务停在确认点/)
   assert.match(source, /直接在下方说明修正、新增或删除要求/)
   assert.match(source, /保留草稿并继续/)
@@ -163,6 +157,84 @@ test('scenario modelling stays as a durable sequential plan until final summary'
   assert.match(source, /completed_with_gaps/)
   assert.doesNotMatch(source, /if \(modelRunAwaitingConfirmation\.value\) \{\s*ElMessage\.info/)
   assert.doesNotMatch(source, /先跳过，保留问题/)
+})
+
+test('global assistant keeps work records in the conversation instead of stacking status cards', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  assert.match(source, /class="assistant-worklog"/)
+  assert.match(source, /aria-label="助手工作过程"/)
+  assert.match(source, /function shouldShowWorkLog/)
+  assert.match(source, /function workTranscriptEntries/)
+  assert.match(source, /function compilationNarrative/)
+  assert.match(source, /class="worklog-live-feed"/)
+  assert.match(source, /aria-label="实时工作播报"/)
+  assert.match(source, /function recordCompilationLiveness/)
+  assert.match(source, /\.slice\(-4\)/)
+  assert.match(source, /本阶段已发起 1 次受控模型调用/)
+  assert.match(source, /仅展示可验证、可回看的工作信息，不包含模型的隐藏推理/)
+  assert.doesNotMatch(source, /class="worklog-toggle"/)
+  assert.match(source, /'is-model-result': proposalOf\(message\)\?\.kind === 'scenario_model'/)
+  assert.match(source, /modelTasks\(proposalOf\(message\)\)\.length && Boolean\(expandedProposal\[index\]\)/)
+  assert.doesNotMatch(source, /class="compilation-plan-card"/)
+  assert.doesNotMatch(source, /class="thinking-summary"/)
+  assert.doesNotMatch(source, /class="assistant-trace"/)
+})
+
+test('scenario modelling uses one assistant event stream instead of browser status polling', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const apiSource = readFileSync(
+    new URL('../src/api/index.ts', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(apiSource, /function streamAssistantEvents/)
+  assert.match(apiSource, /export function streamAssistantCompilationJob/)
+  assert.match(source, /case 'compilation_progress'/)
+  assert.match(source, /case 'compilation_result'/)
+  assert.match(source, /case 'compilation_liveness'/)
+  assert.match(source, /case 'tool_event'/)
+  assert.match(source, /attachCompilationEventStream/)
+  assert.doesNotMatch(source, /scheduleCompilationPoll|pollCompilationJob|compilationPollTimer/)
+  assert.doesNotMatch(source, /window\.setTimeout|window\.setInterval/)
+})
+
+test('live modelling projects draft checkpoints and accepts guidance while minimized', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const apiSource = readFileSync(
+    new URL('../src/api/index.ts', import.meta.url),
+    'utf8',
+  )
+  const scenarioSource = readFileSync(
+    new URL('../src/views/ScenarioDetail.vue', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(apiSource, /submitAssistantCompilationGuidance/)
+  assert.match(apiSource, /\/compilation-jobs\/\$\{jobId\}\/guidance/)
+  assert.match(source, /case 'draft_checkpoint'/)
+  assert.match(source, /function projectDraftCheckpoint/)
+  assert.match(source, /assistant-scenario-drafts-updated/)
+  assert.match(scenarioSource, /onAssistantScenarioDraftsUpdated[\s\S]*?loadScenarioDrafts/)
+  assert.match(source, /v-if="showLauncher && !visible"/)
+  assert.match(source, /'is-working': advisorWorking/)
+  assert.match(source, /launcherStatus/)
+  assert.match(source, /async function openAssistant\(\)[\s\S]*?if \(!threadId\.value\)[\s\S]*?await loadContext\(\)[\s\S]*?onCompilationVisibilityChange\(\)/)
+  assert.match(source, /async function submitCompilationGuidance/)
+  assert.match(source, /if \(content && compilationRunning\.value\)/)
+  assert.match(source, /补充、纠正或删除要求/)
+  assert.doesNotMatch(
+    source,
+    /:disabled="!canSend[^\n]*\|\| compilationBusy/,
+  )
 })
 
 test('scenario model write success requires a persisted mutation ledger', () => {
@@ -373,7 +445,7 @@ test('scenario model recovery remains bound to its durable scope and monotonic r
   )
   const discovery = source.slice(
     source.indexOf('async function discoverCompilationForThread'),
-    source.indexOf('async function beginCompilationRecoveryFromEvent'),
+    source.indexOf('function beginCompilationRecoveryFromEvent'),
   )
   const succeeded = source.slice(
     source.indexOf('async function recoverSucceededCompilation'),
@@ -385,7 +457,8 @@ test('scenario model recovery remains bound to its durable scope and monotonic r
   assert.match(taskRecovery, /const recoveryContext = apiContext\(\)/)
   assert.match(taskRecovery, /if \(!isCurrent\(\)\) return[\s\S]*?await api\.listAssistantMessages[\s\S]*?if \(!isCurrent\(\)\) return/)
   assert.match(source, /Math\.max\(localRevision, responseRevision\)/)
-  assert.match(discovery, /selectCompilationJobForRecovery\(jobs, scope\.scenarioId, knownJobId\)/)
+  assert.match(discovery, /attachCompilationEventStream\(job, scope\)/)
+  assert.doesNotMatch(discovery, /listAssistantCompilationJobs|getAssistantCompilationJob/)
   assert.match(succeeded, /compilationPathFromScopeKey\(result\.proposal_scope_key, scope\.scenarioId\)/)
   assert.match(succeeded, /if \(canonicalPath !== currentPath\)/)
 })
@@ -488,7 +561,9 @@ test('scenario page projects durable model resources into normal canvases and ta
   assert.doesNotMatch(graphCanvas, /AI 已写入|draftStatus|e\.draft/)
   assert.doesNotMatch(graphCanvas, /:stroke-dasharray="n\.meta\?\.aiDraft|e\.dashed \|\| e\.draft/)
   assert.match(source, /对象类型 <b>\{\{ detail\.entities\.length \+ scenarioDraftsOf\('entity'\)\.length \}\}<\/b>/)
-  assert.match(source, /对象实例 <b>\{\{ detail\.instances\.length \+ scenarioDraftsOf\('instance'\)\.length \}\}<\/b>/)
+  assert.match(source, /runtime_instance_count \|\| objectTotal \+ scenarioDraftsOf\('instance'\)\.length/)
+  assert.match(source, /api\.searchObjects/)
+  assert.match(source, /api\.listRelationInstances/)
   for (const rowsName of ['objectMappingRows', 'relationMappingRows', 'functionRows', 'actionRows', 'ruleRows', 'eventRows', 'workflowRows']) {
     assert.match(source, new RegExp(`<b>\\{\\{ ${rowsName}\\.length \\}\\}</b>`))
   }
@@ -820,8 +895,6 @@ test('compilation recovery selects a bookmarked terminal job or a live job only 
   assert.equal(selectCompilationJobForRecovery(jobs, 'scenario-a', 'finished')?.id, 'finished')
   assert.equal(selectCompilationJobForRecovery(jobs, 'scenario-b')?.id, 'other-running')
   assert.equal(selectCompilationJobForRecovery(jobs, 'scenario-c'), null)
-  assert.ok(compilationPollDelay(true) > compilationPollDelay(false))
-  assert.ok(compilationPollDelay(false, 2) > compilationPollDelay(false, 0))
 })
 
 test('scenario compiler issues collapse repeated root causes to one representative with accurate counts', () => {

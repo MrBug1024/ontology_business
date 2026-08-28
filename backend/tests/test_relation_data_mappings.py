@@ -689,6 +689,66 @@ def test_title_name_is_server_synchronized_for_manual_create_and_search(tmp_path
         _close_world(world)
 
 
+def test_object_search_keeps_large_runtime_data_bounded_and_pageable(tmp_path) -> None:
+    world = _world(tmp_path, mode=None)
+    try:
+        world.db.add_all([
+            OntologyInstance(
+                id=f"large-runtime-{index:04d}",
+                scenario_id=world.scenario.id,
+                entity_id=world.source_entity.id,
+                name=f"项目对象 {index:04d}",
+                attributes={"编码": f"P-{index:04d}", "标题": index},
+                source="manual",
+            )
+            for index in range(260)
+        ])
+        world.db.commit()
+        definition = SimpleNamespace(
+            scenario=world.scenario,
+            entities={world.source_entity.id: object()},
+            mappings={},
+        )
+        allow = SimpleNamespace(allowed=True)
+        with (
+            patch.object(scenarios, "_scenario_for_request", return_value=world.scenario),
+            patch.object(scenarios, "_runtime_definition_for_scenario", return_value=definition),
+            patch.object(scenarios.permission_service, "check_object", return_value=allow),
+            patch.object(
+                scenarios.permission_service,
+                "filter_instance_attributes",
+                side_effect=lambda _db, item: item.attributes,
+            ),
+        ):
+            first = scenarios.search_objects(
+                world.scenario.id,
+                q="",
+                entity_id=None,
+                limit=50,
+                offset=0,
+                db=world.db,
+            )
+            second = scenarios.search_objects(
+                world.scenario.id,
+                q="",
+                entity_id=None,
+                limit=50,
+                offset=int(first.next_offset or 0),
+                db=world.db,
+            )
+
+        assert len(first.items) == 50
+        assert first.has_more is True
+        assert first.total_is_exact is False
+        assert first.next_offset == 50
+        assert len(second.items) == 50
+        assert {item.id for item in first.items}.isdisjoint(
+            {item.id for item in second.items}
+        )
+    finally:
+        _close_world(world)
+
+
 def test_manual_relation_unique_race_returns_stable_409(tmp_path) -> None:
     world = _world(tmp_path, mode=None)
     try:

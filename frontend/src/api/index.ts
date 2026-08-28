@@ -10,6 +10,7 @@ import type {
   AssistantAttachment,
   AssistantCompilationJobResult,
   AssistantCompilationJobStatus,
+  AssistantCompilationGuidanceResult,
   AssistantMessage,
   AssistantProposalApplyResult,
   AssistantThread,
@@ -37,6 +38,7 @@ import type {
   MCPTool,
   OntologyInstance,
   RelationInstance,
+  RelationInstanceSearchResult,
   RelationDataMapping,
   RelationDataMappingInput,
   RelationDataMappingPreview,
@@ -138,6 +140,10 @@ export const api = {
     http.get<AssistantCompilationJobStatus>(`/assistant/compilation-jobs/${jobId}`),
   getAssistantCompilationJobResult: (jobId: string) =>
     http.get<AssistantCompilationJobResult>(`/assistant/compilation-jobs/${jobId}/result`),
+  submitAssistantCompilationGuidance: (jobId: string, d: { request_id: string; message: string; attachment_ids: string[] }) =>
+    http.post<AssistantCompilationGuidanceResult>(`/assistant/compilation-jobs/${jobId}/guidance`, d),
+  continueAssistantModelTask: (d: { scenario_id: string; thread_id: string; proposal_id: string; task_id: string }) =>
+    http.post<AssistantCompilationJobStatus>('/assistant/proposals/continue-model-task', d),
   applyAssistantProposal: (d: { kind: 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'; scenario_id?: string; thread_id: string; proposal_id: string; confirm: boolean; allow_partial?: boolean; task_id?: string; task_action?: 'apply' | 'defer' | 'skip' }) =>
     http.post<AssistantProposalApplyResult>('/assistant/proposals/apply', d),
 
@@ -174,6 +180,8 @@ export const api = {
   createRelationInstance: (sid: string, d: Partial<RelationInstance>) =>
     http.post(`/scenarios/${sid}/relation-instances`, d),
   deleteRelationInstance: (rid: string) => http.delete(`/scenarios/relation-instances/${rid}`),
+  listRelationInstances: (sid: string, params: { limit?: number; offset?: number } = {}) =>
+    http.get<RelationInstanceSearchResult>(`/scenarios/${sid}/relation-instances`, { params }),
 
   // 对象运行时
   searchObjects: (sid: string, params: { q?: string; entity_id?: string; limit?: number; offset?: number } = {}) =>
@@ -460,23 +468,9 @@ export function streamChat(
   return ctrl
 }
 
-// 全局助手 SSE：token 流 + 安全处理摘要 + 草稿元数据
-export function streamAssistantChat(
-  payload: {
-    message: string
-    request_id?: string
-    thread_id?: string
-    scenario_id?: string
-    page?: string
-    path?: string
-    selection?: Record<string, any>
-    attachment_ids?: string[]
-    llm_config_id?: string
-    skill_ids?: string[]
-    mcp_ids?: string[]
-    mode?: 'ask' | 'explain' | 'draft' | 'apply' | 'execute'
-    draft_kind?: 'auto' | 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'
-  },
+function streamAssistantEvents(
+  url: string,
+  init: RequestInit,
   onEvent: (ev: { type: string; data: any }) => void,
   onDone: () => void,
   onError: (e: Error) => void,
@@ -488,12 +482,11 @@ export function streamAssistantChat(
     finished = true
     onDone()
   }
-  fetch('/api/assistant/chat/stream', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+  fetch(url, {
+    ...init,
+    headers: { Accept: 'text/event-stream', ...(init.headers || {}) },
     credentials: 'include',
     cache: 'no-store',
-    body: JSON.stringify(payload),
     signal: ctrl.signal,
   })
     .then(async (res) => {
@@ -528,4 +521,54 @@ export function streamAssistantChat(
       if (error.name !== 'AbortError') onError(error)
     })
   return ctrl
+}
+
+// 全局顾问的统一事件流：普通 token 与内部能力事件使用同一协议。
+export function streamAssistantChat(
+  payload: {
+    message: string
+    request_id?: string
+    thread_id?: string
+    scenario_id?: string
+    page?: string
+    path?: string
+    selection?: Record<string, any>
+    attachment_ids?: string[]
+    llm_config_id?: string
+    skill_ids?: string[]
+    mcp_ids?: string[]
+    mode?: 'ask' | 'explain' | 'draft' | 'apply' | 'execute'
+    draft_kind?: 'auto' | 'scenario' | 'ontology' | 'mapping' | 'workflow' | 'scenario_model'
+  },
+  onEvent: (ev: { type: string; data: any }) => void,
+  onDone: () => void,
+  onError: (e: Error) => void,
+) {
+  return streamAssistantEvents(
+    '/api/assistant/chat/stream',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    onEvent,
+    onDone,
+    onError,
+  )
+}
+
+/** Reattach one durable capability run; this is a single SSE subscription, not polling. */
+export function streamAssistantCompilationJob(
+  jobId: string,
+  onEvent: (ev: { type: string; data: any }) => void,
+  onDone: () => void,
+  onError: (e: Error) => void,
+) {
+  return streamAssistantEvents(
+    `/api/assistant/compilation-jobs/${encodeURIComponent(jobId)}/stream`,
+    { method: 'GET' },
+    onEvent,
+    onDone,
+    onError,
+  )
 }
