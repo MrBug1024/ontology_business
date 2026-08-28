@@ -24,6 +24,25 @@ from app.services import agent_mcp_service, permission_service
 from app.services.auth_service import get_tenant_db
 
 
+def test_runtime_grant_migration_is_chained_after_agent_mcp_tables() -> None:
+    from importlib import import_module
+
+    migration = import_module(
+        "migrations.versions.20260828_06_grant_agent_mcp_runtime_access"
+    )
+    assert migration.down_revision == "20260828_05"
+    assert migration.AGENT_MCP_TABLES == (
+        "agent_mcp_services",
+        "agent_mcp_invocations",
+    )
+    statement = str(migration._runtime_role_statement("GRANT"))
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE" in statement
+    assert "TO ontology_app" in statement
+    downgrade_statement = str(migration._runtime_role_statement("REVOKE"))
+    assert "REVOKE SELECT, INSERT, UPDATE, DELETE" in downgrade_statement
+    assert "FROM ontology_app" in downgrade_statement
+
+
 class AgentMCPPublicationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = create_engine(
