@@ -2904,13 +2904,8 @@ def _chunk_checkpoint_payload(
 
 
 def _chunk_parallel_worker_count(db: Session, chunk_count: int) -> int:
-    """Return a bounded worker count for databases with isolated connections."""
+    """Return a bounded worker count for PostgreSQL connections."""
     if chunk_count <= 1:
-        return 1
-    dialect = str(getattr(getattr(db.get_bind(), "dialect", None), "name", ""))
-    # The unit-test StaticPool deliberately shares one SQLite connection.  It
-    # cannot model production connection isolation, so keep that path serial.
-    if dialect == "sqlite":
         return 1
     configured = int(
         getattr(get_settings(), "scenario_model_max_parallel_chunks", 1) or 1
@@ -8760,10 +8755,8 @@ def apply_scenario_model(
         return _apply_scenario_model_mutations(db, scenario, payload)
     except Exception:
         # The compiler is an all-or-nothing application boundary.  A nested
-        # SAVEPOINT is insufficient on SQLite when it is the first write in a
-        # deferred transaction (releasing it can make changes durable).  A
-        # full caller-transaction rollback is the only backend-neutral zero-
-        # write guarantee after a late formal relation-mapping preflight fails.
+        # A full caller-transaction rollback is the zero-write guarantee after
+        # a late formal relation-mapping preflight fails.
         db.rollback()
         raise
 

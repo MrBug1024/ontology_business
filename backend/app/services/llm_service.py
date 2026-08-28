@@ -323,7 +323,7 @@ def _persist_trace(payload: TracePayload, *, db: Session | None = None) -> None:
         finally:
             trace_db.close()
     except Exception:  # noqa: BLE001
-        # worker 内部可能正持有 SQLite 写锁；同一事务的最终 commit 仍可保存 trace。
+        # worker 内部可能正持有事务；同一事务的最终 commit 仍可保存 trace。
         if db is not None:
             try:
                 db.add(_trace_model(payload))

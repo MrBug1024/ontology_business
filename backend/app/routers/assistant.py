@@ -1066,7 +1066,7 @@ def _find_saved_proposal(db: Session, thread_id: str, proposal_id: str) -> tuple
                         else {}
                     )
             # Applying owns its write only after the unique claim below.
-            # Avoid taking a SQLite write lock for staging before another
+            # Avoid taking a database write lock for staging before another
             # committed claimant can be replayed.
             proposal, upgraded = _upgrade_saved_scenario_model_plan(
                 db,
@@ -4146,7 +4146,7 @@ def _finalize_compilation_success(
         assert authorized_scenario is not None
         # Serialize with governed scenario writers where the database supports
         # row locks, then reload every definition collection used by the
-        # baseline.  SQLite safely treats FOR UPDATE as a no-op; the later
+        # baseline.  The later
         # proposal base_snapshot still protects confirmation on every backend.
         scenario = finish_db.execute(
             select(BusinessScenario)
@@ -7984,7 +7984,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         )
         db.flush()
     # Match the streamed transport: persist the user's accepted send before
-    # any downstream generation model runs, so SQLite does not hold a write
+    # any downstream generation model runs, so the database does not hold a write
     # transaction while waiting on the provider.
     db.commit()
     suggestions = (
@@ -8673,8 +8673,8 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             raise HTTPException(409, "该变更草稿正在应用，请稍后重试")
 
         if scenario is not None:
-            # PostgreSQL/MySQL serialize definition writes on the scenario row.
-            # SQLite ignores FOR UPDATE, but the preceding unique claim INSERT
+            # PostgreSQL serializes definition writes on the scenario row.
+            # The preceding unique claim INSERT
             # already holds its single-writer lock until this transaction ends.
             locked = db.execute(
                 select(BusinessScenario)

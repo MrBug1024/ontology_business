@@ -3,10 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import shutil
-import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
@@ -15,7 +12,7 @@ from sqlalchemy import MetaData, Table, create_engine, func, inspect, select, te
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import Session
 
-from ..config import BUCKETS_DIR, get_settings
+from ..config import get_settings
 from ..models import AssistantAttachment, BucketFile, DataSource
 from . import cache_service, dataset_query_service, object_storage_service
 from .policies import validate_read_only_sql
@@ -35,30 +32,16 @@ def _schema_cache_key(ds: DataSource) -> str:
 
 def _db_url(ds: DataSource) -> URL:
     cfg = ds.config or {}
-    if ds.type == "mysql":
-        return URL.create(
-            "mysql+pymysql",
-            username=str(cfg.get("user") or "root"),
-            password=str(cfg.get("password") or ""),
-            host=str(cfg.get("host") or "127.0.0.1"),
-            port=int(cfg.get("port") or 3306),
-            database=str(cfg.get("database") or ""),
-            query={"charset": str(cfg.get("charset") or "utf8mb4")},
-        )
     if ds.type == "postgres":
         return URL.create(
             "postgresql+psycopg",
-            username=str(cfg.get("user") or "postgres"),
+            username=str(cfg.get("user") or cfg.get("username") or "postgres"),
             password=str(cfg.get("password") or ""),
             host=str(cfg.get("host") or "127.0.0.1"),
             port=int(cfg.get("port") or 5432),
             database=str(cfg.get("database") or ""),
         )
-    if ds.type == "sqlite":
-        if not get_settings().uses_sqlite_database:
-            raise ValueError("远端部署禁止访问本地 SQLite 数据源")
-        return URL.create("sqlite", database=str(cfg.get("path") or ""))
-    raise ValueError(f"未知数据库类型: {ds.type}")
+    raise ValueError("数据源必须是 PostgreSQL")
 
 
 def get_engine(ds: DataSource) -> Engine:
@@ -137,8 +120,8 @@ def list_tables(ds: DataSource) -> list[dict[str, Any]]:
             row_count = -1
             try:
                 # The inspector already supplied this identifier. Avoid reflecting
-                # it a second time: some MySQL views cannot be reflected as a
-                # SQLAlchemy Table even though they are directly queryable.
+                # it a second time: the inspector already established that it
+                # is a directly queryable relation.
                 reflected = Table(name, MetaData(), quote=True)
                 row_count = int(
                     conn.execute(select(func.count()).select_from(reflected)).scalar_one()
@@ -515,12 +498,6 @@ def delete_assistant_attachment_object(attachment: AssistantAttachment) -> None:
     )
 
 
-def bucket_dir(ds: DataSource) -> Path:
-    d = BUCKETS_DIR / ds.id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 _WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
@@ -555,13 +532,6 @@ def validate_bucket_filename(filename: str) -> str:
     return name
 
 
-def _bucket_name_candidates(requested_name: str):
-    path = Path(requested_name)
-    yield requested_name
-    for index in range(2, 10_000):
-        yield f"{path.stem} ({index}){path.suffix}"
-
-
 def save_bucket_file(
     ds: DataSource,
     filename: str,
@@ -571,12 +541,7 @@ def save_bucket_file(
     stable_file_id: str | None = None,
     upload_object_key: str | None = None,
 ) -> BucketFile:
-    """Save a file inside one file-bucket root.
-
-    A stable id is a logical database identity only. Managed object-storage
-    uploads always receive a fresh physical key; legacy local template output
-    keeps its private per-execution directory behavior.
-    """
+    """Save a file as a managed MinIO object."""
     if ds.type != "file_bucket":
         raise ValueError("只有文件桶数据源可以保存文件")
     if not isinstance(content, bytes):
@@ -635,151 +600,19 @@ def save_bucket_file(
         bucket_file._managed_object_created = True
         return bucket_file
 
-    root = bucket_dir(ds)
-    storage_root = BUCKETS_DIR.resolve()
-    if root.is_symlink():
-        raise ValueError("文件桶存储目录不能是符号链接")
-    try:
-        root.resolve(strict=True).relative_to(storage_root)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ValueError("文件桶存储目录越界") from exc
-    if stable_file_id is not None:
-        generated_root = root / ".generated"
-        if generated_root.is_symlink():
-            raise ValueError("生成附件目录不能是符号链接")
-        generated_root.mkdir(parents=True, exist_ok=True)
-        directory = generated_root / stable_file_id
-        if directory.is_symlink():
-            raise ValueError("生成附件执行目录不能是符号链接")
-        directory.mkdir(parents=True, exist_ok=True)
-        try:
-            directory = directory.resolve(strict=True)
-            directory.relative_to(root.resolve(strict=True))
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise ValueError("生成附件存储目录越界") from exc
-        target = directory / requested_name
-        pending = directory / f".pending-{uuid.uuid4().hex}"
-        try:
-            descriptor = os.open(
-                pending,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-                0o600,
-            )
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(pending, target)
-            # A prior process may have died after writing its private temp
-            # file. Once this stable retry succeeds, those same-execution
-            # leftovers are safe to remove without touching the result.
-            try:
-                for leftover in directory.glob(".pending-*"):
-                    if leftover != pending and not leftover.is_symlink() and leftover.is_file():
-                        try:
-                            leftover.unlink()
-                        except OSError:
-                            pass
-            except OSError:
-                pass
-        except Exception:
-            if pending.exists():
-                pending.unlink()
-            raise
-        return BucketFile(
-            id=stable_file_id,
-            data_source_id=ds.id,
-            filename=requested_name,
-            stored_path=str(target),
-            size=len(content),
-            mime=mime or _guess_mime(requested_name),
-            content_sha256=hashlib.sha256(content).hexdigest(),
-            status="pending",
-        )
-
-    directory = root
-    target: Path | None = None
-    safe_name = requested_name
-    for candidate_name in _bucket_name_candidates(requested_name):
-        candidate = directory / candidate_name
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        try:
-            descriptor = os.open(candidate, flags, 0o600)
-        except FileExistsError:
-            continue
-        target = candidate
-        safe_name = candidate_name
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except Exception:
-            if candidate.exists():
-                candidate.unlink()
-            raise
-        break
-    if target is None:
-        raise ValueError("同名文件过多，请更换文件名")
-    return BucketFile(
-        id=uuid.uuid4().hex,
-        data_source_id=ds.id,
-        filename=safe_name,
-        stored_path=str(target),
-        size=len(content),
-        mime=mime or _guess_mime(safe_name),
-        content_sha256=hashlib.sha256(content).hexdigest(),
-        status="pending",
-    )
+    raise ValueError("文件桶必须使用 MinIO 存储")
 
 
 def _validated_bucket_mime(filename: str, recorded_mime: str) -> str:
     canonical_mime = _OFFICE_MIMES.get(Path(filename).suffix.lower())
     recorded_base = str(recorded_mime or "").split(";", 1)[0].strip().lower()
     canonical_base = str(canonical_mime or "").split(";", 1)[0].strip().lower()
-    # Historic seed/import paths stored Office files as octet-stream and
-    # Markdown without an explicit charset. Treat those as compatible while
-    # rejecting a contradictory typed MIME.
+    # Older records may omit a MIME or use octet-stream for typed files. Treat
+    # those values as compatible while rejecting a contradictory MIME.
     compatible_legacy = recorded_base in {"", "application/octet-stream"}
     if canonical_mime and not compatible_legacy and recorded_base != canonical_base:
         raise ValueError("附件 MIME 与文件格式不一致")
     return canonical_mime or recorded_mime or _guess_mime(filename)
-
-
-def validate_bucket_file_for_download(
-    bf: BucketFile,
-    ds: DataSource,
-) -> tuple[Path, int, str]:
-    """Resolve and verify a legacy local attachment before serving its bytes."""
-    if bf.data_source_id != ds.id or ds.type != "file_bucket":
-        raise ValueError("附件不属于指定文件桶")
-    if str(getattr(bf, "storage_provider", "") or "").lower() == "minio" or str(
-        getattr(bf, "object_url", "") or bf.stored_path or ""
-    ).lower().startswith("minio://"):
-        raise ValueError("MinIO 附件必须通过对象存储读取")
-    safe_name = validate_bucket_filename(bf.filename)
-    root = bucket_dir(ds).resolve()
-    try:
-        path = Path(bf.stored_path).resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise FileNotFoundError("文件已丢失") from exc
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("附件存储路径越界") from exc
-    if not path.is_file() or path.name != safe_name:
-        raise ValueError("附件存储路径与文件记录不一致")
-    actual_size = path.stat().st_size
-    if bf.size > 0 and actual_size != bf.size:
-        raise ValueError("附件大小与文件记录不一致")
-    if bf.content_sha256:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != bf.content_sha256:
-            raise ValueError("附件内容哈希与文件记录不一致")
-    return path, actual_size, _validated_bucket_mime(safe_name, bf.mime)
 
 
 def minio_file_identity(bf: BucketFile, ds: DataSource) -> tuple[str, str, str]:
@@ -814,65 +647,43 @@ def minio_file_identity(bf: BucketFile, ds: DataSource) -> tuple[str, str, str]:
 
 
 def read_bucket_file(bf: BucketFile, ds: DataSource) -> tuple[bytes, int, str]:
-    """Read and integrity-check either a managed MinIO or legacy local file."""
-    provider = str(getattr(bf, "storage_provider", "") or "").strip().lower()
-    durable_url = str(getattr(bf, "object_url", "") or bf.stored_path or "")
-    if provider == "minio" or durable_url.lower().startswith("minio://"):
-        bucket_name, object_key, safe_name = minio_file_identity(bf, ds)
-        version_id = str(getattr(bf, "object_version_id", "") or "")
-        current = object_storage_service.stat_object(
-            bucket_name,
-            object_key,
-            version_id=version_id,
-        )
-        recorded_etag = str(getattr(bf, "etag", "") or "").strip('"')
-        if recorded_etag and current.etag and current.etag != recorded_etag:
-            raise ValueError("附件 ETag 与文件记录不一致")
-        if bf.size > 0 and current.size != bf.size:
-            raise ValueError("附件大小与文件记录不一致")
-        content = object_storage_service.get_object(
-            bucket_name,
-            object_key,
-            version_id=version_id,
-        )
-        if current.size != len(content) or (bf.size > 0 and len(content) != bf.size):
-            raise ValueError("附件大小与对象内容不一致")
-        if bf.content_sha256 and hashlib.sha256(content).hexdigest() != bf.content_sha256:
-            raise ValueError("附件内容哈希与文件记录不一致")
-        return content, len(content), _validated_bucket_mime(safe_name, bf.mime)
-
-    path, actual_size, media_type = validate_bucket_file_for_download(bf, ds)
-    return path.read_bytes(), actual_size, media_type
+    """Read and integrity-check a managed MinIO object."""
+    bucket_name, object_key, safe_name = minio_file_identity(bf, ds)
+    version_id = str(getattr(bf, "object_version_id", "") or "")
+    current = object_storage_service.stat_object(
+        bucket_name,
+        object_key,
+        version_id=version_id,
+    )
+    recorded_etag = str(getattr(bf, "etag", "") or "").strip('"')
+    if recorded_etag and current.etag and current.etag != recorded_etag:
+        raise ValueError("附件 ETag 与文件记录不一致")
+    if bf.size > 0 and current.size != bf.size:
+        raise ValueError("附件大小与文件记录不一致")
+    content = object_storage_service.get_object(
+        bucket_name,
+        object_key,
+        version_id=version_id,
+    )
+    if current.size != len(content) or (bf.size > 0 and len(content) != bf.size):
+        raise ValueError("附件大小与对象内容不一致")
+    if bf.content_sha256 and hashlib.sha256(content).hexdigest() != bf.content_sha256:
+        raise ValueError("附件内容哈希与文件记录不一致")
+    return content, len(content), _validated_bucket_mime(safe_name, bf.mime)
 
 
 def bucket_file_deletion_identity(
     bf: BucketFile,
     ds: DataSource,
 ) -> tuple[str, str, str, str]:
-    """Validate and return provider/bucket-or-path/key/version for deletion."""
-    provider = str(getattr(bf, "storage_provider", "") or "").strip().lower()
-    durable_url = str(getattr(bf, "object_url", "") or bf.stored_path or "")
-    if provider == "minio" or durable_url.lower().startswith("minio://"):
-        bucket_name, object_key, _safe_name = minio_file_identity(bf, ds)
-        return (
-            "minio",
-            bucket_name,
-            object_key,
-            str(getattr(bf, "object_version_id", "") or ""),
-        )
-    if bf.data_source_id != ds.id or ds.type != "file_bucket":
-        raise ValueError("附件不属于指定文件桶")
-    safe_name = validate_bucket_filename(bf.filename)
-    path = Path(str(bf.stored_path or ""))
-    try:
-        resolved = path.resolve(strict=False)
-        source_root = (BUCKETS_DIR / ds.id).resolve(strict=False)
-        resolved.relative_to(source_root)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ValueError("附件存储路径不属于指定文件桶") from exc
-    if resolved.name != safe_name:
-        raise ValueError("附件存储路径与文件记录不一致")
-    return "local", str(resolved), "", ""
+    """Validate and return the MinIO bucket, key and version for deletion."""
+    bucket_name, object_key, _safe_name = minio_file_identity(bf, ds)
+    return (
+        "minio",
+        bucket_name,
+        object_key,
+        str(getattr(bf, "object_version_id", "") or ""),
+    )
 
 
 def is_managed_minio_file(bucket_file: BucketFile) -> bool:
@@ -899,123 +710,16 @@ def delete_bucket_file(bf: BucketFile, ds: DataSource) -> None:
     provider, bucket_or_path, object_key, version_id = (
         bucket_file_deletion_identity(bf, ds)
     )
-    if provider == "minio":
-        object_storage_service.delete_object(
-            bucket_or_path,
-            object_key,
-            version_id=version_id,
-        )
-        return
-    delete_bucket_file_path(bucket_or_path)
-
-
-def delete_bucket_file_path(stored_path: str) -> None:
-    """Delete a durable MinIO URI or safely unlink a legacy local path."""
-    if str(stored_path or "").lower().startswith("minio://"):
-        object_storage_service.delete_object_url(stored_path)
-        return
-    # Deletion callers already authorise the owning data source.  Avoid
-    # following a corrupt/symlinked record outside the platform bucket root.
-    p = Path(stored_path)
-    try:
-        resolved = p.resolve(strict=True)
-        resolved.relative_to(BUCKETS_DIR.resolve())
-    except (OSError, RuntimeError, ValueError):
-        return
-    if resolved.is_file():
-        resolved.unlink()
-
-
-def reconcile_generated_file_orphans(
-    db: Session,
-    *,
-    older_than_seconds: int = 24 * 60 * 60,
-) -> int:
-    """Remove only stale private generation dirs without BucketFile metadata.
-
-    Stable template output lives under ``<bucket>/.generated/<32-hex-id>``.
-    A hard process exit can occur after the atomic file replace but before the
-    database commit.  Startup reconciliation leaves recent directories alone
-    (another worker may still be committing), keeps every id referenced by a
-    BucketFile row, and refuses unexpected nesting/symlinks before deletion.
-    Ordinary user-upload paths are never considered.
-    """
-    root = BUCKETS_DIR.resolve()
-    if not root.exists() or not root.is_dir():
-        return 0
-    cutoff = time.time() - max(0, int(older_than_seconds))
-    candidates: list[tuple[str, Path]] = []
-    for source_dir in root.iterdir():
-        generated_root = source_dir / ".generated"
-        if source_dir.is_symlink() or not generated_root.is_dir() or generated_root.is_symlink():
-            continue
-        try:
-            generated_root.resolve(strict=True).relative_to(root)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        for execution_dir in generated_root.iterdir():
-            if (
-                execution_dir.is_symlink()
-                or not execution_dir.is_dir()
-                or not re.fullmatch(r"[a-f0-9]{32}", execution_dir.name)
-            ):
-                continue
-            try:
-                children = list(execution_dir.iterdir())
-                # Renderer directories are deliberately flat.  Skipping an
-                # unexpected child is safer than recursively following it.
-                if any(child.is_symlink() or not child.is_file() for child in children):
-                    continue
-                newest = max(
-                    [execution_dir.stat().st_mtime, *(child.stat().st_mtime for child in children)]
-                )
-            except OSError:
-                continue
-            if newest <= cutoff:
-                candidates.append((execution_dir.name, execution_dir))
-    if not candidates:
-        return 0
-
-    candidate_ids = {item[0] for item in candidates}
-    persisted: set[str] = set()
-    ordered_ids = sorted(candidate_ids)
-    for offset in range(0, len(ordered_ids), 500):
-        persisted.update(
-            str(item)
-            for item in db.scalars(
-                select(BucketFile.id).where(BucketFile.id.in_(ordered_ids[offset : offset + 500]))
-            ).all()
-        )
-
-    removed = 0
-    for file_id, directory in candidates:
-        if file_id in persisted:
-            continue
-        try:
-            resolved = directory.resolve(strict=True)
-            resolved.relative_to(root)
-            children = list(resolved.iterdir())
-            if any(child.is_symlink() or not child.is_file() for child in children):
-                continue
-            if max([resolved.stat().st_mtime, *(child.stat().st_mtime for child in children)]) > cutoff:
-                continue
-            for child in children:
-                child.unlink()
-            resolved.rmdir()
-            removed += 1
-        except (FileNotFoundError, OSError, RuntimeError, ValueError):
-            # Another startup worker may have completed the same cleanup.
-            continue
-    return removed
+    if provider != "minio":
+        raise ValueError("文件删除任务必须使用 MinIO")
+    object_storage_service.delete_object(
+        bucket_or_path,
+        object_key,
+        version_id=version_id,
+    )
 
 
 def _guess_mime(name: str) -> str:
     import mimetypes
 
     return _OFFICE_MIMES.get(Path(name).suffix.lower()) or mimetypes.guess_type(name)[0] or "application/octet-stream"
-
-
-def copy_skill_dir(src: Path, dst: Path) -> None:
-    if dst.exists():
-        shutil.rmtree(dst)
-    shutil.copytree(src, dst)

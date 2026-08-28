@@ -990,7 +990,7 @@ def process_available_runs(db: Session, *, now: datetime | None = None, limit: i
                 WorkflowRun.environment == deployment_environment,
             )
             .values(**claim_values)
-            # SQLite 返回的无时区 datetime 不能由 ORM 在内存中与 utc_now() 比较；
+            # 数据库返回的时间值统一由 ORM 在内存中与 utc_now() 比较；
             # 随后的 expire_all()/get() 会从数据库重新读取已领取的记录。
             .execution_options(synchronize_session=False)
         ).rowcount

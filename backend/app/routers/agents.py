@@ -906,7 +906,7 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
     stream_user_id = str(db.info.get("user_id") or "")
     stream_llm_id = str(llm.id)
     # Action tools may commit their dry-run audit row before the streaming turn
-    # finishes.  Persist its parent answer first so SQLite/Postgres FK checks and
+    # finishes.  Persist its parent answer first so PostgreSQL FK checks and
     # lineage never depend on a not-yet-created message id.
     db.add(
         Message(

@@ -19,6 +19,52 @@ MEDICAL_SCENARIO_ID = "cc5d3ff36d2a468596dfa9f8ef2995da"
 BOOKKEEPING_SOURCE_ID = "68fcb44b941a40d48c7aba1efb14e7f6"
 MEDICAL_SOURCE_ID = "a2d20a398ed744e7839acb910f377d6a"
 
+BOOKKEEPING_TABLES = (
+    "accounts",
+    "audit_adjustments",
+    "audit_papers",
+    "audit_projects",
+    "audit_reports",
+    "audited_statements",
+    "communication_records",
+    "confirmations",
+    "customers",
+    "financial_statements",
+    "review_records",
+    "statement_notes",
+    "tax_returns",
+    "voucher_lines",
+    "vouchers",
+)
+MEDICAL_TABLES = ("就诊表", "结算表", "规则表", "项目明细表")
+BOOKKEEPING_DERIVED_RELATIONS = ("audit_project_view",)
+MEDICAL_DERIVED_RELATIONS = ("医疗机构视图", "医保服务项目视图")
+RUNTIME_IMMUTABLE_TABLES = (
+    "data_asset_versions",
+    "dataset_schemas",
+    "dataset_relations",
+    "dataset_fields",
+    "dataset_versions",
+    "dataset_version_assets",
+    "dataset_fragments",
+    "ingestion_run_inputs",
+    "dataset_lineage_edges",
+    "reasoning_terms",
+    "derivation_run_inputs",
+    "assertions",
+    "derivation_evidence",
+)
+RUNTIME_MIGRATION_LEDGER_TABLES = (
+    "alembic_version",
+    "platform_migration_runs",
+    "platform_migration_checkpoints",
+)
+RUNTIME_REQUIRED_UPDATE_TABLES = (
+    "dataset_heads",
+    "ingestion_runs",
+    "derivation_runs",
+)
+
 
 def _quote(identifier: str) -> str:
     return f'"{identifier.replace(chr(34), chr(34) * 2)}"'
@@ -206,16 +252,6 @@ def main() -> int:
         medical_audit_service,
         runtime_definition_service,
     )
-    from scripts.migrate_mysql_to_postgresql import (
-        BOOKKEEPING_DERIVED_RELATIONS,
-        BOOKKEEPING_TABLES,
-        MEDICAL_DERIVED_RELATIONS,
-        MEDICAL_TABLES,
-        RUNTIME_IMMUTABLE_TABLES,
-        RUNTIME_MIGRATION_LEDGER_TABLES,
-        RUNTIME_REQUIRED_UPDATE_TABLES,
-    )
-
     init_db()
     runtime_settings = get_settings()
     with engine.connect() as connection:

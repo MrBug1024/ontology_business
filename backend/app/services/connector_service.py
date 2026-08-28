@@ -256,7 +256,7 @@ def _connector_enabled(kind: str, connector: Any) -> bool:
 
 def _secret_state(kind: str, connector: Any) -> str:
     if kind == "data_source":
-        if str(getattr(connector, "type", "")) in {"file_bucket", "sqlite"}:
+        if str(getattr(connector, "type", "")) in {"file_bucket", "dataset"}:
             return "not_required"
         return "configured" if bool(getattr(connector, "config", {}) or {}) else "missing"
     if kind == "mcp":

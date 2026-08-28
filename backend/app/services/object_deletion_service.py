@@ -646,25 +646,23 @@ def enqueue_bucket_file_deletion(
     provider, bucket_or_path, object_key, version_id = (
         datasource_service.bucket_file_deletion_identity(bucket_file, data_source)
     )
-    if provider == "minio":
-        bucket_name = bucket_or_path
-        object_url = object_storage_service.stable_object_url(
-            bucket_name, object_key
-        )
-        _fence_upload_key_for_deletion(
-            db,
-            provider="minio",
-            bucket_name=bucket_name,
-            object_key=object_key,
-            object_url=object_url,
-            origin_type="bucket_file_delete",
-            origin_id=bucket_file.id,
-            tenant_id=data_source.tenant_id,
-            scenario_id=data_source.scenario_id,
-        )
-    else:
-        bucket_name = ""
-        object_url = bucket_or_path
+    if provider != "minio":
+        raise ValueError("文件删除任务必须使用 MinIO")
+    bucket_name = bucket_or_path
+    object_url = object_storage_service.stable_object_url(
+        bucket_name, object_key
+    )
+    _fence_upload_key_for_deletion(
+        db,
+        provider="minio",
+        bucket_name=bucket_name,
+        object_key=object_key,
+        object_url=object_url,
+        origin_type="bucket_file_delete",
+        origin_id=bucket_file.id,
+        tenant_id=data_source.tenant_id,
+        scenario_id=data_source.scenario_id,
+    )
     return _enqueue(
         db,
         provider=provider,
@@ -727,9 +725,6 @@ def _delete_job_object(job: ObjectDeletionJob) -> None:
             object_key,
             version_id=job.object_version_id,
         )
-        return
-    if job.provider == "local":
-        datasource_service.delete_bucket_file_path(job.object_url)
         return
     raise ValueError("对象删除任务存储提供方无效")
 

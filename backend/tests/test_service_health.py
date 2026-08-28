@@ -24,7 +24,7 @@ class _Connection:
 
 
 class _Engine:
-    dialect = SimpleNamespace(name="mysql")
+    dialect = SimpleNamespace(name="postgresql")
 
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
@@ -39,7 +39,6 @@ def _settings(*, redis_configured: bool = True):
         minio_aliyun_access_key_id="access",
         minio_aliyun_access_key_secret="secret",
         minio_bucketname="ontology",
-        uses_sqlite_database=False,
         redis_configured=redis_configured,
     )
 

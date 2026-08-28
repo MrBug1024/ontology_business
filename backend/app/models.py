@@ -22,7 +22,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects import mysql, postgresql
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .config import get_settings
@@ -38,12 +38,12 @@ def _now() -> datetime:
 
 
 def _json_document_type():
-    """Use PostgreSQL JSONB without giving up SQLite/MySQL test portability."""
+    """Use PostgreSQL JSONB for document-shaped values."""
     return JSON().with_variant(postgresql.JSONB(none_as_null=True), "postgresql")
 
 
 def _sha256_check(column_name: str) -> str:
-    """Portable exact lowercase SHA-256 check for PostgreSQL/MySQL/SQLite."""
+    """Return the PostgreSQL check for an exact lowercase SHA-256 value."""
     remainder = column_name
     for character in "0123456789abcdef":
         remainder = f"replace({remainder}, '{character}', '')"
@@ -639,7 +639,7 @@ class DataMapping(Base):
 # 数据源
 # ──────────────────────────────────────────────
 class DataSource(Base):
-    """数据源：关系型数据库（mysql/postgres/sqlite）或文件桶（file_bucket）。"""
+    """数据源：PostgreSQL、MinIO 文件桶或 MinIO 版本化数据集。"""
 
     __tablename__ = "data_sources"
     __table_args__ = (
@@ -655,7 +655,7 @@ class DataSource(Base):
         ForeignKey("business_scenarios.id", ondelete="SET NULL"), index=True, nullable=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    type: Mapped[str] = mapped_column(String(30), nullable=False)  # mysql / postgres / sqlite / file_bucket
+    type: Mapped[str] = mapped_column(String(30), nullable=False)  # postgres / file_bucket / dataset
     config: Mapped[dict] = mapped_column(JSON, default=dict)
     # A durable, monotonic revision of all runtime-relevant configuration.
     # Releases record this value instead of storing an unsafe configuration
@@ -701,11 +701,9 @@ class BucketFile(Base):
     )
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
     stored_path: Mapped[str] = mapped_column(String(4096), nullable=False)
-    # ``stored_path`` remains for rolling upgrades and local test storage.
-    # Managed objects use the structured fields below and mirror their stable
-    # ``minio://`` URI into ``stored_path`` for legacy callers.
+    # ``stored_path`` mirrors the stable MinIO URI for API compatibility.
     storage_provider: Mapped[str] = mapped_column(
-        String(20), default="local", nullable=False
+        String(20), default="minio", nullable=False
     )
     bucket_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     object_key: Mapped[str] = mapped_column(String(2048), default="", nullable=False)
@@ -735,7 +733,7 @@ class BucketFile(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / parsed / error
     error: Mapped[str] = mapped_column(Text, default="")
     parsed_text: Mapped[str] = mapped_column(
-        Text().with_variant(mysql.LONGTEXT(), "mysql"), default=""
+        Text, default=""
     )
     # P1 RAG 索引：解析文本变化后按内容哈希增量重建分块向量。
     index_status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / queued / indexed / partial / error
@@ -778,7 +776,7 @@ class ObjectDeletionJob(Base):
     )
 
     # A SHA-256 of provider + immutable object identity is both the primary
-    # key and the deduplication key without requiring an oversized MySQL index.
+    # key and the deduplication key without requiring an oversized index.
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     provider: Mapped[str] = mapped_column(String(20), nullable=False)
     bucket_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
@@ -931,7 +929,7 @@ class DocumentChunk(Base):
     char_end: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, default="")
     content_hash: Mapped[str] = mapped_column(String(64), default="")
-    # JSON 保证 SQLite / Postgres 均可用；服务层统一按余弦相似度检索。
+    # JSONB stores the embedding; the service layer performs cosine similarity.
     embedding: Mapped[list] = mapped_column(JSON, default=list)
     embedding_model: Mapped[str] = mapped_column(String(120), default="local-semantic-hash-192-v1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -1082,8 +1080,7 @@ class DocumentIndexJob(Base):
     __table_args__ = (
         Index("ix_document_index_jobs_dispatch", "status", "available_at"),
         Index("ix_document_index_jobs_file_created", "bucket_file_id", "created_at"),
-        # 活跃任务使用同一个 logical key，终态任务清空该字段。这样在 SQLite
-        # 及其他支持唯一索引的数据库中都能防止同一文件重复入队。
+        # 活跃任务使用同一个 logical key，终态任务清空该字段。
         UniqueConstraint("tenant_id", "active_key", name="uq_document_index_jobs_active_key"),
     )
 
@@ -1291,8 +1288,7 @@ class MCPConfig(Base):
     )
     is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    # A materialized, Unicode-normalized identity keeps SQLite, PostgreSQL and
-    # MySQL conflict behaviour identical and lets the database close the
+    # A materialized, Unicode-normalized identity lets PostgreSQL close the
     # create/import check-then-write race.
     name_key: Mapped[str] = mapped_column(String(600), nullable=False, default="")
     transport: Mapped[str] = mapped_column(String(20), default="stdio")  # stdio / sse / streamable_http
@@ -1554,7 +1550,7 @@ class AssistantProposalApplication(Base):
     ``proposal_id`` is generated server-side and globally unique.  Making it
     the primary key turns two concurrent confirmations into one transaction
     that owns the write and one unique-key replay/conflict, including on
-    SQLite where ``SELECT FOR UPDATE`` is unavailable.
+    PostgreSQL row locks provide the serialization boundary.
     """
 
     __tablename__ = "assistant_proposal_applications"
@@ -1792,10 +1788,9 @@ class AssistantAttachment(Base):
     # Hash the uploaded bytes before parsing so retries key off the actual
     # attachment content without copying the binary into the job ledger.
     content_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
-    # Legacy rows whose original bytes were discarded are explicitly ``none``.
-    # Every new upload records a stable managed MinIO identity instead.
+    # Every upload records a stable managed MinIO identity.
     storage_provider: Mapped[str] = mapped_column(
-        String(20), default="none", nullable=False
+        String(20), default="minio", nullable=False
     )
     bucket_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     object_key: Mapped[str] = mapped_column(String(2048), default="", nullable=False)
@@ -1806,7 +1801,7 @@ class AssistantAttachment(Base):
     object_url: Mapped[str] = mapped_column(String(4096), default="", nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / parsed / error
     parsed_text: Mapped[str] = mapped_column(
-        Text().with_variant(mysql.LONGTEXT(), "mysql"), default=""
+        Text, default=""
     )
     error: Mapped[str] = mapped_column(Text, default="")
     consumed_at: Mapped[datetime | None] = mapped_column(
@@ -2582,7 +2577,7 @@ class ActionExecutionLog(Base):
     input_params: Mapped[dict] = mapped_column(JSON, default=dict)
     # 执行状态: running / success / failed / confirmation_required / dry_run /
     # awaiting_approval.  Keep headroom beyond the longest canonical value so
-    # strict MySQL cannot reject an audit row that SQLite historically accepted.
+    # PostgreSQL enforces the audit row contract at the database boundary.
     status: Mapped[str] = mapped_column(String(32), default="running")
     # execute / dry_run / confirmation
     mode: Mapped[str] = mapped_column(String(20), default="execute")

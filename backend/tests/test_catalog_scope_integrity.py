@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import importlib.util
-import inspect
 from pathlib import Path
 
 import pytest
 from sqlalchemy import CheckConstraint, ForeignKeyConstraint, UniqueConstraint
-from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
 from app.models import Base
-from scripts import migrate_mysql_to_postgresql as migration
+from scripts import verify_postgresql_runtime as runtime
 from scripts.verify_postgresql_runtime import _validate_runtime_table_privileges
 
 
@@ -76,8 +75,8 @@ def test_scope_columns_are_non_nullable_where_identity_requires_them() -> None:
             assert table.c[column_name].nullable is False, (table_name, column_name)
 
 
-@pytest.mark.parametrize("dialect", (postgresql.dialect(), sqlite.dialect(), mysql.dialect()))
-def test_catalog_scope_tables_compile_for_supported_dialects(dialect) -> None:
+def test_catalog_scope_tables_compile_for_postgresql() -> None:
+    dialect = postgresql.dialect()
     table_names = (
         "data_asset_versions",
         "dataset_versions",
@@ -122,21 +121,21 @@ def test_reasoning_evidence_is_pinned_to_the_assertion_run_input() -> None:
 
 def _valid_privileges() -> dict[str, dict[str, bool]]:
     privileges: dict[str, dict[str, bool]] = {}
-    for table_name in migration.RUNTIME_IMMUTABLE_TABLES:
+    for table_name in runtime.RUNTIME_IMMUTABLE_TABLES:
         privileges[table_name] = {
             "select": True,
             "insert": True,
             "update": False,
             "delete": False,
         }
-    for table_name in migration.RUNTIME_MIGRATION_LEDGER_TABLES:
+    for table_name in runtime.RUNTIME_MIGRATION_LEDGER_TABLES:
         privileges[table_name] = {
             "select": True,
             "insert": False,
             "update": False,
             "delete": False,
         }
-    for table_name in migration.RUNTIME_REQUIRED_UPDATE_TABLES:
+    for table_name in runtime.RUNTIME_REQUIRED_UPDATE_TABLES:
         privileges[table_name] = {
             "select": True,
             "insert": True,
@@ -147,30 +146,21 @@ def _valid_privileges() -> dict[str, dict[str, bool]]:
 
 
 def test_runtime_privilege_contract_preserves_state_updates_only() -> None:
-    assert set(migration.RUNTIME_IMMUTABLE_TABLES).isdisjoint(
-        migration.RUNTIME_REQUIRED_UPDATE_TABLES
+    assert set(runtime.RUNTIME_IMMUTABLE_TABLES).isdisjoint(
+        runtime.RUNTIME_REQUIRED_UPDATE_TABLES
     )
-    assert set(migration.RUNTIME_REQUIRED_UPDATE_TABLES) == {
+    assert set(runtime.RUNTIME_REQUIRED_UPDATE_TABLES) == {
         "dataset_heads",
         "ingestion_runs",
         "derivation_runs",
     }
     result = _validate_runtime_table_privileges(
         _valid_privileges(),
-        immutable_tables=migration.RUNTIME_IMMUTABLE_TABLES,
-        ledger_tables=migration.RUNTIME_MIGRATION_LEDGER_TABLES,
-        required_update_tables=migration.RUNTIME_REQUIRED_UPDATE_TABLES,
+        immutable_tables=runtime.RUNTIME_IMMUTABLE_TABLES,
+        ledger_tables=runtime.RUNTIME_MIGRATION_LEDGER_TABLES,
+        required_update_tables=runtime.RUNTIME_REQUIRED_UPDATE_TABLES,
     )
-    assert result["immutable_tables"] == len(migration.RUNTIME_IMMUTABLE_TABLES)
-
-
-def test_grant_bootstrap_revokes_mutation_and_has_safe_future_defaults() -> None:
-    source = inspect.getsource(migration._grant_runtime_privileges)
-    assert "REVOKE UPDATE, DELETE ON TABLE {} FROM {}" in source
-    assert "REVOKE INSERT, UPDATE, DELETE ON TABLE {} FROM {}" in source
-    assert "REVOKE UPDATE, DELETE ON TABLES FROM {}" in source
-    assert "GRANT SELECT, INSERT ON TABLES TO {}" in source
-    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {}" not in source
+    assert result["immutable_tables"] == len(runtime.RUNTIME_IMMUTABLE_TABLES)
 
 
 @pytest.mark.parametrize(
@@ -188,7 +178,7 @@ def test_runtime_privilege_contract_rejects_mutation(table_name: str, privilege:
     with pytest.raises(RuntimeError, match="mutat"):
         _validate_runtime_table_privileges(
             privileges,
-            immutable_tables=migration.RUNTIME_IMMUTABLE_TABLES,
-            ledger_tables=migration.RUNTIME_MIGRATION_LEDGER_TABLES,
-            required_update_tables=migration.RUNTIME_REQUIRED_UPDATE_TABLES,
+            immutable_tables=runtime.RUNTIME_IMMUTABLE_TABLES,
+            ledger_tables=runtime.RUNTIME_MIGRATION_LEDGER_TABLES,
+            required_update_tables=runtime.RUNTIME_REQUIRED_UPDATE_TABLES,
         )

@@ -57,19 +57,15 @@ test('data source labels report the configured storage authority', () => {
   )
   assert.equal(
     dataSourceLocationLabel({ type: 'file_bucket', config: { storage_backend: 'LOCAL' } }),
-    '本地',
+    '托管存储',
   )
   assert.equal(
     dataSourceLocationLabel({ type: 'file_bucket', config: {} }),
     '托管存储',
   )
   assert.equal(
-    dataSourceLocationLabel({ type: 'mysql', config: { host: 'db.internal' } }),
+    dataSourceLocationLabel({ type: 'postgres', config: { host: 'db.internal' } }),
     'db.internal',
-  )
-  assert.equal(
-    dataSourceLocationLabel({ type: 'sqlite', config: { path: 'data/source.db' } }),
-    'data/source.db',
   )
 })
 

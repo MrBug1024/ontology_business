@@ -195,25 +195,21 @@
         </el-form-item>
         <el-form-item label="类型" required>
           <el-radio-group v-model="form.type" @change="onTypeChange">
-            <el-radio value="mysql">MySQL</el-radio>
             <el-radio value="postgres">PostgreSQL</el-radio>
             <el-radio value="file_bucket">文件桶</el-radio>
           </el-radio-group>
         </el-form-item>
 
-        <template v-if="form.type === 'mysql' || form.type === 'postgres'">
+        <template v-if="form.type === 'postgres'">
           <el-row :gutter="10">
             <el-col :span="14"><el-form-item label="主机"><el-input v-model="form.config.host" placeholder="127.0.0.1" /></el-form-item></el-col>
-            <el-col :span="10"><el-form-item label="端口"><el-input v-model.number="form.config.port" :placeholder="form.type === 'mysql' ? '3306' : '5432'" /></el-form-item></el-col>
+            <el-col :span="10"><el-form-item label="端口"><el-input v-model.number="form.config.port" placeholder="5432" /></el-form-item></el-col>
           </el-row>
           <el-row :gutter="10">
             <el-col :span="14"><el-form-item label="数据库"><el-input v-model="form.config.database" /></el-form-item></el-col>
             <el-col :span="10"><el-form-item label="用户名"><el-input v-model="form.config.username" /></el-form-item></el-col>
           </el-row>
           <el-form-item label="密码"><el-input v-model="form.config.password" type="password" show-password /></el-form-item>
-        </template>
-        <template v-else-if="form.type === 'sqlite'">
-          <el-form-item label="文件路径"><el-input v-model="form.config.path" placeholder="data/demo.db（相对 backend 或绝对路径）" /></el-form-item>
         </template>
         <template v-else>
           <el-form-item label="说明"><div class="muted">文件桶用于上传业务文档（Excel / Word / PDF / 图片等），平台自动解析为文本供 Agent 检索。</div></el-form-item>
@@ -277,7 +273,7 @@ const returnPath = ref(safeReturnPath(route.query.return_to))
 
 const dlg = ref(false)
 const saving = ref(false)
-const form = ref<Partial<DataSource> & { config: Record<string, any> }>({ type: 'mysql', config: {} })
+const form = ref<Partial<DataSource> & { config: Record<string, any> }>({ type: 'postgres', config: {} })
 
 const testing = ref(false)
 const tables = ref<TableInfo[]>([])
@@ -309,7 +305,7 @@ let testRequest = 0
 let textRequest = 0
 
 const TYPE_LABELS: Record<string, string> = {
-  mysql: 'MySQL', postgres: 'PostgreSQL', sqlite: 'SQLite', dataset: '数据集', file_bucket: '文件桶',
+  postgres: 'PostgreSQL', dataset: '数据集', file_bucket: '文件桶',
 }
 function typeLabel(t: string) { return TYPE_LABELS[t] || t }
 function fmtSize(n: number) {
@@ -576,17 +572,16 @@ async function removeFile(f: BucketFile) {
 // ── 新建/编辑 ──
 function onTypeChange() {
   form.value.config =
-    form.value.type === 'sqlite' ? { path: '' }
-    : form.value.type === 'file_bucket' ? {}
-    : form.value.type === 'mysql' ? { host: '127.0.0.1', port: 3306, database: '', username: 'root', password: '' }
-    : { host: '127.0.0.1', port: 5432, database: '', username: 'postgres', password: '' }
+    form.value.type === 'file_bucket'
+      ? {}
+      : { host: '127.0.0.1', port: 5432, database: '', username: 'postgres', password: '' }
 }
 function openCreate() {
   form.value = {
     name: '',
     scenario_id: scenarioScope.value || undefined,
-    type: 'mysql',
-    config: { host: '127.0.0.1', port: 3306, database: '', username: 'root', password: '' },
+    type: 'postgres',
+    config: { host: '127.0.0.1', port: 5432, database: '', username: 'postgres', password: '' },
   }
   dlg.value = true
 }

@@ -1350,8 +1350,8 @@ def _snapshot_for_scenario(db: Session, scenario: BusinessScenario, snapshot_id:
 def _lock_branch(db: Session, branch_id: str) -> OntologyBranch | None:
     """Refresh and row-lock a branch before a merge/rollback head transition.
 
-    SQLite treats ``FOR UPDATE`` as a no-op, while PostgreSQL/MySQL serialize
-    concurrent head updates.  ``populate_existing`` avoids relying on a stale
+    PostgreSQL row locks serialize concurrent head updates.
+    ``populate_existing`` avoids relying on a stale
     relationship object that was loaded while authorising the proposal.
     """
     return db.execute(

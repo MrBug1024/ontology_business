@@ -10,13 +10,11 @@ import hashlib
 import json
 import math
 import re
-import sqlite3
 from collections.abc import Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy import inspect as sa_inspect
@@ -354,7 +352,6 @@ class MedicalAuditError(ValueError):
 @dataclass(frozen=True)
 class _SourceSchema:
     source: DataSource
-    path: Path | None
     tables: dict[str, str]
     columns: dict[str, dict[str, str]]
 
@@ -401,7 +398,6 @@ class MedicalAuditMappingContract:
     source_type: str
     connector_revision: int
     connector_config_hash: str
-    path: Path | None
     tables: dict[str, str]
     columns: dict[str, dict[str, str]]
     mapping_ids: dict[str, str]
@@ -419,7 +415,7 @@ class MedicalAuditMappingContract:
 
 
 class _AuditResult:
-    """Small result facade shared by sqlite3 and SQLAlchemy connections."""
+    """Small result facade shared by PostgreSQL and dataset connections."""
 
     def __init__(self, rows: Sequence[Mapping[str, Any]]) -> None:
         self._rows = list(rows)
@@ -434,51 +430,23 @@ class _AuditResult:
         return iter(self._rows)
 
 
-_MYSQL_IDENTIFIER = re.compile(r'"((?:[^"\r\n]|"")*)"')
-
-
 class _AuditConnection:
     """Read-only query facade over relational and immutable dataset sources."""
 
     def __init__(self, source: DataSource) -> None:
         self.dialect = str(source.type or "").lower()
-        self._sqlite: sqlite3.Connection | None = None
         self._sqlalchemy = None
         self._dataset: dataset_query_service.DatasetConnection | None = None
-        if self.dialect == "sqlite":
-            raw_path = str((source.config or {}).get("path") or "").strip()
-            path = Path(raw_path).expanduser().resolve()
-            connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA query_only = ON")
-            self._sqlite = connection
-        elif self.dialect == "mysql":
+        if self.dialect == "postgres":
             self._sqlalchemy = datasource_service.get_engine(source).connect()
         elif self.dialect == "dataset":
             self._dataset = dataset_query_service.open_connection(source)
         else:
             raise MedicalAuditError(
                 "INVALID_QUERY",
-                "医保审计仅支持受管数据集或兼容的关系型数据源。",
+                "医保审计仅支持 PostgreSQL 或受管数据集。",
                 retryable=False,
             )
-
-    @staticmethod
-    def _mysql_sql(sql: str) -> str:
-        def quote(match: re.Match[str]) -> str:
-            value = match.group(1).replace('""', '"').replace("`", "``")
-            return f"`{value}`"
-
-        translated = _MYSQL_IDENTIFIER.sub(quote, sql)
-        translated = re.sub(r"\bAS\s+MATERIALIZED\s*\(", "AS (", translated, flags=re.I)
-        translated = re.sub(r"\s+AS\s+TEXT\)", " AS CHAR)", translated, flags=re.I)
-        translated = re.sub(
-            r"\s+AS\s+REAL\)",
-            " AS DECIMAL(30, 8))",
-            translated,
-            flags=re.I,
-        )
-        return translated.replace("?", "%s")
 
     def execute(
         self,
@@ -486,9 +454,6 @@ class _AuditConnection:
         params: Sequence[Any] | None = None,
     ) -> _AuditResult:
         values = tuple(params or ())
-        if self._sqlite is not None:
-            cursor = self._sqlite.execute(sql, values)
-            return _AuditResult(cursor.fetchall())
         dataset = getattr(self, "_dataset", None)
         if dataset is not None:
             columns, rows = dataset.execute(sql, values)
@@ -497,13 +462,10 @@ class _AuditConnection:
             )
         if self._sqlalchemy is None:
             raise RuntimeError("医保审计连接已关闭")
-        result = self._sqlalchemy.exec_driver_sql(self._mysql_sql(sql), values)
+        result = self._sqlalchemy.exec_driver_sql(sql.replace("?", "%s"), values)
         return _AuditResult(result.mappings().all())
 
     def close(self) -> None:
-        if self._sqlite is not None:
-            self._sqlite.close()
-            self._sqlite = None
         if self._sqlalchemy is not None:
             self._sqlalchemy.rollback()
             self._sqlalchemy.close()
@@ -609,8 +571,8 @@ def resolve_mapping_contract(
                 f"对象类型 {entity_api_name} 的运行映射未绑定到当前 Agent 可用数据源。"
             )
         source_type = str(getattr(source, "type", "") or "").lower()
-        if source_type not in {"sqlite", "mysql", "dataset"}:
-            raise _mapping_contract_error("医保审计运行映射必须绑定受管数据集或兼容关系型数据源。")
+        if source_type not in {"postgres", "dataset"}:
+            raise _mapping_contract_error("医保审计运行映射必须绑定 PostgreSQL 或受管数据集。")
         if selected_source is not None and str(selected_source.id) != source_id:
             raise _mapping_contract_error("医保审计对象映射跨越多个物理数据源，拒绝执行关联审计。")
         selected_source = source
@@ -704,33 +666,22 @@ def resolve_mapping_contract(
         getattr(selected_source, "config", None) or {}, "医保审计数据源配置"
     )
     connector_config_hash = _payload_sha256(source_config)
-    path: Path | None = None
-    if source_type == "sqlite":
-        raw_path = str(source_config.get("path") or "").strip()
-        if not raw_path:
-            raise _mapping_contract_error("医保审计映射绑定的数据源缺少 SQLite 路径。")
-        path = Path(raw_path).expanduser().resolve()
-        if not path.is_file():
-            raise MedicalAuditError(
-                "RESOURCE_NOT_FOUND",
-                "医保审计映射绑定的 SQLite 数据源不存在或不可读取。",
-                retryable=False,
-            )
-    elif source_type == "dataset":
+    if source_type == "dataset":
         if not str(source_config.get("dataset_version_id") or "").strip():
             raise _mapping_contract_error("医保审计映射绑定的数据集缺少固定版本标识。")
     elif not all(
         str(source_config.get(key) or "").strip()
-        for key in ("host", "database", "user")
+        for key in ("host", "database")
     ):
-        raise _mapping_contract_error("医保审计映射绑定的 MySQL 数据源配置不完整。")
+        raise _mapping_contract_error("医保审计映射绑定的 PostgreSQL 数据源配置不完整。")
+    if not str(source_config.get("user") or source_config.get("username") or "").strip():
+        raise _mapping_contract_error("医保审计映射绑定的 PostgreSQL 数据源配置不完整。")
     payload = _mapping_contract_payload(
         source_id=source_id,
         source_name=source_name,
         source_type=source_type,
         connector_revision=connector_revision,
         connector_config_hash=connector_config_hash,
-        path=path,
         tables=tables,
         columns=columns,
         mapping_provenance=mapping_provenance,
@@ -744,7 +695,6 @@ def resolve_mapping_contract(
         source_type=source_type,
         connector_revision=connector_revision,
         connector_config_hash=connector_config_hash,
-        path=path,
         tables=tables,
         columns=columns,
         mapping_ids=mapping_ids,
@@ -864,10 +814,9 @@ def _mapping_contract_payload(
     *,
     source_id: str,
     source_name: str = "",
-    source_type: str = "sqlite",
+    source_type: str = "postgres",
     connector_revision: int,
     connector_config_hash: str = "",
-    path: Path | None = None,
     tables: Mapping[str, str],
     columns: Mapping[str, Mapping[str, str]],
     mapping_provenance: Mapping[str, Mapping[str, Any]],
@@ -880,7 +829,6 @@ def _mapping_contract_payload(
         "source_type": source_type,
         "connector_revision": connector_revision,
         "connector_config_hash": connector_config_hash,
-        "path": str(path) if path is not None else "",
         "tables": dict(sorted(tables.items())),
         "columns": {
             key: dict(sorted(value.items()))
@@ -923,7 +871,7 @@ def _validate_mapping_contract(contract: MedicalAuditMappingContract) -> None:
         or str(getattr(contract.source, "name", "") or "") != contract.source_name
         or str(getattr(contract.source, "type", "") or "").lower()
         != contract.source_type
-        or contract.source_type not in {"sqlite", "mysql", "dataset"}
+        or contract.source_type not in {"postgres", "dataset"}
         or int(getattr(contract.source, "connector_revision", 0) or 0)
         != contract.connector_revision
     ):
@@ -933,16 +881,6 @@ def _validate_mapping_contract(contract: MedicalAuditMappingContract) -> None:
     )
     if _payload_sha256(current_config) != contract.connector_config_hash:
         raise _mapping_contract_error("医保审计数据源配置已偏离已解析的运行映射契约。")
-    if contract.source_type == "sqlite":
-        current_path = Path(str(current_config.get("path") or "")).expanduser().resolve()
-        if current_path != contract.path or not current_path.is_file():
-            raise MedicalAuditError(
-                "RESOURCE_NOT_FOUND",
-                "医保审计数据源路径已变化或不可读取。",
-                retryable=False,
-            )
-    elif contract.path is not None:
-        raise _mapping_contract_error("远端医保审计契约不能携带本地数据库路径。")
     for logical_name, table_name in contract.tables.items():
         _mapped_identifier(table_name, f"{logical_name} 映射表名")
         for column in contract.columns[logical_name].values():
@@ -964,7 +902,6 @@ def _validate_mapping_contract(contract: MedicalAuditMappingContract) -> None:
         source_type=contract.source_type,
         connector_revision=contract.connector_revision,
         connector_config_hash=contract.connector_config_hash,
-        path=contract.path,
         tables=contract.tables,
         columns=contract.columns,
         mapping_provenance=contract.mapping_provenance,
@@ -1088,7 +1025,7 @@ def run_medical_audit(
             )
     except MedicalAuditError:
         raise
-    except (sqlite3.Error, SQLAlchemyError, dataset_query_service.DatasetQueryError) as exc:
+    except (SQLAlchemyError, dataset_query_service.DatasetQueryError) as exc:
         raise MedicalAuditError(
             "TOOL_EXECUTION_FAILED",
             "医保审计查询执行失败，请检查数据源结构和字段类型。",
@@ -1583,7 +1520,7 @@ def _source_schema(contract: MedicalAuditMappingContract) -> _SourceSchema:
                         )
     except MedicalAuditError:
         raise
-    except (sqlite3.Error, SQLAlchemyError, dataset_query_service.DatasetQueryError) as exc:
+    except (SQLAlchemyError, dataset_query_service.DatasetQueryError) as exc:
         raise MedicalAuditError(
             "RESOURCE_NOT_FOUND",
             "无法核验医保审计运行映射对应的关系型数据源结构。",
@@ -1591,7 +1528,6 @@ def _source_schema(contract: MedicalAuditMappingContract) -> _SourceSchema:
         ) from exc
     return _SourceSchema(
         source=contract.source,
-        path=contract.path,
         tables=dict(contract.tables),
         columns={key: dict(value) for key, value in contract.columns.items()},
     )
@@ -1627,7 +1563,7 @@ def find_facility_names_in_text(
         FROM {_q(table)} AS c
         WHERE c.{quoted_column} IS NOT NULL
           AND TRIM(CAST(c.{quoted_column} AS TEXT)) <> ''
-          AND instr(?, TRIM(CAST(c.{quoted_column} AS TEXT))) > 0
+          AND strpos(?, TRIM(CAST(c.{quoted_column} AS TEXT))) > 0
         ORDER BY LENGTH(facility_name) DESC, facility_name ASC
         LIMIT ?
     """
@@ -1637,7 +1573,7 @@ def find_facility_names_in_text(
                 query,
                 (user_message, MAX_FACILITY_SCOPE_MATCHES + 1),
             ).fetchall()
-    except (sqlite3.Error, SQLAlchemyError, dataset_query_service.DatasetQueryError) as exc:
+    except (SQLAlchemyError, dataset_query_service.DatasetQueryError) as exc:
         raise MedicalAuditError(
             "TOOL_EXECUTION_FAILED",
             "无法核验用户指定的医保机构范围。",
@@ -1834,14 +1770,14 @@ def _daily_overstay(
         params.append(facility_name)
     if stay_days:
         stay_expression = f"CAST(e.{_q(stay_days)} AS REAL)"
-    elif connection.dialect == "mysql":
+    elif connection.dialect == "dataset":
         stay_expression = (
-            f"DATEDIFF(DATE(e.{_q(ended_at)}), DATE(e.{_q(started_at)})) + 1"
+            f"date_diff('day', CAST(e.{_q(started_at)} AS DATE), "
+            f"CAST(e.{_q(ended_at)} AS DATE)) + 1"
         )
     else:
         stay_expression = (
-            f"julianday(date(e.{_q(ended_at)})) - "
-            f"julianday(date(e.{_q(started_at)})) + 1"
+            f"(DATE(e.{_q(ended_at)}) - DATE(e.{_q(started_at)})) + 1"
         )
     patient_expression = (
         f"MAX(CAST(e.{_q(encounter_patient)} AS TEXT))"

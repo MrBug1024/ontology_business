@@ -553,27 +553,14 @@ def _lock_materialization_scope(
     scenario_id: str,
 ) -> None:
     """Serialize lineage decisions before any proposal-specific rows exist."""
-    bind = db.get_bind()
-    if bind.dialect.name == "sqlite":
-        # SQLite ignores SELECT FOR UPDATE. This no-op write acquires its
-        # database write lock without advancing the scenario's updated_at.
-        result = db.execute(
-            text(
-                "UPDATE business_scenarios SET id = id "
-                "WHERE id = :scenario_id AND tenant_id = :tenant_id"
-            ),
-            {"scenario_id": scenario_id, "tenant_id": tenant_id},
+    locked = db.scalar(
+        select(BusinessScenario.id)
+        .where(
+            BusinessScenario.id == scenario_id,
+            BusinessScenario.tenant_id == tenant_id,
         )
-        locked = result.rowcount == 1
-    else:
-        locked = db.scalar(
-            select(BusinessScenario.id)
-            .where(
-                BusinessScenario.id == scenario_id,
-                BusinessScenario.tenant_id == tenant_id,
-            )
-            .with_for_update()
-        ) is not None
+        .with_for_update()
+    ) is not None
     if not locked:
         raise ValueError("场景不存在或不属于当前租户")
 

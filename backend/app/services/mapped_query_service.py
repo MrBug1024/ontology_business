@@ -113,7 +113,7 @@ def _safe_identifier(value: Any, label: str, *, maximum: int = 300) -> str:
 
 
 def quote_identifier(data_source_type: str, identifier: Any) -> str:
-    """Quote one physical identifier for SQLite/PostgreSQL/MySQL.
+    """Quote one physical identifier for PostgreSQL or a versioned dataset.
 
     Identifier text never comes from the model, but quoting is still mandatory:
     mapping authors may legitimately use spaces/reserved words and a malformed
@@ -121,12 +121,10 @@ def quote_identifier(data_source_type: str, identifier: Any) -> str:
     """
     value = _safe_identifier(identifier, "映射列名")
     source_type = str(data_source_type or "").strip().lower()
-    if source_type == "mysql":
-        return "`" + value.replace("`", "``") + "`"
-    if source_type in {"sqlite", "postgres", "dataset"}:
+    if source_type in {"postgres", "dataset"}:
         return '"' + value.replace('"', '""') + '"'
     raise MappedQueryError(
-        "确定性映射查询仅支持 dataset、sqlite、postgres 和 mysql 数据源"
+        "确定性映射查询仅支持 dataset 和 PostgreSQL 数据源"
     )
 
 
@@ -225,12 +223,10 @@ def _resolve_mapping_and_source(
         raise MappedQueryError("数据映射的数据源不属于当前租户或业务场景")
     if str(getattr(source, "type", "") or "") not in {
         "dataset",
-        "sqlite",
         "postgres",
-        "mysql",
     }:
         raise MappedQueryError(
-            "确定性映射查询仅支持 dataset、sqlite、postgres 和 mysql 数据源"
+            "确定性映射查询仅支持 dataset 和 PostgreSQL 数据源"
         )
     _safe_identifier(getattr(mapping, "table_name", None), "映射表名")
     return mapping, source

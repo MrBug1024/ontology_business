@@ -71,7 +71,7 @@ _NAMED_PARAMETER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _DERIVED_EXTERNAL_FUNCTION_RE = re.compile(
     r"\b(?:"
     r"read_[A-Za-z0-9_]*|glob|query|query_table|"
-    r"sqlite_scan|postgres_scan|mysql_scan|iceberg_scan|delta_scan|"
+    r"postgres_scan|iceberg_scan|delta_scan|"
     r"arrow_scan|pandas_scan|parquet_scan|pragma_[A-Za-z0-9_]*|"
     r"duckdb_[A-Za-z0-9_]*|current_setting|current_query|"
     r"current_database|current_schema|current_schemas|current_user|session_user"
@@ -1432,8 +1432,6 @@ class DatasetConnection:
             connection.execute("SET allow_persistent_secrets = false")
             connection.execute("SET autoinstall_known_extensions = false")
             connection.execute("SET autoload_known_extensions = false")
-            # The medical audit SQL is intentionally shared with SQLite.
-            connection.execute("CREATE MACRO julianday(value) AS julian(value)")
             derived_plan = _derived_view_plan(connection, catalog)
             for relation, paths in paths_by_relation:
                 connection.from_parquet(

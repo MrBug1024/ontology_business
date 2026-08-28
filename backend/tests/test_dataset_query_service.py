@@ -125,13 +125,13 @@ def test_dataset_connection_uses_verified_views_and_named_parameters(tmp_path: P
         columns, rows = connection.execute(
             "WITH selected AS MATERIALIZED ("
             "SELECT instr(?, name) AS matched, "
-            "julianday(date('2024-01-03')) - julianday(date('2024-01-01')) + 1 AS days "
+            "date_diff('day', date('2024-01-01'), date('2024-01-03')) + 1 AS days "
             'FROM "规则表" WHERE name = ?'
             ") SELECT matched, days FROM selected",
             ("contains beta", "beta"),
         )
         assert columns == ["matched", "days"]
-        assert rows == [(10, 3.0)]
+        assert rows == [(10, 3)]
 
         tables = connection.describe()
         assert tables[0]["name"] == "规则表"
@@ -165,12 +165,6 @@ def test_named_parameter_translation_skips_literals_comments_and_casts() -> None
 @pytest.mark.parametrize(
     ("dialect", "sql"),
     [
-        ("mysql", "SELECT 1 /*!50000 INTO OUTFILE '/tmp/result' */"),
-        ("mysql", "SELECT 1 /*M!100100 SLEEP(3600) */"),
-        ("mysql", "SELECT LOAD_FILE('/etc/passwd')"),
-        ("mysql", "SELECT SLEEP(3600)"),
-        ("mysql", "SELECT GET_LOCK('query-lock', 3600)"),
-        ("mysql", "SELECT BENCHMARK(1000000000, SHA2('x', 512))"),
         ("duckdb", "SELECT sleep_ms(3600000)"),
         ("duckdb", "SELECT * FROM read_csv_auto('/tmp/outside.csv')"),
         ("duckdb", "SELECT * FROM query_table('outside')"),
@@ -190,7 +184,7 @@ def test_dialect_policy_keeps_ordinary_bound_selects_valid() -> None:
         "SELECT id FROM ledger WHERE id = :id "
         "AND note = 'SLEEP(1) is inert text'"
     )
-    assert validate_read_only_sql(statement, dialect="mysql") == statement
+    assert validate_read_only_sql(statement, dialect="postgres") == statement
 
 
 def test_duckdb_resource_limits_timeout_and_connection_recovery(

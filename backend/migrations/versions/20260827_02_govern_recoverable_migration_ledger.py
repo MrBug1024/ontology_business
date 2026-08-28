@@ -8,7 +8,6 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.dialects import mysql
 from sqlalchemy.dialects import postgresql
 
 revision: str = '20260827_02'
@@ -27,9 +26,9 @@ def upgrade() -> None:
     sa.Column('status', sa.String(length=24), nullable=False),
     sa.Column('current_phase', sa.String(length=24), nullable=False),
     sa.Column('manifest', sa.JSON().with_variant(postgresql.JSONB(none_as_null=True, astext_type=sa.Text()), 'postgresql'), nullable=False),
-    sa.Column('started_at', sa.DateTime(timezone=True).with_variant(mysql.DATETIME(fsp=6), 'mysql'), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True).with_variant(mysql.DATETIME(fsp=6), 'mysql'), nullable=False),
-    sa.Column('completed_at', sa.DateTime(timezone=True).with_variant(mysql.DATETIME(fsp=6), 'mysql'), nullable=True),
+    sa.Column('started_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('last_error', sa.Text(), nullable=False),
     sa.CheckConstraint("current_phase IN ('plan', 'bootstrap', 'archive', 'import', 'verify', 'cutover')", name='ck_platform_migration_runs_phase'),
     sa.CheckConstraint("status IN ('running', 'failed', 'verified', 'cutover')", name='ck_platform_migration_runs_status'),
@@ -45,7 +44,7 @@ def upgrade() -> None:
     sa.Column('payload_sha256', sa.String(length=64), nullable=False),
     sa.Column('row_count', sa.BigInteger(), nullable=True),
     sa.Column('payload', sa.JSON().with_variant(postgresql.JSONB(none_as_null=True, astext_type=sa.Text()), 'postgresql'), nullable=False),
-    sa.Column('completed_at', sa.DateTime(timezone=True).with_variant(mysql.DATETIME(fsp=6), 'mysql'), nullable=False),
+    sa.Column('completed_at', sa.DateTime(timezone=True), nullable=False),
     sa.CheckConstraint("status IN ('complete', 'verified')", name='ck_platform_migration_checkpoints_status'),
     sa.CheckConstraint('row_count IS NULL OR row_count >= 0', name='ck_platform_migration_checkpoints_rows'),
     sa.ForeignKeyConstraint(['run_id'], ['platform_migration_runs.id'], ondelete='RESTRICT'),

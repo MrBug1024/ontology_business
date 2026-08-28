@@ -1776,18 +1776,10 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             ),
         )
 
-    def test_semantic_mapping_query_quotes_all_supported_dialects(self) -> None:
-        self.assertEqual(
-            mapped_query_service.quote_identifier("sqlite", 'odd"column'),
-            '"odd""column"',
-        )
+    def test_semantic_mapping_query_quotes_postgresql_identifiers(self) -> None:
         self.assertEqual(
             mapped_query_service.quote_identifier("postgres", 'odd"column'),
             '"odd""column"',
-        )
-        self.assertEqual(
-            mapped_query_service.quote_identifier("mysql", "odd`column"),
-            "`odd``column`",
         )
         self.assertEqual(
             mapped_query_service.quote_table("postgres", "report.projects"),
@@ -1800,24 +1792,18 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             "filters": [{"property": "项目名称", "op": "contains", "value": "A%_!"}],
         }
         source = context.data_sources[0]
-        expected = {
-            "sqlite": ('"project_code"', 'FROM "projects"'),
-            "postgres": ('"project_code"', 'FROM "projects"'),
-            "mysql": ("`project_code`", "FROM `projects`"),
-        }
-        for dialect, fragments in expected.items():
-            source.type = dialect
-            plan = mapped_query_service.prepare_query(
-                self.db,
-                definition=context.runtime_definition,
-                mappings=context.mappings,
-                data_sources=context.data_sources,
-                args=args,
-            )
-            self.assertIn(fragments[0], plan.sql)
-            self.assertIn(fragments[1], plan.sql)
-            self.assertNotIn("A%_!", plan.sql)
-            self.assertEqual(plan.parameters["mq_0"], "%A!%!_!!%")
+        source.type = "postgres"
+        plan = mapped_query_service.prepare_query(
+            self.db,
+            definition=context.runtime_definition,
+            mappings=context.mappings,
+            data_sources=context.data_sources,
+            args=args,
+        )
+        self.assertIn('"project_code"', plan.sql)
+        self.assertIn('FROM "projects"', plan.sql)
+        self.assertNotIn("A%_!", plan.sql)
+        self.assertEqual(plan.parameters["mq_0"], "%A!%!_!!%")
 
     def test_semantic_mapping_query_rechecks_property_acl_and_historic_results(self) -> None:
         owner_context = self._context()

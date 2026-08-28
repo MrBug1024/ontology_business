@@ -705,7 +705,7 @@ def _delete_scenario_governance_history(
 
     Releases, rollbacks and proposals keep RESTRICT foreign keys to immutable
     snapshots.  Deleting the scenario directly lets SQLAlchemy schedule the
-    snapshot deletes before those rows, which fails on SQLite/Postgres even
+    snapshot deletes before those rows, which fails on PostgreSQL even
     though every row belongs to the same user-owned scenario.  Clear the
     dependency chain explicitly; active staging/prod releases are rejected by
     ``assert_scenario_deletion_allowed`` before this helper is called.

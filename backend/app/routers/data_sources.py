@@ -153,8 +153,6 @@ def list_data_sources(scenario_id: str | None = None, db: Session = Depends(get_
 def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_db)):
     if payload.type == "dataset":
         raise HTTPException(400, "版本化数据集只能由平台摄取流程创建")
-    if payload.type == "sqlite" and not get_settings().uses_sqlite_database:
-        raise HTTPException(400, "远端部署禁止创建本地 SQLite 数据源")
     if payload.scenario_id:
         scenario = tenant_service.require_scenario(db, payload.scenario_id, writable=True)
         permission_service.require_scenario_permission(db, scenario, "write")
@@ -190,8 +188,6 @@ def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_d
 
 @router.put("/{ds_id}", response_model=DataSourceOut)
 def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(get_tenant_db)):
-    if payload.type == "sqlite" and not get_settings().uses_sqlite_database:
-        raise HTTPException(400, "远端部署禁止切换为本地 SQLite 数据源")
     observed = tenant_service.require_visible(
         db, DataSource, ds_id, "数据源不存在"
     )

@@ -1296,8 +1296,8 @@ def execute_action(
     log = ActionExecutionLog(**log_values)
     db.add(log)
     # External executors need a durable claim before their side effect.  A
-    # template attachment is local and participates in the same DB transaction
-    # as BucketFile/index metadata instead: an interrupted process rolls back
+    # Template output participates in the same DB transaction as BucketFile and
+    # index metadata: an interrupted process rolls back
     # the claim so the same idempotency key can safely retry instead of being
     # trapped forever behind a committed ``running`` row.
     if enforce_policy and scoped_idempotency_key and not transactional_template:

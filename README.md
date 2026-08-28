@@ -17,9 +17,9 @@
 ## 功能特性
 
 - **业务场景 / 本体建模**：使用行业通用术语定义对象类型、属性、关系类型、对象实例与关系实例，支持命名空间、主键、枚举、约束、生命周期和来源信息。
-- **数据源**：
+  - **数据源**：
   - 版本化数据集：PostgreSQL Catalog 管理元数据，MinIO 保存不可变文件与 Parquet，DuckDB 执行只读查询。
-  - 外部关系型连接器：MySQL / PostgreSQL / SQLite（表浏览 + 受控只读 SQL），不作为平台控制面存储。
+  - PostgreSQL 连接器：表浏览与受控只读 SQL；PostgreSQL 也是平台控制面唯一关系型存储。
   - 文件桶（file bucket）：上传 Excel / Word / Markdown / PDF / 图片，自动解析入库用于 RAG 检索。
 - **技能（Skill）**：安装受控的本地能力，供已配置的操作或工作流调用；内置 `ocr-parser`（OCR 文档解析）与 `data-analyzer`。
 - **MCP 服务**：接入 Model Context Protocol 工具服务（SSE / Streamable HTTP，以及由运维显式开启的 stdio）；支持表单配置请求头，也支持批量导入常见客户端的 `mcpServers` JSON。
@@ -51,15 +51,10 @@ project-root
 │   │   ├── ...                # 平台运行时代码，不包含具体行业种子
 │   │   ├── routers/           # scenarios / data_sources / llm_configs / skills / mcp / agents
 │   │   └── services/          # datasource / doc_parser / llm / rag / skill / mcp / agent_engine
-│   ├── examples/              # 可选演示场景与样例文档（不参与平台运行时）
-│   │   ├── seed_retail.py
-│   │   ├── seed_bookkeeping.py
-│   │   └── bookkeeping_docs/
 │   ├── skills/
 │   │   ├── ocr-parser/        # OCR 文档解析技能（已内置）
 │   │   └── data-analyzer/     # 数据分析技能
 │   ├── tests/                 # 平台策略与核心行为回归测试
-│   ├── data/                  # 仅限测试/历史兼容；远端运行时不保存业务数据
 │   ├── .env.example           # 无密钥配置模板；复制为 .env 后按需填写
 │   └── requirements.txt
 └── frontend/
@@ -90,11 +85,6 @@ python -m pip install -r .\backend\requirements.txt
 
 # 创建本地配置（首次；不要提交真实密钥）
 Copy-Item .\backend\.env.example .\backend\.env
-
-# 生成演示数据（可选；演示种子不属于平台运行时代码）
-$env:PYTHONPATH=(Resolve-Path .\backend).Path
-python .\backend\examples\seed_retail.py
-python .\backend\examples\seed_bookkeeping.py
 
 # 启动后端（默认使用 8001）
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8001

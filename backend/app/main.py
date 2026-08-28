@@ -31,7 +31,6 @@ from .routers import (
 )
 from .services import (
     cache_service,
-    datasource_service,
     object_storage_service,
     operations_service,
     permission_service,
@@ -80,7 +79,6 @@ async def lifespan(_: FastAPI):
     try:
         permission_service.bootstrap_authorization(db)
         operations_service.purge_expired_assistant_attachments(db)
-        datasource_service.reconcile_generated_file_orphans(db)
         db.commit()
         skill_service.sync_skills_to_db(db)
     finally:
@@ -160,7 +158,7 @@ def health():
             settings.minio_bucketname,
         )
     )
-    minio_required = not settings.uses_sqlite_database
+    minio_required = True
     try:
         minio_configured = object_storage_service.configuration().configured
         minio_declared = minio_configured or minio_requested

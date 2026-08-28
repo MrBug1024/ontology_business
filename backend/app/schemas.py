@@ -532,7 +532,7 @@ class ScenarioDetail(ScenarioOut):
 # ──────────────────────────────────────────────
 class DataSourceIn(BaseModel):
     name: str
-    type: Literal["mysql", "postgres", "sqlite", "file_bucket", "dataset"] = "mysql"
+    type: Literal["postgres", "file_bucket", "dataset"] = "postgres"
     scenario_id: str | None = None
     config: dict = Field(default_factory=dict)
 
@@ -554,7 +554,7 @@ class BucketFileOut(BaseModel):
     id: str
     data_source_id: str
     filename: str
-    storage_provider: str = "local"
+    storage_provider: str = "minio"
     bucket_name: str = ""
     object_key: str = ""
     object_version_id: str = ""
@@ -1368,7 +1368,7 @@ class AssistantAttachmentOut(BaseModel):
     filename: str
     mime: str = ""
     size: int = 0
-    storage_provider: str = "none"
+    storage_provider: str = "minio"
     bucket_name: str = ""
     object_key: str = ""
     object_version_id: str = ""

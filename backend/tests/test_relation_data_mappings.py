@@ -825,18 +825,12 @@ def test_release_title_normalization_fk_binding_and_runtime_hash(tmp_path) -> No
         _close_world(world)
 
 
-def test_mysql_and_postgres_mapping_identifiers_are_dialect_safe() -> None:
-    assert ontology_service._quoted_mapping_table("sales.orders", "mysql") == (
-        "`sales`.`orders`"
-    )
-    assert ontology_service._quoted_mapping_column("odd`column", "mysql") == (
-        "`odd``column`"
-    )
+def test_postgresql_mapping_identifiers_are_dialect_safe() -> None:
     assert ontology_service._quoted_mapping_table("sales.orders", "postgres") == (
         '"sales"."orders"'
     )
     with pytest.raises(ValueError):
-        ontology_service._quoted_mapping_table("orders; DROP TABLE users", "mysql")
+        ontology_service._quoted_mapping_table("orders; DROP TABLE users", "postgres")
 
 
 def test_title_and_unique_edge_migration_is_idempotent_and_mapper_is_wired() -> None:
