@@ -66,7 +66,8 @@ interface ApiClient {
   delete<T = any>(url: string, config?: any): Promise<T>
 }
 
-const instance = axios.create({ baseURL: '/api', timeout: 120000, withCredentials: true })
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '')
+const instance = axios.create({ baseURL: apiBaseUrl, timeout: 120000, withCredentials: true })
 
 instance.interceptors.response.use(
   (r) => r.data,
@@ -427,7 +428,7 @@ export function streamChat(
   onError: (e: Error) => void,
 ) {
   const ctrl = new AbortController()
-  fetch(`/api/agents/${agentId}/chat`, {
+  fetch(`${apiBaseUrl}/agents/${agentId}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
@@ -545,7 +546,7 @@ export function streamAssistantChat(
   onError: (e: Error) => void,
 ) {
   return streamAssistantEvents(
-    '/api/assistant/chat/stream',
+    `${apiBaseUrl}/assistant/chat/stream`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -565,7 +566,7 @@ export function streamAssistantCompilationJob(
   onError: (e: Error) => void,
 ) {
   return streamAssistantEvents(
-    `/api/assistant/compilation-jobs/${encodeURIComponent(jobId)}/stream`,
+    `${apiBaseUrl}/assistant/compilation-jobs/${encodeURIComponent(jobId)}/stream`,
     { method: 'GET' },
     onEvent,
     onDone,
