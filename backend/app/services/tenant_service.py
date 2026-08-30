@@ -47,4 +47,6 @@ def require_scenario(db: Session, scenario_id: str, writable: bool = False) -> B
         raise HTTPException(404, "业务场景不存在")
     if writable and scenario.tenant_id != current_tenant_id(db):
         raise HTTPException(403, "公共业务场景只读")
+    if writable and scenario.status == "retired":
+        raise HTTPException(409, "业务场景已退役，只允许读取历史定义与审计记录")
     return scenario

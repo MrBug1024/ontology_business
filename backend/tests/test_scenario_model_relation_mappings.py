@@ -53,8 +53,8 @@ class ScenarioModelRelationMappingTests(unittest.TestCase):
             tenant_id=tenant.id,
             scenario_id=self.scenario.id,
             name="项目业务库",
-            type="sqlite",
-            config={"path": "not-opened-relation-compiler.db"},
+            type="postgres",
+            config={},
         )
         self.db.add_all([tenant, user, self.scenario, self.source])
         self.db.commit()

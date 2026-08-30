@@ -1,6 +1,7 @@
 """End-to-end proof that configured scenario resources reach the Agent runtime."""
 from __future__ import annotations
 
+import copy
 import json
 import unittest
 from types import SimpleNamespace
@@ -12,6 +13,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
+from app.providers.medical_audit import grounding as medical_grounding
+from app.providers.medical_audit.provider import COMPATIBILITY_MANIFEST
 from app.routers import agents as agents_router
 from app.routers import scenarios as scenarios_router
 from app.schemas import ActionExecuteRequest
@@ -52,6 +55,7 @@ from app.services import (
     runtime_definition_service,
     workflow_service,
 )
+from app.services.capability_agent_extensions import GroundingResult
 from app.services.policies import (
     PolicyViolation,
     validate_agent_sql_scope,
@@ -66,6 +70,61 @@ def _schema(properties: dict | None = None, required: list[str] | None = None) -
         "required": required or [],
         "additionalProperties": False,
     }
+
+
+def _medical_truthful_final_content(
+    content: str,
+    *,
+    user_message: str,
+    tool_outcomes: list[dict[str, Any]],
+    controlled_medical_audit: bool = True,
+    authoritative_medical_facilities: list[str] | None = None,
+    medical_facility_lookup_succeeded: bool | None = None,
+) -> str:
+    """Exercise Provider-owned grounding through the generic Agent contract."""
+
+    del controlled_medical_audit  # compatibility with the pre-Provider test shape
+    result = medical_grounding.grounding_result(
+        tool_outcomes,
+        user_message=user_message,
+        tool_names=tuple(
+            tool.name for tool in COMPATIBILITY_MANIFEST.tool_aliases
+        ),
+        authoritative_facilities=authoritative_medical_facilities,
+        facility_lookup_succeeded=medical_facility_lookup_succeeded,
+        definition_hash="test-definition-hash",
+    )
+    return agent_engine._truthful_final_content(
+        content,
+        user_message=user_message,
+        tool_outcomes=tool_outcomes,
+        grounding_results=(result,),
+    )
+
+
+def _unverified_grounding() -> GroundingResult:
+    return GroundingResult(
+        provider_key="test.governed-audit",
+        provider_version="1.0.0",
+        verified=False,
+        status_lines=(
+            "未形成可验证审计结论，不能把当前回答作为违规审计结果。",
+        ),
+    )
+
+
+class _UnverifiedGroundingExtension:
+    provider_key = "test.governed-audit"
+    provider_version = "1.0.0"
+
+    def agent_tools(self) -> tuple:
+        return ()
+
+    def prepare_grounding(self, _user_message: str) -> None:
+        return None
+
+    def ground(self, _user_message: str, _tool_outcomes: Any, _prepared: Any) -> GroundingResult:
+        return _unverified_grounding()
 
 
 class AgentCapabilityClosureTests(unittest.TestCase):
@@ -201,7 +260,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="项目主数据",
-            type="sqlite",
+            type="postgres",
             config={},
             status="ok",
         )
@@ -606,8 +665,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         ):
             self.assertIn(expected, prompt)
         for expected in (
-            "就是本次审计的有效规则",
-            "在该范围内未发现违规",
+            "就是当前请求的有效约束",
+            "在该范围内未发现匹配记录",
             "不得向用户索要内部 ID",
             "最多重试一次",
             "必须先调用 list_actions",
@@ -624,16 +683,20 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             "event-risk-found": "risk_found_event",
             "workflow-risk-response": "risk_response_workflow",
         }
-        for resources in (
-            context.functions,
-            context.actions,
-            context.rules,
-            context.events,
-            context.workflows,
+        for attribute in (
+            "functions",
+            "actions",
+            "rules",
+            "events",
+            "workflows",
         ):
-            for resource in resources:
+            working_resources = []
+            for resource in getattr(context, attribute):
+                resource = copy.copy(resource)
                 if resource.id in aliases:
                     resource.api_name = aliases[resource.id]
+                working_resources.append(resource)
+            setattr(context, attribute, working_resources)
 
         self.assertEqual(
             json.loads(
@@ -705,7 +768,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         )
         self.assertEqual(normalized["required"], ["project_id"])
         self.assertEqual(normalized["properties"]["project_id"]["type"], "string")
-        workflow = context.workflows[0]
+        workflow = copy.copy(context.workflows[0])
+        context.workflows[0] = workflow
         workflow.nodes = [
             {"id": "start", "type": "start", "data": {}},
             {
@@ -753,11 +817,15 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="SQL Action 参数绑定",
-            type="sqlite",
-            config={"path": ":memory:"},
+            type="postgres",
+            config={},
             status="ok",
         )
-        engine = datasource_service.get_engine(source)
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
         try:
             with engine.begin() as connection:
                 connection.execute(text("CREATE TABLE allowed_rows (code TEXT, visible TEXT)"))
@@ -769,26 +837,27 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                     text("INSERT INTO hidden_rows VALUES ('不可越权读取')")
                 )
 
-            injected = workflow_service._exec_sql(
-                self.db,
-                {
-                    "data_source_id": source.id,
-                    "sql": "SELECT visible FROM allowed_rows WHERE code = '{code}'",
-                },
-                {"code": "X' UNION SELECT secret FROM hidden_rows --"},
-                data_source=source,
-            )
-            self.assertEqual(injected["rows"], [])
-            legitimate = workflow_service._exec_sql(
-                self.db,
-                {
-                    "data_source_id": source.id,
-                    "sql": "SELECT visible FROM allowed_rows WHERE code = {code} OR code = {code}",
-                },
-                {"code": "SAFE"},
-                data_source=source,
-            )
-            self.assertEqual(legitimate["rows"], [["可见记录"]])
+            with patch.object(datasource_service, "get_engine", return_value=engine):
+                injected = workflow_service._exec_sql(
+                    self.db,
+                    {
+                        "data_source_id": source.id,
+                        "sql": "SELECT visible FROM allowed_rows WHERE code = '{code}'",
+                    },
+                    {"code": "X' UNION SELECT secret FROM hidden_rows --"},
+                    data_source=source,
+                )
+                self.assertEqual(injected["rows"], [])
+                legitimate = workflow_service._exec_sql(
+                    self.db,
+                    {
+                        "data_source_id": source.id,
+                        "sql": "SELECT visible FROM allowed_rows WHERE code = {code} OR code = {code}",
+                    },
+                    {"code": "SAFE"},
+                    data_source=source,
+                )
+                self.assertEqual(legitimate["rows"], [["可见记录"]])
 
             for template, params in (
                 ("SELECT {missing}", {}),
@@ -799,7 +868,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                 with self.assertRaises(ValueError, msg=template):
                     workflow_service._compile_sql_action(template, params)
         finally:
-            datasource_service.invalidate_engine(source)
+            engine.dispose()
 
     def test_disabled_definitions_are_discoverable_but_not_invocable(self) -> None:
         self.db.query(FunctionDefinition).filter(
@@ -930,7 +999,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="未绑定隐私数据",
-            type="sqlite",
+            type="postgres",
             config={},
         )
         hidden_mapping = DataMapping(
@@ -1073,7 +1142,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             )
 
             source = self.db.get(DataSource, "source-projects")
-            source.config = {"database": "same-schema-rebound.sqlite"}
+            source.config = {"database": "same_schema_rebound"}
             self.db.commit()
             rebound_context = self._context()
             self.assertFalse(
@@ -2400,6 +2469,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
 
     def test_run_agent_truth_guard_rejects_delivery_claim_without_tools(self) -> None:
         context = self._context()
+        context.provider_extensions = (_UnverifiedGroundingExtension(),)
         with patch.object(
             agent_engine.llm_service,
             "chat_stream",
@@ -2592,6 +2662,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
 
     def test_run_agent_truth_guard_requires_successful_audit_query(self) -> None:
         context = self._context()
+        context.provider_extensions = (_UnverifiedGroundingExtension(),)
         responses = iter(
             [
                 iter(
@@ -2666,7 +2737,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             }
         ]
 
-        controlled = agent_engine._truthful_final_content(
+        controlled = _medical_truthful_final_content(
             "已完成重复收费违规审计。",
             user_message="请完成医保重复收费违规审计",
             tool_outcomes=outcomes,
@@ -2676,6 +2747,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             "已完成项目审计。",
             user_message="请审计项目违规情况",
             tool_outcomes=outcomes,
+            grounding_results=(_unverified_grounding(),),
         )
 
         self.assertIn("未形成可验证审计结论", controlled)
@@ -2712,6 +2784,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             "AP001 年度审计已经完成。",
             user_message="请完成 AP001 年度审计的全部工作任务",
             tool_outcomes=[first_page],
+            grounding_results=(_unverified_grounding(),),
         )
         complete = agent_engine._truthful_final_content(
             "AP001 年度审计查询完成。",
@@ -2724,6 +2797,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                     "result": mapped_page(2, truncated=False),
                 },
             ],
+            grounding_results=(_unverified_grounding(),),
         )
 
         self.assertIn("未形成可验证审计结论", incomplete)
@@ -2756,7 +2830,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             },
         }
 
-        final_content = agent_engine._truthful_final_content(
+        final_content = _medical_truthful_final_content(
             "审计完成：20 条，金额 975.95 元。",
             user_message=(
                 "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
@@ -2824,7 +2898,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             },
         ]
 
-        final_content = agent_engine._truthful_final_content(
+        final_content = _medical_truthful_final_content(
             "已完成审计。",
             user_message=(
                 "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
@@ -2868,13 +2942,13 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             "result": json.dumps(payload, ensure_ascii=False),
         }]
 
-        wrong_strategy = agent_engine._truthful_final_content(
+        wrong_strategy = _medical_truthful_final_content(
             "审计完成。",
             user_message="请审计阿司匹林用药天数超过 7 天的违规记录",
             tool_outcomes=outcome,
             controlled_medical_audit=True,
         )
-        missing_parameter = agent_engine._truthful_final_content(
+        missing_parameter = _medical_truthful_final_content(
             "审计完成。",
             user_message="请审计电子结肠镜检查的重复收费问题",
             tool_outcomes=outcome,
@@ -2886,13 +2960,13 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertNotIn("医保确定性汇总", wrong_strategy)
         self.assertNotIn("医保确定性汇总", missing_parameter)
         self.assertTrue(
-            agent_engine._medical_number_mentioned(
+            medical_grounding._medical_number_mentioned(
                 "请审计 AP001 刮痧治疗收费大于两次的记录",
                 2,
             )
         )
         self.assertFalse(
-            agent_engine._medical_number_mentioned(
+            medical_grounding._medical_number_mentioned(
                 "请审计 AP001 刮痧治疗收费大于两次的记录",
                 1,
             )
@@ -2936,25 +3010,25 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         scoped_request = (
             "请审计贵阳泰康乐综合医院刮痧治疗收费大于两次的违规记录"
         )
-        omitted = agent_engine._truthful_final_content(
+        omitted = _medical_truthful_final_content(
             "审计完成。",
             user_message=scoped_request,
             tool_outcomes=outcome(None),
             controlled_medical_audit=True,
         )
-        wrong = agent_engine._truthful_final_content(
+        wrong = _medical_truthful_final_content(
             "审计完成。",
             user_message=scoped_request,
             tool_outcomes=outcome("其他医院"),
             controlled_medical_audit=True,
         )
-        matched = agent_engine._truthful_final_content(
+        matched = _medical_truthful_final_content(
             "审计完成。",
             user_message=scoped_request,
             tool_outcomes=outcome("贵阳泰康乐综合医院"),
             controlled_medical_audit=True,
         )
-        project_code_only = agent_engine._truthful_final_content(
+        project_code_only = _medical_truthful_final_content(
             "审计完成。",
             user_message="请审计 AP001 刮痧治疗收费大于两次的违规记录",
             tool_outcomes=outcome(None),
@@ -2969,7 +3043,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertNotIn("未形成可验证审计结论", matched)
         self.assertIn("医保确定性汇总", project_code_only)
         self.assertNotIn("未形成可验证审计结论", project_code_only)
-        production_matched = agent_engine._truthful_final_content(
+        production_matched = _medical_truthful_final_content(
             "审计完成。",
             user_message=scoped_request,
             tool_outcomes=outcome("贵阳泰康乐综合医院"),
@@ -2977,7 +3051,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             authoritative_medical_facilities=["贵阳泰康乐综合医院"],
             medical_facility_lookup_succeeded=True,
         )
-        global_matched = agent_engine._truthful_final_content(
+        global_matched = _medical_truthful_final_content(
             "审计完成。",
             user_message="请审计刮痧治疗收费大于 2 次的违规记录",
             tool_outcomes=outcome(None),
@@ -2985,7 +3059,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             authoritative_medical_facilities=[],
             medical_facility_lookup_succeeded=True,
         )
-        no_facility_negative_business_term = agent_engine._truthful_final_content(
+        no_facility_negative_business_term = _medical_truthful_final_content(
             "审计完成。",
             user_message=(
                 "请审计刮痧治疗收费大于 2 次且不包含已撤销记录的违规情况"
@@ -3024,14 +3098,14 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         for service_exclusion_request in service_exclusion_requests:
             with self.subTest(service_exclusion_request=service_exclusion_request):
                 self.assertFalse(
-                    agent_engine._medical_request_excludes_facility(
+                    medical_grounding._medical_request_excludes_facility(
                         service_exclusion_request,
                         ["贵阳泰康乐综合医院"],
                     )
                 )
         for auditable_service_exclusion in service_exclusion_requests[1:]:
             with self.subTest(auditable_service_exclusion=auditable_service_exclusion):
-                verified = agent_engine._truthful_final_content(
+                verified = _medical_truthful_final_content(
                     "审计完成。",
                     user_message=auditable_service_exclusion,
                     tool_outcomes=outcome("贵阳泰康乐综合医院"),
@@ -3066,13 +3140,13 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         for excluded_request in excluded_requests:
             with self.subTest(excluded_request=excluded_request):
                 self.assertTrue(
-                    agent_engine._medical_request_excludes_facility(
+                    medical_grounding._medical_request_excludes_facility(
                         excluded_request,
                         [facility],
                     )
                 )
                 for tool_facility in (facility, None):
-                    excluded = agent_engine._truthful_final_content(
+                    excluded = _medical_truthful_final_content(
                         "审计完成。",
                         user_message=excluded_request,
                         tool_outcomes=outcome(tool_facility),
@@ -3096,7 +3170,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             alias_zero_payload,
             ensure_ascii=False,
         )
-        unmatched_alias = agent_engine._truthful_final_content(
+        unmatched_alias = _medical_truthful_final_content(
             "未发现违规记录。",
             user_message=f"请审计{alias}刮痧治疗收费大于 2 次的违规记录",
             tool_outcomes=alias_zero_outcome,
@@ -3107,11 +3181,11 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertIn("未形成可验证审计结论", unmatched_alias)
         self.assertNotIn("医保确定性汇总", unmatched_alias)
         self.assertEqual(
-            agent_engine._requested_medical_facilities(scoped_request),
-            {agent_engine._normalized_business_text("贵阳泰康乐综合医院")},
+            medical_grounding._requested_medical_facilities(scoped_request),
+            {medical_grounding._normalized_business_text("贵阳泰康乐综合医院")},
         )
         self.assertEqual(
-            agent_engine._requested_medical_facilities(
+            medical_grounding._requested_medical_facilities(
                 "请审计 AP001 项目和所有医疗机构的违规记录"
             ),
             set(),
@@ -3122,7 +3196,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             "请审计 AP-001 医院项目的收费情况",
         ):
             self.assertEqual(
-                agent_engine._requested_medical_facilities(generic_project_scope),
+                medical_grounding._requested_medical_facilities(generic_project_scope),
                 set(),
             )
 
@@ -3132,15 +3206,15 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         long_request = (
             f"请审计{long_facility}刮痧治疗收费大于两次的违规记录"
         )
-        resolved = agent_engine._resolved_medical_facilities(
+        resolved = medical_grounding._resolved_medical_facilities(
             long_request,
             [long_facility],
         )
         self.assertEqual(
             resolved,
-            {agent_engine._normalized_business_text(long_facility)},
+            {medical_grounding._normalized_business_text(long_facility)},
         )
-        long_omitted = agent_engine._truthful_final_content(
+        long_omitted = _medical_truthful_final_content(
             "审计完成。",
             user_message=long_request,
             tool_outcomes=outcome(None),
@@ -3148,7 +3222,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             authoritative_medical_facilities=[long_facility],
             medical_facility_lookup_succeeded=True,
         )
-        long_matched = agent_engine._truthful_final_content(
+        long_matched = _medical_truthful_final_content(
             "审计完成。",
             user_message=long_request,
             tool_outcomes=outcome(long_facility),
@@ -3156,7 +3230,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             authoritative_medical_facilities=[long_facility],
             medical_facility_lookup_succeeded=True,
         )
-        failed_lookup = agent_engine._truthful_final_content(
+        failed_lookup = _medical_truthful_final_content(
             "审计完成。",
             user_message=scoped_request,
             tool_outcomes=outcome("贵阳泰康乐综合医院"),
@@ -3175,18 +3249,18 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         station_request = (
             f"请审计{long_station}和{short_station}刮痧治疗收费大于两次的违规记录"
         )
-        station_scopes = agent_engine._resolved_medical_facilities(
+        station_scopes = medical_grounding._resolved_medical_facilities(
             station_request,
             [long_station, short_station],
         )
         self.assertEqual(
             station_scopes,
             {
-                agent_engine._normalized_business_text(long_station),
-                agent_engine._normalized_business_text(short_station),
+                medical_grounding._normalized_business_text(long_station),
+                medical_grounding._normalized_business_text(short_station),
             },
         )
-        station_single_result = agent_engine._truthful_final_content(
+        station_single_result = _medical_truthful_final_content(
             "审计完成。",
             user_message=station_request,
             tool_outcomes=outcome(long_station),
@@ -3206,10 +3280,10 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         ):
             with self.subTest(facility_suffix=facility):
                 self.assertEqual(
-                    agent_engine._requested_medical_facilities(
+                    medical_grounding._requested_medical_facilities(
                         f"请审计{facility}的收费记录"
                     ),
-                    {agent_engine._normalized_business_text(facility)},
+                    {medical_grounding._normalized_business_text(facility)},
                 )
 
     def test_truth_guard_rejects_duplicate_or_empty_medical_page_identity(self) -> None:
@@ -3249,7 +3323,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             [str(index) for index in range(10)],
             truncated=False,
         )
-        duplicate_content = agent_engine._truthful_final_content(
+        duplicate_content = _medical_truthful_final_content(
             "已返回全部明细。",
             user_message=(
                 "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
@@ -3274,7 +3348,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             ["", *[str(index) for index in range(1, 10)]],
             truncated=True,
         )
-        empty_content = agent_engine._truthful_final_content(
+        empty_content = _medical_truthful_final_content(
             "已返回全部明细。",
             user_message=(
                 "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"

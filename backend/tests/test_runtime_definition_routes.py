@@ -29,6 +29,7 @@ from app.models import (
     OntologyEntity,
     OntologyEvent,
     OntologyProperty,
+    OntologyProposal,
     OntologyRelation,
     OntologyRelease,
     OntologyRule,
@@ -39,7 +40,12 @@ from app.models import (
     WorkflowRun,
 )
 from app.routers import scenarios as scenarios_router
-from app.services import connector_service, permission_service, release_service
+from app.services import (
+    connector_service,
+    permission_service,
+    release_service,
+    runtime_definition_service,
+)
 from app.services.auth_service import get_current_user
 
 
@@ -93,7 +99,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 tenant_id=self.tenant.id,
                 scenario_id=self.scenario.id,
                 name="发布版订单源",
-                type="sqlite",
+                type="postgres",
                 config={},
             )
             self.mapping = DataMapping(
@@ -102,7 +108,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 entity_id=self.entity.id,
                 data_source_id=self.source.id,
                 data_source_binding_key="runtime-orders",
-                data_source_binding_ref={"adapter": "sqlite"},
+                data_source_binding_ref={"adapter": "postgres"},
                 table_name="orders",
                 column_map={},
             )
@@ -124,7 +130,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 executor_config={
                     "sql": "SELECT 'release-a'",
                     "data_source_binding_key": "runtime-orders",
-                    "data_source_binding_ref": {"adapter": "sqlite"},
+                    "data_source_binding_ref": {"adapter": "postgres"},
                 },
                 requires_confirmation=False,
                 idempotency_required=False,
@@ -449,8 +455,8 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_user_owned_scenario_with_dev_release_history_can_be_deleted(self) -> None:
-        """Deleting a draft/dev scenario also removes its immutable history."""
+    def test_user_owned_scenario_with_dev_release_history_is_retired(self) -> None:
+        """Retirement preserves immutable definitions and release history."""
         self._create_staging_release()
         db = self.Session()
         try:
@@ -458,9 +464,6 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
             self.assertIsNotNone(release)
             release.environment = "dev"
             db.commit()
-            # The application enables SQLite foreign keys.  Turn them on for
-            # this in-memory route fixture too so deletion order is exercised.
-            db.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
         finally:
             db.close()
 
@@ -469,10 +472,194 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
 
         db = self.Session()
         try:
-            db.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
-            self.assertIsNone(db.get(BusinessScenario, self.scenario.id))
-            self.assertIsNone(db.get(OntologyRelease, "release-runtime-a"))
-            self.assertIsNone(db.get(OntologySnapshot, "snapshot-runtime-a"))
-            self.assertIsNone(db.get(OntologyBranch, "branch-runtime"))
+            scenario = db.get(BusinessScenario, self.scenario.id)
+            self.assertIsNotNone(scenario)
+            self.assertEqual(scenario.status, "retired")
+            self.assertIsNotNone(db.get(OntologyRelease, "release-runtime-a"))
+            self.assertIsNotNone(db.get(OntologySnapshot, "snapshot-runtime-a"))
+            self.assertIsNotNone(db.get(OntologyBranch, "branch-runtime"))
+            with self.assertRaisesRegex(
+                runtime_definition_service.RuntimeDefinitionError,
+                "已退役",
+            ):
+                runtime_definition_service.resolve_active(db, scenario, environment="dev")
+        finally:
+            db.close()
+
+    def test_withdraw_and_retire_keep_staging_snapshot_read_only(self) -> None:
+        snapshot_id, release_id = self._create_staging_release()
+
+        withdrawn = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/releases/staging/withdraw",
+            json={"confirmed": True, "reason": "场景正式退役前撤下部署"},
+        )
+        self.assertEqual(withdrawn.status_code, 200, withdrawn.text)
+        self.assertTrue(withdrawn.json()["changed"])
+        self.assertEqual(withdrawn.json()["withdrawn_release_ids"], [release_id])
+        self.assertEqual(withdrawn.json()["withdrawn_by_user_id"], self.user.id)
+
+        replay = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/releases/staging/withdraw",
+            json={"confirmed": True, "reason": "重复请求不得重写第一次审计"},
+        )
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertFalse(replay.json()["changed"])
+        self.assertEqual(replay.json()["reason"], "场景正式退役前撤下部署")
+
+        retired = self.client.delete(f"/api/scenarios/{self.scenario.id}")
+        self.assertEqual(retired.status_code, 200, retired.text)
+
+        with self._staging_settings():
+            detail = self.client.get(
+                f"/api/scenarios/{self.scenario.id}?include_runtime_facts=false"
+            )
+            self.assertEqual(detail.status_code, 200, detail.text)
+            self.assertEqual(detail.json()["status"], "retired")
+            self.assertFalse(detail.json()["can_write"])
+            self.assertEqual(
+                [item["name"] for item in detail.json()["actions"]],
+                ["发布版操作 A"],
+            )
+            self.assertEqual(
+                [item["name"] for item in detail.json()["events"]],
+                ["发布版事件 A"],
+            )
+            self.assertIn(
+                "发布版工作流 A",
+                [item["name"] for item in detail.json()["workflows"]],
+            )
+
+            blocked_execution = self.client.post(
+                f"/api/scenarios/actions/{self.action.id}/execute",
+                json={"params": {}, "dry_run": True},
+            )
+            self.assertEqual(
+                blocked_execution.status_code,
+                409,
+                blocked_execution.text,
+            )
+            self.assertIn("已退役", blocked_execution.text)
+
+        db = self.Session()
+        try:
+            db.info["tenant_id"] = self.tenant.id
+            db.info["user_id"] = self.user.id
+            scenario = db.get(BusinessScenario, self.scenario.id)
+            release = db.get(OntologyRelease, release_id)
+            self.assertEqual(release.status, "rolled_back")
+            self.assertIsNotNone(release.withdrawn_at)
+            self.assertEqual(release.withdrawn_by_user_id, self.user.id)
+            self.assertEqual(release.withdraw_reason, "场景正式退役前撤下部署")
+            with self.assertRaisesRegex(
+                runtime_definition_service.RuntimeDefinitionError,
+                "已退役",
+            ):
+                runtime_definition_service.resolve_active(
+                    db,
+                    scenario,
+                    environment="staging",
+                )
+            history = runtime_definition_service.resolve_retired_history(
+                db,
+                scenario,
+                environment="staging",
+            )
+            self.assertEqual(history.snapshot_id, snapshot_id)
+            self.assertEqual(history.release_id, release_id)
+            self.assertEqual(history.actions[self.action.id].name, "发布版操作 A")
+            self.assertEqual(db.query(ActionExecutionLog).count(), 0)
+        finally:
+            db.close()
+
+    def test_every_governance_write_rejects_a_retired_scenario(self) -> None:
+        snapshot_id, _release_id = self._create_staging_release()
+        withdrawn = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/releases/staging/withdraw",
+            json={"confirmed": True, "reason": "为退役治理边界测试撤下"},
+        )
+        self.assertEqual(withdrawn.status_code, 200, withdrawn.text)
+
+        db = self.Session()
+        try:
+            proposal = OntologyProposal(
+                id="proposal-retired-guard",
+                tenant_id=self.tenant.id,
+                scenario_id=self.scenario.id,
+                branch_id="branch-runtime",
+                base_snapshot_id=snapshot_id,
+                proposed_snapshot_id=snapshot_id,
+                title="退役写入边界",
+                status="draft",
+                created_by_user_id=self.user.id,
+            )
+            db.add(proposal)
+            db.commit()
+        finally:
+            db.close()
+
+        retired = self.client.delete(f"/api/scenarios/{self.scenario.id}")
+        self.assertEqual(retired.status_code, 200, retired.text)
+
+        db = self.Session()
+        db.info["tenant_id"] = self.tenant.id
+        db.info["user_id"] = self.user.id
+        try:
+            snapshot = db.get(OntologySnapshot, snapshot_id)
+            blocked_writes = (
+                lambda: release_service.create_branch(
+                    db,
+                    self.scenario.id,
+                    name="retired-branch",
+                ),
+                lambda: release_service.create_proposal(
+                    db,
+                    "branch-runtime",
+                    title="retired-proposal",
+                    description="",
+                    content=snapshot.content,
+                ),
+                lambda: release_service.submit_proposal(
+                    db,
+                    "proposal-retired-guard",
+                ),
+                lambda: release_service.create_review(
+                    db,
+                    "proposal-retired-guard",
+                    decision="approve",
+                ),
+                lambda: release_service.merge_proposal(
+                    db,
+                    "proposal-retired-guard",
+                    confirmed=True,
+                ),
+                lambda: release_service.publish_snapshot(
+                    db,
+                    self.scenario.id,
+                    environment="staging",
+                    confirmed=True,
+                    snapshot_id=snapshot_id,
+                ),
+                lambda: release_service.rollback_snapshot(
+                    db,
+                    self.scenario.id,
+                    target_snapshot_id=snapshot_id,
+                    confirmed=True,
+                    environment="staging",
+                ),
+                lambda: release_service.withdraw_environment(
+                    db,
+                    self.scenario.id,
+                    environment="staging",
+                    confirmed=True,
+                    reason="不得改写退役发布",
+                ),
+            )
+            for write in blocked_writes:
+                with self.assertRaisesRegex(
+                    release_service.ReleaseConflictError,
+                    "已退役",
+                ):
+                    write()
+                db.rollback()
         finally:
             db.close()

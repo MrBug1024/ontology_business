@@ -114,7 +114,13 @@ def install_skill_from_dir(src: Path, name: str) -> Path:
     return dst
 
 
-def execute_skill(skill: Skill, args: list[str], timeout: int = 600) -> dict[str, Any]:
+def execute_skill(
+    skill: Skill,
+    args: list[str],
+    timeout: int = 600,
+    *,
+    execution_key: str | None = None,
+) -> dict[str, Any]:
     """执行技能入口脚本，返回 {"status", "stdout", "stderr", "exit_code"}。"""
     entry = _find_entry(Path(skill.path))
     if not entry:
@@ -125,6 +131,8 @@ def execute_skill(skill: Skill, args: list[str], timeout: int = 600) -> dict[str
         env.setdefault("OCR_API_KEY", s.ocr_api_key)
     if s.ocr_base_url:
         env.setdefault("OCR_BASE_URL", s.ocr_base_url)
+    if execution_key:
+        env["CAPABILITY_EXECUTION_KEY"] = str(execution_key)
     cmd = [sys.executable, entry, *args]
     try:
         proc = subprocess.run(

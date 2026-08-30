@@ -3,6 +3,7 @@ import type {
   ScenarioModelDraftListResponse,
   ScenarioModelDraftResource,
 } from '@/types'
+import { normalizeCandidateBlockers } from './candidateGovernance.ts'
 
 export const scenarioDraftStages = [
   'ontology',
@@ -13,6 +14,7 @@ export const scenarioDraftStages = [
   'rules',
   'events',
   'workflows',
+  'candidates',
 ] as const
 
 export type ScenarioDraftStage = typeof scenarioDraftStages[number]
@@ -31,6 +33,7 @@ const stageByKind: Record<string, ScenarioDraftStage> = {
   rule: 'rules',
   event: 'events',
   workflow: 'workflows',
+  capability_port: 'candidates',
 }
 
 const kindLabels: Record<string, string> = {
@@ -47,6 +50,7 @@ const kindLabels: Record<string, string> = {
   rule: '规则',
   event: '事件',
   workflow: '工作流',
+  capability_port: '能力端口',
 }
 
 const stageLabels: Record<ScenarioDraftStage, string> = {
@@ -58,6 +62,7 @@ const stageLabels: Record<ScenarioDraftStage, string> = {
   rules: '规则',
   events: '事件',
   workflows: '工作流',
+  candidates: '候选定义',
 }
 
 function clean(value: unknown) {
@@ -167,7 +172,23 @@ export function normalizeScenarioModelDrafts(
         validationIssues.filter((entry) => entry.blocking).length,
       ),
       draft_status: clean(item.draft_status || item.status) || 'needs_revision',
-      source: clean(item.source) || 'assistant',
+      source: clean(item.source || item.materialization_source) || 'unknown',
+      materialization_source: clean(item.materialization_source || item.source),
+      source_origin: ['assistant', 'manual', 'imported'].includes(clean(item.source_origin))
+        ? item.source_origin
+        : 'unknown',
+      validation_status: ['valid', 'invalid'].includes(clean(item.validation_status))
+        ? item.validation_status
+        : 'not_validated',
+      lifecycle_status: ['candidate', 'deferred', 'formalized', 'resolved', 'superseded'].includes(clean(item.lifecycle_status))
+        ? item.lifecycle_status
+        : 'candidate',
+      promotion_eligible: item.promotion_eligible === true,
+      promotion_blockers: normalizeCandidateBlockers(item.promotion_blockers),
+      activation_status: ['active', 'not_applicable'].includes(clean(item.activation_status))
+        ? item.activation_status
+        : 'inactive',
+      quality_fingerprint: clean(item.quality_fingerprint),
       source_thread_id: clean(item.source_thread_id || item.thread_id) || null,
       source_message_id: clean(item.source_message_id) || null,
       compilation_job_id: clean(item.compilation_job_id) || null,

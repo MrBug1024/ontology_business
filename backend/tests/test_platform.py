@@ -492,7 +492,7 @@ class MappingRuntimeTests(unittest.TestCase):
 
     def test_preview_reports_mapping_coverage_and_unmapped_columns(self) -> None:
         scenario = SimpleNamespace(id="scenario-1")
-        data_source = SimpleNamespace(id="source-1", scenario_id=None, type="sqlite", name="业务库")
+        data_source = SimpleNamespace(id="source-1", scenario_id=None, type="postgres", name="业务库")
         entity = SimpleNamespace(
             id="entity-1",
             scenario_id="scenario-1",

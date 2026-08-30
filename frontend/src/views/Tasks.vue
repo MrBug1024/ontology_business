@@ -2,9 +2,9 @@
   <main class="task-page" aria-labelledby="task-page-title">
     <header class="task-header">
       <div>
-        <div class="eyebrow">OPERATIONS</div>
-        <h1 id="task-page-title">任务中心</h1>
-        <p>跟踪工作流队列、重试和人工审批，所有状态均可回溯。</p>
+        <div class="eyebrow">RUNTIME GOVERNANCE</div>
+        <h1 id="task-page-title">运行治理</h1>
+        <p>治理工作流运行、重试与人工审批，所有状态均可回溯。</p>
       </div>
       <div class="task-header-actions">
         <el-button :loading="loading" @click="loadTasks()">

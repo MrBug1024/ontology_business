@@ -39,7 +39,7 @@ from app.services import (
 
 
 def _binding(key: str) -> tuple[str, dict]:
-    return key, {"adapter": "sqlite", "required_capabilities": ["sql_read"]}
+    return key, {"adapter": "postgres", "required_capabilities": ["sql_read"]}
 
 
 def _write_source_database(path: str) -> None:
@@ -65,6 +65,101 @@ def _write_source_database(path: str) -> None:
             INSERT INTO join_links VALUES (' S-1 ', '7');
             """
         )
+
+
+def _external_connector_fakes(source_path: str):
+    """Replace network I/O while retaining a PostgreSQL public contract.
+
+    The temporary SQLite file is only a deterministic test double behind the
+    connector service boundary; no production runtime path sees or accepts a
+    SQLite DataSource.
+    """
+
+    def execute_query(
+        sql: str,
+        parameters: dict | None,
+        limit: int | None,
+    ) -> dict:
+        statement = datasource_service.validate_read_only_sql(
+            sql,
+            dialect="postgres",
+        )
+        resolved_limit = max(1, int(limit or 500))
+        with sqlite3.connect(source_path) as connection:
+            cursor = connection.execute(statement, parameters or {})
+            columns = [str(item[0]) for item in (cursor.description or [])]
+            rows = cursor.fetchmany(resolved_limit + 1)
+        truncated = len(rows) > resolved_limit
+        values = [list(row) for row in rows[:resolved_limit]]
+        return {
+            "columns": columns,
+            "rows": values,
+            "row_count": len(values),
+            "truncated": truncated,
+        }
+
+    def fake_run_query(
+        _source,
+        sql: str,
+        limit: int | None = None,
+        *,
+        max_rows: int | None = None,
+    ) -> dict:
+        ceiling = limit if limit is not None else max_rows
+        return execute_query(sql, None, ceiling)
+
+    def fake_run_parameterized_query(
+        _source,
+        sql: str,
+        parameters,
+        *,
+        limit: int | None = None,
+    ) -> dict:
+        return execute_query(sql, dict(parameters), limit)
+
+    def fake_list_tables(_source) -> list[dict]:
+        tables: list[dict] = []
+        with sqlite3.connect(source_path) as connection:
+            names = connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' ORDER BY name"
+            ).fetchall()
+            for (name,) in names:
+                safe_name = str(name).replace('"', '""')
+                columns = [
+                    {
+                        "name": str(row[1]),
+                        "type": str(row[2]),
+                        "pk": bool(row[5]),
+                    }
+                    for row in connection.execute(
+                        f'PRAGMA table_info("{safe_name}")'
+                    ).fetchall()
+                ]
+                row_count = connection.execute(
+                    f'SELECT COUNT(*) FROM "{safe_name}"'
+                ).fetchone()[0]
+                tables.append({
+                    "name": str(name),
+                    "columns": columns,
+                    "row_count": int(row_count),
+                })
+        return tables
+
+    return (
+        patch.object(
+            datasource_service,
+            "test_connection",
+            return_value=(True, "连接成功"),
+        ),
+        patch.object(datasource_service, "list_tables", side_effect=fake_list_tables),
+        patch.object(datasource_service, "run_query", side_effect=fake_run_query),
+        patch.object(
+            datasource_service,
+            "run_parameterized_query",
+            side_effect=fake_run_parameterized_query,
+        ),
+    )
 
 
 def _world(tmp_path, *, mode: str | None = "source_fk") -> SimpleNamespace:
@@ -135,9 +230,9 @@ def _world(tmp_path, *, mode: str | None = "source_fk") -> SimpleNamespace:
         id="source-physical",
         tenant_id=scenario.tenant_id,
         scenario=scenario,
-        name="业务 SQLite",
-        type="sqlite",
-        config={"path": source_path},
+        name="业务 PostgreSQL",
+        type="postgres",
+        config={"host": "connector.test.invalid", "database": "fixture"},
         status="ok",
     )
     source_key, source_ref = _binding("source-binding")
@@ -180,6 +275,10 @@ def _world(tmp_path, *, mode: str | None = "source_fk") -> SimpleNamespace:
     )
     db.commit()
 
+    connector_patchers = _external_connector_fakes(source_path)
+    for patcher in connector_patchers:
+        patcher.start()
+
     relation_mapping = None
     if mode:
         payload = {
@@ -220,10 +319,13 @@ def _world(tmp_path, *, mode: str | None = "source_fk") -> SimpleNamespace:
         source_mapping=source_mapping,
         target_mapping=target_mapping,
         relation_mapping=relation_mapping,
+        connector_patchers=connector_patchers,
     )
 
 
 def _close_world(world: SimpleNamespace) -> None:
+    for patcher in reversed(world.connector_patchers):
+        patcher.stop()
     source_id = str(world.data_source.id)
     world.db.close()
     world.engine.dispose()
@@ -243,7 +345,7 @@ def _connector_audits(world: SimpleNamespace) -> dict[str, dict]:
             "binding_id": "binding-source-dev",
             "connector_id": world.data_source.id,
             "connector_name": world.data_source.name,
-            "adapter_type": "sqlite",
+            "adapter_type": "postgres",
         },
         world.target_mapping.id: {
             "kind": "data_source",
@@ -253,7 +355,7 @@ def _connector_audits(world: SimpleNamespace) -> dict[str, dict]:
             "binding_id": "binding-target-dev",
             "connector_id": world.data_source.id,
             "connector_name": world.data_source.name,
-            "adapter_type": "sqlite",
+            "adapter_type": "postgres",
         },
     }
 

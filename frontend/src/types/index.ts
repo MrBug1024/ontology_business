@@ -99,6 +99,24 @@ export interface Scenario {
   workflow_count?: number
 }
 
+export interface ScenarioPurgePlan {
+  scenario_id: string
+  scenario_name: string
+  status: string
+  can_purge: boolean
+  blockers: string[]
+  counts: Record<string, number>
+  retained: Record<string, number>
+  requires_audit_confirmation: boolean
+}
+
+export interface ScenarioPurgeResult {
+  scenario_id: string
+  deleted: boolean
+  deletion_jobs: number
+  retained: Record<string, number>
+}
+
 export interface OntologyInstance {
   id?: string
   scenario_id?: string
@@ -586,6 +604,7 @@ export type ScenarioModelDraftResourceKind =
   | 'rule'
   | 'event'
   | 'workflow'
+  | 'capability_port'
   | string
 
 export interface ScenarioModelDraftIssue {
@@ -598,10 +617,18 @@ export interface ScenarioModelDraftIssue {
   source_refs?: string[]
 }
 
-/**
- * An AI-authored draft resource. It is projected into the regular scenario
- * canvas and tabs while staying inactive until the user corrects/promotes it.
- */
+export type ScenarioModelCandidateOrigin = 'assistant' | 'manual' | 'imported' | 'unknown'
+export type ScenarioModelCandidateValidationStatus = 'not_validated' | 'valid' | 'invalid'
+export type ScenarioModelCandidateLifecycleStatus = 'candidate' | 'deferred' | 'formalized' | 'resolved' | 'superseded'
+export type ScenarioModelCandidateActivationStatus = 'inactive' | 'active' | 'not_applicable'
+
+export interface ScenarioModelCandidateBlocker extends ScenarioModelDraftIssue {
+  field_path?: string[]
+  draft_ids?: string[]
+  resource_keys?: string[]
+}
+
+/** A provenance-neutral, inert candidate governed by the server quality state machine. */
 export interface ScenarioModelDraftResource {
   id: string
   revision: number
@@ -617,6 +644,14 @@ export interface ScenarioModelDraftResource {
   blocking_issue_count?: number
   draft_status: ScenarioModelDraftStatus
   source?: 'assistant' | 'ai' | string
+  materialization_source: string
+  source_origin: ScenarioModelCandidateOrigin
+  validation_status: ScenarioModelCandidateValidationStatus
+  lifecycle_status: ScenarioModelCandidateLifecycleStatus
+  promotion_eligible: boolean
+  promotion_blockers: ScenarioModelCandidateBlocker[]
+  activation_status: ScenarioModelCandidateActivationStatus
+  quality_fingerprint: string
   source_thread_id?: string | null
   source_message_id?: string | null
   compilation_job_id?: string | null
@@ -636,8 +671,46 @@ export interface ScenarioModelDraftListResponse {
   next_offset?: number | null
   issues_count?: number
   blocking_issue_count?: number
-  summary?: Record<string, any>
-  page_summary?: Record<string, any>
+  summary?: ScenarioModelCandidateSummary
+  page_summary?: ScenarioModelCandidateSummary
+}
+
+export interface ScenarioModelCandidateSummary {
+  candidate_count?: number
+  formalized_count?: number
+  promotion_eligible_count?: number
+  promotion_blocked_count?: number
+  by_origin?: Record<string, number>
+  by_validation?: Record<string, number>
+  [key: string]: unknown
+}
+
+export interface ScenarioModelCandidateRevisionRequest {
+  expected_revision: number
+}
+
+export interface ScenarioModelCandidatePromotionItem {
+  draft_id: string
+  expected_revision: number
+}
+
+export interface ScenarioModelCandidateBatchPromotionRequest {
+  items: ScenarioModelCandidatePromotionItem[]
+}
+
+export interface ScenarioModelCandidatePromotionResultItem {
+  draft_id?: string
+  resource_kind?: string
+  formal_resource_id?: string
+  activation_status?: ScenarioModelCandidateActivationStatus
+}
+
+export interface ScenarioModelCandidatePromotionResult {
+  ok: boolean
+  atomic: boolean
+  promoted: ScenarioModelCandidatePromotionResultItem[]
+  counts: Record<string, number>
+  quality_fingerprint: string
 }
 
 export interface ScenarioModelDraftUpdate {
@@ -648,6 +721,149 @@ export interface ScenarioModelDraftUpdate {
 export interface ScenarioModelDraftResolve {
   expected_revision: number
   resolved_resource_id: string
+}
+
+export type CatalogEnvironment = 'dev' | 'staging' | 'prod'
+
+export type CatalogBindingRole =
+  | 'modeling_evidence'
+  | 'test_fixture'
+  | 'invocation_input'
+  | 'reference'
+  | 'rules'
+  | 'output'
+  | 'input'
+
+export type CatalogCanonicalBindingRole = Exclude<CatalogBindingRole, 'input'>
+
+export interface CatalogAsset {
+  id: string
+  tenant_id: string
+  key: string
+  name: string
+  description?: string
+  kind: 'file' | 'stream' | 'api' | 'database' | 'generated' | 'other'
+  media_type?: string
+  labels: Record<string, unknown>
+  lifecycle_status: 'active' | 'retired'
+  created_by_user_id?: string | null
+  created_at: string
+  updated_at: string
+  retired_at?: string | null
+  version_count: number
+}
+
+export interface CatalogAssetVersion {
+  id: string
+  tenant_id: string
+  asset_id: string
+  version_number: number
+  provenance_kind: string
+  status: string
+  content_sha256: string
+  byte_size: number
+  version_document: Record<string, unknown>
+  created_by_user_id?: string | null
+  created_at: string
+}
+
+export interface CatalogManagedUpload {
+  purpose: 'managed_asset' | 'invocation_attachment'
+  temporary: boolean
+  expires_at?: string | null
+  created: boolean
+  asset: Pick<CatalogAsset, 'id' | 'key' | 'name' | 'kind' | 'media_type' | 'lifecycle_status'>
+  version: {
+    id: string
+    asset_id: string
+    version_number: number
+    provenance_kind: string
+    status: string
+    content_sha256: string
+    byte_size: number
+    profile: Record<string, unknown>
+    lifecycle: Record<string, unknown>
+    created_at: string
+  }
+}
+
+export interface LogicalDataset {
+  id: string
+  tenant_id: string
+  key: string
+  name: string
+  description?: string
+  labels: Record<string, unknown>
+  lifecycle_status: 'active' | 'retired'
+  created_by_user_id?: string | null
+  created_at: string
+  updated_at: string
+  retired_at?: string | null
+  schema_count: number
+  version_count: number
+  heads: Record<string, string>
+}
+
+export interface DatasetVersion {
+  id: string
+  tenant_id: string
+  dataset_id: string
+  schema_id: string
+  version_number: number
+  parent_version_id?: string | null
+  status: string
+  record_count: number
+  fragment_count: number
+  byte_size: number
+  content_hash: string
+  manifest: Record<string, unknown>
+  created_by_user_id?: string | null
+  created_at: string
+  ready_at?: string | null
+}
+
+export interface DatasetHead {
+  id: string
+  tenant_id: string
+  dataset_id: string
+  environment: CatalogEnvironment
+  dataset_version_id: string
+  updated_by_user_id?: string | null
+  updated_at: string
+}
+
+export interface ConnectorBindingOption {
+  binding_key: string
+  label: string
+  connector_kind: 'data_source' | 'mcp' | 'llm'
+  environment: CatalogEnvironment
+  ready: boolean
+  blocking_reason: string
+  capabilities: string[]
+  updated_at?: string | null
+}
+
+export interface ScenarioDatasetBindingCreate {
+  dataset_id: string
+  binding_key: string
+  environment: CatalogEnvironment
+  role: CatalogCanonicalBindingRole
+  binding_mode: 'head' | 'pinned'
+  dataset_head_id?: string | null
+  dataset_version_id?: string | null
+  is_required: boolean
+  status: 'active' | 'disabled' | 'error'
+  config: Record<string, unknown>
+}
+
+export interface ScenarioDatasetBinding extends Omit<ScenarioDatasetBindingCreate, 'role'> {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  role: CatalogBindingRole
+  resolved_dataset_version_id?: string | null
+  created_at: string
+  updated_at: string
 }
 
 export interface DataSource {
@@ -943,10 +1159,61 @@ export type AgentCapabilityScope = Record<AgentCapabilityCategory, AgentCapabili
 
 export interface AgentCapabilityReadinessItem {
   id: string
+  key?: string
+  kind?: 'function' | 'action' | 'rule' | 'event' | 'workflow'
   name: string
   description?: string
   executable: boolean
   blocked_reasons: string[]
+  input_schema?: Record<string, unknown>
+  side_effect?: boolean
+  requires_confirmation?: boolean
+  idempotency_required?: boolean
+  ports?: AgentCapabilityDataPort[]
+  data_ports?: AgentCapabilityDataPort[]
+}
+
+export type AgentManagedBindingKind =
+  | 'dataset_version'
+  | 'dataset_head'
+  | 'asset_version'
+  | 'connector_binding'
+
+export interface AgentCapabilityDataPort {
+  key?: string
+  port_key?: string
+  name?: string
+  description?: string
+  direction?: 'input' | 'output'
+  role?: string
+  media_kind?: string
+  required?: boolean
+  cardinality?: string
+  binding_policy?: string
+  binding_kinds?: AgentManagedBindingKind[]
+  allow_override?: boolean
+  schema_document?: Record<string, unknown>
+  schema_hash?: string | null
+  schema_signature?: string | null
+}
+
+export interface AgentRuntimeCapability {
+  kind: 'function' | 'action' | 'workflow'
+  key: string
+  name: string
+  description?: string
+  input_schema: Record<string, unknown>
+  output_schema: Record<string, unknown>
+  side_effect: boolean
+  requires_confirmation: boolean
+  idempotency_required: boolean
+  data_ports: AgentCapabilityDataPort[]
+  readiness: {
+    ready: boolean
+    issues?: Array<Record<string, unknown>>
+  }
+  definition_hash: string
+  deployment_fingerprint: string
 }
 
 export interface AgentCapabilitySummary {
@@ -966,6 +1233,58 @@ export interface AgentCapabilityCatalog {
   categories: Record<AgentCapabilityCategory, AgentCapabilityReadinessItem[]>
 }
 
+export type AgentReadinessAxisKey = 'definition' | 'validation' | 'release' | 'runtime'
+
+export interface AgentReadinessIssue {
+  code: string
+  label: string
+  target?: string
+  blocking?: boolean
+}
+
+export interface AgentReadinessAxis {
+  ready: boolean
+  missing: AgentReadinessIssue[]
+}
+
+/** Transitional server payload accepted while the four-axis contract rolls out. */
+export interface AgentReadinessPayload {
+  source?: 'server' | 'legacy'
+  definition?: AgentReadinessAxis | boolean | null
+  validation?: AgentReadinessAxis | boolean | null
+  release?: AgentReadinessAxis | boolean | null
+  runtime?: AgentReadinessAxis | boolean | null
+  definition_valid?: boolean
+  validation_ready?: boolean
+  release_ready?: boolean
+  runtime_ready?: boolean
+  missing?: Partial<Record<AgentReadinessAxisKey, Array<AgentReadinessIssue | string>>>
+  issues?: Partial<Record<AgentReadinessAxisKey, Array<AgentReadinessIssue | string>>>
+}
+
+export interface AgentReadiness extends AgentReadinessPayload {
+  source: 'server' | 'legacy'
+  definition: AgentReadinessAxis
+  validation: AgentReadinessAxis
+  release: AgentReadinessAxis
+  runtime: AgentReadinessAxis
+}
+
+export type AgentRuntimeBindingMode =
+  | 'legacy'
+  | 'shadow'
+  | 'prefer_capability'
+  | 'capability_only'
+
+export interface AgentRuntimeConnection {
+  id?: string
+  name: string
+  type: 'postgres'
+  config: Record<string, any>
+  status?: string
+  last_error?: string
+}
+
 export interface Agent {
   id?: string
   name: string
@@ -974,9 +1293,17 @@ export interface Agent {
   llm_config_id?: string | null
   system_prompt?: string
   data_source_ids: string[]
+  runtime_connections?: AgentRuntimeConnection[]
   capability_scope?: AgentCapabilityScope | null
   capability_scope_legacy?: boolean
   capability_summary?: Partial<Record<AgentCapabilityCategory, AgentCapabilitySummary>>
+  runtime_binding_mode?: AgentRuntimeBindingMode
+  readiness?: AgentReadiness | AgentReadinessPayload | null
+  /** Flat fields are accepted for compatibility with early four-axis responses. */
+  definition_valid?: boolean
+  validation_ready?: boolean
+  release_ready?: boolean
+  runtime_ready?: boolean
   temperature?: number
   max_tokens?: number
   created_at?: string
@@ -1000,7 +1327,41 @@ export interface ChatMessage {
   tool_calls?: any[]
   tool_results?: any[]
   citations?: RagCitation[]
+  input_snapshot?: Record<string, unknown>
+  evidence_refs?: Array<Record<string, unknown>>
   created_at?: string
+}
+
+export interface AgentManagedInput {
+  port_key: string
+  dataset_version_id?: string
+  dataset_head_id?: string
+  asset_version_id?: string
+  artifact_id?: string
+  binding_key?: string
+  expected_signature?: string
+}
+
+export interface AgentCapabilityTarget {
+  kind: 'function' | 'action' | 'workflow'
+  key: string
+}
+
+export interface AgentChatAttachment {
+  asset_version_id: string
+  expected_signature?: string
+  filename?: string
+}
+
+export interface AgentChatRequest {
+  message: string
+  conversation_id?: string
+  environment?: 'dev' | 'staging' | 'prod'
+  inputs?: Record<string, unknown>
+  managed_inputs?: AgentManagedInput[]
+  capability?: AgentCapabilityTarget
+  idempotency_key?: string
+  attachments?: AgentChatAttachment[]
 }
 
 /** P1 运行时任务状态：由队列、重试、超时与审批共同驱动。 */

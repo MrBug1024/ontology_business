@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     ocr_api_key: str = ""
 
     # Agent runtime
+    # New validation Agents use the capability runtime by default.  Keeping
+    # this deployment-controlled preserves an immediate rollback path without
+    # rewriting existing Agent rows, whose database default remains legacy.
+    new_agent_runtime_binding_mode: Literal["legacy", "capability_only"] = (
+        "capability_only"
+    )
     max_tool_rounds: int = 20
     max_query_rows: int = 200
     dataset_query_timeout_seconds: float = Field(default=30.0, ge=0.1, le=600.0)
@@ -109,6 +115,14 @@ class Settings(BaseSettings):
     scenario_model_max_llm_calls: int = 24
     max_upload_bytes: int = 50 * 1024 * 1024
     allow_unsafe_workflow_nodes: bool = False
+    # Async workflow inputs are sealed with an externally managed AES-256-GCM
+    # key ring before they enter the database.  The JSON object maps stable key
+    # ids to URL-safe base64 encoded 32-byte keys; the active id selects the key
+    # for new payloads while old ids remain available for decrypting retries.
+    # There is deliberately no built-in/default key: enqueue fails closed until
+    # the deployment supplies both values.
+    workflow_payload_encryption_keys: str = ""
+    workflow_payload_active_key_id: str = ""
     # HTTP Action 默认只允许公网 HTTPS 目标。开发环境如确有受控本地模拟端点，
     # 必须由部署配置显式开启，不能由 API 请求覆盖。
     allow_insecure_http_actions: bool = False

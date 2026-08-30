@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -66,7 +67,30 @@ _MAX_SCHEMA_BYTES = 16_000
 _MAX_SCHEMA_DEPTH = 12
 _MAX_PROPERTIES = 100
 _MAX_TAGS = 20
-RUNTIME_KINDS = {"contract", "weighted_score", "threshold", "geo_distance", "timeseries_aggregate"}
+RUNTIME_KINDS = {
+    "contract",
+    "weighted_score",
+    "threshold",
+    "geo_distance",
+    "timeseries_aggregate",
+    "provider",
+}
+_PROVIDER_KEY_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
+_PROVIDER_VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,79}$")
+_PROVIDER_SECRET_KEY_RE = re.compile(
+    r"(?:password|passwd|secret|credential|token|authorization|cookie|dsn|"
+    r"database[_-]?url|api[_-]?key|connection[_-]?string|sql|table[_-]?name|"
+    r"column[_-]?name)",
+    flags=re.IGNORECASE,
+)
+_PROVIDER_FORBIDDEN_VALUE_RE = re.compile(
+    r"(?:\b(?:select|insert|update|delete|drop|alter|create|grant|revoke)\b\s+"
+    r"|(?:postgres(?:ql)?|mysql|mariadb|mssql|oracle|sqlite|redis|s3|file|minio)://"
+    r"|\b(?:password|passwd|secret|credential|token|authorization|api[_-]?key)\s*[:=]"
+    r"|(?:^|[;\s])(?:host|server|database|user(?:name)?|port)\s*=)",
+    flags=re.IGNORECASE,
+)
+_PROVIDER_ABSOLUTE_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|/[^/]+/)")
 
 
 def _text(value: Any, label: str, *, maximum: int, allow_empty: bool = True) -> str:
@@ -248,6 +272,50 @@ def normalize_definition(value: Mapping[str, Any] | Any) -> dict[str, Any]:
             runtime_config.get("value_field", "value"), str
         ):
             raise FunctionDefinitionError("timeseries_aggregate.value_field 必须是字符串")
+    elif runtime_kind == "provider":
+        if set(runtime_config) != {
+            "provider_key",
+            "provider_version",
+            "provider_config",
+        }:
+            raise FunctionDefinitionError(
+                "provider 运行配置必须且只能包含 provider_key、provider_version 和 provider_config"
+            )
+        provider_key = str(runtime_config.get("provider_key") or "").strip().casefold()
+        provider_version = str(runtime_config.get("provider_version") or "").strip()
+        provider_config = runtime_config.get("provider_config")
+        if not _PROVIDER_KEY_RE.fullmatch(provider_key):
+            raise FunctionDefinitionError("provider_key 必须是可移植的受信 Provider 标识")
+        if not _PROVIDER_VERSION_RE.fullmatch(provider_version):
+            raise FunctionDefinitionError("provider_version 格式无效")
+        if not isinstance(provider_config, dict):
+            raise FunctionDefinitionError("provider_config 必须是对象")
+
+        def reject_sensitive_config(document: Any) -> None:
+            if isinstance(document, Mapping):
+                for key, nested in document.items():
+                    if _PROVIDER_SECRET_KEY_RE.search(str(key)):
+                        raise FunctionDefinitionError(
+                            "provider_config 不能包含凭据、SQL 或物理表列配置"
+                        )
+                    reject_sensitive_config(nested)
+            elif isinstance(document, list):
+                for nested in document:
+                    reject_sensitive_config(nested)
+            elif isinstance(document, str) and (
+                _PROVIDER_FORBIDDEN_VALUE_RE.search(document)
+                or _PROVIDER_ABSOLUTE_PATH_RE.search(document.strip())
+            ):
+                raise FunctionDefinitionError(
+                    "provider_config 不能包含凭据、SQL、连接串或物理存储路径"
+                )
+
+        reject_sensitive_config(provider_config)
+        runtime_config = {
+            "provider_key": provider_key,
+            "provider_version": provider_version,
+            "provider_config": provider_config,
+        }
     return {
         "name": _text(value.get("name"), "函数名称", maximum=200, allow_empty=False),
         "description": _text(value.get("description", ""), "函数说明", maximum=8_000),

@@ -140,6 +140,7 @@ def list_data_sources(scenario_id: str | None = None, db: Session = Depends(get_
         scenario = tenant_service.require_scenario(db, scenario_id)
         permission_service.require_scenario_permission(db, scenario, "read")
     stmt = select(DataSource).where(tenant_service.visible_clause(DataSource, db))
+    stmt = stmt.where(DataSource.resource_scope == "modeling")
     if scenario_id:
         stmt = stmt.where(DataSource.scenario_id == scenario_id)
     return [
@@ -174,7 +175,12 @@ def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_d
             )
         except object_storage_service.ObjectStorageError as exc:
             raise HTTPException(503, str(exc)) from exc
-    ds = DataSource(tenant_id=tenant_service.current_tenant_id(db), **values)
+    ds = DataSource(
+        tenant_id=tenant_service.current_tenant_id(db),
+        resource_scope="modeling",
+        owner_agent_id=None,
+        **values,
+    )
     if ds.type == "file_bucket":
         try:
             datasource_service.ensure_file_bucket_storage(ds)

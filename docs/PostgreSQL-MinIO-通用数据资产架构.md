@@ -21,13 +21,15 @@ DuckDB 只在 API 进程内读取已校验的 MinIO Parquet，作为无状态查
 - `dataset_schemas` / `dataset_relations` / `dataset_fields`：版本化 Schema、逻辑关系和字段契约。
 - `dataset_versions` / `dataset_fragments`：固定内容哈希的数据集版本及 Parquet 分片。
 - `dataset_heads`：开发、预发、生产环境的原子版本指针。
-- `scenario_dataset_bindings`：场景以 input、reference、rules 或 output 角色消费数据集。
+- `scenario_dataset_bindings`：场景按环境以 modeling_evidence、test_fixture、invocation_input、reference、rules 或 output 角色消费数据集。建模证据和测试夹具不会自动进入生产调用上下文。
 - `ingestion_runs` / `dataset_lineage_edges`：可恢复导入与版本血缘。
 - `semantic_mappings`：把数据集字段映射到本体属性。
 - `derivation_runs` / `assertions` / `derivation_evidence`：业务推导的输入固定、断言和证据链。
 - `serving_projections`：面向查询、搜索、向量或缓存的可重建加速层。
 
 关键目录、版本、映射和证据均由 PostgreSQL 的复合唯一键、复合外键和摘要校验闭合。不可变数据版本与证据对象保存在 MinIO，Redis 中的数据必须可以从 PostgreSQL 和 MinIO 重建。
+
+业务场景的能力定义只保存数据端口、Schema、语义映射和逻辑 binding key，不保存某一批客户数据。每次调用通过 `RunInputBinding` 固定最终 `DatasetVersion` 或经过验签的实时 `ConnectorBinding`；Definition hash 与数据绑定 fingerprint 分开计算，因此更换数据批次不会改变能力版本。
 
 ## 文件与查询契约
 

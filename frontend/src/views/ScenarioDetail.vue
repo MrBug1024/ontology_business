@@ -31,17 +31,28 @@
         </div>
       </div>
       <div class="ph-right">
-        <el-tag v-if="!canWrite" type="info" effect="plain" aria-label="当前场景为只读访问">只读访问</el-tag>
+        <el-tag v-if="detail.status === 'retired'" type="info" effect="plain">已退役</el-tag>
+        <el-tag v-else-if="!canWrite" type="info" effect="plain" aria-label="当前场景为只读访问">只读访问</el-tag>
       </div>
     </div>
+
+    <el-alert
+      v-if="detail.status === 'retired'"
+      class="retired-notice"
+      type="info"
+      :closable="false"
+      title="该场景已退役，定义、目录资产和运行审计保留为只读。"
+    />
 
     <el-tabs v-model="tab" class="sd-tabs">
       <!-- ═══════════ 本体 ═══════════ -->
       <el-tab-pane label="本体模型" name="ontology" lazy>
         <div class="tab-toolbar">
           <div class="tab-stats">
-            <span class="stat">对象类型 <b>{{ detail.entities.length + scenarioDraftsOf('entity').length }}</b></span>
-            <span class="stat">关系类型 <b>{{ detail.relations.length + scenarioDraftsOf('relation').length }}</b></span>
+            <span class="stat">正式对象类型 <b>{{ detail.entities.length }}</b></span>
+            <span class="stat">候选对象类型 <b>{{ scenarioDraftsOf('entity').length }}</b></span>
+            <span class="stat">正式关系类型 <b>{{ detail.relations.length }}</b></span>
+            <span class="stat">候选关系类型 <b>{{ scenarioDraftsOf('relation').length }}</b></span>
           </div>
           <div v-if="canWrite" class="tab-actions">
             <el-button size="small" @click="openEntity()"><el-icon><Plus /></el-icon> 对象类型</el-button>
@@ -77,7 +88,8 @@
       <el-tab-pane label="实例数据" name="instances" lazy>
         <div class="tab-toolbar">
           <div class="tab-stats">
-            <span class="stat">对象实例 <b>{{ detail.runtime_instance_count || objectTotal + scenarioDraftsOf('instance').length }}</b></span>
+            <span class="stat">正式对象实例 <b>{{ detail.runtime_instance_count || objectTotal }}</b></span>
+            <span class="stat">候选对象实例 <b>{{ scenarioDraftsOf('instance').length }}</b></span>
             <span class="stat">关系实例 <b>{{ relationInstanceTotalIsExact ? relationInstanceTotal : `约 ${relationInstanceTotal}` }}</b></span>
             <span class="stat stat-runtime">运行时对象 <b>{{ objectTotal }}</b></span>
           </div>
@@ -234,8 +246,10 @@
       <el-tab-pane label="数据映射" name="mappings" lazy>
         <div class="tab-toolbar">
           <div class="tab-stats mapping-stats">
-            <span class="stat">对象映射 <b>{{ objectMappingRows.length }}</b></span>
-            <span class="stat">关系映射 <b>{{ relationMappingRows.length }}</b></span>
+            <span class="stat">正式对象映射 <b>{{ detail.mappings.length }}</b></span>
+            <span class="stat">候选对象映射 <b>{{ scenarioDraftsOf('mapping', 'data_mapping', 'conceptual_mapping').length }}</b></span>
+            <span class="stat">正式关系映射 <b>{{ detail.relation_mappings.length }}</b></span>
+            <span class="stat">候选关系映射 <b>{{ scenarioDraftsOf('relation_mapping').length }}</b></span>
           </div>
         </div>
 
@@ -315,7 +329,7 @@
       <!-- ═══════════ 业务函数（无副作用、可由 Agent 调用）═══════════ -->
       <el-tab-pane label="函数" name="functions" data-testid="functions-tab" lazy>
         <div class="tab-toolbar">
-          <div class="tab-stats"><span class="stat">函数 <b>{{ functionRows.length }}</b></span></div>
+          <div class="tab-stats"><span class="stat">正式函数 <b>{{ detail.functions.length }}</b></span><span class="stat">候选函数 <b>{{ scenarioDraftsOf('function').length }}</b></span></div>
           <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" data-testid="create-function" @click="openFunction()"><el-icon><Plus /></el-icon> 添加函数</el-button>
           </div>
@@ -382,7 +396,7 @@
       <!-- ═══════════ 操作（Actions）═══════════ -->
       <el-tab-pane label="操作" name="actions" lazy>
         <div class="tab-toolbar">
-          <div class="tab-stats"><span class="stat">操作 <b>{{ actionRows.length }}</b></span></div>
+          <div class="tab-stats"><span class="stat">正式操作 <b>{{ detail.actions.length }}</b></span><span class="stat">候选操作 <b>{{ scenarioDraftsOf('action').length }}</b></span></div>
           <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" @click="openAction()"><el-icon><Plus /></el-icon> 添加操作</el-button>
           </div>
@@ -429,7 +443,7 @@
       <!-- ═══════════ 规则（Rules）═══════════ -->
       <el-tab-pane label="规则" name="rules" lazy>
         <div class="tab-toolbar">
-          <div class="tab-stats"><span class="stat">规则 <b>{{ ruleRows.length }}</b></span></div>
+          <div class="tab-stats"><span class="stat">正式规则 <b>{{ detail.rules.length }}</b></span><span class="stat">候选规则 <b>{{ scenarioDraftsOf('rule').length }}</b></span></div>
           <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" @click="openRule()"><el-icon><Plus /></el-icon> 添加规则</el-button>
           </div>
@@ -472,7 +486,7 @@
       <!-- ═══════════ 事件（Events）═══════════ -->
       <el-tab-pane label="事件" name="events" lazy>
         <div class="tab-toolbar">
-          <div class="tab-stats"><span class="stat">事件 <b>{{ eventRows.length }}</b></span></div>
+          <div class="tab-stats"><span class="stat">正式事件 <b>{{ detail.events.length }}</b></span><span class="stat">候选事件 <b>{{ scenarioDraftsOf('event').length }}</b></span></div>
           <div v-if="canWrite" class="tab-actions">
             <el-button size="small" type="primary" @click="openEvent()"><el-icon><Plus /></el-icon> 添加事件</el-button>
           </div>
@@ -535,7 +549,7 @@
         <!-- 工作流列表 -->
         <template v-else>
           <div class="tab-toolbar">
-            <div class="tab-stats"><span class="stat">工作流 <b>{{ workflowRows.length }}</b></span></div>
+            <div class="tab-stats"><span class="stat">正式工作流 <b>{{ detail.workflows.length }}</b></span><span class="stat">候选工作流 <b>{{ scenarioDraftsOf('workflow').length }}</b></span></div>
             <div v-if="canWrite" class="tab-actions">
               <el-button size="small" type="primary" @click="openWorkflow()"><el-icon><Plus /></el-icon> 新建工作流</el-button>
             </div>
@@ -583,6 +597,22 @@
             </el-table>
           </div>
         </template>
+      </el-tab-pane>
+
+      <el-tab-pane name="candidates" lazy>
+        <template #label>
+          <span>候选评审 <b class="candidate-tab-count">{{ scenarioDraftSummary.candidate_count ?? '—' }}</b></span>
+        </template>
+        <CandidateReviewPanel
+          :scenario-id="sid"
+          :candidates="scenarioDrafts"
+          :summary="scenarioDraftSummary"
+          :formal-count="formalDefinitionCount"
+          :loading="scenarioDraftsLoading"
+          :load-error="scenarioDraftsError"
+          :can-write="canWrite"
+          @refresh="refreshCandidateReview"
+        />
       </el-tab-pane>
     </el-tabs>
 
@@ -1337,6 +1367,7 @@ import SchemaFieldBuilder from '@/components/SchemaFieldBuilder.vue'
 import StructuredValueCell from '@/components/StructuredValueCell.vue'
 import StructuredValueEditor from '@/components/StructuredValueEditor.vue'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
+import CandidateReviewPanel from '@/components/CandidateReviewPanel.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
 import { safeInternalReturnPath } from '@/utils/navigation'
 import {
@@ -1347,7 +1378,7 @@ import {
   relationMappingModeLabel,
   relationMappingPayloadFingerprint,
 } from '@/utils/relationMappings'
-import type { ArtifactTemplate, AssistantActionPreview, ScenarioDetail, ScenarioModelDraftIssue, ScenarioModelDraftResource, GraphData, GraphNode, GraphEdge, Entity, Relation, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, RelationDataMapping, RelationDataMappingInput, RelationDataMappingPreview, TableInfo, WorkflowRun } from '@/types'
+import type { ArtifactTemplate, AssistantActionPreview, ScenarioDetail, ScenarioModelCandidateSummary, ScenarioModelDraftIssue, ScenarioModelDraftResource, GraphData, GraphNode, GraphEdge, Entity, Relation, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, RelationDataMapping, RelationDataMappingInput, RelationDataMappingPreview, TableInfo, WorkflowRun } from '@/types'
 import { cleanTemplateExecutorConfig, templateFormatLabel, templatePathsToSchema, templateUnavailableReason } from '@/utils/templates'
 import { draftRefToken, normalizeScenarioModelDrafts, scenarioDraftIsOpen, scenarioDraftKindLabel, scenarioDraftStage } from '@/utils/scenarioModelDrafts'
 
@@ -1360,6 +1391,7 @@ const scenarioLoadError = ref('')
 // Draft resources can be numerous and are replaced as a batch; deep-reactive
 // proxying them makes route teardown and graph projection unnecessarily costly.
 const scenarioDrafts = shallowRef<ScenarioModelDraftResource[]>([])
+const scenarioDraftSummary = ref<ScenarioModelCandidateSummary>({})
 const scenarioDraftsLoading = ref(false)
 const scenarioDraftsError = ref('')
 type PendingScenarioDraftResolution = {
@@ -1395,7 +1427,7 @@ const scenarioDataSources = computed(() => dataSources.value.filter((source) => 
 const databaseDataSources = computed(() => scenarioDataSources.value.filter((source) => source.type !== 'file_bucket'))
 const fileBucketSources = computed(() => scenarioDataSources.value.filter((source) => source.type === 'file_bucket'))
 const writableFileBucketSources = computed(() => fileBucketSources.value.filter((source) => source.can_write !== false))
-const stageNames = new Set(['ontology', 'instances', 'mappings', 'functions', 'actions', 'rules', 'events', 'workflows'])
+const stageNames = new Set(['ontology', 'instances', 'mappings', 'functions', 'actions', 'rules', 'events', 'workflows', 'candidates'])
 const requestedStage = Array.isArray(route.query.stage) ? route.query.stage[0] : route.query.stage
 const tab = ref(typeof requestedStage === 'string' && stageNames.has(requestedStage) ? requestedStage : 'ontology')
 const instFilter = ref('')
@@ -1442,6 +1474,7 @@ watch(tab, (value, previousValue) => {
     void searchObjects()
     void loadRelationInstances()
   }
+  if (value === 'candidates' && previousValue !== 'candidates') void loadScenarioDrafts(true)
   if (route.query.stage !== value) {
     void router.replace({ query: { ...route.query, stage: value } })
   }
@@ -1461,6 +1494,18 @@ type InlineScenarioDraftRow = Record<string, any> & {
 }
 
 const openScenarioDrafts = computed(() => scenarioDrafts.value.filter(scenarioDraftIsOpen))
+const formalDefinitionCount = computed(() => (
+  detail.value.entities.length
+  + detail.value.entities.reduce((total, entity) => total + entity.properties.length, 0)
+  + detail.value.relations.length
+  + detail.value.mappings.length
+  + detail.value.relation_mappings.length
+  + detail.value.functions.length
+  + detail.value.actions.length
+  + detail.value.rules.length
+  + detail.value.events.length
+  + detail.value.workflows.length
+))
 
 function scenarioDraftsOf(...kinds: string[]) {
   const accepted = new Set(kinds)
@@ -3900,7 +3945,7 @@ function withDraftReferenceIssues(item: ScenarioModelDraftResource): ScenarioMod
   }
 }
 
-async function loadScenarioDrafts() {
+async function loadScenarioDrafts(includeIssues = tab.value === 'candidates') {
   const request = ++scenarioDraftRequest
   scenarioDraftsLoading.value = true
   scenarioDraftsError.value = ''
@@ -3909,6 +3954,7 @@ async function loadScenarioDrafts() {
     const limit = 1000
     let offset = 0
     let expectedTotal: number | undefined
+    let governanceSummary: ScenarioModelCandidateSummary = {}
     while (true) {
       const response = await api.listScenarioModelDrafts(sid, {
         offset,
@@ -3916,7 +3962,7 @@ async function loadScenarioDrafts() {
         // The scene projection only needs editable payloads and lifecycle
         // metadata. Large validation evidence is loaded on demand by callers
         // that explicitly request the detailed draft view.
-        include_issues: false,
+        include_issues: includeIssues,
       })
       if (scenarioDraftViewDisposed || request !== scenarioDraftRequest) return
       const normalizedPage = normalizeScenarioModelDrafts(response)
@@ -3924,6 +3970,7 @@ async function loadScenarioDrafts() {
       for (const item of normalizedPage) draftsById.set(item.id, item)
 
       const metadata = response && !Array.isArray(response) ? response : undefined
+      if (offset === 0 && metadata?.summary) governanceSummary = metadata.summary
       const responseTotal = Number(metadata?.total)
       if (Number.isSafeInteger(responseTotal) && responseTotal >= 0) {
         if (expectedTotal === undefined) expectedTotal = responseTotal
@@ -3952,12 +3999,25 @@ async function loadScenarioDrafts() {
     // the complete paginated result before surfacing local binding issues.
     scenarioDrafts.value = normalized
     scenarioDrafts.value = normalized.map(withDraftReferenceIssues)
+    scenarioDraftSummary.value = governanceSummary
   } catch (error: any) {
     if (scenarioDraftViewDisposed || request !== scenarioDraftRequest) return
     scenarioDraftsError.value = error?.message || '请稍后重试；正式场景资源不受影响。'
   } finally {
     if (!scenarioDraftViewDisposed && request === scenarioDraftRequest) scenarioDraftsLoading.value = false
   }
+}
+
+async function refreshCandidateReview(definitionChanged: boolean) {
+  if (definitionChanged) {
+    try {
+      const loaded = await api.getScenario(sid, { include_runtime_facts: false })
+      detail.value = { ...loaded, relation_mappings: loaded.relation_mappings || [] }
+    } catch (error: any) {
+      ElMessage.error(error?.message || '正式定义已更新，但场景统计刷新失败，请稍后重试。')
+    }
+  }
+  await loadScenarioDrafts(true)
 }
 
 // ── 加载 ──
@@ -4199,6 +4259,22 @@ onBeforeUnmount(() => {
 .sd-tabs :deep(.el-tabs__item) {
   font-size: 14px;
   font-weight: 600;
+}
+.candidate-tab-count {
+  display: inline-flex;
+  min-width: 20px;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  margin-inline-start: 5px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 .sd-tabs :deep(.el-tabs__content) {
   flex: 1;

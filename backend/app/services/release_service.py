@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -24,6 +25,8 @@ from ..models import (
     BusinessScenario,
     DataMapping,
     DataSource,
+    DatasetHead,
+    DatasetVersion,
     EventEnvelope,
     FunctionDefinition,
     OntologyAction,
@@ -42,6 +45,8 @@ from ..models import (
     OntologyProperty,
     RelationInstance,
     RelationDataMapping,
+    ScenarioCapabilityPort,
+    ScenarioDatasetBinding,
     WorkflowRun,
 )
 from . import (
@@ -108,6 +113,17 @@ class ReleaseValidationError(ValueError):
 
 class ReleaseConflictError(ReleaseValidationError):
     """并发/状态冲突；调用方需要重新基于最新分支创建提案。"""
+
+
+@dataclass(frozen=True)
+class ReleaseWithdrawalResult:
+    scenario_id: str
+    environment: str
+    withdrawn_release_ids: tuple[str, ...]
+    changed: bool
+    withdrawn_at: datetime | None
+    withdrawn_by_user_id: str | None
+    reason: str
 
 
 def _now() -> datetime:
@@ -672,6 +688,151 @@ def _normalize_workflow(raw: Any) -> dict:
     }
 
 
+_CAPABILITY_PORT_DIRECTIONS = {"input", "output"}
+_CAPABILITY_PORT_ROLES = {
+    "modeling_evidence",
+    "test_fixture",
+    "invocation_input",
+    "reference",
+    "rules",
+    "output",
+}
+_CAPABILITY_PORT_MEDIA_KINDS = {
+    "message",
+    "structured",
+    "document",
+    "dataset",
+    "connector",
+    "artifact",
+}
+_CAPABILITY_PORT_CARDINALITIES = {"one", "many"}
+_CAPABILITY_PORT_BINDING_POLICIES = {
+    "per_invocation",
+    "scenario_default",
+    "release_pinned",
+    "none",
+}
+_CAPABILITY_PORT_KINDS = {"function", "action", "workflow"}
+_CAPABILITY_PORT_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,179}")
+_PORT_PHYSICAL_REFERENCE_KEYS = {
+    "asset_id",
+    "asset_version_id",
+    "bucket_file_id",
+    "connector_binding_id",
+    "connection_string",
+    "connection_url",
+    "data_source_id",
+    "dataset_head_id",
+    "dataset_id",
+    "dataset_version_id",
+    "dsn",
+    "physical_table",
+    "sql",
+    "table_name",
+}
+
+
+def _reject_port_physical_references(value: Any, *, path: str = "config") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            if normalized in _PORT_PHYSICAL_REFERENCE_KEYS:
+                raise ReleaseValidationError(
+                    f"能力端口 {path}.{key} 不能保存物理资源或运行数据引用"
+                )
+            _reject_port_physical_references(child, path=f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_port_physical_references(child, path=f"{path}[{index}]")
+
+
+def _normalize_capability_port(raw: Any, *, contract_version: int) -> dict:
+    """Normalize one protocol-neutral port without admitting runtime data."""
+    if not isinstance(raw, dict):
+        raise ReleaseValidationError("能力端口必须是对象")
+    direction = _string(raw.get("direction"), "能力端口方向", maximum=20)
+    role = _string(raw.get("role"), "能力端口用途", maximum=30)
+    media_kind = _string(
+        raw.get("media_kind"), "能力端口介质类型", default="structured", maximum=20
+    )
+    cardinality = _string(
+        raw.get("cardinality"), "能力端口基数", default="one", maximum=20
+    )
+    binding_policy = _string(
+        raw.get("binding_policy"),
+        "能力端口绑定策略",
+        default="per_invocation",
+        maximum=30,
+    )
+    if direction not in _CAPABILITY_PORT_DIRECTIONS:
+        raise ReleaseValidationError("能力端口方向无效")
+    if role not in _CAPABILITY_PORT_ROLES:
+        raise ReleaseValidationError("能力端口用途无效")
+    if media_kind not in _CAPABILITY_PORT_MEDIA_KINDS:
+        raise ReleaseValidationError("能力端口介质类型无效")
+    if cardinality not in _CAPABILITY_PORT_CARDINALITIES:
+        raise ReleaseValidationError("能力端口基数无效")
+    if binding_policy not in _CAPABILITY_PORT_BINDING_POLICIES:
+        raise ReleaseValidationError("能力端口绑定策略无效")
+    if (direction == "output") != (role == "output"):
+        raise ReleaseValidationError("输出端口必须使用 output 用途，输入端口不能使用 output")
+    if binding_policy == "none" and _bool(
+        raw.get("is_required"), "能力端口 is_required", default=True
+    ):
+        raise ReleaseValidationError("binding_policy=none 的能力端口不能声明为必填")
+
+    port_key = _string(raw.get("port_key"), "能力端口 key", maximum=180).strip()
+    if _CAPABILITY_PORT_KEY_RE.fullmatch(port_key) is None:
+        raise ReleaseValidationError(
+            "能力端口 key 必须以字母或数字开头，且只能包含 . _ : -"
+        )
+    name = _string(raw.get("name"), "能力端口名称", maximum=300).strip()
+    if not name:
+        raise ReleaseValidationError("能力端口名称不能为空")
+
+    schema_hash = _string(
+        raw.get("dataset_schema_hash"), "能力端口 Dataset Schema hash", maximum=64
+    ).lower()
+    if schema_hash and not re.fullmatch(r"[0-9a-f]{64}", schema_hash):
+        raise ReleaseValidationError("能力端口 Dataset Schema hash 必须是 SHA-256")
+    schema_document = _sanitize_secret_values(
+        _dict(raw.get("schema_document"), "能力端口 JSON Schema")
+    )
+    config = _sanitize_secret_values(_dict(raw.get("config"), "能力端口配置"))
+    if _contains_marker(schema_document) or _contains_marker(config):
+        raise ReleaseValidationError("能力端口契约不能包含凭据或敏感配置")
+    _reject_port_physical_references(config)
+    normalized = {
+        "id": _required_id(raw.get("id"), "能力端口 id"),
+        "port_key": port_key,
+        "name": name,
+        "description": _string(raw.get("description"), "能力端口说明", maximum=8_000),
+        "direction": direction,
+        "role": role,
+        "media_kind": media_kind,
+        "schema_document": schema_document,
+        "dataset_schema_hash": schema_hash,
+        "is_required": _bool(raw.get("is_required"), "能力端口 is_required", default=True),
+        "cardinality": cardinality,
+        "binding_policy": binding_policy,
+        "config": config,
+    }
+    if contract_version >= 2:
+        capability_kind = _string(
+            raw.get("capability_kind"), "能力端口所属能力类型", maximum=40
+        ).strip().lower()
+        capability_key = _string(
+            raw.get("capability_key"), "能力端口所属能力 key", maximum=240
+        ).strip()
+        if capability_kind not in _CAPABILITY_PORT_KINDS:
+            raise ReleaseValidationError("能力端口所属能力类型无效")
+        if not capability_key:
+            raise ReleaseValidationError("能力端口所属能力 key 不能为空")
+        normalized["capability_kind"] = capability_kind
+        normalized["capability_key"] = capability_key
+    return normalized
+
+
 def _runtime_binding_requirements(
     mappings: list[dict], relation_mappings: list[dict], actions: list[dict], workflows: list[dict]
 ) -> list[dict[str, str]]:
@@ -769,6 +930,27 @@ def normalize_snapshot_content(content: Any) -> dict:
         _normalize_function(item)
         for item in _list(content.get("functions") if functions_present else [], "函数定义列表")
     ]
+    # Capability ports were introduced in definition format v2.  Omission is
+    # preserved for legacy v1 snapshots so normalizing a historical snapshot
+    # does not alter its integrity hash.
+    capability_ports_present = "capability_ports" in content
+    capability_contract_version = (
+        content.get("capability_contract_version", 1)
+        if capability_ports_present
+        else 1
+    )
+    if capability_contract_version not in {1, 2}:
+        raise ReleaseValidationError("不支持的 capability contract 版本")
+    capability_ports = [
+        _normalize_capability_port(
+            item,
+            contract_version=int(capability_contract_version),
+        )
+        for item in _list(
+            content.get("capability_ports") if capability_ports_present else [],
+            "能力端口列表",
+        )
+    ]
     actions = [_normalize_action(item) for item in _list(content.get("actions"), "Action 列表")]
     rules = [_normalize_rule(item) for item in _list(content.get("rules"), "规则列表")]
     events = [_normalize_event(item) for item in _list(content.get("events"), "事件列表")]
@@ -821,6 +1003,7 @@ def normalize_snapshot_content(content: Any) -> dict:
         "数据映射": mappings,
         "关系数据映射": relation_mappings,
         "函数": functions,
+        "能力端口": capability_ports,
         "关系": relations,
         "Action": actions,
         "规则": rules,
@@ -831,12 +1014,36 @@ def normalize_snapshot_content(content: Any) -> dict:
         if len(set(ids)) != len(ids):
             raise ReleaseValidationError(f"{label} id 不能重复")
 
+    capability_port_keys = [
+        (
+            item.get("capability_kind", ""),
+            item.get("capability_key", ""),
+            item["port_key"].casefold(),
+        )
+        if capability_contract_version >= 2
+        else ("", "", item["port_key"].casefold())
+        for item in capability_ports
+    ]
+    if len(set(capability_port_keys)) != len(capability_port_keys):
+        raise ReleaseValidationError("能力端口 key 不能重复")
+
     entity_id_set = set(entity_ids)
     relation_id_set = {item["id"] for item in relations}
     mapping_by_id = {item["id"]: item for item in mappings}
+    function_id_set = {item["id"] for item in functions}
     action_id_set = {item["id"] for item in actions}
     rule_id_set = {item["id"] for item in rules}
     event_id_set = {item["id"] for item in events}
+    workflow_id_set = {item["id"] for item in workflows}
+    capability_ids = {
+        "function": function_id_set,
+        "action": action_id_set,
+        "workflow": workflow_id_set,
+    }
+    if capability_contract_version >= 2:
+        for port in capability_ports:
+            if port["capability_key"] not in capability_ids[port["capability_kind"]]:
+                raise ReleaseValidationError("能力端口引用了不存在的所属能力")
     for relation in relations:
         if relation["source_entity_id"] not in entity_id_set or relation["target_entity_id"] not in entity_id_set:
             raise ReleaseValidationError("关系引用了不存在的实体")
@@ -958,6 +1165,9 @@ def normalize_snapshot_content(content: Any) -> dict:
         normalized["relation_mappings"] = relation_mappings
     if functions_present:
         normalized["functions"] = functions
+    if capability_ports_present:
+        normalized["capability_contract_version"] = capability_contract_version
+        normalized["capability_ports"] = capability_ports
     if connector_bindings_present:
         normalized["connector_bindings"] = connector_bindings
     return normalized
@@ -1065,6 +1275,22 @@ def active_snapshot_content(content: Mapping[str, Any]) -> dict:
     projected["actions"] = actions
     projected["rules"] = rules
     projected["workflows"] = workflows
+    if int(projected.get("capability_contract_version", 1) or 1) >= 2:
+        active_capabilities = {
+            "function": {
+                str(item["id"]) for item in projected.get("functions", [])
+            },
+            "action": {str(item["id"]) for item in actions},
+            "workflow": {str(item["id"]) for item in workflows},
+        }
+        projected["capability_ports"] = [
+            item
+            for item in projected.get("capability_ports", [])
+            if str(item.get("capability_key") or "")
+            in active_capabilities.get(
+                str(item.get("capability_kind") or ""), set()
+            )
+        ]
     return projected
 
 
@@ -1204,6 +1430,44 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
                 .order_by(FunctionDefinition.id.asc())
             ).scalars().all()
         ],
+        # Ports describe requirements only.  Dataset ids, asset versions,
+        # connector ids, physical table names and credentials are deliberately
+        # excluded from the immutable capability definition.
+        "capability_contract_version": 2,
+        "capability_ports": [
+            {
+                "id": port.id,
+                "capability_kind": port.capability_kind,
+                "capability_key": port.capability_key,
+                "port_key": port.port_key,
+                "name": port.name,
+                "description": port.description or "",
+                "direction": port.direction,
+                "role": port.role,
+                "media_kind": port.media_kind,
+                "schema_document": copy.deepcopy(port.schema_document or {}),
+                "dataset_schema_hash": (
+                    port.dataset_schema.schema_hash if port.dataset_schema else ""
+                ),
+                "is_required": bool(port.is_required),
+                "cardinality": port.cardinality or "one",
+                "binding_policy": port.binding_policy or "per_invocation",
+                "config": _sanitize_secret_values(port.config or {}),
+            }
+            for port in db.execute(
+                select(ScenarioCapabilityPort)
+                .options(joinedload(ScenarioCapabilityPort.dataset_schema))
+                .where(
+                    ScenarioCapabilityPort.scenario_id == scenario.id,
+                    ScenarioCapabilityPort.status == "active",
+                )
+                .order_by(
+                    ScenarioCapabilityPort.capability_kind.asc(),
+                    ScenarioCapabilityPort.capability_key.asc(),
+                    ScenarioCapabilityPort.port_key.asc(),
+                )
+            ).scalars().unique().all()
+        ],
         "actions": [
             {
                 "id": action.id,
@@ -1301,6 +1565,7 @@ def _scenario_for_read(db: Session, scenario_id: str) -> tuple[BusinessScenario,
 def _scenario_for_manage(db: Session, scenario_id: str) -> tuple[BusinessScenario, permission_service.Principal]:
     scenario, principal = _scenario_for_read(db, scenario_id)
     permission_service.require_tenant_permission(db, "manage")
+    _require_active_governance_scenario(scenario)
     return scenario, principal
 
 
@@ -1317,6 +1582,7 @@ def _branch_for_read(db: Session, branch_id: str) -> tuple[OntologyBranch, Busin
 def _branch_for_manage(db: Session, branch_id: str) -> tuple[OntologyBranch, BusinessScenario, permission_service.Principal]:
     branch, scenario, principal = _branch_for_read(db, branch_id)
     permission_service.require_tenant_permission(db, "manage")
+    _require_active_governance_scenario(scenario)
     return branch, scenario, principal
 
 
@@ -1337,7 +1603,16 @@ def _proposal_for_read(db: Session, proposal_id: str) -> tuple[OntologyProposal,
 def _proposal_for_manage(db: Session, proposal_id: str) -> tuple[OntologyProposal, BusinessScenario, permission_service.Principal]:
     proposal, scenario, principal = _proposal_for_read(db, proposal_id)
     permission_service.require_tenant_permission(db, "manage")
+    _require_active_governance_scenario(scenario)
     return proposal, scenario, principal
+
+
+def _require_active_governance_scenario(
+    scenario: BusinessScenario,
+) -> BusinessScenario:
+    if str(scenario.status or "").strip().lower() == "retired":
+        raise ReleaseConflictError("业务场景已退役，不能创建或变更治理定义")
+    return scenario
 
 
 def _snapshot_for_scenario(db: Session, scenario: BusinessScenario, snapshot_id: str) -> OntologySnapshot:
@@ -1644,6 +1919,86 @@ def _require_mapping_sql_bindings(
         )
 
 
+def _require_snapshot_managed_dependencies(
+    db: Session,
+    scenario: BusinessScenario,
+    content: Mapping[str, Any],
+    *,
+    environment: str,
+) -> None:
+    """Require governed bindings promised by stable reference and rule ports."""
+
+    raw_ports = content.get("capability_ports") or []
+    ports = raw_ports if isinstance(raw_ports, list) else []
+    for port in ports:
+        if not isinstance(port, Mapping):
+            continue
+        role = str(port.get("role") or "invocation_input").strip().lower()
+        policy = str(port.get("binding_policy") or "per_invocation").strip().lower()
+        if (
+            str(port.get("direction") or "input").strip().lower() != "input"
+            or not bool(port.get("is_required", True))
+            or role not in {"reference", "rules"}
+            or policy not in {"scenario_default", "release_pinned"}
+        ):
+            continue
+        port_key = str(port.get("port_key") or "").strip()
+        config = port.get("config") if isinstance(port.get("config"), Mapping) else {}
+        binding_key = str(
+            config.get("default_binding_key", config.get("binding_key", port_key))
+            or ""
+        ).strip()
+        binding = db.execute(
+            select(ScenarioDatasetBinding).where(
+                ScenarioDatasetBinding.tenant_id == scenario.tenant_id,
+                ScenarioDatasetBinding.scenario_id == scenario.id,
+                ScenarioDatasetBinding.environment == environment,
+                ScenarioDatasetBinding.binding_key == binding_key,
+                ScenarioDatasetBinding.role == role,
+                ScenarioDatasetBinding.status == "active",
+            )
+        ).scalar_one_or_none()
+        if binding is None:
+            raise ReleaseValidationError(
+                f"发布环境缺少必填 {role} 端口的受管绑定：{binding_key}"
+            )
+        mode = str(binding.binding_mode or "").strip().lower()
+        if policy == "release_pinned" and mode != "pinned":
+            raise ReleaseValidationError(
+                f"release_pinned 端口必须绑定固定数据版本：{binding_key}"
+            )
+        if mode == "pinned":
+            ready = db.execute(
+                select(DatasetVersion.id).where(
+                    DatasetVersion.id == binding.dataset_version_id,
+                    DatasetVersion.dataset_id == binding.dataset_id,
+                    DatasetVersion.tenant_id == scenario.tenant_id,
+                    DatasetVersion.status == "ready",
+                )
+            ).scalar_one_or_none()
+        elif mode == "head":
+            ready = db.execute(
+                select(DatasetHead.id)
+                .join(
+                    DatasetVersion,
+                    DatasetVersion.id == DatasetHead.dataset_version_id,
+                )
+                .where(
+                    DatasetHead.id == binding.dataset_head_id,
+                    DatasetHead.dataset_id == binding.dataset_id,
+                    DatasetHead.tenant_id == scenario.tenant_id,
+                    DatasetHead.environment == environment,
+                    DatasetVersion.status == "ready",
+                )
+            ).scalar_one_or_none()
+        else:
+            ready = None
+        if ready is None:
+            raise ReleaseValidationError(
+                f"必填 {role} 端口的受管绑定尚未就绪：{binding_key}"
+            )
+
+
 def _ensure_live_matches_head(db: Session, scenario: BusinessScenario, branch: OntologyBranch) -> None:
     if not branch.head_snapshot_id:
         raise ReleaseConflictError("分支没有可作为合并基线的 head 快照")
@@ -1748,7 +2103,10 @@ def _lock_template_governance_scenario(
         )
     except template_catalog_service.TemplateCatalogError as exc:
         raise ReleaseConflictError(str(exc)) from exc
-    return locked[scenario.id]
+    # This check intentionally happens after the refreshed row lock.  A
+    # publisher that waited behind retirement must observe ``retired`` and
+    # fail instead of creating a new active release after retirement commits.
+    return _require_active_governance_scenario(locked[scenario.id])
 
 
 def _workflow_reference_ids(workflow: dict) -> dict[str, set[str]]:
@@ -1892,6 +2250,19 @@ def assert_scenario_deletion_allowed(
     ).scalar_one_or_none()
     if active_release is not None:
         raise ReleaseConflictError("不能删除仍被活动环境发布引用的业务场景")
+
+
+def assert_scenario_retirement_allowed(
+    db: Session,
+    scenario: BusinessScenario,
+) -> None:
+    """Require active staging/prod deployments to be withdrawn before retirement."""
+    try:
+        assert_scenario_deletion_allowed(db, scenario)
+    except ReleaseConflictError as exc:
+        raise ReleaseConflictError(
+            "不能退役仍被活动环境发布引用的业务场景"
+        ) from exc
 
 
 def assert_resource_deletion_allowed(
@@ -2668,6 +3039,7 @@ def get_proposal(db: Session, proposal_id: str) -> OntologyProposal:
 def submit_proposal(db: Session, proposal_id: str) -> OntologyProposal:
     """Submit an existing draft without allowing silent content replacement."""
     proposal, scenario, principal = _proposal_for_manage(db, proposal_id)
+    scenario = _lock_template_governance_scenario(db, scenario)
     if proposal.status != "draft":
         raise ReleaseConflictError("只有草稿提案可以提交评审")
     if proposal.created_by_user_id != principal.user_id:
@@ -2708,7 +3080,8 @@ def create_review(
     decision: str,
     comment: str = "",
 ) -> OntologyReview:
-    proposal, _, principal = _proposal_for_manage(db, proposal_id)
+    proposal, scenario, principal = _proposal_for_manage(db, proposal_id)
+    scenario = _lock_template_governance_scenario(db, scenario)
     if decision not in {"approve", "reject"}:
         raise ReleaseValidationError("评审决定必须为 approve 或 reject")
     if proposal.status != "submitted":
@@ -2868,6 +3241,12 @@ def publish_snapshot(
     )
     try:
         _validate_snapshot_template_actions(db, scenario, snapshot.content or {})
+        _require_snapshot_managed_dependencies(
+            db,
+            scenario,
+            snapshot.content or {},
+            environment=environment,
+        )
         connector_audit = _require_snapshot_connectors(
             db, scenario, snapshot.content or {}, environment=environment
         )
@@ -2913,6 +3292,96 @@ def list_releases(
     if environment:
         stmt = stmt.where(OntologyRelease.environment == environment)
     return db.execute(stmt.order_by(OntologyRelease.created_at.desc())).scalars().all()
+
+
+def withdraw_environment(
+    db: Session,
+    scenario_id: str,
+    *,
+    environment: str,
+    confirmed: bool,
+    reason: str,
+) -> ReleaseWithdrawalResult:
+    """Atomically remove the active staging/prod deployment pointer.
+
+    Release and snapshot rows remain durable.  ``rolled_back`` is the existing
+    inactive release state; the dedicated withdrawal facts distinguish this
+    lifecycle command from an ontology snapshot rollback without inventing a
+    second active-state vocabulary.
+    """
+    if confirmed is not True:
+        raise ReleaseValidationError("撤下发布必须显式 confirmed=true")
+    if environment not in {"staging", "prod"}:
+        raise ReleaseValidationError("只能撤下 staging 或 prod 环境发布")
+    withdrawal_reason = _string(reason, "撤下原因", maximum=8_000).strip()
+    if not withdrawal_reason:
+        raise ReleaseValidationError("撤下原因不能为空")
+
+    scenario, principal = _scenario_for_manage(db, scenario_id)
+    try:
+        scenario = _lock_template_governance_scenario(db, scenario)
+        active_releases = list(
+            db.scalars(
+                select(OntologyRelease)
+                .where(
+                    OntologyRelease.scenario_id == scenario.id,
+                    OntologyRelease.tenant_id == scenario.tenant_id,
+                    OntologyRelease.environment == environment,
+                    OntologyRelease.status == "released",
+                )
+                .order_by(OntologyRelease.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            ).all()
+        )
+        if not active_releases:
+            previous = db.scalar(
+                select(OntologyRelease)
+                .where(
+                    OntologyRelease.scenario_id == scenario.id,
+                    OntologyRelease.tenant_id == scenario.tenant_id,
+                    OntologyRelease.environment == environment,
+                    OntologyRelease.withdrawn_at.is_not(None),
+                )
+                .order_by(
+                    OntologyRelease.withdrawn_at.desc(),
+                    OntologyRelease.created_at.desc(),
+                    OntologyRelease.id.desc(),
+                )
+                .limit(1)
+            )
+            if previous is None:
+                raise ReleaseConflictError(f"{environment} 环境没有可撤下的活动发布")
+            return ReleaseWithdrawalResult(
+                scenario_id=scenario.id,
+                environment=environment,
+                withdrawn_release_ids=(previous.id,),
+                changed=False,
+                withdrawn_at=previous.withdrawn_at,
+                withdrawn_by_user_id=previous.withdrawn_by_user_id,
+                reason=previous.withdraw_reason or "",
+            )
+
+        withdrawn_at = _now()
+        release_ids = tuple(release.id for release in active_releases)
+        for release in active_releases:
+            release.status = "rolled_back"
+            release.withdrawn_at = withdrawn_at
+            release.withdrawn_by_user_id = principal.user_id
+            release.withdraw_reason = withdrawal_reason
+        db.commit()
+        return ReleaseWithdrawalResult(
+            scenario_id=scenario.id,
+            environment=environment,
+            withdrawn_release_ids=release_ids,
+            changed=True,
+            withdrawn_at=withdrawn_at,
+            withdrawn_by_user_id=principal.user_id,
+            reason=withdrawal_reason,
+        )
+    except Exception:
+        db.rollback()
+        raise
 
 
 def rollback_snapshot(

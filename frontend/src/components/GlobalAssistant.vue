@@ -3426,8 +3426,43 @@ onBeforeUnmount(() => {
   .worklog-chevron, .disclosure-chevron, .stream-cursor { transition: none; animation: none; }
 }
 
+@media (max-width: 560px), (max-height: 480px) {
+  .assistant-launcher {
+    top: 8px;
+    right: 136px;
+    bottom: auto;
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    min-height: 44px;
+    padding: 4px;
+    justify-content: center;
+    gap: 0;
+    border-radius: 50%;
+  }
+  .assistant-launcher-copy {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .assistant-live-dot { display: none; }
+}
+
+@media (max-height: 480px) and (min-width: 901px) {
+  .assistant-launcher { right: 296px; }
+}
+
 @media (max-width: 560px) {
-  .assistant-launcher { right: 14px; bottom: 14px; }
+  .assistant-head { padding: 10px 12px; }
+  .assistant-title-wrap { gap: 8px; }
+  .assistant-title { font-size: 14px; white-space: nowrap; }
+  .assistant-title :deep(.el-tag), .assistant-subtitle { display: none; }
   .context-hint { width: 100%; margin-left: 0; }
   .assistant-session-bar { align-items: flex-start; flex-direction: column; }
   .session-actions { width: 100%; }

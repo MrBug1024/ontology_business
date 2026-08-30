@@ -41,6 +41,12 @@ from app.schemas import DataMappingIn
 
 class MappingRefreshJobTests(unittest.TestCase):
     def setUp(self) -> None:
+        probe = patch(
+            "app.services.datasource_service.test_connection",
+            return_value=(True, "test connector ready"),
+        )
+        probe.start()
+        self.addCleanup(probe.stop)
         self.engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(self.engine)
         self.db = Session(self.engine)
@@ -60,7 +66,7 @@ class MappingRefreshJobTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="订单库",
-            type="sqlite",
+            type="postgres",
             config={},
             status="ok",
         )
@@ -121,7 +127,7 @@ class MappingRefreshJobTests(unittest.TestCase):
     def _publish_mapping_to_staging(self):
         """Create the exact release/binding evidence a non-dev job requires."""
         self.mapping.data_source_binding_key = "orders-refresh-binding"
-        self.mapping.data_source_binding_ref = {"adapter": "sqlite"}
+        self.mapping.data_source_binding_ref = {"adapter": "postgres"}
         binding = connector_service.upsert_binding(
             self.db,
             self.scenario,

@@ -2,8 +2,8 @@
   <div class="page">
     <div class="page-header">
       <div>
-        <h1>Agent 管理</h1>
-        <div class="sub">绑定业务场景、大模型与业务数据，完成就绪检查后进入对话</div>
+        <h1>验证 Agent</h1>
+        <div class="sub">供业务专家验证场景理解与能力边界；运行数据和附件按每次验证独立提供</div>
       </div>
       <div class="agent-header-actions">
         <el-select
@@ -16,7 +16,7 @@
         >
           <el-option v-for="scenario in scenarios" :key="scenario.id" :label="scenario.name" :value="scenario.id" />
         </el-select>
-        <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 Agent</el-button>
+        <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建验证 Agent</el-button>
       </div>
     </div>
 
@@ -29,13 +29,15 @@
               <div class="ag-name">{{ a.name }}</div>
               <div class="muted">{{ a.scenario_name || '未绑定场景' }}</div>
             </div>
-            <el-tag size="small" effect="plain" :type="agentReady(a) ? 'success' : 'warning'">{{ agentReady(a) ? '可对话' : '待配置' }}</el-tag>
+            <el-tag size="small" effect="plain" :type="agentReady(a) ? 'success' : 'warning'">{{ agentReady(a) ? '可验证' : '待补齐' }}</el-tag>
           </div>
           <div class="ag-desc">{{ a.description || '暂无描述' }}</div>
           <div class="ag-tags">
             <el-tag v-if="a.llm_name" size="small" type="primary" effect="light"><el-icon aria-hidden="true"><ChatDotRound /></el-icon>{{ a.llm_name }}</el-tag>
-            <el-tag v-for="n in a.data_source_names || []" :key="n" size="small" type="info" effect="light"><el-icon aria-hidden="true"><Coin /></el-icon>{{ n }}</el-tag>
-            <span class="muted" v-if="!(a.llm_name || a.data_source_names?.length)">未配置模型与数据</span>
+            <el-tag v-for="connection in a.runtime_connections || []" :key="connection.id || connection.name" size="small" type="info" effect="light">
+              <el-icon aria-hidden="true"><Coin /></el-icon>{{ connection.name }}
+            </el-tag>
+            <span class="muted" v-if="!(a.llm_name || a.runtime_connections?.length)">暂无模型与业务数据库</span>
           </div>
           <div class="capability-line">
             <span>业务能力 {{ capabilityTotals(a).selected }} 项</span>
@@ -44,17 +46,20 @@
             <el-tag v-if="a.capability_scope_legacy" size="small" type="warning" effect="plain">旧版待配置</el-tag>
           </div>
           <div class="agent-readiness" :class="{ ready: agentReady(a) }">
-            <span :class="{ done: agentReadiness(a).ontology }"><el-icon><component :is="agentReadiness(a).ontology ? 'CircleCheck' : 'Warning'" /></el-icon>本体</span>
-            <span :class="{ done: agentReadiness(a).source }"><el-icon><component :is="agentReadiness(a).source ? 'CircleCheck' : 'Warning'" /></el-icon>数据源</span>
-            <span :class="{ done: agentReadiness(a).mapping }"><el-icon><component :is="agentReadiness(a).mapping ? 'CircleCheck' : 'Warning'" /></el-icon>映射</span>
-            <span :class="{ done: agentReadiness(a).model }"><el-icon><component :is="agentReadiness(a).model ? 'CircleCheck' : 'Warning'" /></el-icon>模型</span>
-            <span :class="{ done: agentReadiness(a).dataBinding }"><el-icon><component :is="agentReadiness(a).dataBinding ? 'CircleCheck' : 'Warning'" /></el-icon>业务数据</span>
+            <span
+              v-for="axis in readinessAxes"
+              :key="axis.key"
+              :class="{ done: agentReadiness(a)[axis.key].ready }"
+              :title="readinessAxisTitle(a, axis.key, axis.label)"
+            >
+              <el-icon><component :is="agentReadiness(a)[axis.key].ready ? 'CircleCheck' : 'Warning'" /></el-icon>{{ axis.label }}
+            </span>
           </div>
           <div class="ag-actions">
-            <el-button v-if="agentReady(a)" size="small" type="primary" @click="openAgentChat(a)"><el-icon><ChatDotRound /></el-icon> 进入对话</el-button>
-            <el-button v-else size="small" plain type="warning" @click="continueSetup(a)"><el-icon><Position /></el-icon> 继续建设</el-button>
+            <el-button v-if="agentReady(a)" size="small" type="primary" @click="openAgentChat(a)"><el-icon><ChatDotRound /></el-icon> 开始验证</el-button>
+            <el-button v-else size="small" plain type="warning" @click="continueSetup(a)"><el-icon><Position /></el-icon> 补齐验证配置</el-button>
             <el-button size="small" :type="agentReady(a) ? 'primary' : 'warning'" :text="agentReady(a)" :plain="!agentReady(a)" @click="openEdit(a)">
-              <el-icon><Setting /></el-icon> {{ agentReady(a) ? '配置' : '补齐配置' }}
+              <el-icon><Setting /></el-icon> 编辑
             </el-button>
             <el-button size="small" text type="danger" @click="remove(a)"><el-icon><Delete /></el-icon> 删除</el-button>
           </div>
@@ -63,12 +68,12 @@
     </el-row>
     <div v-if="!loading && !agents.length" class="empty-wrap">
       <div class="empty-icon"><el-icon :size="28"><Cpu /></el-icon></div>
-      <div>暂无 Agent，点击右上角「新建 Agent」开始</div>
-      <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新建 Agent</el-button>
+      <div>暂无验证 Agent，点击右上角开始创建</div>
+      <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新建验证 Agent</el-button>
     </div>
 
     <!-- 编辑对话框 -->
-    <el-dialog v-model="dlg" :title="form.id ? '编辑 Agent' : '新建 Agent'" width="900px" top="4vh" class="agent-dialog">
+    <el-dialog v-model="dlg" :title="form.id ? '编辑验证 Agent' : '新建验证 Agent'" width="900px" top="4vh" class="agent-dialog">
       <el-form :model="form" label-width="100px" class="agent-form">
         <el-row :gutter="12">
           <el-col :span="12">
@@ -98,23 +103,56 @@
 
         <el-form-item label="系统提示词">
           <el-input v-model="form.system_prompt" type="textarea" :rows="3"
-            placeholder="可选。留空则使用平台默认提示词（包含本体、映射数据和场景能力摘要）" />
+            placeholder="可选。留空则使用平台默认提示词（包含场景语义与已授权能力，并按需使用验证资源）" />
         </el-form-item>
 
-        <el-form-item label="可用数据">
-          <el-select v-model="form.data_source_ids" multiple placeholder="选择映射数据及需要检索的文档资料库" style="width:100%">
-            <el-option v-for="d in availableDataSources" :key="d.id" :label="d.name" :value="d.id">
-              <span>{{ d.name }}</span>
-              <span class="muted" style="float:right">{{ sourceBindingHint(d) }}</span>
-            </el-option>
-          </el-select>
-        </el-form-item>
+        <section class="runtime-connection-section" aria-labelledby="runtime-connection-heading">
+          <div class="runtime-connection-heading">
+            <div>
+              <h3 id="runtime-connection-heading">业务数据库</h3>
+              <p>可选。这里只配置 Agent 正式运行时可访问的数据库；“建模资料”中的连接不会出现在这里，也不会被运行时使用。</p>
+            </div>
+            <el-button size="small" :disabled="!form.scenario_id" @click="addRuntimeConnection">
+              <el-icon><Plus /></el-icon>添加数据库
+            </el-button>
+          </div>
+          <el-alert
+            v-if="!form.scenario_id"
+            type="info"
+            :closable="false"
+            title="选择业务场景后可以配置业务数据库"
+          />
+          <div v-else-if="form.runtime_connections?.length" class="runtime-connection-list">
+            <article v-for="(connection, index) in form.runtime_connections" :key="connection.id || index" class="runtime-connection-card">
+              <div class="runtime-connection-card-head">
+                <strong>PostgreSQL 数据库 {{ index + 1 }}</strong>
+                <el-tag v-if="connection.status === 'ok'" size="small" type="success">连接正常</el-tag>
+                <el-tag v-else-if="connection.status === 'error'" size="small" type="danger">连接异常</el-tag>
+                <el-button text type="danger" :aria-label="`移除数据库 ${index + 1}`" @click="removeRuntimeConnection(index)">
+                  <el-icon><Delete /></el-icon>
+                </el-button>
+              </div>
+              <el-row :gutter="10">
+                <el-col :span="8"><el-input v-model="connection.name" placeholder="连接名称" aria-label="业务数据库连接名称" /></el-col>
+                <el-col :span="10"><el-input v-model="connection.config.host" placeholder="主机地址" aria-label="数据库主机地址" /></el-col>
+                <el-col :span="6"><el-input-number v-model="connection.config.port" :min="1" :max="65535" controls-position="right" aria-label="数据库端口" style="width:100%" /></el-col>
+              </el-row>
+              <el-row :gutter="10" class="runtime-connection-fields">
+                <el-col :span="8"><el-input v-model="connection.config.database" placeholder="数据库名" aria-label="数据库名" /></el-col>
+                <el-col :span="8"><el-input v-model="connection.config.username" placeholder="用户名" aria-label="数据库用户名" /></el-col>
+                <el-col :span="8"><el-input v-model="connection.config.password" type="password" show-password :placeholder="connection.id ? '留空保持原密码' : '密码'" aria-label="数据库密码" /></el-col>
+              </el-row>
+              <p v-if="connection.last_error" class="runtime-connection-error">{{ connection.last_error }}</p>
+            </article>
+          </div>
+          <el-empty v-else description="未配置业务数据库；Agent 仍可处理对话文本和本轮上传文件" :image-size="54" />
+        </section>
 
         <section class="capability-section" aria-labelledby="agent-capability-heading">
           <div class="capability-heading">
             <div>
-              <h3 id="agent-capability-heading">业务能力白名单</h3>
-              <p>只把完成此 Agent 职责所需的函数、操作、规则、事件和工作流交给模型。空白名单仍可查询本体与已绑定数据。</p>
+              <h3 id="agent-capability-heading">业务能力</h3>
+              <p>新 Agent 默认拥有当前场景的全部业务能力；只有需要限制职责边界时，才改为指定能力。</p>
             </div>
             <el-tag v-if="capabilityCatalog" size="small" effect="plain">{{ capabilityCatalog.environment }} 运行定义</el-tag>
           </div>
@@ -191,15 +229,14 @@
         </section>
 
         <el-alert
-          v-if="form.scenario_id"
           :type="formAgentReady ? 'success' : 'warning'"
           :closable="false"
           show-icon
           class="setup-alert"
-          :title="formAgentReady ? 'Agent 已具备进入对话的条件' : `尚缺：${formAgentMissing.join('、')}`"
+          :title="formAgentReady ? 'Agent 已具备开始能力验证的条件' : `尚缺：${formAgentMissing.join('、')}`"
         >
           <template #default>
-            <span v-if="!formAgentReady">可以先保存草稿；补齐以上项目后才能进入对话。</span>
+            <span>{{ formAgentReady ? '发布与正式运行仍以各自就绪检查为准。' : '绑定资源是可选项，无固定数据的场景不会因此被阻塞。' }}</span>
           </template>
         </el-alert>
       </el-form>
@@ -216,7 +253,8 @@ import { computed, ref, onBeforeUnmount, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
-import { cloneAgentCapabilityScope, emptyAgentCapabilityScope } from '@/utils/agentCapabilities'
+import { allAgentCapabilityScope, cloneAgentCapabilityScope, emptyAgentCapabilityScope } from '@/utils/agentCapabilities'
+import { normalizeAgentReadiness } from '@/utils/agentReadiness'
 import type {
   Agent,
   AgentCapabilityCatalog,
@@ -224,10 +262,10 @@ import type {
   AgentCapabilityReadinessItem,
   AgentCapabilitySelection,
   AgentCapabilitySummary,
+  AgentReadinessAxisKey,
   Scenario,
-  ScenarioDetail,
   LLMConfig,
-  DataSource,
+  AgentRuntimeConnection,
 } from '@/types'
 
 const capabilityCategories: Array<{ key: AgentCapabilityCategory; label: string; help: string }> = [
@@ -237,12 +275,16 @@ const capabilityCategories: Array<{ key: AgentCapabilityCategory; label: string;
   { key: 'events', label: '事件', help: '业务事件发布' },
   { key: 'workflows', label: '工作流', help: '跨步骤任务编排' },
 ]
+const readinessAxes: Array<{ key: AgentReadinessAxisKey; label: string }> = [
+  { key: 'definition', label: '定义' },
+  { key: 'validation', label: '验证' },
+  { key: 'release', label: '发布' },
+  { key: 'runtime', label: '运行' },
+]
 
 const agents = ref<Agent[]>([])
 const scenarios = ref<Scenario[]>([])
 const llms = ref<LLMConfig[]>([])
-const dataSources = ref<DataSource[]>([])
-const scenarioDetails = ref<Record<string, ScenarioDetail>>({})
 const route = useRoute()
 const router = useRouter()
 const queryScenarioId = () => {
@@ -254,7 +296,7 @@ const scenarioScope = ref(queryScenarioId())
 const dlg = ref(false)
 const saving = ref(false)
 const loading = ref(false)
-const form = ref<Partial<Agent>>({ data_source_ids: [], capability_scope: emptyAgentCapabilityScope() })
+const form = ref<Partial<Agent>>({ data_source_ids: [], capability_scope: allAgentCapabilityScope() })
 const capabilityCatalog = ref<AgentCapabilityCatalog | null>(null)
 const capabilityCatalogLoading = ref(false)
 const capabilityCatalogError = ref('')
@@ -330,66 +372,25 @@ function capabilityTotals(agent: Partial<Agent>) {
     { selected: 0, executable: 0, blocked: 0 },
   )
 }
-const formMappedSourceIds = computed(() => new Set(
-  (form.value.scenario_id ? scenarioDetails.value[form.value.scenario_id]?.mappings : [])
-    ?.map((mapping) => mapping.data_source_id) || [],
-))
-const availableDataSources = computed(() => {
-  const scenarioId = form.value.scenario_id
-  return dataSources.value.filter((source) => {
-    const belongsToScenario = !scenarioId || !source.scenario_id || source.scenario_id === scenarioId
-    const hasMapping = Boolean(source.id && formMappedSourceIds.value.has(source.id))
-    return belongsToScenario && (hasMapping || source.type === 'file_bucket')
-  })
-})
-function sourceBindingHint(source: DataSource) {
-  return source.id && formMappedSourceIds.value.has(source.id) ? '已映射' : '文档检索'
-}
-function scenarioSetup(scenarioId?: string | null) {
-  const detail = scenarioId ? scenarioDetails.value[scenarioId] : undefined
-  const ontology = Boolean(detail?.entities?.length)
-  const source = Boolean(detail?.data_sources?.length || detail?.mappings?.some((mapping) => mapping.data_source_id))
-  const mapping = Boolean(detail?.mappings?.length)
-  return { ontology, source, mapping }
-}
 function agentReadiness(agent: Partial<Agent>) {
-  const setup = scenarioSetup(agent.scenario_id)
-  const mappedSourceIds = new Set(
-    (agent.scenario_id ? scenarioDetails.value[agent.scenario_id]?.mappings : [])
-      ?.map((mapping) => mapping.data_source_id) || [],
-  )
-  const dataBinding = Boolean(agent.data_source_ids?.some((id) => mappedSourceIds.has(id)))
-  const model = Boolean(agent.llm_config_id)
-  return { ...setup, model, dataBinding, ready: setup.ontology && setup.source && setup.mapping && model && dataBinding }
+  return normalizeAgentReadiness(agent)
 }
 function agentReady(agent: Partial<Agent>) {
-  return agentReadiness(agent).ready
+  return agentReadiness(agent).validation.ready
 }
-const formScenarioMissing = computed(() => {
-  const setup = scenarioSetup(form.value.scenario_id)
-  const missing: string[] = []
-  if (!setup.ontology) missing.push('对象类型')
-  if (!setup.source) missing.push('数据源')
-  if (!setup.mapping) missing.push('数据映射')
-  return missing
-})
-const formAgentMissing = computed(() => {
-  const missing = [...formScenarioMissing.value]
-  if (!form.value.llm_config_id) missing.push('大模型')
-  if (!(form.value.data_source_ids || []).some((id) => formMappedSourceIds.value.has(id))) missing.push('映射数据')
-  return missing
-})
+function readinessAxisTitle(agent: Partial<Agent>, key: AgentReadinessAxisKey, label: string) {
+  const axis = agentReadiness(agent)[key]
+  if (axis.ready) return `${label}已就绪`
+  return axis.missing.map((issue) => issue.label).join('；') || `${label}尚未就绪`
+}
+const formReadiness = computed(() => normalizeAgentReadiness({
+  name: form.value.name || '',
+  scenario_id: form.value.scenario_id,
+  llm_config_id: form.value.llm_config_id,
+  data_source_ids: form.value.data_source_ids || [],
+}))
+const formAgentMissing = computed(() => formReadiness.value.validation.missing.map((issue) => issue.label))
 const formAgentReady = computed(() => formAgentMissing.value.length === 0)
-async function ensureScenarioDetail(scenarioId?: string | null) {
-  if (!scenarioId || scenarioDetails.value[scenarioId]) return
-  try {
-    const detail = await api.getScenario(scenarioId, { include_runtime_facts: false })
-    if (!viewDisposed) scenarioDetails.value = { ...scenarioDetails.value, [detail.id]: detail }
-  } catch {
-    // 场景详情的访问错误由就绪提示体现，不阻断 Agent 草稿编辑。
-  }
-}
-
 async function loadCapabilityCatalog(scenarioId?: string | null) {
   const request = ++capabilityCatalogRequest
   capabilityCatalog.value = null
@@ -418,19 +419,13 @@ async function load() {
   const scope = scenarioScope.value
   loading.value = true
   try {
-    const [ag, sc, ll, ds] = await Promise.all([
-      api.listAgents(), api.listScenarios(), api.listLLM(), api.listDataSources(),
+    const [ag, sc, ll] = await Promise.all([
+      api.listAgents(), api.listScenarios(), api.listLLM(),
     ])
-    const detailIds = [...new Set(ag.map((agent) => agent.scenario_id).filter((id): id is string => Boolean(id)))]
-    const details = await Promise.allSettled(detailIds.map((id) => api.getScenario(id, { include_runtime_facts: false })))
     if (viewDisposed || request !== loadRequest || scope !== scenarioScope.value) return
     agents.value = scope ? ag.filter((agent) => agent.scenario_id === scope) : ag
     scenarios.value = sc
     llms.value = ll
-    dataSources.value = ds
-    scenarioDetails.value = Object.fromEntries(
-      details.flatMap((result) => result.status === 'fulfilled' ? [[result.value.id, result.value] as const] : []),
-    )
   } catch (e: any) {
     if (!viewDisposed && request === loadRequest) ElMessage.error('加载失败：' + e.message)
   } finally {
@@ -443,34 +438,59 @@ function openCreate() {
     description: '',
     scenario_id: scenarioScope.value || undefined,
     data_source_ids: [],
-    capability_scope: emptyAgentCapabilityScope(),
+    runtime_connections: [],
+    capability_scope: allAgentCapabilityScope(),
+    runtime_binding_mode: 'capability_only',
   }
   editingLegacyScope.value = false
   editingCapabilitySummary.value = {}
   dlg.value = true
-  void ensureScenarioDetail(form.value.scenario_id)
   void loadCapabilityCatalog(form.value.scenario_id)
 }
 function openEdit(a: Agent) {
   form.value = {
     ...a,
-    data_source_ids: [...(a.data_source_ids || [])],
+    data_source_ids: [],
+    runtime_binding_mode: 'capability_only',
+    runtime_connections: (a.runtime_connections || []).map((connection) => ({
+      ...connection,
+      config: { ...connection.config },
+    })),
     capability_scope: cloneAgentCapabilityScope(a.capability_scope),
   }
   editingLegacyScope.value = Boolean(a.capability_scope_legacy)
   editingCapabilitySummary.value = a.capability_summary || {}
   dlg.value = true
-  void ensureScenarioDetail(form.value.scenario_id)
   void loadCapabilityCatalog(form.value.scenario_id)
 }
 
 function changeFormScenario(value: string | undefined) {
   form.value.data_source_ids = []
-  form.value.capability_scope = emptyAgentCapabilityScope()
+  form.value.runtime_connections = []
+  form.value.capability_scope = allAgentCapabilityScope()
   editingLegacyScope.value = false
   editingCapabilitySummary.value = {}
-  void ensureScenarioDetail(value)
   void loadCapabilityCatalog(value)
+}
+
+function addRuntimeConnection() {
+  if (!form.value.scenario_id) return ElMessage.info('请先选择业务场景')
+  const connection: AgentRuntimeConnection = {
+    name: `业务数据库 ${(form.value.runtime_connections?.length || 0) + 1}`,
+    type: 'postgres',
+    config: {
+      host: '127.0.0.1',
+      port: 5432,
+      database: '',
+      username: 'postgres',
+      password: '',
+    },
+  }
+  form.value.runtime_connections = [...(form.value.runtime_connections || []), connection]
+}
+
+function removeRuntimeConnection(index: number) {
+  form.value.runtime_connections = (form.value.runtime_connections || []).filter((_item, itemIndex) => itemIndex !== index)
 }
 function openAgentChat(agent: Agent) {
   if (!agent.id) return
@@ -484,28 +504,29 @@ function openAgentChat(agent: Agent) {
   })
 }
 function continueSetup(agent: Agent) {
-  const setup = scenarioSetup(agent.scenario_id)
-  if (!agent.scenario_id) return openEdit(agent)
-  if (!setup.ontology) {
-    void router.push({ name: 'scenario-detail', params: { id: agent.scenario_id }, query: { stage: 'ontology', return_to: route.fullPath } })
-    return
-  }
-  if (!setup.source) {
-    void router.push({ name: 'data-sources', query: { scenario_id: agent.scenario_id, return_to: route.fullPath } })
-    return
-  }
-  if (!setup.mapping) {
-    void router.push({ name: 'scenario-detail', params: { id: agent.scenario_id }, query: { stage: 'mappings', return_to: route.fullPath } })
-    return
-  }
   openEdit(agent)
 }
 async function save() {
   if (!form.value.name) return ElMessage.warning('请填写名称')
+  const invalidConnection = (form.value.runtime_connections || []).find((connection) => (
+    !connection.name.trim()
+    || !String(connection.config.host || '').trim()
+    || !String(connection.config.database || '').trim()
+    || !String(connection.config.username || '').trim()
+  ))
+  if (invalidConnection) return ElMessage.warning('请补齐业务数据库的名称、主机、数据库名和用户名')
   saving.value = true
   try {
-    if (form.value.id) await api.updateAgent(form.value.id, form.value)
-    else await api.createAgent(form.value)
+    if (form.value.id) await api.updateAgent(form.value.id, {
+      ...form.value,
+      data_source_ids: [],
+      runtime_binding_mode: 'capability_only',
+    })
+    else await api.createAgent({
+      ...form.value,
+      data_source_ids: [],
+      runtime_binding_mode: 'capability_only',
+    })
     ElMessage.success('已保存')
     dlg.value = false
     load()
@@ -592,6 +613,17 @@ onBeforeUnmount(() => {
   -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   line-height: 1.5;
 }
+.runtime-connection-section { margin: 16px 0; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
+.runtime-connection-heading, .runtime-connection-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.runtime-connection-heading { align-items: flex-start; margin-bottom: 12px; }
+.runtime-connection-heading h3 { margin: 0; color: var(--text-1); font-size: 15px; }
+.runtime-connection-heading p { margin: 4px 0 0; color: var(--text-3); font-size: 11px; line-height: 1.55; }
+.runtime-connection-list { display: grid; gap: 10px; }
+.runtime-connection-card { padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.runtime-connection-card-head { margin-bottom: 10px; }
+.runtime-connection-card-head strong { margin-right: auto; color: var(--text-1); font-size: 12px; }
+.runtime-connection-fields { margin-top: 9px; }
+.runtime-connection-error { margin: 8px 0 0; color: var(--danger); font-size: 11px; }
 .ag-tags { min-height: 24px; margin-bottom: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
 .capability-line {
   display: flex;

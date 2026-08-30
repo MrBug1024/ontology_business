@@ -9,7 +9,17 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base, orm_datetime as DateTime
@@ -110,6 +120,14 @@ class AgentMCPService(Base):
     __tablename__ = "agent_mcp_services"
     __table_args__ = (
         UniqueConstraint("tenant_id", "name_key", name="uq_agent_mcp_services_tenant_name"),
+        CheckConstraint(
+            "publication_mode IN ('legacy_agent', 'capability_release')",
+            name="ck_agent_mcp_services_publication_mode",
+        ),
+        CheckConstraint(
+            "publication_mode = 'legacy_agent' OR capability_release_id IS NOT NULL",
+            name="ck_agent_mcp_services_capability_target",
+        ),
         Index("ix_agent_mcp_services_tenant_enabled", "tenant_id", "enabled"),
         Index("ix_agent_mcp_services_agent_enabled", "agent_id", "enabled"),
     )
@@ -135,6 +153,18 @@ class AgentMCPService(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    publication_mode: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="legacy_agent", server_default="legacy_agent"
+    )
+    capability_release_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "ontology_releases.id",
+            name="fk_agent_mcp_services_capability_release",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
     agent_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     definition_snapshot_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     release_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -167,6 +197,15 @@ class AgentMCPInvocation(Base):
     )
     execution_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    capability_invocation_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "capability_invocations.id",
+            name="fk_agent_mcp_invocations_capability_invocation",
+            ondelete="SET NULL",
+        ),
+        index=True,
+        nullable=True,
     )
     request_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     conversation_id: Mapped[str | None] = mapped_column(

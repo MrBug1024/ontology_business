@@ -30,6 +30,7 @@ from app.services import (
     agent_engine,
     permission_service,
     runtime_definition_service,
+    workflow_payload_service,
 )
 
 
@@ -269,7 +270,17 @@ class AgentEventWorkflowConfirmationTests(unittest.TestCase):
         run = self.db.get(WorkflowRun, response["result"]["workflow_run"]["id"])
         self.assertIsNotNone(run)
         self.assertEqual(run.status, "queued")
-        self.assertEqual(run.input_params, {"project_id": "P-001"})
+        self.assertEqual(
+            workflow_payload_service.open_workflow_run_input(run),
+            {"project_id": "P-001"},
+        )
+        self.assertNotIn(
+            "P-001",
+            json.dumps(response["result"]["workflow_run"], ensure_ascii=False),
+        )
+        self.assertTrue(
+            response["result"]["workflow_run"]["input_params"]["redacted"]
+        )
         self.assertEqual(run.definition_hash, preview["definition_hash"])
         self.assertEqual(response["result"]["task_url"], f"/tasks?task={run.id}")
 

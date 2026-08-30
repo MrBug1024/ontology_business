@@ -3,15 +3,15 @@
     <!-- 左侧：会话列表 -->
     <div class="chat-side">
       <div class="side-head">
-        <el-button text @click="goBack" aria-label="返回 Agent 列表" title="返回 Agent 列表"><el-icon aria-hidden="true"><ArrowLeft /></el-icon></el-button>
+        <el-button text @click="goBack" aria-label="返回验证 Agent 列表" title="返回验证 Agent 列表"><el-icon aria-hidden="true"><ArrowLeft /></el-icon></el-button>
         <div class="agent-title">
           <div class="agent-name">{{ agent?.name }}</div>
           <div class="muted">{{ agent?.scenario_name || '未绑定场景' }}</div>
         </div>
       </div>
       <div class="conv-list">
-        <el-button class="new-conv-button" type="primary" @click="newConv">
-          <el-icon aria-hidden="true"><Plus /></el-icon> 新对话
+        <el-button class="new-conv-button" type="primary" :disabled="!agentValidationReady" @click="newConv">
+          <el-icon aria-hidden="true"><Plus /></el-icon> 新建验证会话
         </el-button>
         <div v-for="c in conversations" :key="c.id" class="conv-item" :class="{ active: curConv?.id === c.id }">
           <button class="conv-open" type="button" :aria-current="curConv?.id === c.id ? 'page' : undefined" :aria-label="`打开对话：${c.title || '新对话'}`" @click="openConv(c)">
@@ -23,20 +23,33 @@
         <el-empty v-if="!conversations.length" description="暂无对话" :image-size="50" />
       </div>
       <div class="side-foot" v-if="agent">
-        <div class="muted">已配置能力</div>
-        <el-tag v-for="n in agent.data_source_names || []" :key="n" size="small" type="info" effect="plain" style="margin:2px"><el-icon aria-hidden="true"><Coin /></el-icon>{{ n }}</el-tag>
+        <div class="muted side-foot-label">本轮业务数据</div>
+        <span class="muted">来自对话附件与 Agent 已配置的业务数据库</span>
       </div>
     </div>
 
     <!-- 右侧：对话区 -->
     <div class="chat-main">
+      <el-alert
+        v-if="agent"
+        class="validation-notice"
+        :type="agentValidationReady ? 'info' : 'warning'"
+        :closable="false"
+        show-icon
+        :title="agentValidationReady ? '第三方调用模拟器' : '尚不可开始验证'"
+        :description="agentValidationReady
+          ? '直接描述业务需求并按需上传本次处理的文件。Agent 会在创建时授权的业务能力中自主选择；建模资料不会作为本次正式业务数据。'
+          : validationMissingText"
+      />
       <div class="chat-messages" ref="msgRef">
         <div v-if="!messages.length" class="empty-chat">
           <div class="empty-icon"><el-icon :size="40"><ChatDotRound /></el-icon></div>
-          <div class="empty-title">{{ agent?.name }} 已就绪</div>
-          <div class="muted">基于「{{ agent?.scenario_name || '通用' }}」场景本体，可查询数据、检索文档，并安全预演及确认业务操作</div>
-          <div class="suggestions">
-            <button class="sug" type="button" v-for="q in suggestions" :key="q" @click="send(q)">{{ q }}</button>
+          <div class="empty-title">{{ agentValidationReady ? `${agent?.name || 'Agent'} 可开始验证` : '等待验证配置' }}</div>
+          <div class="muted">{{ agentValidationReady
+            ? `基于「${agent?.scenario_name || '通用'}」场景语义与已授权能力，验证理解、分析、生成和受控操作。`
+            : validationMissingText }}</div>
+          <div v-if="agentValidationReady" class="suggestions">
+            <button class="sug" type="button" v-for="q in suggestions" :key="q" @click="useSuggestion(q)">{{ q }}</button>
           </div>
         </div>
 
@@ -172,34 +185,32 @@
       </el-dialog>
 
       <div class="chat-input-area">
-        <el-input v-model="input" type="textarea" :rows="2" resize="none"
-          placeholder="输入业务问题，例如查询数据、检索文档或预演已配置的业务操作"
-          @keydown.enter.exact.prevent="send()" />
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
-          <span class="muted">Enter 发送 · Shift+Enter 换行</span>
-          <el-button v-if="streaming" type="danger" plain @click="stop">
-            <el-icon><VideoPause /></el-icon> 停止
-          </el-button>
-          <el-button v-else type="primary" :disabled="!input.trim()" @click="send()">
-            <el-icon><Promotion /></el-icon> 发送
-          </el-button>
-        </div>
+        <AgentInvocationComposer
+          ref="composerRef"
+          :disabled="!agentValidationReady"
+          :busy="streaming"
+          :placeholder="agentValidationReady ? '描述业务需求，或上传本次处理所需的文件' : validationMissingText"
+          @submit="send"
+          @stop="stop"
+        />
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onBeforeUnmount, onMounted, nextTick, watch } from 'vue'
+import { computed, ref, onBeforeUnmount, onMounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamChat } from '@/api'
-import type { Agent, ChatMessage, Conversation, RagCitation } from '@/types'
+import type { Agent, AgentChatRequest, ChatMessage, Conversation, RagCitation } from '@/types'
+import AgentInvocationComposer from '@/components/AgentInvocationComposer.vue'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
 import { actionArtifactAttachment } from '@/utils/artifactAttachments'
 import type { ArtifactAttachment } from '@/utils/artifactAttachments'
 import { actionConfirmationParams } from '@/utils/actionConfirmation'
+import { normalizeAgentReadiness } from '@/utils/agentReadiness'
 
 const route = useRoute()
 const router = useRouter()
@@ -217,19 +228,29 @@ type CitationPreview = {
 }
 
 const messages = ref<ChatViewMessage[]>([])
-const input = ref('')
 const streaming = ref(false)
+const composerRef = ref<InstanceType<typeof AgentInvocationComposer>>()
 const msgRef = ref<HTMLElement>()
 let ctrl: AbortController | null = null
+let activeStreamFailed = false
 let viewDisposed = false
 let agentLoadRequest = 0
 
 const suggestions = [
-  '请介绍当前业务场景和可用能力',
-  '查询当前场景中可用的业务对象',
-  '根据已配置规则检查一组业务数据',
-  '检索业务文档并给出要点总结',
+  '请说明当前场景目标、输入输出与可用能力',
+  '根据我接下来提供的需求给出专业分析和建议',
+  '检查我接下来提供的材料说明并指出缺失信息',
+  '预演一个已配置的业务操作并说明影响',
 ]
+
+const validationReadiness = computed(() => agent.value
+  ? normalizeAgentReadiness(agent.value).validation
+  : { ready: false, missing: [] })
+const agentValidationReady = computed(() => validationReadiness.value.ready)
+const validationMissingText = computed(() => {
+  const labels = validationReadiness.value.missing.map((issue) => issue.label)
+  return labels.length ? `尚缺：${labels.join('、')}` : '服务端尚未确认验证就绪状态'
+})
 
 function queryValue(value: unknown) {
   return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
@@ -695,26 +716,43 @@ async function delConv(c: Conversation) {
   }
 }
 
-function send(text?: string) {
-  const msg = (text ?? input.value).trim()
-  if (!msg || streaming.value) return
-  input.value = ''
+function invocationMessage(payload: AgentChatRequest) {
+  if (payload.message.trim()) return payload.message.trim()
+  if (payload.attachments?.length) return `已上传 ${payload.attachments.length} 个文件，请根据文件内容完成业务需求。`
+  return ''
+}
+
+function useSuggestion(text: string) {
+  composerRef.value?.submitMessage(text)
+}
+
+function send(payload: AgentChatRequest) {
+  if (!agentValidationReady.value) {
+    ElMessage.warning(validationMissingText.value)
+    return
+  }
+  if (streaming.value) return
+  const msg = invocationMessage(payload)
   messages.value.push({ role: 'user', content: msg })
   messages.value.push({ role: 'assistant', content: '', tool_calls: [], streaming: true, status: '正在思考…' })
   const ai = messages.value[messages.value.length - 1]!
   streaming.value = true
+  activeStreamFailed = false
   const isNewConv = !curConv.value
   scrollBottom()
 
   ctrl = streamChat(
     agent.value!.id!,
-    { message: msg, conversation_id: curConv.value?.id },
+    { ...payload, conversation_id: curConv.value?.id },
     (ev) => handleEvent(ev, ai),
     () => finish(ai, isNewConv),
     (e) => {
+      activeStreamFailed = true
       ai.status = ''
       ai.streaming = false
+      ai.content = streamErrorContent(ai.content, e.message)
       streaming.value = false
+      ctrl = null
       ElMessage.error('对话出错：' + e.message)
     },
   )
@@ -749,6 +787,7 @@ function handleEvent(ev: { type: string; data: any }, ai: ChatViewMessage) {
     case 'done':
       break
     case 'error':
+      activeStreamFailed = true
       ai.status = ''
       ai.content = streamErrorContent(ai.content, ev.data)
       break
@@ -757,11 +796,17 @@ function handleEvent(ev: { type: string; data: any }, ai: ChatViewMessage) {
 }
 
 async function finish(ai: ChatViewMessage, isNewConv = false) {
+  const succeeded = !activeStreamFailed
   ai.streaming = false
   ai.status = ''
   streaming.value = false
   ctrl = null
-  await loadConvs()
+  if (succeeded) composerRef.value?.clearAfterSuccess()
+  try {
+    await loadConvs()
+  } catch {
+    ElMessage.warning('调用已完成，但会话列表刷新失败')
+  }
   if (isNewConv && conversations.value.length) {
     curConv.value = conversations.value[0]
   }
@@ -769,6 +814,7 @@ async function finish(ai: ChatViewMessage, isNewConv = false) {
 }
 
 function stop() {
+  activeStreamFailed = true
   ctrl?.abort()
   streaming.value = false
 }
@@ -809,6 +855,7 @@ onBeforeUnmount(() => {
 .chat-layout { height: 100%; min-height: 0; overflow: hidden; }
 .chat-side, .chat-main { min-height: 0; overflow: hidden; }
 .chat-messages { min-height: 0; overscroll-behavior: contain; }
+.validation-notice { flex: 0 0 auto; margin: 12px 34px 0; }
 .chat-layout button, .chat-layout :deep(.el-button) { touch-action: manipulation; }
 .chat-layout :deep(.el-button) { min-height: 44px; }
 .side-head :deep(.el-button) { min-width: 44px; }
@@ -914,6 +961,7 @@ onBeforeUnmount(() => {
   gap: 6px;
   margin-bottom: 4px;
 }
+.side-foot-label { flex-basis: 100%; }
 .tool-card .head { min-height: 44px; }
 .tool-structured-value { padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
 .agent-action-confirm { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 9px; padding: 9px 10px; border: 1px solid color-mix(in srgb, var(--warning) 38%, var(--border)); border-radius: 9px; background: var(--warning-soft); }
@@ -1078,6 +1126,7 @@ onBeforeUnmount(() => {
   .conv-list { min-height: 0; }
   .chat-main { min-height: 0; height: auto; }
   .chat-messages { padding: 18px 14px; }
+  .validation-notice { margin: 10px 14px 0; }
   .chat-input-area { padding: 12px 14px 16px; }
   .attach-card { align-items: flex-start; flex-wrap: wrap; }
   .attach-info { min-width: calc(100% - 52px); }

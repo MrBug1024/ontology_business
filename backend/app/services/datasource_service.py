@@ -450,7 +450,14 @@ def assistant_attachment_object_identity(
     """Return a validated managed identity; legacy text-only rows have none."""
     provider = str(getattr(attachment, "storage_provider", "none") or "none").lower()
     object_url = str(getattr(attachment, "object_url", "") or "")
-    if provider == "none" and not object_url:
+    recorded_bucket = str(getattr(attachment, "bucket_name", "") or "")
+    recorded_key = str(getattr(attachment, "object_key", "") or "")
+    # The column default changed from ``none`` to ``minio`` when raw uploads
+    # became mandatory. Rows created before that migration can therefore read
+    # as ``minio`` while still containing only parsed text. No locator means
+    # there is no external object to delete; a partially populated locator
+    # remains invalid and continues to fail closed below.
+    if not object_url and not recorded_bucket and not recorded_key:
         return None
     if provider != "minio" and not object_url.lower().startswith("minio://"):
         raise ValueError("助手附件存储提供方无效")
@@ -459,8 +466,8 @@ def assistant_attachment_object_identity(
     url_key = ""
     if object_url:
         url_bucket, url_key = object_storage_service.parse_object_url(object_url)
-    bucket_name = str(getattr(attachment, "bucket_name", "") or url_bucket)
-    object_key = str(getattr(attachment, "object_key", "") or url_key)
+    bucket_name = recorded_bucket or url_bucket
+    object_key = recorded_key or url_key
     if (url_bucket and url_bucket != bucket_name) or (url_key and url_key != object_key):
         raise ValueError("助手附件对象字段与地址不一致")
     try:

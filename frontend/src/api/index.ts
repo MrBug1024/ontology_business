@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { withNormalizedAgentReadiness } from '@/utils/agentReadiness'
 import type {
   FunctionRun,
   Agent,
@@ -18,6 +19,12 @@ import type {
   BucketFile,
   ArtifactTemplate,
   ArtifactTemplateDetail,
+  CatalogAsset,
+  CatalogAssetVersion,
+  CatalogManagedUpload,
+  ConnectorBindingOption,
+  AgentChatRequest,
+  AgentRuntimeCapability,
   ChatMessage,
   Conversation,
   DataMapping,
@@ -26,6 +33,8 @@ import type {
   DocumentReindexResult,
   DocumentSearchResult,
   DataSource,
+  DatasetHead,
+  DatasetVersion,
   EventEnvelope,
   FunctionDefinition,
   LLMConfig,
@@ -33,6 +42,7 @@ import type {
   LLMEvaluationSummary,
   LLMTrace,
   LLMUsageSummary,
+  LogicalDataset,
   MCPConfig,
   MCPImportResult,
   MCPTool,
@@ -45,8 +55,15 @@ import type {
   ObjectDetail,
   ObjectSearchResult,
   Scenario,
+  ScenarioPurgePlan,
+  ScenarioPurgeResult,
+  ScenarioDatasetBinding,
+  ScenarioDatasetBindingCreate,
   ScenarioDetail,
   ScenarioModelDraftListResponse,
+  ScenarioModelCandidateBatchPromotionRequest,
+  ScenarioModelCandidatePromotionResult,
+  ScenarioModelCandidateRevisionRequest,
   ScenarioModelDraftResolve,
   ScenarioModelDraftResource,
   ScenarioModelDraftUpdate,
@@ -75,13 +92,29 @@ instance.interceptors.response.use(
       window.location.assign('/login')
     }
     const msg = err.response?.data?.detail || err.message || '请求失败'
-    const error = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg)) as Error & { status?: number }
+    const error = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg)) as Error & {
+      status?: number
+      detail?: unknown
+    }
     error.status = Number(err.response?.status || 0) || undefined
+    error.detail = msg
     return Promise.reject(error)
   },
 )
 
-const http = instance as unknown as ApiClient
+export const http = instance as unknown as ApiClient
+
+function agentWritePayload(agent: Partial<Agent>): Partial<Agent> {
+  const {
+    readiness: _readiness,
+    definition_valid: _definitionValid,
+    validation_ready: _validationReady,
+    release_ready: _releaseReady,
+    runtime_ready: _runtimeReady,
+    ...payload
+  } = agent
+  return payload
+}
 
 // ── 场景 & 本体 ──────────────────────────────
 export const api = {
@@ -148,7 +181,9 @@ export const api = {
     http.post<AssistantProposalApplyResult>('/assistant/proposals/apply', d),
 
   // 场景
-  listScenarios: () => http.get<Scenario[]>('/scenarios'),
+  listScenarios: (includeRetired = false) => http.get<Scenario[]>('/scenarios', {
+    params: { include_retired: includeRetired },
+  }),
   getScenario: (id: string, params: { include_runtime_facts?: boolean } = {}) =>
     http.get<ScenarioDetail>(`/scenarios/${id}`, { params }),
   listScenarioModelDrafts: (id: string, params: { offset?: number; limit?: number; include_issues?: boolean } = {}) =>
@@ -157,9 +192,19 @@ export const api = {
     http.patch<ScenarioModelDraftResource>(`/scenarios/${scenarioId}/model-drafts/${draftId}`, update),
   resolveScenarioModelDraft: (scenarioId: string, draftId: string, resolution: ScenarioModelDraftResolve) =>
     http.post<ScenarioModelDraftResource>(`/scenarios/${scenarioId}/model-drafts/${draftId}/resolve`, resolution),
+  revalidateScenarioModelCandidate: (scenarioId: string, draftId: string, request: ScenarioModelCandidateRevisionRequest) =>
+    http.post<ScenarioModelDraftResource>(`/scenarios/${scenarioId}/model-drafts/${draftId}/revalidate`, request),
+  promoteScenarioModelCandidate: (scenarioId: string, draftId: string, request: ScenarioModelCandidateRevisionRequest) =>
+    http.post<ScenarioModelCandidatePromotionResult>(`/scenarios/${scenarioId}/model-drafts/${draftId}/promote`, request),
+  promoteScenarioModelCandidates: (scenarioId: string, request: ScenarioModelCandidateBatchPromotionRequest) =>
+    http.post<ScenarioModelCandidatePromotionResult>(`/scenarios/${scenarioId}/model-drafts/promote-batch`, request),
   createScenario: (d: Partial<Scenario>) => http.post<Scenario>('/scenarios', d),
   updateScenario: (id: string, d: Partial<Scenario>) => http.put<Scenario>(`/scenarios/${id}`, d),
   deleteScenario: (id: string) => http.delete(`/scenarios/${id}`),
+  restoreScenario: (id: string) => http.post<{ scenario_id: string; status: string; restored: boolean }>(`/scenarios/${id}/restore`),
+  getScenarioPurgePlan: (id: string) => http.get<ScenarioPurgePlan>(`/scenarios/${id}/purge-plan`),
+  purgeScenario: (id: string, d: { expected_name: string; confirmed: boolean; delete_audit_history: boolean }) =>
+    http.post<ScenarioPurgeResult>(`/scenarios/${id}/purge`, d),
 
   // 实体
   createEntity: (sid: string, d: any) => http.post(`/scenarios/${sid}/entities`, d),
@@ -263,7 +308,42 @@ export const api = {
   retryTask: (id: string) => http.post<WorkflowRun>(`/tasks/${id}/retry`),
   cancelTask: (id: string) => http.post<WorkflowRun>(`/operations/runs/${id}/cancel`),
 
-  // 数据源
+  // 资源目录：LogicalDataset 与场景用途绑定不包含物理连接配置。
+  listCatalogAssets: () => http.get<CatalogAsset[]>('/catalog/assets'),
+  listCatalogAssetVersions: (assetId: string) =>
+    http.get<CatalogAssetVersion[]>(`/catalog/assets/${assetId}/versions`),
+  uploadCatalogAttachment: (d: {
+    file: File
+    expires_in_seconds?: number
+    onProgress?: (percent: number) => void
+  }) => {
+    const fd = new FormData()
+    fd.append('file', d.file)
+    fd.append('purpose', 'invocation_attachment')
+    fd.append('name', d.file.name)
+    if (d.expires_in_seconds) fd.append('expires_in_seconds', String(d.expires_in_seconds))
+    return http.post<CatalogManagedUpload>('/catalog/uploads', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (event: { loaded: number; total?: number }) => {
+        if (event.total && d.onProgress) d.onProgress(Math.round((event.loaded * 100) / event.total))
+      },
+    })
+  },
+  listLogicalDatasets: () => http.get<LogicalDataset[]>('/catalog/datasets'),
+  listDatasetHeads: (datasetId: string) => http.get<DatasetHead[]>(`/catalog/datasets/${datasetId}/heads`),
+  listDatasetVersions: (datasetId: string) => http.get<DatasetVersion[]>(`/catalog/datasets/${datasetId}/versions`),
+  listScenarioDatasetBindings: (scenarioId: string) =>
+    http.get<ScenarioDatasetBinding[]>(`/scenarios/${scenarioId}/dataset-bindings`),
+  listScenarioConnectorBindings: (scenarioId: string, environment: 'dev' | 'staging' | 'prod' = 'dev') =>
+    http.get<ConnectorBindingOption[]>(`/scenarios/${scenarioId}/connector-bindings`, {
+      params: { environment },
+    }),
+  createScenarioDatasetBinding: (scenarioId: string, d: ScenarioDatasetBindingCreate) =>
+    http.post<ScenarioDatasetBinding>(`/scenarios/${scenarioId}/dataset-bindings`, d),
+  deleteScenarioDatasetBinding: (scenarioId: string, bindingId: string) =>
+    http.delete<{ message: string }>(`/scenarios/${scenarioId}/dataset-bindings/${bindingId}`),
+
+  // 物理接入与文件管理（保留旧 API 兼容）。
   listDataSources: (sid?: string) =>
     http.get<DataSource[]>('/data-sources', { params: sid ? { scenario_id: sid } : {} }),
   createDataSource: (d: Partial<DataSource>) => http.post<DataSource>('/data-sources', d),
@@ -399,11 +479,13 @@ export const api = {
   deleteAgentMCPService: (id: string) => http.delete(`/agent-mcp-services/${id}`),
 
   // Agent
-  listAgents: () => http.get<Agent[]>('/agents'),
-  getAgent: (id: string) => http.get<Agent>(`/agents/${id}`),
+  listAgents: async () => (await http.get<Agent[]>('/agents')).map(withNormalizedAgentReadiness),
+  getAgent: async (id: string) => withNormalizedAgentReadiness(await http.get<Agent>(`/agents/${id}`)),
+  getAgentRuntimeCapabilities: (id: string) =>
+    http.get<AgentRuntimeCapability[]>(`/agents/${id}/runtime-capabilities`),
   getAgentCapabilityCatalog: (scenarioId: string) => http.get<AgentCapabilityCatalog>(`/agents/capability-catalog/${scenarioId}`),
-  createAgent: (d: Partial<Agent>) => http.post<Agent>('/agents', d),
-  updateAgent: (id: string, d: Partial<Agent>) => http.put<Agent>(`/agents/${id}`, d),
+  createAgent: async (d: Partial<Agent>) => withNormalizedAgentReadiness(await http.post<Agent>('/agents', agentWritePayload(d))),
+  updateAgent: async (id: string, d: Partial<Agent>) => withNormalizedAgentReadiness(await http.put<Agent>(`/agents/${id}`, agentWritePayload(d))),
   deleteAgent: (id: string) => http.delete(`/agents/${id}`),
   listConversations: (agentId: string) => http.get<Conversation[]>(`/agents/${agentId}/conversations`),
   deleteConversation: (cid: string) => http.delete(`/agents/conversations/${cid}`),
@@ -421,7 +503,7 @@ export const api = {
 // SSE 流式对话
 export function streamChat(
   agentId: string,
-  payload: { message: string; conversation_id?: string },
+  payload: AgentChatRequest,
   onEvent: (ev: { type: string; data: any }) => void,
   onDone: () => void,
   onError: (e: Error) => void,
@@ -435,7 +517,20 @@ export function streamChat(
     signal: ctrl.signal,
   })
     .then(async (res) => {
-      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) {
+        let message = `HTTP ${res.status}`
+        try {
+          const body = await res.json()
+          const detail = body?.detail
+          message = typeof detail === 'string'
+            ? detail
+            : typeof detail?.message === 'string' ? detail.message : message
+        } catch {
+          // Keep the status-only fallback when the server did not return JSON.
+        }
+        throw new Error(message)
+      }
+      if (!res.body) throw new Error('服务端未返回事件流')
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buf = ''

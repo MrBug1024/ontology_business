@@ -2,29 +2,49 @@
   <div class="page data-sources-page">
     <div class="page-header">
       <div>
-        <h1>数据源</h1>
-        <div class="sub">接入数据库、版本化数据集或托管文件桶</div>
+        <h1>建模资料</h1>
+        <div class="sub">上传历史样本、参考文档或连接样本数据库，帮助平台理解业务场景</div>
       </div>
       <div class="data-source-header-actions">
         <el-button v-if="returnPath" @click="returnToPreviousFlow"><el-icon><ArrowLeft /></el-icon> 返回上一步</el-button>
-        <el-select
-          v-model="scenarioScope"
-          clearable
-          filterable
-          aria-label="按业务场景筛选数据源"
-          placeholder="全部业务场景"
-          @change="changeScenarioScope"
-        >
-          <el-option v-for="scenario in scenarios" :key="scenario.id" :label="scenario.name" :value="scenario.id" />
-        </el-select>
-        <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建数据源</el-button>
+        <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新增建模资料</el-button>
       </div>
     </div>
 
-    <el-row :gutter="16">
+    <section class="card resource-boundary" aria-labelledby="resource-boundary-title">
+      <header>
+        <span class="eyebrow">DATA BOUNDARY</span>
+        <h2 id="resource-boundary-title">这里保存的是场景认知材料，不是客户永远不变的业务数据</h2>
+      </header>
+      <div class="resource-boundary-grid">
+        <article>
+          <strong>本页全部都是建模资料</strong>
+          <p>历史 Excel、文档、规则、表结构和数据库连接默认都可用于场景建模，帮助业务专家与智能顾问理解字段、关系和业务规律，无需再声明用途。</p>
+        </article>
+        <article>
+          <strong>正式运行数据</strong>
+          <p>只来自验证对话或第三方 Agent 当次上传的文件，以及创建 Agent 时专门配置的业务数据库；本页任何资料都不会自动进入正式调用。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="resource-section-group" aria-labelledby="connections-title">
+      <header class="resource-group-heading">
+        <div><span class="eyebrow">MODELING MATERIALS</span><h2 id="connections-title">资料文件与数据库样本</h2></div>
+        <p>本页所有资料默认都可用于场景建模，无需选择场景或声明用途。</p>
+      </header>
+        <el-alert
+          class="physical-connection-note"
+          type="info"
+          :closable="false"
+          show-icon
+          title="本页连接和文件永远只用于建模"
+          description="正式验证数据只来自对话上传附件或 Agent 创建/编辑时单独配置的业务数据库。"
+        />
+        <el-row :gutter="16" class="physical-workspace">
       <el-col class="data-sources-list-col" :xs="24" :md="9">
         <div class="card data-sources-list-card" v-loading="loading">
-          <div class="card-title"><el-icon><Coin /></el-icon> 数据源列表</div>
+          <div class="card-title"><el-icon><Coin /></el-icon> 建模资料</div>
           <div class="ds-list">
             <button v-for="ds in dataSources" :key="ds.id" type="button" class="ds-item" :class="{ active: selected?.id === ds.id }" :aria-current="selected?.id === ds.id ? 'true' : undefined" :aria-label="`选择数据源：${ds.name}`" @click="select(ds)">
               <div class="ds-icon" :class="ds.type">
@@ -40,8 +60,8 @@
             </button>
             <div v-if="!loading && !dataSources.length" class="empty-wrap">
               <div class="empty-icon"><el-icon :size="26"><Coin /></el-icon></div>
-              <div>暂无数据源</div>
-              <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新建数据源</el-button>
+              <div>暂无建模资料</div>
+              <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新增建模资料</el-button>
             </div>
           </div>
         </div>
@@ -57,7 +77,7 @@
               <template v-if="selected.can_write">
                 <el-button size="small" @click="testConn" :loading="testing"><el-icon><Link /></el-icon> 测试连接</el-button>
                 <el-button size="small" @click="openEdit(selected)"><el-icon><Edit /></el-icon> 编辑</el-button>
-                <el-button size="small" type="danger" @click="remove(selected)" aria-label="删除数据源" title="删除数据源"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
+                <el-button size="small" type="danger" @click="remove(selected)" aria-label="删除建模资料" title="删除建模资料"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
               </template>
             </div>
           </div>
@@ -180,19 +200,15 @@
             </div>
           </template>
         </div>
-        <el-empty v-else description="选择左侧数据源查看详情" />
+        <el-empty v-else description="选择左侧建模资料查看详情" />
       </el-col>
-    </el-row>
+        </el-row>
+    </section>
 
-    <!-- 新建/编辑对话框 -->
-    <el-dialog v-model="dlg" :title="form.id ? '编辑数据源' : '新建数据源'" width="560px">
+    <!-- 新建/编辑建模资料 -->
+    <el-dialog v-model="dlg" :title="form.id ? '编辑建模资料' : '新增建模资料'" width="560px">
       <el-form :model="form" label-width="90px" class="data-source-form">
-        <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：业务数据库、业务文档桶" /></el-form-item>
-        <el-form-item label="所属场景">
-          <el-select v-model="form.scenario_id" clearable placeholder="可选" style="width:100%">
-            <el-option v-for="s in scenarios" :key="s.id" :label="s.name" :value="s.id" />
-          </el-select>
-        </el-form-item>
+        <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：历史业务样本、规则参考资料" /></el-form-item>
         <el-form-item label="类型" required>
           <el-radio-group v-model="form.type" @change="onTypeChange">
             <el-radio value="postgres">PostgreSQL</el-radio>
@@ -250,25 +266,24 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { api } from '@/api'
-import type { DataSource, Scenario, TableInfo, BucketFile, RagCitation } from '@/types'
+import type {
+  BucketFile,
+  DataSource,
+  RagCitation,
+  TableInfo,
+} from '@/types'
 import { dataSourceLocationLabel } from '@/utils/dataSources'
 
 const dataSources = ref<DataSource[]>([])
-const scenarios = ref<Scenario[]>([])
 const selected = ref<DataSource | null>(null)
 const loading = ref(false)
 const route = useRoute()
 const router = useRouter()
-const routeScenarioId = () => {
-  const value = route.query.scenario_id
-  return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
-}
 function safeReturnPath(value: unknown): string {
   const candidate = Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
   if (!candidate.startsWith('/') || candidate.startsWith('//') || candidate.includes('\\')) return ''
   return candidate
 }
-const scenarioScope = ref(routeScenarioId())
 const returnPath = ref(safeReturnPath(route.query.return_to))
 
 const dlg = ref(false)
@@ -328,13 +343,11 @@ function indexTagType(status?: string): 'success' | 'warning' | 'danger' | 'info
 
 async function load() {
   const request = ++loadRequest
-  const scope = scenarioScope.value
   loading.value = true
   try {
-    const [ds, sc] = await Promise.all([api.listDataSources(scope || undefined), api.listScenarios()])
-    if (viewDisposed || request !== loadRequest || scope !== scenarioScope.value) return
+    const ds = await api.listDataSources()
+    if (viewDisposed || request !== loadRequest) return
     dataSources.value = ds
-    scenarios.value = sc
     const requestedSource = Array.isArray(route.query.source_id) ? route.query.source_id[0] : route.query.source_id
     const nextSelection = ds.find((source) => source.id === requestedSource)
       || ds.find((source) => source.id === selected.value?.id)
@@ -383,7 +396,7 @@ function select(ds: DataSource, syncRoute = true) {
   if (ds.type !== 'file_bucket') void loadTables()
   else void loadFiles()
   if (syncRoute && route.query.source_id !== ds.id) {
-    void router.replace({ name: 'data-sources', query: { ...route.query, source_id: ds.id } })
+    void router.replace({ name: 'data-sources', query: { ...route.query, source_id: ds.id, view: 'connections' } })
   }
 }
 async function loadTables() {
@@ -569,7 +582,7 @@ async function removeFile(f: BucketFile) {
   }
 }
 
-// ── 新建/编辑 ──
+// ── 建模资料新建/编辑 ──
 function onTypeChange() {
   form.value.config =
     form.value.type === 'file_bucket'
@@ -579,7 +592,7 @@ function onTypeChange() {
 function openCreate() {
   form.value = {
     name: '',
-    scenario_id: scenarioScope.value || undefined,
+    scenario_id: undefined,
     type: 'postgres',
     config: { host: '127.0.0.1', port: 5432, database: '', username: 'postgres', password: '' },
   }
@@ -596,10 +609,10 @@ async function save() {
     const saved = form.value.id
       ? await api.updateDataSource(form.value.id, form.value)
       : await api.createDataSource(form.value)
-    ElMessage.success('已保存')
+    ElMessage.success('建模资料已保存')
     dlg.value = false
     if (saved.id) {
-      await router.replace({ name: 'data-sources', query: { ...route.query, source_id: saved.id } })
+      await router.replace({ name: 'data-sources', query: { ...route.query, source_id: saved.id, view: 'connections' } })
     }
     await load()
   } catch (e: any) {
@@ -610,7 +623,7 @@ async function save() {
 }
 async function remove(ds: DataSource) {
   try {
-    await ElMessageBox.confirm(`删除数据源「${ds.name}」？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(`删除建模资料「${ds.name}」？此操作可能同时影响其托管文件。`, '确认', { type: 'warning' })
     await api.deleteDataSource(ds.id!)
     clearSelection()
     ElMessage.success('已删除')
@@ -618,16 +631,6 @@ async function remove(ds: DataSource) {
   } catch (e: any) {
     if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
   }
-}
-
-async function changeScenarioScope(value: string) {
-  const query = { ...route.query }
-  if (value) query.scenario_id = value
-  else delete query.scenario_id
-  delete query.source_id
-  clearSelection()
-  await router.replace({ name: 'data-sources', query })
-  return
 }
 
 async function returnToPreviousFlow() {
@@ -698,16 +701,46 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.ds-classification { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 5px; margin-top: 5px; color: var(--warning); font-size: 10px; line-height: 1.35; }
 
-/* ── 数据源工作区：主页面统一滚动，长表格仅在必要时局部限高 ── */
+/* ── 建模资料与连接工作区 ── */
 .data-sources-page {
   min-height: 100%;
   box-sizing: border-box;
 }
-.data-sources-page > .el-row {
+.resource-boundary { display: grid; gap: 14px; margin-bottom: 22px; }
+.resource-boundary header h2 { margin: 4px 0 0; color: var(--text); font-size: clamp(17px, 2vw, 22px); line-height: 1.4; }
+.resource-boundary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.resource-boundary-grid article { padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-2); }
+.resource-boundary-grid strong { display: block; margin-bottom: 5px; color: var(--text); font-size: 14px; }
+.resource-boundary-grid p { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.65; }
+.resource-section-group { display: grid; gap: 14px; margin-top: 24px; }
+.resource-group-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; }
+.resource-group-heading h2 { margin: 3px 0 0; color: var(--text); font-size: 20px; }
+.resource-group-heading p { max-width: 640px; margin: 0; color: var(--text-3); font-size: 12px; line-height: 1.55; text-align: right; }
+.catalog-principle, .catalog-error, .physical-connection-note { margin-bottom: 14px; }
+.catalog-section { min-width: 0; margin-bottom: 16px; }
+.catalog-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+.catalog-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.catalog-section-head > div { min-width: 0; }
+.catalog-section-head h2 { margin: 0; color: var(--text); font-size: 16px; line-height: 1.4; }
+.catalog-section-head p { margin: 4px 0 0; color: var(--text-3); font-size: 12px; line-height: 1.55; }
+.catalog-table { width: 100%; }
+.catalog-primary-cell { min-width: 0; }
+.catalog-primary-cell strong, .catalog-primary-cell small { display: block; overflow-wrap: anywhere; }
+.catalog-primary-cell strong { color: var(--text); font-size: 13px; line-height: 1.4; }
+.catalog-primary-cell small { margin-top: 3px; color: var(--text-3); font-size: 11px; }
+.binding-role-cell { display: flex; min-width: 0; align-items: flex-start; flex-direction: column; gap: 5px; }
+.binding-role-cell small { color: var(--text-3); font-size: 11px; line-height: 1.4; }
+.head-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.legacy-binding-alert { margin-bottom: 12px; }
+.physical-detail-note { margin-bottom: 14px; }
+.binding-option-description { float: right; max-width: 360px; margin-left: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.binding-safe-note, .legacy-scope-note { margin-bottom: 14px; }
+.physical-workspace {
   align-items: flex-start;
 }
-.data-sources-page > .el-row > .el-col {
+.physical-workspace > .el-col {
   min-width: 0;
 }
 .data-sources-list-col > .card,
@@ -731,7 +764,7 @@ onBeforeUnmount(() => {
   gap: 8px;
   margin: 12px 0;
 }
-.data-source-header-actions { display: flex; align-items: center; gap: 8px; }
+.data-source-header-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .data-source-header-actions :deep(.el-select) { width: min(240px, 38vw); }
 .retrieval-panel {
   flex: 0 0 auto;
@@ -770,14 +803,25 @@ onBeforeUnmount(() => {
   .data-sources-page {
     padding: 14px;
   }
-  .data-sources-page > .el-row {
+  .catalog-grid {
+    grid-template-columns: 1fr;
+  }
+  .resource-boundary-grid { grid-template-columns: 1fr; }
+  .resource-group-heading { align-items: flex-start; flex-direction: column; gap: 7px; }
+  .resource-group-heading p { text-align: left; }
+  .catalog-section-head {
+    align-items: stretch;
     flex-direction: column;
   }
-  .data-sources-page > .el-row > .data-sources-list-col {
+  .catalog-section-head > :deep(.el-tag) { align-self: flex-start; }
+  .physical-workspace {
+    flex-direction: column;
+  }
+  .physical-workspace > .data-sources-list-col {
     width: 100%;
     max-width: none;
   }
-  .data-sources-page > .el-row > .data-source-detail-col {
+  .physical-workspace > .data-source-detail-col {
     width: 100%;
     max-width: none;
     margin-top: 12px;
@@ -799,5 +843,11 @@ onBeforeUnmount(() => {
   .data-source-form :deep(.el-form-item) { display: block; }
   .data-source-form :deep(.el-form-item__label) { width: auto !important; height: auto; justify-content: flex-start; margin-bottom: 6px; padding: 0; line-height: 1.45; }
   .data-source-form :deep(.el-form-item__content) { margin-left: 0 !important; }
+  .binding-form > .el-row { margin-right: 0 !important; margin-left: 0 !important; }
+  .binding-form > .el-row > .el-col { max-width: 100%; flex: 0 0 100%; padding-right: 0 !important; padding-left: 0 !important; }
+  .binding-form :deep(.el-form-item) { display: block; }
+  .binding-form :deep(.el-form-item__label) { width: auto !important; height: auto; justify-content: flex-start; margin-bottom: 6px; padding: 0; line-height: 1.45; }
+  .binding-form :deep(.el-form-item__content) { margin-left: 0 !important; }
+  :deep(.binding-dialog) { width: calc(100% - 24px) !important; }
 }
 </style>

@@ -12,7 +12,6 @@ from typing import Any, Mapping
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..config import get_settings
 from ..models import BusinessScenario, OntologyRelease, OntologySnapshot
 from . import connector_service, release_service
 
@@ -28,34 +27,19 @@ _DIRECT_ID_FIELDS = {
 }
 
 
-def _configured_runtime_environment() -> str:
-    """Return the one environment this server process is allowed to run."""
-    try:
-        return connector_service.normalize_environment(get_settings().runtime_environment)
-    except connector_service.ConnectorBindingError as exc:
-        raise RuntimeConnectorError(str(exc)) from exc
-
-
 def runtime_environment(environment: str | None = None) -> str:
-    """Return the fixed deployment environment and reject cross-env overrides.
+    """Normalize an explicit target independently of host deployment config.
 
-    ``environment`` is intentionally accepted only for durable workflow runs
-    which carry the environment they were queued in.  It is an assertion, not
-    a selector: a dev worker must never execute a staging/prod run (or vice
-    versa) merely because a persisted value says so.
+    Platform authoring defaults to ``dev`` even when the Python process is
+    deployed with ``RUNTIME_ENVIRONMENT=prod``. Durable production executions
+    carry and pass their own environment explicitly.
     """
-    configured = _configured_runtime_environment()
     if environment in (None, ""):
-        return configured
+        return "dev"
     try:
-        requested = connector_service.normalize_environment(environment)
+        return connector_service.normalize_environment(environment)
     except connector_service.ConnectorBindingError as exc:
         raise RuntimeConnectorError(str(exc)) from exc
-    if requested != configured:
-        raise RuntimeConnectorError(
-            f"运行环境 {requested} 与当前部署环境 {configured} 不一致，已安全阻断"
-        )
-    return configured
 
 
 def _active_release(

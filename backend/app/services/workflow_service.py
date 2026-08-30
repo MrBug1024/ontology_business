@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import copy
 from datetime import date, datetime, time as datetime_time, timezone
 import ipaddress
 import hashlib
@@ -52,6 +53,7 @@ from . import (
     template_artifact_service,
     template_catalog_service,
     tenant_service,
+    workflow_payload_service,
 )
 from .policies import PolicyViolation, validate_action_params, validate_workflow_graph
 
@@ -62,6 +64,11 @@ class WorkflowDeadlineExceeded(PolicyViolation):
 
 class WorkflowGenerationError(ValueError):
     """Raised when model output cannot become a valid, saveable workflow draft."""
+
+
+_WORKFLOW_PARAMETER_RE = re.compile(
+    r"\{\{\s*params\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"
+)
 
 
 def _check_deadline(deadline_at: datetime | None) -> None:
@@ -173,6 +180,125 @@ def validate_workflow_definition(nodes: list[dict[str, Any]], edges: list[dict[s
         raise PolicyViolation(
             f"{labels} 节点默认停用；请改用经过权限、确认、幂等和审计约束的 Action"
         )
+
+
+def normalize_parameter_schema(schema: Any) -> dict[str, Any]:
+    """Normalize current JSON Schema and the legacy flat Action schema."""
+
+    if not isinstance(schema, dict) or not schema:
+        return {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": True,
+        }
+
+    if "properties" in schema or "required" in schema or schema.get("type") == "object":
+        normalized = copy.deepcopy(schema)
+        normalized.setdefault("type", "object")
+        normalized.setdefault("properties", {})
+        normalized.setdefault("required", [])
+    else:
+        normalized = {
+            "type": "object",
+            "properties": copy.deepcopy(schema),
+            "required": [],
+            "additionalProperties": False,
+        }
+
+    properties = normalized.get("properties")
+    if not isinstance(properties, dict):
+        return normalized
+    declared = normalized.get("required")
+    required = [
+        str(name)
+        for name in (declared if isinstance(declared, list) else [])
+        if isinstance(name, str)
+    ]
+    cleaned_properties: dict[str, Any] = {}
+    for name, definition in properties.items():
+        cleaned = copy.deepcopy(definition)
+        if isinstance(cleaned, dict) and isinstance(cleaned.get("required"), bool):
+            if cleaned.pop("required") and str(name) not in required:
+                required.append(str(name))
+        cleaned_properties[str(name)] = cleaned
+    normalized["properties"] = cleaned_properties
+    normalized["required"] = required
+    return normalized
+
+
+def workflow_parameter_schema(
+    workflow: Any,
+    actions: list[Any] | tuple[Any, ...],
+) -> dict[str, Any]:
+    """Return the existing inferred workflow input contract as JSON Schema."""
+
+    trigger = getattr(workflow, "trigger_config", {}) or {}
+    if isinstance(trigger, dict):
+        explicit = trigger.get("input_schema") or trigger.get("params_schema")
+        if isinstance(explicit, dict):
+            return normalize_parameter_schema(explicit)
+
+    action_by_id = {
+        str(getattr(action, "id", "")): action
+        for action in actions
+        if str(getattr(action, "id", ""))
+    }
+    properties: dict[str, Any] = {}
+    required: set[str] = set()
+
+    def remember(value: Any, *, is_required: bool = True, definition: Any = None) -> None:
+        if isinstance(value, str):
+            for name in _WORKFLOW_PARAMETER_RE.findall(value):
+                if name not in properties:
+                    properties[name] = (
+                        copy.deepcopy(definition)
+                        if isinstance(definition, dict)
+                        else {"description": "工作流定义引用的输入参数"}
+                    )
+                if is_required:
+                    required.add(name)
+        elif isinstance(value, dict):
+            for child in value.values():
+                remember(child, is_required=is_required)
+        elif isinstance(value, list):
+            for child in value:
+                remember(child, is_required=is_required)
+
+    for entry in [
+        *list(getattr(workflow, "nodes", []) or []),
+        *list(getattr(workflow, "steps", []) or []),
+    ]:
+        if not isinstance(entry, dict):
+            continue
+        data = entry.get("data") if isinstance(entry.get("data"), dict) else entry
+        if str(entry.get("type") or data.get("type") or "") != "action":
+            remember(data)
+            continue
+        params = data.get("params") if isinstance(data.get("params"), dict) else {}
+        action = action_by_id.get(str(data.get("action_id") or ""))
+        action_schema = normalize_parameter_schema(
+            getattr(action, "input_schema", {}) if action is not None else {}
+        )
+        action_properties = action_schema.get("properties", {})
+        action_required = {
+            str(item)
+            for item in action_schema.get("required", [])
+            if isinstance(item, str)
+        }
+        for action_field, value in params.items():
+            remember(
+                value,
+                is_required=action_field in action_required,
+                definition=action_properties.get(action_field),
+            )
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": [name for name in properties if name in required],
+        "additionalProperties": True,
+    }
 
 
 def validate_workflow_references(
@@ -332,6 +458,9 @@ def canonicalize_workflow_references(
 _HTTP_ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
 _HTTP_BLOCKED_HEADERS = {"host", "connection", "proxy-authorization", "proxy-connection"}
 _UNMANAGED_SKILL_CONFIG_FIELDS = {"skill_name", "skill_path", "script", "interpreter"}
+_HTTP_IDEMPOTENCY_MODE = "header"
+_MCP_IDEMPOTENCY_MODE = "mcp_meta"
+_SKILL_IDEMPOTENCY_MODE = "capability_execution_key_env"
 
 
 def _is_public_ip(value: str) -> bool:
@@ -670,6 +799,20 @@ def _decision_chain_context(
     lineage_context = db.info.get("action_lineage_context")
     if not isinstance(lineage_context, dict):
         lineage_context = {}
+    capability_principal_type = str(
+        lineage_context.get("capability_principal_type") or ""
+    ).strip()[:20]
+    capability_principal_hash = str(
+        lineage_context.get("capability_principal_hash") or ""
+    ).strip()
+    permission_decision = dict(permission or {})
+    if capability_principal_type and re.fullmatch(
+        r"[a-z][a-z0-9_.-]{0,19}", capability_principal_type
+    ) and re.fullmatch(r"[0-9a-f]{64}", capability_principal_hash):
+        permission_decision["capability_principal"] = {
+            "id_hash": capability_principal_hash,
+            "type": capability_principal_type,
+        }
     correlation_id = str(
         lineage_context.get("correlation_id")
         or trace_context.get("correlation_id")
@@ -687,12 +830,14 @@ def _decision_chain_context(
         lineage_context.get("parent_action_log_id") or ""
     ).strip() or None
     return {
-        "actor_type": "agent" if agent_id else "user" if actor_user_id else "unknown",
+        "actor_type": capability_principal_type or (
+            "agent" if agent_id else "user" if actor_user_id else "unknown"
+        ),
         "actor_user_id": actor_user_id,
         "agent_id": agent_id,
         "llm_config_id": llm_config_id,
         "model_name": model_name,
-        "permission_decision": dict(permission or {}),
+        "permission_decision": permission_decision,
         "data_context": {},
         "correlation_id": correlation_id,
         "parent_action_log_id": parent_action_log_id,
@@ -918,7 +1063,11 @@ def _compact_preview_value(value: Any, *, max_chars: int) -> Any:
     }
 
 
-def _compact_action_preview_plan(plan: dict[str, Any]) -> dict[str, Any]:
+def _compact_action_preview_plan(
+    plan: dict[str, Any],
+    *,
+    include_parameter_values: bool = True,
+) -> dict[str, Any]:
     """Build a bounded plan without echoing arbitrarily large business input.
 
     The durable ActionExecutionLog retains the validated parameters so the
@@ -933,7 +1082,14 @@ def _compact_action_preview_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "parameter_count": max(0, int(plan.get("parameter_count") or 0)),
         "side_effects_skipped": True,
     }
-    if plan.get("parameters_omitted"):
+    if not include_parameter_values:
+        digest, size = _preview_digest(plan.get("parameters", {}))
+        compact.update({
+            "parameters_omitted": True,
+            "parameters_sha256": digest,
+            "parameters_serialized_chars": size,
+        })
+    elif plan.get("parameters_omitted"):
         compact.update({
             "parameters_omitted": True,
             "parameter_keys": [
@@ -1123,15 +1279,112 @@ def _stable_template_execution_id(
 
 def _idempotent_replay(
     existing: ActionExecutionLog,
-    normalized: dict[str, Any],
+    expected_input_params: dict[str, Any],
     permission: dict[str, Any],
 ) -> dict[str, Any]:
-    if (existing.input_params or {}) != normalized:
+    if (existing.input_params or {}) != expected_input_params:
         raise PolicyViolation("同一个 idempotency_key 不能复用不同的参数")
     replay = _response_from_log(existing, status="idempotent_replay")
     replay["original_status"] = existing.status
     replay["permission"] = permission
     return replay
+
+
+def recover_action_execution(
+    db: Session,
+    action: Any,
+    *,
+    parent_action_log_id: str,
+    execution_key: str,
+    expected_input_audit: dict[str, Any],
+    runtime_environment: str | None = None,
+    runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+) -> dict[str, Any]:
+    """Read-only reconciliation for a Capability confirmation crash window."""
+
+    provenance = _runtime_provenance(runtime_definition, runtime_environment)
+    scoped_key = _scoped_idempotency_key(
+        execution_key,
+        str(provenance["environment"]),
+    )
+    preview = db.get(ActionExecutionLog, parent_action_log_id)
+    execution = _find_preview_execution(db, action, parent_action_log_id)
+    if preview is None or execution is None or not scoped_key:
+        return {"state": "indeterminate"}
+    matches = (
+        preview.scenario_id == action.scenario_id
+        and preview.target_type == "action"
+        and preview.target_id == action.id
+        and preview.mode == "dry_run"
+        and execution.scenario_id == action.scenario_id
+        and execution.target_type == "action"
+        and execution.target_id == action.id
+        and execution.mode == "execute"
+        and execution.parent_action_log_id == preview.id
+        and execution.idempotency_key == scoped_key
+        and (execution.input_params or {}) == expected_input_audit
+        and execution.environment == provenance["environment"]
+        and execution.definition_snapshot_id == provenance["definition_snapshot_id"]
+        and execution.release_id == provenance["release_id"]
+        and execution.definition_hash == provenance["definition_hash"]
+        and execution.definition_source == provenance["definition_source"]
+        and execution.actor_type == preview.actor_type
+        and execution.actor_user_id == preview.actor_user_id
+        and execution.agent_id == preview.agent_id
+    )
+    if not matches:
+        return {"state": "indeterminate"}
+    if execution.status == "success":
+        return {
+            "state": "succeeded",
+            "output": {
+                "action_execution_log_id": execution.id,
+                "idempotent_replay": True,
+                "result": execution.result or {},
+                "status": "succeeded",
+            },
+        }
+    # SQL Actions are read-only by policy, and Template failures participate
+    # in the local audit/artifact transaction. External executor failures do
+    # not prove that their remote side effect did not occur.
+    if execution.status == "failed" and action.executor_type in {"sql", "template"}:
+        return {
+            "state": "failed",
+            "error_code": "action_execution_failed",
+        }
+    return {"state": "indeterminate"}
+
+
+def _require_external_idempotency_support(
+    db: Session,
+    action: Any,
+    cfg: dict[str, Any],
+    execution_key: str | None,
+) -> None:
+    """Fail closed before a Capability Action reaches an unsafe executor."""
+
+    if not execution_key:
+        raise PolicyViolation("Capability Action 缺少服务端执行幂等键")
+    executor_type = str(action.executor_type or "")
+    if executor_type in {"sql", "template"}:
+        return
+    if executor_type == "http":
+        if str(cfg.get("idempotency_mode") or "") != _HTTP_IDEMPOTENCY_MODE:
+            raise PolicyViolation("HTTP Action 未声明受治理的下游幂等契约")
+        if any(str(name).lower() == "idempotency-key" for name in (cfg.get("headers") or {})):
+            raise PolicyViolation("HTTP Action 不能自行配置受控幂等请求头")
+        return
+    if executor_type == "mcp":
+        if str(cfg.get("idempotency_mode") or "") != _MCP_IDEMPOTENCY_MODE:
+            raise PolicyViolation("MCP Action 未声明受治理的下游幂等契约")
+        return
+    if executor_type == "skill":
+        skill = validate_skill_action_config(db, cfg)
+        metadata = skill.meta if isinstance(skill.meta, dict) else {}
+        if str(metadata.get("idempotency_mode") or "") != _SKILL_IDEMPOTENCY_MODE:
+            raise PolicyViolation("Skill Action 未声明受治理的下游幂等契约")
+        return
+    raise PolicyViolation("该 Action 执行器不支持可验证的下游幂等语义")
 
 
 def preview_action(
@@ -1141,6 +1394,9 @@ def preview_action(
     *,
     runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+    commit: bool = True,
+    audit_input_params: dict[str, Any] | None = None,
+    include_preview_input_values: bool = True,
 ) -> dict[str, Any]:
     """校验参数并生成 Action 预演，不触发 SQL/HTTP/脚本/MCP/Skill。"""
     capability_readiness_service.require_executable(
@@ -1159,20 +1415,28 @@ def preview_action(
     permission = _permission_summary(db, action, confirmed=False, dry_run=True)
     if not permission["allowed"]:
         raise PolicyViolation("没有预演该操作的权限")
+    persisted_input_params = (
+        copy.deepcopy(audit_input_params)
+        if audit_input_params is not None
+        else normalized
+    )
     start = time.time()
     log = ActionExecutionLog(
         scenario_id=action.scenario_id,
         target_type="action",
         target_id=action.id,
         target_name=action.name,
-        input_params=normalized,
+        input_params=persisted_input_params,
         status="dry_run",
         mode="dry_run",
         # input_params is the one authoritative, access-controlled copy used
         # by confirmation equality checks.  Avoid retaining a second unbounded
         # copy inside the broadly rendered result plan.
         result={
-            "plan": _compact_action_preview_plan(plan),
+            "plan": _compact_action_preview_plan(
+                plan,
+                include_parameter_values=include_preview_input_values,
+            ),
             "permission": _compact_permission(permission),
         },
         connector_audit=plan.get("connector_audit", []),
@@ -1181,8 +1445,11 @@ def preview_action(
         duration_ms=int((time.time() - start) * 1000),
     )
     db.add(log)
-    db.commit()
-    db.refresh(log)
+    if commit:
+        db.commit()
+        db.refresh(log)
+    else:
+        db.flush()
     response = _preview_response_from_log(
         log,
         action=action,
@@ -1202,6 +1469,9 @@ def execute_action(
     enforce_policy: bool = True,
     runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+    audit_input_params: dict[str, Any] | None = None,
+    include_preview_input_values: bool = True,
+    external_idempotency_required: bool = False,
 ) -> dict[str, Any]:
     """执行单个操作，统一完成参数校验、权限确认和幂等日志。"""
     if dry_run:
@@ -1211,6 +1481,8 @@ def execute_action(
             params,
             runtime_environment=runtime_environment,
             runtime_definition=runtime_definition,
+            audit_input_params=audit_input_params,
+            include_preview_input_values=include_preview_input_values,
         )
     capability_readiness_service.require_executable(
         "action", action, definition=runtime_definition, db=db
@@ -1220,6 +1492,11 @@ def execute_action(
         idempotency_key, str(provenance["environment"])
     )
     normalized = validate_action_params(action.input_schema or {}, params)
+    persisted_input_params = (
+        copy.deepcopy(audit_input_params)
+        if audit_input_params is not None
+        else normalized
+    )
     _enforce_action_precondition(action, normalized)
     permission = _permission_summary(db, action, confirmed=confirm)
     if not permission["allowed"]:
@@ -1231,7 +1508,7 @@ def execute_action(
             target_type="action",
             target_id=action.id,
             target_name=action.name,
-            input_params=normalized,
+            input_params=persisted_input_params,
             status="confirmation_required",
             mode="confirmation",
             # 确认提醒不占用幂等键；真正的 execute 记录才会保留并竞争该键。
@@ -1260,12 +1537,20 @@ def execute_action(
     if enforce_policy and parent_action_log_id:
         existing = _find_preview_execution(db, action, str(parent_action_log_id))
         if existing:
-            return _idempotent_replay(existing, normalized, permission)
+            return _idempotent_replay(existing, persisted_input_params, permission)
 
     if enforce_policy and scoped_idempotency_key:
         existing = _find_idempotent_log(db, action, scoped_idempotency_key)
         if existing:
-            return _idempotent_replay(existing, normalized, permission)
+            return _idempotent_replay(existing, persisted_input_params, permission)
+
+    if external_idempotency_required:
+        _require_external_idempotency_support(
+            db,
+            action,
+            action.executor_config or {},
+            scoped_idempotency_key,
+        )
 
     start = time.time()
     transactional_template = action.executor_type == "template"
@@ -1284,7 +1569,7 @@ def execute_action(
         target_type="action",
         target_id=action.id,
         target_name=action.name,
-        input_params=normalized,
+        input_params=persisted_input_params,
         status="running",
         mode="execute",
         idempotency_key=scoped_idempotency_key,
@@ -1309,7 +1594,7 @@ def execute_action(
             if existing is None:
                 existing = _find_preview_execution(db, action, str(parent_action_log_id or ""))
             if existing:
-                return _idempotent_replay(existing, normalized, permission)
+                return _idempotent_replay(existing, persisted_input_params, permission)
             raise
         db.refresh(log)
     else:
@@ -1325,7 +1610,7 @@ def execute_action(
             if existing is None:
                 existing = _find_preview_execution(db, action, str(parent_action_log_id or ""))
             if existing:
-                return _idempotent_replay(existing, normalized, permission)
+                return _idempotent_replay(existing, persisted_input_params, permission)
             raise
 
     try:
@@ -1336,6 +1621,8 @@ def execute_action(
             runtime_environment=runtime_environment,
             runtime_definition=runtime_definition,
             execution_log=log,
+            execution_key=scoped_idempotency_key,
+            external_idempotency_required=external_idempotency_required,
         )
         _enforce_action_postcondition(action, result)
         log.status = "success"
@@ -1369,10 +1656,15 @@ def _dispatch_executor(
     runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
     execution_log: ActionExecutionLog | None = None,
+    execution_key: str | None = None,
+    external_idempotency_required: bool = False,
 ) -> tuple[Any, list[dict[str, Any]]]:
     """按 executor_type 分发到具体执行器。"""
     etype = action.executor_type
     cfg = action.executor_config or {}
+
+    if external_idempotency_required:
+        _require_external_idempotency_support(db, action, cfg, execution_key)
 
     # A release snapshot intentionally redacts arbitrary HTTP headers and
     # Skill/Script execution may depend on mutable host state.  Those executor
@@ -1397,7 +1689,13 @@ def _dispatch_executor(
             data_source=source,
         ), [audit]
     if etype == "skill":
-        return _exec_skill(db, cfg, params), []
+        return _exec_skill(
+            db,
+            cfg,
+            params,
+            execution_key=execution_key,
+            require_idempotency=external_idempotency_required,
+        ), []
     if etype == "mcp":
         mcp, audit = _action_runtime_connector(
             db,
@@ -1407,9 +1705,21 @@ def _dispatch_executor(
             runtime_environment=runtime_environment,
             runtime_definition=runtime_definition,
         )
-        return _exec_mcp(db, cfg, params, mcp=mcp), [audit]
+        return _exec_mcp(
+            db,
+            cfg,
+            params,
+            mcp=mcp,
+            execution_key=execution_key,
+            require_idempotency=external_idempotency_required,
+        ), [audit]
     if etype == "http":
-        return _exec_http(cfg, params), []
+        return _exec_http(
+            cfg,
+            params,
+            execution_key=execution_key,
+            require_idempotency=external_idempotency_required,
+        ), []
     if etype == "script":
         return _exec_script(cfg, params), []
     if etype == "template":
@@ -1733,15 +2043,39 @@ def _exec_sql(
     )
 
 
-def _exec_skill(db: Session, cfg: dict, params: dict) -> Any:
+def _exec_skill(
+    db: Session,
+    cfg: dict,
+    params: dict,
+    *,
+    execution_key: str | None = None,
+    require_idempotency: bool = False,
+) -> Any:
     """Execute a catalogued enabled Skill with a bounded argument shape."""
     skill = validate_skill_action_config(db, cfg)
+    if require_idempotency:
+        metadata = skill.meta if isinstance(skill.meta, dict) else {}
+        if (
+            not execution_key
+            or str(metadata.get("idempotency_mode") or "")
+            != _SKILL_IDEMPOTENCY_MODE
+        ):
+            raise PolicyViolation("Skill Action 缺少受治理的下游幂等契约")
     args = params.get("args", [])
     if isinstance(args, dict):
         args = [str(v) for v in args.values()]
     if not isinstance(args, list):
         raise ValueError("Skill Action 的 args 必须是数组或对象")
-    result = skill_service.execute_skill(skill, [str(arg) for arg in args], timeout=60)
+    skill_args = [str(arg) for arg in args]
+    if require_idempotency:
+        result = skill_service.execute_skill(
+            skill,
+            skill_args,
+            timeout=60,
+            execution_key=execution_key,
+        )
+    else:
+        result = skill_service.execute_skill(skill, skill_args, timeout=60)
     return {
         "status": str(result.get("status") or "error"),
         "stdout": str(result.get("stdout") or "")[:3000],
@@ -1750,7 +2084,15 @@ def _exec_skill(db: Session, cfg: dict, params: dict) -> Any:
     }
 
 
-def _exec_mcp(db: Session, cfg: dict, params: dict, *, mcp: Any = None) -> Any:
+def _exec_mcp(
+    db: Session,
+    cfg: dict,
+    params: dict,
+    *,
+    mcp: Any = None,
+    execution_key: str | None = None,
+    require_idempotency: bool = False,
+) -> Any:
     """MCP 执行器：调用 MCP 工具。
 
     cfg: {mcp_id, tool_name}
@@ -1759,15 +2101,33 @@ def _exec_mcp(db: Session, cfg: dict, params: dict, *, mcp: Any = None) -> Any:
     tool_name = cfg.get("tool_name", "")
     if not tool_name or (not mcp_id and mcp is None):
         raise ValueError("MCP 执行器需要 mcp_id 和 tool_name 配置")
+    if require_idempotency and (
+        not execution_key
+        or str(cfg.get("idempotency_mode") or "") != _MCP_IDEMPOTENCY_MODE
+    ):
+        raise PolicyViolation("MCP Action 缺少受治理的下游幂等契约")
     from ..models import MCPConfig
 
     mcp = mcp or db.get(MCPConfig, mcp_id)
     if not mcp:
         raise ValueError(f"MCP 不存在: {mcp_id}")
+    if require_idempotency:
+        return mcp_service.call_tool(
+            mcp,
+            tool_name,
+            params,
+            execution_key=execution_key,
+        )
     return mcp_service.call_tool(mcp, tool_name, params)
 
 
-def _exec_http(cfg: dict, params: dict) -> Any:
+def _exec_http(
+    cfg: dict,
+    params: dict,
+    *,
+    execution_key: str | None = None,
+    require_idempotency: bool = False,
+) -> Any:
     """HTTP 执行器：发送 HTTP 请求。
 
     cfg: {method, url, headers}
@@ -1780,6 +2140,15 @@ def _exec_http(cfg: dict, params: dict) -> Any:
     url = str(cfg.get("url", ""))
     headers = dict(cfg.get("headers") or {})
     validate_http_action_config({**cfg, "method": method, "url": url, "headers": headers})
+    if require_idempotency:
+        if (
+            not execution_key
+            or str(cfg.get("idempotency_mode") or "") != _HTTP_IDEMPOTENCY_MODE
+        ):
+            raise PolicyViolation("HTTP Action 缺少受治理的下游幂等契约")
+        if any(str(name).lower() == "idempotency-key" for name in headers):
+            raise PolicyViolation("HTTP Action 不能自行配置受控幂等请求头")
+        headers["Idempotency-Key"] = execution_key
     # 参数替换 URL
     for k, v in params.items():
         url = url.replace("{%s}" % k, str(v))
@@ -1922,6 +2291,7 @@ def execute_workflow(
     runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
     deadline_at: datetime | None = None,
+    audit_input_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """执行工作流：优先可视化 DAG（nodes/edges），回退旧版线性 steps。
 
@@ -1951,7 +2321,14 @@ def execute_workflow(
         target_type="workflow",
         target_id=workflow.id,
         target_name=workflow.name,
-        input_params=params,
+        # WorkflowRun owns the recoverable encrypted copy.  This workflow-level
+        # audit row keeps only a value-free summary; action-level audit rows
+        # retain their existing idempotency/confirmation semantics.
+        input_params=(
+            copy.deepcopy(audit_input_params)
+            if audit_input_params is not None
+            else workflow_payload_service.summarize_for_public(params)
+        ),
         status="running",
         **_decision_chain_context(db, workflow_permission_summary),
         **provenance,
@@ -2213,7 +2590,11 @@ def _execute_dag(
 
         if ntype == "start":
             res["status"] = "success"
-            res["result"] = params
+            # Keep raw parameters in the in-memory graph context for downstream
+            # templates, but never duplicate them into the durable run/result.
+            res["result"] = {
+                "input_summary": workflow_payload_service.summarize_for_public(params)
+            }
             ctx[node_id] = params
 
         elif ntype == "end":

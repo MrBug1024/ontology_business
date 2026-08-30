@@ -30,3 +30,4 @@ __pycache__
 .tmp-medical-audit-template
 .pytest-basetemp-audit
 .pytest_cache
+.codex-sheet-inspect

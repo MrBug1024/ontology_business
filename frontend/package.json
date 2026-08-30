@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "test": "node --test tests/artifact-and-schema.test.mjs",
+    "test": "node --test tests/artifact-and-schema.test.mjs tests/agent-readiness.test.mjs tests/catalog-bindings.test.mjs tests/agent-invocation.test.mjs tests/candidate-governance.test.mjs tests/capability-access.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -18,7 +18,7 @@ class MappingIncrementalRuntimeTests(unittest.TestCase):
         self.db = Session(self.engine)
         self.scenario = BusinessScenario(id="scenario-1", name="映射增量")
         self.source = DataSource(
-            id="source-1", scenario_id=self.scenario.id, name="源库", type="sqlite", config={}
+            id="source-1", scenario_id=self.scenario.id, name="源库", type="postgres", config={}
         )
         self.entity = OntologyEntity(id="entity-1", scenario_id=self.scenario.id, name="费用单")
         self.key = OntologyProperty(id="property-id", entity_id=self.entity.id, name="id", is_key=True)

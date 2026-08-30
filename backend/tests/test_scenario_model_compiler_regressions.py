@@ -166,8 +166,8 @@ class ScenarioModelCompilerRegressionTests(unittest.TestCase):
             tenant_id=self.scenario.tenant_id,
             scenario_id=self.scenario.id,
             name="项目业务库",
-            type="sqlite",
-            config={"path": "not-opened-in-test.db"},
+            type="postgres",
+            config={"database": "construction_projects"},
         )
         self.db.add(source)
         self.db.flush()
@@ -628,8 +628,8 @@ class ScenarioModelCompilerRegressionTests(unittest.TestCase):
             tenant_id=self.scenario.tenant_id,
             scenario_id=self.scenario.id,
             name="项目新库",
-            type="sqlite",
-            config={"path": "not-opened-new-test.db"},
+            type="postgres",
+            config={"database": "construction_projects_next"},
         )
         self.db.add(new_source)
         self.db.commit()

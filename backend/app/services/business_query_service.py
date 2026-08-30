@@ -656,7 +656,7 @@ def prepare_query(
     if group_sql and any(column.expression not in set(group_sql) for column in columns):
         raise BusinessQueryError(
             "使用 group_by 时，返回的普通属性必须全部出现在 group_by 中；"
-            "请先查询分组汇总，再单独查询违规明细"
+            "请先查询分组汇总，再单独查询所需明细"
         )
     having_sql: list[str] = []
     for index, raw in enumerate(_list(request.get("having"), "having", maximum=20)):

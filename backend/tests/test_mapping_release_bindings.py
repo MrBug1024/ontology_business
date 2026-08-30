@@ -123,12 +123,12 @@ class MappingReleaseBindingTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="后加订单库",
-            type="sqlite",
+            type="postgres",
             config={},
         )
         self.db.add(source)
         self.db.commit()
-        self._add_mapping(source=source, key="orders-binding", reference={"adapter": "sqlite"})
+        self._add_mapping(source=source, key="orders-binding", reference={"adapter": "postgres"})
 
         legacy_content = copy.deepcopy(snapshot.content)
         legacy_content.pop("mappings", None)
@@ -147,7 +147,7 @@ class MappingReleaseBindingTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="已审计订单库",
-            type="sqlite",
+            type="postgres",
             config={},
         )
         self.db.add(source)
@@ -155,7 +155,7 @@ class MappingReleaseBindingTests(unittest.TestCase):
         self._add_mapping(
             source=source,
             key="audited-orders-binding",
-            reference={"adapter": "sqlite"},
+            reference={"adapter": "postgres"},
         )
         self._healthy_binding(key="audited-orders-binding", connector_id=source.id)
         snapshot = self._branch_snapshot()
@@ -178,7 +178,7 @@ class MappingReleaseBindingTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="逻辑订单库",
-            type="sqlite",
+            type="postgres",
             config={},
         )
         bucket = DataSource(

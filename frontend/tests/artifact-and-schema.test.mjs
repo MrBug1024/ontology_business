@@ -112,6 +112,37 @@ test('global assistant shows safe references and keeps capability changes govern
   assert.doesNotMatch(source, /return '场景已有定义'/)
 })
 
+test('global assistant launcher and drawer header stay clear on narrow screens', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const launcherStart = source.indexOf('@media (max-width: 560px), (max-height: 480px)')
+  const narrowStart = source.indexOf('@media (max-width: 560px)', launcherStart + 1)
+  const narrowEnd = source.indexOf('@media (max-height: 480px)', narrowStart)
+
+  assert.notEqual(launcherStart, -1)
+  assert.notEqual(narrowStart, -1)
+  assert.notEqual(narrowEnd, -1)
+  assert.match(source, /\.assistant-launcher\s*\{\s*position:\s*fixed;/)
+  const launcherStyles = source.slice(launcherStart, narrowStart)
+  const narrowStyles = source.slice(narrowStart, narrowEnd)
+  assert.match(
+    launcherStyles,
+    /\.assistant-launcher\s*\{[\s\S]*?top:\s*8px;[\s\S]*?right:\s*136px;[\s\S]*?bottom:\s*auto;/,
+  )
+  assert.match(
+    launcherStyles,
+    /\.assistant-launcher-copy\s*\{[\s\S]*?position:\s*absolute;[\s\S]*?clip:\s*rect\(0, 0, 0, 0\);/,
+  )
+  assert.match(launcherStyles, /\.assistant-live-dot\s*\{\s*display:\s*none;/)
+  assert.match(
+    source,
+    /@media \(max-height: 480px\) and \(min-width: 901px\)\s*\{\s*\.assistant-launcher\s*\{\s*right:\s*296px;/,
+  )
+  assert.match(narrowStyles, /\.assistant-title\s*\{[^}]*white-space:\s*nowrap;/)
+})
+
 test('global assistant delegates task routing to the semantic planner', () => {
   const source = readFileSync(
     new URL('../src/components/GlobalAssistant.vue', import.meta.url),
@@ -529,7 +560,7 @@ test('materialized AI drafts stay durable, disabled and linked to the original m
   assert.equal(draftRefToken({ kind: 'data_source', id: 'source-1' }), 'source-1')
 })
 
-test('scenario page projects durable model resources into normal canvases and tabs without AI warning chrome', () => {
+test('scenario page separates governed candidates from formal counts without AI warning chrome', () => {
   const source = readFileSync(
     new URL('../src/views/ScenarioDetail.vue', import.meta.url),
     'utf8',
@@ -553,16 +584,21 @@ test('scenario page projects durable model resources into normal canvases and ta
   assert.doesNotMatch(pageTemplate, /AI 草稿|AI 已写入|草稿停用|>修正(?:并编排)?</)
   assert.doesNotMatch(pageTemplate, /class="mapping-prerequisite"|class="mapping-readiness-alert"/)
   assert.doesNotMatch(pageTemplate, /stat-draft|is-ai-draft|inlineDraftRowClass/)
-  assert.doesNotMatch(pageTemplate, /scenarioDraftsLoading|scenarioDraftsError|scenarioDraftPromotionError/)
+  assert.match(pageTemplate, /<CandidateReviewPanel/)
+  assert.match(pageTemplate, /:loading="scenarioDraftsLoading"/)
+  assert.match(pageTemplate, /:load-error="scenarioDraftsError"/)
   assert.doesNotMatch(graphCanvas, /AI 已写入|draftStatus|e\.draft/)
   assert.doesNotMatch(graphCanvas, /:stroke-dasharray="n\.meta\?\.aiDraft|e\.dashed \|\| e\.draft/)
-  assert.match(source, /对象类型 <b>\{\{ detail\.entities\.length \+ scenarioDraftsOf\('entity'\)\.length \}\}<\/b>/)
-  assert.match(source, /runtime_instance_count \|\| objectTotal \+ scenarioDraftsOf\('instance'\)\.length/)
+  assert.match(source, /正式对象类型 <b>\{\{ detail\.entities\.length \}\}<\/b>/)
+  assert.match(source, /候选对象类型 <b>\{\{ scenarioDraftsOf\('entity'\)\.length \}\}<\/b>/)
+  assert.match(source, /正式对象实例 <b>\{\{ detail\.runtime_instance_count \|\| objectTotal \}\}<\/b>/)
+  assert.match(source, /候选对象实例 <b>\{\{ scenarioDraftsOf\('instance'\)\.length \}\}<\/b>/)
   assert.match(source, /api\.searchObjects/)
   assert.match(source, /api\.listRelationInstances/)
-  for (const rowsName of ['objectMappingRows', 'relationMappingRows', 'functionRows', 'actionRows', 'ruleRows', 'eventRows', 'workflowRows']) {
-    assert.match(source, new RegExp(`<b>\\{\\{ ${rowsName}\\.length \\}\\}</b>`))
-  }
+  assert.match(source, /正式函数 <b>\{\{ detail\.functions\.length \}\}<\/b>/)
+  assert.match(source, /候选函数 <b>\{\{ scenarioDraftsOf\('function'\)\.length \}\}<\/b>/)
+  assert.match(source, /正式工作流 <b>\{\{ detail\.workflows\.length \}\}<\/b>/)
+  assert.match(source, /候选工作流 <b>\{\{ scenarioDraftsOf\('workflow'\)\.length \}\}<\/b>/)
   assert.match(source, /loadScenarioModelDrafts|listScenarioModelDrafts/)
   assert.match(source, /const openScenarioDrafts = computed\(\(\) => scenarioDrafts\.value\.filter\(scenarioDraftIsOpen\)\)/)
   assert.match(source, /function scenarioDraftDisplayId[\s\S]*?`ai-draft:\$\{item\.resource_kind\}:\$\{item\.id\}`/)

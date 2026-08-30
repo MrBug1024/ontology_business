@@ -69,10 +69,20 @@ def test_revision_04_constraint_contract_matches_orm_metadata() -> None:
 
 def test_scope_columns_are_non_nullable_where_identity_requires_them() -> None:
     revision = _load_revision()
+    lifecycle_nullable = {
+        # Revision 11 permits only the whole physical blob pair to become NULL
+        # after a guarded temporary-attachment expiry transition. Tenant scope
+        # and every live pair remain constrained by the composite foreign keys.
+        ("data_asset_versions", "bucket_data_source_id"),
+    }
     for table_name, column_names in revision.REQUIRED_COLUMNS.items():
         table = Base.metadata.tables[table_name]
         for column_name in column_names:
-            assert table.c[column_name].nullable is False, (table_name, column_name)
+            expected_nullable = (table_name, column_name) in lifecycle_nullable
+            assert table.c[column_name].nullable is expected_nullable, (
+                table_name,
+                column_name,
+            )
 
 
 def test_catalog_scope_tables_compile_for_postgresql() -> None:

@@ -12,10 +12,12 @@ or retry underneath an operator.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Iterable
 
 from sqlalchemy import select
@@ -34,6 +36,7 @@ from ..models import (
     OntologyRule,
     OntologySnapshot,
     OntologyWorkflow,
+    ScenarioCapabilityPort,
     WorkflowRun,
 )
 from . import connector_service, release_service
@@ -43,11 +46,204 @@ class RuntimeDefinitionError(ValueError):
     """A deployment cannot safely resolve the requested immutable definition."""
 
 
+class _FrozenDict(dict):
+    """JSON-compatible mapping that rejects in-place changes.
+
+    A ``dict`` subclass is intentional.  Existing v1 serializers and schema
+    validators use concrete ``dict`` checks, while callers that need a mutable
+    working value can still obtain one with ``copy.deepcopy``.
+    """
+
+    @staticmethod
+    def _immutable(*_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("runtime definition values are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+    def __copy__(self) -> dict[Any, Any]:
+        return dict(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[Any, Any]:
+        copied: dict[Any, Any] = {}
+        memo[id(self)] = copied
+        copied.update(
+            {
+                copy.deepcopy(key, memo): copy.deepcopy(value, memo)
+                for key, value in self.items()
+            }
+        )
+        return copied
+
+
+class _FrozenList(list):
+    """JSON-compatible sequence that rejects in-place changes."""
+
+    @staticmethod
+    def _immutable(*_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("runtime definition values are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+
+    def __copy__(self) -> list[Any]:
+        return list(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> list[Any]:
+        copied: list[Any] = []
+        memo[id(self)] = copied
+        copied.extend(copy.deepcopy(value, memo) for value in self)
+        return copied
+
+
+class _RuntimeResource:
+    """Detached ORM-shaped DTO sealed after its relationship graph is wired."""
+
+    __slots__ = ("__dict__", "_locked")
+
+    def __init__(self, **values: Any) -> None:
+        object.__setattr__(self, "_locked", False)
+        self.__dict__.update(values)
+
+    def __getattribute__(self, name: str) -> Any:
+        value = object.__getattribute__(self, name)
+        if name == "__dict__" and object.__getattribute__(self, "_locked"):
+            return MappingProxyType(value)
+        return value
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if self._locked:
+            raise TypeError("runtime definition resources are immutable")
+        self.__dict__[name] = value
+
+    def __delattr__(self, name: str) -> None:
+        if self._locked:
+            raise TypeError("runtime definition resources are immutable")
+        try:
+            del self.__dict__[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def _seal(self) -> None:
+        object.__setattr__(self, "_locked", True)
+
+    def __copy__(self) -> SimpleNamespace:
+        # A few legacy execution paths intentionally make a detached working
+        # copy before substituting an environment connector.
+        return SimpleNamespace(**vars(self))
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> SimpleNamespace:
+        copied = SimpleNamespace()
+        memo[id(self)] = copied
+        copied.__dict__.update(
+            {
+                key: copy.deepcopy(value, memo)
+                for key, value in vars(self).items()
+            }
+        )
+        return copied
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic convenience.
+        identity = getattr(self, "id", getattr(self, "port_key", ""))
+        name = getattr(self, "name", "")
+        return f"RuntimeResource(id={identity!r}, name={name!r})"
+
+
+def _deep_freeze(value: Any, memo: dict[int, Any] | None = None) -> Any:
+    """Freeze one detached runtime graph while preserving resource cycles."""
+
+    memo = memo if memo is not None else {}
+    if value is None or isinstance(
+        value,
+        (str, bytes, bool, int, float, complex),
+    ):
+        return value
+    existing = memo.get(id(value))
+    if existing is not None:
+        return existing
+    if isinstance(value, _RuntimeResource):
+        memo[id(value)] = value
+        if not value._locked:
+            for key, item in tuple(vars(value).items()):
+                value.__dict__[key] = _deep_freeze(item, memo)
+            value._seal()
+        return value
+    if isinstance(value, Mapping):
+        # Runtime JSON cannot contain reference cycles.  Resource cycles are
+        # handled above, before their list/dict relationship containers close.
+        frozen = _FrozenDict(
+            (key, _deep_freeze(item, memo)) for key, item in value.items()
+        )
+        memo[id(value)] = frozen
+        return frozen
+    if isinstance(value, list):
+        frozen = _FrozenList(_deep_freeze(item, memo) for item in value)
+        memo[id(value)] = frozen
+        return frozen
+    if isinstance(value, tuple):
+        frozen = tuple(_deep_freeze(item, memo) for item in value)
+        memo[id(value)] = frozen
+        return frozen
+    if isinstance(value, (set, frozenset)):
+        frozen = frozenset(_deep_freeze(item, memo) for item in value)
+        memo[id(value)] = frozen
+        return frozen
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, Sequence):
+        frozen = tuple(_deep_freeze(item, memo) for item in value)
+        memo[id(value)] = frozen
+        return frozen
+    # Dates, UUIDs, Decimals and SQL scalar wrapper values are immutable.  ORM
+    # instances never reach this branch because every runtime row is projected
+    # through ``_row_values`` before graph construction.
+    return value
+
+
+def _row_values(value: Any) -> dict[str, Any]:
+    """Copy scalar ORM columns or one snapshot object into detached values."""
+
+    if isinstance(value, Mapping):
+        return dict(value)
+    table = getattr(value, "__table__", None)
+    if table is not None:
+        return {
+            column.key: getattr(value, column.key)
+            for column in table.columns
+        }
+    try:
+        return dict(vars(value))
+    except TypeError as exc:
+        raise RuntimeDefinitionError("运行定义资源无法安全快照") from exc
+
+
+def _read(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
 @dataclass(frozen=True)
 class RuntimeDefinition:
     """A fully resolved live or frozen definition for one scenario/environment."""
 
-    scenario: BusinessScenario
+    scenario: Any
     environment: str
     source: str
     snapshot_id: str | None
@@ -63,6 +259,7 @@ class RuntimeDefinition:
     rules: dict[str, Any]
     events: dict[str, Any]
     workflows: dict[str, Any]
+    capability_ports: dict[str, Any]
 
     @property
     def is_frozen(self) -> bool:
@@ -76,17 +273,114 @@ def _normalize_environment(value: str | None) -> str:
         raise RuntimeDefinitionError(str(exc)) from exc
 
 
-def _runtime_resource(raw: dict[str, Any], scenario: BusinessScenario) -> SimpleNamespace:
-    """Turn verified snapshot JSON into the small ORM-shaped surface we need.
+def _runtime_resource(raw: Any, scenario: _RuntimeResource) -> _RuntimeResource:
+    """Turn one ORM row or verified snapshot object into a detached draft.
 
     The DTO deliberately contains no persistence session or mutable ORM state.
-    Permission checks still evaluate against the current scenario and grants,
-    while definition fields stay frozen at the release snapshot.
+    Permission checks still evaluate current grants against a scenario identity
+    snapshot, while definition fields stay fixed for this resolve lifecycle.
     """
-    data = dict(raw)
+    data = _row_values(raw)
     data["scenario_id"] = scenario.id
     data["scenario"] = scenario
-    return SimpleNamespace(**data)
+    return _RuntimeResource(**data)
+
+
+def _materialize_runtime_graph(
+    scenario: BusinessScenario,
+    groups: Mapping[str, Mapping[str, Any]],
+) -> tuple[_RuntimeResource, dict[str, dict[str, Any]]]:
+    """Project ORM/snapshot rows into one detached, deeply immutable graph."""
+
+    scenario_view = _RuntimeResource(**_row_values(scenario))
+    entities = {
+        str(resource_id): _runtime_resource(raw, scenario_view)
+        for resource_id, raw in groups.get("entities", {}).items()
+    }
+    for resource_id, entity in entities.items():
+        raw_entity = groups["entities"][resource_id]
+        raw_properties = list(_read(raw_entity, "properties", []) or [])
+        entity.lifecycle_status = str(
+            getattr(entity, "lifecycle_status", "active") or "active"
+        )
+        entity.properties = [
+            _runtime_resource(
+                {
+                    **_row_values(raw_property),
+                    "entity_id": entity.id,
+                },
+                scenario_view,
+            )
+            for raw_property in sorted(
+                raw_properties,
+                key=lambda item: str(_read(item, "id", "")),
+            )
+        ]
+        for prop in entity.properties:
+            prop.entity = entity
+
+    def resources(group: str) -> dict[str, _RuntimeResource]:
+        return {
+            str(resource_id): _runtime_resource(raw, scenario_view)
+            for resource_id, raw in groups.get(group, {}).items()
+        }
+
+    relations = resources("relations")
+    functions = resources("functions")
+    mappings = resources("mappings")
+    relation_mappings = resources("relation_mappings")
+    actions = resources("actions")
+    rules = resources("rules")
+    events = resources("events")
+    workflows = resources("workflows")
+    capability_ports = resources("capability_ports")
+
+    for relation in relations.values():
+        relation.source_entity = entities.get(str(relation.source_entity_id))
+        relation.target_entity = entities.get(str(relation.target_entity_id))
+    for resource in [*mappings.values(), *actions.values(), *rules.values()]:
+        resource.entity = entities.get(str(getattr(resource, "entity_id", "") or ""))
+    for relation_mapping in relation_mappings.values():
+        relation_mapping.relation = relations.get(str(relation_mapping.relation_id))
+        relation_mapping.source_mapping = mappings.get(
+            str(relation_mapping.source_mapping_id)
+        )
+        relation_mapping.target_mapping = mappings.get(
+            str(relation_mapping.target_mapping_id)
+        )
+    for port_key, port in capability_ports.items():
+        raw_port = groups["capability_ports"][port_key]
+        raw_schema = _read(raw_port, "dataset_schema", None)
+        if raw_schema is not None:
+            port.dataset_schema = _RuntimeResource(**_row_values(raw_schema))
+            port.dataset_schema_hash = str(
+                getattr(port.dataset_schema, "schema_hash", "") or ""
+            )
+        else:
+            port.dataset_schema = None
+            port.dataset_schema_hash = str(
+                getattr(port, "dataset_schema_hash", "") or ""
+            )
+
+    detached: dict[str, dict[str, Any]] = {
+        "entities": entities,
+        "relations": relations,
+        "functions": functions,
+        "mappings": mappings,
+        "relation_mappings": relation_mappings,
+        "actions": actions,
+        "rules": rules,
+        "events": events,
+        "workflows": workflows,
+        "capability_ports": capability_ports,
+    }
+    memo: dict[int, Any] = {}
+    frozen_groups = {
+        group: _deep_freeze(resources_by_id, memo)
+        for group, resources_by_id in detached.items()
+    }
+    frozen_scenario = _deep_freeze(scenario_view, memo)
+    return frozen_scenario, frozen_groups
 
 
 def _live_definition(scenario: BusinessScenario, environment: str, db: Session) -> RuntimeDefinition:
@@ -174,6 +468,31 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
             })
         )
     }
+    capability_ports = {
+        item.id: item
+        for item in db.execute(
+            select(ScenarioCapabilityPort).where(
+                ScenarioCapabilityPort.scenario_id == scenario.id,
+                ScenarioCapabilityPort.status == "active",
+            )
+        ).scalars().all()
+    }
+    capability_ids = {
+        "function": set(functions),
+        "action": set(actions),
+        "workflow": set(workflows),
+    }
+    orphaned_ports = sorted(
+        str(port.id)
+        for port in capability_ports.values()
+        if str(port.capability_key or "")
+        not in capability_ids.get(str(port.capability_kind or ""), set())
+    )
+    if orphaned_ports:
+        raise RuntimeDefinitionError(
+            "活动能力端口引用了不存在或不可执行的所属能力："
+            + "、".join(orphaned_ports[:20])
+        )
     definition_groups = {
         "entities": entities,
         "relations": relations,
@@ -184,11 +503,27 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
         "rules": rules,
         "events": events,
         "workflows": workflows,
+        "capability_ports": capability_ports,
     }
+    scenario_view, definition_groups = _materialize_runtime_graph(
+        scenario,
+        definition_groups,
+    )
+    entities = definition_groups["entities"]
+    relations = definition_groups["relations"]
+    functions = definition_groups["functions"]
+    mappings = definition_groups["mappings"]
+    relation_mappings = definition_groups["relation_mappings"]
+    actions = definition_groups["actions"]
+    rules = definition_groups["rules"]
+    events = definition_groups["events"]
+    workflows = definition_groups["workflows"]
+    capability_ports = definition_groups["capability_ports"]
 
-    # Dev remains mutable, but a dry-run still needs a reproducible optimistic
-    # pin.  Hash only definition columns (not refresh/error/runtime state) so a
-    # confirmed action is rejected when its meaning changed after preview.
+    # Dev authoring remains mutable between resolves, but each resolve/deployment
+    # gets a reproducible optimistic pin and a detached object graph. Hash only
+    # definition columns (not refresh/error/runtime state) so a confirmed action
+    # is rejected when its meaning changed after preview.
     definition_fields = {
         "entities": (
             "id", "name", "api_name", "namespace", "description", "icon", "color",
@@ -211,6 +546,12 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
         "rules": ("id", "entity_id", "name", "description", "condition", "action_on_match", "trigger_action_ids", "severity", "enabled"),
         "events": ("id", "name", "description", "payload_schema", "trigger_source", "enabled"),
         "workflows": ("id", "name", "description", "trigger_type", "trigger_config", "steps", "nodes", "edges", "status", "enabled", "access_scope"),
+        "capability_ports": (
+            "id", "capability_kind", "capability_key", "port_key", "name",
+            "description", "direction", "role",
+            "media_kind", "schema_document", "is_required", "cardinality",
+            "binding_policy", "config",
+        ),
     }
     digest_payload = {
         group: [
@@ -239,6 +580,18 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
         }
         for _resource_id, entity in sorted(entities.items())
     ]
+    digest_payload["capability_ports"] = [
+        {
+            **{
+                field: getattr(port, field, None)
+                for field in definition_fields["capability_ports"]
+            },
+            "dataset_schema_hash": (
+                port.dataset_schema.schema_hash if port.dataset_schema else ""
+            ),
+        }
+        for _port_key, port in sorted(capability_ports.items())
+    ]
     canonical = json.dumps(
         digest_payload,
         ensure_ascii=False,
@@ -249,7 +602,7 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
     live_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     return RuntimeDefinition(
-        scenario=scenario,
+        scenario=scenario_view,
         environment=environment,
         source="live",
         snapshot_id=None,
@@ -265,6 +618,7 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
         rules=rules,
         events=events,
         workflows=workflows,
+        capability_ports=capability_ports,
     )
 
 
@@ -299,83 +653,77 @@ def _from_snapshot(
     content_hash = release_service.snapshot_hash(content)
     if not snapshot.content_hash or snapshot.content_hash != content_hash:
         raise RuntimeDefinitionError("发布快照校验失败，已阻止运行")
+    if (
+        int(content.get("capability_contract_version", 1) or 1) < 2
+        and bool(content.get("capability_ports"))
+    ):
+        raise RuntimeDefinitionError("发布快照能力端口缺少明确归属，已阻止运行")
     runtime_content = release_service.active_snapshot_content(content)
-    entities = {
-        str(item["id"]): _runtime_resource(item, scenario)
-        for item in runtime_content.get("entities", [])
-    }
-    for entity in entities.values():
-        entity.lifecycle_status = str(
-            getattr(entity, "lifecycle_status", "active") or "active"
-        )
-        entity.properties = [
-            _runtime_resource(
-                {**property_data, "entity_id": entity.id}, scenario
-            )
-            for property_data in list(getattr(entity, "properties", []) or [])
-        ]
-        for prop in entity.properties:
-            prop.entity = entity
-    relations = {
-        str(item["id"]): _runtime_resource(item, scenario)
-        for item in runtime_content.get("relations", [])
-    }
-    for relation in relations.values():
-        relation.source_entity = entities.get(str(relation.source_entity_id))
-        relation.target_entity = entities.get(str(relation.target_entity_id))
 
-    mappings = {
-        str(item["id"]): _runtime_resource(item, scenario)
-        for item in runtime_content.get("mappings", [])
-    }
-    relation_mappings = {
-        str(item["id"]): _runtime_resource(item, scenario)
-        for item in runtime_content.get("relation_mappings", [])
-    }
-    functions = {
-        str(item["id"]): _runtime_resource(item, scenario)
-        for item in runtime_content.get("functions", [])
-    }
-    actions = {
-        str(item["id"]): _runtime_resource(item, scenario)
-        for item in runtime_content.get("actions", [])
-    }
-    rules = {
-        str(item["id"]): _runtime_resource(item, scenario)
-        for item in runtime_content.get("rules", [])
-    }
-    events = {
-        str(item["id"]): _runtime_resource(item, scenario)
-        for item in runtime_content.get("events", [])
-    }
-    workflows = {
-        str(item["id"]): _runtime_resource(item, scenario)
-        for item in runtime_content.get("workflows", [])
-    }
-    for resource in [*mappings.values(), *actions.values(), *rules.values()]:
-        resource.entity = entities.get(str(getattr(resource, "entity_id", "") or ""))
-    for relation_mapping in relation_mappings.values():
-        relation_mapping.relation = relations.get(str(relation_mapping.relation_id))
-        relation_mapping.source_mapping = mappings.get(str(relation_mapping.source_mapping_id))
-        relation_mapping.target_mapping = mappings.get(str(relation_mapping.target_mapping_id))
+    def historic_resource(group: str, item: Mapping[str, Any]) -> dict[str, Any]:
+        values = dict(item)
+        # Early snapshot contracts did not persist presentation timestamps.
+        # A release snapshot is immutable, so its creation time is the only
+        # truthful fallback for historic DTO serialization.
+        values.setdefault("created_at", snapshot.created_at)
+        if group == "functions":
+            values.setdefault("updated_at", snapshot.created_at)
+        if group == "mappings":
+            values.setdefault("environment_status", {})
+            values.setdefault("status", "unknown")
+            values.setdefault("last_error", "")
+            values.setdefault("last_checked_at", None)
+            values.setdefault("last_refreshed_at", None)
+            values.setdefault("last_row_count", 0)
+            values.setdefault("last_imported_count", 0)
+        if group == "relation_mappings":
+            values.setdefault("status", "unknown")
+            values.setdefault("last_error", "")
+            values.setdefault("last_checked_at", None)
+            values.setdefault("last_refreshed_at", None)
+            values.setdefault("last_link_count", 0)
+        return values
+
+    scenario_view, frozen_groups = _materialize_runtime_graph(
+        scenario,
+        {
+            group: {
+                str(item["id"]): historic_resource(group, item)
+                for item in runtime_content.get(group, [])
+            }
+            for group in (
+                "entities",
+                "relations",
+                "functions",
+                "mappings",
+                "relation_mappings",
+                "actions",
+                "rules",
+                "events",
+                "workflows",
+                "capability_ports",
+            )
+        },
+    )
 
     return RuntimeDefinition(
-        scenario=scenario,
+        scenario=scenario_view,
         environment=environment,
         source="release",
         snapshot_id=snapshot.id,
         release_id=release.id if release else None,
         definition_hash=content_hash,
         scenario_name=str(content["scenario"]["name"]),
-        entities=entities,
-        relations=relations,
-        actions=actions,
-        functions=functions,
-        mappings=mappings,
-        relation_mappings=relation_mappings,
-        rules=rules,
-        events=events,
-        workflows=workflows,
+        entities=frozen_groups["entities"],
+        relations=frozen_groups["relations"],
+        actions=frozen_groups["actions"],
+        functions=frozen_groups["functions"],
+        mappings=frozen_groups["mappings"],
+        relation_mappings=frozen_groups["relation_mappings"],
+        rules=frozen_groups["rules"],
+        events=frozen_groups["events"],
+        workflows=frozen_groups["workflows"],
+        capability_ports=frozen_groups["capability_ports"],
     )
 
 
@@ -407,6 +755,8 @@ def resolve_active(
     environment: str | None = None,
 ) -> RuntimeDefinition:
     """Resolve the current definition for a request entering this deployment."""
+    if scenario.status == "retired":
+        raise RuntimeDefinitionError("业务场景已退役，不能创建新的运行调用")
     normalized_environment = _normalize_environment(environment)
     if normalized_environment == "dev":
         return _live_definition(scenario, normalized_environment, db)
@@ -414,6 +764,72 @@ def resolve_active(
     snapshot = db.get(OntologySnapshot, release.snapshot_id)
     if not snapshot:
         raise RuntimeDefinitionError(f"{normalized_environment} 环境的发布快照不可用")
+    return _from_snapshot(
+        scenario,
+        normalized_environment,
+        snapshot,
+        release=release,
+    )
+
+
+def resolve_authoring(
+    db: Session,
+    scenario: BusinessScenario,
+) -> RuntimeDefinition:
+    """Return the mutable control-plane definition independently of host env.
+
+    ``RUNTIME_ENVIRONMENT`` describes where this Python process is deployed;
+    it must not turn an online installation into a read-only production
+    runtime.  Scenario pages, modeling, candidate review and validation setup
+    all inspect the tenant's current live definition.  Only an explicit
+    invocation or release request may select a staging/prod snapshot.
+
+    Retired scenarios are write-frozen by the scenario permission boundary, so
+    their live rows are also the stable control-plane record shown before a
+    user restores or permanently deletes the scenario.
+    """
+    return _live_definition(scenario, "dev", db)
+
+
+def resolve_retired_history(
+    db: Session,
+    scenario: BusinessScenario,
+    *,
+    environment: str | None = None,
+) -> RuntimeDefinition:
+    """Resolve read-only history without reopening an executable deployment.
+
+    This function is intentionally separate from ``resolve_active`` and is
+    only valid after scenario retirement.  A staging/prod read selects the
+    most recently deployed immutable snapshot even after its active pointer
+    was withdrawn.  Dev-only scenarios have no deployment snapshot contract;
+    their frozen-by-retirement live rows remain available for historic reads.
+    """
+    if str(scenario.status or "").strip().lower() != "retired":
+        raise RuntimeDefinitionError("历史定义读取只适用于已退役业务场景")
+    normalized_environment = _normalize_environment(environment)
+    release = db.scalar(
+        select(OntologyRelease)
+        .where(
+            OntologyRelease.scenario_id == scenario.id,
+            OntologyRelease.tenant_id == scenario.tenant_id,
+            OntologyRelease.environment == normalized_environment,
+            OntologyRelease.status.in_({"released", "superseded", "rolled_back"}),
+        )
+        .order_by(OntologyRelease.created_at.desc(), OntologyRelease.id.desc())
+        .limit(1)
+    )
+    if release is None:
+        if normalized_environment == "dev":
+            return _live_definition(scenario, normalized_environment, db)
+        raise RuntimeDefinitionError(
+            f"{normalized_environment} 环境没有可追溯的历史发布快照"
+        )
+    snapshot = db.get(OntologySnapshot, release.snapshot_id)
+    if snapshot is None:
+        raise RuntimeDefinitionError(
+            f"{normalized_environment} 环境的历史发布快照不可用"
+        )
     return _from_snapshot(
         scenario,
         normalized_environment,

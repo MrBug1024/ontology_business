@@ -45,9 +45,6 @@ _TOOL_BY_TARGET = {
 def _runtime_provenance(
     definition: runtime_definition_service.RuntimeDefinition,
 ) -> dict[str, Any]:
-    environment = runtime_connector_service.runtime_environment()
-    if definition.environment != environment:
-        raise AgentConfirmationError("运行定义环境与当前部署环境不一致，已阻止预演")
     return {
         "environment": definition.environment,
         "definition_snapshot_id": definition.snapshot_id,
@@ -310,6 +307,8 @@ def _event_dict(envelope: Any, queued_runs: list[Any]) -> dict[str, Any]:
 
 
 def _workflow_run_dict(run: Any, workflow_name: str) -> dict[str, Any]:
+    from . import workflow_payload_service
+
     return {
         "id": run.id,
         "scenario_id": run.scenario_id,
@@ -317,7 +316,7 @@ def _workflow_run_dict(run: Any, workflow_name: str) -> dict[str, Any]:
         "workflow_name": workflow_name,
         "trigger_source": run.trigger_source,
         "status": run.status,
-        "input_params": run.input_params or {},
+        "input_params": workflow_payload_service.public_input_summary(run),
         "environment": run.environment,
         "definition_snapshot_id": run.definition_snapshot_id,
         "release_id": run.release_id,
@@ -448,7 +447,7 @@ def confirm_preview(
         definition = runtime_definition_service.resolve_active(
             db,
             scenario,
-            environment=runtime_connector_service.runtime_environment(),
+            environment=preview.environment or "dev",
         )
         resource = runtime_definition_service.resolve_resource(
             definition, preview.target_type, preview.target_id

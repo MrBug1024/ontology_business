@@ -9,7 +9,7 @@
 - query_mapped_objects 按本体属性执行确定性的参数化映射查询
 - list_tables         列出某数据源的表结构
 - query_business_data 按本体对象和属性执行跨表、分组和聚合业务查询
-- run_medical_audit  在医保审计场景执行版本化、参数化的确定性审计策略
+- Provider tools     由受信 Provider 通过通用扩展契约注册的确定性能力
 - search_documents    在文件桶中检索相关文档片段（RAG）
 - read_document       读取某个已解析文档的全文
 - list_functions      列出场景中的无副作用业务函数
@@ -62,7 +62,6 @@ from . import (
     function_runtime_service,
     llm_service,
     mapped_query_service,
-    medical_audit_service,
     ontology_service,
     permission_service,
     rag_service,
@@ -71,6 +70,14 @@ from . import (
     tenant_service,
     workflow_service,
 )
+from .capability_agent_extensions import (
+    AgentProviderExtensionError,
+    AgentProviderToolError,
+    GroundingResult,
+    LegacyCapabilityMatch,
+    bind_agent_providers,
+)
+from .capability_contracts import RuntimeDataContext, canonical_hash
 from .policies import (
     PolicyViolation,
     validate_action_params,
@@ -99,7 +106,6 @@ _SAFE_TOOL_ERROR_CODES = frozenset(
 )
 _MAX_TOOL_RESULT_CHARS = 8_000
 _WORKFLOW_PARAM_RE = re.compile(r"\{\{\s*params\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
-_AUDIT_INTENT_TERMS = ("审计", "核验", "核查", "排查", "违规")
 _DELIVERY_INTENT_VERBS = ("生成", "完成", "出具", "编制", "交付", "导出", "制作", "产出", "提交")
 _DELIVERY_INTENT_NOUNS = (
     "报告",
@@ -109,123 +115,6 @@ _DELIVERY_INTENT_NOUNS = (
     "文件",
     "产出物",
     "全部工作任务",
-)
-_COMPLETE_DETAIL_TERMS = ("全部", "全量", "所有", "完整", "逐条", "明细")
-_MEDICAL_STRATEGY_LABELS = {
-    "charge_threshold": "单条收费数量阈值",
-    "daily_overstay": "日计价超过住院天数",
-    "included_service_duplicate": "包含项目重复收费",
-    "limited_drug_duration": "限疗程用药",
-}
-_MEDICAL_STRATEGY_ARGUMENTS = {
-    "charge_threshold": ("service_name", "threshold"),
-    "daily_overstay": ("service_names",),
-    "included_service_duplicate": ("included_service", "duplicate_service"),
-    "limited_drug_duration": ("drug_name", "max_days"),
-}
-_MEDICAL_RECORD_IDENTITY_FIELDS = {
-    "charge_threshold": ("charge_line_id",),
-    "daily_overstay": ("encounter_id", "service_name"),
-    "included_service_duplicate": ("charge_line_id",),
-    "limited_drug_duration": ("encounter_id", "drug_name"),
-}
-_MEDICAL_FACILITY_SUFFIXES = (
-    "社区卫生服务站",
-    "社区卫生服务中心",
-    "疾病预防控制中心",
-    "妇幼保健院",
-    "医疗中心",
-    "急救中心",
-    "卫生院",
-    "门诊部",
-    "医务室",
-    "卫生室",
-    "护理院",
-    "疗养院",
-    "大药房",
-    "检验所",
-    "中医馆",
-    "诊所",
-    "服务站",
-    "药房",
-    "药店",
-    "医院",
-)
-_MEDICAL_FACILITY_SUFFIX_PATTERN = re.compile(
-    r"[0-9A-Za-z\u4e00-\u9fff·._/-]{1,60}?(?:"
-    + "|".join(re.escape(value) for value in _MEDICAL_FACILITY_SUFFIXES)
-    + r")",
-    flags=re.IGNORECASE,
-)
-_MEDICAL_FACILITY_SCOPE_INTRODUCERS = (
-    "审计对象是",
-    "审计对象为",
-    "医疗机构是",
-    "医疗机构为",
-    "机构名称是",
-    "机构名称为",
-    "范围限定为",
-    "范围为",
-    "仅针对",
-    "只针对",
-    "项目涉及的",
-    "项目中的",
-    "项目内的",
-    "项目下的",
-    "项目的",
-    "范围内的",
-    "对应的",
-    "所属的",
-    "对应",
-    "涉及的",
-    "请审计",
-    "完成",
-    "审计",
-    "核验",
-    "核查",
-    "排查",
-    "检查",
-    "查询",
-    "分析",
-    "针对",
-    "关于",
-    "对于",
-    "对",
-    "在",
-)
-_GENERIC_MEDICAL_FACILITY_PREFIXES = frozenset({
-    "",
-    "某",
-    "某某",
-    "一家",
-    "这家",
-    "该",
-    "本",
-    "当地",
-    "相关",
-    "上述",
-    "定点",
-    "医保定点",
-    "医疗",
-    "综合",
-    "人民",
-    "公立",
-    "私立",
-    "各",
-    "所有",
-    "全部",
-    "任一",
-})
-_MEDICAL_FACILITY_NEGATIVE_PREFIXES = (
-    "不要审计",
-    "无需审计",
-    "不审计",
-    "不包括",
-    "不包含",
-    "不含",
-    "排除",
-    "剔除",
-    "除",
 )
 
 
@@ -340,466 +229,45 @@ def _dry_run_action_target(outcome: Mapping[str, Any]) -> tuple[str, str] | None
     return identity, label
 
 
-def _display_number(value: Any) -> str | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return format(float(value), ".12g")
-
-
-def _medical_record_identity(
-    strategy: str,
-    record: Any,
-) -> tuple[str, ...] | None:
-    fields = _MEDICAL_RECORD_IDENTITY_FIELDS.get(strategy)
-    if not fields or not isinstance(record, dict):
-        return None
-    values: list[str] = []
-    for field in fields:
-        value = record.get(field)
-        if value is None or isinstance(value, bool):
-            return None
-        normalized = str(value).strip()
-        if not normalized:
-            return None
-        values.append(normalized)
-    return tuple(values)
-
-
-def _normalized_business_text(value: Any) -> str:
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").casefold())
-
-
-def _requested_medical_facilities(user_message: str) -> set[str]:
-    """Extract explicit facility scope without treating business ids as names."""
-
-    facilities: set[str] = set()
-    for match in _MEDICAL_FACILITY_SUFFIX_PATTERN.finditer(str(user_message or "")):
-        candidate = match.group(0)
-        cut_at = 0
-        for introducer in _MEDICAL_FACILITY_SCOPE_INTRODUCERS:
-            index = candidate.rfind(introducer)
-            if index >= 0:
-                cut_at = max(cut_at, index + len(introducer))
-        candidate = candidate[cut_at:]
-        candidate = re.sub(
-            r"^(?:(?:请)?帮我|请|麻烦|仅|只|将|把|和|与|及|以及|对|在|的)+",
-            "",
-            candidate,
-        )
-        normalized = _normalized_business_text(candidate)
-        suffix = next(
-            (
-                _normalized_business_text(value)
-                for value in _MEDICAL_FACILITY_SUFFIXES
-                if normalized.endswith(_normalized_business_text(value))
-            ),
-            "",
-        )
-        if not suffix:
-            continue
-        prefix = normalized[: -len(suffix)]
-        if (
-            prefix in _GENERIC_MEDICAL_FACILITY_PREFIXES
-            or re.fullmatch(
-                r"(?:各|所有|全部|任一|相关|上述|当地|某|某某|一家|这家|该|本|"
-                r"医保|定点|医疗|公立|私立|综合|人民)+",
-                prefix,
-            )
-            or re.fullmatch(
-                r"(?:项目)?[a-z]{1,12}\d{1,12}(?:年度|项目|业务|场景|任务|的|涉及的)*",
-                prefix,
-            )
-        ):
-            continue
-        facilities.add(normalized)
-    return facilities
-
-
-def _resolved_medical_facilities(
+def _prepare_provider_grounding(
+    extensions: Sequence[Any],
     user_message: str,
-    authoritative_facilities: Sequence[str] | None = None,
-) -> set[str]:
-    """Keep distinct governed values while removing heuristic name fragments."""
-
-    heuristic = _requested_medical_facilities(user_message)
-    authoritative = {
-        normalized
-        for value in authoritative_facilities or ()
-        if (normalized := _normalized_business_text(value))
-    }
-    if authoritative:
-        return authoritative | {
-            candidate
-            for candidate in heuristic
-            if not any(candidate in governed for governed in authoritative)
-        }
-    return {
-        candidate
-        for candidate in heuristic
-        if not any(
-            candidate != longer and candidate in longer
-            for longer in heuristic
-        )
-    }
+) -> tuple[tuple[Any, Any], ...]:
+    prepared: list[tuple[Any, Any]] = []
+    for extension in extensions:
+        try:
+            state = extension.prepare_grounding(user_message)
+        except Exception:  # noqa: BLE001 - Provider preparation fails closed.
+            state = None
+        prepared.append((extension, state))
+    return tuple(prepared)
 
 
-def _medical_request_excludes_facility(
-    user_message: str,
-    authoritative_facilities: Sequence[str] | None = None,
-) -> bool:
-    """Fail closed when an explicitly named institution is a negative scope.
-
-    The deterministic medical tool only supports equality or all-facility
-    scope. It cannot prove a NOT-facility request, even when governed lookup
-    correctly recognizes the institution being excluded.
-    """
-
-    explicit_facilities = _resolved_medical_facilities(
-        user_message,
-        authoritative_facilities,
-    )
-    if not explicit_facilities:
-        return False
-    normalized_message = _normalized_business_text(user_message)
-    normalized_prefixes = tuple(
-        _normalized_business_text(prefix)
-        for prefix in _MEDICAL_FACILITY_NEGATIVE_PREFIXES
-    )
-    facility_names: set[str] = set()
-    for candidate in explicit_facilities:
-        normalized = candidate
-        # Heuristic extraction can retain a leading negative verb (for
-        # example, ``排除某医院``). Strip only a leading scope operator so the
-        # following regexes can bind the operator back to the exact name span.
-        for prefix in normalized_prefixes:
-            if normalized.startswith(prefix) and len(normalized) > len(prefix):
-                normalized = normalized[len(prefix):]
-                break
-        if normalized:
-            facility_names.add(normalized)
-
-    for facility_name in facility_names:
-        facility = re.escape(facility_name)
-        patterns = (
-            rf"除(?:了)?{facility}(?:以外|之外|外)",
-            rf"除(?:了)?{facility}(?=(?:审计|核查|检查|排查|其他|其余|剩余))",
-            rf"{facility}除外",
-            rf"(?:不含|不包括|不包含){facility}",
-            rf"(?:排除|剔除)(?:掉)?{facility}",
-            rf"跳过{facility}",
-            rf"(?:不要审计|不审计|无需审计){facility}",
-            rf"(?:不要|不|无需)(?:对)?{facility}"
-            rf"(?:进行|开展)?(?:本次)?审计",
-            rf"{facility}(?:不要审计|不审计|无需审计)",
-            rf"{facility}(?:暂)?不在(?:本次)?审计范围(?:之)?内",
-            rf"{facility}(?:暂)?不纳入(?:本次)?审计",
-            rf"(?:本次)?审计不涉及{facility}",
-        )
-        if any(re.search(pattern, normalized_message) for pattern in patterns):
-            return True
-    return False
-
-
-def _chinese_integer(value: int) -> set[str]:
-    digits = "零一二三四五六七八九"
-    if value < 0 or value > 99:
-        return set()
-    if value < 10:
-        result = {digits[value]}
-        if value == 2:
-            result.add("两")
-        return result
-    tens, ones = divmod(value, 10)
-    prefix = "" if tens == 1 else digits[tens]
-    return {prefix + "十" + (digits[ones] if ones else "")}
-
-
-def _medical_number_mentioned(user_message: str, value: Any) -> bool:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    numeric = float(value)
-    raw_user = str(user_message or "").casefold()
-    numeric_forms = {format(numeric, ".12g")}
-    chinese_forms: set[str] = set()
-    if numeric.is_integer():
-        integer = int(numeric)
-        numeric_forms.add(str(integer))
-        chinese_forms.update(_chinese_integer(integer))
-    if any(form and form in raw_user for form in chinese_forms):
-        return True
-    return any(
-        re.search(
-            rf"(?<![0-9a-z]){re.escape(form)}(?![0-9a-z])",
-            raw_user,
-        )
-        is not None
-        for form in numeric_forms
-        if form
-    )
-
-
-def _requested_medical_strategy(user_message: str) -> str | None:
-    text = _normalized_business_text(user_message)
-    if any(term in text for term in ("重复收费", "重复收取", "另行收费", "包含项目", "已包含")):
-        return "included_service_duplicate"
-    if any(term in text for term in ("限疗程", "超疗程", "用药天数", "用药时长", "疗程天数")):
-        return "limited_drug_duration"
-    if any(term in text for term in ("住院天数", "日计价", "按日计费", "每日计费")):
-        return "daily_overstay"
-    if (
-        any(term in text for term in ("大于", "高于", "超过", "超出"))
-        and any(term in text for term in ("收费", "数量", "次数", "次"))
-    ):
-        return "charge_threshold"
-    return None
-
-
-def _medical_request_matches_user(
-    strategy: str,
-    arguments: Any,
-    evidence: Mapping[str, Any],
+def _provider_grounding_results(
+    prepared: Sequence[tuple[Any, Any]],
     *,
     user_message: str,
-    requested_facilities: set[str] | None = None,
-    authoritative_facilities: set[str] | None = None,
-) -> bool:
-    """Bind deterministic medical evidence to the user's stated audit task."""
-
-    if not isinstance(arguments, Mapping) or _requested_medical_strategy(user_message) != strategy:
-        return False
-    parameters = evidence.get("parameters")
-    if not isinstance(parameters, Mapping):
-        return False
-    expected_parameters: dict[str, Any] = {
-        "facility_name": arguments.get("facility_name"),
-    }
-    for key in _MEDICAL_STRATEGY_ARGUMENTS[strategy]:
-        if key not in arguments:
-            return False
-        expected_parameters[key] = arguments[key]
-    if dict(parameters) != expected_parameters:
-        return False
-
-    user_text = _normalized_business_text(user_message)
-    requested_facilities = (
-        _resolved_medical_facilities(user_message)
-        if requested_facilities is None
-        else requested_facilities
-    )
-    expected_facility = _normalized_business_text(expected_parameters.get("facility_name"))
-    if (
-        authoritative_facilities is not None
-        and expected_parameters.get("facility_name") is not None
-        and (
-            not expected_facility
-            or expected_facility not in authoritative_facilities
-        )
-    ):
-        # A successful governed lookup is authoritative. Heuristic aliases or
-        # unknown names cannot turn an equality query with zero rows into proof.
-        return False
-    if requested_facilities and (
-        len(requested_facilities) != 1
-        or not expected_facility
-        or requested_facilities != {expected_facility}
-    ):
-        # A query without facility_name expands beyond an explicitly named
-        # institution.  Likewise, one facility-scoped tool result cannot prove
-        # a request that named a different or multiple institutions.
-        return False
-    for key in ("facility_name", "service_name", "included_service", "duplicate_service", "drug_name"):
-        value = expected_parameters.get(key)
-        if value is not None and _normalized_business_text(value) not in user_text:
-            return False
-    service_names = expected_parameters.get("service_names")
-    if service_names is not None and (
-        not isinstance(service_names, list)
-        or not service_names
-        or any(
-            not isinstance(value, str)
-            or _normalized_business_text(value) not in user_text
-            for value in service_names
-        )
-    ):
-        return False
-    for key in ("threshold", "max_days"):
-        if key in expected_parameters and not _medical_number_mentioned(
-            user_message,
-            expected_parameters[key],
-        ):
-            return False
-    return True
-
-
-def _medical_audit_status(
-    tool_outcomes: list[dict[str, Any]],
-    *,
-    user_message: str,
-    authoritative_facilities: Sequence[str] | None = None,
-    facility_lookup_succeeded: bool | None = None,
-) -> tuple[list[str], bool]:
-    """Build deterministic summaries and prove every requested detail page."""
-    if facility_lookup_succeeded is False:
-        return [], False
-    normalized_authoritative_facilities = {
-        normalized
-        for value in authoritative_facilities or ()
-        if (normalized := _normalized_business_text(value))
-    }
-    if _medical_request_excludes_facility(
-        user_message,
-        authoritative_facilities,
-    ):
-        return [], False
-    requested_facilities = _resolved_medical_facilities(
-        user_message,
-        authoritative_facilities,
-    )
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for outcome in tool_outcomes:
-        if outcome["name"] != "run_medical_audit" or _failed_tool_result(outcome["result"]):
-            continue
-        payload = _parsed_result(outcome["result"])
-        evidence = payload.get("evidence") if isinstance(payload, dict) else None
-        if (
-            not isinstance(payload, dict)
-            or payload.get("ok") is not True
-            or not isinstance(payload.get("summary"), dict)
-            or not isinstance(payload.get("records"), list)
-            or not isinstance(evidence, dict)
-        ):
-            continue
-        strategy = str(payload.get("strategy") or "")
-        if strategy not in _MEDICAL_STRATEGY_ARGUMENTS or not _medical_request_matches_user(
-            strategy,
-            outcome.get("arguments"),
-            evidence,
-            user_message=user_message,
-            requested_facilities=requested_facilities,
-            authoritative_facilities=(
-                normalized_authoritative_facilities
-                if facility_lookup_succeeded is True
-                else None
-            ),
-        ):
-            continue
-        signature = json.dumps(
-            {
-                "audit_version": payload.get("audit_version"),
-                "strategy": payload.get("strategy"),
-                "source_id": evidence.get("source_id"),
-                "parameters": evidence.get("parameters"),
-                "limit": payload.get("limit"),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
-        groups.setdefault(signature, []).append({**outcome, "payload": payload})
-
-    lines: list[str] = []
-    verified = False
-    wants_complete_details = any(term in user_message for term in _COMPLETE_DETAIL_TERMS)
-    for pages in groups.values():
-        first = pages[0]["payload"]
-        summary = first["summary"]
-        count = summary.get("violation_count")
-        amount = _display_number(summary.get("violation_amount"))
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0 or amount is None:
-            continue
-        verified = True
-        strategy = str(first.get("strategy") or "")
-        label = _MEDICAL_STRATEGY_LABELS.get(strategy, strategy or "未知策略")
-        summary_parts = [f"{label}：违规 {count} 条（组）", f"违规金额 {amount} 元"]
-        for field, field_label in (
-            ("violating_quantity", "涉及数量"),
-            ("excess_quantity", "超计数量"),
-        ):
-            displayed = _display_number(summary.get(field))
-            if displayed is not None:
-                summary_parts.append(f"{field_label} {displayed}")
-        lines.append(
-            "医保确定性汇总（模型正文数字不一致时以此为准）："
-            + "，".join(summary_parts)
-            + "。"
-        )
-
-        expected_offset = 0
-        delivered_rows = 0
-        complete = False
-        chain_valid = True
-        seen_identities: set[tuple[str, ...]] = set()
-        baseline_summary = json.dumps(summary, ensure_ascii=False, sort_keys=True)
-        baseline_evidence = json.dumps(
-            first.get("evidence"), ensure_ascii=False, sort_keys=True, default=str
-        )
-        for page in pages:
-            payload = page["payload"]
-            arguments = page.get("arguments") or {}
-            offset = payload.get("offset")
-            row_count = payload.get("row_count")
-            truncated = payload.get("truncated")
-            next_offset = payload.get("next_offset")
-            try:
-                requested_offset = int(arguments.get("offset") or 0)
-            except (TypeError, ValueError):
-                chain_valid = False
-                break
-            if (
-                isinstance(offset, bool)
-                or not isinstance(offset, int)
-                or isinstance(row_count, bool)
-                or not isinstance(row_count, int)
-                or row_count < 0
-                or row_count != len(payload["records"])
-                or not isinstance(truncated, bool)
-                or offset != expected_offset
-                or offset != requested_offset
-                or json.dumps(payload.get("summary"), ensure_ascii=False, sort_keys=True)
-                != baseline_summary
-                or json.dumps(
-                    payload.get("evidence"), ensure_ascii=False, sort_keys=True, default=str
-                )
-                != baseline_evidence
-            ):
-                chain_valid = False
-                break
-            if "limit" in arguments and payload.get("limit") != arguments.get("limit"):
-                chain_valid = False
-                break
-            page_identities: list[tuple[str, ...]] = []
-            for record in payload["records"]:
-                identity = _medical_record_identity(strategy, record)
-                if identity is None or identity in seen_identities:
-                    chain_valid = False
-                    break
-                seen_identities.add(identity)
-                page_identities.append(identity)
-            if not chain_valid or len(page_identities) != row_count:
-                chain_valid = False
-                break
-            delivered_rows += row_count
-            if truncated:
-                if row_count <= 0 or next_offset != offset + row_count:
-                    chain_valid = False
-                    break
-                expected_offset = int(next_offset)
-                continue
-            if next_offset is not None:
-                chain_valid = False
-                break
-            complete = True
-            break
-
-        if chain_valid and complete and delivered_rows == count:
-            lines.append(f"审计明细分页已完整读取 {delivered_rows}/{count} 条。")
-        else:
-            qualifier = "本次要求全部明细；" if wants_complete_details else ""
-            lines.append(
-                f"{qualifier}审计统计可用，但明细仅连续读取 {delivered_rows}/{count} 条，"
-                "不能视为全部明细已交付。"
+    tool_outcomes: Sequence[Mapping[str, Any]],
+) -> tuple[GroundingResult, ...]:
+    results: list[GroundingResult] = []
+    for extension, state in prepared:
+        try:
+            result = extension.ground(user_message, tool_outcomes, state)
+        except Exception:  # noqa: BLE001 - deterministic verification fails closed.
+            result = GroundingResult(
+                provider_key=str(extension.provider_key),
+                provider_version=str(extension.provider_version),
+                verified=False,
+                status_lines=(
+                    "受信能力的确定性证据核验失败，不能据此认定业务结论成立。",
+                ),
             )
-    return lines, verified
+        if not isinstance(result, GroundingResult):
+            raise AgentProviderExtensionError(
+                "Provider grounding hook returned an invalid contract"
+            )
+        results.append(result)
+    return tuple(results)
 
 
 def _truthful_final_content(
@@ -807,9 +275,7 @@ def _truthful_final_content(
     *,
     user_message: str,
     tool_outcomes: list[dict[str, Any]],
-    controlled_medical_audit: bool = False,
-    authoritative_medical_facilities: Sequence[str] | None = None,
-    medical_facility_lookup_succeeded: bool | None = None,
+    grounding_results: Sequence[GroundingResult] = (),
 ) -> str:
     """Append an authoritative status derived from tools, never model claims."""
     status_lines: list[str] = []
@@ -840,19 +306,10 @@ def _truthful_final_content(
         else:
             status_lines.append("未生成可确认预演，不能视为业务任务已完成。")
 
-    medical_lines, verified_medical_audit = _medical_audit_status(
-        tool_outcomes,
-        user_message=user_message,
-        authoritative_facilities=authoritative_medical_facilities,
-        facility_lookup_succeeded=medical_facility_lookup_succeeded,
-    )
-    status_lines.extend(medical_lines)
-    audit_intent = any(term in user_message for term in _AUDIT_INTENT_TERMS)
-    # Generic object queries contain facts, not a governed audit rule/proof.
-    # Only a server-owned deterministic audit contract may suppress this guard.
-    successful_audit_query = verified_medical_audit
-    if audit_intent and not successful_audit_query:
-        status_lines.append("未形成可验证审计结论，不能把当前回答作为违规审计结果。")
+    for result in grounding_results:
+        if not isinstance(result, GroundingResult):
+            continue
+        status_lines.extend(result.status_lines)
 
     failed_counts: defaultdict[str, int] = defaultdict(int)
     for item in tool_outcomes:
@@ -1021,10 +478,18 @@ def _workflow_parameter_schema(workflow: Any, actions: list[Any]) -> dict[str, A
 class AgentContext:
     """一次 Agent 会话的运行时上下文。"""
 
-    def __init__(self, db: Session, agent: Agent, llm: LLMConfig):
+    def __init__(
+        self,
+        db: Session,
+        agent: Agent,
+        llm: LLMConfig,
+        *,
+        environment: str = "dev",
+    ):
         self.db = db
         self.agent = agent
         self.llm = llm
+        self.environment = str(environment or "dev").strip().lower()
         # Agent 工具始终以当前租户运行；缺少上下文时拒绝，而不是隐式获得全库访问。
         self.tenant_id = tenant_service.current_tenant_id(db)
         self.scenario = (
@@ -1047,15 +512,24 @@ class AgentContext:
         self._load_bindings()
 
     def _load_bindings(self) -> None:
-        ds_ids = [str(item) for item in (self.agent.data_source_ids or []) if str(item)]
+        # The legacy engine may still be instantiated while replaying historic
+        # messages, but it must obey the same data boundary as the capability
+        # runtime.  ``Agent.data_source_ids`` points at modeling-era rows and is
+        # deliberately ignored.  Only databases explicitly owned by this Agent
+        # are formal business data.
+        ds_ids = [
+            str(item)
+            for item in (self.agent.runtime_data_source_ids or [])
+            if str(item)
+        ]
         if ds_ids:
-            ds_scope = tenant_service.visible_clause(DataSource, self.db)
             self.data_sources = list(
                 self.db.execute(
                     select(DataSource).where(
                         DataSource.id.in_(ds_ids),
-                        ds_scope,
-                        or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == self.agent.scenario_id),
+                        DataSource.tenant_id == self.tenant_id,
+                        DataSource.resource_scope == "agent_runtime",
+                        DataSource.owner_agent_id == self.agent.id,
                     )
                 ).scalars().all()
             )
@@ -1089,6 +563,8 @@ class AgentContext:
         self.workflows: list[Any] = []
         self.mappings: list[Any] = []
         self.relation_mappings: list[Any] = []
+        self.provider_extensions: tuple[Any, ...] = ()
+        self.provider_tool_extensions: dict[str, Any] = {}
         self.capability_readiness: dict[str, dict[str, capability_readiness_service.CapabilityReadiness]] = {
             kind: {} for kind in ("function", "action", "rule", "event", "workflow")
         }
@@ -1102,7 +578,7 @@ class AgentContext:
         definition = runtime_definition_service.resolve_active(
             self.db,
             self.scenario,
-            environment=runtime_connector_service.runtime_environment(),
+            environment=self.environment,
         )
         self.runtime_definition = definition
         self.entities = list(definition.entities.values())
@@ -1206,6 +682,14 @@ class AgentContext:
             if str(mapping.source_mapping_id) in visible_mapping_ids
             and str(mapping.target_mapping_id) in visible_mapping_ids
         ]
+        self.provider_extensions = bind_agent_providers(self)
+        for extension in getattr(self, "provider_extensions", ()):
+            for tool in extension.agent_tools():
+                if tool.name in self.provider_tool_extensions:
+                    raise AgentProviderExtensionError(
+                        "Provider Agent tool name is not unique in this runtime"
+                    )
+                self.provider_tool_extensions[tool.name] = extension
 
     def _capability_status(
         self,
@@ -1220,51 +704,6 @@ class AgentContext:
             resource,
             definition=self.runtime_definition,
             db=self.db,
-        )
-
-    def _medical_audit_access_policy(
-        self,
-    ) -> medical_audit_service.MedicalAuditAccessPolicy:
-        """Resolve every medical field through the current ontology ACL.
-
-        The policy starts empty and adds only declared, currently readable
-        properties. Missing definitions therefore cannot become implicit
-        grants for this specialized query path.
-        """
-
-        allowed: set[str] = set()
-        for entity in self.entities:
-            entity_api_name = str(getattr(entity, "api_name", "") or "").strip()
-            if entity_api_name not in {"medical_charge_line", "medical_encounter"}:
-                continue
-            for prop in getattr(entity, "properties", []) or []:
-                property_api_name = str(
-                    getattr(prop, "api_name", "") or ""
-                ).strip()
-                if not property_api_name:
-                    continue
-                if permission_service.can_read_property(self.db, prop):
-                    allowed.add(f"{entity_api_name}.{property_api_name}")
-        return medical_audit_service.access_policy(sorted(allowed))
-
-    def _medical_audit_mapping_contract(
-        self,
-    ) -> medical_audit_service.MedicalAuditMappingContract:
-        """Resolve the specialized audit only through this turn's runtime mappings."""
-
-        return medical_audit_service.resolve_mapping_contract(
-            self.data_sources,
-            self.mappings,
-            definition=self.runtime_definition,
-        )
-
-    def _medical_facility_names_in_message(self, user_message: str) -> list[str]:
-        """Resolve user-stated facilities through this turn's mapping and ACL."""
-
-        return medical_audit_service.find_facility_names_in_text(
-            self._medical_audit_mapping_contract(),
-            user_message,
-            property_access=self._medical_audit_access_policy(),
         )
 
     def _rule_fields_are_visible(self, rule: Any) -> bool:
@@ -1429,23 +868,10 @@ class AgentContext:
                     },
                 ),
             ]
-        medical_audit_ready = False
-        if self.scenario and self.scenario.namespace == "medical_audit":
-            try:
-                self._medical_audit_mapping_contract()
-            except medical_audit_service.MedicalAuditError:
-                medical_audit_ready = False
-            else:
-                medical_audit_ready = True
-        if medical_audit_ready:
-            tools.append(
-                _tool(
-                    "run_medical_audit",
-                    "执行版本化、确定性的医保违规审计。只选择受控 strategy 并传业务参数；"
-                    "不能传 SQL、表名、列名或数据源 id。结果包含全量命中计数和金额、证据口径及分页游标；"
-                    "truncated=true 时保持相同参数并使用 next_offset 读取下一页。",
-                    medical_audit_service.tool_schema(),
-                )
+        for extension in getattr(self, "provider_extensions", ()):
+            tools.extend(
+                _tool(tool.name, tool.description, dict(tool.parameters))
+                for tool in extension.agent_tools()
             )
         if self.mappings:
             tools += [
@@ -1530,7 +956,7 @@ class AgentContext:
                     "query_business_data",
                     "按对象类型和本体属性完成业务数据查询。支持多个相关对象、过滤、分组、次数/金额等聚合和排序；"
                     "服务端根据当前运行定义和数据映射生成参数化查询。不能传 SQL、表名、列名或数据源 id。"
-                    "需要跨表明细、按业务对象统计或审计汇总时使用本工具。结果 truncated=true 时，"
+                    "需要跨表明细、按业务对象统计或聚合分析时使用本工具。结果 truncated=true 时，"
                     "用 next_offset 继续读取，并保持相同的稳定排序。",
                     {
                         "base_entity": {
@@ -1827,6 +1253,19 @@ class AgentContext:
                 retryable=True,
             )
         try:
+            provider_extension = getattr(
+                self, "provider_tool_extensions", {}
+            ).get(name)
+            if provider_extension is not None:
+                try:
+                    result = provider_extension.execute_agent_tool(name, args)
+                except AgentProviderToolError as exc:
+                    return _tool_error(
+                        exc.code,
+                        exc.message,
+                        retryable=exc.retryable,
+                    )
+                return result if isinstance(result, str) else _dump(result)
             if name == "list_ontology_model":
                 return _dump(
                     self._ontology_model_tool(str(args.get("entity") or ""))
@@ -1887,28 +1326,6 @@ class AgentContext:
                     ]
                     tables.append(item)
                 return _dump(tables)
-            if name == "run_medical_audit":
-                if not self.scenario or self.scenario.namespace != "medical_audit":
-                    return _tool_error(
-                        "DIRECT_TOOL_DISABLED",
-                        "run_medical_audit 仅供医保审计业务场景使用。",
-                        retryable=False,
-                    )
-                try:
-                    mapping_contract = self._medical_audit_mapping_contract()
-                    return _dump(
-                        medical_audit_service.run_medical_audit(
-                            mapping_contract,
-                            args,
-                            property_access=self._medical_audit_access_policy(),
-                        )
-                    )
-                except medical_audit_service.MedicalAuditError as exc:
-                    return _tool_error(
-                        exc.code,
-                        exc.message,
-                        retryable=exc.retryable,
-                    )
             if name == "run_sql":
                 return _tool_error(
                     "DIRECT_TOOL_DISABLED",
@@ -2958,6 +2375,20 @@ class AgentContext:
                 if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
             }
             return name in current_tools
+        provider_extension = getattr(
+            self, "provider_tool_extensions", {}
+        ).get(name)
+        if provider_extension is not None:
+            try:
+                return bool(
+                    provider_extension.authorize_historic_tool_result(
+                        name,
+                        args,
+                        result,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - replay authorization fails closed.
+                return False
         if name == "list_ontology_model":
             if not isinstance(result, dict):
                 return False
@@ -3109,19 +2540,6 @@ class AgentContext:
             except Exception:  # noqa: BLE001 - authorization is fail closed.
                 return False
             return business_query_service.authorize_historic_result(plan, result)
-        if name == "run_medical_audit":
-            if not self.scenario or self.scenario.namespace != "medical_audit":
-                return False
-            try:
-                mapping_contract = self._medical_audit_mapping_contract()
-                return medical_audit_service.authorize_historic_result(
-                    mapping_contract,
-                    args,
-                    result,
-                    property_access=self._medical_audit_access_policy(),
-                )
-            except medical_audit_service.MedicalAuditError:
-                return False
         if name == "run_sql":
             # Direct SQL is no longer an exposed Agent tool and legacy results
             # did not persist a connector revision. The UI may show the durable
@@ -3198,6 +2616,144 @@ class AgentContext:
         if name in {"search_documents", "read_document"}:
             return isinstance(result, dict)
         return False
+
+    def match_historic_capability_result(
+        self,
+        name: str,
+        args: dict[str, Any],
+        raw_result: Any,
+    ) -> LegacyCapabilityMatch | None:
+        """Prove a legacy tool call is the counterpart of one capability.
+
+        Provider aliases remain provider-owned.  The sole platform mapping is
+        the generic deterministic Function tool, where both the selected
+        resource and nested typed inputs can be verified without business
+        vocabulary.
+        """
+
+        result = self._parsed_tool_result(raw_result)
+        if result is None:
+            return None
+        provider_extension = getattr(
+            self, "provider_tool_extensions", {}
+        ).get(name)
+        if provider_extension is not None:
+            try:
+                return provider_extension.match_legacy_capability(
+                    name,
+                    args,
+                    result,
+                )
+            except Exception:  # noqa: BLE001 - compatibility proof fails closed.
+                return None
+        if name != "run_function":
+            return None
+        try:
+            function = _resource_by_reference(
+                self.functions,
+                args.get("function_id"),
+                "函数",
+            )
+        except _ToolContractError:
+            return None
+        params = args.get("params")
+        if function is None or not isinstance(params, Mapping) or not isinstance(result, dict):
+            return None
+        definition_hash = str(
+            getattr(getattr(self, "runtime_definition", None), "definition_hash", "")
+            or ""
+        )
+        if not definition_hash or str(result.get("definition_hash") or "") != definition_hash:
+            return None
+        try:
+            expected = function_runtime_service.execute_function(function, dict(params))
+        except Exception:  # noqa: BLE001 - deterministic legacy proof fails closed.
+            return None
+        normalized_result = dict(result)
+        normalized_result.pop("definition_hash", None)
+        if normalized_result != expected:
+            return None
+        return LegacyCapabilityMatch(
+            owner_key="platform.function",
+            owner_version="1",
+            capability_kind="function",
+            capability_key=str(function.id),
+            inputs=dict(params),
+            comparison_result=expected,
+        )
+
+    def normalize_capability_shadow_result(
+        self,
+        match: LegacyCapabilityMatch,
+        result: Any,
+    ) -> Any | None:
+        """Apply the same trusted compatibility contract to capability output."""
+
+        if match.owner_key == "platform.function" and match.owner_version == "1":
+            return self._parsed_tool_result(result)
+        for provider_extension in getattr(self, "provider_extensions", ()):
+            if (
+                provider_extension.provider_key != match.owner_key
+                or provider_extension.provider_version != match.owner_version
+            ):
+                continue
+            try:
+                return provider_extension.normalize_capability_shadow_result(
+                    match,
+                    result,
+                )
+            except Exception:  # noqa: BLE001 - compatibility proof fails closed.
+                return None
+        return None
+
+    def verify_shadow_data_context(
+        self,
+        match: LegacyCapabilityMatch,
+        data_context: RuntimeDataContext,
+    ) -> str | None:
+        """Prove legacy and capability execution resolved the same data."""
+
+        if not isinstance(data_context, RuntimeDataContext):
+            return None
+        if match.owner_key == "platform.function" and match.owner_version == "1":
+            # The generic deterministic Function runtime has no managed-data
+            # adapter.  Any handle would therefore be consumed by capability
+            # execution only and cannot be claimed equivalent to legacy.
+            if data_context.handles:
+                return None
+            return canonical_hash(
+                {
+                    "contract": "platform-function-shadow-data-equivalence/v1",
+                    "capability_kind": match.capability_kind,
+                    "capability_key": match.capability_key,
+                    "definition_hash": str(
+                        getattr(
+                            getattr(self, "runtime_definition", None),
+                            "definition_hash",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "runtime_data_context_fingerprint": data_context.fingerprint,
+                },
+                domain="provider-shadow-data-equivalence-v1",
+            )
+        for provider_extension in getattr(self, "provider_extensions", ()):
+            if (
+                provider_extension.provider_key != match.owner_key
+                or provider_extension.provider_version != match.owner_version
+            ):
+                continue
+            try:
+                proof = provider_extension.verify_shadow_data_context(
+                    match,
+                    data_context,
+                )
+            except Exception:  # noqa: BLE001 - data proof fails closed.
+                return None
+            value = str(proof or "").strip().casefold()
+            return value if re.fullmatch(r"[0-9a-f]{64}", value) else None
+        return None
 
     def _read_doc(self, file_id: str = "", filename: str = "") -> str:
         """读取资料库全文时附带可持久化引用，避免全文工具绕过引用审计。"""
@@ -3369,7 +2925,7 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
         if ctx.mappings:
             parts.append(
                 "简单的单对象查询优先使用 query_mapped_objects，按对象类型和本体属性传入结构化条件；"
-                "涉及跨对象关联、分组、去重或聚合审计时使用 query_business_data。"
+                "涉及跨对象关联、分组、去重或聚合分析时使用 query_business_data。"
                 "所有查询参数都使用对象类型和本体属性，不要编写 SQL 或传递物理表/列名。"
             )
         if any(source.type == "file_bucket" for source in ctx.data_sources):
@@ -3453,7 +3009,7 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
         "涉及数据时务必基于工具返回的真实数据，不要编造；无法确认时明确说明数据缺口。"
         "如果场景定义了本体、映射、函数、操作、规则、事件或工作流，优先使用这些业务抽象来完成任务。"
         "需要确认本体字段时，先无参数调用 list_ontology_model 发现对象，再用 entity 精确读取目标对象的完整属性和相关关系。"
-        "用户在当前请求中明确给出的对象、范围、条件和阈值，就是本次审计的有效规则；"
+        "用户在当前请求中明确给出的对象、范围、条件和阈值，就是当前请求的有效约束；"
         "可以用规则目录补充解释，但不能因为目录中没有同名规则而拒绝按用户条件查询。"
     )
     parts.append(
@@ -3463,7 +3019,7 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
         "不要把明细属性和聚合混在一个不完整的分组查询里。跨对象查询优先使用已配置的数据关系映射，"
         "没有可验证的关系或用户要求的维度未映射时，明确指出配置缺口并停止猜测。"
         "首页查询（offset 为 0）成功且 row_count=0（或 empty=true）表示该数据范围内没有命中记录："
-        "必须明确回答‘在该范围内未发现违规’，不得把合法的零行结果说成缺少数据、缺少规则或执行失败；"
+        "必须明确回答‘在该范围内未发现匹配记录’，不得把合法的零行结果说成缺少数据、缺少规则或执行失败；"
         "后续页 offset>0 且 row_count=0 只表示分页结束。只有结构化 error 才表示工具失败。"
     )
     parts.append(
@@ -3477,10 +3033,10 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
         "发现资源和准确 schema，再把 list 返回的 id、api_name 或 name 传给执行工具；不得向用户索要内部 ID。\n"
         "若工具返回 retryable=true 的结构化 schema/参数错误，应依据 error.message 或 list_* 返回的 schema 修正参数，"
         "最多重试一次且不得原样重复；retryable=false 时停止重试并说明阻塞点。\n"
-        "凡用户要求报告、附注、财务报表或其他附件交付，必须先调用 list_actions，找到相应的模板执行器操作，"
+        "凡用户要求报告、附注、结构化附件或其他文件交付，必须先调用 list_actions，找到相应的模板执行器操作，"
         "再按每个操作的 input_schema 实际调用 execute_action 生成可确认预演；不得只写一段 Markdown、伪造下载链接或声称附件已生成。"
         "如果没有已就绪的模板操作，要明确指出缺少哪类模板操作。\n"
-        "涉及审计、排查或核验时，最终结果必须包含：判断依据、数据范围、明细或明确的无结果说明、"
+        "用户要求可验证结论时，最终结果必须包含：判断依据、数据范围、明细或明确的无结果说明、"
         "统计汇总、证据引用、数据限制和结论。若无法完成，必须明确指出缺少哪个字段、映射或能力，"
         "并停止继续猜测。"
     )
@@ -3591,23 +3147,10 @@ def _run_agent(
     if ctx.db is not db or ctx.agent.id != agent.id:
         raise RuntimeError("Agent 运行上下文与当前对话不匹配")
     ctx.llm = llm
-    controlled_medical_audit = bool(
-        ctx.scenario and ctx.scenario.namespace == "medical_audit"
+    prepared_grounding = _prepare_provider_grounding(
+        getattr(ctx, "provider_extensions", ()),
+        user_message,
     )
-    authoritative_medical_facilities: list[str] = []
-    medical_facility_lookup_succeeded: bool | None = None
-    if controlled_medical_audit and any(
-        term in user_message for term in _AUDIT_INTENT_TERMS
-    ):
-        try:
-            authoritative_medical_facilities = (
-                ctx._medical_facility_names_in_message(user_message)
-            )
-            medical_facility_lookup_succeeded = True
-        except Exception:
-            # Contract, schema, connection and property ACL failures must all
-            # prevent deterministic evidence from being presented as verified.
-            medical_facility_lookup_succeeded = False
     # The router's summary is a presentation optimisation only. The actual
     # prompt must be rebuilt from this turn's resolved runtime definition so a
     # staging/prod Agent cannot inherit mutable live ontology text.
@@ -3681,9 +3224,11 @@ def _run_agent(
                 content,
                 user_message=user_message,
                 tool_outcomes=tool_outcomes,
-                controlled_medical_audit=controlled_medical_audit,
-                authoritative_medical_facilities=authoritative_medical_facilities,
-                medical_facility_lookup_succeeded=medical_facility_lookup_succeeded,
+                grounding_results=_provider_grounding_results(
+                    prepared_grounding,
+                    user_message=user_message,
+                    tool_outcomes=tool_outcomes,
+                ),
             )
             if ctx.citations:
                 yield {"type": "citations", "data": ctx.citation_snapshot()}
@@ -3799,9 +3344,11 @@ def _run_agent(
         untrusted_final_content,
         user_message=user_message,
         tool_outcomes=tool_outcomes,
-        controlled_medical_audit=controlled_medical_audit,
-        authoritative_medical_facilities=authoritative_medical_facilities,
-        medical_facility_lookup_succeeded=medical_facility_lookup_succeeded,
+        grounding_results=_provider_grounding_results(
+            prepared_grounding,
+            user_message=user_message,
+            tool_outcomes=tool_outcomes,
+        ),
     )
     if final_parts:
         for part in final_parts:
@@ -3849,6 +3396,10 @@ def run_agent(
         "model_name": llm.model or "",
     }
     try:
+        capability_loop = getattr(runtime_context, "run_agent", None)
+        if callable(capability_loop):
+            yield from capability_loop(history, user_message)
+            return
         yield from _run_agent(
             db,
             agent,

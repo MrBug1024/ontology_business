@@ -37,7 +37,7 @@
       </div>
 
       <nav class="side-nav" aria-label="主导航">
-        <div class="nav-label">核心流程</div>
+        <div class="nav-label">能力生命周期</div>
         <el-menu
           :default-active="activeRoute"
           router
@@ -47,13 +47,13 @@
           active-text-color="var(--sidebar-title)"
           @select="sidebarOpen = false"
         >
-          <el-menu-item index="/scenarios"><el-icon aria-hidden="true"><OfficeBuilding /></el-icon><span>业务场景</span></el-menu-item>
-          <el-menu-item index="/data-sources"><el-icon aria-hidden="true"><Coin /></el-icon><span>数据源</span></el-menu-item>
-          <el-menu-item index="/templates"><el-icon aria-hidden="true"><Files /></el-icon><span>模板中心</span></el-menu-item>
-          <el-menu-item index="/agents"><el-icon aria-hidden="true"><Cpu /></el-icon><span>Agent</span></el-menu-item>
+          <el-menu-item index="/scenarios"><el-icon aria-hidden="true"><OfficeBuilding /></el-icon><span>场景能力</span></el-menu-item>
+          <el-menu-item index="/data-sources"><el-icon aria-hidden="true"><Coin /></el-icon><span>建模资料</span></el-menu-item>
+          <el-menu-item index="/agents"><el-icon aria-hidden="true"><Cpu /></el-icon><span>验证中心</span></el-menu-item>
+          <el-menu-item index="/access"><el-icon aria-hidden="true"><Connection /></el-icon><span>发布与接入</span></el-menu-item>
         </el-menu>
 
-        <div class="nav-label">运行</div>
+        <div class="nav-label">运行控制</div>
         <el-menu
           :default-active="activeRoute"
           router
@@ -63,10 +63,10 @@
           active-text-color="var(--sidebar-title)"
           @select="sidebarOpen = false"
         >
-          <el-menu-item index="/tasks"><el-icon aria-hidden="true"><List /></el-icon><span>任务中心</span></el-menu-item>
+          <el-menu-item index="/tasks"><el-icon aria-hidden="true"><List /></el-icon><span>运行治理</span></el-menu-item>
         </el-menu>
 
-        <div class="nav-label">系统设置</div>
+        <div class="nav-label">平台管理</div>
         <el-menu
           :default-active="activeRoute"
           router
@@ -77,7 +77,8 @@
           @select="sidebarOpen = false"
         >
           <el-sub-menu index="settings">
-            <template #title><el-icon aria-hidden="true"><Setting /></el-icon><span>能力配置</span></template>
+            <template #title><el-icon aria-hidden="true"><Setting /></el-icon><span>平台配置</span></template>
+            <el-menu-item index="/templates">产物模板</el-menu-item>
             <el-menu-item index="/llm">大模型</el-menu-item>
             <el-menu-item index="/mcp">外部工具</el-menu-item>
             <el-menu-item index="/skills">本地技能</el-menu-item>
@@ -150,6 +151,7 @@ const theme = ref<'light' | 'dark'>((localStorage.getItem('ontology-theme') as '
 const activeRoute = computed(() => {
   if (route.path.startsWith('/scenarios')) return '/scenarios'
   if (route.path.startsWith('/agents')) return '/agents'
+  if (route.path.startsWith('/access')) return '/access'
   return route.path
 })
 const pageTitle = computed(() => String(route.meta.title || '业务场景'))

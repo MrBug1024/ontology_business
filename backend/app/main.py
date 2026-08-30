@@ -13,18 +13,23 @@ from sqlalchemy import text
 
 from .config import get_settings
 from .database import engine, init_db
+from .request_body_limit import RequestBodyLimitMiddleware
 from . import agent_mcp_server
 from .routers import (
     agent_mcp,
     agents,
     assistant,
+    capability_access,
     auth,
+    catalog,
     data_sources,
     external_api,
+    external_capabilities,
     functions,
     llm_configs,
     mcp,
     operations,
+    platform_migrations,
     scenarios,
     skills,
     templates,
@@ -79,6 +84,7 @@ async def lifespan(_: FastAPI):
     try:
         permission_service.bootstrap_authorization(db)
         operations_service.purge_expired_assistant_attachments(db)
+        operations_service.purge_expired_catalog_attachments(db)
         db.commit()
         skill_service.sync_skills_to_db(db)
     finally:
@@ -111,6 +117,14 @@ settings = get_settings()
 app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=lifespan)
 
 app.add_middleware(
+    RequestBodyLimitMiddleware,
+    max_body_bytes=settings.max_upload_bytes + 1024 * 1024,
+    paths={
+        f"{settings.api_prefix}/catalog/uploads",
+        f"{settings.api_prefix}/external/v2/assets/upload",
+    },
+)
+app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=True,
@@ -121,17 +135,22 @@ app.add_middleware(
 app.include_router(scenarios.router, prefix=settings.api_prefix)
 app.include_router(auth.router, prefix=settings.api_prefix)
 app.include_router(data_sources.router, prefix=settings.api_prefix)
+app.include_router(catalog.router, prefix=settings.api_prefix)
+app.include_router(catalog.scenario_router, prefix=settings.api_prefix)
 app.include_router(llm_configs.router, prefix=settings.api_prefix)
 app.include_router(skills.router, prefix=settings.api_prefix)
 app.include_router(templates.router, prefix=settings.api_prefix)
 app.include_router(mcp.router, prefix=settings.api_prefix)
 app.include_router(agents.router, prefix=settings.api_prefix)
+app.include_router(platform_migrations.router, prefix=settings.api_prefix)
 app.include_router(assistant.router, prefix=settings.api_prefix)
 app.include_router(operations.router, prefix=settings.api_prefix)
 app.include_router(operations.operations_router, prefix=settings.api_prefix)
 app.include_router(functions.router, prefix=settings.api_prefix)
 app.include_router(external_api.management_router, prefix=settings.api_prefix)
 app.include_router(external_api.router, prefix=settings.api_prefix)
+app.include_router(external_capabilities.router, prefix=settings.api_prefix)
+app.include_router(capability_access.router, prefix=settings.api_prefix)
 app.include_router(agent_mcp.router, prefix=settings.api_prefix)
 
 

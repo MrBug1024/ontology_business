@@ -223,6 +223,7 @@ class AgentCapabilityScopeTests(unittest.TestCase):
         )
         created = self.db.get(Agent, created_out.id)
         self.assertEqual(created.capability_scope, agent_capability_service.explicit_empty_scope())
+        self.assertEqual(created.runtime_binding_mode, "capability_only")
         self.assertFalse(created_out.capability_scope_legacy)
         created_context = self._context(created)
         self.assertEqual(created_context.functions, [])
@@ -249,6 +250,21 @@ class AgentCapabilityScopeTests(unittest.TestCase):
             {item.id for item in self._context(self.legacy_agent).functions},
             {self.function_a.id, self.function_b.id},
         )
+
+    def test_new_agent_default_can_be_rolled_back_without_rewriting_existing_rows(self) -> None:
+        with patch.object(
+            agents_router,
+            "get_settings",
+            return_value=SimpleNamespace(new_agent_runtime_binding_mode="legacy"),
+        ):
+            created_out = agents_router.create_agent(
+                AgentIn(name="回退模式 Agent", scenario_id=self.scenario.id),
+                self.db,
+            )
+
+        created = self.db.get(Agent, created_out.id)
+        self.assertEqual(created.runtime_binding_mode, "legacy")
+        self.assertEqual(self.legacy_agent.runtime_binding_mode, "legacy")
 
     def test_unrelated_edit_freezes_legacy_scope_without_losing_capabilities(self) -> None:
         updated = agents_router.update_agent(

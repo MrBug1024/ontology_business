@@ -271,7 +271,7 @@ def test_entity_conceptual_mapping_resolve_uses_immutable_kind_and_identity() ->
             tenant_id=tenant.id,
             scenario_id=scenario.id,
             name="Entity source",
-            type="sqlite",
+            type="postgres",
             config={},
         )
         other_source = DataSource(
@@ -279,7 +279,7 @@ def test_entity_conceptual_mapping_resolve_uses_immutable_kind_and_identity() ->
             tenant_id=tenant.id,
             scenario_id=other_scenario.id,
             name="Other source",
-            type="sqlite",
+            type="postgres",
             config={},
         )
         entity = OntologyEntity(
@@ -388,7 +388,7 @@ def test_relation_conceptual_mapping_resolve_validates_relation_identity() -> No
             tenant_id=tenant.id,
             scenario_id=scenario.id,
             name="Relation source",
-            type="sqlite",
+            type="postgres",
             config={},
         )
         project = OntologyEntity(

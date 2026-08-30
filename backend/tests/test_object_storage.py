@@ -476,6 +476,23 @@ class ObjectStorageTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["text"], "年度凭证")
 
+    def test_legacy_text_only_attachment_has_no_managed_object(self) -> None:
+        attachment = AssistantAttachment(
+            id="a" * 32,
+            tenant_id="tenant-a",
+            filename="历史说明.md",
+            storage_provider="minio",
+            bucket_name="",
+            object_key="",
+            object_url="",
+            parsed_text="历史解析文本",
+            status="parsed",
+        )
+
+        self.assertIsNone(
+            datasource_service.assistant_attachment_object_identity(attachment)
+        )
+
     def test_assistant_attachment_uses_managed_object_identity(self) -> None:
         attachment = AssistantAttachment(
             id="b" * 32,

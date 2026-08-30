@@ -19,6 +19,7 @@ from app.database import Base, get_db
 from app.models import (
     Agent,
     AssistantAttachment,
+    AssistantMessage,
     AssistantThread,
     AuthSession,
     AuthorizationGrant,
@@ -954,6 +955,106 @@ class SecurityAclRegressionTests(unittest.TestCase):
         try:
             thread = db.get(AssistantThread, created.json()["id"])
             self.assertEqual(thread.created_by_user_id, self.viewer.id)
+        finally:
+            db.close()
+
+    def test_retired_scenario_keeps_history_but_blocks_new_agent_and_assistant_writes(self) -> None:
+        scenario_path = f"/scenarios/{self.scenario.id}"
+        scenario_thread = AssistantThread(
+            id="assistant-thread-retired-history",
+            tenant_id=self.tenant.id,
+            created_by_user_id=self.owner.id,
+            scenario_id=self.scenario.id,
+            scope_key=f"scenario:{self.scenario.id}|path:{scenario_path}",
+            title="退役前顾问历史",
+        )
+        historic_message = AssistantMessage(
+            id="assistant-message-retired-history",
+            thread_id=scenario_thread.id,
+            role="assistant",
+            content="退役前形成的历史结论",
+        )
+        db = self.Session()
+        try:
+            db.add_all([scenario_thread, historic_message])
+            db.commit()
+        finally:
+            db.close()
+
+        self._as_viewer()
+        forbidden_withdrawal = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/releases/staging/withdraw",
+            json={"confirmed": True, "reason": "viewer 不得执行"},
+        )
+        self.assertEqual(
+            forbidden_withdrawal.status_code,
+            403,
+            forbidden_withdrawal.text,
+        )
+
+        self.current_user_id = self.owner.id
+        retired = self.client.delete(f"/api/scenarios/{self.scenario.id}")
+        self.assertEqual(retired.status_code, 200, retired.text)
+
+        agent_history = self.client.get(
+            f"/api/agents/conversations/{self.conversation.id}/messages"
+        )
+        self.assertEqual(agent_history.status_code, 200, agent_history.text)
+        assistant_history = self.client.get(
+            f"/api/assistant/threads/{scenario_thread.id}/messages"
+            f"?scenario_id={self.scenario.id}&path={scenario_path}"
+        )
+        self.assertEqual(assistant_history.status_code, 200, assistant_history.text)
+        self.assertEqual(
+            [item["content"] for item in assistant_history.json()],
+            ["退役前形成的历史结论"],
+        )
+
+        blocked_requests = (
+            self.client.post(f"/api/agents/{self.agent.id}/conversations"),
+            self.client.post(
+                f"/api/agents/{self.agent.id}/chat",
+                json={"message": "退役后不得新增 Agent 消息"},
+            ),
+            self.client.post(
+                f"/api/assistant/threads?scenario_id={self.scenario.id}"
+                f"&path={scenario_path}"
+            ),
+            self.client.post(
+                "/api/assistant/chat",
+                json={
+                    "message": "退役后不得新增顾问消息",
+                    "scenario_id": self.scenario.id,
+                    "path": scenario_path,
+                },
+            ),
+        )
+        for response in blocked_requests:
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn("已退役", response.text)
+
+        deleted_agent_history = self.client.delete(
+            f"/api/agents/conversations/{self.conversation.id}"
+        )
+        self.assertEqual(
+            deleted_agent_history.status_code,
+            200,
+            deleted_agent_history.text,
+        )
+        deleted_assistant_history = self.client.delete(
+            f"/api/assistant/threads/{scenario_thread.id}"
+            f"?scenario_id={self.scenario.id}&path={scenario_path}"
+        )
+        self.assertEqual(
+            deleted_assistant_history.status_code,
+            200,
+            deleted_assistant_history.text,
+        )
+
+        db = self.Session()
+        try:
+            self.assertIsNone(db.get(Conversation, self.conversation.id))
+            self.assertIsNone(db.get(AssistantThread, scenario_thread.id))
         finally:
             db.close()
 

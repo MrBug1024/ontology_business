@@ -571,7 +571,9 @@ def enqueue_mapping_refresh(
     else:
         requested_by_user_id = permission_service.require_principal(db).user_id
 
-    environment = runtime_connector_service.runtime_environment()
+    # Mapping refresh from the modeling/control plane always targets the live
+    # authoring definition, regardless of where this server process is hosted.
+    environment = "dev"
     runtime_mapping, definition = resolve_mapping_runtime_definition(
         db,
         scenario,
@@ -759,12 +761,10 @@ def _job_context(
 
 
 def expire_stale_mapping_refresh_jobs(db: Session, *, now: datetime | None = None) -> None:
-    """Only the matching deployment environment may reclaim its stalled jobs."""
+    """Reclaim stalled jobs using each job's persisted environment."""
     now = now or utc_now()
-    environment = runtime_connector_service.runtime_environment()
     jobs = db.execute(
         select(DataMappingRefreshJob).where(
-            DataMappingRefreshJob.environment == environment,
             DataMappingRefreshJob.status == "running",
         )
     ).scalars().all()
@@ -807,8 +807,6 @@ def resolve_mapping_data_source(
 def _claimed_job_context(
     db: Session,
     job_id: str,
-    *,
-    deployment_environment: str,
 ) -> tuple[DataMappingRefreshJob | None, BusinessScenario | None, DataMapping | None, str | None]:
     """Reload ownership after external I/O before committing imported objects.
 
@@ -821,8 +819,6 @@ def _claimed_job_context(
     job = db.get(DataMappingRefreshJob, job_id, populate_existing=True)
     if job is None:
         return None, None, None, "映射刷新任务已删除"
-    if job.environment != deployment_environment:
-        return job, None, None, "映射刷新任务不属于当前部署环境"
     if job.status != "running":
         return job, None, None, "映射刷新任务已取消或不再可提交"
     scenario, mapping, reason = _job_context(db, job)
@@ -837,11 +833,9 @@ def process_mapping_refresh_jobs(
 ) -> list[DataMappingRefreshJob]:
     """Atomically claim and process a bounded number of mapping refresh jobs."""
     dispatch_now = now or utc_now()
-    deployment_environment = runtime_connector_service.runtime_environment()
     job_ids = db.execute(
         select(DataMappingRefreshJob.id)
         .where(
-            DataMappingRefreshJob.environment == deployment_environment,
             DataMappingRefreshJob.status.in_(DISPATCHABLE_STATUSES),
             DataMappingRefreshJob.available_at <= dispatch_now,
         )
@@ -858,7 +852,6 @@ def process_mapping_refresh_jobs(
             update(DataMappingRefreshJob)
             .where(
                 DataMappingRefreshJob.id == job_id,
-                DataMappingRefreshJob.environment == deployment_environment,
                 DataMappingRefreshJob.status.in_(DISPATCHABLE_STATUSES),
                 DataMappingRefreshJob.available_at <= claim_now,
             )
@@ -1002,7 +995,6 @@ def process_mapping_refresh_jobs(
                 current, _scenario, current_mapping, current_reason = _claimed_job_context(
                     db,
                     job_id,
-                    deployment_environment=deployment_environment,
                 )
                 if current is not None and current.status in ACTIVE_STATUSES:
                     if current_reason:
@@ -1026,7 +1018,6 @@ def process_mapping_refresh_jobs(
                 current, _current_scenario, current_mapping, current_reason = _claimed_job_context(
                     db,
                     job_id,
-                    deployment_environment=deployment_environment,
                 )
                 if current_reason:
                     raise PolicyViolation(current_reason)

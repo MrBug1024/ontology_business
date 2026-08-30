@@ -3,20 +3,27 @@
     <div class="page-header">
       <div>
         <h1>MCP 服务</h1>
-        <div class="sub">{{ activeSection === 'connected' ? '接入外部工具服务，供操作和工作流调用' : '把已验证 Agent 发布为第三方可直接调用的 MCP 服务' }}</div>
+        <div class="sub">管理由平台操作和工作流调用的外部 MCP 工具；平台能力对外发布统一在“发布与接入”完成</div>
       </div>
-      <div v-if="canManage && activeSection === 'connected'" class="page-actions">
-        <el-button plain @click="openImport"><el-icon><DocumentAdd /></el-icon> 导入 mcpServers 配置</el-button>
-        <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
+      <div class="page-actions">
+        <el-button plain @click="router.push({ name: 'capability-access' })"><el-icon><Promotion /></el-icon> 前往发布与接入</el-button>
+        <template v-if="canManage">
+          <el-button plain @click="openImport"><el-icon><DocumentAdd /></el-icon> 导入 mcpServers 配置</el-button>
+          <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建 MCP</el-button>
+        </template>
       </div>
     </div>
 
-    <el-tabs v-model="activeSection" class="mcp-sections">
-      <el-tab-pane label="接入的 MCP" name="connected" />
-      <el-tab-pane label="Agent 发布" name="published" />
-    </el-tabs>
+    <el-alert
+      class="readonly-notice"
+      type="info"
+      :closable="false"
+      show-icon
+      title="这里是平台调用的外部工具，不是能力发布入口"
+      description="REST、Capability MCP、集成密钥和发布清单请前往“发布与接入”。"
+    />
 
-    <section v-if="activeSection === 'connected'">
+    <section>
 
     <el-alert
       v-if="!canManage"
@@ -62,8 +69,6 @@
       </div>
     </div>
     </section>
-
-    <AgentMCPPublications v-else :can-manage="canManage" />
 
     <el-dialog v-if="canManage" v-model="dlg" :title="form.id ? '编辑 MCP' : '新建 MCP'" width="min(720px, 94vw)" @closed="clearFormErrors">
       <div v-if="formError" ref="formErrorRef" class="form-error-summary" role="alert" tabindex="-1">
@@ -201,12 +206,12 @@
 
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 import type { MCPConfig, MCPImportResult, MCPTool } from '@/types'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
-import AgentMCPPublications from '@/components/AgentMCPPublications.vue'
 import { parseStandardMCPConfig } from '@/utils/mcpConfig'
 
 type MCPForm = {
@@ -222,8 +227,8 @@ type MCPForm = {
 }
 
 const auth = useAuthStore()
+const router = useRouter()
 const canManage = computed(() => auth.user?.can_manage === true)
-const activeSection = ref<'connected' | 'published'>('connected')
 const mcps = ref<(MCPConfig & { _testing?: boolean })[]>([])
 const dlg = ref(false)
 const saving = ref(false)

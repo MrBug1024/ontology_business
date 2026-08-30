@@ -121,8 +121,8 @@ class TestOntologyEntityLifecycleRuntime:
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="生命周期测试源",
-            type="sqlite",
-            config={"path": "unused.db"},
+            type="postgres",
+            config={},
         )
         self.active_mapping = DataMapping(
             id="mapping-active",

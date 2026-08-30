@@ -15,7 +15,15 @@ from ..models import Organization, OrganizationMember, User
 from . import permission_service
 
 
-SUPPORTED_SCOPES = frozenset({"scenarios:read", "objects:read"})
+SUPPORTED_SCOPES = frozenset(
+    {
+        "scenarios:read",
+        "objects:read",
+        "capabilities:read",
+        "capabilities:invoke",
+        "assets:write",
+    }
+)
 _KEY_HASH_DOMAIN = b"ontology-platform/external-api-key/v1\0"
 
 
@@ -184,9 +192,10 @@ def _invalid_key() -> HTTPException:
     )
 
 
-def authenticate(request: Request, db: Session) -> ExternalApiContext:
-    """Authenticate strictly from ``X-API-Key``; never fall back to a cookie."""
-    raw_token = request.headers.get("X-API-Key", "").strip()
+def authenticate_token(raw_token: str, db: Session) -> ExternalApiContext:
+    """Authenticate one raw external key in an already-owned DB session."""
+
+    raw_token = str(raw_token or "").strip()
     if not raw_token or len(raw_token) > 512:
         raise _invalid_key()
     now = utc_now()
@@ -235,6 +244,12 @@ def authenticate(request: Request, db: Session) -> ExternalApiContext:
         scopes=scopes,
         expires_at=key.expires_at,
     )
+
+
+def authenticate(request: Request, db: Session) -> ExternalApiContext:
+    """Authenticate strictly from ``X-API-Key``; never fall back to a cookie."""
+
+    return authenticate_token(request.headers.get("X-API-Key", ""), db)
 
 
 def require_scope(context: ExternalApiContext, scope: str) -> None:

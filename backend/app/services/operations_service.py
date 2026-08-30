@@ -10,12 +10,17 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models import (
     AssistantAttachment,
+    BucketFile,
     BusinessScenario,
+    DataAsset,
+    DataAssetVersion,
+    DataSource,
     EventEnvelope,
     OntologyEvent,
     OntologyWorkflow,
@@ -29,6 +34,7 @@ from . import (
     permission_service,
     runtime_connector_service,
     runtime_definition_service,
+    workflow_payload_service,
 )
 from .policies import PolicyViolation, validate_action_params
 
@@ -280,7 +286,7 @@ def _definition_for_workflow(
     resolved = definition or runtime_definition_service.resolve_active(
         db,
         scenario,
-        environment=runtime_connector_service.runtime_environment(),
+        environment="dev",
     )
     if resolved.scenario.id != scenario.id:
         raise PolicyViolation("运行定义不属于工作流业务场景")
@@ -553,12 +559,15 @@ def enqueue_workflow_run(
     creator_id = _creator_for_enqueue(db, created_by_user_id)
     now = utc_now()
     run = WorkflowRun(
+        id=uuid4().hex,
         scenario_id=workflow.scenario_id,
         workflow_id=workflow.id,
         trigger_source=trigger_source,
         event_envelope_id=event_envelope_id,
         dedupe_key=scoped_dedupe_key,
-        input_params=dict(params or {}),
+        input_payload={},
+        input_summary={},
+        input_digest="",
         environment=definition.environment,
         definition_snapshot_id=definition.snapshot_id,
         release_id=definition.release_id,
@@ -571,6 +580,9 @@ def enqueue_workflow_run(
         scheduled_for=scheduled_for,
         created_by_user_id=creator_id,
     )
+    # Seal before the ORM sees the row.  Missing key configuration, malformed
+    # JSON or any crypto error therefore leaves no plaintext queue record.
+    workflow_payload_service.seal_workflow_run_input(run, dict(params or {}))
     db.add(run)
     db.flush()
     # The primary key is now available.  Retain it for every automatic retry;
@@ -598,7 +610,7 @@ def publish_event(
     definition = runtime_definition or runtime_definition_service.resolve_active(
         db,
         scenario,
-        environment=runtime_connector_service.runtime_environment(),
+        environment="dev",
     )
     if definition.scenario.id != scenario.id:
         raise PolicyViolation("运行定义不属于事件业务场景")
@@ -741,9 +753,8 @@ def _event_in_causation_chain(db: Session, source_run_id: str, event_id: str) ->
 def enqueue_due_schedules(db: Session, *, now: datetime | None = None) -> list[WorkflowRun]:
     """扫描启用的 interval 定时工作流，并将到期运行写入持久化队列。"""
     now = now or utc_now()
-    deployment_environment = runtime_connector_service.runtime_environment()
     definitions = runtime_definition_service.active_definitions(
-        db, environment=deployment_environment
+        db, environment="dev"
     )
     queued: list[WorkflowRun] = []
     for definition in definitions:
@@ -898,17 +909,11 @@ def _ensure_approval_request(db: Session, run: WorkflowRun, waiting_step: dict[s
 def process_available_runs(db: Session, *, now: datetime | None = None, limit: int = 8) -> list[WorkflowRun]:
     """同步处理少量已到期队列项；由 lifespan 中的后台循环调用。"""
     now = now or utc_now()
-    deployment_environment = runtime_connector_service.runtime_environment()
     run_ids = db.execute(
         select(WorkflowRun.id)
         .where(
             WorkflowRun.status.in_(DISPATCHABLE_RUN_STATUSES),
             WorkflowRun.available_at <= now,
-            # A shared queue may be served by multiple deployment environments.
-            # Never claim another environment's work; its matching worker must
-            # process it, and legacy runs without an environment are quarantined
-            # by the database migration instead of falling back to dev.
-            WorkflowRun.environment == deployment_environment,
         )
         .order_by(WorkflowRun.available_at.asc(), WorkflowRun.created_at.asc())
         .limit(max(1, min(limit, 32)))
@@ -920,7 +925,6 @@ def process_available_runs(db: Session, *, now: datetime | None = None, limit: i
             not run
             or run.status not in DISPATCHABLE_RUN_STATUSES
             or _aware(run.available_at) > now
-            or run.environment != deployment_environment
         ):
             continue
         try:
@@ -987,7 +991,6 @@ def process_available_runs(db: Session, *, now: datetime | None = None, limit: i
                 WorkflowRun.id == run_id,
                 WorkflowRun.status.in_(DISPATCHABLE_RUN_STATUSES),
                 WorkflowRun.available_at <= now,
-                WorkflowRun.environment == deployment_environment,
             )
             .values(**claim_values)
             # 数据库返回的时间值统一由 ORM 在内存中与 utc_now() 比较；
@@ -1014,10 +1017,11 @@ def process_available_runs(db: Session, *, now: datetime | None = None, limit: i
                 scenario,
                 requested_user_id=run.created_by_user_id,
             ):
+                workflow_inputs = workflow_payload_service.open_workflow_run_input(run)
                 result = workflow_service.execute_workflow(
                     db,
                     workflow,
-                    run.input_params or {},
+                    workflow_inputs,
                     execution_id=run.execution_key or run.id,
                     approved_node_ids=set(run.approved_node_ids or []),
                     attempt=max(1, run.attempt),
@@ -1029,6 +1033,7 @@ def process_available_runs(db: Session, *, now: datetime | None = None, limit: i
                     # value as a request-controlled environment selector.
                     runtime_environment=runtime_connector_service.runtime_environment(run.environment),
                     runtime_definition=definition,
+                    audit_input_params=workflow_payload_service.public_input_summary(run),
                 )
         except Exception as exc:  # noqa: BLE001
             result = {"status": "failed", "steps": [], "error": str(exc), "duration_ms": 0}
@@ -1398,6 +1403,128 @@ def purge_expired_assistant_attachments(
     return len(expired)
 
 
+def purge_expired_catalog_attachments(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    limit: int = 200,
+) -> int:
+    """Detach expired temporary payloads while retaining logical audit ids."""
+    cutoff = now or utc_now()
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    bounded_limit = max(1, min(int(limit), 1000))
+    lifecycle = DataAssetVersion.version_document["lifecycle"]
+    candidate_ids = list(
+        db.scalars(
+            select(DataAssetVersion.id)
+            .join(DataAsset, DataAsset.id == DataAssetVersion.asset_id)
+            .where(
+                DataAssetVersion.status == "ready",
+                DataAssetVersion.bucket_file_id.is_not(None),
+                lifecycle["purpose"].as_string() == "invocation_attachment",
+                lifecycle["temporary"].as_boolean().is_(True),
+                lifecycle["expires_at"].as_string() <= cutoff.isoformat(),
+            )
+            .order_by(DataAssetVersion.created_at, DataAssetVersion.id)
+            .limit(bounded_limit)
+        ).all()
+    )
+    purged = 0
+    postgresql = db.get_bind().dialect.name == "postgresql"
+    for version_id in candidate_ids:
+        try:
+            with db.begin_nested():
+                version_statement = select(DataAssetVersion).where(
+                    DataAssetVersion.id == version_id,
+                    DataAssetVersion.status == "ready",
+                )
+                if not postgresql:
+                    version_statement = version_statement.with_for_update(
+                        skip_locked=True
+                    )
+                version = db.scalar(version_statement)
+                if version is None or not version.bucket_file_id:
+                    continue
+                document = dict(version.version_document or {})
+                version_lifecycle = dict(document.get("lifecycle") or {})
+                raw_expires_at = str(version_lifecycle.get("expires_at") or "")
+                try:
+                    expires_at = datetime.fromisoformat(
+                        raw_expires_at.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    continue
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if (
+                    version_lifecycle.get("purpose") != "invocation_attachment"
+                    or version_lifecycle.get("temporary") is not True
+                    or expires_at > cutoff
+                ):
+                    continue
+                asset = db.scalar(
+                    select(DataAsset)
+                    .where(DataAsset.id == version.asset_id)
+                )
+                if asset is None or asset.tenant_id != version.tenant_id:
+                    continue
+
+                expected_file_id = version.bucket_file_id
+                expected_source_id = version.bucket_data_source_id
+                if postgresql:
+                    detached = db.execute(
+                        text(
+                            "SELECT detached_bucket_file_id, detached_source_id "
+                            "FROM public.detach_expired_catalog_asset_blob(:version_id)"
+                        ),
+                        {"version_id": version.id},
+                    ).one_or_none()
+                    if detached is None:
+                        continue
+                    detached_file_id = str(detached.detached_bucket_file_id or "")
+                    detached_source_id = str(detached.detached_source_id or "")
+                    if (
+                        detached_file_id != expected_file_id
+                        or detached_source_id != expected_source_id
+                    ):
+                        raise RuntimeError("到期附件物理身份在清理期间发生变化")
+                    db.expire(version)
+                else:
+                    # SQLite has no runtime-role privilege boundary. Keep its
+                    # lifecycle behavior identical for local development and
+                    # tests while PostgreSQL uses the guarded function above.
+                    detached_file_id = str(expected_file_id or "")
+                    detached_source_id = str(expected_source_id or "")
+                    version.status = "retired"
+                    version.bucket_file_id = None
+                    version.bucket_data_source_id = None
+                    version.source_locator = {}
+                    db.flush()
+
+                bucket_file = db.get(BucketFile, detached_file_id)
+                source = db.get(DataSource, detached_source_id)
+                if (
+                    bucket_file is None
+                    or source is None
+                    or bucket_file.data_source_id != source.id
+                    or source.tenant_id != version.tenant_id
+                ):
+                    raise RuntimeError("到期附件物理身份与租户范围不一致")
+                object_deletion_service.enqueue_bucket_file_deletion(
+                    db, bucket_file, source
+                )
+                db.delete(bucket_file)
+                db.flush()
+
+                purged += 1
+        except IntegrityError:
+            # An unexpected secondary BucketFile consumer is a retention
+            # signal. Keep the payload and let a later governed cleanup decide.
+            continue
+    return purged
+
+
 def worker_tick(*, limit: int = 8) -> int:
     """供应用生命周期后台协程调用的一次无状态轮询。"""
     from ..database import SessionLocal
@@ -1414,6 +1541,7 @@ def worker_tick(*, limit: int = 8) -> int:
         )
         expire_stale_operations(db)
         purge_expired_assistant_attachments(db, limit=max(50, limit * 25))
+        purge_expired_catalog_attachments(db, limit=max(50, limit * 25))
         assistant_compilation_job_service.purge_expired_completed_execution_inputs(
             db,
             limit=max(50, limit * 25),

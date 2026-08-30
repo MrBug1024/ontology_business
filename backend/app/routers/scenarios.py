@@ -17,20 +17,28 @@ from ..database import get_db
 from ..models import (
     ActionExecutionLog,
     Agent,
+    Assertion,
+    AssistantAttachment,
     AssistantAuditLog,
     AssistantCompilationJob,
     AssistantMessage,
+    AssistantRouteDecision,
     AssistantThread,
     AuthorizationGrant,
     BucketFile,
     BusinessScenario,
+    CapabilityInvocation,
+    ConnectorBinding,
     Conversation,
     DataMapping,
     DataMappingRefreshJob,
     DataSource,
+    DerivationRun,
+    DerivationRunInput,
     FunctionDefinition,
     MCPConfig,
     Message,
+    LLMInvocationTrace,
     OntologyAction,
     OntologyBranch,
     OntologyEntity,
@@ -48,6 +56,9 @@ from ..models import (
     RelationDataMapping,
     Skill,
     RelationInstance,
+    ReasoningTerm,
+    RunInputBinding,
+    ScenarioDatasetBinding,
     ScenarioModelDraftResource,
     WorkflowApprovalRequest,
     WorkflowRun,
@@ -91,11 +102,21 @@ from ..schemas import (
     RuleOut,
     ScenarioDetail,
     ScenarioIn,
+    ScenarioModelCandidateBatchPromotionRequest,
+    ScenarioModelCandidateCreate,
+    ScenarioModelCandidatePromotionOut,
+    ScenarioModelCandidateRevisionRequest,
     ScenarioModelDraftResourceListOut,
     ScenarioModelDraftResourceOut,
     ScenarioModelDraftResourcePatch,
     ScenarioModelDraftResourceResolve,
     ScenarioOut,
+    ScenarioPurgeOut,
+    ScenarioPurgePlanOut,
+    ScenarioPurgeRequest,
+    ScenarioReleaseWithdrawOut,
+    ScenarioReleaseWithdrawRequest,
+    ScenarioRestoreOut,
     WorkflowExecuteRequest,
     WorkflowGenerateRequest,
     WorkflowIn,
@@ -105,6 +126,7 @@ from ..schemas import (
 )
 from ..services import (
     agent_capability_service,
+    candidate_governance_service,
     connector_service,
     datasource_service,
     function_definition_service,
@@ -122,6 +144,7 @@ from ..services import (
     template_catalog_service,
     tenant_service,
     workflow_service,
+    workflow_payload_service,
 )
 from ..services.auth_service import get_current_user
 from ..services.policies import PolicyViolation
@@ -743,6 +766,148 @@ def _delete_scenario_governance_history(
     )
 
 
+def _count_where(db: Session, model: Any, *conditions: Any) -> int:
+    return int(
+        db.scalar(select(func.count()).select_from(model).where(*conditions)) or 0
+    )
+
+
+def _scenario_purge_plan(
+    db: Session,
+    scenario: BusinessScenario,
+) -> ScenarioPurgePlanOut:
+    agent_ids = select(Agent.id).where(Agent.scenario_id == scenario.id)
+    conversation_ids = select(Conversation.id).where(
+        Conversation.agent_id.in_(agent_ids)
+    )
+    assistant_thread_ids = select(AssistantThread.id).where(
+        AssistantThread.scenario_id == scenario.id
+    )
+    dataset_ids = {
+        str(value)
+        for value in db.scalars(
+            select(ScenarioDatasetBinding.dataset_id).where(
+                ScenarioDatasetBinding.scenario_id == scenario.id
+            )
+        ).all()
+    }
+    shared_datasets = 0
+    for dataset_id in dataset_ids:
+        if _count_where(
+            db,
+            ScenarioDatasetBinding,
+            ScenarioDatasetBinding.dataset_id == dataset_id,
+            ScenarioDatasetBinding.scenario_id != scenario.id,
+        ):
+            shared_datasets += 1
+
+    counts = {
+        "object_types": _count_where(
+            db, OntologyEntity, OntologyEntity.scenario_id == scenario.id
+        ),
+        "relation_types": _count_where(
+            db, OntologyRelation, OntologyRelation.scenario_id == scenario.id
+        ),
+        "object_instances": _count_where(
+            db, OntologyInstance, OntologyInstance.scenario_id == scenario.id
+        ),
+        "relation_instances": _count_where(
+            db, RelationInstance, RelationInstance.scenario_id == scenario.id
+        ),
+        "mappings": _count_where(
+            db, DataMapping, DataMapping.scenario_id == scenario.id
+        ) + _count_where(
+            db, RelationDataMapping, RelationDataMapping.scenario_id == scenario.id
+        ),
+        "data_sources": _count_where(
+            db, DataSource, DataSource.scenario_id == scenario.id
+        ),
+        "dataset_bindings": _count_where(
+            db,
+            ScenarioDatasetBinding,
+            ScenarioDatasetBinding.scenario_id == scenario.id,
+        ),
+        "connector_bindings": _count_where(
+            db, ConnectorBinding, ConnectorBinding.scenario_id == scenario.id
+        ),
+        "agents": _count_where(db, Agent, Agent.scenario_id == scenario.id),
+        "conversations": _count_where(
+            db, Conversation, Conversation.agent_id.in_(agent_ids)
+        ),
+        "messages": _count_where(
+            db, Message, Message.conversation_id.in_(conversation_ids)
+        ),
+        "assistant_threads": _count_where(
+            db, AssistantThread, AssistantThread.scenario_id == scenario.id
+        ),
+        "assistant_attachments": _count_where(
+            db, AssistantAttachment, AssistantAttachment.thread_id.in_(assistant_thread_ids)
+        ),
+        "capability_invocations": _count_where(
+            db, CapabilityInvocation, CapabilityInvocation.scenario_id == scenario.id
+        ),
+        "action_logs": _count_where(
+            db, ActionExecutionLog, ActionExecutionLog.scenario_id == scenario.id
+        ),
+        "workflow_runs": _count_where(
+            db, WorkflowRun, WorkflowRun.scenario_id == scenario.id
+        ),
+        "releases": _count_where(
+            db, OntologyRelease, OntologyRelease.scenario_id == scenario.id
+        ),
+        "llm_traces": _count_where(
+            db, LLMInvocationTrace, LLMInvocationTrace.scenario_id == scenario.id
+        ),
+    }
+    blockers: list[str] = []
+    if scenario.status != "retired":
+        blockers.append("请先退役场景，确认不再接受新的验证和运行请求")
+    if _count_where(
+        db,
+        OntologyRelease,
+        OntologyRelease.scenario_id == scenario.id,
+        OntologyRelease.status == "released",
+        OntologyRelease.environment.in_(("staging", "prod")),
+    ):
+        blockers.append("仍有预发布或生产 Release，请先在发布与接入中撤下")
+    if _count_where(
+        db,
+        CapabilityInvocation,
+        CapabilityInvocation.scenario_id == scenario.id,
+        CapabilityInvocation.status.in_(("pending", "running", "awaiting_confirmation")),
+    ):
+        blockers.append("仍有进行中的能力调用")
+    if _count_where(
+        db,
+        WorkflowRun,
+        WorkflowRun.scenario_id == scenario.id,
+        WorkflowRun.status.in_(("queued", "running", "awaiting_approval", "retry_waiting")),
+    ):
+        blockers.append("仍有进行中的工作流任务")
+    audit_keys = (
+        "conversations",
+        "messages",
+        "capability_invocations",
+        "action_logs",
+        "workflow_runs",
+        "releases",
+        "llm_traces",
+    )
+    return ScenarioPurgePlanOut(
+        scenario_id=scenario.id,
+        scenario_name=scenario.name,
+        status=scenario.status,
+        can_purge=not blockers,
+        blockers=blockers,
+        counts=counts,
+        retained={
+            "logical_datasets": len(dataset_ids),
+            "shared_logical_datasets": shared_datasets,
+        },
+        requires_audit_confirmation=any(counts[key] for key in audit_keys),
+    )
+
+
 def _scenario_model_draft_out(
     row: ScenarioModelDraftResource,
     *,
@@ -755,6 +920,14 @@ def _scenario_model_draft_out(
     issues = [
         item for item in (row.validation_issues or []) if isinstance(item, dict)
     ] if include_issues else []
+    governance = candidate_governance_service.governance_projection(
+        row,
+        include_stored_issues=include_issues,
+    )
+    if not include_issues:
+        # Eligibility remains server-owned even for compact list responses,
+        # but the full structured blocker payload is fetched on demand.
+        governance = {**governance, "promotion_blockers": []}
     return ScenarioModelDraftResourceOut(
         id=row.id,
         scenario_id=row.scenario_id,
@@ -774,6 +947,7 @@ def _scenario_model_draft_out(
         # These are platform-owned constants, not editable lifecycle flags.
         enabled=False,
         publishable=False,
+        **governance,
         resolved_resource_id=row.resolved_resource_id or "",
         source_thread_id=row.source_thread_id or "",
         source_message_id=row.source_message_id or "",
@@ -1201,7 +1375,7 @@ def _workflow_run_out(db: Session, run: WorkflowRun) -> WorkflowRunOut:
         definition_hash=run.definition_hash or "",
         definition_source=run.definition_source or "live",
         status=run.status,
-        input_params=run.input_params or {},
+        input_params=workflow_payload_service.public_input_summary(run),
         attempt=run.attempt,
         max_attempts=run.max_attempts,
         timeout_seconds=run.timeout_seconds,
@@ -1298,16 +1472,22 @@ def _relation_out(r: OntologyRelation, entities: list[OntologyEntity]) -> Relati
 
 
 @router.get("", response_model=list[ScenarioOut])
-def list_scenarios(db: Session = Depends(get_db)):
+def list_scenarios(
+    include_retired: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
     # A tenant-visible row is not necessarily ACL-visible: an explicit scenario
     # deny must also remove it from navigation/list responses, otherwise its
     # name and counts become an information disclosure even when detail routes
     # correctly return 403.
+    statement = select(BusinessScenario).where(
+        tenant_service.visible_clause(BusinessScenario, db)
+    )
+    if not include_retired:
+        statement = statement.where(BusinessScenario.status != "retired")
     return [
         _scenario_out(s)
-        for s in db.execute(
-            select(BusinessScenario).where(tenant_service.visible_clause(BusinessScenario, db))
-        ).scalars().all()
+        for s in db.execute(statement).scalars().all()
         if permission_service.check_scenario(db, s, "read").allowed
     ]
 
@@ -1370,9 +1550,13 @@ def _rel_instance_out(ri: RelationInstance) -> RelationInstanceOut:
     )
 
 
-def _mapping_out(m: DataMapping) -> DataMappingOut:
+def _mapping_out(
+    m: DataMapping,
+    *,
+    data_source: DataSource | None = None,
+) -> DataMappingOut:
     ent = m.entity
-    ds = m.data_source
+    ds = data_source or getattr(m, "data_source", None)
     runtime_state = mapping_refresh_service.mapping_runtime_state(m)
     return DataMappingOut(
         id=m.id,
@@ -1397,15 +1581,11 @@ def _mapping_out(m: DataMapping) -> DataMappingOut:
     )
 
 
-def _runtime_definition_for_scenario(db: Session, scenario: BusinessScenario) -> Any:
+def _authoring_definition_for_scenario(db: Session, scenario: BusinessScenario) -> Any:
     try:
-        return runtime_definition_service.resolve_active(
-            db,
-            scenario,
-            environment=runtime_connector_service.runtime_environment(),
-        )
+        return runtime_definition_service.resolve_authoring(db, scenario)
     except runtime_definition_service.RuntimeDefinitionError as exc:
-        raise HTTPException(409, f"当前部署定义不可读取场景数据: {exc}") from exc
+        raise HTTPException(409, f"当前建模定义不可读取: {exc}") from exc
 
 
 def _instance_in_current_runtime(
@@ -1415,7 +1595,7 @@ def _instance_in_current_runtime(
     if definition is not None:
         return ontology_service.instance_in_runtime_definition(instance, definition)
     return ontology_service.instance_in_runtime_environment(
-        instance, runtime_connector_service.runtime_environment()
+        instance, "dev"
     )
 
 
@@ -1423,7 +1603,12 @@ def _relation_in_current_runtime(instance: RelationInstance, definition: Any) ->
     return ontology_service.relation_instance_in_runtime_definition(instance, definition)
 
 
-def _relation_mapping_out(m: RelationDataMapping) -> RelationDataMappingOut:
+def _relation_mapping_out(
+    m: RelationDataMapping,
+    *,
+    data_source: DataSource | None = None,
+) -> RelationDataMappingOut:
+    source = data_source or getattr(m, "data_source", None)
     return RelationDataMappingOut(
         id=m.id,
         scenario_id=m.scenario_id,
@@ -1435,7 +1620,7 @@ def _relation_mapping_out(m: RelationDataMapping) -> RelationDataMappingOut:
         target_entity_name=(m.target_mapping.entity.name if m.target_mapping and m.target_mapping.entity else ""),
         mode=m.mode,
         data_source_id=m.data_source_id,
-        data_source_name=m.data_source.name if m.data_source else "",
+        data_source_name=source.name if source else "",
         table_name=m.table_name or "",
         foreign_key_column=m.foreign_key_column or "",
         source_key_column=m.source_key_column or "",
@@ -1632,7 +1817,7 @@ def list_scenario_model_drafts(
     limit: int = Query(default=500, ge=1, le=1000),
     db: Session = Depends(get_db),
 ):
-    """List inert AI-generated resources under the normal scenario ACL."""
+    """List governed candidates of any provenance under the scenario ACL."""
     scenario = _scenario_for_request(db, scenario_id)
     tenant_id = tenant_service.current_tenant_id(db)
     user_id = str(db.info.get("user_id") or "")
@@ -1694,6 +1879,7 @@ def list_scenario_model_drafts(
             ScenarioModelDraftResource.title,
             ScenarioModelDraftResource.payload,
             ScenarioModelDraftResource.source_refs,
+            ScenarioModelDraftResource.materialization_source,
             ScenarioModelDraftResource.draft_status,
             ScenarioModelDraftResource.resolved_resource_id,
             ScenarioModelDraftResource.source_thread_id,
@@ -1727,16 +1913,253 @@ def list_scenario_model_drafts(
             _scenario_model_draft_out(row, include_issues=include_issues)
             for row in rows
         ],
-        summary=scenario_model_draft_service.draft_summary(
-            all_rows, include_issue_counts=include_issues
-        ),
-        page_summary=scenario_model_draft_service.draft_summary(
-            rows, include_issue_counts=include_issues
-        ),
+        summary={
+            **scenario_model_draft_service.draft_summary(
+                all_rows, include_issue_counts=include_issues
+            ),
+            **candidate_governance_service.governance_summary(
+                all_rows, include_stored_issues=include_issues
+            ),
+        },
+        page_summary={
+            **scenario_model_draft_service.draft_summary(
+                rows, include_issue_counts=include_issues
+            ),
+            **candidate_governance_service.governance_summary(
+                rows, include_stored_issues=include_issues
+            ),
+        },
         total=total,
         has_more=next_offset < total,
         next_offset=next_offset if next_offset < total else None,
     )
+
+
+@router.post(
+    "/{scenario_id}/model-drafts",
+    response_model=ScenarioModelDraftResourceOut,
+    status_code=201,
+)
+def create_scenario_model_candidate(
+    scenario_id: str,
+    payload: ScenarioModelCandidateCreate,
+    db: Session = Depends(get_db),
+):
+    """Register a human-authored candidate without bypassing quality gates."""
+    scenario = _scenario_for_request(db, scenario_id, writable=True)
+    tenant_id = tenant_service.current_tenant_id(db)
+    user_id = str(db.info.get("user_id") or "")
+    if not user_id:
+        raise HTTPException(401, "候选定义必须绑定已认证用户")
+    try:
+        row = candidate_governance_service.create_manual_candidate(
+            db,
+            scenario,
+            tenant_id=tenant_id,
+            created_by_user_id=user_id,
+            resource_kind=payload.resource_kind,
+            resource_key=payload.resource_key,
+            title=payload.title,
+            payload=payload.payload,
+            task_id=payload.task_id,
+            source_refs=payload.source_refs,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    db.add(AssistantAuditLog(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        scenario_id=scenario.id,
+        thread_id=None,
+        operation="create_model_candidate",
+        status="success",
+        context={
+            "draft_resource_id": row.id,
+            "proposal_id": row.proposal_id,
+            "resource_kind": row.resource_kind,
+            "resource_key": row.resource_key,
+            "source_origin": "manual",
+        },
+        result={
+            "validation_status": "not_validated",
+            "promotion_eligible": False,
+            "activation_status": "inactive",
+        },
+    ))
+    db.commit()
+    db.refresh(row)
+    return _scenario_model_draft_out(row)
+
+
+@router.post(
+    "/{scenario_id}/model-drafts/{draft_id}/revalidate",
+    response_model=ScenarioModelDraftResourceOut,
+)
+def revalidate_scenario_model_candidate(
+    scenario_id: str,
+    draft_id: str,
+    payload: ScenarioModelCandidateRevisionRequest,
+    db: Session = Depends(get_db),
+):
+    """Deterministically revalidate the current candidate revision."""
+    scenario = _scenario_for_request(db, scenario_id, writable=True)
+    tenant_id = tenant_service.current_tenant_id(db)
+    user_id = str(db.info.get("user_id") or "")
+    try:
+        row, evaluation = candidate_governance_service.revalidate_candidate(
+            db,
+            scenario,
+            tenant_id=tenant_id,
+            created_by_user_id=user_id,
+            draft_id=draft_id,
+            expected_revision=payload.expected_revision,
+        )
+    except candidate_governance_service.CandidateNotFound as exc:
+        db.rollback()
+        raise HTTPException(404, "候选定义不存在") from exc
+    except candidate_governance_service.CandidateRevisionConflict as exc:
+        db.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    db.add(AssistantAuditLog(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        scenario_id=scenario.id,
+        thread_id=None,
+        operation="revalidate_model_candidate",
+        status="success" if evaluation.eligible else "blocked",
+        context={
+            "draft_resource_id": row.id,
+            "resource_kind": row.resource_kind,
+            "resource_key": row.resource_key,
+            "source_origin": candidate_governance_service.source_origin(row),
+            "revision": row.revision,
+        },
+        result={
+            "promotion_eligible": evaluation.eligible,
+            "quality_fingerprint": evaluation.fingerprint,
+            "blocker_codes": [
+                str(item.get("code") or "") for item in evaluation.blockers
+            ],
+        },
+    ))
+    db.commit()
+    db.refresh(row)
+    return _scenario_model_draft_out(row)
+
+
+def _promote_scenario_model_candidates(
+    scenario: BusinessScenario,
+    payload: ScenarioModelCandidateBatchPromotionRequest,
+    db: Session,
+) -> ScenarioModelCandidatePromotionOut:
+    ids = [item.draft_id for item in payload.items]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(400, {
+            "code": "candidate_selection_duplicate",
+            "message": "同一候选不能在一个原子批次中重复出现。",
+            "blockers": [],
+        })
+    tenant_id = tenant_service.current_tenant_id(db)
+    user_id = str(db.info.get("user_id") or "")
+    expected = {
+        item.draft_id: item.expected_revision for item in payload.items
+    }
+    try:
+        rows, result = candidate_governance_service.promote_candidates(
+            db,
+            scenario,
+            tenant_id=tenant_id,
+            created_by_user_id=user_id,
+            expected_revisions=expected,
+        )
+        for row in rows:
+            _refresh_resolved_draft_source_plan(db, scenario, row)
+    except candidate_governance_service.CandidateNotFound as exc:
+        db.rollback()
+        raise HTTPException(404, "一个或多个候选定义不存在") from exc
+    except candidate_governance_service.CandidateRevisionConflict as exc:
+        db.rollback()
+        raise HTTPException(409, {
+            "code": "candidate_revision_conflict",
+            "message": str(exc),
+            "blockers": [],
+        }) from exc
+    except candidate_governance_service.CandidatePromotionBlocked as exc:
+        db.rollback()
+        raise HTTPException(409, {
+            "code": "candidate_promotion_blocked",
+            "message": str(exc),
+            "blockers": exc.blockers,
+        }) from exc
+    except PolicyViolation as exc:
+        db.rollback()
+        raise HTTPException(409, {
+            "code": "formal_preflight_failed",
+            "message": str(exc),
+            "blockers": [],
+        }) from exc
+    db.add(AssistantAuditLog(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        scenario_id=scenario.id,
+        thread_id=None,
+        operation="promote_model_candidates",
+        status="success",
+        context={
+            "atomic": True,
+            "candidate_ids": sorted(ids),
+            "candidate_count": len(ids),
+            "quality_fingerprint": result.get("quality_fingerprint", ""),
+        },
+        result={
+            "promoted": [
+                {
+                    "draft_id": item.get("draft_id"),
+                    "resource_kind": item.get("resource_kind"),
+                    "formal_resource_id": item.get("formal_resource_id"),
+                    "activation_status": item.get("activation_status"),
+                }
+                for item in result.get("promoted") or []
+            ],
+            "counts": result.get("counts") or {},
+        },
+    ))
+    db.commit()
+    return ScenarioModelCandidatePromotionOut(**result)
+
+
+@router.post(
+    "/{scenario_id}/model-drafts/promote-batch",
+    response_model=ScenarioModelCandidatePromotionOut,
+)
+def promote_scenario_model_candidates_batch(
+    scenario_id: str,
+    payload: ScenarioModelCandidateBatchPromotionRequest,
+    db: Session = Depends(get_db),
+):
+    """Promote every selected candidate, or persist none of them."""
+    scenario = _scenario_for_request(db, scenario_id, writable=True)
+    return _promote_scenario_model_candidates(scenario, payload, db)
+
+
+@router.post(
+    "/{scenario_id}/model-drafts/{draft_id}/promote",
+    response_model=ScenarioModelCandidatePromotionOut,
+)
+def promote_scenario_model_candidate(
+    scenario_id: str,
+    draft_id: str,
+    payload: ScenarioModelCandidateRevisionRequest,
+    db: Session = Depends(get_db),
+):
+    """Single-item convenience endpoint backed by the atomic batch path."""
+    scenario = _scenario_for_request(db, scenario_id, writable=True)
+    request = ScenarioModelCandidateBatchPromotionRequest(items=[{
+        "draft_id": draft_id,
+        "expected_revision": payload.expected_revision,
+    }])
+    return _promote_scenario_model_candidates(scenario, request, db)
 
 
 @router.patch(
@@ -1890,7 +2313,7 @@ def get_scenario(
     ),
 ):
     s = _scenario_for_request(db, scenario_id)
-    definition = _runtime_definition_for_scenario(db, s)
+    definition = _authoring_definition_for_scenario(db, s)
     base = _scenario_out(s)
     entity_ids = {str(item) for item in definition.entities}
     relation_ids = {str(item) for item in definition.relations}
@@ -1901,7 +2324,15 @@ def get_scenario(
     rule_ids = {str(item) for item in definition.rules}
     event_ids = {str(item) for item in definition.events}
     workflow_ids = {str(item) for item in definition.workflows}
-    active_entities = [e for e in s.entities if e.id in entity_ids]
+    # Once retired, the mutable authoring rows are no longer the historical
+    # definition.  Project the detached release graph itself so a later dev
+    # edit cannot rewrite what users see in the retired staging/prod record.
+    historic_definition = s.status == "retired"
+    active_entities = (
+        list(definition.entities.values())
+        if historic_definition
+        else [e for e in s.entities if e.id in entity_ids]
+    )
     entities = [
         _entity_out(
             db,
@@ -1913,9 +2344,14 @@ def get_scenario(
         )
         for e in active_entities
     ]
+    relation_definitions = (
+        list(definition.relations.values())
+        if historic_definition
+        else list(s.relations)
+    )
     relations = [
         _relation_out(r, active_entities)
-        for r in s.relations
+        for r in relation_definitions
         if r.id in relation_ids
         and r.source_entity_id in entity_ids
         and r.target_entity_id in entity_ids
@@ -1986,34 +2422,83 @@ def get_scenario(
     else:
         instances = []
         rel_instances = []
-    mappings = [_mapping_out(m) for m in s.data_mappings if m.id in mapping_ids]
-    relation_mappings = [
-        _relation_mapping_out(m)
-        for m in s.relation_data_mappings
-        if m.id in relation_mapping_ids
+    data_sources_by_id = {source.id: source for source in s.data_sources}
+    mapping_definitions = (
+        list(definition.mappings.values())
+        if historic_definition
+        else list(s.data_mappings)
+    )
+    mappings = [
+        _mapping_out(
+            mapping,
+            data_source=data_sources_by_id.get(mapping.data_source_id),
+        )
+        for mapping in mapping_definitions
+        if mapping.id in mapping_ids
     ]
+    relation_mapping_definitions = (
+        list(definition.relation_mappings.values())
+        if historic_definition
+        else list(s.relation_data_mappings)
+    )
+    relation_mappings = [
+        _relation_mapping_out(
+            mapping,
+            data_source=data_sources_by_id.get(mapping.data_source_id),
+        )
+        for mapping in relation_mapping_definitions
+        if mapping.id in relation_mapping_ids
+    ]
+    function_definitions = (
+        list(definition.functions.values())
+        if historic_definition
+        else list(s.function_definitions)
+    )
     functions = [
         _function_out(function)
-        for function in s.function_definitions
+        for function in function_definitions
         if function.id in function_ids
     ]
+    action_definitions = (
+        list(definition.actions.values())
+        if historic_definition
+        else list(s.actions)
+    )
     actions = [
         _action_out(action)
-        for action in s.actions
+        for action in action_definitions
         if action.id in action_ids
         and permission_service.check_action(db, action, "read").allowed
     ]
-    rules = [_rule_out(r) for r in s.rules if r.id in rule_ids]
-    events = [_event_out(e) for e in s.events if e.id in event_ids]
+    rule_definitions = (
+        list(definition.rules.values())
+        if historic_definition
+        else list(s.rules)
+    )
+    event_definitions = (
+        list(definition.events.values())
+        if historic_definition
+        else list(s.events)
+    )
+    workflow_definitions = (
+        list(definition.workflows.values())
+        if historic_definition
+        else list(s.workflows)
+    )
+    rules = [_rule_out(rule) for rule in rule_definitions if rule.id in rule_ids]
+    events = [_event_out(event) for event in event_definitions if event.id in event_ids]
     workflows = [
         _workflow_out(workflow)
-        for workflow in s.workflows
+        for workflow in workflow_definitions
         if workflow.id in workflow_ids
         and permission_service.check_workflow(db, workflow, "read").allowed
     ]
     return ScenarioDetail(
         **base.model_dump(),
-        can_write=permission_service.check_scenario(db, s, "write").allowed,
+        can_write=(
+            s.status != "retired"
+            and permission_service.check_scenario(db, s, "write").allowed
+        ),
         entities=entities,
         relations=relations,
         data_sources=ds_out,
@@ -2035,12 +2520,12 @@ def get_scenario(
 @router.get("/{scenario_id}/graph")
 def scenario_graph(scenario_id: str, mode: str = "schema", db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id)
-    definition = _runtime_definition_for_scenario(db, s)
+    definition = _authoring_definition_for_scenario(db, s)
     return ontology_service.build_graph(
         s,
         mode=mode,
         db=db,
-        environment=runtime_connector_service.runtime_environment(),
+        environment=definition.environment,
         runtime_definition=definition,
     )
 
@@ -2056,7 +2541,7 @@ def search_objects(
 ):
     """对象运行时搜索：只返回当前场景可见对象及安全来源摘要。"""
     scenario = _scenario_for_request(db, scenario_id)
-    definition = _runtime_definition_for_scenario(db, scenario)
+    definition = _authoring_definition_for_scenario(db, scenario)
     filters = [OntologyInstance.scenario_id == scenario_id]
     active_entity_ids = [str(item) for item in definition.entities]
     if not active_entity_ids:
@@ -2201,7 +2686,7 @@ def search_objects(
 def get_object(scenario_id: str, object_id: str, db: Session = Depends(get_db)):
     """返回对象属性、邻接关系和来源追踪信息。"""
     scenario = _scenario_for_request(db, scenario_id)
-    definition = _runtime_definition_for_scenario(db, scenario)
+    definition = _authoring_definition_for_scenario(db, scenario)
     instance = db.get(OntologyInstance, object_id)
     if (
         not instance
@@ -2227,11 +2712,46 @@ def update_scenario(scenario_id: str, payload: ScenarioIn, db: Session = Depends
     return _scenario_out(s)
 
 
+@router.post(
+    "/{scenario_id}/releases/{environment}/withdraw",
+    response_model=ScenarioReleaseWithdrawOut,
+)
+def withdraw_scenario_release(
+    scenario_id: str,
+    environment: str,
+    payload: ScenarioReleaseWithdrawRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        result = release_service.withdraw_environment(
+            db,
+            scenario_id,
+            environment=environment,
+            confirmed=payload.confirmed,
+            reason=payload.reason,
+        )
+    except release_service.ReleaseValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return ScenarioReleaseWithdrawOut(
+        scenario_id=result.scenario_id,
+        environment=result.environment,
+        withdrawn_release_ids=list(result.withdrawn_release_ids),
+        changed=result.changed,
+        withdrawn_at=result.withdrawn_at,
+        withdrawn_by_user_id=result.withdrawn_by_user_id,
+        reason=result.reason,
+    )
+
+
 @router.delete("/{scenario_id}", response_model=Msg)
 def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
-    s = _scenario_for_request(db, scenario_id, writable=True)
-    # Serialize deletion with child-row FK inserts (template creation and
-    # releases). Reuse only the refreshed locked row for every preflight below.
+    # A scenario is an audit and deployment anchor. DELETE is therefore a
+    # retirement command; physical purge belongs to a separate retention-aware
+    # workflow and must never be implied by ordinary product navigation.
+    s = tenant_service.require_scenario(db, scenario_id)
+    if s.tenant_id != tenant_service.current_tenant_id(db):
+        raise HTTPException(403, "公共业务场景只读")
+    permission_service.require_scenario_permission(db, s, "write")
     s = db.scalar(
         select(BusinessScenario)
         .where(
@@ -2242,23 +2762,112 @@ def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
         .with_for_update()
     )
     if not s:
-        raise HTTPException(409, "业务场景在删除期间已变化，请刷新后重试")
+        raise HTTPException(409, "业务场景在退役期间已变化，请刷新后重试")
+    if s.status == "retired":
+        return Msg(message="已退役")
     try:
-        release_service.assert_scenario_deletion_allowed(db, s)
+        release_service.assert_scenario_retirement_allowed(db, s)
     except release_service.ReleaseValidationError as exc:
         raise HTTPException(409, str(exc)) from exc
+    s.status = "retired"
+    db.commit()
+    return Msg(message="已退役")
+
+
+@router.post("/{scenario_id}/restore", response_model=ScenarioRestoreOut)
+def restore_scenario(scenario_id: str, db: Session = Depends(get_db)):
+    """Restore a retired scenario to the mutable authoring workspace."""
+    scenario = tenant_service.require_scenario(db, scenario_id)
+    if scenario.tenant_id != tenant_service.current_tenant_id(db):
+        raise HTTPException(403, "公共业务场景只读")
+    permission_service.require_scenario_permission(db, scenario, "write")
+    scenario = db.scalar(
+        select(BusinessScenario)
+        .where(
+            BusinessScenario.id == scenario.id,
+            BusinessScenario.tenant_id == tenant_service.current_tenant_id(db),
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if scenario is None:
+        raise HTTPException(409, "业务场景在恢复期间已变化，请刷新后重试")
+    if scenario.status != "retired":
+        return ScenarioRestoreOut(
+            scenario_id=scenario.id,
+            status="active" if scenario.status == "active" else "draft",
+            restored=False,
+        )
+    scenario.status = "draft"
+    db.commit()
+    return ScenarioRestoreOut(
+        scenario_id=scenario.id,
+        status="draft",
+        restored=True,
+    )
+
+
+@router.get("/{scenario_id}/purge-plan", response_model=ScenarioPurgePlanOut)
+def get_scenario_purge_plan(scenario_id: str, db: Session = Depends(get_db)):
+    """Preview an irreversible purge without exposing customer data values."""
+    permission_service.require_tenant_permission(db, "manage")
+    scenario = tenant_service.require_scenario(db, scenario_id)
+    if scenario.tenant_id != tenant_service.current_tenant_id(db):
+        raise HTTPException(403, "公共业务场景不能永久删除")
+    return _scenario_purge_plan(db, scenario)
+
+
+@router.post("/{scenario_id}/purge", response_model=ScenarioPurgeOut)
+def purge_scenario(
+    scenario_id: str,
+    payload: ScenarioPurgeRequest,
+    db: Session = Depends(get_db),
+):
+    """Permanently remove one retired scenario and its owned working history.
+
+    Tenant-level catalog datasets remain independent assets.  Their bindings
+    are removed with the scenario, while the purge response reports how many
+    dataset records were intentionally retained for separate lifecycle
+    management.  Scenario-owned file objects are deleted through the durable
+    outbox so storage cleanup is recoverable.
+    """
+    permission_service.require_tenant_permission(db, "manage")
+    scenario = tenant_service.require_scenario(db, scenario_id)
+    if scenario.tenant_id != tenant_service.current_tenant_id(db):
+        raise HTTPException(403, "公共业务场景不能永久删除")
+    scenario = db.scalar(
+        select(BusinessScenario)
+        .where(
+            BusinessScenario.id == scenario.id,
+            BusinessScenario.tenant_id == tenant_service.current_tenant_id(db),
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if scenario is None:
+        raise HTTPException(409, "业务场景在删除期间已变化，请刷新后重试")
+    plan = _scenario_purge_plan(db, scenario)
+    if not payload.confirmed:
+        raise HTTPException(409, "永久删除尚未确认")
+    if payload.expected_name != scenario.name:
+        raise HTTPException(409, "输入的场景名称与当前场景不一致")
+    if plan.blockers:
+        raise HTTPException(409, "；".join(plan.blockers))
+    if plan.requires_audit_confirmation and not payload.delete_audit_history:
+        raise HTTPException(409, "该场景包含验证或运行审计，请明确确认同时删除审计历史")
     try:
-        template_catalog_service.prepare_scenario_deletion(db, s)
-    except template_catalog_service.TemplateCatalogError as exc:
+        release_service.assert_scenario_deletion_allowed(db, scenario)
+        template_catalog_service.prepare_scenario_deletion(db, scenario)
+    except (
+        release_service.ReleaseValidationError,
+        template_catalog_service.TemplateCatalogError,
+    ) as exc:
         raise HTTPException(409, str(exc)) from exc
-    # Uploads lock their owning DataSource before writing MinIO and committing
-    # BucketFile metadata.  Lock the same rows before the current-read below so
-    # a concurrent upload either finishes and is queued here, or starts after
-    # the scenario has gone and cannot commit an untracked object.
+
     scenario_sources = list(
         db.scalars(
             select(DataSource)
-            .where(DataSource.scenario_id == s.id)
+            .where(DataSource.scenario_id == scenario.id)
             .order_by(DataSource.id)
             .execution_options(populate_existing=True)
             .with_for_update()
@@ -2279,24 +2888,110 @@ def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
         if source_ids
         else []
     )
-    bucket_files = [
-        (bucket_file, source_by_id[bucket_file.data_source_id])
-        for bucket_file in locked_files
-    ]
+    thread_ids = list(
+        db.scalars(
+            select(AssistantThread.id).where(
+                AssistantThread.scenario_id == scenario.id
+            )
+        ).all()
+    )
+    attachments = (
+        list(
+            db.scalars(
+                select(AssistantAttachment)
+                .where(AssistantAttachment.thread_id.in_(thread_ids))
+                .order_by(AssistantAttachment.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            ).all()
+        )
+        if thread_ids
+        else []
+    )
     try:
         deletion_job_ids = [
             object_deletion_service.enqueue_bucket_file_deletion(
-                db, bucket_file, data_source
+                db, bucket_file, source_by_id[bucket_file.data_source_id]
             )
-            for bucket_file, data_source in bucket_files
+            for bucket_file in locked_files
         ]
+        deletion_job_ids.extend(
+            job_id
+            for attachment in attachments
+            if (
+                job_id := object_deletion_service.enqueue_assistant_attachment_deletion(
+                    db, attachment
+                )
+            )
+        )
     except (ValueError, object_storage_service.ObjectStorageError) as exc:
         raise HTTPException(409, str(exc)) from exc
-    _delete_scenario_governance_history(db, s)
-    db.delete(s)
-    db.commit()
+
+    invocation_ids = select(CapabilityInvocation.id).where(
+        CapabilityInvocation.scenario_id == scenario.id
+    )
+    run_ids = select(DerivationRun.id).where(
+        DerivationRun.scenario_id == scenario.id
+    )
+    db.execute(
+        delete(RunInputBinding).where(RunInputBinding.invocation_id.in_(invocation_ids))
+    )
+    db.execute(
+        delete(CapabilityInvocation).where(
+            CapabilityInvocation.scenario_id == scenario.id
+        )
+    )
+    db.execute(
+        delete(Assertion).where(Assertion.scenario_id == scenario.id)
+    )
+    db.execute(
+        delete(DerivationRunInput).where(
+            DerivationRunInput.derivation_run_id.in_(run_ids)
+        )
+    )
+    db.execute(
+        delete(DerivationRun).where(DerivationRun.scenario_id == scenario.id)
+    )
+    db.execute(
+        delete(ReasoningTerm).where(ReasoningTerm.scenario_id == scenario.id)
+    )
+    db.execute(
+        delete(LLMInvocationTrace).where(LLMInvocationTrace.scenario_id == scenario.id)
+    )
+    db.execute(
+        delete(AssistantAuditLog).where(AssistantAuditLog.scenario_id == scenario.id)
+    )
+    db.execute(
+        delete(AssistantRouteDecision).where(
+            AssistantRouteDecision.scenario_id == scenario.id
+        )
+    )
+    db.execute(
+        delete(AssistantCompilationJob).where(
+            AssistantCompilationJob.scenario_id == scenario.id
+        )
+    )
+    db.execute(
+        delete(AssistantThread).where(AssistantThread.scenario_id == scenario.id)
+    )
+    db.execute(delete(Agent).where(Agent.scenario_id == scenario.id))
+    _delete_scenario_governance_history(db, scenario)
+    db.delete(scenario)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            409,
+            "场景仍被受保护的审计或共享资源引用，永久删除已取消",
+        ) from exc
     object_deletion_service.drain_jobs_best_effort(db, deletion_job_ids)
-    return Msg(message="已删除")
+    return ScenarioPurgeOut(
+        scenario_id=scenario_id,
+        deleted=True,
+        deletion_jobs=len(deletion_job_ids),
+        retained=plan.retained,
+    )
 
 
 # ── 实体 ──────────────────────────────────────
@@ -2830,7 +3525,7 @@ def list_relation_instances(
 ):
     """Return a bounded relation-instance page for the instance workspace."""
     scenario = _scenario_for_request(db, scenario_id)
-    definition = _runtime_definition_for_scenario(db, scenario)
+    definition = _authoring_definition_for_scenario(db, scenario)
     candidates = db.execute(
         select(RelationInstance)
         .options(
@@ -3458,10 +4153,6 @@ def get_mapping_refresh_job(
     job = db.get(DataMappingRefreshJob, job_id)
     if not job or job.tenant_id != tenant_service.current_tenant_id(db):
         raise HTTPException(404, "映射刷新任务不存在")
-    if job.environment != runtime_connector_service.runtime_environment():
-        # Shared metadata storage must not expose one deployment's task state
-        # through another environment's API surface.
-        raise HTTPException(404, "映射刷新任务不存在")
     _scenario_for_request(db, job.scenario_id)
     response.headers["Cache-Control"] = "no-store"
     return _mapping_refresh_job_out(job)
@@ -3633,7 +4324,7 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
         definition = runtime_definition_service.resolve_active(
             db,
             scenario,
-            environment=runtime_connector_service.runtime_environment(),
+            environment=payload.environment,
         )
         a = runtime_definition_service.resolve_resource(definition, "action", action_id)
     except runtime_definition_service.RuntimeDefinitionError as exc:
@@ -3854,13 +4545,16 @@ def evaluate_rule(rule_id: str, payload: dict, db: Session = Depends(get_db)):
         raise HTTPException(404, "规则不存在")
     scenario = _scenario_for_request(db, live_rule.scenario_id)
     record = (payload or {}).get("record", {})
+    environment = str((payload or {}).get("environment") or "dev").strip().lower()
+    if environment not in {"dev", "staging", "prod"}:
+        raise HTTPException(400, "environment 必须是 dev、staging 或 prod")
     if not isinstance(record, dict):
         raise HTTPException(400, "规则评估记录必须是对象")
     try:
         definition = runtime_definition_service.resolve_active(
             db,
             scenario,
-            environment=runtime_connector_service.runtime_environment(),
+            environment=environment,
         )
         rule = runtime_definition_service.resolve_resource(
             definition, "rule", rule_id
@@ -3930,7 +4624,7 @@ def publish_event(event_id: str, payload: EventPublishIn, db: Session = Depends(
         definition = runtime_definition_service.resolve_active(
             db,
             scenario,
-            environment=runtime_connector_service.runtime_environment(),
+            environment=payload.environment,
         )
         event = runtime_definition_service.resolve_resource(definition, "event", event_id)
         envelope, queued_runs = operations_service.publish_event(
@@ -4063,7 +4757,7 @@ def create_workflow_run(
         definition = runtime_definition_service.resolve_active(
             db,
             scenario,
-            environment=runtime_connector_service.runtime_environment(),
+            environment=payload.environment,
         )
         workflow = runtime_definition_service.resolve_resource(
             definition, "workflow", workflow_id
@@ -4102,7 +4796,7 @@ def execute_workflow(workflow_id: str, payload: WorkflowExecuteRequest, db: Sess
     """
     return create_workflow_run(
         workflow_id,
-        WorkflowRunCreateRequest(params=payload.params),
+        WorkflowRunCreateRequest(params=payload.params, environment=payload.environment),
         db,
     )
 
@@ -4145,17 +4839,18 @@ def _can_read_execution_log(db: Session, log: ActionExecutionLog) -> bool:
 @router.get("/{scenario_id}/execution-logs", response_model=list[ActionExecutionLogOut])
 def list_execution_logs(
     scenario_id: str,
+    environment: str | None = Query(default=None, pattern="^(dev|staging|prod)$"),
     limit: int = Query(default=50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
     _scenario_for_request(db, scenario_id)
+    statement = select(ActionExecutionLog).where(
+        ActionExecutionLog.scenario_id == scenario_id,
+    )
+    if environment:
+        statement = statement.where(ActionExecutionLog.environment == environment)
     logs = db.execute(
-        select(ActionExecutionLog)
-        .where(
-            ActionExecutionLog.scenario_id == scenario_id,
-            ActionExecutionLog.environment
-            == runtime_connector_service.runtime_environment(),
-        )
+        statement
         .order_by(ActionExecutionLog.created_at.desc())
         .limit(limit)
     ).scalars().all()
@@ -4166,7 +4861,9 @@ def list_execution_logs(
             target_type=l.target_type,
             target_id=l.target_id,
             target_name=l.target_name,
-            input_params=l.input_params or {},
+            input_params=workflow_payload_service.summarize_for_public(
+                l.input_params or {}
+            ),
             status=l.status,
             mode=l.mode or "execute",
             idempotency_key=l.idempotency_key,

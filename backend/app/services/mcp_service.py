@@ -301,11 +301,23 @@ async def _list_tools_async(cfg: MCPConfig) -> list[dict[str, Any]]:
     raise ValueError(f"未知 MCP 传输类型: {cfg.transport}")
 
 
-async def _call_tool_async(cfg: MCPConfig, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+async def _call_tool_async(
+    cfg: MCPConfig,
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    execution_key: str | None = None,
+) -> dict[str, Any]:
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
     from mcp.client.streamable_http import streamable_http_client
+
+    tool_metadata = (
+        {"com.ontology-platform/capability-execution-key": execution_key}
+        if execution_key
+        else None
+    )
 
     if cfg.transport == "stdio":
         if not get_settings().allow_mcp_stdio:
@@ -314,7 +326,7 @@ async def _call_tool_async(cfg: MCPConfig, name: str, arguments: dict[str, Any])
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                res = await session.call_tool(name, arguments)
+                res = await session.call_tool(name, arguments, meta=tool_metadata)
                 return _content_to_text(res)
     if cfg.transport == "sse":
         target = await asyncio.to_thread(_assert_safe_remote_target, cfg.url)
@@ -326,7 +338,7 @@ async def _call_tool_async(cfg: MCPConfig, name: str, arguments: dict[str, Any])
         ) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                res = await session.call_tool(name, arguments)
+                res = await session.call_tool(name, arguments, meta=tool_metadata)
                 return _content_to_text(res)
     if cfg.transport in ("streamable_http", "http"):
         target = await asyncio.to_thread(_assert_safe_remote_target, cfg.url)
@@ -338,7 +350,7 @@ async def _call_tool_async(cfg: MCPConfig, name: str, arguments: dict[str, Any])
             async with streamable_http_client(cfg.url, http_client=http_client) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    res = await session.call_tool(name, arguments)
+                    res = await session.call_tool(name, arguments, meta=tool_metadata)
                     return _content_to_text(res)
     raise ValueError(f"未知 MCP 传输类型: {cfg.transport}")
 
@@ -371,10 +383,26 @@ def list_tools(cfg: MCPConfig) -> list[dict[str, Any]]:
     return _run(asyncio.wait_for(_list_tools_async(cfg), timeout=timeout))
 
 
-def call_tool(cfg: MCPConfig, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def call_tool(
+    cfg: MCPConfig,
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    execution_key: str | None = None,
+) -> dict[str, Any]:
     timeout = max(5.0, float(get_settings().mcp_operation_timeout_seconds))
     try:
-        return _run(asyncio.wait_for(_call_tool_async(cfg, name, arguments), timeout=timeout))
+        return _run(
+            asyncio.wait_for(
+                _call_tool_async(
+                    cfg,
+                    name,
+                    arguments,
+                    execution_key=execution_key,
+                ),
+                timeout=timeout,
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         raise ValueError(public_error(exc, cfg)) from None
 

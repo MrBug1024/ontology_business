@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import func, inspect, select
 
@@ -244,13 +245,26 @@ def main() -> int:
         BusinessScenario,
         DataSource,
         DatasetFragment,
+        DatasetVersion,
+        FunctionDefinition,
         LogicalDataset,
+        ScenarioCapabilityPort,
+        User,
     )
+    from app.providers.medical_audit.provider import PROVIDER_KEY, PROVIDER_VERSION
     from app.services import (
         cache_service,
+        capability_application_service,
         datasource_service,
-        medical_audit_service,
+        permission_service,
         runtime_definition_service,
+    )
+    from app.services.capability_contracts import (
+        Actor,
+        BindingOverride,
+        CapabilityRef,
+        Request,
+        canonical_json,
     )
     init_db()
     runtime_settings = get_settings()
@@ -324,11 +338,51 @@ def main() -> int:
         definition = runtime_definition_service.resolve_active(
             session, medical_scenario, environment="dev"
         )
-        contract = medical_audit_service.resolve_mapping_contract(
-            [medical_source], list(definition.mappings.values()), definition=definition
+        charge_entity = next(
+            (
+                entity
+                for entity in definition.entities.values()
+                if str(getattr(entity, "api_name", "")) == "medical_charge_line"
+            ),
+            None,
         )
-        charge_table = contract.tables["charge"]
-        service_column = contract.columns["charge"]["service_name"]
+        if charge_entity is None:
+            raise RuntimeError("medical provider charge entity is missing")
+        medical_entity_ids = {
+            str(entity.id)
+            for entity in definition.entities.values()
+            if str(getattr(entity, "api_name", ""))
+            in {"medical_charge_line", "medical_encounter"}
+        }
+        provider_mappings = [
+            mapping
+            for mapping in definition.mappings.values()
+            if str(mapping.entity_id) in medical_entity_ids
+        ]
+        charge_mapping = next(
+            (
+                mapping
+                for mapping in provider_mappings
+                if str(mapping.entity_id) == str(charge_entity.id)
+            ),
+            None,
+        )
+        service_property = next(
+            (
+                prop
+                for prop in charge_entity.properties
+                if str(getattr(prop, "api_name", "")) == "service_name"
+            ),
+            None,
+        )
+        if charge_mapping is None or service_property is None:
+            raise RuntimeError("medical provider mapping contract is incomplete")
+        charge_table = str(charge_mapping.table_name or "")
+        service_column = str(
+            (charge_mapping.column_map or {}).get(service_property.name) or ""
+        )
+        if not charge_table or not service_column:
+            raise RuntimeError("medical provider service field is not mapped")
         top_service = datasource_service.run_query(
             medical_source,
             (
@@ -342,22 +396,155 @@ def main() -> int:
             limit=1,
         )
         service_name = str(_scalar(top_service, "service_name"))
-        audit = medical_audit_service.run_medical_audit(
-            contract,
-            {
+        dataset_version_id = str(
+            (medical_source.config or {}).get("dataset_version_id") or ""
+        )
+        dataset_version = session.get(DatasetVersion, dataset_version_id)
+        if (
+            dataset_version is None
+            or dataset_version.tenant_id != medical_scenario.tenant_id
+            or dataset_version.status != "ready"
+        ):
+            raise RuntimeError("medical provider dataset version is unavailable")
+
+        principal = None
+        users = session.scalars(
+            select(User).where(
+                User.tenant_id == medical_scenario.tenant_id,
+                User.status == "active",
+            )
+        ).all()
+        for user in users:
+            session.info["tenant_id"] = medical_scenario.tenant_id
+            session.info["user_id"] = user.id
+            session.info.pop("permission_cache", None)
+            try:
+                principal = permission_service.require_principal(session)
+            except Exception:  # noqa: BLE001 - keep searching valid retained users.
+                continue
+            break
+        if principal is None:
+            raise RuntimeError("medical provider verification principal is unavailable")
+
+        port_key = f"runtime_verify_{uuid4().hex[:12]}"
+        function_id = uuid4().hex
+        function = FunctionDefinition(
+            id=function_id,
+            scenario_id=medical_scenario.id,
+            name="Runtime verification provider function",
+            description="Transaction-local Provider acceptance definition.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["charge_threshold"],
+                    },
+                    "service_name": {"type": "string"},
+                    "threshold": {"type": "number"},
+                    "limit": {"type": "integer", "minimum": 1},
+                    "offset": {"type": "integer", "minimum": 0},
+                },
+                "required": ["strategy", "service_name", "threshold"],
+                "additionalProperties": False,
+            },
+            output_schema={"type": "object", "properties": {}},
+            runtime_kind="provider",
+            runtime_config={
+                "provider_key": PROVIDER_KEY,
+                "provider_version": PROVIDER_VERSION,
+                "provider_config": {
+                    "input_port_key": port_key,
+                    "mapping_ids": [str(mapping.id) for mapping in provider_mappings],
+                },
+            },
+        )
+        port = ScenarioCapabilityPort(
+            id=uuid4().hex,
+            tenant_id=medical_scenario.tenant_id,
+            scenario_id=medical_scenario.id,
+            capability_kind="function",
+            capability_key=function.id,
+            port_key=port_key,
+            name="Runtime verification dataset",
+            direction="input",
+            role="invocation_input",
+            media_kind="dataset",
+            dataset_id=dataset_version.dataset_id,
+            dataset_schema_id=dataset_version.schema_id,
+            schema_document={"type": "array"},
+            is_required=True,
+            cardinality="one",
+            binding_policy="per_invocation",
+            status="active",
+        )
+        session.add_all([function, port])
+        session.flush()
+        deployment, _inputs = capability_application_service.resolve_deployment(
+            session,
+            medical_scenario,
+            environment="dev",
+        )
+        request = Request(
+            capability=CapabilityRef(kind="function", resource_id=function.id),
+            inputs={
                 "strategy": "charge_threshold",
                 "service_name": service_name,
                 "threshold": 0,
                 "limit": 3,
                 "offset": 0,
             },
-            include_sensitive=True,
-            property_access=medical_audit_service.access_policy(
-                sorted(medical_audit_service._ALL_MEDICAL_PROPERTIES)
+            binding_overrides=(
+                BindingOverride(
+                    port_key=port_key,
+                    binding_kind="dataset_version",
+                    reference_id=dataset_version.id,
+                    signature=dataset_version.content_hash,
+                ),
             ),
+            correlation_id=f"runtime-verify:{uuid4().hex}",
+            expected_definition_hash=deployment.definition_hash,
+            expected_deployment_fingerprint=deployment.fingerprint,
         )
+        receipt = capability_application_service.invoke(
+            session,
+            medical_scenario,
+            Actor(
+                actor_type="service",
+                principal_id="postgresql-runtime-verifier",
+                tenant_id=medical_scenario.tenant_id,
+                user_id=principal.user_id,
+                roles=principal.role_keys,
+                scopes=("capability:read", "capability:invoke"),
+            ),
+            request,
+            environment="dev",
+            invocation_source="internal",
+        )
+        audit = receipt.output
         if not audit.get("ok") or int(audit["summary"]["violation_count"]) <= 0:
             raise RuntimeError("medical audit did not return deterministic evidence")
+        grounding = audit.get("grounding") or {}
+        handles = (grounding.get("provenance") or {}).get("data_handles") or []
+        public_evidence = audit.get("evidence") or {}
+        serialized_audit = canonical_json(audit)
+        if (
+            receipt.definition_hash != deployment.definition_hash
+            or receipt.data_context_fingerprint
+            != (grounding.get("provenance") or {}).get("data_context_fingerprint")
+            or len(handles) != 1
+            or handles[0].get("version_id") != dataset_version.id
+            or public_evidence.get("source_id") != dataset_version.id
+        ):
+            raise RuntimeError("medical provider provenance is not fixed to the dataset version")
+        if (
+            "tables" in public_evidence
+            or "resolved_columns" in public_evidence
+            or not public_evidence.get("mapping_contract_fingerprint")
+            or medical_source.id in serialized_audit
+            or charge_table in serialized_audit
+        ):
+            raise RuntimeError("medical provider public evidence exposed physical mapping facts")
 
         dataset_count = int(
             session.scalar(select(func.count()).select_from(LogicalDataset)) or 0

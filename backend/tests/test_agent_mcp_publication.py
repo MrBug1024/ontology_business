@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -18,9 +19,14 @@ from sqlalchemy.pool import StaticPool
 from app import agent_mcp_server
 from app.database import Base
 from app.external_api_models import AgentMCPService
-from app.models import Agent, Tenant, User
+from app.models import Agent, BusinessScenario, FunctionDefinition, Tenant, User
 from app.routers import agent_mcp
-from app.services import agent_mcp_service, permission_service
+from app.services import (
+    agent_mcp_service,
+    capability_mcp_service,
+    external_api_service,
+    permission_service,
+)
 from app.services.auth_service import get_tenant_db
 
 
@@ -176,6 +182,7 @@ class AgentMCPPublicationTests(unittest.TestCase):
             db.close()
 
     def test_official_client_can_initialize_list_and_call_with_bound_token(self) -> None:
+        gateway = importlib.reload(agent_mcp_server)
         raw_token, hashed, prefix, hint = agent_mcp_service.issue_token()
         db = self.Session()
         try:
@@ -200,8 +207,8 @@ class AgentMCPPublicationTests(unittest.TestCase):
             db.close()
 
         async def exercise() -> None:
-            transport = httpx.ASGITransport(app=agent_mcp_server.mcp_app)
-            async with agent_mcp_server.mcp_server.session_manager.run():
+            transport = httpx.ASGITransport(app=gateway.mcp_app)
+            async with gateway.mcp_server.session_manager.run():
                 async with httpx.AsyncClient(
                     transport=transport,
                     base_url="http://testserver",
@@ -214,12 +221,59 @@ class AgentMCPPublicationTests(unittest.TestCase):
                             initialized = await session.initialize()
                             self.assertEqual(initialized.serverInfo.name, "Ontology Platform Agent Gateway")
                             tools = await session.list_tools()
-                            self.assertEqual([tool.name for tool in tools.tools], ["invoke_agent"])
+                            self.assertEqual(
+                                {tool.name for tool in tools.tools},
+                                {
+                                    "get_capability_receipt",
+                                    "invoke_agent",
+                                    "invoke_capability",
+                                    "list_capabilities",
+                                },
+                            )
+                            invoke_tool = next(
+                                tool for tool in tools.tools if tool.name == "invoke_capability"
+                            )
+                            kind_schema = invoke_tool.inputSchema["properties"][
+                                "capability_kind"
+                            ]
+                            self.assertEqual(
+                                kind_schema.get("pattern"),
+                                "^(function|action|workflow)$",
+                            )
+                            managed_schema = invoke_tool.inputSchema["properties"][
+                                "managed_inputs"
+                            ]
+                            array_schemas = [
+                                candidate
+                                for candidate in managed_schema.get("anyOf", [managed_schema])
+                                if candidate.get("type") == "array"
+                            ]
+                            self.assertEqual(
+                                [candidate.get("maxItems") for candidate in array_schemas],
+                                [100],
+                            )
                             result = await session.call_tool(
                                 "invoke_agent", {"message": "执行医保违规审计"}
                             )
                             self.assertFalse(result.isError)
                             self.assertEqual(result.structuredContent["answer"], "审计完成")
+                            enhanced = await session.call_tool(
+                                "invoke_agent",
+                                {
+                                    "message": "分析本次输入",
+                                    "inputs": {"priority": 2},
+                                    "managed_inputs": [{
+                                        "port_key": "documents",
+                                        "asset_version_id": "asset-version-1",
+                                    }],
+                                    "capability": {
+                                        "kind": "function",
+                                        "key": "function-1",
+                                    },
+                                    "idempotency_key": "stable-agent-call-1",
+                                },
+                            )
+                            self.assertFalse(enhanced.isError)
 
         with (
             patch.object(agent_mcp_service, "SessionLocal", self.Session),
@@ -227,7 +281,117 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 agent_mcp_service,
                 "invoke_published_agent",
                 return_value={"answer": "审计完成", "conversation_id": "conversation-test"},
-            ),
+            ) as invoke_mock,
+        ):
+            asyncio.run(exercise())
+        first = invoke_mock.call_args_list[0]
+        self.assertEqual(first.kwargs["message"], "执行医保违规审计")
+        self.assertIsNone(first.kwargs["inputs"])
+        second = invoke_mock.call_args_list[1]
+        self.assertEqual(second.kwargs["inputs"], {"priority": 2})
+        self.assertEqual(
+            second.kwargs["managed_inputs"],
+            [{"port_key": "documents", "asset_version_id": "asset-version-1"}],
+        )
+        self.assertEqual(second.kwargs["capability"], {"kind": "function", "key": "function-1"})
+        self.assertEqual(second.kwargs["idempotency_key"], "stable-agent-call-1")
+
+    def test_external_capability_key_can_use_generic_mcp_tools(self) -> None:
+        gateway = importlib.reload(agent_mcp_server)
+        db = self.Session()
+        try:
+            scenario = BusinessScenario(
+                id="scenario-cap-mcp",
+                tenant_id=self.tenant.id,
+                name="Generic capability MCP",
+                status="active",
+            )
+            function = FunctionDefinition(
+                id="function-cap-mcp",
+                scenario_id=scenario.id,
+                name="Weighted score",
+                input_schema={
+                    "type": "object",
+                    "properties": {"amount": {"type": "number"}},
+                    "required": ["amount"],
+                    "additionalProperties": False,
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {"score": {"type": "number"}},
+                },
+                runtime_kind="weighted_score",
+                runtime_config={"weights": {"amount": 0.5}, "bias": 2},
+            )
+            db.add_all([scenario, function])
+            db.commit()
+            _key, raw_token = external_api_service.issue_key(
+                db,
+                tenant_id=self.tenant.id,
+                user_id=self.owner.id,
+                issued_by_user_id=self.owner.id,
+                name="capability-mcp-client",
+                scopes=["capabilities:read", "capabilities:invoke"],
+                expires_in_days=30,
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        async def exercise() -> None:
+            transport = httpx.ASGITransport(app=gateway.mcp_app)
+            async with gateway.mcp_server.session_manager.run():
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                    headers={"Authorization": f"Bearer {raw_token}"},
+                ) as http_client:
+                    async with streamable_http_client(
+                        "http://testserver/mcp",
+                        http_client=http_client,
+                    ) as (read_stream, write_stream, _):
+                        async with ClientSession(read_stream, write_stream) as session:
+                            await session.initialize()
+                            listed = await session.call_tool(
+                                "list_capabilities",
+                                {
+                                    "scenario_id": scenario.id,
+                                    "environment": "dev",
+                                },
+                            )
+                            self.assertFalse(listed.isError)
+                            capabilities = listed.structuredContent["capabilities"]
+                            self.assertEqual([item["key"] for item in capabilities], [function.id])
+                            self.assertNotIn("provider_key", str(listed.structuredContent))
+
+                            invoked = await session.call_tool(
+                                "invoke_capability",
+                                {
+                                    "scenario_id": scenario.id,
+                                    "capability_kind": "function",
+                                    "capability_key": function.id,
+                                    "environment": "dev",
+                                    "inputs": {"amount": 4},
+                                },
+                            )
+                            self.assertFalse(invoked.isError)
+                            receipt = invoked.structuredContent
+                            self.assertEqual(receipt["status"], "succeeded")
+                            self.assertEqual(receipt["output"]["score"], 4)
+
+                            queried = await session.call_tool(
+                                "get_capability_receipt",
+                                {"invocation_id": receipt["invocation_id"]},
+                            )
+                            self.assertFalse(queried.isError)
+                            self.assertEqual(
+                                queried.structuredContent["output"],
+                                receipt["output"],
+                            )
+
+        with (
+            patch.object(agent_mcp_service, "SessionLocal", self.Session),
+            patch.object(capability_mcp_service, "SessionLocal", self.Session),
         ):
             asyncio.run(exercise())
 

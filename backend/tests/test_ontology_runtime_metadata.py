@@ -238,8 +238,8 @@ class MappingTransformPipelineTests(unittest.TestCase):
             tenant_id="tenant-transform",
             scenario_id=self.scenario.id,
             name="供应商源",
-            type="sqlite",
-            config={"path": "unused-by-mocked-query"},
+            type="postgres",
+            config={},
         )
         self.mapping = DataMapping(
             id="mapping-transform",
@@ -327,6 +327,26 @@ class MappingTransformPipelineTests(unittest.TestCase):
 
 
 class SQLiteMigrationIdempotenceTests(unittest.TestCase):
+    def test_legacy_helpers_refuse_postgresql_schema_mutation(self) -> None:
+        postgresql_engine = SimpleNamespace(
+            dialect=SimpleNamespace(name="postgresql")
+        )
+        helpers = (
+            database._migrate_mcp_name_identity,
+            database._migrate_ontology_api_names,
+            database._migrate_ontology_runtime_metadata,
+            database._migrate_action_decision_chain,
+            database._migrate_data_sources_nullable_scenario,
+            database._migrate_assistant_attachment_lifecycle,
+            database._migrate_assistant_compilation_jobs,
+            database._repair_nullable_orphan_references,
+        )
+        with patch.object(database, "engine", postgresql_engine):
+            for helper in helpers:
+                with self.subTest(helper=helper.__name__):
+                    with self.assertRaisesRegex(RuntimeError, "Alembic"):
+                        helper()
+
     def test_existing_rows_are_upgraded_twice_without_overwrite(self) -> None:
         legacy_engine = create_engine("sqlite:///:memory:")
         with legacy_engine.begin() as connection:

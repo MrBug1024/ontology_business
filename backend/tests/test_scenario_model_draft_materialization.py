@@ -1180,8 +1180,8 @@ class ScenarioModelDraftMaterializationTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="项目主数据",
-            type="sqlite",
-            config={"path": "acceptance-only.db"},
+            type="postgres",
+            config={},
             status="ok",
         )
         self.db.add(source)

@@ -25,7 +25,6 @@ from sqlalchemy import (
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .config import get_settings
 from .database import Base, orm_datetime as DateTime
 
 
@@ -40,6 +39,13 @@ def _now() -> datetime:
 def _json_document_type():
     """Use PostgreSQL JSONB for document-shaped values."""
     return JSON().with_variant(postgresql.JSONB(none_as_null=True), "postgresql")
+
+
+def _nullable_json_document_type():
+    """Use SQL NULL, rather than JSON ``null``, for an absent document."""
+    return JSON(none_as_null=True).with_variant(
+        postgresql.JSONB(none_as_null=True), "postgresql"
+    )
 
 
 def _sha256_check(column_name: str) -> str:
@@ -60,8 +66,8 @@ def _assistant_attachment_expiry() -> datetime:
 
 
 def _runtime_environment_default() -> str:
-    """Keep direct ORM-created runs aligned with this server deployment."""
-    return get_settings().runtime_environment
+    """Default control-plane rows without consulting host deployment config."""
+    return "dev"
 
 
 def normalize_mcp_name_key(value: str) -> str:
@@ -283,7 +289,7 @@ class BusinessScenario(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     industry: Mapped[str] = mapped_column(String(100), default="")
     namespace: Mapped[str] = mapped_column(String(180), default="default")
-    status: Mapped[str] = mapped_column(String(20), default="draft")  # draft / active
+    status: Mapped[str] = mapped_column(String(20), default="draft")  # draft / active / retired
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
@@ -644,6 +650,10 @@ class DataSource(Base):
     __tablename__ = "data_sources"
     __table_args__ = (
         UniqueConstraint("id", "tenant_id", name="uq_data_sources_id_tenant"),
+        CheckConstraint(
+            "resource_scope IN ('modeling', 'agent_runtime')",
+            name="ck_data_sources_resource_scope",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -653,6 +663,14 @@ class DataSource(Base):
     is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     scenario_id: Mapped[str | None] = mapped_column(
         ForeignKey("business_scenarios.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    # Existing rows are modeling material. Agent runtime connectors are kept
+    # outside the modeling-material catalog and are never listed there.
+    resource_scope: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="modeling", server_default="modeling"
+    )
+    owner_agent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="CASCADE"), index=True, nullable=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     type: Mapped[str] = mapped_column(String(30), nullable=False)  # postgres / file_bucket / dataset
@@ -1375,6 +1393,13 @@ for _connector_model in _CONNECTOR_REVISION_FIELDS:
 # ──────────────────────────────────────────────
 class Agent(Base):
     __tablename__ = "agents"
+    __table_args__ = (
+        CheckConstraint(
+            "runtime_binding_mode IN ('legacy', 'shadow', 'prefer_capability', "
+            "'capability_only')",
+            name="ck_agents_runtime_binding_mode",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str | None] = mapped_column(
@@ -1390,9 +1415,18 @@ class Agent(Base):
     )
     system_prompt: Mapped[str] = mapped_column(Text, default="")
     data_source_ids: Mapped[list] = mapped_column(JSON, default=list)
+    # Formal databases configured on the Agent. These ids always point to
+    # DataSource rows whose resource_scope is agent_runtime.
+    runtime_data_source_ids: Mapped[list] = mapped_column(JSON, default=list)
     # Legacy NULL remains representable for old databases but is interpreted as
     # explicit-empty. Only an explicitly configured scope may grant tools.
     capability_scope: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    # ``legacy`` values remain representable only so old snapshots can still be
+    # decoded.  Product/runtime code migrates every Agent to the capability
+    # path; modeling materials are never an Agent runtime binding.
+    runtime_binding_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="capability_only", server_default="capability_only"
+    )
     temperature: Mapped[float] = mapped_column(Float, default=0.2)
     max_tokens: Mapped[int] = mapped_column(Integer, default=4096)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -1445,6 +1479,14 @@ class Message(Base):
     stream_finalized: Mapped[bool] = mapped_column(Boolean, default=True)
     # Agent 检索到的稳定资料引用。保留 file/chunk/字符偏移，令历史消息仍可追溯原文。
     citations: Mapped[list] = mapped_column(JSON, default=list)
+    # Per-turn capability input audit.  This is deliberately a safe outline:
+    # hashes, field types, runtime selection and deployment fingerprints only;
+    # raw structured values and connector configuration are never stored here.
+    input_snapshot: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    # Governed version/invocation references used by this exact turn.  These
+    # remain separate from legacy RAG citations because their authorization and
+    # replay semantics are defined by the capability invocation audit.
+    evidence_refs: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
@@ -1861,7 +1903,8 @@ class FunctionDefinition(Base):
     # scenario and is never inferred from this field.
     visibility: Mapped[str] = mapped_column(String(20), default="scenario")
     # contract / weighted_score / threshold / geo_distance /
-    # timeseries_aggregate
+    # timeseries_aggregate / provider. Provider rows store only a trusted
+    # registry key, explicit version and value-only config, never an import path.
     runtime_kind: Mapped[str] = mapped_column(String(40), default="contract")
     runtime_config: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -2275,7 +2318,9 @@ class OntologyRelease(Base):
     )
     # dev / staging / prod
     environment: Mapped[str] = mapped_column(String(20), nullable=False)
-    # released / superseded / rolled_back
+    # released / superseded / rolled_back.  An explicit environment withdrawal
+    # reuses the inactive ``rolled_back`` state and records its own audit facts
+    # below so it cannot be confused with a snapshot rollback.
     status: Mapped[str] = mapped_column(String(20), default="released")
     notes: Mapped[str] = mapped_column(Text, default="")
     # Immutable, credential-free evidence of the bindings that passed the
@@ -2285,6 +2330,13 @@ class OntologyRelease(Base):
     created_by_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    withdrawn_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    withdrawn_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    withdraw_reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship(back_populates="ontology_releases")
@@ -2346,6 +2398,10 @@ class ConnectorBinding(Base):
             "scenario_id", "environment", "binding_key",
             name="uq_connector_bindings_scenario_environment_key",
         ),
+        UniqueConstraint(
+            "id", "tenant_id", "scenario_id",
+            name="uq_connector_bindings_id_scope",
+        ),
         Index("ix_connector_bindings_connector", "connector_kind", "connector_id"),
         Index("ix_connector_bindings_scenario_environment", "scenario_id", "environment"),
     )
@@ -2396,6 +2452,11 @@ class WorkflowRun(Base):
         Index("ix_workflow_runs_scenario_created", "scenario_id", "created_at"),
         Index("ix_workflow_runs_release", "release_id", "definition_snapshot_id"),
         Index("uq_workflow_runs_dedupe", "workflow_id", "dedupe_key", unique=True),
+        CheckConstraint(
+            "input_digest = '' OR (length(input_digest) = 64 "
+            "AND input_digest = lower(input_digest))",
+            name="ck_workflow_runs_input_digest",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -2419,7 +2480,18 @@ class WorkflowRun(Base):
     )
     # 事件和调度投递以此键去重；手动运行不填写，允许重复提交。
     dedupe_key: Mapped[str | None] = mapped_column(String(180), nullable=True)
-    input_params: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Caller parameters are never stored here in plaintext.  New runs contain
+    # only a versioned AES-256-GCM envelope; ``input_summary`` is a separately
+    # authenticated, value-free API projection and ``input_digest`` is a keyed
+    # equality/audit fingerprint.  Empty defaults keep directly imported or
+    # malformed rows non-sensitive but deliberately non-executable.
+    input_payload: Mapped[dict] = mapped_column(
+        "input_payload", JSON, default=dict, nullable=False
+    )
+    input_summary: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    input_digest: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     # Fixed when queued so approval/retry cannot silently switch environments.
     environment: Mapped[str] = mapped_column(String(20), default=_runtime_environment_default)
     # A staging/prod run pins the immutable released definition.  The live
@@ -2834,6 +2906,10 @@ class DataAssetVersion(Base):
         CheckConstraint(
             _sha256_check("content_sha256"), name="ck_asset_versions_content_sha"
         ),
+        CheckConstraint(
+            "(bucket_file_id IS NULL) = (bucket_data_source_id IS NULL)",
+            name="ck_asset_versions_blob_pair",
+        ),
         Index("ix_asset_versions_asset_status", "asset_id", "status"),
     )
 
@@ -2845,11 +2921,11 @@ class DataAssetVersion(Base):
         ForeignKey("data_assets.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     version_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    bucket_file_id: Mapped[str] = mapped_column(
-        ForeignKey("bucket_files.id", ondelete="RESTRICT"), nullable=False, index=True
+    bucket_file_id: Mapped[str | None] = mapped_column(
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"), nullable=True, index=True
     )
-    bucket_data_source_id: Mapped[str] = mapped_column(
-        String(32), nullable=False, index=True
+    bucket_data_source_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
     )
     provenance_kind: Mapped[str] = mapped_column(
         String(30), default="upload", nullable=False
@@ -2873,7 +2949,7 @@ class DataAssetVersion(Base):
     asset: Mapped[DataAsset] = relationship(
         back_populates="versions", foreign_keys=[asset_id]
     )
-    bucket_file: Mapped[BucketFile] = relationship(foreign_keys=[bucket_file_id])
+    bucket_file: Mapped[BucketFile | None] = relationship(foreign_keys=[bucket_file_id])
 
 
 class LogicalDataset(Base):
@@ -3777,7 +3853,10 @@ class ScenarioDatasetBinding(Base):
 
     __tablename__ = "scenario_dataset_bindings"
     __table_args__ = (
-        UniqueConstraint("scenario_id", "binding_key", name="uq_scenario_dataset_binding_key"),
+        UniqueConstraint(
+            "scenario_id", "environment", "binding_key",
+            name="uq_scenario_dataset_binding_key",
+        ),
         UniqueConstraint(
             "id",
             "scenario_id",
@@ -3798,8 +3877,13 @@ class ScenarioDatasetBinding(Base):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "role IN ('input', 'reference', 'rules', 'output')",
+            "role IN ('input', 'modeling_evidence', 'test_fixture', "
+            "'invocation_input', 'reference', 'rules', 'output')",
             name="ck_scenario_dataset_bindings_role",
+        ),
+        CheckConstraint(
+            "environment IN ('dev', 'staging', 'prod')",
+            name="ck_scenario_dataset_bindings_environment",
         ),
         CheckConstraint(
             "status IN ('active', 'disabled', 'error')",
@@ -3841,6 +3925,10 @@ class ScenarioDatasetBinding(Base):
             ondelete="RESTRICT",
         ),
         Index("ix_scenario_dataset_bindings_dataset", "dataset_id", "status"),
+        Index(
+            "ix_scenario_dataset_bindings_scenario_environment",
+            "scenario_id", "environment", "role", "status",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -3855,6 +3943,9 @@ class ScenarioDatasetBinding(Base):
     )
     binding_key: Mapped[str] = mapped_column(String(180), nullable=False)
     role: Mapped[str] = mapped_column(String(20), default="input", nullable=False)
+    environment: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="dev", server_default="dev"
+    )
     binding_mode: Mapped[str] = mapped_column(String(20), nullable=False)
     dataset_head_id: Mapped[str | None] = mapped_column(
         String(32), nullable=True, index=True
@@ -3883,6 +3974,491 @@ class ScenarioDatasetBinding(Base):
         primaryjoin="ScenarioDatasetBinding.dataset_version_id == DatasetVersion.id",
         foreign_keys=[dataset_version_id],
         overlaps="dataset,dataset_head",
+    )
+
+
+class ScenarioCapabilityPort(Base):
+    """Versionable input or output contract for one scenario capability."""
+
+    __tablename__ = "scenario_capability_ports"
+    __table_args__ = (
+        UniqueConstraint(
+            "scenario_id",
+            "capability_kind",
+            "capability_key",
+            "port_key",
+            name="uq_scenario_capability_ports_owner_key",
+        ),
+        UniqueConstraint(
+            "id", "tenant_id", "scenario_id",
+            name="uq_scenario_capability_ports_id_scope",
+        ),
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"],
+            ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_scenario_capability_ports_scenario_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_schema_id", "dataset_id", "tenant_id"],
+            [
+                "dataset_schemas.id",
+                "dataset_schemas.dataset_id",
+                "dataset_schemas.tenant_id",
+            ],
+            name="fk_scenario_capability_ports_schema_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "capability_kind IN ('function', 'action', 'workflow')",
+            name="ck_scenario_capability_ports_capability_kind",
+        ),
+        CheckConstraint(
+            "direction IN ('input', 'output')",
+            name="ck_scenario_capability_ports_direction",
+        ),
+        CheckConstraint(
+            "role IN ('modeling_evidence', 'test_fixture', 'invocation_input', "
+            "'reference', 'rules', 'output')",
+            name="ck_scenario_capability_ports_role",
+        ),
+        CheckConstraint(
+            "media_kind IN ('message', 'structured', 'document', 'dataset', "
+            "'connector', 'artifact')",
+            name="ck_scenario_capability_ports_media_kind",
+        ),
+        CheckConstraint(
+            "cardinality IN ('one', 'many')",
+            name="ck_scenario_capability_ports_cardinality",
+        ),
+        CheckConstraint(
+            "binding_policy IN ('per_invocation', 'scenario_default', "
+            "'release_pinned', 'none')",
+            name="ck_scenario_capability_ports_binding_policy",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'active', 'retired')",
+            name="ck_scenario_capability_ports_status",
+        ),
+        CheckConstraint(
+            "(dataset_id IS NULL AND dataset_schema_id IS NULL) OR "
+            "(dataset_id IS NOT NULL AND dataset_schema_id IS NOT NULL)",
+            name="ck_scenario_capability_ports_dataset_contract",
+        ),
+        CheckConstraint(
+            "(direction = 'output' AND role = 'output') OR "
+            "(direction = 'input' AND role <> 'output')",
+            name="ck_scenario_capability_ports_direction_role",
+        ),
+        Index(
+            "ix_scenario_capability_ports_owner_role",
+            "scenario_id", "capability_kind", "capability_key",
+            "direction", "role", "status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(
+        ForeignKey("business_scenarios.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    capability_kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    capability_key: Mapped[str] = mapped_column(String(240), nullable=False)
+    port_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    name: Mapped[str] = mapped_column(String(300), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    direction: Mapped[str] = mapped_column(String(20), nullable=False)
+    role: Mapped[str] = mapped_column(String(30), nullable=False)
+    media_kind: Mapped[str] = mapped_column(
+        String(20), default="structured", nullable=False
+    )
+    dataset_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    dataset_schema_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    schema_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    is_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    cardinality: Mapped[str] = mapped_column(String(20), default="one", nullable=False)
+    binding_policy: Mapped[str] = mapped_column(
+        String(30), default="per_invocation", nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False)
+    config: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(foreign_keys=[scenario_id])
+    dataset_schema: Mapped[DatasetSchema | None] = relationship(
+        foreign_keys=[dataset_schema_id, dataset_id, tenant_id]
+    )
+
+
+class CapabilityInvocation(Base):
+    """One auditable execution of a scenario capability contract."""
+
+    __tablename__ = "capability_invocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "id", "tenant_id", "scenario_id",
+            name="uq_capability_invocations_id_scope",
+        ),
+        UniqueConstraint(
+            "tenant_id", "request_id",
+            name="uq_capability_invocations_request",
+        ),
+        UniqueConstraint(
+            "tenant_id", "scenario_id", "capability_kind", "capability_key",
+            "definition_hash", "deployment_fingerprint", "idempotency_key",
+            name="uq_capability_invocations_idempotency",
+        ),
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"],
+            ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_capability_invocations_scenario_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["release_id", "tenant_id", "scenario_id", "definition_snapshot_id"],
+            [
+                "ontology_releases.id",
+                "ontology_releases.tenant_id",
+                "ontology_releases.scenario_id",
+                "ontology_releases.snapshot_id",
+            ],
+            name="fk_capability_invocations_release_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "environment IN ('dev', 'staging', 'prod')",
+            name="ck_capability_invocations_environment",
+        ),
+        CheckConstraint(
+            "invocation_source IN ('internal', 'agent', 'rest', 'mcp')",
+            name="ck_capability_invocations_source",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'awaiting_confirmation', "
+            "'succeeded', 'failed', 'cancelled', 'rejected', 'timed_out')",
+            name="ck_capability_invocations_status",
+        ),
+        CheckConstraint(
+            "length(capability_kind) BETWEEN 1 AND 40 "
+            "AND capability_kind = lower(capability_kind) "
+            "AND length(capability_key) BETWEEN 1 AND 240",
+            name="ck_capability_invocations_capability_identity",
+        ),
+        CheckConstraint(
+            "length(correlation_id) BETWEEN 1 AND 240",
+            name="ck_capability_invocations_correlation",
+        ),
+        CheckConstraint(
+            "length(principal_type) BETWEEN 1 AND 40 "
+            "AND principal_type = lower(principal_type) "
+            "AND length(principal_id) BETWEEN 1 AND 240",
+            name="ck_capability_invocations_principal",
+        ),
+        CheckConstraint(
+            "(release_id IS NULL AND definition_snapshot_id IS NULL) OR "
+            "(release_id IS NOT NULL AND definition_snapshot_id IS NOT NULL)",
+            name="ck_capability_invocations_release_pair",
+        ),
+        CheckConstraint(
+            _sha256_check("input_hash"),
+            name="ck_capability_invocations_input_hash",
+        ),
+        CheckConstraint(
+            _sha256_check("definition_hash"),
+            name="ck_capability_invocations_definition_hash",
+        ),
+        CheckConstraint(
+            _sha256_check("deployment_fingerprint"),
+            name="ck_capability_invocations_deployment_fingerprint",
+        ),
+        CheckConstraint(
+            _sha256_check("data_context_fingerprint"),
+            name="ck_capability_invocations_data_context_fingerprint",
+        ),
+        Index(
+            "ix_capability_invocations_scenario_created",
+            "scenario_id", "created_at",
+        ),
+        Index(
+            "ix_capability_invocations_dispatch",
+            "environment", "status", "created_at",
+        ),
+        Index(
+            "ix_capability_invocations_capability_created",
+            "tenant_id", "scenario_id", "capability_kind", "capability_key",
+            "created_at",
+        ),
+        Index(
+            "ix_capability_invocations_principal_created",
+            "tenant_id", "principal_type", "principal_id", "created_at",
+        ),
+        Index(
+            "ix_capability_invocations_correlation",
+            "tenant_id", "correlation_id",
+        ),
+        Index(
+            "ix_capability_invocations_deployment",
+            "tenant_id", "deployment_fingerprint", "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    agent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    requested_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    release_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    definition_snapshot_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    environment: Mapped[str] = mapped_column(String(20), nullable=False)
+    capability_kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    capability_key: Mapped[str] = mapped_column(String(240), nullable=False)
+    definition_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    deployment_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    data_context_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(240), nullable=False)
+    principal_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    principal_id: Mapped[str] = mapped_column(String(240), nullable=False)
+    invocation_source: Mapped[str] = mapped_column(
+        String(20), default="internal", nullable=False
+    )
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(180), nullable=True
+    )
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    request_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    result_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    error_code: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    scenario: Mapped[BusinessScenario] = relationship(foreign_keys=[scenario_id])
+    agent: Mapped[Agent | None] = relationship(foreign_keys=[agent_id])
+    release: Mapped[OntologyRelease | None] = relationship(
+        foreign_keys=[release_id, tenant_id, scenario_id, definition_snapshot_id],
+        viewonly=True,
+    )
+    input_bindings: Mapped[list["RunInputBinding"]] = relationship(
+        back_populates="invocation", cascade="all, delete-orphan"
+    )
+
+
+class RunInputBinding(Base):
+    """One provided source and its optional resolved immutable dataset version."""
+
+    __tablename__ = "run_input_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "invocation_id", "capability_port_id", "ordinal",
+            name="uq_run_input_bindings_port_ordinal",
+        ),
+        ForeignKeyConstraint(
+            ["invocation_id", "tenant_id", "scenario_id"],
+            [
+                "capability_invocations.id",
+                "capability_invocations.tenant_id",
+                "capability_invocations.scenario_id",
+            ],
+            name="fk_run_input_bindings_invocation_scope",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["capability_port_id", "tenant_id", "scenario_id"],
+            [
+                "scenario_capability_ports.id",
+                "scenario_capability_ports.tenant_id",
+                "scenario_capability_ports.scenario_id",
+            ],
+            name="fk_run_input_bindings_port_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["asset_version_id", "tenant_id"],
+            ["data_asset_versions.id", "data_asset_versions.tenant_id"],
+            name="fk_run_input_bindings_asset_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["source_dataset_version_id", "tenant_id"],
+            ["dataset_versions.id", "dataset_versions.tenant_id"],
+            name="fk_run_input_bindings_source_version_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_head_id", "source_dataset_id", "tenant_id"],
+            ["dataset_heads.id", "dataset_heads.dataset_id", "dataset_heads.tenant_id"],
+            name="fk_run_input_bindings_head_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["connector_binding_id", "tenant_id", "scenario_id"],
+            [
+                "connector_bindings.id",
+                "connector_bindings.tenant_id",
+                "connector_bindings.scenario_id",
+            ],
+            name="fk_run_input_bindings_connector_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["resolved_dataset_version_id", "tenant_id"],
+            ["dataset_versions.id", "dataset_versions.tenant_id"],
+            name="fk_run_input_bindings_resolved_version_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "source_kind IN ('inline', 'asset_version', 'dataset_version', "
+            "'dataset_head', 'connector_binding')",
+            name="ck_run_input_bindings_source_kind",
+        ),
+        CheckConstraint(
+            "(CASE WHEN inline_document IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN asset_version_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN source_dataset_version_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN dataset_head_id IS NULL THEN 0 ELSE 1 END + "
+            "CASE WHEN connector_binding_id IS NULL THEN 0 ELSE 1 END) = 1",
+            name="ck_run_input_bindings_one_source",
+        ),
+        CheckConstraint(
+            "(source_kind = 'inline' AND inline_document IS NOT NULL) OR "
+            "(source_kind = 'asset_version' AND asset_version_id IS NOT NULL) OR "
+            "(source_kind = 'dataset_version' AND source_dataset_version_id IS NOT NULL) OR "
+            "(source_kind = 'dataset_head' AND dataset_head_id IS NOT NULL "
+            "AND source_dataset_id IS NOT NULL) OR "
+            "(source_kind = 'connector_binding' AND connector_binding_id IS NOT NULL)",
+            name="ck_run_input_bindings_source_matches_kind",
+        ),
+        CheckConstraint(
+            "(dataset_head_id IS NULL AND source_dataset_id IS NULL) OR "
+            "(dataset_head_id IS NOT NULL AND source_dataset_id IS NOT NULL)",
+            name="ck_run_input_bindings_head_pair",
+        ),
+        CheckConstraint(
+            "ordinal >= 0", name="ck_run_input_bindings_ordinal"
+        ),
+        CheckConstraint(
+            "status IN ('provided', 'resolving', 'ready', 'failed')",
+            name="ck_run_input_bindings_status",
+        ),
+        Index(
+            "ix_run_input_bindings_invocation_status",
+            "invocation_id", "status", "ordinal",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    invocation_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    capability_port_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    inline_document: Mapped[dict | list | str | int | float | bool | None] = mapped_column(
+        _nullable_json_document_type(), nullable=True
+    )
+    asset_version_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    source_dataset_version_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    dataset_head_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    source_dataset_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    connector_binding_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    resolved_dataset_version_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    schema_hash: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="provided", nullable=False)
+    binding_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    invocation: Mapped[CapabilityInvocation] = relationship(
+        back_populates="input_bindings",
+        foreign_keys=[invocation_id, tenant_id, scenario_id],
+    )
+    capability_port: Mapped[ScenarioCapabilityPort] = relationship(
+        foreign_keys=[capability_port_id, tenant_id, scenario_id], viewonly=True
+    )
+    asset_version: Mapped[DataAssetVersion | None] = relationship(
+        foreign_keys=[asset_version_id, tenant_id], viewonly=True
+    )
+    source_dataset_version: Mapped[DatasetVersion | None] = relationship(
+        foreign_keys=[source_dataset_version_id, tenant_id], viewonly=True
+    )
+    dataset_head: Mapped[DatasetHead | None] = relationship(
+        foreign_keys=[dataset_head_id, source_dataset_id, tenant_id], viewonly=True
+    )
+    connector_binding: Mapped[ConnectorBinding | None] = relationship(
+        foreign_keys=[connector_binding_id, tenant_id, scenario_id], viewonly=True
+    )
+    resolved_dataset_version: Mapped[DatasetVersion | None] = relationship(
+        foreign_keys=[resolved_dataset_version_id, tenant_id], viewonly=True
     )
 
 
@@ -4092,6 +4668,7 @@ class SemanticMapping(Base):
     )
     field_mappings: Mapped[list["SemanticFieldMapping"]] = relationship(
         back_populates="semantic_mapping",
+        cascade="all, delete-orphan",
         order_by="SemanticFieldMapping.ordinal",
         foreign_keys="SemanticFieldMapping.semantic_mapping_id",
     )

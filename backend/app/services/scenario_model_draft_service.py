@@ -53,6 +53,7 @@ RESOURCE_KINDS = frozenset({
     "rule",
     "event",
     "workflow",
+    "capability_port",
 })
 FORMAL_RESOURCE_KINDS = RESOURCE_KINDS - {"instance", "conceptual_mapping"}
 AUTO_REPAIR_MAPPING_ISSUE_CODES = frozenset({
@@ -86,6 +87,8 @@ _KIND_ALIASES = {
     "rules": "rule",
     "events": "event",
     "workflows": "workflow",
+    "capability_ports": "capability_port",
+    "ports": "capability_port",
 }
 _SECTION_KINDS = {
     "entities": "entity",
@@ -113,6 +116,7 @@ _DEFAULT_TASK_IDS = {
     "rule": "rules",
     "event": "rules",
     "workflow": "workflows",
+    "capability_port": "capabilities",
 }
 
 

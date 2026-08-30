@@ -1559,8 +1559,8 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 tenant_id="tenant-scenario-compiler",
                 scenario_id=self.scenario.id,
                 name=f"Catalog source {index:02d}",
-                type="sqlite",
-                config={"path": f"catalog-{index:02d}.sqlite3"},
+                type="postgres",
+                config={},
                 status="ok",
             )
             for index in range(1, 52)

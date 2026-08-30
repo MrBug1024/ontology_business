@@ -19,6 +19,55 @@ class Msg(BaseModel):
     data: Any = None
 
 
+class ScenarioReleaseWithdrawRequest(BaseModel):
+    confirmed: bool = False
+    reason: str = Field(min_length=1, max_length=8_000)
+
+    model_config = {"extra": "forbid"}
+
+
+class ScenarioReleaseWithdrawOut(BaseModel):
+    scenario_id: str
+    environment: Literal["staging", "prod"]
+    withdrawn_release_ids: list[str] = Field(default_factory=list)
+    changed: bool
+    withdrawn_at: datetime | None = None
+    withdrawn_by_user_id: str | None = None
+    reason: str = ""
+
+
+class ScenarioRestoreOut(BaseModel):
+    scenario_id: str
+    status: Literal["draft", "active"]
+    restored: bool
+
+
+class ScenarioPurgeRequest(BaseModel):
+    expected_name: str = Field(min_length=1, max_length=200)
+    confirmed: bool = False
+    delete_audit_history: bool = False
+
+    model_config = {"extra": "forbid"}
+
+
+class ScenarioPurgePlanOut(BaseModel):
+    scenario_id: str
+    scenario_name: str
+    status: str
+    can_purge: bool
+    blockers: list[str] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+    retained: dict[str, int] = Field(default_factory=dict)
+    requires_audit_confirmation: bool = False
+
+
+class ScenarioPurgeOut(BaseModel):
+    scenario_id: str
+    deleted: bool
+    deletion_jobs: int = 0
+    retained: dict[str, int] = Field(default_factory=dict)
+
+
 class RegisterIn(BaseModel):
     email: str
     password: str = Field(min_length=8, max_length=128)
@@ -157,10 +206,11 @@ class ScenarioIn(BaseModel):
     description: str = ""
     industry: str = ""
     namespace: str = Field(default="default", min_length=1, max_length=180)
-    status: str = "draft"
+    status: Literal["draft", "active"] = "draft"
 
 
 class ScenarioOut(ScenarioIn):
+    status: Literal["draft", "active", "retired"] = "draft"
     id: str
     created_at: datetime
     updated_at: datetime
@@ -467,7 +517,8 @@ class FunctionDefinitionIn(BaseModel):
     tags: list[str] = Field(default_factory=list, max_length=20)
     visibility: Literal["scenario", "tenant"] = "scenario"
     runtime_kind: Literal[
-        "contract", "weighted_score", "threshold", "geo_distance", "timeseries_aggregate"
+        "contract", "weighted_score", "threshold", "geo_distance", "timeseries_aggregate",
+        "provider",
     ] = "contract"
     runtime_config: dict = Field(default_factory=dict)
 
@@ -486,6 +537,7 @@ class FunctionDefinitionOut(FunctionDefinitionIn):
 class FunctionRunIn(BaseModel):
     params: dict = Field(default_factory=dict)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=180)
+    environment: Literal["dev", "staging", "prod"] = "dev"
 
 
 class FunctionRunOut(BaseModel):
@@ -582,7 +634,14 @@ class BucketFileOut(BaseModel):
 
 
 class ScenarioModelDraftResourceOut(BaseModel):
-    """An inert resource candidate visible in the scene draft workspace."""
+    """A governed candidate visible in the scene definition workspace.
+
+    ``publishable`` remains the legacy staging-layer safety flag: a candidate
+    row is never itself a runtime definition.  ``promotion_eligible`` is the
+    independent quality decision that says whether the candidate may be
+    formalised into the dev definition.  Its value never depends on whether
+    the source was an assistant, a person, or an import.
+    """
 
     id: str
     scenario_id: str
@@ -594,7 +653,7 @@ class ScenarioModelDraftResourceOut(BaseModel):
     resource_kind: Literal[
         "entity", "property", "relation", "instance", "mapping",
         "conceptual_mapping", "relation_mapping", "function", "action",
-        "rule", "event", "workflow",
+        "rule", "event", "workflow", "capability_port",
     ]
     resource_key: str
     title: str = ""
@@ -609,6 +668,16 @@ class ScenarioModelDraftResourceOut(BaseModel):
     ]
     enabled: Literal[False] = False
     publishable: Literal[False] = False
+    materialization_source: str = ""
+    source_origin: Literal["assistant", "manual", "imported", "unknown"] = "unknown"
+    validation_status: Literal["not_validated", "valid", "invalid"] = "not_validated"
+    lifecycle_status: Literal[
+        "candidate", "deferred", "formalized", "resolved", "superseded"
+    ] = "candidate"
+    promotion_eligible: bool = False
+    promotion_blockers: list[dict] = Field(default_factory=list)
+    activation_status: Literal["inactive", "active", "not_applicable"] = "inactive"
+    quality_fingerprint: str = ""
     resolved_resource_id: str = ""
     source_thread_id: str = ""
     source_message_id: str = ""
@@ -635,6 +704,57 @@ class ScenarioModelDraftResourcePatch(BaseModel):
     payload: dict
 
     model_config = {"extra": "forbid"}
+
+
+class ScenarioModelCandidateCreate(BaseModel):
+    """Create a human-authored candidate in the same governance lane as AI.
+
+    The payload uses the platform's resource contract for ``resource_kind``;
+    no business-domain fields or executable implementation are inferred.
+    """
+
+    resource_kind: Literal[
+        "entity", "property", "relation", "instance", "mapping",
+        "conceptual_mapping", "relation_mapping", "function", "action",
+        "rule", "event", "workflow", "capability_port",
+    ]
+    resource_key: str = Field(min_length=1, max_length=500)
+    title: str = Field(default="", max_length=300)
+    payload: dict
+    task_id: str = Field(default="", max_length=80)
+    source_refs: list[str] = Field(default_factory=list, max_length=100)
+
+    model_config = {"extra": "forbid"}
+
+
+class ScenarioModelCandidateRevisionRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+
+    model_config = {"extra": "forbid"}
+
+
+class ScenarioModelCandidatePromotionItem(BaseModel):
+    draft_id: str = Field(min_length=1, max_length=32)
+    expected_revision: int = Field(ge=0)
+
+    model_config = {"extra": "forbid"}
+
+
+class ScenarioModelCandidateBatchPromotionRequest(BaseModel):
+    items: list[ScenarioModelCandidatePromotionItem] = Field(
+        min_length=1,
+        max_length=200,
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class ScenarioModelCandidatePromotionOut(BaseModel):
+    ok: bool = True
+    atomic: bool = True
+    promoted: list[dict] = Field(default_factory=list)
+    counts: dict = Field(default_factory=dict)
+    quality_fingerprint: str = ""
 
 
 class ScenarioModelDraftResourceResolve(BaseModel):
@@ -1226,6 +1346,45 @@ class AgentCapabilitySummary(BaseModel):
     items: list[AgentCapabilityReadinessItem] = Field(default_factory=list)
 
 
+class AgentReadinessIssue(BaseModel):
+    code: str
+    label: str
+    target: str = ""
+    blocking: bool = True
+
+
+class AgentReadinessAxis(BaseModel):
+    ready: bool = False
+    missing: list[AgentReadinessIssue] = Field(default_factory=list)
+
+
+class AgentReadiness(BaseModel):
+    source: Literal["server", "legacy"] = "server"
+    definition: AgentReadinessAxis = Field(default_factory=AgentReadinessAxis)
+    validation: AgentReadinessAxis = Field(default_factory=AgentReadinessAxis)
+    release: AgentReadinessAxis = Field(default_factory=AgentReadinessAxis)
+    runtime: AgentReadinessAxis = Field(default_factory=AgentReadinessAxis)
+    definition_valid: bool = False
+    validation_ready: bool = False
+    release_ready: bool = False
+    runtime_ready: bool = False
+
+
+class AgentRuntimeConnectionIn(BaseModel):
+    id: str | None = Field(default=None, min_length=1, max_length=32)
+    name: str = Field(min_length=1, max_length=200)
+    type: Literal["postgres"] = "postgres"
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentRuntimeConnectionOut(AgentRuntimeConnectionIn):
+    id: str
+    status: str = "unknown"
+    last_error: str = ""
+
+
 class AgentIn(BaseModel):
     name: str
     description: str = ""
@@ -1233,10 +1392,17 @@ class AgentIn(BaseModel):
     llm_config_id: Optional[str] = None
     system_prompt: str = ""
     data_source_ids: list[str] = Field(default_factory=list)
+    runtime_connections: list[AgentRuntimeConnectionIn] = Field(
+        default_factory=list,
+        max_length=20,
+    )
     # None is accepted only for update compatibility. The create route turns
     # omission into an explicit empty scope; legacy database NULL is never
     # produced by a new API request.
     capability_scope: AgentCapabilityScope | None = None
+    runtime_binding_mode: Literal[
+        "legacy", "shadow", "prefer_capability", "capability_only"
+    ] | None = None
     temperature: float = Field(default=0.2, ge=0, le=2)
     max_tokens: int = Field(default=4096, ge=256, le=32768)
 
@@ -1248,8 +1414,17 @@ class AgentOut(AgentIn):
     scenario_name: str = ""
     llm_name: str = ""
     data_source_names: list[str] = []
+    runtime_connections: list[AgentRuntimeConnectionOut] = Field(default_factory=list)
     capability_scope_legacy: bool = False
     capability_summary: dict[str, AgentCapabilitySummary] = Field(default_factory=dict)
+    runtime_binding_mode: Literal[
+        "legacy", "shadow", "prefer_capability", "capability_only"
+    ] = "legacy"
+    readiness: AgentReadiness = Field(default_factory=AgentReadiness)
+    definition_valid: bool = False
+    validation_ready: bool = False
+    release_ready: bool = False
+    runtime_ready: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -1271,14 +1446,90 @@ class MessageOut(BaseModel):
     tool_calls: list = []
     tool_results: list = []
     citations: list = []
+    input_snapshot: dict[str, Any] = Field(default_factory=dict)
+    evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime
 
     model_config = {"from_attributes": True}
 
 
+class AgentCapabilityTargetIn(BaseModel):
+    kind: Literal["function", "action", "workflow"]
+    key: str = Field(min_length=1, max_length=240)
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentManagedInputIn(BaseModel):
+    """One governed reference for a validation turn, never a physical source."""
+
+    port_key: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    dataset_version_id: str | None = Field(default=None, min_length=1, max_length=32)
+    dataset_head_id: str | None = Field(default=None, min_length=1, max_length=32)
+    asset_version_id: str | None = Field(default=None, min_length=1, max_length=32)
+    artifact_id: str | None = Field(default=None, min_length=1, max_length=32)
+    binding_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=180,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    expected_signature: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def exactly_one_reference(self) -> "AgentManagedInputIn":
+        values = (
+            self.dataset_version_id,
+            self.dataset_head_id,
+            self.asset_version_id,
+            self.artifact_id,
+            self.binding_key,
+        )
+        if sum(value is not None for value in values) != 1:
+            raise ValueError("每个端口必须且只能提供一个受管引用")
+        return self
+
+
+class AgentChatAttachmentIn(BaseModel):
+    """One immutable file uploaded by the conversation user for this turn."""
+
+    asset_version_id: str = Field(min_length=1, max_length=32)
+    expected_signature: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    filename: str = Field(default="", max_length=500)
+
+    model_config = {"extra": "forbid"}
+
+
 class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    managed_inputs: list[AgentManagedInputIn] = Field(default_factory=list, max_length=100)
+    attachments: list[AgentChatAttachmentIn] = Field(default_factory=list, max_length=20)
+    capability: AgentCapabilityTargetIn | None = None
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=180)
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def unique_managed_ports(self) -> "ChatRequest":
+        keys = [item.port_key.casefold() for item in self.managed_inputs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("同一端口不能重复提交受管输入")
+        return self
 
 
 class ChatEvent(BaseModel):
@@ -1654,6 +1905,7 @@ class ActionExecutionLogOut(BaseModel):
 
 class ActionExecuteRequest(BaseModel):
     params: dict = Field(default_factory=dict)
+    environment: Literal["dev", "staging", "prod"] = "dev"
     dry_run: bool = False
     confirm: bool = False
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=120)
@@ -1684,12 +1936,14 @@ class AgentToolConfirmationRequest(BaseModel):
 
 class WorkflowExecuteRequest(BaseModel):
     params: dict = Field(default_factory=dict)
+    environment: Literal["dev", "staging", "prod"] = "dev"
 
 
 class WorkflowRunCreateRequest(BaseModel):
     """提交一次人工运行；可靠性策略由工作流 trigger_config 统一控制。"""
 
     params: dict = Field(default_factory=dict)
+    environment: Literal["dev", "staging", "prod"] = "dev"
 
 
 class WorkflowRunOut(BaseModel):
@@ -1704,6 +1958,8 @@ class WorkflowRunOut(BaseModel):
     definition_hash: str = ""
     definition_source: str = "live"
     status: str
+    # Backward-compatible field name; the response contains only a value-free
+    # authenticated summary, never the worker's decrypted parameters.
     input_params: dict = Field(default_factory=dict)
     attempt: int = 0
     max_attempts: int = 1
@@ -1751,6 +2007,7 @@ class ApprovalDecisionIn(BaseModel):
 class EventPublishIn(BaseModel):
     payload: dict = Field(default_factory=dict)
     dedupe_key: str | None = Field(default=None, min_length=1, max_length=180)
+    environment: Literal["dev", "staging", "prod"] = "dev"
 
 
 class EventEnvelopeOut(BaseModel):

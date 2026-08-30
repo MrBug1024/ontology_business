@@ -359,10 +359,18 @@ def _assert_thread_scope(
         raise HTTPException(409, "助手会话与当前页面或业务场景不一致，请切换到当前上下文的会话")
 
 
-def _scenario(db: Session, scenario_id: str | None, writable: bool = False) -> BusinessScenario | None:
+def _scenario(
+    db: Session,
+    scenario_id: str | None,
+    writable: bool = False,
+    *,
+    require_active: bool = False,
+) -> BusinessScenario | None:
     if not scenario_id:
         return None
     scenario = tenant_service.require_scenario(db, scenario_id, writable=writable)
+    if require_active and scenario.status == "retired":
+        raise HTTPException(409, "业务场景已退役，不能创建新的顾问会话或消息")
     permission_service.require_scenario_permission(
         db,
         scenario,
@@ -3963,6 +3971,13 @@ def _merge_staged_compilation_payload(
         if isinstance(item, dict) and str(item.get("task_id") or "") == task_id
     ]
     result["draft_candidates"] = [*current_candidates, *stage_candidates]
+    result["capability_modeling"] = (
+        scenario_model_compiler.merge_capability_modeling_sidecars(
+            result.get("capability_modeling"),
+            stage.get("capability_modeling"),
+            replace_ports=task_id == "capabilities",
+        )
+    )
 
     changes_by_id: dict[str, dict[str, Any]] = {}
     anonymous_changes: list[dict[str, Any]] = []
@@ -4142,7 +4157,11 @@ def _finalize_compilation_success(
                 token=lease_token,
                 attempt=lease_attempt,
             )
-        authorized_scenario = _scenario(finish_db, scenario_id)
+        authorized_scenario = _scenario(
+            finish_db,
+            scenario_id,
+            require_active=True,
+        )
         assert authorized_scenario is not None
         # Serialize with governed scenario writers where the database supports
         # row locks, then reload every definition collection used by the
@@ -4154,10 +4173,13 @@ def _finalize_compilation_success(
                 BusinessScenario.id == scenario_id,
                 BusinessScenario.tenant_id == tenant_id,
             )
+            .execution_options(populate_existing=True)
             .with_for_update()
         ).scalars().first()
         if not scenario:
             raise RuntimeError("编译任务所属业务场景不存在")
+        if scenario.status == "retired":
+            raise RuntimeError("业务场景已退役，不能写入新的顾问建模结果")
         finish_db.expire(
             scenario,
             [
@@ -5892,11 +5914,10 @@ def _assistant_action_preview(
         }
         return analysis, question, f"已定位操作“{action.name}”，补齐参数后才能完成权限检查和预演。"
 
-    definition = runtime_definition_service.resolve_active(
-        db,
-        scenario,
-        environment=runtime_connector_service.runtime_environment(),
-    )
+    # The platform assistant is an authoring/control-plane surface.  A server
+    # deployed with RUNTIME_ENVIRONMENT=prod must still be able to model and
+    # preview a newly-created scenario before any release exists.
+    definition = runtime_definition_service.resolve_authoring(db, scenario)
     runtime_action = runtime_definition_service.resolve_resource(
         definition, "action", action.id
     )
@@ -6412,6 +6433,32 @@ def _consume_attachments(
     db.flush()
 
 
+def _lock_active_message_scenario(
+    db: Session,
+    thread: AssistantThread,
+) -> None:
+    """Serialize message writes with scenario retirement.
+
+    Long-running model and compilation paths use a fresh session when they
+    persist their result.  Re-reading the row with a lock here prevents a
+    cached pre-retirement scenario from accepting a late message.
+    """
+    if not thread.scenario_id:
+        return
+    scenario = db.scalar(
+        select(BusinessScenario)
+        .where(BusinessScenario.id == thread.scenario_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if scenario is None or (
+        scenario.tenant_id != thread.tenant_id and not scenario.is_public
+    ):
+        raise HTTPException(409, "顾问会话所属业务场景已不可用")
+    if scenario.status == "retired":
+        raise HTTPException(409, "业务场景已退役，不能写入新的顾问会话消息")
+
+
 def _save_message(
     db: Session,
     thread: AssistantThread,
@@ -6423,6 +6470,7 @@ def _save_message(
     thinking: list[dict[str, Any]] | None = None,
     message_id: str | None = None,
 ) -> AssistantMessage:
+    _lock_active_message_scenario(db, thread)
     thread.updated_at = datetime.now(timezone.utc)
     if message_id:
         existing = db.get(AssistantMessage, message_id)
@@ -6506,7 +6554,7 @@ def create_thread(
     path: str = "",
     db: Session = Depends(get_tenant_db),
 ):
-    _scenario(db, scenario_id)
+    _scenario(db, scenario_id, require_active=True)
     if not scenario_id:
         permission_service.require_tenant_permission(db, "read")
     thread = AssistantThread(
@@ -6532,46 +6580,51 @@ def list_thread_messages(
 ):
     thread = _thread(db, thread_id)
     _assert_thread_scope(thread, scenario_id, page, path)
-    messages = db.execute(
+    scenario = _scenario(db, thread.scenario_id) if thread.scenario_id else None
+    retired_history = bool(scenario and scenario.status == "retired")
+    message_query = (
         select(AssistantMessage)
         .where(AssistantMessage.thread_id == thread_id)
         .order_by(AssistantMessage.created_at)
         .execution_options(populate_existing=True)
-        .with_for_update()
-    ).scalars().all()
+    )
+    if not retired_history:
+        message_query = message_query.with_for_update()
+    messages = db.execute(message_query).scalars().all()
     upgraded_any = False
-    for message in messages:
-        if (
-            message.role == "assistant"
-            and not _has_invalid_historic_rag_source(db, thread, message)
-        ):
-            _proposal, upgraded = _upgrade_saved_scenario_model_plan(db, message)
-            upgraded_any = upgraded_any or upgraded
-    linked_job_ids = {
-        str(context.get("compilation_job_id") or "")
-        for context in (
-            message.context
-            for message in messages
-            if message.role == "assistant"
-        )
-        if isinstance(context, dict) and context.get("compilation_job_id")
-    }
-    if linked_job_ids:
-        terminal_jobs = db.execute(
-            select(AssistantCompilationJob).where(
-                AssistantCompilationJob.id.in_(linked_job_ids),
-                AssistantCompilationJob.tenant_id == _tenant(db),
-                AssistantCompilationJob.created_by_user_id
-                == _current_user_id(db),
-                AssistantCompilationJob.scenario_id == thread.scenario_id,
-                AssistantCompilationJob.status.in_({"succeeded", "failed"}),
+    if not retired_history:
+        for message in messages:
+            if (
+                message.role == "assistant"
+                and not _has_invalid_historic_rag_source(db, thread, message)
+            ):
+                _proposal, upgraded = _upgrade_saved_scenario_model_plan(db, message)
+                upgraded_any = upgraded_any or upgraded
+        linked_job_ids = {
+            str(context.get("compilation_job_id") or "")
+            for context in (
+                message.context
+                for message in messages
+                if message.role == "assistant"
             )
-        ).scalars().all()
-        for job in terminal_jobs:
-            upgraded_any = (
-                _reconcile_terminal_compilation_subscriptions(db, job)
-                or upgraded_any
-            )
+            if isinstance(context, dict) and context.get("compilation_job_id")
+        }
+        if linked_job_ids:
+            terminal_jobs = db.execute(
+                select(AssistantCompilationJob).where(
+                    AssistantCompilationJob.id.in_(linked_job_ids),
+                    AssistantCompilationJob.tenant_id == _tenant(db),
+                    AssistantCompilationJob.created_by_user_id
+                    == _current_user_id(db),
+                    AssistantCompilationJob.scenario_id == thread.scenario_id,
+                    AssistantCompilationJob.status.in_({"succeeded", "failed"}),
+                )
+            ).scalars().all()
+            for job in terminal_jobs:
+                upgraded_any = (
+                    _reconcile_terminal_compilation_subscriptions(db, job)
+                    or upgraded_any
+                )
     if upgraded_any:
         db.commit()
     return [_assistant_message_out(db, thread, message) for message in messages]
@@ -6688,6 +6741,7 @@ def submit_compilation_guidance(
 ):
     """Queue a correction into the current run without launching a second job."""
     job = _owned_compilation_job(db, job_id)
+    _scenario(db, job.scenario_id, require_active=True)
     thread_id = str(job.thread_id or "").strip()
     if not thread_id:
         raise HTTPException(409, "编译任务尚未绑定可继续指导的会话")
@@ -7006,7 +7060,7 @@ def delete_attachment(attachment_id: str, db: Session = Depends(get_tenant_db)):
 @router.post("/chat/stream")
 def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     """全局助手 SSE：流式回答，同时发送可展开的安全处理摘要。"""
-    scenario = _scenario(db, payload.scenario_id)
+    scenario = _scenario(db, payload.scenario_id, require_active=True)
     _configure_assistant_runtime(db, payload)
     capability_context = _assistant_capability_context(db, payload)
     thread = _thread(db, payload.thread_id) if payload.thread_id else None
@@ -7238,6 +7292,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 db,
                 payload.scenario_id,
                 writable=intent == "scenario_model",
+                require_active=True,
             )
             llm = _llm(db)
             suggestions = (
@@ -7886,7 +7941,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
 
 @router.post("/chat", response_model=AssistantReplyOut)
 def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
-    scenario = _scenario(db, payload.scenario_id)
+    scenario = _scenario(db, payload.scenario_id, require_active=True)
     _configure_assistant_runtime(db, payload)
     capability_context = _assistant_capability_context(db, payload)
     thread = _thread(db, payload.thread_id) if payload.thread_id else None

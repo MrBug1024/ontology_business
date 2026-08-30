@@ -274,20 +274,12 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 ),
             ]
         )
-        source_path = Path(self.temp_dir.name) / "source.sqlite3"
-        with sqlite3.connect(source_path) as connection:
-            connection.execute(
-                "CREATE TABLE purchase_requests (request_no TEXT PRIMARY KEY, amount REAL NOT NULL)"
-            )
-            connection.execute(
-                "INSERT INTO purchase_requests(request_no, amount) VALUES ('P-1', 1200)"
-            )
         source = DataSource(
             tenant_id=self.tenant.id,
             scenario_id=scenario.id,
             name="采购数据库",
-            type="sqlite",
-            config={"path": str(source_path)},
+            type="postgres",
+            config={},
             status="ok",
         )
         self.db.add(source)
@@ -309,16 +301,27 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             scenario=scenario,
         )
 
-        result = assistant.apply_proposal(
-            AssistantProposalApplyRequest(
-                kind="mapping",
-                scenario_id=scenario.id,
-                thread_id=thread.id,
-                proposal_id=proposal["proposal_id"],
-                confirm=True,
-            ),
-            self.db,
-        )
+        with patch.object(
+            assistant.datasource_service,
+            "list_tables",
+            return_value=[{
+                "name": "purchase_requests",
+                "columns": [
+                    {"name": "request_no", "type": "TEXT", "pk": True},
+                    {"name": "amount", "type": "NUMERIC", "pk": False},
+                ],
+            }],
+        ):
+            result = assistant.apply_proposal(
+                AssistantProposalApplyRequest(
+                    kind="mapping",
+                    scenario_id=scenario.id,
+                    thread_id=thread.id,
+                    proposal_id=proposal["proposal_id"],
+                    confirm=True,
+                ),
+                self.db,
+            )
         mapping = self.db.get(DataMapping, result["data"]["mapping_id"])
         self.assertEqual(mapping.column_map, data["column_map"])
         self.assertTrue(result["data"]["refresh_required"])
@@ -1641,15 +1644,12 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 is_required=True,
             )
         )
-        source_path = Path(self.temp_dir.name) / "stale.sqlite3"
-        with sqlite3.connect(source_path) as connection:
-            connection.execute("CREATE TABLE orders (order_no TEXT PRIMARY KEY)")
         source = DataSource(
             tenant_id=self.tenant.id,
             scenario_id=scenario.id,
             name="订单源",
-            type="sqlite",
-            config={"path": str(source_path)},
+            type="postgres",
+            config={},
         )
         self.db.add(source)
         self.runtime_sources.append(source)
@@ -1672,7 +1672,19 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             proposal=proposal,
             scenario=scenario,
         )
-        with self.assertRaisesRegex(ValueError, "不存在的源字段"):
+        with (
+            patch.object(
+                assistant.datasource_service,
+                "list_tables",
+                return_value=[{
+                    "name": "orders",
+                    "columns": [{
+                        "name": "order_no", "type": "TEXT", "pk": True,
+                    }],
+                }],
+            ),
+            self.assertRaisesRegex(ValueError, "不存在的源字段"),
+        ):
             assistant.apply_proposal(
                 AssistantProposalApplyRequest(
                     kind="mapping",
@@ -1705,15 +1717,12 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 is_required=True,
             )
         )
-        source_path = Path(self.temp_dir.name) / "transform-preserve.sqlite3"
-        with sqlite3.connect(source_path) as connection:
-            connection.execute("CREATE TABLE orders (order_no TEXT PRIMARY KEY)")
         source = DataSource(
             tenant_id=self.tenant.id,
             scenario_id=scenario.id,
             name="订单源",
-            type="sqlite",
-            config={"path": str(source_path)},
+            type="postgres",
+            config={},
         )
         mapping = DataMapping(
             scenario=scenario,
@@ -1734,18 +1743,30 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             "column_map": {"订单号": "order_no"},
         }
 
-        updated, operation = assistant._apply_mapping_draft(
-            self.db, scenario, data
-        )
-        self.assertEqual(operation, "update")
-        self.assertEqual(updated.transform_rules, {"订单号": [{"op": "trim"}]})
+        with patch.object(
+            assistant.datasource_service,
+            "list_tables",
+            return_value=[{
+                "name": "orders",
+                "columns": [{
+                    "name": "order_no", "type": "TEXT", "pk": True,
+                }],
+            }],
+        ):
+            updated, operation = assistant._apply_mapping_draft(
+                self.db, scenario, data
+            )
+            self.assertEqual(operation, "update")
+            self.assertEqual(updated.transform_rules, {"订单号": [{"op": "trim"}]})
 
-        data["transform_rules"] = {"订单号": [{"op": "upper"}]}
-        updated, _operation = assistant._apply_mapping_draft(self.db, scenario, data)
-        self.assertEqual(updated.transform_rules, {"订单号": [{"op": "upper"}]})
-        data["transform_rules"] = {"订单号": [{"op": "python"}]}
-        with self.assertRaisesRegex(ValueError, "不支持的声明式转换"):
-            assistant._apply_mapping_draft(self.db, scenario, data)
+            data["transform_rules"] = {"订单号": [{"op": "upper"}]}
+            updated, _operation = assistant._apply_mapping_draft(
+                self.db, scenario, data
+            )
+            self.assertEqual(updated.transform_rules, {"订单号": [{"op": "upper"}]})
+            data["transform_rules"] = {"订单号": [{"op": "python"}]}
+            with self.assertRaisesRegex(ValueError, "不支持的声明式转换"):
+                assistant._apply_mapping_draft(self.db, scenario, data)
 
     def test_chat_apply_and_execute_modes_only_return_governance_guidance(self) -> None:
         before_scenarios = self.db.scalar(
@@ -2651,8 +2672,8 @@ class ActionDecisionChainTests(unittest.TestCase):
             tenant_id=tenant.id,
             scenario_id=self.scenario.id,
             name="Action 审计数据源",
-            type="sqlite",
-            config={"path": "not-opened-in-preview.sqlite3"},
+            type="postgres",
+            config={},
             status="ok",
         )
         self.action = OntologyAction(

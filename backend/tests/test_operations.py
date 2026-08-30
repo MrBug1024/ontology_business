@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.database import Base
@@ -30,7 +30,12 @@ from app.models import (
 from app.routers import scenarios as scenarios_router
 from app.schemas import ActionIn
 from app.services.agent_engine import AgentContext
-from app.services import operations_service, permission_service, workflow_service
+from app.services import (
+    operations_service,
+    permission_service,
+    workflow_payload_service,
+    workflow_service,
+)
 from app.services.policies import PolicyViolation, validate_workflow_graph
 
 
@@ -99,7 +104,10 @@ class OperationsRuntimeTests(unittest.TestCase):
 
     def test_approval_pauses_then_resumes_the_same_durable_run(self) -> None:
         workflow = self._workflow(name="approval", node_types=("approval",))
-        run, created = operations_service.enqueue_workflow_run(self.db, workflow, {"case": "A"})
+        marker = "customer-secret-approval-input"
+        run, created = operations_service.enqueue_workflow_run(
+            self.db, workflow, {"case": marker}
+        )
         self.assertTrue(created)
         self.db.commit()
 
@@ -107,6 +115,7 @@ class OperationsRuntimeTests(unittest.TestCase):
         self.db.refresh(run)
         self.assertEqual(run.status, "awaiting_approval")
         self.assertEqual([step["node"] for step in run.result["steps"]], ["start", "n1"])
+        self.assertNotIn(marker, json.dumps(run.result, ensure_ascii=False))
         approval = self.db.query(WorkflowApprovalRequest).filter_by(workflow_run_id=run.id).one()
         self.assertEqual(approval.status, "pending")
 
@@ -116,6 +125,95 @@ class OperationsRuntimeTests(unittest.TestCase):
         self.assertEqual(run.status, "succeeded")
         self.assertIn("n1", run.approved_node_ids)
         self.assertEqual(run.result["steps"][-1]["node"], "end")
+        self.assertNotIn(marker, json.dumps(run.result, ensure_ascii=False))
+        workflow_logs = self.db.query(ActionExecutionLog).filter_by(
+            target_type="workflow",
+            target_id=workflow.id,
+        ).all()
+        self.assertGreaterEqual(len(workflow_logs), 2)
+        for log in workflow_logs:
+            self.assertNotIn(
+                marker,
+                json.dumps(
+                    {"input_params": log.input_params, "result": log.result},
+                    ensure_ascii=False,
+                ),
+            )
+            self.assertTrue(log.input_params["redacted"])
+        public_logs = scenarios_router.list_execution_logs(
+            self.scenario.id,
+            limit=50,
+            db=self.db,
+        )
+        self.assertTrue(public_logs)
+        self.assertTrue(all(item.input_params["redacted"] for item in public_logs))
+        self.assertNotIn(
+            marker,
+            json.dumps(
+                [item.model_dump(mode="json") for item in public_logs],
+                ensure_ascii=False,
+            ),
+        )
+
+    def test_workflow_input_is_encrypted_at_rest_and_worker_recovers_exact_payload(self) -> None:
+        workflow = self._workflow(name="encrypted-input")
+        marker = "never-store-this-customer-value-in-plaintext"
+        payload = {"operation": marker, "count": 4}
+        run, created = operations_service.enqueue_workflow_run(
+            self.db,
+            workflow,
+            payload,
+        )
+        self.assertTrue(created)
+        self.db.commit()
+
+        stored = self.db.execute(
+            select(
+                WorkflowRun.input_payload,
+                WorkflowRun.input_summary,
+                WorkflowRun.input_digest,
+            ).where(WorkflowRun.id == run.id)
+        ).one()
+        self.assertNotIn(marker, json.dumps(stored._asdict(), sort_keys=True))
+        self.assertEqual(stored.input_payload["alg"], "A256GCM")
+        self.assertEqual(
+            workflow_payload_service.public_input_summary(run)["field_count"],
+            2,
+        )
+
+        with patch.object(
+            workflow_service,
+            "execute_workflow",
+            return_value={"status": "success", "steps": [], "duration_ms": 1},
+        ) as execute:
+            operations_service.process_available_runs(self.db)
+        self.assertEqual(execute.call_args.args[2], payload)
+        self.db.refresh(run)
+        self.assertEqual(run.status, "succeeded")
+
+        public = scenarios_router._workflow_run_out(self.db, run)
+        public_document = public.model_dump(mode="json")
+        self.assertNotIn(marker, json.dumps(public_document, sort_keys=True))
+        self.assertTrue(public.input_params["redacted"])
+        self.assertEqual(public.input_params["field_count"], 2)
+
+    def test_enqueue_fails_closed_without_payload_key_and_writes_no_run(self) -> None:
+        workflow = self._workflow(name="missing-payload-key")
+        settings = SimpleNamespace(
+            workflow_payload_active_key_id="",
+            workflow_payload_encryption_keys="",
+        )
+        with patch.object(
+            workflow_payload_service,
+            "get_settings",
+            return_value=settings,
+        ), self.assertRaises(workflow_payload_service.WorkflowPayloadError):
+            operations_service.enqueue_workflow_run(
+                self.db,
+                workflow,
+                {"operation": "must-not-persist"},
+            )
+        self.assertEqual(self.db.query(WorkflowRun).count(), 0)
 
     def test_legacy_approval_step_resumes_using_its_canonical_node_id(self) -> None:
         workflow = OntologyWorkflow(

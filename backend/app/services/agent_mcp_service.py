@@ -54,7 +54,9 @@ def agent_config_hash(agent: Agent) -> str:
         "scenario_id": agent.scenario_id,
         "llm_config_id": agent.llm_config_id,
         "system_prompt": agent.system_prompt or "",
-        "data_source_ids": sorted(str(item) for item in (agent.data_source_ids or [])),
+        "runtime_data_source_ids": sorted(
+            str(item) for item in (agent.runtime_data_source_ids or [])
+        ),
         "capability_scope": agent.capability_scope,
         "temperature": agent.temperature,
         "max_tokens": agent.max_tokens,
@@ -85,12 +87,13 @@ def validate_agent_runtime(
     agent_id: str,
     *,
     writable: bool = False,
+    environment: str = "dev",
 ) -> tuple[Agent, Any, list[str]]:
     # Import lazily to keep the MCP service independent from router import order.
     from ..routers import agents
 
     agent = agents._agent(db, agent_id, writable=writable)
-    context = agents._authorization_context(db, agent)
+    context = agents._authorization_context(db, agent, environment=environment)
     if context is None:
         return agent, None, ["当前环境运行定义或连接器"]
     missing = agents._agent_readiness_missing(db, agent, runtime_context=context)
@@ -107,7 +110,11 @@ def service_runtime_status(
         db.info["tenant_id"] = service.tenant_id
         db.info["user_id"] = service.execution_user_id or ""
         try:
-            agent, context, missing = validate_agent_runtime(db, service.agent_id)
+            agent, context, missing = validate_agent_runtime(
+                db,
+                service.agent_id,
+                environment=service.runtime_environment,
+            )
         except HTTPException as exc:
             return None, None, [str(exc.detail)], True
         if context is None:
@@ -167,6 +174,10 @@ def invoke_published_agent(
     *,
     message: str,
     conversation_id: str | None,
+    inputs: dict[str, Any] | None = None,
+    managed_inputs: list[dict[str, Any]] | None = None,
+    capability: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     from ..routers import agents
 
@@ -200,13 +211,25 @@ def invoke_published_agent(
                 raise AgentMCPError("对话不属于当前 Agent MCP 服务")
 
         request_id = uuid.uuid4().hex
+        input_document = {
+            "message": message,
+            "inputs": inputs or {},
+            "managed_inputs": managed_inputs or [],
+            "capability": capability,
+            "idempotency_key": idempotency_key,
+        }
         invocation = AgentMCPInvocation(
             service_id=service.id,
             tenant_id=service.tenant_id,
             agent_id=service.agent_id,
             execution_user_id=service.execution_user_id,
             request_id=request_id,
-            input_hash=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            input_hash=hashlib.sha256(json.dumps(
+                input_document,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
             status="running",
         )
         db.add(invocation)
@@ -216,6 +239,11 @@ def invoke_published_agent(
             service.agent_id,
             message=message,
             conversation_id=conversation_id,
+            inputs=inputs,
+            managed_inputs=managed_inputs,
+            capability=capability,
+            idempotency_key=idempotency_key,
+            environment=service.runtime_environment,
             db=db,
         )
         result.update({

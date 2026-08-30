@@ -53,7 +53,7 @@ def run_function(
         definition = runtime_definition_service.resolve_active(
             db,
             scenario,
-            environment=runtime_connector_service.runtime_environment(),
+            environment=payload.environment,
         )
         function = runtime_definition_service.resolve_resource(
             definition, "function", function_id
