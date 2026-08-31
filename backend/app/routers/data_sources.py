@@ -78,6 +78,10 @@ def _out(ds: DataSource, db: Session) -> DataSourceOut:
             ds.tenant_id == tenant_service.current_tenant_id(db)
             and _can_access_data_source(db, ds, writable=True)
         ),
+        can_delete=(
+            ds.tenant_id == tenant_service.current_tenant_id(db)
+            and _can_access_data_source(db, ds, writable=True)
+        ),
     )
 
 
@@ -262,8 +266,6 @@ def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(
 @router.delete("/{ds_id}", response_model=Msg)
 def delete_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
     ds = _data_source(db, ds_id, writable=True)
-    if ds.type == "dataset":
-        raise HTTPException(409, "版本化数据集不能通过通用数据源接口删除")
     try:
         connector_service.assert_connector_not_bound(db, "data_source", ds.id)
     except connector_service.ConnectorBindingConflictError as exc:
@@ -280,6 +282,11 @@ def delete_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
             )
             for bucket_file in bucket_files
         ]
+        catalog_cleanup = datasource_service.detach_platform_catalog_references_for_deletion(
+            db,
+            ds,
+            [bucket_file.id for bucket_file in bucket_files],
+        )
     except (ValueError, object_storage_service.ObjectStorageError) as exc:
         raise HTTPException(409, str(exc)) from exc
     datasource_service.invalidate_engine(ds)
@@ -290,7 +297,24 @@ def delete_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
         db.rollback()
         raise HTTPException(409, "数据源在删除期间被业务资源引用，请刷新后重试") from exc
     object_deletion_service.drain_jobs_best_effort(db, deletion_job_ids)
-    return Msg(message="已删除")
+    if bucket_files:
+        return Msg(
+            message=f"已删除建模资料，{len(bucket_files)} 个托管文件已进入 MinIO 清理队列",
+            data={
+                "data_source_id": ds_id,
+                "files_deleted": len(bucket_files),
+                "cleanup_jobs": len(deletion_job_ids),
+                **catalog_cleanup,
+            },
+        )
+    return Msg(
+        message="已删除建模资料",
+        data={
+            "data_source_id": ds_id,
+            "files_deleted": 0,
+            "cleanup_jobs": 0,
+        },
+    )
 
 
 @router.post("/{ds_id}/test", response_model=Msg)
@@ -580,6 +604,9 @@ def delete_file(file_id: str, db: Session = Depends(get_tenant_db)):
         deletion_job_id = object_deletion_service.enqueue_bucket_file_deletion(
             db, bf, source
         )
+        catalog_cleanup = datasource_service.detach_platform_catalog_references_for_deletion(
+            db, source, [bf.id]
+        )
     except (ValueError, object_storage_service.ObjectStorageError) as exc:
         raise HTTPException(409, str(exc)) from exc
     db.delete(bf)
@@ -589,4 +616,7 @@ def delete_file(file_id: str, db: Session = Depends(get_tenant_db)):
         db.rollback()
         raise HTTPException(409, "文件在删除期间被登记为模板，请刷新后重试") from exc
     object_deletion_service.drain_jobs_best_effort(db, [deletion_job_id])
-    return Msg(message="已删除")
+    return Msg(
+        message="已删除",
+        data={"file_id": file_id, "cleanup_job": deletion_job_id, **catalog_cleanup},
+    )

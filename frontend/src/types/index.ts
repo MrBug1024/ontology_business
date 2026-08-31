@@ -877,6 +877,7 @@ export interface DataSource {
   created_at?: string
   file_count?: number
   can_write?: boolean
+  can_delete?: boolean
 }
 
 export interface BucketFile {

@@ -151,6 +151,7 @@ const purgeCountLabels: Record<string, string> = {
   agents: '验证 Agent', conversations: '验证会话', messages: '对话消息', assistant_threads: '顾问会话',
   assistant_attachments: '顾问附件', capability_invocations: '能力调用记录', action_logs: '操作审计',
   workflow_runs: '工作流记录', releases: '发布记录', llm_traces: '模型调用审计',
+  assertions: '验证结论', derivation_runs: '推理运行', derivation_evidence: '推理证据',
 }
 const visiblePurgeCounts = computed(() => Object.entries(purgePlan.value?.counts || {})
   .filter(([, value]) => value > 0)

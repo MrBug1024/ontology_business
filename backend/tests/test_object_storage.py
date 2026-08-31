@@ -525,6 +525,24 @@ class ObjectStorageTests(unittest.TestCase):
                 version_id=attachment.object_version_id,
             )
 
+    def test_legacy_assistant_attachment_identity_can_be_deleted(self) -> None:
+        object_key = "ontology-business/migrations/assistant/legacy-note.md"
+        object_url = object_storage_service.stable_object_url("ontology", object_key)
+        attachment = AssistantAttachment(
+            id="c" * 32,
+            tenant_id="tenant-a",
+            filename="legacy-note.md",
+            storage_provider="minio",
+            bucket_name="ontology",
+            object_key=object_key,
+            object_url=object_url,
+        )
+
+        self.assertEqual(
+            datasource_service.assistant_attachment_object_identity(attachment),
+            ("ontology", object_key, ""),
+        )
+
     def test_assistant_upload_preserves_object_when_commit_result_is_unknown(self) -> None:
         class _FailingDb:
             rolled_back = False

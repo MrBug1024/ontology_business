@@ -29,7 +29,7 @@ def orm_datetime(*, timezone: bool = True):
     return SQLAlchemyDateTime(timezone=timezone)
 
 
-POSTGRESQL_SCHEMA_REVISION = "20260830_14"
+POSTGRESQL_SCHEMA_REVISION = "20260831_17"
 
 _settings = get_settings()
 if not _settings.uses_postgresql_database:

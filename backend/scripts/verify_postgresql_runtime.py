@@ -238,6 +238,28 @@ def _verify_runtime_table_privileges(
     )
 
 
+def _verify_runtime_function_privileges(connection: Any) -> None:
+    """Ensure the runtime role can invoke only governed cleanup functions."""
+    signatures = (
+        (
+            "public.purge_retired_scenario_audit(varchar,varchar)",
+            "public.purge_retired_scenario_audit",
+        ),
+        (
+            "public.detach_data_source_file_references(varchar,varchar,varchar[])",
+            "public.detach_data_source_file_references",
+        ),
+    )
+    for signature, label in signatures:
+        executable = connection.exec_driver_sql(
+            "SELECT has_function_privilege("
+            "current_user, %s, 'EXECUTE')",
+            (signature,),
+        ).scalar_one()
+        if not bool(executable):
+            raise RuntimeError(f"runtime role cannot EXECUTE {label}")
+
+
 def main() -> int:
     from app.config import get_settings
     from app.database import SessionLocal, engine, init_db
@@ -279,6 +301,7 @@ def main() -> int:
             ledger_tables=RUNTIME_MIGRATION_LEDGER_TABLES,
             required_update_tables=RUNTIME_REQUIRED_UPDATE_TABLES,
         )
+        _verify_runtime_function_privileges(connection)
     catalog_inspector = inspect(engine)
     physical_relations = set(catalog_inspector.get_table_names(schema="public"))
     physical_relations.update(catalog_inspector.get_view_names(schema="public"))

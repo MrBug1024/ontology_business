@@ -72,18 +72,28 @@
           <div class="card-title">
             <el-icon><Setting /></el-icon> {{ selected.name }}
             <el-tag size="small" type="info">{{ typeLabel(selected.type) }}</el-tag>
-            <el-tag v-if="!selected.can_write" size="small" type="warning" effect="plain">只读公开资源</el-tag>
+            <el-tag v-if="selected.type === 'dataset' && selected.can_delete" size="small" type="warning" effect="plain">不可编辑，可删除连接</el-tag>
+            <el-tag v-else-if="!selected.can_write && !selected.can_delete" size="small" type="warning" effect="plain">只读公开资源</el-tag>
             <div style="margin-left:auto;display:flex;gap:6px">
               <template v-if="selected.can_write">
                 <el-button size="small" @click="testConn" :loading="testing"><el-icon><Link /></el-icon> 测试连接</el-button>
                 <el-button size="small" @click="openEdit(selected)"><el-icon><Edit /></el-icon> 编辑</el-button>
-                <el-button size="small" type="danger" @click="remove(selected)" aria-label="删除建模资料" title="删除建模资料"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
               </template>
+              <el-button v-if="selected.can_delete" size="small" type="danger" @click="remove(selected)" aria-label="删除建模资料" title="删除建模资料"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
             </div>
           </div>
 
           <!-- 数据库表结构；原始 SQL 仅保留为后端管理诊断能力，不向普通业务用户开放。 -->
           <template v-if="selected.type !== 'file_bucket'">
+            <el-alert
+              v-if="selected.type === 'dataset' && selected.can_delete"
+              title="版本化数据集连接可以删除"
+              description="删除会移除这条建模资料连接记录；底层目录版本仍受引用保护，不会被误删。"
+              type="info"
+              :closable="false"
+              show-icon
+              class="readonly-note"
+            />
             <section class="database-tables" aria-labelledby="database-tables-title">
               <h3 id="database-tables-title">数据表</h3>
               <el-table :data="tables" size="small" max-height="520">
@@ -573,7 +583,11 @@ function viewCitation(citation: RagCitation) {
 }
 async function removeFile(f: BucketFile) {
   try {
-    await ElMessageBox.confirm(`删除文件「${f.filename}」？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(
+      `删除文件「${f.filename}」？数据库中的对象删除记录会保留，MinIO 文件将在清理任务中删除。`,
+      '确认删除',
+      { type: 'warning', confirmButtonText: '删除文件', cancelButtonText: '取消' },
+    )
     await api.deleteFile(f.id)
     ElMessage.success('已删除')
     await loadFiles()
@@ -623,10 +637,19 @@ async function save() {
 }
 async function remove(ds: DataSource) {
   try {
-    await ElMessageBox.confirm(`删除建模资料「${ds.name}」？此操作可能同时影响其托管文件。`, '确认', { type: 'warning' })
-    await api.deleteDataSource(ds.id!)
+    const detail = ds.type === 'postgres'
+      ? '这只会删除本平台保存的连接配置，不会执行任何删除远程 PostgreSQL 数据的操作。'
+      : ds.type === 'dataset'
+      ? '这会移除当前建模资料中的连接记录，不会删除仍被目录或审计引用的底层版本。'
+      : `这会删除资料记录及其 ${ds.file_count || 0} 个托管文件；数据库会保留清理审计，MinIO 对象进入清理队列。`
+    await ElMessageBox.confirm(`删除建模资料「${ds.name}」？${detail}`, '确认删除', {
+      type: 'warning',
+      confirmButtonText: '删除建模资料',
+      cancelButtonText: '取消',
+    })
+    const result: any = await api.deleteDataSource(ds.id!)
     clearSelection()
-    ElMessage.success('已删除')
+    ElMessage.success(result?.message || '已删除')
     await load()
   } catch (e: any) {
     if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')

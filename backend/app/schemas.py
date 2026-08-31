@@ -598,6 +598,9 @@ class DataSourceOut(DataSourceIn):
     file_count: int = 0
     # 前端据此区分“可检索的公开资源”和“可修改的自有资源”。
     can_write: bool = False
+    # 删除权限与编辑权限分离：版本化数据集连接不可编辑，但租户所有者
+    # 仍可从“建模资料”目录移除这条连接记录。
+    can_delete: bool = False
 
     model_config = {"from_attributes": True}
 

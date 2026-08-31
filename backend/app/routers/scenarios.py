@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import cast, delete, func, or_, select, String
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import cast, delete, func, or_, select, String, text, update
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import Session, joinedload, load_only
 
 from ..config import get_settings
@@ -35,6 +35,7 @@ from ..models import (
     DataSource,
     DerivationRun,
     DerivationRunInput,
+    DerivationEvidence,
     FunctionDefinition,
     MCPConfig,
     Message,
@@ -54,6 +55,9 @@ from ..models import (
     OntologySnapshot,
     OntologyWorkflow,
     RelationDataMapping,
+    SemanticFieldMapping,
+    SemanticMapping,
+    SemanticRelationMapping,
     Skill,
     RelationInstance,
     ReasoningTerm,
@@ -783,6 +787,20 @@ def _scenario_purge_plan(
     assistant_thread_ids = select(AssistantThread.id).where(
         AssistantThread.scenario_id == scenario.id
     )
+    assertion_ids = select(Assertion.id).where(Assertion.scenario_id == scenario.id)
+    derivation_run_ids = select(DerivationRun.id).where(
+        DerivationRun.scenario_id == scenario.id
+    )
+    action_log_ids = select(ActionExecutionLog.id).where(
+        ActionExecutionLog.scenario_id == scenario.id
+    )
+    evidence_for_scenario = or_(
+        DerivationEvidence.derivation_run_id.in_(derivation_run_ids),
+        DerivationEvidence.assertion_id.in_(assertion_ids),
+        DerivationEvidence.evidence_assertion_id.in_(assertion_ids),
+        DerivationEvidence.action_execution_log_id.in_(action_log_ids),
+        DerivationEvidence.action_scenario_id == scenario.id,
+    )
     dataset_ids = {
         str(value)
         for value in db.scalars(
@@ -843,6 +861,15 @@ def _scenario_purge_plan(
         "assistant_attachments": _count_where(
             db, AssistantAttachment, AssistantAttachment.thread_id.in_(assistant_thread_ids)
         ),
+        "assertions": _count_where(
+            db, Assertion, Assertion.scenario_id == scenario.id
+        ),
+        "derivation_runs": _count_where(
+            db, DerivationRun, DerivationRun.scenario_id == scenario.id
+        ),
+        "derivation_evidence": _count_where(
+            db, DerivationEvidence, evidence_for_scenario
+        ),
         "capability_invocations": _count_where(
             db, CapabilityInvocation, CapabilityInvocation.scenario_id == scenario.id
         ),
@@ -892,6 +919,9 @@ def _scenario_purge_plan(
         "workflow_runs",
         "releases",
         "llm_traces",
+        "assertions",
+        "derivation_runs",
+        "derivation_evidence",
     )
     return ScenarioPurgePlanOut(
         scenario_id=scenario.id,
@@ -2863,6 +2893,12 @@ def purge_scenario(
         template_catalog_service.TemplateCatalogError,
     ) as exc:
         raise HTTPException(409, str(exc)) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            409,
+            "场景模板或共享资源仍被保护，永久删除已取消",
+        ) from exc
 
     scenario_sources = list(
         db.scalars(
@@ -2924,60 +2960,145 @@ def purge_scenario(
                 )
             )
         )
+        for source in scenario_sources:
+            source_file_ids = [
+                bucket_file.id
+                for bucket_file in locked_files
+                if bucket_file.data_source_id == source.id
+            ]
+            if source_file_ids:
+                datasource_service.detach_platform_catalog_references_for_deletion(
+                    db, source, source_file_ids
+                )
     except (ValueError, object_storage_service.ObjectStorageError) as exc:
         raise HTTPException(409, str(exc)) from exc
 
-    invocation_ids = select(CapabilityInvocation.id).where(
-        CapabilityInvocation.scenario_id == scenario.id
-    )
-    run_ids = select(DerivationRun.id).where(
-        DerivationRun.scenario_id == scenario.id
-    )
-    db.execute(
-        delete(RunInputBinding).where(RunInputBinding.invocation_id.in_(invocation_ids))
-    )
-    db.execute(
-        delete(CapabilityInvocation).where(
+    try:
+        invocation_ids = select(CapabilityInvocation.id).where(
             CapabilityInvocation.scenario_id == scenario.id
         )
-    )
-    db.execute(
-        delete(Assertion).where(Assertion.scenario_id == scenario.id)
-    )
-    db.execute(
-        delete(DerivationRunInput).where(
-            DerivationRunInput.derivation_run_id.in_(run_ids)
+        run_ids = select(DerivationRun.id).where(
+            DerivationRun.scenario_id == scenario.id
         )
-    )
-    db.execute(
-        delete(DerivationRun).where(DerivationRun.scenario_id == scenario.id)
-    )
-    db.execute(
-        delete(ReasoningTerm).where(ReasoningTerm.scenario_id == scenario.id)
-    )
-    db.execute(
-        delete(LLMInvocationTrace).where(LLMInvocationTrace.scenario_id == scenario.id)
-    )
-    db.execute(
-        delete(AssistantAuditLog).where(AssistantAuditLog.scenario_id == scenario.id)
-    )
-    db.execute(
-        delete(AssistantRouteDecision).where(
-            AssistantRouteDecision.scenario_id == scenario.id
+        assertion_ids = select(Assertion.id).where(
+            Assertion.scenario_id == scenario.id
         )
-    )
-    db.execute(
-        delete(AssistantCompilationJob).where(
-            AssistantCompilationJob.scenario_id == scenario.id
+        action_log_ids = select(ActionExecutionLog.id).where(
+            ActionExecutionLog.scenario_id == scenario.id
         )
-    )
-    db.execute(
-        delete(AssistantThread).where(AssistantThread.scenario_id == scenario.id)
-    )
-    db.execute(delete(Agent).where(Agent.scenario_id == scenario.id))
-    _delete_scenario_governance_history(db, scenario)
-    db.delete(scenario)
-    try:
+
+        # The immutable audit tables deliberately deny DELETE to the runtime
+        # role.  PostgreSQL performs this bounded, user-confirmed cleanup in a
+        # migration-owned SECURITY DEFINER function; SQLite keeps the direct
+        # path for local tests and development.
+        if db.get_bind().dialect.name == "postgresql":
+            db.execute(
+                text(
+                    "SELECT public.purge_retired_scenario_audit(:scenario_id, :tenant_id)"
+                ),
+                {"scenario_id": scenario.id, "tenant_id": scenario.tenant_id},
+            )
+        else:
+            db.execute(
+                delete(DerivationEvidence).where(
+                    or_(
+                        DerivationEvidence.derivation_run_id.in_(run_ids),
+                        DerivationEvidence.assertion_id.in_(assertion_ids),
+                        DerivationEvidence.evidence_assertion_id.in_(assertion_ids),
+                        DerivationEvidence.action_execution_log_id.in_(action_log_ids),
+                        DerivationEvidence.action_scenario_id == scenario.id,
+                    )
+                )
+            )
+        db.execute(
+            delete(RunInputBinding).where(
+                RunInputBinding.invocation_id.in_(invocation_ids)
+            )
+        )
+        db.execute(
+            delete(CapabilityInvocation).where(
+                CapabilityInvocation.scenario_id == scenario.id
+            )
+        )
+        if db.get_bind().dialect.name != "postgresql":
+            # Assertions can form an internal supersedes chain.  Clear those
+            # links inside the same purge transaction so the RESTRICT self-FK
+            # does not make a single bulk DELETE order-dependent.
+            db.execute(
+                update(Assertion)
+                .where(
+                    Assertion.scenario_id == scenario.id,
+                    Assertion.supersedes_assertion_id.is_not(None),
+                )
+                .values(supersedes_assertion_id=None)
+            )
+            db.execute(
+                delete(Assertion).where(Assertion.scenario_id == scenario.id)
+            )
+            db.execute(
+                delete(DerivationRunInput).where(
+                    DerivationRunInput.derivation_run_id.in_(run_ids)
+                )
+            )
+        db.execute(
+            delete(DerivationRun).where(DerivationRun.scenario_id == scenario.id)
+        )
+        if db.get_bind().dialect.name != "postgresql":
+            db.execute(
+                delete(ReasoningTerm).where(ReasoningTerm.scenario_id == scenario.id)
+            )
+
+        # Dataset bindings are shared catalog references, not owned datasets.
+        # Remove scenario-owned semantic mappings first because those mappings
+        # protect their binding rows with RESTRICT foreign keys.
+        semantic_mapping_ids = select(SemanticMapping.id).where(
+            SemanticMapping.scenario_id == scenario.id
+        )
+        db.execute(
+            delete(SemanticRelationMapping).where(
+                SemanticRelationMapping.scenario_id == scenario.id
+            )
+        )
+        db.execute(
+            delete(SemanticFieldMapping).where(
+                SemanticFieldMapping.semantic_mapping_id.in_(semantic_mapping_ids)
+            )
+        )
+        db.execute(
+            delete(SemanticMapping).where(SemanticMapping.scenario_id == scenario.id)
+        )
+        db.execute(
+            delete(ScenarioDatasetBinding).where(
+                ScenarioDatasetBinding.scenario_id == scenario.id
+            )
+        )
+
+        db.execute(
+            delete(LLMInvocationTrace).where(
+                LLMInvocationTrace.scenario_id == scenario.id
+            )
+        )
+        db.execute(
+            delete(AssistantAuditLog).where(
+                AssistantAuditLog.scenario_id == scenario.id
+            )
+        )
+        db.execute(
+            delete(AssistantRouteDecision).where(
+                AssistantRouteDecision.scenario_id == scenario.id
+            )
+        )
+        db.execute(
+            delete(AssistantCompilationJob).where(
+                AssistantCompilationJob.scenario_id == scenario.id
+            )
+        )
+        db.execute(
+            delete(AssistantThread).where(AssistantThread.scenario_id == scenario.id)
+        )
+        db.execute(delete(Agent).where(Agent.scenario_id == scenario.id))
+        _delete_scenario_governance_history(db, scenario)
+        db.delete(scenario)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -2985,6 +3106,14 @@ def purge_scenario(
             409,
             "场景仍被受保护的审计或共享资源引用，永久删除已取消",
         ) from exc
+    except ProgrammingError as exc:
+        db.rollback()
+        if "purge_retired_scenario_audit" in str(exc):
+            raise HTTPException(
+                503,
+                "数据库尚未完成永久删除迁移，请先升级数据库并重启后端",
+            ) from exc
+        raise
     object_deletion_service.drain_jobs_best_effort(db, deletion_job_ids)
     return ScenarioPurgeOut(
         scenario_id=scenario_id,

@@ -8,12 +8,24 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
-from sqlalchemy import MetaData, Table, create_engine, func, inspect, select, text
+from sqlalchemy import delete, MetaData, Table, create_engine, func, inspect, or_, select, text
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
-from ..models import AssistantAttachment, BucketFile, DataSource
+from ..models import (
+    AssistantAttachment,
+    BucketFile,
+    DataAssetVersion,
+    DataSource,
+    DatasetFragment,
+    DatasetVersion,
+    DerivationEvidence,
+    DerivationRun,
+    DocumentChunk,
+    IngestionRun,
+)
 from . import cache_service, dataset_query_service, object_storage_service
 from .policies import validate_read_only_sql
 
@@ -471,15 +483,25 @@ def assistant_attachment_object_identity(
     if (url_bucket and url_bucket != bucket_name) or (url_key and url_key != object_key):
         raise ValueError("助手附件对象字段与地址不一致")
     try:
-        _validate_assistant_attachment_object_key(
-            object_key,
-            attachment.tenant_id,
-            attachment.id,
-            attachment.filename,
-            require_generation=False,
-        )
+        try:
+            _validate_assistant_attachment_object_key(
+                object_key,
+                attachment.tenant_id,
+                attachment.id,
+                attachment.filename,
+                require_generation=False,
+            )
+        except ValueError:
+            # Old/generated attachment rows may predate the tenant-scoped key
+            # layout.  They remain deletable only by their exact persisted
+            # identity inside the server-managed MinIO prefix.
+            _validate_persisted_minio_object_key(
+                object_key,
+                configured.bucket_name,
+                configured.prefix,
+            )
     except ValueError as exc:
-        raise ValueError("助手附件对象不属于托管存储作用域") from exc
+        raise ValueError("助手附件对象不属于平台托管存储作用域") from exc
     if bucket_name != configured.bucket_name:
         raise ValueError("助手附件对象不属于托管存储作用域")
     return (
@@ -653,6 +675,273 @@ def minio_file_identity(bf: BucketFile, ds: DataSource) -> tuple[str, str, str]:
     return recorded_bucket, recorded_key, safe_name
 
 
+def _validate_persisted_minio_object_key(
+    object_key: str,
+    bucket_name: str,
+    prefix: str,
+) -> str:
+    """Validate an object identity already persisted for a platform file.
+
+    New uploads use the tenant/scenario/data-source/file layout validated by
+    ``_validate_bucket_object_key``.  Older migration/import rows can have a
+    different layout, but they are still deletable when the exact identity is
+    already recorded in our database and remains below the one server-managed
+    MinIO prefix.  The key is never accepted from the delete request itself.
+    """
+    recorded = str(object_key or "").strip("/")
+    if not recorded:
+        raise ValueError("MinIO 附件缺少对象身份记录")
+    try:
+        # stable_object_url delegates to the storage layer's canonical object
+        # key validation (no empty/dot/traversal/control-character segments).
+        _bucket, normalized = object_storage_service.parse_object_url(
+            object_storage_service.stable_object_url(bucket_name, recorded)
+        )
+    except object_storage_service.ObjectStorageError as exc:
+        raise ValueError("MinIO 附件对象身份记录无效") from exc
+    if prefix and not normalized.startswith(f"{prefix}/"):
+        raise ValueError("MinIO 附件对象不属于平台托管文件桶")
+    return normalized
+
+
+def _minio_file_deletion_identity(
+    bf: BucketFile,
+    ds: DataSource,
+) -> tuple[str, str, str]:
+    """Resolve a persisted MinIO file identity for a destructive operation.
+
+    Deletion intentionally accepts both the current scoped key format and
+    historical platform-managed keys.  Ownership is established by the
+    tenant-owned ``DataSource``/``BucketFile`` relationship plus the exact
+    bucket/key recorded in the control-plane database; the configured bucket
+    and prefix remain an independent server-side boundary.
+    """
+    if bf.data_source_id != ds.id or ds.type != "file_bucket":
+        raise ValueError("附件不属于指定文件桶")
+    safe_name = validate_bucket_filename(bf.filename)
+    bucket_name, prefix = managed_minio_location(ds)
+    object_url = str(getattr(bf, "object_url", "") or bf.stored_path or "")
+    url_bucket = ""
+    url_key = ""
+    if object_url:
+        try:
+            url_bucket, url_key = object_storage_service.parse_object_url(object_url)
+        except object_storage_service.ObjectStorageError as exc:
+            raise ValueError("MinIO 附件对象地址无效") from exc
+    recorded_bucket = str(getattr(bf, "bucket_name", "") or url_bucket).strip()
+    recorded_key = str(getattr(bf, "object_key", "") or url_key).strip("/")
+    if not recorded_bucket or not recorded_key:
+        raise ValueError("MinIO 附件缺少对象身份记录")
+    if (url_bucket and url_bucket != recorded_bucket) or (
+        url_key and url_key != recorded_key
+    ):
+        raise ValueError("MinIO 附件对象字段与地址不一致")
+    if recorded_bucket != bucket_name:
+        raise ValueError("MinIO 附件对象不属于平台托管文件桶")
+    try:
+        # Prefer the current strict identity check.  If this is an older
+        # migration/generated key, fall back only to the exact persisted key
+        # under the server-managed prefix.
+        try:
+            validated_key = _validate_bucket_object_key(
+                recorded_key,
+                ds,
+                bf.id,
+                safe_name,
+                require_generation=False,
+            )
+        except ValueError:
+            validated_key = _validate_persisted_minio_object_key(
+                recorded_key,
+                bucket_name,
+                prefix,
+            )
+    except ValueError as exc:
+        raise ValueError("MinIO 附件对象不属于平台托管文件桶") from exc
+    return recorded_bucket, validated_key, safe_name
+
+
+def detach_platform_catalog_references_for_deletion(
+    db: Session,
+    data_source: DataSource,
+    bucket_file_ids: list[str] | tuple[str, ...],
+) -> dict[str, int]:
+    """Detach local catalog pointers before deleting owned source files.
+
+    A BucketFile is the physical payload for several immutable catalog rows.
+    Removing the platform-owned payload must not be blocked by those rows, but
+    those rows must also stop advertising a now-deleted MinIO object.  The
+    logical catalog identities are retained as retired audit metadata; only
+    their physical-file pointers and directly materialized fragments are
+    detached.  Remote database contents are not involved in this operation.
+    """
+    normalized_ids = sorted({str(value) for value in bucket_file_ids if str(value)})
+    if not normalized_ids:
+        return {
+            "asset_versions_detached": 0,
+            "dataset_fragments_deleted": 0,
+            "manifest_versions_detached": 0,
+        }
+    if data_source.type != "file_bucket":
+        return {
+            "asset_versions_detached": 0,
+            "dataset_fragments_deleted": 0,
+            "manifest_versions_detached": 0,
+        }
+
+    if db.get_bind().dialect.name == "postgresql":
+        try:
+            result = db.execute(
+                text(
+                    "SELECT asset_versions_detached, "
+                    "dataset_fragments_deleted, manifest_versions_detached "
+                    "FROM public.detach_data_source_file_references("
+                    ":source_id, :tenant_id, CAST(:file_ids AS varchar[]))"
+                ),
+                {
+                    "source_id": data_source.id,
+                    "tenant_id": data_source.tenant_id,
+                    "file_ids": normalized_ids,
+                },
+            ).one()
+        except ProgrammingError as exc:
+            raise ValueError(
+                "数据库尚未完成本地 MinIO 文件删除迁移，请先升级数据库并重启后端"
+            ) from exc
+        return {
+            "asset_versions_detached": int(result.asset_versions_detached or 0),
+            "dataset_fragments_deleted": int(result.dataset_fragments_deleted or 0),
+            "manifest_versions_detached": int(result.manifest_versions_detached or 0),
+        }
+
+    # SQLite is used by local tests and development.  Keep its lifecycle
+    # behavior equivalent to the governed PostgreSQL function above.
+    ingestion_runs = list(
+        db.scalars(
+            select(IngestionRun)
+            .where(
+                IngestionRun.trace_bucket_file_id.in_(normalized_ids),
+                IngestionRun.trace_data_source_id == data_source.id,
+            )
+            .with_for_update()
+        ).all()
+    )
+    derivation_runs = list(
+        db.scalars(
+            select(DerivationRun)
+            .where(
+                DerivationRun.trace_bucket_file_id.in_(normalized_ids),
+                DerivationRun.trace_data_source_id == data_source.id,
+            )
+            .with_for_update()
+        ).all()
+    )
+    for run in [*ingestion_runs, *derivation_runs]:
+        run.trace_bucket_file_id = None
+        run.trace_data_source_id = None
+
+    asset_versions = list(
+        db.scalars(
+            select(DataAssetVersion)
+            .where(
+                DataAssetVersion.bucket_file_id.in_(normalized_ids),
+                DataAssetVersion.bucket_data_source_id == data_source.id,
+            )
+            .with_for_update()
+        ).all()
+    )
+    for version in asset_versions:
+        version.status = "retired"
+        version.bucket_file_id = None
+        version.bucket_data_source_id = None
+        version.source_locator = {}
+
+    fragments = list(
+        db.scalars(
+            select(DatasetFragment)
+            .where(
+                DatasetFragment.bucket_file_id.in_(normalized_ids),
+                DatasetFragment.bucket_data_source_id == data_source.id,
+            )
+            .with_for_update()
+        ).all()
+    )
+    document_chunks = list(
+        db.scalars(
+            select(DocumentChunk)
+            .where(
+                DocumentChunk.bucket_file_id.in_(normalized_ids),
+                DocumentChunk.data_source_id == data_source.id,
+            )
+            .with_for_update()
+        ).all()
+    )
+    evidence_conditions = []
+    if fragments:
+        evidence_conditions.append(
+            DerivationEvidence.dataset_fragment_id.in_(
+                [fragment.id for fragment in fragments]
+            )
+        )
+    if document_chunks:
+        evidence_conditions.append(
+            DerivationEvidence.document_chunk_id.in_(
+                [chunk.id for chunk in document_chunks]
+            )
+        )
+    if evidence_conditions:
+        dependent_evidence = list(
+            db.scalars(
+                select(DerivationEvidence)
+                .where(or_(*evidence_conditions))
+                .with_for_update()
+            ).all()
+        )
+        for evidence in dependent_evidence:
+            db.delete(evidence)
+
+    affected_dataset_version_ids = {
+        str(fragment.dataset_version_id) for fragment in fragments
+    }
+    manifest_versions = list(
+        db.scalars(
+            select(DatasetVersion)
+            .where(
+                DatasetVersion.manifest_bucket_file_id.in_(normalized_ids),
+                DatasetVersion.manifest_data_source_id == data_source.id,
+            )
+            .with_for_update()
+        ).all()
+    )
+    affected_dataset_version_ids.update(
+        str(version.id) for version in manifest_versions
+    )
+    for fragment in fragments:
+        db.delete(fragment)
+    affected_versions = (
+        list(
+            db.scalars(
+                select(DatasetVersion)
+                .where(DatasetVersion.id.in_(sorted(affected_dataset_version_ids)))
+                .with_for_update()
+            ).all()
+        )
+        if affected_dataset_version_ids
+        else []
+    )
+    for version in affected_versions:
+        version.status = "retired"
+        if version.manifest_bucket_file_id in normalized_ids:
+            version.manifest_bucket_file_id = None
+            version.manifest_data_source_id = None
+
+    return {
+        "asset_versions_detached": len(asset_versions),
+        "dataset_fragments_deleted": len(fragments),
+        "manifest_versions_detached": len(manifest_versions),
+    }
+
+
 def read_bucket_file(bf: BucketFile, ds: DataSource) -> tuple[bytes, int, str]:
     """Read and integrity-check a managed MinIO object."""
     bucket_name, object_key, safe_name = minio_file_identity(bf, ds)
@@ -684,7 +973,7 @@ def bucket_file_deletion_identity(
     ds: DataSource,
 ) -> tuple[str, str, str, str]:
     """Validate and return the MinIO bucket, key and version for deletion."""
-    bucket_name, object_key, _safe_name = minio_file_identity(bf, ds)
+    bucket_name, object_key, _safe_name = _minio_file_deletion_identity(bf, ds)
     return (
         "minio",
         bucket_name,
