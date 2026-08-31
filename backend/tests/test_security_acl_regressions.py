@@ -627,8 +627,9 @@ class SecurityAclRegressionTests(unittest.TestCase):
 
         def inspect_runtime(*_args, **kwargs):
             context = kwargs["runtime_context"]
-            self.assertEqual(context.relations[0].source_entity.name, self.entity.name)
-            self.assertEqual(context.relations[0].target_entity.name, self.entity.name)
+            relation = next(iter(context.runtime_definition.relations.values()))
+            self.assertEqual(relation.source_entity_id, self.entity.id)
+            self.assertEqual(relation.target_entity_id, self.entity.id)
             yield {"type": "token", "data": "关系运行时可用"}
             yield {"type": "done", "data": "关系运行时可用"}
 
@@ -796,10 +797,7 @@ class SecurityAclRegressionTests(unittest.TestCase):
         self.assertEqual(len(captured_runtime_context), 1)
         self.assertEqual(len(authorization_contexts), 2)
         self.assertIs(captured_runtime_context[0], authorization_contexts[-1])
-        self.assertEqual(
-            {source.id for source in captured_runtime_context[0].data_sources},
-            {self.scoped_source.id},
-        )
+        self.assertEqual(captured_runtime_context[0].runtime_connections, [])
 
     def test_agent_rejects_incompatible_model_bindings_and_disabled_bound_chat_model(self) -> None:
         create = self.client.post(

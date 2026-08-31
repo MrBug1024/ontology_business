@@ -120,6 +120,29 @@ def _provider_config(function: Any) -> Mapping[str, Any]:
     )
 
 
+def _provider_input_port(
+    capability: CapabilityRef,
+    deployment: ResolvedDeployment,
+    port_key: str,
+) -> Any:
+    resources = _read(deployment.definition, "capability_ports", {}) or {}
+    values = resources.values() if isinstance(resources, Mapping) else resources
+    matches = [
+        port
+        for port in values
+        if str(_read(port, "capability_kind", "") or "").casefold() == capability.kind
+        and str(_read(port, "capability_key", "") or "") == capability.resource_id
+        and str(_read(port, "port_key", "") or "").casefold() == port_key
+        and str(_read(port, "direction", "input") or "input").casefold() == "input"
+        and str(_read(port, "binding_policy", "none") or "none").casefold() != "none"
+    ]
+    if len(matches) != 1:
+        raise MedicalAuditProviderError(
+            "Provider input_port_key must resolve to exactly one active managed input port"
+        )
+    return matches[0]
+
+
 def _bound_functions(context: Any) -> tuple[Any, ...]:
     result: list[Any] = []
     for function in getattr(context, "functions", ()) or ():
@@ -659,7 +682,8 @@ class MedicalAuditProvider:
         deployment: ResolvedDeployment,
     ) -> Mapping[str, Any]:
         function = _function_resource(capability, deployment)
-        _provider_config(function)
+        config = _provider_config(function)
+        _provider_input_port(capability, deployment, str(config["input_port_key"]))
         schema = _read(function, "input_schema", {}) or {}
         if not isinstance(schema, Mapping):
             raise MedicalAuditProviderError("Provider function input schema is invalid")

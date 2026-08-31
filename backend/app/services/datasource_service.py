@@ -456,6 +456,58 @@ def save_assistant_attachment_object(
     attachment._managed_object_created = True
 
 
+def save_assistant_attachment_object_path(
+    attachment: AssistantAttachment,
+    source_path: str | Path,
+    *,
+    upload_object_key: str | None = None,
+    content_sha256: str = "",
+) -> None:
+    """Stream a staged assistant attachment to MinIO without materialising bytes."""
+    configured = object_storage_service.require_configuration()
+    path = Path(source_path).resolve(strict=True)
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("附件暂存文件必须是普通文件")
+    digest = str(content_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("附件缺少有效内容哈希")
+    object_key = (
+        _validate_assistant_attachment_object_key(
+            upload_object_key,
+            attachment.tenant_id,
+            attachment.id,
+            attachment.filename,
+            require_generation=True,
+        )
+        if upload_object_key is not None
+        else build_assistant_attachment_object_key(
+            attachment.tenant_id,
+            attachment.id,
+            attachment.filename,
+            upload_id=uuid.uuid4().hex,
+        )
+    )
+    uploaded = object_storage_service.put_file(
+        configured.bucket_name,
+        object_key,
+        path,
+        content_type=attachment.mime or _guess_mime(attachment.filename),
+        sha256=digest,
+    )
+    attachment.content_hash = digest
+    attachment.size = int(path.stat().st_size)
+    attachment.mime = attachment.mime or _guess_mime(attachment.filename)
+    attachment.storage_provider = "minio"
+    attachment.bucket_name = configured.bucket_name
+    attachment.object_key = object_key
+    attachment.object_version_id = uploaded.version_id
+    attachment.etag = uploaded.etag
+    attachment.object_url = object_storage_service.stable_object_url(
+        configured.bucket_name, object_key
+    )
+    attachment._managed_object_created = True
+
+
 def assistant_attachment_object_identity(
     attachment: AssistantAttachment,
 ) -> tuple[str, str, str] | None:
@@ -630,6 +682,85 @@ def save_bucket_file(
         return bucket_file
 
     raise ValueError("文件桶必须使用 MinIO 存储")
+
+
+def save_bucket_file_path(
+    ds: DataSource,
+    filename: str,
+    source_path: str | Path,
+    *,
+    mime: str | None = None,
+    stable_file_id: str | None = None,
+    upload_object_key: str | None = None,
+    content_sha256: str = "",
+) -> BucketFile:
+    """Stream a local staging file to managed MinIO without loading it in RAM."""
+    if ds.type != "file_bucket" or not is_managed_minio_source(ds):
+        raise ValueError("文件桶必须使用 MinIO 存储")
+    requested_name = validate_bucket_filename(filename)
+    file_id = str(stable_file_id or uuid.uuid4().hex).lower()
+    if not re.fullmatch(r"[a-f0-9]{32}", file_id):
+        raise ValueError("稳定文件标识必须是 32 位十六进制字符串")
+    unresolved_path = Path(source_path).expanduser()
+    if unresolved_path.is_symlink():
+        raise ValueError("上传暂存文件必须是普通文件")
+    path = unresolved_path.resolve(strict=True)
+    if not path.is_file():
+        raise ValueError("上传暂存文件必须是普通文件")
+    size = int(path.stat().st_size)
+    if size <= 0:
+        raise ValueError("上传文件不能为空")
+    digest = str(content_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        hasher = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                hasher.update(chunk)
+        digest = hasher.hexdigest()
+    bucket_name, _prefix = managed_minio_location(ds)
+    object_key = (
+        _validate_bucket_object_key(
+            upload_object_key,
+            ds,
+            file_id,
+            requested_name,
+            require_generation=True,
+        )
+        if upload_object_key is not None
+        else build_bucket_object_key(
+            ds,
+            file_id,
+            requested_name,
+            upload_id=uuid.uuid4().hex,
+        )
+    )
+    resolved_mime = mime or _guess_mime(requested_name)
+    uploaded = object_storage_service.put_file(
+        bucket_name,
+        object_key,
+        path,
+        content_type=resolved_mime,
+        sha256=digest,
+    )
+    object_url = object_storage_service.stable_object_url(bucket_name, object_key)
+    bucket_file = BucketFile(
+        id=file_id,
+        data_source_id=ds.id,
+        filename=requested_name,
+        stored_path=object_url,
+        storage_provider="minio",
+        bucket_name=bucket_name,
+        object_key=object_key,
+        object_version_id=uploaded.version_id,
+        etag=uploaded.etag,
+        object_url=object_url,
+        size=size,
+        mime=resolved_mime,
+        content_sha256=digest,
+        status="pending",
+    )
+    bucket_file._managed_object_created = True
+    return bucket_file
 
 
 def _validated_bucket_mime(filename: str, recorded_mime: str) -> str:

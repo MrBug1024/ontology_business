@@ -586,6 +586,40 @@ def test_function_action_and_workflow_share_explicit_managed_port_rules() -> Non
         )
 
 
+def test_business_input_port_accepts_uploaded_dataset_or_remote_database() -> None:
+    ref = "request:p0001"
+    ports = assistant_capability_modeling_service.normalize_managed_data_port_declarations(
+        [{
+            "port_key": "business_data.current",
+            "name": "Current business data",
+            "direction": "input",
+            "role": "invocation_input",
+            "media_kind": "structured",
+            "schema_document": {"type": "object"},
+            "binding_policy": "per_invocation",
+            "binding_kinds": [
+                "dataset_version",
+                "dataset_head",
+                "connector_binding",
+            ],
+            "evidence_kind": "versioned_data",
+            "evidence_refs": [ref],
+        }],
+        resource_kind="workflow",
+        resource_key="workflow.audit",
+        resource_evidence_refs=[ref],
+        resource_confidence=0.95,
+    )
+
+    assert len(ports) == 1
+    assert ports[0]["port"]["media_kind"] == "structured"
+    assert ports[0]["port"]["config"]["allowed_binding_kinds"] == [
+        "connector_binding",
+        "dataset_head",
+        "dataset_version",
+    ]
+
+
 def test_no_data_source_and_no_interaction_contract_allows_zero_ports(
     governed_scenario,
 ) -> None:

@@ -574,6 +574,37 @@ export interface ScenarioDetail extends Scenario {
   workflows: OntologyWorkflow[]
 }
 
+export interface ScenarioCapabilityPort {
+  id: string
+  tenant_id: string
+  scenario_id: string
+  capability_kind: 'function' | 'action' | 'workflow'
+  capability_key: string
+  port_key: string
+  name: string
+  description: string
+  direction: 'input' | 'output'
+  role: 'modeling_evidence' | 'test_fixture' | 'invocation_input' | 'reference' | 'rules' | 'output'
+  media_kind: 'message' | 'structured' | 'document' | 'dataset' | 'connector' | 'artifact'
+  dataset_id?: string | null
+  dataset_schema_id?: string | null
+  dataset_schema_hash?: string
+  schema_document: Record<string, unknown>
+  is_required: boolean
+  cardinality: 'one' | 'many'
+  binding_policy: 'per_invocation' | 'scenario_default' | 'release_pinned' | 'none'
+  status: 'draft' | 'active' | 'retired'
+  config: Record<string, unknown>
+  created_by_user_id?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type ScenarioCapabilityPortWrite = Omit<
+  ScenarioCapabilityPort,
+  'id' | 'tenant_id' | 'scenario_id' | 'dataset_schema_hash' | 'created_by_user_id' | 'created_at' | 'updated_at'
+>
+
 export type ScenarioModelDraftStatus =
   | 'generated'
   | 'needs_revision'
@@ -768,7 +799,7 @@ export interface CatalogAssetVersion {
 }
 
 export interface CatalogManagedUpload {
-  purpose: 'managed_asset' | 'invocation_attachment'
+  purpose: 'managed_asset' | 'validation_asset' | 'invocation_attachment'
   temporary: boolean
   expires_at?: string | null
   created: boolean
@@ -785,6 +816,27 @@ export interface CatalogManagedUpload {
     lifecycle: Record<string, unknown>
     created_at: string
   }
+}
+
+export interface ValidationDataset {
+  dataset_id: string
+  dataset_version_id: string
+  content_hash: string
+  schema_hash: string
+  record_count: number
+  byte_size: number
+  relation_names: string[]
+  source_asset_version_ids: string[]
+  reused: boolean
+}
+
+export interface ValidationDatasetJob {
+  id: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed'
+  error: string
+  created_at: string
+  updated_at: string
+  result?: ValidationDataset | null
 }
 
 export interface LogicalDataset {
@@ -1349,7 +1401,8 @@ export interface AgentCapabilityTarget {
 }
 
 export interface AgentChatAttachment {
-  asset_version_id: string
+  asset_version_id?: string
+  dataset_version_id?: string
   expected_signature?: string
   filename?: string
 }

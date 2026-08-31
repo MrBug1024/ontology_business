@@ -40,6 +40,7 @@ from ..services import (
     object_deletion_service,
     object_storage_service,
     permission_service,
+    upload_staging_service,
 )
 from ..services.capability_contracts import (
     Actor,
@@ -218,21 +219,51 @@ async def upload_invocation_attachment(
             )
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
-        max_bytes = int(get_settings().max_upload_bytes)
-        content = await file.read(max_bytes + 1)
-        if len(content) > max_bytes:
+        settings = get_settings()
+        max_upload_bytes = int(
+            getattr(settings, "catalog_max_upload_bytes", settings.max_upload_bytes)
+        )
+        chunk_bytes = int(getattr(settings, "upload_stream_chunk_bytes", 1024 * 1024))
+        in_memory_bytes = int(
+            getattr(settings, "catalog_in_memory_upload_bytes", settings.max_upload_bytes)
+        )
+        try:
+            staged = await upload_staging_service.stage_upload(
+                file,
+                max_bytes=max_upload_bytes,
+                chunk_bytes=chunk_bytes,
+            )
+        except upload_staging_service.UploadTooLargeError as exc:
             raise HTTPException(
                 status_code=413,
-                detail=f"文件超过大小限制（{max_bytes // (1024 * 1024)} MB）",
-            )
-        result = catalog_ingestion_service.persist_managed_upload(
-            context.db,
-            source,
-            content,
-            file.filename or "file",
-            file.content_type,
-            metadata,
-        )
+                detail=(
+                    "文件超过大小限制（"
+                    f"{max_upload_bytes // (1024 * 1024)} MB）"
+                ),
+            ) from exc
+        try:
+            if staged.byte_size <= in_memory_bytes:
+                result = catalog_ingestion_service.persist_managed_upload(
+                    context.db,
+                    source,
+                    staged.path.read_bytes(),
+                    file.filename or "file",
+                    file.content_type,
+                    metadata,
+                )
+            else:
+                result = catalog_ingestion_service.persist_managed_upload_path(
+                    context.db,
+                    source,
+                    staged.path,
+                    file.filename or "file",
+                    file.content_type,
+                    metadata,
+                    content_sha256=staged.content_sha256,
+                    byte_size=staged.byte_size,
+                )
+        finally:
+            staged.remove()
         asset = context.db.get(DataAsset, result.asset_id)
         version = context.db.get(DataAssetVersion, result.version_id)
         if asset is None or version is None:

@@ -1443,6 +1443,7 @@ _PROMPT = """你是业务本体文档编译器。只输出一个 JSON 对象，�
 - 附件、历史样本和“可用数据源表结构”只用于理解数据形状、字段关系和业务语义，默认都是 modeling_evidence，绝不能因为本次看见了这些数据就把它们解释为能力未来每次运行时的固定输入。
 - 函数 input_schema/output_schema 描述每次能力调用的协议中立交互契约。应根据来源明确表达的文本、文档或结构化交互需求建模；没有 DataSource 也完全可以建立函数契约、操作和其他业务模型。
 - 普通文本、数字、对象和数组都只写入 Function/Action 的 JSON Schema，不得为它们创建 managed_data_ports。只有来源明确要求每次使用版本化数据、文档/附件、稳定 reference/rules 或环境 connector 时，才可在对应 Function/Action/Workflow 上声明 managed_data_ports；每个端口必须有独立 evidence_refs，不能仅凭 input_schema/output_schema 猜测。
+- 同一份业务输入既允许第三方上传表格、又允许绑定远程数据库时，只声明一个 structured + invocation_input + per_invocation 端口，binding_kinds 同时包含 dataset_version、dataset_head、connector_binding。属于同一业务数据包的多张关联表只声明一个数据集端口，不得按文件拆成多个端口。
 - 不得把 data_source_id、数据资产/数据集/版本 ID、表名或附件 ID 写入函数 Schema、操作执行配置或其他永久运行配置。物理数据映射只遵守下方 mappings 的独立受治理规则。
 
 来源与冲突策略：
@@ -1555,6 +1556,7 @@ coverage: [{source_ref,status,reason,change_keys}]
 - functions 只定义输入/输出 JSON Schema；type 只能是 object/array/string/number/integer/boolean/null。不得生成代码、URL、SQL 或运行配置。
 - input_schema/output_schema 描述每次调用需要提交和返回的逻辑内容；从文本或文档交互需求建模时不要求存在 DataSource。附件和历史数据只能作为 Schema/语义证据，不能成为固定运行绑定。
 - 普通文本和 JSON 参数只属于 input_schema/output_schema。仅当来源明确要求版本化数据、文档/附件、reference/rules 或 connector 依赖时，才在对应 Function/Action/Workflow 上声明 managed_data_ports；端口 evidence_kind 只能是 versioned_data、document_attachment、reference、rules、connector，且必须引用该能力已有的 evidence_refs。不得填写任何资源 ID、表名、路径或连接信息。
+- 同一业务输入可由上传数据集或远程数据库二选一提供时，声明单个 structured 端口，并同时列出 dataset_version、dataset_head、connector_binding；同一数据包的多张关联表只使用一个端口。
 - actions 只描述输入、前置条件、后置效果；entity_ref 必须引用已确认对象。不得发明执行器、自动发布或未在资料中出现的业务能力。
 - 函数、操作引用不完整时保留有证据的候选并写 unresolved；操作默认待绑定、停用。
 functions: [{key,name,description,input_schema,output_schema,tags,managed_data_ports:[{port_key,name,description,direction,role,media_kind,schema_document,is_required,cardinality,binding_policy,binding_kinds,evidence_kind,evidence_refs,confidence}],evidence_refs,confidence}]

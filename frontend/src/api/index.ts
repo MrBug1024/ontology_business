@@ -22,6 +22,8 @@ import type {
   CatalogAsset,
   CatalogAssetVersion,
   CatalogManagedUpload,
+  ValidationDataset,
+  ValidationDatasetJob,
   ConnectorBindingOption,
   AgentChatRequest,
   AgentRuntimeCapability,
@@ -59,6 +61,8 @@ import type {
   ScenarioPurgeResult,
   ScenarioDatasetBinding,
   ScenarioDatasetBindingCreate,
+  ScenarioCapabilityPort,
+  ScenarioCapabilityPortWrite,
   ScenarioDetail,
   ScenarioModelDraftListResponse,
   ScenarioModelCandidateBatchPromotionRequest,
@@ -160,6 +164,7 @@ export const api = {
     fd.append('file', file)
     return http.post<AssistantAttachment>('/assistant/attachments', fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60 * 60 * 1000,
     })
   },
   deleteAssistantAttachment: (id: string) => http.delete(`/assistant/attachments/${id}`),
@@ -205,6 +210,10 @@ export const api = {
   getScenarioPurgePlan: (id: string) => http.get<ScenarioPurgePlan>(`/scenarios/${id}/purge-plan`),
   purgeScenario: (id: string, d: { expected_name: string; confirmed: boolean; delete_audit_history: boolean }) =>
     http.post<ScenarioPurgeResult>(`/scenarios/${id}/purge`, d),
+  listScenarioCapabilityPorts: (scenarioId: string) =>
+    http.get<ScenarioCapabilityPort[]>(`/scenarios/${scenarioId}/capability-ports`),
+  updateScenarioCapabilityPort: (scenarioId: string, portId: string, d: ScenarioCapabilityPortWrite) =>
+    http.put<ScenarioCapabilityPort>(`/scenarios/${scenarioId}/capability-ports/${portId}`, d),
 
   // 实体
   createEntity: (sid: string, d: any) => http.post(`/scenarios/${sid}/entities`, d),
@@ -314,20 +323,46 @@ export const api = {
     http.get<CatalogAssetVersion[]>(`/catalog/assets/${assetId}/versions`),
   uploadCatalogAttachment: (d: {
     file: File
+    purpose?: 'validation_asset' | 'invocation_attachment'
     expires_in_seconds?: number
     onProgress?: (percent: number) => void
   }) => {
     const fd = new FormData()
     fd.append('file', d.file)
-    fd.append('purpose', 'invocation_attachment')
+    fd.append('purpose', d.purpose || 'validation_asset')
     fd.append('name', d.file.name)
     if (d.expires_in_seconds) fd.append('expires_in_seconds', String(d.expires_in_seconds))
     return http.post<CatalogManagedUpload>('/catalog/uploads', fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60 * 60 * 1000,
       onUploadProgress: (event: { loaded: number; total?: number }) => {
         if (event.total && d.onProgress) d.onProgress(Math.round((event.loaded * 100) / event.total))
       },
     })
+  },
+  deleteCatalogAsset: (assetId: string) => http.delete(`/catalog/assets/${assetId}`),
+  createValidationDatasetJob: (assetVersionIds: string[], name = '验证数据包') =>
+    http.post<ValidationDatasetJob>('/catalog/validation-dataset-jobs', {
+      asset_version_ids: assetVersionIds,
+      name,
+    }),
+  getValidationDatasetJob: (jobId: string) =>
+    http.get<ValidationDatasetJob>(`/catalog/validation-dataset-jobs/${jobId}`),
+  buildValidationDataset: async (assetVersionIds: string[], name = '验证数据包') => {
+    let job = await http.post<ValidationDatasetJob>('/catalog/validation-dataset-jobs', {
+      asset_version_ids: assetVersionIds,
+      name,
+    })
+    const deadline = Date.now() + 4 * 60 * 60 * 1000
+    while (job.status === 'queued' || job.status === 'running') {
+      if (Date.now() >= deadline) throw new Error('验证数据集准备超时，请稍后从资料库重试')
+      await new Promise((resolve) => window.setTimeout(resolve, 1500))
+      job = await http.get<ValidationDatasetJob>(`/catalog/validation-dataset-jobs/${job.id}`)
+    }
+    if (job.status === 'failed' || !job.result) {
+      throw new Error(job.error || '验证数据集准备失败')
+    }
+    return job.result
   },
   listLogicalDatasets: () => http.get<LogicalDataset[]>('/catalog/datasets'),
   listDatasetHeads: (datasetId: string) => http.get<DatasetHead[]>(`/catalog/datasets/${datasetId}/heads`),
@@ -360,6 +395,7 @@ export const api = {
     files.forEach((f) => fd.append('files', f))
     return http.post<BucketFile[]>(`/data-sources/${id}/files`, fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60 * 60 * 1000,
     })
   },
   reparseFile: (fid: string) => http.post(`/data-sources/files/${fid}/reparse`),

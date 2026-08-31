@@ -113,7 +113,35 @@ class Settings(BaseSettings):
     # A job that reaches this limit fails closed and is not retried under the
     # same execution fingerprint.
     scenario_model_max_llm_calls: int = 24
+    # ``max_upload_bytes`` remains the compatibility ceiling for legacy APIs
+    # that still materialise request bodies in memory.  Governed catalog/file
+    # uploads use the independent streaming ceiling below.
     max_upload_bytes: int = 50 * 1024 * 1024
+    catalog_max_upload_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=64 * 1024 * 1024 * 1024,
+    )
+    catalog_in_memory_upload_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        ge=64 * 1024,
+        le=64 * 1024 * 1024,
+    )
+    upload_stream_chunk_bytes: int = Field(
+        default=4 * 1024 * 1024,
+        ge=64 * 1024,
+        le=64 * 1024 * 1024,
+    )
+    catalog_max_office_expanded_bytes: int = Field(
+        default=8 * 1024 * 1024 * 1024,
+        ge=64 * 1024 * 1024,
+        le=256 * 1024 * 1024 * 1024,
+    )
+    document_parse_max_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=2 * 1024 * 1024 * 1024,
+    )
     allow_unsafe_workflow_nodes: bool = False
     # Async workflow inputs are sealed with an externally managed AES-256-GCM
     # key ring before they enter the database.  The JSON object maps stable key

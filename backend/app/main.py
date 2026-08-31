@@ -40,6 +40,7 @@ from .services import (
     operations_service,
     permission_service,
     skill_service,
+    validation_dataset_service,
 )
 
 
@@ -64,6 +65,19 @@ async def _assistant_compilation_worker() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("AI 场景建模任务恢复轮询失败")
         await asyncio.sleep(10)
+
+
+async def _validation_dataset_worker() -> None:
+    """Resume durable validation Parquet materializations outside request threads."""
+    while True:
+        try:
+            worked = await asyncio.to_thread(
+                validation_dataset_service.process_next_validation_dataset_job
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("验证数据集 worker 轮询失败")
+            worked = False
+        await asyncio.sleep(0.2 if worked else 2)
 
 
 @asynccontextmanager
@@ -93,6 +107,12 @@ async def lifespan(_: FastAPI):
         await asyncio.to_thread(assistant.recover_expired_compilation_jobs)
     except Exception:  # noqa: BLE001
         logger.exception("AI 场景建模任务启动恢复失败")
+    try:
+        await asyncio.to_thread(
+            validation_dataset_service.recover_validation_dataset_jobs
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("验证数据集任务启动恢复失败")
     async with agent_mcp_server.mcp_server.session_manager.run():
         operations_worker = asyncio.create_task(
             _operations_worker(),
@@ -102,15 +122,22 @@ async def lifespan(_: FastAPI):
             _assistant_compilation_worker(),
             name="assistant-compilation-recovery-worker",
         )
+        validation_dataset_worker = asyncio.create_task(
+            _validation_dataset_worker(),
+            name="validation-dataset-worker",
+        )
         try:
             yield
         finally:
             operations_worker.cancel()
             compilation_worker.cancel()
+            validation_dataset_worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await operations_worker
             with contextlib.suppress(asyncio.CancelledError):
                 await compilation_worker
+            with contextlib.suppress(asyncio.CancelledError):
+                await validation_dataset_worker
 
 
 settings = get_settings()
@@ -118,10 +145,11 @@ app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=li
 
 app.add_middleware(
     RequestBodyLimitMiddleware,
-    max_body_bytes=settings.max_upload_bytes + 1024 * 1024,
+    max_body_bytes=settings.catalog_max_upload_bytes + 1024 * 1024,
     paths={
         f"{settings.api_prefix}/catalog/uploads",
         f"{settings.api_prefix}/external/v2/assets/upload",
+        f"{settings.api_prefix}/assistant/attachments",
     },
 )
 app.add_middleware(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from pathlib import Path
 from urllib.parse import quote
 import uuid
 
@@ -24,6 +25,7 @@ from ..schemas import (
     TableInfo,
 )
 from ..services import (
+    catalog_ingestion_service,
     connector_service,
     datasource_service,
     object_deletion_service,
@@ -33,6 +35,7 @@ from ..services import (
     scenario_model_draft_service,
     template_catalog_service,
     tenant_service,
+    upload_staging_service,
 )
 from ..config import get_settings
 from ..services.auth_service import get_tenant_db
@@ -451,13 +454,36 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
     if ds.type != "file_bucket":
         raise HTTPException(400, "该数据源不是文件桶")
     created: list[BucketFile] = []
-    max_upload_bytes = get_settings().max_upload_bytes
+    settings = get_settings()
     for uf in files:
-        content = await uf.read(max_upload_bytes + 1)
-        if len(content) > max_upload_bytes:
-            raise HTTPException(413, f"文件超过大小限制（{max_upload_bytes // (1024 * 1024)} MB）")
         filename = uf.filename or "file"
+        content_type = uf.content_type
+        try:
+            staged = await upload_staging_service.stage_upload(
+                uf,
+                max_bytes=int(settings.catalog_max_upload_bytes),
+                chunk_bytes=int(settings.upload_stream_chunk_bytes),
+            )
+        except upload_staging_service.UploadTooLargeError as exc:
+            raise HTTPException(
+                413,
+                "文件超过大小限制（"
+                f"{int(settings.catalog_max_upload_bytes) // (1024 * 1024)} MB）",
+            ) from exc
         file_id = uuid.uuid4().hex
+        table_file = Path(filename).suffix.lower() in {".csv", ".tsv", ".xls", ".xlsx", ".xlsm"}
+        table_profile_text = ""
+        if table_file:
+            try:
+                _media_type, table_profile = catalog_ingestion_service.build_profile_path(
+                    staged.path, filename, content_type
+                )
+                table_profile_text = catalog_ingestion_service.profile_summary_text(
+                    table_profile, filename
+                )
+            except ValueError as exc:
+                staged.remove()
+                raise HTTPException(400, str(exc)) from exc
         upload_claim = None
         if datasource_service.is_managed_minio_source(ds):
             try:
@@ -465,6 +491,7 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
                     ds, file_id, filename
                 )
             except Exception as exc:  # noqa: BLE001 - expose no DB/MinIO details.
+                staged.remove()
                 raise HTTPException(503, "无法建立文件上传事务") from exc
         try:
             heartbeat = (
@@ -475,25 +502,41 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
             with heartbeat as active_heartbeat:
                 if upload_claim is not None:
                     object_deletion_service.begin_upload_put(upload_claim)
-                bf = datasource_service.save_bucket_file(
-                    ds,
-                    filename,
-                    content,
-                    stable_file_id=file_id if upload_claim is not None else None,
-                    upload_object_key=(
-                        upload_claim.object_key
-                        if upload_claim is not None
-                        else None
-                    ),
-                )
+                if staged.byte_size <= int(settings.catalog_in_memory_upload_bytes):
+                    bf = datasource_service.save_bucket_file(
+                        ds,
+                        filename,
+                        staged.path.read_bytes(),
+                        mime=content_type,
+                        stable_file_id=file_id if upload_claim is not None else None,
+                        upload_object_key=(
+                            upload_claim.object_key if upload_claim is not None else None
+                        ),
+                    )
+                else:
+                    bf = datasource_service.save_bucket_file_path(
+                        ds,
+                        filename,
+                        staged.path,
+                        mime=content_type,
+                        stable_file_id=file_id if upload_claim is not None else None,
+                        upload_object_key=(
+                            upload_claim.object_key if upload_claim is not None else None
+                        ),
+                        content_sha256=staged.content_sha256,
+                    )
                 if upload_claim is not None:
                     object_deletion_service.assert_upload_active(
                         active_heartbeat, upload_claim, bf
                     )
         except ValueError as exc:
+            staged.remove()
             raise HTTPException(400, str(exc)) from exc
         except (RuntimeError, object_storage_service.ObjectStorageError) as exc:
+            staged.remove()
             raise HTTPException(503, str(exc)) from exc
+        finally:
+            staged.remove()
         db.add(bf)
         try:
             if upload_claim is not None:
@@ -501,8 +544,14 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
                     db, upload_claim, bf, ds
                 )
             db.flush()
-            # 文件已可靠写入对象存储；解析与 embedding 由可恢复的后台任务处理。
-            rag_service.enqueue_document_index(db, bf, parse_document=True)
+            # Only schema metadata is indexed for modeling. Business rows are
+            # queried from MinIO-backed datasets and never copied into PG.
+            if table_file:
+                bf.status = "parsed"
+                bf.parsed_text = table_profile_text
+                rag_service.enqueue_document_index(db, bf, parse_document=False)
+            else:
+                rag_service.enqueue_document_index(db, bf, parse_document=True)
             db.commit()
         except Exception as exc:
             db.rollback()
@@ -534,6 +583,8 @@ def reparse_file(file_id: str, db: Session = Depends(get_tenant_db)):
     if not bf:
         raise HTTPException(404, "文件不存在")
     _data_source(db, bf.data_source_id, writable=True)
+    if Path(bf.filename).suffix.lower() in {".csv", ".tsv", ".xls", ".xlsx", ".xlsm"}:
+        raise HTTPException(409, "表格业务数据必须通过数据集通道解析，不能建立文档全文索引")
     bf.status = "pending"
     bf.error = ""
     bf.parsed_text = ""

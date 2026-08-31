@@ -66,7 +66,7 @@ project-root
     │   ├── types/             # 领域类型
     │   ├── styles/            # 全局样式
     │   └── views/             # Scenarios / ScenarioDetail / DataSources / Agents / AgentChat / Tasks / Skills / MCP / LLMConfigs
-    ├── vite.config.ts         # 端口 5173，/api 代理到 127.0.0.1:8001
+    ├── vite.config.ts         # 端口 5173，/api 代理到 127.0.0.1:8000
     └── package.json
 ```
 
@@ -87,11 +87,11 @@ python -m pip install -r .\backend\requirements.txt
 # 创建本地配置（首次；不要提交真实密钥）
 Copy-Item .\backend\.env.example .\backend\.env
 
-# 启动后端（默认使用 8001）
-python -m uvicorn app.main:app --app-dir .\backend --host 127.0.0.1 --port 8001
+# 启动后端（默认使用 8000）
+python -m uvicorn app.main:app --app-dir .\backend --host 127.0.0.1 --port 8000
 ```
 
-> 后端 API 文档：http://127.0.0.1:8001/docs
+> 后端 API 文档：http://127.0.0.1:8000/docs
 
 后端启动前，PostgreSQL 必须已升级到 Alembic head。当前存储边界、首次建库、迁移和回退要求见
 [PostgreSQL / MinIO 通用数据资产架构](./docs/PostgreSQL-MinIO-通用数据资产架构.md)。`init_db()` 只校验迁移版本，不会在生产库隐式建表。
@@ -104,7 +104,7 @@ npm --prefix .\frontend install
 # 若 npm 11 拦截了 postinstall 脚本：
 npm --prefix .\frontend approve-scripts esbuild vue-demi
 
-# 启动开发服务器（端口 5173，/api 自动代理到 8001）
+# 启动开发服务器（端口 5173，/api 自动代理到 8000）
 npm --prefix .\frontend run dev
 ```
 
@@ -254,6 +254,6 @@ npm --prefix .\frontend run build
 
 ## 常见问题
 
-- **需要改后端端口**：同步设置前端环境变量 `VITE_API_PROXY_TARGET`，默认代理目标是 `http://127.0.0.1:8001`。
+- **需要改后端端口**：同步设置前端环境变量 `VITE_API_PROXY_TARGET`，默认代理目标是 `http://127.0.0.1:8000`。
 - **npm 11 拦截 postinstall**：执行 `npm approve-scripts esbuild vue-demi`。
 - **LLM 调用失败**：检查 LLM 配置的 API Key 是否真实有效，可在 LLM 配置页点「测试」。

@@ -26,6 +26,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ..config import get_settings
 from ..catalog_schemas import (
     CatalogManagedUploadMetadata,
     DataAssetCreate,
@@ -56,6 +57,7 @@ _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _DATETIME_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
 )
+_RELATION_NAME_CLEAN_RE = re.compile(r"[\x00-\x1f\x7f]")
 _RESERVED_LABELS = {
     "catalog_purpose",
     "temporary",
@@ -174,6 +176,26 @@ class PreparedCatalogUpload:
 
 
 @dataclass(frozen=True)
+class PreparedCatalogPathUpload:
+    source_path: Path
+    byte_size: int
+    filename: str
+    content_sha256: str
+    media_type: str
+    profile: dict[str, Any]
+    metadata: CatalogManagedUploadMetadata
+    asset_key: str
+    asset_name: str
+    labels: dict[str, Any]
+    lifecycle: dict[str, Any]
+    expires_at: datetime | None
+
+    @property
+    def temporary(self) -> bool:
+        return self.metadata.purpose == "invocation_attachment"
+
+
+@dataclass(frozen=True)
 class ManagedCatalogUploadResult:
     asset_id: str
     version_id: str
@@ -256,6 +278,39 @@ def _validate_zip_container(content: bytes, required_prefix: str) -> None:
             ):
                 raise catalog_service.CatalogError("Office 文件压缩比超过安全限制")
             if not any(name.startswith(required_prefix) for name in names):
+                raise catalog_service.CatalogError("文件内容与 Office 扩展名不一致")
+    except BadZipFile as exc:
+        raise catalog_service.CatalogError("Office 文件容器无效") from exc
+
+
+def _validate_zip_container_path(path: Path, required_prefix: str) -> None:
+    """Validate an Office ZIP from disk without expanding it into memory."""
+    try:
+        with ZipFile(path) as archive:
+            infos = archive.infolist()
+            if not infos or len(infos) > MAX_ZIP_MEMBERS:
+                raise catalog_service.CatalogError("Office 文件容器条目数量异常")
+            expanded = 0
+            compressed = 0
+            found_required = False
+            for info in infos:
+                pure = PurePosixPath(info.filename.replace("\\", "/"))
+                if pure.is_absolute() or ".." in pure.parts or info.flag_bits & 0x1:
+                    raise catalog_service.CatalogError("Office 文件容器包含不安全条目")
+                expanded += max(0, int(info.file_size))
+                compressed += max(0, int(info.compress_size))
+                found_required = found_required or str(pure).startswith(required_prefix)
+            expanded_limit = int(get_settings().catalog_max_office_expanded_bytes)
+            if expanded > expanded_limit:
+                raise catalog_service.CatalogError(
+                    f"Office 文件展开后超过安全限制（{expanded_limit // (1024 * 1024)} MB）"
+                )
+            if (
+                expanded > 10 * 1024 * 1024
+                and expanded > max(1, compressed) * MAX_ZIP_COMPRESSION_RATIO
+            ):
+                raise catalog_service.CatalogError("Office 文件压缩比超过安全限制")
+            if not found_required:
                 raise catalog_service.CatalogError("文件内容与 Office 扩展名不一致")
     except BadZipFile as exc:
         raise catalog_service.CatalogError("Office 文件容器无效") from exc
@@ -391,6 +446,36 @@ def _table_contract(name: str, header: list[Any], rows: list[list[Any]], *, trun
     }
 
 
+def runtime_relation_name(
+    filename: str,
+    source_relation_name: str,
+    relation_count: int,
+) -> str:
+    """Return one logical relation identity shared by modeling and runtime."""
+
+    stem = Path(filename).stem.strip() or "table"
+    source = str(source_relation_name or "").strip() or "table"
+    value = stem if int(relation_count or 0) <= 1 else f"{stem}__{source}"
+    value = _RELATION_NAME_CLEAN_RE.sub("", value).strip() or "table"
+    if len(value) > 180:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+        value = f"{value[:160]}-{digest}"
+    return value
+
+
+def _with_runtime_relation_names(profile: dict[str, Any], filename: str) -> dict[str, Any]:
+    if profile.get("category") != "table":
+        return profile
+    tables = [item for item in profile.get("tables") or [] if isinstance(item, dict)]
+    for table in tables:
+        table["relation_name"] = runtime_relation_name(
+            filename,
+            str(table.get("name") or ""),
+            len(tables),
+        )
+    return profile
+
+
 def _csv_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
     text = _decode_text(content)
     sample = text[:65536]
@@ -421,8 +506,42 @@ def _csv_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
         "category": "table",
         "extension": spec.extension,
         "media_type": spec.media_type,
-        "tables": [_table_contract("data", header, rows, truncated=truncated)],
+        "tables": [{**_table_contract("data", header, rows, truncated=truncated), "header_row_index": 0}],
     }
+
+
+def _sheet_profile_rows(
+    values: Iterable[Iterable[Any]],
+) -> tuple[int, list[Any], list[list[Any]], bool] | None:
+    """Detect a header after optional title rows, then retain a bounded sample."""
+    buffered: list[tuple[int, list[Any]]] = []
+    iterator = iter(values)
+    for raw_index, raw in enumerate(iterator):
+        row = list(raw)
+        if any(_logical_type(value) is not None for value in row):
+            buffered.append((raw_index, row))
+        if len(buffered) >= 25:
+            break
+    if not buffered:
+        return None
+    header_position = max(
+        range(len(buffered)),
+        key=lambda index: sum(
+            _logical_type(value) is not None for value in buffered[index][1]
+        ),
+    )
+    header_index, header = buffered[header_position]
+    rows = [row for _index, row in buffered[header_position + 1 :]]
+    truncated = False
+    for raw in iterator:
+        row = list(raw)
+        if not any(_logical_type(value) is not None for value in row):
+            continue
+        if len(rows) >= MAX_PROFILE_ROWS:
+            truncated = True
+            break
+        rows.append(row)
+    return header_index, header, rows[:MAX_PROFILE_ROWS], truncated
 
 
 def _xlsx_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
@@ -441,23 +560,14 @@ def _xlsx_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
     tables: list[dict[str, Any]] = []
     try:
         for sheet in workbook.worksheets:
-            header: list[Any] | None = None
-            rows: list[list[Any]] = []
-            truncated = False
-            for values in sheet.iter_rows(values_only=True):
-                row = list(values)
-                if not any(_logical_type(value) is not None for value in row):
-                    continue
-                if header is None:
-                    header = row
-                    continue
-                if len(rows) >= MAX_PROFILE_ROWS:
-                    truncated = True
-                    break
-                rows.append(row)
-            if header is not None:
+            detected = _sheet_profile_rows(sheet.iter_rows(values_only=True))
+            if detected is not None:
+                header_index, header, rows, truncated = detected
                 tables.append(
-                    _table_contract(sheet.title, header, rows, truncated=truncated)
+                    {
+                        **_table_contract(sheet.title, header, rows, truncated=truncated),
+                        "header_row_index": header_index,
+                    }
                 )
     finally:
         workbook.close()
@@ -565,12 +675,227 @@ def build_profile(content: bytes, filename: str, client_media_type: str | None =
         profile = _xls_profile(content, spec)
     else:
         profile = _document_profile(content, safe_name, spec)
+    profile = _with_runtime_relation_names(profile, safe_name)
     # Reuse the catalog document guard to guarantee profiles cannot grow into
     # raw row storage or accidentally contain credential-shaped keys.
     profile = catalog_service.safe_catalog_document(
         profile, label="文件结构 profile", maximum=128_000
     )
     return spec.media_type, profile
+
+
+def _text_encoding_from_sample(sample: bytes) -> str:
+    if sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    if b"\x00" in sample[:8192]:
+        raise catalog_service.CatalogError("文本文件包含二进制内容")
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            sample.decode(encoding)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+    raise catalog_service.CatalogError("文本文件编码不受支持")
+
+
+def _csv_profile_path(path: Path, spec: FormatSpec) -> dict[str, Any]:
+    with path.open("rb") as raw:
+        sample_bytes = raw.read(65536)
+    encoding = _text_encoding_from_sample(sample_bytes)
+    sample = sample_bytes.decode(encoding)
+    try:
+        delimiter = csv.Sniffer().sniff(sample, delimiters="\t,;|").delimiter
+    except csv.Error:
+        delimiter = "\t" if spec.extension == ".tsv" else ","
+    header: list[Any] | None = None
+    rows: list[list[Any]] = []
+    truncated = False
+    try:
+        with path.open("r", encoding=encoding, newline="") as handle:
+            for row in csv.reader(handle, delimiter=delimiter):
+                if not any(str(value).strip() for value in row):
+                    continue
+                if header is None:
+                    header = list(row)
+                    continue
+                if len(rows) >= MAX_PROFILE_ROWS:
+                    truncated = True
+                    break
+                rows.append(list(row))
+    except UnicodeDecodeError as exc:
+        raise catalog_service.CatalogError("CSV/TSV 文件编码无效") from exc
+    if header is None:
+        raise catalog_service.CatalogError("CSV/TSV 文件为空")
+    return {
+        "format": PROFILE_FORMAT,
+        "category": "table",
+        "extension": spec.extension,
+        "media_type": spec.media_type,
+        "tables": [{**_table_contract("data", header, rows, truncated=truncated), "header_row_index": 0}],
+    }
+
+
+def _xlsx_profile_path(path: Path, spec: FormatSpec) -> dict[str, Any]:
+    from openpyxl import load_workbook
+
+    try:
+        workbook = load_workbook(
+            path,
+            read_only=True,
+            data_only=True,
+            keep_links=False,
+            keep_vba=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise catalog_service.CatalogError("Excel 文件解析失败") from exc
+    tables: list[dict[str, Any]] = []
+    try:
+        for sheet in workbook.worksheets:
+            detected = _sheet_profile_rows(sheet.iter_rows(values_only=True))
+            if detected is not None:
+                header_index, header, rows, truncated = detected
+                tables.append(
+                    {
+                        **_table_contract(sheet.title, header, rows, truncated=truncated),
+                        "header_row_index": header_index,
+                    }
+                )
+    finally:
+        workbook.close()
+    if not tables:
+        raise catalog_service.CatalogError("Excel 文件没有可识别的工作表")
+    return {
+        "format": PROFILE_FORMAT,
+        "category": "table",
+        "extension": spec.extension,
+        "media_type": spec.media_type,
+        "tables": tables,
+    }
+
+
+def _validate_signature_path(path: Path, spec: FormatSpec) -> None:
+    if spec.extension in {".xlsx", ".xlsm"}:
+        _validate_zip_container_path(path, "xl/")
+        return
+    if spec.extension == ".docx":
+        _validate_zip_container_path(path, "word/")
+        return
+    if spec.extension == ".pptx":
+        _validate_zip_container_path(path, "ppt/")
+        return
+    with path.open("rb") as handle:
+        prefix = handle.read(16)
+    _validate_signature(prefix, spec)
+
+
+def build_profile_path(
+    source_path: str | Path,
+    filename: str,
+    client_media_type: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Build a bounded schema/profile from a staged file in constant memory."""
+    path = Path(source_path).resolve(strict=True)
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise catalog_service.CatalogError("上传文件不能为空")
+    safe_name = datasource_service.validate_bucket_filename(filename)
+    spec = _format_spec(safe_name, client_media_type)
+    _validate_signature_path(path, spec)
+    if spec.extension in {".csv", ".tsv"}:
+        profile = _csv_profile_path(path, spec)
+    elif spec.extension in {".xlsx", ".xlsm"}:
+        profile = _xlsx_profile_path(path, spec)
+    elif spec.extension == ".xls":
+        try:
+            import xlrd  # type: ignore
+
+            workbook = xlrd.open_workbook(filename=str(path), on_demand=True)
+            tables = []
+            try:
+                for sheet in workbook.sheets():
+                    if sheet.nrows <= 0:
+                        continue
+                    header = [sheet.cell_value(0, column) for column in range(sheet.ncols)]
+                    count = min(max(0, sheet.nrows - 1), MAX_PROFILE_ROWS)
+                    rows = [
+                        [sheet.cell_value(row, column) for column in range(sheet.ncols)]
+                        for row in range(1, 1 + count)
+                    ]
+                    tables.append(
+                        _table_contract(
+                            sheet.name,
+                            header,
+                            rows,
+                            truncated=sheet.nrows - 1 > MAX_PROFILE_ROWS,
+                        )
+                    )
+            finally:
+                workbook.release_resources()
+        except ImportError as exc:
+            raise catalog_service.CatalogError("服务端缺少 .xls 解析依赖") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise catalog_service.CatalogError("Excel 文件解析失败") from exc
+        if not tables:
+            raise catalog_service.CatalogError("Excel 文件没有可识别的工作表")
+        profile = {
+            "format": PROFILE_FORMAT,
+            "category": "table",
+            "extension": spec.extension,
+            "media_type": spec.media_type,
+            "tables": tables,
+        }
+    else:
+        in_memory_limit = int(get_settings().catalog_in_memory_upload_bytes)
+        if path.stat().st_size <= in_memory_limit:
+            _media, profile = build_profile(path.read_bytes(), safe_name, client_media_type)
+        else:
+            profile = {
+                "format": PROFILE_FORMAT,
+                "category": "document",
+                "extension": spec.extension,
+                "media_type": spec.media_type,
+                "parser": {"name": "platform-document-parser", "status": "deferred"},
+                "text": {"character_count": 0, "line_count": 0},
+            }
+    profile = _with_runtime_relation_names(profile, safe_name)
+    profile = catalog_service.safe_catalog_document(
+        profile, label="文件结构 profile", maximum=128_000
+    )
+    return spec.media_type, profile
+
+
+def profile_summary_text(profile: dict[str, Any], filename: str) -> str:
+    """Render schema-only modeling context; profiles never contain business rows."""
+    if not isinstance(profile, dict) or profile.get("category") != "table":
+        return ""
+    tables: list[dict[str, Any]] = []
+    for raw_table in profile.get("tables") or []:
+        if not isinstance(raw_table, dict):
+            continue
+        tables.append(
+            {
+                "name": str(
+                    raw_table.get("relation_name")
+                    or raw_table.get("name")
+                    or "table"
+                ),
+                "sample_row_count": int(raw_table.get("sample_row_count") or 0),
+                "sample_truncated": bool(raw_table.get("sample_truncated", False)),
+                "columns": [
+                    {
+                        "name": str(column.get("name") or ""),
+                        "logical_type": str(column.get("logical_type") or "unknown"),
+                        "nullable": bool(column.get("nullable", True)),
+                    }
+                    for column in (raw_table.get("columns") or [])
+                    if isinstance(column, dict)
+                ],
+            }
+        )
+    return (
+        f"【表格结构：{datasource_service.validate_bucket_filename(filename)}】\n"
+        "原始业务行保存在 MinIO，建模上下文只包含以下结构元数据：\n"
+        + json.dumps({"tables": tables}, ensure_ascii=False, indent=2)
+    )
 
 
 def prepare_upload(
@@ -637,6 +962,86 @@ def prepare_upload(
         labels["expires_at"] = expires_at.isoformat()
     return PreparedCatalogUpload(
         content=content,
+        filename=safe_name,
+        content_sha256=digest,
+        media_type=media_type,
+        profile=profile,
+        metadata=metadata,
+        asset_key=asset_key,
+        asset_name=(metadata.name or safe_name).strip(),
+        labels=labels,
+        lifecycle=lifecycle,
+        expires_at=expires_at,
+    )
+
+
+def prepare_upload_path(
+    source_path: str | Path,
+    filename: str,
+    client_media_type: str | None,
+    metadata: CatalogManagedUploadMetadata,
+    *,
+    content_sha256: str,
+    byte_size: int,
+    now: datetime | None = None,
+) -> PreparedCatalogPathUpload:
+    path = Path(source_path).resolve(strict=True)
+    size = int(byte_size)
+    if not path.is_file() or size <= 0 or path.stat().st_size != size:
+        raise catalog_service.CatalogError("上传暂存文件大小无效")
+    digest = str(content_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise catalog_service.CatalogError("上传文件缺少有效内容哈希")
+    safe_name = datasource_service.validate_bucket_filename(filename)
+    media_type, profile = build_profile_path(path, safe_name, client_media_type)
+    labels = catalog_service.safe_catalog_document(
+        metadata.labels, label="资产标签", maximum=32_000
+    )
+
+    def reject_physical_metadata(node: Any) -> None:
+        if isinstance(node, dict):
+            for raw_key, value in node.items():
+                key = str(raw_key).strip().lower().replace("-", "_")
+                if key in _PHYSICAL_METADATA_KEYS:
+                    raise catalog_service.CatalogError(
+                        "资产标签不得包含对象路径、存储配置或凭据字段"
+                    )
+                reject_physical_metadata(value)
+        elif isinstance(node, list):
+            for value in node:
+                reject_physical_metadata(value)
+
+    reject_physical_metadata(labels)
+    if _RESERVED_LABELS.intersection(str(key).strip().lower() for key in labels):
+        raise catalog_service.CatalogError("资产标签不得覆盖平台生命周期字段")
+    clock = now or datetime.now(timezone.utc)
+    expires_at = None
+    if metadata.purpose == "invocation_attachment":
+        expires_at = clock + timedelta(
+            seconds=metadata.expires_in_seconds or DEFAULT_ATTACHMENT_TTL_SECONDS
+        )
+    temporary = metadata.purpose == "invocation_attachment"
+    lifecycle = {
+        "purpose": metadata.purpose,
+        "temporary": temporary,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "promotion_policy": "explicit_copy_required" if temporary else "not_applicable",
+        "auto_promote": False,
+    }
+    asset_key = catalog_service.validate_catalog_key(
+        metadata.asset_key or f"upload.{metadata.purpose}.{digest}", "资产 key"
+    )
+    labels = {
+        **labels,
+        "catalog_purpose": metadata.purpose,
+        "temporary": temporary,
+        "promotion_policy": lifecycle["promotion_policy"],
+    }
+    if expires_at:
+        labels["expires_at"] = expires_at.isoformat()
+    return PreparedCatalogPathUpload(
+        source_path=path,
+        byte_size=size,
         filename=safe_name,
         content_sha256=digest,
         media_type=media_type,
@@ -741,9 +1146,10 @@ def require_external_upload_bucket(db: Session) -> DataSource:
 
 
 def find_or_create_asset(
-    db: Session, prepared: PreparedCatalogUpload
+    db: Session, prepared: PreparedCatalogUpload | PreparedCatalogPathUpload
 ) -> tuple[DataAsset, DataAssetVersion | None, bool, bool]:
     """Resolve content-hash idempotency before any object is uploaded."""
+    reactivated = False
     existing = db.scalar(
         select(DataAsset).where(
             DataAsset.tenant_id == tenant_service.current_tenant_id(db),
@@ -765,7 +1171,12 @@ def find_or_create_asset(
         )
     else:
         if existing.lifecycle_status != "active":
-            raise catalog_service.CatalogError("目标数据资产已退役")
+            if prepared.metadata.purpose != "validation_asset":
+                raise catalog_service.CatalogError("目标数据资产已退役")
+            existing.lifecycle_status = "active"
+            existing.retired_at = None
+            existing.labels = prepared.labels
+            reactivated = True
         existing_purpose = str((existing.labels or {}).get("catalog_purpose") or "")
         if existing_purpose and existing_purpose != prepared.metadata.purpose:
             raise catalog_service.CatalogError("临时附件与长期资产不能原地互相晋级")
@@ -778,6 +1189,8 @@ def find_or_create_asset(
         .where(
             DataAssetVersion.asset_id == existing.id,
             DataAssetVersion.content_sha256 == prepared.content_sha256,
+            DataAssetVersion.status == "ready",
+            DataAssetVersion.bucket_file_id.is_not(None),
         )
         .order_by(
             DataAssetVersion.version_number.desc(),
@@ -785,7 +1198,7 @@ def find_or_create_asset(
         )
         .limit(1)
     )
-    replace_expired = False
+    replace_expired = reactivated
     if duplicate is not None and prepared.metadata.purpose == "invocation_attachment":
         lifecycle, duplicate_expires_at = lifecycle_from_version(duplicate)
         clock = datetime.now(timezone.utc)
@@ -822,7 +1235,7 @@ def register_prepared_version(
     db: Session,
     asset: DataAsset,
     bucket_file_id: str,
-    prepared: PreparedCatalogUpload,
+    prepared: PreparedCatalogUpload | PreparedCatalogPathUpload,
     *,
     allow_duplicate_content: bool = False,
 ) -> DataAssetVersion:
@@ -925,6 +1338,111 @@ def persist_managed_upload(
                 # A writer outside this service may have won after our initial
                 # lookup. Roll back its metadata and remove only our exact
                 # generation-scoped object through the durable cleanup outbox.
+                result = ManagedCatalogUploadResult(
+                    asset_id=asset.id,
+                    version_id=version.id,
+                    created=False,
+                )
+                db.rollback()
+                schedule_abandoned_upload()
+                return result
+            result = ManagedCatalogUploadResult(
+                asset_id=asset.id,
+                version_id=version.id,
+                created=True,
+            )
+            db.commit()
+            return result
+    except Exception:
+        db.rollback()
+        schedule_abandoned_upload()
+        raise
+
+
+def persist_managed_upload_path(
+    db: Session,
+    source: DataSource,
+    source_path: str | Path,
+    filename: str,
+    client_media_type: str | None,
+    metadata: CatalogManagedUploadMetadata,
+    *,
+    content_sha256: str,
+    byte_size: int,
+) -> ManagedCatalogUploadResult:
+    """Persist a large catalog upload with bounded memory and the same lifecycle fence."""
+    upload_claim = None
+    bucket_file: BucketFile | None = None
+
+    def schedule_abandoned_upload() -> None:
+        if upload_claim is not None and bucket_file is not None:
+            object_deletion_service.schedule_abandoned_upload_best_effort(
+                upload_claim, bucket_file
+            )
+
+    try:
+        prepared = prepare_upload_path(
+            source_path,
+            filename,
+            client_media_type,
+            metadata,
+            content_sha256=content_sha256,
+            byte_size=byte_size,
+        )
+        tenant_id = tenant_service.current_tenant_id(db)
+        with _serialize_upload_identity(
+            db,
+            tenant_id=tenant_id,
+            asset_key=prepared.asset_key,
+        ):
+            asset, duplicate, _asset_created, replace_expired = find_or_create_asset(
+                db, prepared
+            )
+            if duplicate is not None:
+                result = ManagedCatalogUploadResult(
+                    asset_id=asset.id,
+                    version_id=duplicate.id,
+                    created=False,
+                )
+                db.rollback()
+                return result
+
+            file_id = uuid.uuid4().hex
+            upload_claim = object_deletion_service.prepare_bucket_file_upload(
+                source, file_id, prepared.filename
+            )
+            with object_deletion_service.heartbeat_upload_intent(
+                upload_claim
+            ) as upload_heartbeat:
+                object_deletion_service.begin_upload_put(upload_claim)
+                bucket_file = datasource_service.save_bucket_file_path(
+                    source,
+                    prepared.filename,
+                    prepared.source_path,
+                    mime=prepared.media_type,
+                    stable_file_id=file_id,
+                    upload_object_key=upload_claim.object_key,
+                    content_sha256=prepared.content_sha256,
+                )
+                object_deletion_service.assert_upload_active(
+                    upload_heartbeat, upload_claim, bucket_file
+                )
+            bucket_file.status = "parsed"
+            bucket_file.error = ""
+            bucket_file.parsed_text = ""
+            db.add(bucket_file)
+            object_deletion_service.retain_bucket_file_upload(
+                db, upload_claim, bucket_file, source
+            )
+            db.flush()
+            version = register_prepared_version(
+                db,
+                asset,
+                bucket_file.id,
+                prepared,
+                allow_duplicate_content=replace_expired,
+            )
+            if version.bucket_file_id != bucket_file.id:
                 result = ManagedCatalogUploadResult(
                     asset_id=asset.id,
                     version_id=version.id,

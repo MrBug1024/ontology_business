@@ -190,6 +190,7 @@
           :disabled="!agentValidationReady"
           :busy="streaming"
           :placeholder="agentValidationReady ? '描述业务需求，或上传本次处理所需的文件' : validationMissingText"
+          :accepted-attachment-kinds="acceptedAttachmentKinds"
           @submit="send"
           @stop="stop"
         />
@@ -203,7 +204,7 @@ import { computed, ref, onBeforeUnmount, onMounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamChat } from '@/api'
-import type { Agent, AgentChatRequest, ChatMessage, Conversation, RagCitation } from '@/types'
+import type { Agent, AgentChatRequest, AgentRuntimeCapability, ChatMessage, Conversation, RagCitation } from '@/types'
 import AgentInvocationComposer from '@/components/AgentInvocationComposer.vue'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
@@ -215,6 +216,7 @@ import { normalizeAgentReadiness } from '@/utils/agentReadiness'
 const route = useRoute()
 const router = useRouter()
 const agent = ref<Agent | null>(null)
+const runtimeCapabilities = ref<AgentRuntimeCapability[]>([])
 const conversations = ref<Conversation[]>([])
 const curConv = ref<Conversation | null>(null)
 type ChatViewMessage = ChatMessage & { streaming?: boolean; status?: string }
@@ -251,6 +253,14 @@ const validationMissingText = computed(() => {
   const labels = validationReadiness.value.missing.map((issue) => issue.label)
   return labels.length ? `尚缺：${labels.join('、')}` : '服务端尚未确认验证就绪状态'
 })
+const acceptedAttachmentKinds = computed(() => [...new Set(
+  runtimeCapabilities.value
+    .filter((capability) => capability.readiness?.ready)
+    .flatMap((capability) => capability.data_ports || [])
+    .filter((port) => port.direction !== 'output' && port.allow_override !== false)
+    .flatMap((port) => port.binding_kinds || [])
+    .filter((kind) => kind === 'dataset_version' || kind === 'asset_version'),
+)])
 
 function queryValue(value: unknown) {
   return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
@@ -648,7 +658,10 @@ function scrollBottom() {
 async function loadAgent() {
   const requestedId = String(route.params.id || '')
   const requestId = ++agentLoadRequest
-  const loadedAgent = await api.getAgent(requestedId)
+  const [loadedAgent, loadedCapabilities] = await Promise.all([
+    api.getAgent(requestedId),
+    api.getAgentRuntimeCapabilities(requestedId),
+  ])
   if (viewDisposed || requestId !== agentLoadRequest || String(route.params.id || '') !== requestedId) return
   const agentScenarioId = loadedAgent.scenario_id || ''
   if (agentScenarioId && queryValue(route.query.scenario_id) !== agentScenarioId) {
@@ -660,6 +673,7 @@ async function loadAgent() {
     if (viewDisposed || requestId !== agentLoadRequest || String(route.params.id || '') !== requestedId) return
   }
   agent.value = loadedAgent
+  runtimeCapabilities.value = loadedCapabilities
   void loadConvs()
 }
 
@@ -828,6 +842,7 @@ watch(() => route.params.id, (nextId, previousId) => {
   ctrl?.abort()
   ctrl = null
   agent.value = null
+  runtimeCapabilities.value = []
   conversations.value = []
   curConv.value = null
   messages.value = []

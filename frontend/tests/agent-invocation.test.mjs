@@ -163,10 +163,16 @@ test('Agent chat clears the composer only after a successful stream', () => {
   assert.match(source, /activeStreamFailed = true[\s\S]*case 'error'/)
 })
 
-test('invocation composer is natural chat with managed temporary attachments only', () => {
+test('invocation composer reuses validation assets and materializes tables as datasets', () => {
   const source = readFileSync(new URL('../src/components/AgentInvocationComposer.vue', import.meta.url), 'utf8')
   assert.match(source, /api\.uploadCatalogAttachment/)
-  assert.match(source, /aria-label="上传本次对话附件"/)
-  assert.doesNotMatch(source, /listCatalogAssets|listLogicalDatasets|listScenarioConnectorBindings/)
+  assert.match(source, /purpose: uploadMode\.value/)
+  assert.match(source, /api\.listCatalogAssets/)
+  assert.match(source, /api\.buildValidationDataset/)
+  assert.match(source, /api\.deleteCatalogAsset/)
+  assert.match(source, /dataset_version_id: tableDataset\.dataset_version_id/)
+  assert.doesNotMatch(source, /disabled \|\| busy \|\| !attachmentsEnabled/)
+  assert.doesNotMatch(source, /当前授权能力没有兼容/)
+  assert.doesNotMatch(source, /listLogicalDatasets|listScenarioConnectorBindings/)
   assert.doesNotMatch(source, /structured_inputs|managed_inputs|port_key/)
 })

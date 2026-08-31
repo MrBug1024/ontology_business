@@ -12,6 +12,8 @@
 
 DuckDB 只在 API 进程内读取已校验的 MinIO Parquet，作为无状态查询引擎，不持久化业务数据。
 
+PostgreSQL 不保存上传表格的业务行、Excel 单元格或 Parquet 内容，只保存租户、逻辑资产、版本、Schema、行数、摘要、血缘、任务状态和 MinIO 对象身份。文档检索的兼容索引属于另一条明确的数据产品边界；表格上传不会进入 `parsed_text` 或 `document_chunks`。
+
 医保审计和代理记账是普通业务场景，不拥有平台专用数据库结构。业务关系、字段和规则均通过数据集目录与语义映射描述，由 PostgreSQL 保存目录和映射元数据，由 MinIO 保存数据资产。
 
 ## 通用模型
@@ -34,6 +36,10 @@ DuckDB 只在 API 进程内读取已校验的 MinIO Parquet，作为无状态查
 ## 文件与查询契约
 
 MinIO 对象使用内容寻址路径，数据库保存 `bucket_name`、`object_key`、`object_version_id`、`etag`、`object_url`、字节数和 SHA-256。`object_url` 使用稳定的 `minio://` 身份，不保存会过期的预签名 URL。
+
+目录、建模资料和验证中心默认支持单文件 2 GiB，采用 4 MiB 网络读取块和私有暂存文件；小于 8 MiB 的兼容路径才允许一次性读取。Office 压缩容器默认最多展开 8 GiB。CSV、TSV、XLS、XLSX 和 XLSM 在后台转成 zstd Parquet，单个 Parquet 目标大小约 256 MiB，避免大对象超过查询节点缓存上限。原始文件和派生 Parquet 都在 MinIO，转换失败不会留下可见的半成品版本。
+
+验证中心有两种生命周期：`validation_asset` 默认持久保留并可跨对话复用；`invocation_attachment` 只用于一次性调用并按 TTL 清理。用户显式删除资产时，PostgreSQL 先退役逻辑版本并登记删除 Outbox，再删除 MinIO 原始对象和依赖分片。场景 Definition/Release 只保存数据端口契约而不保存验证批次，因此该删除不会破坏已经发布的能力。
 
 一次数据集查询按以下顺序执行：
 

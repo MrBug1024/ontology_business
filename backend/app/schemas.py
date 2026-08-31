@@ -1505,7 +1505,8 @@ class AgentManagedInputIn(BaseModel):
 class AgentChatAttachmentIn(BaseModel):
     """One immutable file uploaded by the conversation user for this turn."""
 
-    asset_version_id: str = Field(min_length=1, max_length=32)
+    asset_version_id: str | None = Field(default=None, min_length=1, max_length=32)
+    dataset_version_id: str | None = Field(default=None, min_length=1, max_length=32)
     expected_signature: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -1513,6 +1514,12 @@ class AgentChatAttachmentIn(BaseModel):
     filename: str = Field(default="", max_length=500)
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def exactly_one_reference(self) -> "AgentChatAttachmentIn":
+        if (self.asset_version_id is None) == (self.dataset_version_id is None):
+            raise ValueError("附件必须且只能引用一个资产版本或数据集版本")
+        return self
 
 
 class ChatRequest(BaseModel):

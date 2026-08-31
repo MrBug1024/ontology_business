@@ -492,6 +492,7 @@ def _agent_turn_input(payload: ChatRequest) -> agent_runtime_adapter.AgentTurnIn
         attachments=tuple(
             agent_runtime_adapter.AgentAttachmentInput(
                 asset_version_id=item.asset_version_id,
+                dataset_version_id=item.dataset_version_id,
                 filename=item.filename,
                 expected_signature=item.expected_signature,
             )
@@ -569,9 +570,12 @@ def _message_out_for_model_replay(
     authorization_context = (
         context if context is not None else _authorization_context(db, agent)
     )
-    runtime_source_ids = {
-        source.id for source in authorization_context.data_sources
-    } if authorization_context is not None else set()
+    runtime_sources = (
+        getattr(authorization_context, "data_sources", None)
+        or getattr(authorization_context, "runtime_connections", None)
+        or ()
+    )
+    runtime_source_ids = {str(source.id) for source in runtime_sources}
     if (
         (
             citations

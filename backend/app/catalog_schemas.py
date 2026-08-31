@@ -18,7 +18,11 @@ CatalogBindingRole = Literal[
     "input",
 ]
 CatalogEnvironment = Literal["dev", "staging", "prod"]
-CatalogUploadPurpose = Literal["managed_asset", "invocation_attachment"]
+CatalogUploadPurpose = Literal[
+    "managed_asset",
+    "validation_asset",
+    "invocation_attachment",
+]
 
 
 class ConnectorBindingOptionOut(BaseModel):
@@ -108,8 +112,8 @@ class CatalogManagedUploadMetadata(BaseModel):
 
     @model_validator(mode="after")
     def lifecycle_is_explicit(self) -> "CatalogManagedUploadMetadata":
-        if self.purpose == "managed_asset" and self.expires_in_seconds is not None:
-            raise ValueError("managed_asset 不能设置临时附件到期时间")
+        if self.purpose != "invocation_attachment" and self.expires_in_seconds is not None:
+            raise ValueError("长期资产不能设置临时附件到期时间")
         return self
 
 
@@ -144,6 +148,40 @@ class CatalogManagedUploadOut(BaseModel):
     created: bool
     asset: CatalogManagedAssetRefOut
     version: CatalogManagedVersionRefOut
+
+
+class ValidationDatasetBuildIn(BaseModel):
+    asset_version_ids: list[str] = Field(min_length=1, max_length=20)
+    name: str = Field(default="验证数据包", min_length=1, max_length=300)
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def unique_asset_versions(self) -> "ValidationDatasetBuildIn":
+        if len(self.asset_version_ids) != len(set(self.asset_version_ids)):
+            raise ValueError("验证数据文件不能重复")
+        return self
+
+
+class ValidationDatasetOut(BaseModel):
+    dataset_id: str
+    dataset_version_id: str
+    content_hash: str
+    schema_hash: str
+    record_count: int
+    byte_size: int
+    relation_names: list[str] = Field(default_factory=list)
+    source_asset_version_ids: list[str] = Field(default_factory=list)
+    reused: bool = False
+
+
+class ValidationDatasetJobOut(BaseModel):
+    id: str
+    status: Literal["queued", "running", "succeeded", "failed"]
+    error: str = ""
+    created_at: datetime
+    updated_at: datetime
+    result: ValidationDatasetOut | None = None
 
 
 class LogicalDatasetCreate(BaseModel):

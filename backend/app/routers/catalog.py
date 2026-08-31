@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -44,13 +46,20 @@ from ..catalog_schemas import (
     SemanticFieldMappingOut,
     SemanticMappingCreate,
     SemanticMappingOut,
+    ValidationDatasetBuildIn,
+    ValidationDatasetJobOut,
+    ValidationDatasetOut,
 )
 from ..models import (
+    BucketFile,
     DataAsset,
     DataAssetVersion,
+    DataSource,
     DatasetHead,
+    DatasetFragment,
     DatasetSchema,
     DatasetVersion,
+    DatasetVersionAsset,
     LogicalDataset,
     ScenarioCapabilityPort,
     ScenarioDatasetBinding,
@@ -61,10 +70,14 @@ from ..services import (
     catalog_ingestion_service,
     catalog_service,
     connector_service,
+    datasource_service,
     object_deletion_service,
     object_storage_service,
     permission_service,
+    template_catalog_service,
     tenant_service,
+    upload_staging_service,
+    validation_dataset_service,
 )
 from ..services.auth_service import get_current_user, get_tenant_db
 
@@ -304,6 +317,104 @@ def create_asset(
         raise _catalog_error(exc) from exc
 
 
+@router.delete("/assets/{asset_id}")
+def delete_asset(
+    asset_id: str,
+    db: Session = Depends(get_tenant_db),
+) -> dict[str, object]:
+    """Retire one tenant asset and durably remove every owned MinIO payload.
+
+    Published capability definitions contain contracts rather than asset ids,
+    so this operation never edits a release. Any validation dataset assembled
+    from the deleted asset is retired and cannot be selected for a new run.
+    """
+    permission_service.require_tenant_permission(db, "write")
+    asset = catalog_service.require_asset(db, asset_id)
+    if asset.lifecycle_status != "active":
+        return {"message": "资产已删除", "asset_id": asset.id, "cleanup_jobs": []}
+    versions = list(asset.versions)
+    version_ids = [item.id for item in versions]
+    dependent_dataset_ids: list[str] = []
+    if version_ids:
+        dependent_dataset_ids = list(
+            db.scalars(
+                select(DatasetVersionAsset.dataset_version_id).where(
+                    DatasetVersionAsset.asset_version_id.in_(version_ids)
+                )
+            ).all()
+        )
+    file_id_set = {str(item.bucket_file_id) for item in versions if item.bucket_file_id}
+    if dependent_dataset_ids:
+        file_id_set.update(
+            str(value)
+            for value in db.scalars(
+                select(DatasetFragment.bucket_file_id).where(
+                    DatasetFragment.dataset_version_id.in_(dependent_dataset_ids)
+                )
+            ).all()
+            if value
+        )
+    file_ids = sorted(file_id_set)
+    files = (
+        list(
+            db.scalars(
+                select(BucketFile)
+                .where(BucketFile.id.in_(file_ids))
+                .with_for_update()
+            ).all()
+        )
+        if file_ids
+        else []
+    )
+    try:
+        template_catalog_service.assert_bucket_files_not_registered(
+            db, [item.id for item in files]
+        )
+        cleanup_jobs: list[str] = []
+        cleanup = {
+            "asset_versions_detached": 0,
+            "dataset_fragments_deleted": 0,
+            "manifest_versions_detached": 0,
+        }
+        by_source: dict[str, list[BucketFile]] = {}
+        for item in files:
+            by_source.setdefault(item.data_source_id, []).append(item)
+        for source_id, source_files in by_source.items():
+            source = db.get(DataSource, source_id)
+            if source is None or source.tenant_id != asset.tenant_id:
+                raise catalog_service.CatalogError("资产文件存储归属无效")
+            for item in source_files:
+                cleanup_jobs.append(
+                    object_deletion_service.enqueue_bucket_file_deletion(db, item, source)
+                )
+            result = datasource_service.detach_platform_catalog_references_for_deletion(
+                db, source, [item.id for item in source_files]
+            )
+            for key, value in result.items():
+                cleanup[key] = int(cleanup.get(key, 0)) + int(value)
+            for item in source_files:
+                db.delete(item)
+        asset.lifecycle_status = "retired"
+        asset.retired_at = datetime.now(timezone.utc)
+        db.commit()
+    except (catalog_service.CatalogError, ValueError) as exc:
+        db.rollback()
+        raise _catalog_error(
+            exc if isinstance(exc, catalog_service.CatalogError) else catalog_service.CatalogError(str(exc)),
+            status_code=409,
+        ) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="资产在删除期间被其他资源占用") from exc
+    object_deletion_service.drain_jobs_best_effort(db, cleanup_jobs)
+    return {
+        "message": "资产已删除，已发布能力定义不受影响",
+        "asset_id": asset.id,
+        "cleanup_jobs": cleanup_jobs,
+        **cleanup,
+    }
+
+
 @router.post(
     "/uploads",
     response_model=CatalogManagedUploadOut,
@@ -351,7 +462,7 @@ async def upload_managed_catalog_file(
     try:
         source = (
             catalog_ingestion_service.require_external_upload_bucket(db)
-            if purpose == "invocation_attachment"
+            if purpose in {"invocation_attachment", "validation_asset"}
             else catalog_ingestion_service.require_managed_file_bucket(
                 db, str(file_bucket_id or "")
             )
@@ -374,21 +485,51 @@ async def upload_managed_catalog_file(
     try:
         # Resolve ACL and managed-storage policy before parsing attacker-owned
         # bytes so an inaccessible bucket cannot be used as a profiling oracle.
-        max_bytes = int(get_settings().max_upload_bytes)
-        content = await file.read(max_bytes + 1)
-        if len(content) > max_bytes:
+        settings = get_settings()
+        max_upload_bytes = int(
+            getattr(settings, "catalog_max_upload_bytes", settings.max_upload_bytes)
+        )
+        chunk_bytes = int(getattr(settings, "upload_stream_chunk_bytes", 1024 * 1024))
+        in_memory_bytes = int(
+            getattr(settings, "catalog_in_memory_upload_bytes", settings.max_upload_bytes)
+        )
+        try:
+            staged = await upload_staging_service.stage_upload(
+                file,
+                max_bytes=max_upload_bytes,
+                chunk_bytes=chunk_bytes,
+            )
+        except upload_staging_service.UploadTooLargeError as exc:
             raise HTTPException(
                 status_code=413,
-                detail=f"文件超过大小限制（{max_bytes // (1024 * 1024)} MB）",
-            )
-        result = catalog_ingestion_service.persist_managed_upload(
-            db,
-            source,
-            content,
-            file.filename or "file",
-            file.content_type,
-            metadata,
-        )
+                detail=(
+                    "文件超过大小限制（"
+                    f"{max_upload_bytes // (1024 * 1024)} MB）"
+                ),
+            ) from exc
+        try:
+            if staged.byte_size <= in_memory_bytes:
+                result = catalog_ingestion_service.persist_managed_upload(
+                    db,
+                    source,
+                    staged.path.read_bytes(),
+                    file.filename or "file",
+                    file.content_type,
+                    metadata,
+                )
+            else:
+                result = catalog_ingestion_service.persist_managed_upload_path(
+                    db,
+                    source,
+                    staged.path,
+                    file.filename or "file",
+                    file.content_type,
+                    metadata,
+                    content_sha256=staged.content_sha256,
+                    byte_size=staged.byte_size,
+                )
+        finally:
+            staged.remove()
         asset = db.get(DataAsset, result.asset_id)
         version = db.get(DataAssetVersion, result.version_id)
         if asset is None or version is None:
@@ -436,6 +577,76 @@ def list_asset_versions(
     permission_service.require_tenant_permission(db, "read")
     asset = catalog_service.require_asset(db, asset_id)
     return [DataAssetVersionOut.model_validate(item) for item in asset.versions]
+
+
+@router.post(
+    "/validation-datasets",
+    response_model=ValidationDatasetOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def build_validation_dataset(
+    payload: ValidationDatasetBuildIn,
+    db: Session = Depends(get_tenant_db),
+) -> ValidationDatasetOut:
+    try:
+        result = validation_dataset_service.build_validation_dataset(db, payload)
+        return ValidationDatasetOut.model_validate(result)
+    except validation_dataset_service.ValidationDatasetError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except object_deletion_service.UploadIntentLeaseLostError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="数据集物化事务已失效") from exc
+    except object_storage_service.ObjectStorageError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="验证数据集对象存储不可用") from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="相同验证数据包正在生成，请稍后重试") from exc
+
+
+@router.post(
+    "/validation-dataset-jobs",
+    response_model=ValidationDatasetJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def enqueue_validation_dataset_job(
+    payload: ValidationDatasetBuildIn,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_tenant_db),
+) -> ValidationDatasetJobOut:
+    try:
+        document = validation_dataset_service.enqueue_validation_dataset_job(
+            db, payload
+        )
+        if document["status"] == "queued":
+            background_tasks.add_task(
+                validation_dataset_service.process_validation_dataset_job,
+                str(document["id"]),
+            )
+        return ValidationDatasetJobOut.model_validate(document)
+    except validation_dataset_service.ValidationDatasetError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="相同验证数据包正在排队") from exc
+
+
+@router.get(
+    "/validation-dataset-jobs/{job_id}",
+    response_model=ValidationDatasetJobOut,
+)
+def get_validation_dataset_job(
+    job_id: str,
+    db: Session = Depends(get_tenant_db),
+) -> ValidationDatasetJobOut:
+    try:
+        return ValidationDatasetJobOut.model_validate(
+            validation_dataset_service.get_validation_dataset_job(db, job_id)
+        )
+    except validation_dataset_service.ValidationDatasetError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post(

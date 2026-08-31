@@ -88,6 +88,12 @@ _MANAGED_PORT_FIELDS = frozenset({
     "confidence",
 })
 _MEDIA_BINDING_KINDS = {
+    "structured": (
+        "asset_version",
+        "connector_binding",
+        "dataset_head",
+        "dataset_version",
+    ),
     "dataset": ("dataset_head", "dataset_version"),
     "document": ("asset_version",),
     "artifact": ("asset_version",),
@@ -270,7 +276,7 @@ def normalize_managed_data_port_declarations(
         if media_kind not in _MEDIA_BINDING_KINDS:
             raise ValueError(
                 f"managed_data_ports[{index}].media_kind 必须是 "
-                "dataset、document、artifact 或 connector；普通文本/JSON 属于 typed inputs"
+                "structured、dataset、document、artifact 或 connector；普通文本/JSON 属于 typed inputs"
             )
         if direction == "output":
             if role != "output":
@@ -293,12 +299,16 @@ def normalize_managed_data_port_declarations(
                 raise ValueError(
                     f"managed_data_ports[{index}] 的 {evidence_kind} 证据必须使用 {expected_role} 角色"
                 )
-            if evidence_kind == "versioned_data" and media_kind != "dataset":
-                raise ValueError(f"managed_data_ports[{index}] 版本化数据必须使用 dataset media_kind")
+            if evidence_kind == "versioned_data" and media_kind not in {"dataset", "structured"}:
+                raise ValueError(
+                    f"managed_data_ports[{index}] 版本化业务数据必须使用 dataset 或 structured media_kind"
+                )
             if evidence_kind == "document_attachment" and media_kind not in {"document", "artifact"}:
                 raise ValueError(f"managed_data_ports[{index}] 文档/附件必须使用 document 或 artifact media_kind")
-            if evidence_kind == "connector" and media_kind != "connector":
-                raise ValueError(f"managed_data_ports[{index}] connector 依赖必须使用 connector media_kind")
+            if evidence_kind == "connector" and media_kind not in {"connector", "structured"}:
+                raise ValueError(
+                    f"managed_data_ports[{index}] connector 依赖必须使用 connector 或 structured media_kind"
+                )
             if evidence_kind in {"reference", "rules"} and media_kind not in {
                 "dataset", "document", "artifact", "connector",
             }:

@@ -2732,7 +2732,12 @@ class ActionDecisionChainTests(unittest.TestCase):
         self.assertEqual(log.status, "dry_run")
         self.assertIn("plan", log.result)
 
-        rows = scenarios.list_execution_logs(self.scenario.id, 50, self.db)
+        rows = scenarios.list_execution_logs(
+            self.scenario.id,
+            environment=None,
+            limit=50,
+            db=self.db,
+        )
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(row.actor_user_id, "user-action-audit")

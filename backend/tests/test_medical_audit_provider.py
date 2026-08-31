@@ -162,6 +162,23 @@ def _definition(*, tenant_id: str, scenario_id: str, version: str = PROVIDER_VER
         runtime_config=_provider_config(version=version),
         input_schema=_schema(),
     )
+    port = SimpleNamespace(
+        id="port-records",
+        capability_kind="function",
+        capability_key=function.id,
+        port_key="records",
+        direction="input",
+        role="invocation_input",
+        media_kind="structured",
+        binding_policy="per_invocation",
+        config={
+            "allowed_binding_kinds": [
+                "dataset_version",
+                "dataset_head",
+                "connector_binding",
+            ]
+        },
+    )
     definition_hash = "d" * 64
     return SimpleNamespace(
         scenario=SimpleNamespace(id=scenario_id, tenant_id=tenant_id),
@@ -173,6 +190,7 @@ def _definition(*, tenant_id: str, scenario_id: str, version: str = PROVIDER_VER
         functions={function.id: function},
         entities={entity.id: entity},
         mappings={mapping.id: mapping},
+        capability_ports={port.id: port},
     )
 
 
@@ -181,6 +199,30 @@ def _registry() -> CapabilityProviderRegistry:
     registry.register_instance(MedicalAuditProvider())
     registry.seal()
     return registry
+
+
+def test_provider_contract_rejects_missing_declared_input_port(db: Session) -> None:
+    definition = _definition(
+        tenant_id="tenant-missing-port",
+        scenario_id="scenario-missing-port",
+    )
+    definition.capability_ports = {}
+    deployment = ResolvedDeployment(
+        scenario_id="scenario-missing-port",
+        tenant_id="tenant-missing-port",
+        environment="dev",
+        definition_hash=definition.definition_hash,
+        definition=definition,
+    )
+
+    with pytest.raises(CapabilityInvocationError) as captured:
+        resolve_capability_contract(
+            db,
+            deployment,
+            CapabilityRef(kind="function", resource_id="function-audit"),
+            registry=_registry(),
+        )
+    assert captured.value.code == "provider_contract_failed"
 
 
 def test_live_unknown_mapping_health_remains_fail_closed() -> None:
@@ -1222,7 +1264,31 @@ def test_provider_bound_function_is_discovered_by_generic_application_service(
         runtime_kind="provider",
         runtime_config=_provider_config(),
     )
-    db.add_all([tenant, user, scenario, function])
+    port = ScenarioCapabilityPort(
+        id="port-provider-discovery",
+        tenant_id=tenant.id,
+        scenario_id=scenario.id,
+        capability_kind="function",
+        capability_key=function.id,
+        port_key="records",
+        name="Invocation records",
+        direction="input",
+        role="invocation_input",
+        media_kind="structured",
+        schema_document={"type": "object"},
+        is_required=True,
+        cardinality="one",
+        binding_policy="per_invocation",
+        status="active",
+        config={
+            "allowed_binding_kinds": [
+                "dataset_version",
+                "dataset_head",
+                "connector_binding",
+            ]
+        },
+    )
+    db.add_all([tenant, user, scenario, function, port])
     db.flush()
     permission_service.ensure_organization(db, tenant.id, owner_user_id=user.id)
     db.info["tenant_id"] = tenant.id
@@ -1237,7 +1303,14 @@ def test_provider_bound_function_is_discovered_by_generic_application_service(
 
     assert item["kind"] == "function"
     assert item["input_schema"] == _schema()
-    assert item["readiness"] == {"ready": True, "issues": []}
+    assert item["readiness"]["ready"] is True
+    assert item["readiness"]["issues"] == [{
+        "axis": "runtime",
+        "blocking": False,
+        "code": "invocation_input_required",
+        "message": "required managed input must be supplied with the invocation",
+        "port_key": "records",
+    }]
 
 
 def test_provider_version_mismatch_fails_before_invocation_audit(db: Session) -> None:

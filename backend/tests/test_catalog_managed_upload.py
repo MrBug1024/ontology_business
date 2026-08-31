@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from contextlib import ExitStack, nullcontext
 from io import BytesIO
+import asyncio
 import hashlib
 import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import IntegrityError
@@ -35,6 +36,7 @@ from app.services import (
     object_deletion_service,
     object_storage_service,
     permission_service,
+    upload_staging_service,
 )
 from app.services.auth_service import get_current_user, get_tenant_db
 
@@ -257,6 +259,7 @@ class CatalogManagedUploadTests(unittest.TestCase):
         self.assertTrue(body["created"])
         self.assertFalse(body["temporary"])
         table = body["version"]["profile"]["tables"][0]
+        self.assertEqual(table["relation_name"], "records")
         self.assertEqual(table["sample_row_count"], 2)
         self.assertEqual(
             [column["name"] for column in table["columns"]],
@@ -318,9 +321,50 @@ class CatalogManagedUploadTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.text)
         table = response.json()["version"]["profile"]["tables"][0]
         self.assertEqual(table["name"], "Items")
+        self.assertEqual(table["relation_name"], "items")
         self.assertEqual(table["columns"][1]["logical_type"], "integer")
         self.assertTrue(table["columns"][1]["nullable"])
         self.assertEqual(table["columns"][2]["logical_type"], "boolean")
+
+    def test_stream_staging_preserves_xlsx_suffix_for_path_parser(self) -> None:
+        from openpyxl import Workbook
+
+        output = BytesIO()
+        workbook = Workbook()
+        workbook.active.append(["id", "amount"])
+        workbook.active.append(["A-1", 12.5])
+        workbook.save(output)
+        staged = asyncio.run(
+            upload_staging_service.stage_upload(
+                UploadFile(file=BytesIO(output.getvalue()), filename="claims.xlsx"),
+                max_bytes=1024 * 1024,
+                chunk_bytes=1024,
+            )
+        )
+        try:
+            self.assertEqual(staged.path.suffix, ".xlsx")
+            _media_type, profile = catalog_ingestion_service.build_profile_path(
+                staged.path,
+                "claims.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            self.assertEqual(profile["tables"][0]["relation_name"], "claims")
+        finally:
+            staged.remove()
+
+    def test_runtime_relation_names_disambiguate_multi_sheet_workbooks(self) -> None:
+        self.assertEqual(
+            catalog_ingestion_service.runtime_relation_name(
+                "claims.xlsx", "Sheet1", 1
+            ),
+            "claims",
+        )
+        self.assertEqual(
+            catalog_ingestion_service.runtime_relation_name(
+                "claims.xlsx", "Details", 2
+            ),
+            "claims__Details",
+        )
 
     def test_document_profile_records_scale_without_persisting_parsed_text(self) -> None:
         from docx import Document

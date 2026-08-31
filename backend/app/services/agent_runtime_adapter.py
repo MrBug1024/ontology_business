@@ -81,15 +81,19 @@ class AgentRuntimeAdapterError(RuntimeError):
 class AgentAttachmentInput:
     """An immutable user upload; the model maps it to a capability data port."""
 
-    asset_version_id: str
+    asset_version_id: str | None = None
+    dataset_version_id: str | None = None
     filename: str = ""
     expected_signature: str | None = None
 
     def __post_init__(self) -> None:
-        version_id = str(self.asset_version_id or "").strip()
+        asset_version_id = str(self.asset_version_id or "").strip() or None
+        dataset_version_id = str(self.dataset_version_id or "").strip() or None
         filename = str(self.filename or "").strip()[:500]
         signature = str(self.expected_signature or "").strip().lower() or None
-        if not version_id or len(version_id) > 32:
+        if (asset_version_id is None) == (dataset_version_id is None) or any(
+            len(value) > 32 for value in (asset_version_id, dataset_version_id) if value
+        ):
             raise AgentRuntimeAdapterError(
                 "invalid_attachment_reference",
                 "Agent attachment version reference is invalid",
@@ -101,9 +105,18 @@ class AgentAttachmentInput:
                 "invalid_attachment_signature",
                 "Agent attachment signature is invalid",
             )
-        object.__setattr__(self, "asset_version_id", version_id)
+        object.__setattr__(self, "asset_version_id", asset_version_id)
+        object.__setattr__(self, "dataset_version_id", dataset_version_id)
         object.__setattr__(self, "filename", filename)
         object.__setattr__(self, "expected_signature", signature)
+
+    @property
+    def binding_kind(self) -> str:
+        return "dataset_version" if self.dataset_version_id else "asset_version"
+
+    @property
+    def reference_id(self) -> str:
+        return str(self.dataset_version_id or self.asset_version_id or "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,7 +184,7 @@ class AgentTurnInput:
                 "too_many_attachments",
                 "An Agent turn may contain at most 20 attachments",
             )
-        version_ids = [item.asset_version_id for item in attachments]
+        version_ids = [(item.binding_kind, item.reference_id) for item in attachments]
         if len(version_ids) != len(set(version_ids)):
             raise AgentRuntimeAdapterError(
                 "duplicate_attachment",
@@ -276,6 +289,7 @@ def _safe_turn_input(turn_input: AgentTurnInput) -> dict[str, Any]:
         "attachments": [
             {
                 "asset_version_id": item.asset_version_id,
+                "dataset_version_id": item.dataset_version_id,
                 "filename": item.filename,
                 "expected_signature": item.expected_signature,
             }
@@ -646,7 +660,7 @@ class CapabilityAgentRuntime:
             invoke_properties["attachment_bindings"] = {
                 "type": "array",
                 "description": (
-                    "Map each user attachment index to one asset_version-compatible "
+                    "Map each user attachment index to one compatible managed-data "
                     "input port from the selected capability. Omit only when the order "
                     "of attachments and eligible ports is unambiguous."
                 ),
@@ -725,10 +739,6 @@ class CapabilityAgentRuntime:
             if isinstance(item, Mapping)
             and str(item.get("direction") or "input").strip().lower() != "output"
             and bool(item.get("allow_override", False))
-            and "asset_version" in {
-                str(kind).strip().lower()
-                for kind in (item.get("binding_kinds") or [])
-            }
             and str(item.get("key") or item.get("port_key") or "").strip()
             not in occupied
         ]
@@ -736,23 +746,49 @@ class CapabilityAgentRuntime:
             str(item.get("key") or item.get("port_key") or "").strip(): item
             for item in eligible
         }
-        if not eligible_by_key:
+        def compatible(index: int, key: str) -> bool:
+            port = eligible_by_key.get(key)
+            if port is None or index < 0 or index >= len(attachments):
+                return False
+            return attachments[index].binding_kind in {
+                str(kind).strip().lower()
+                for kind in (port.get("binding_kinds") or [])
+            }
+
+        if not eligible_by_key or any(
+            not any(
+                attachment.binding_kind in {
+                    str(kind).strip().lower()
+                    for kind in (port.get("binding_kinds") or [])
+                }
+                for port in eligible
+            )
+            for attachment in attachments
+        ):
             raise AgentRuntimeAdapterError(
                 "capability_does_not_accept_attachments",
-                "The selected capability has no file input port for the user's attachments",
+                "The selected capability has no compatible dataset or file input port for the user's attachments",
             )
 
         pairs: list[tuple[int, str]] = []
         if raw_bindings is None:
-            if len(attachments) > len(eligible):
-                raise AgentRuntimeAdapterError(
-                    "attachment_port_mapping_required",
-                    "There are more attachments than compatible file input ports",
+            used: set[str] = set()
+            for index, _attachment in enumerate(attachments):
+                key = next(
+                    (
+                        candidate
+                        for candidate in eligible_by_key
+                        if candidate not in used and compatible(index, candidate)
+                    ),
+                    "",
                 )
-            pairs = [
-                (index, str(port.get("key") or port.get("port_key") or "").strip())
-                for index, port in enumerate(eligible[: len(attachments)])
-            ]
+                if not key:
+                    raise AgentRuntimeAdapterError(
+                        "attachment_port_mapping_required",
+                        "There are more attachments than compatible input ports",
+                    )
+                used.add(key)
+                pairs.append((index, key))
         else:
             if not isinstance(raw_bindings, Sequence) or isinstance(
                 raw_bindings, (str, bytes, bytearray)
@@ -785,7 +821,7 @@ class CapabilityAgentRuntime:
                 "Every uploaded attachment must be mapped exactly once",
             )
         if len(port_keys) != len(set(port_keys)) or any(
-            key not in eligible_by_key for key in port_keys
+            not compatible(index, key) for index, key in pairs
         ):
             raise AgentRuntimeAdapterError(
                 "invalid_attachment_port",
@@ -794,8 +830,8 @@ class CapabilityAgentRuntime:
         return tuple(
             DataBindingOverride(
                 port_key=port_key,
-                binding_kind="asset_version",
-                reference_id=attachments[index].asset_version_id,
+                binding_kind=attachments[index].binding_kind,
+                reference_id=attachments[index].reference_id,
                 signature=attachments[index].expected_signature,
             )
             for index, port_key in pairs

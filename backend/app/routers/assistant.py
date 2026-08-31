@@ -66,6 +66,7 @@ from ..services import (
     assistant_orchestrator,
     assistant_compilation_job_service,
     assistant_compilation_stream_service,
+    catalog_ingestion_service,
     doc_parser,
     datasource_service,
     llm_service,
@@ -81,6 +82,7 @@ from ..services import (
     scenario_model_draft_service,
     scenario_model_compiler,
     tenant_service,
+    upload_staging_service,
     workflow_service,
 )
 from ..services.auth_service import get_tenant_db
@@ -6952,22 +6954,48 @@ def delete_thread(
 async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(get_tenant_db)):
     settings = get_settings()
     _purge_expired_attachments(db)
-    content = await file.read()
-    if len(content) > settings.max_upload_bytes:
-        raise HTTPException(413, f"附件超过 {settings.max_upload_bytes // 1024 // 1024}MB 限制")
-
+    filename_input = file.filename or "附件"
+    content_type = file.content_type or "application/octet-stream"
+    max_upload_bytes = int(
+        getattr(settings, "catalog_max_upload_bytes", settings.max_upload_bytes)
+    )
+    in_memory_bytes = int(
+        getattr(settings, "catalog_in_memory_upload_bytes", settings.max_upload_bytes)
+    )
     try:
-        filename = datasource_service.validate_bucket_filename(file.filename or "附件")
+        staged = await upload_staging_service.stage_upload(
+            file,
+            max_bytes=max_upload_bytes,
+            chunk_bytes=int(getattr(settings, "upload_stream_chunk_bytes", 1024 * 1024)),
+        )
+    except upload_staging_service.UploadTooLargeError as exc:
+        raise HTTPException(
+            413,
+            f"附件超过 {max_upload_bytes // 1024 // 1024}MB 限制",
+        ) from exc
+    try:
+        filename = datasource_service.validate_bucket_filename(filename_input)
     except ValueError as exc:
+        staged.remove()
         raise HTTPException(400, str(exc)) from exc
+    table_file = Path(filename).suffix.lower() in {".csv", ".tsv", ".xls", ".xlsx", ".xlsm"}
+    document_limit = int(
+        getattr(settings, "document_parse_max_bytes", settings.max_upload_bytes)
+    )
+    if not table_file and staged.byte_size > document_limit:
+        staged.remove()
+        raise HTTPException(
+            413,
+            f"文档解析上限为 {document_limit // 1024 // 1024}MB；超大结构化数据请使用 CSV/XLSX 数据集通道",
+        )
     attachment = AssistantAttachment(
         id=uuid.uuid4().hex,
         tenant_id=_tenant(db),
         created_by_user_id=_current_user_id(db),
         filename=filename,
-        mime=file.content_type or "application/octet-stream",
-        size=len(content),
-        content_hash=hashlib.sha256(content).hexdigest(),
+        mime=content_type,
+        size=staged.byte_size,
+        content_hash=staged.content_sha256,
         status="pending",
     )
     try:
@@ -6980,15 +7008,24 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
             upload_claim
         ) as upload_heartbeat:
             object_deletion_service.begin_upload_put(upload_claim)
-            datasource_service.save_assistant_attachment_object(
-                attachment,
-                content,
-                upload_object_key=upload_claim.object_key,
-            )
+            if staged.byte_size <= in_memory_bytes:
+                datasource_service.save_assistant_attachment_object(
+                    attachment,
+                    staged.path.read_bytes(),
+                    upload_object_key=upload_claim.object_key,
+                )
+            else:
+                datasource_service.save_assistant_attachment_object_path(
+                    attachment,
+                    staged.path,
+                    upload_object_key=upload_claim.object_key,
+                    content_sha256=staged.content_sha256,
+                )
             object_deletion_service.assert_upload_active(
                 upload_heartbeat, upload_claim, attachment
             )
     except Exception as exc:  # noqa: BLE001 - storage service exposes safe errors.
+        staged.remove()
         raise HTTPException(503, "助手附件对象存储写入失败") from exc
     try:
         db.add(attachment)
@@ -6996,9 +7033,18 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
             db, upload_claim, attachment
         )
         db.flush()
-        parsed = doc_parser.parse_bytes(content, filename)
+        if table_file:
+            _media_type, profile = catalog_ingestion_service.build_profile_path(
+                staged.path, filename, content_type
+            )
+            parsed_text = catalog_ingestion_service.profile_summary_text(
+                profile, filename
+            )
+            parsed = {"status": "success", "text": parsed_text, "message": "表格结构解析完成"}
+        else:
+            parsed = doc_parser.parse_bytes(staged.path.read_bytes(), filename)
+            parsed_text = str(parsed.get("text") or "")
         attachment.status = "parsed" if parsed.get("status") == "success" else "error"
-        parsed_text = str(parsed.get("text") or "")
         if attachment.status == "parsed" and len(parsed_text) > ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS:
             raise HTTPException(
                 413,
@@ -7023,6 +7069,8 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
         # commit response: its worker retains a committed reference or removes
         # every object version when no metadata transaction became durable.
         raise
+    finally:
+        staged.remove()
     db.refresh(attachment)
     return attachment
 

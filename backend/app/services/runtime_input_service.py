@@ -869,9 +869,16 @@ def _load_dataset_version(
             "managed dataset version is not ready",
             port_key=reference.port_key,
         )
+    port_config = _safe_port_config(port)
+    per_invocation = str(
+        getattr(port, "binding_policy", "") or ""
+    ).strip().lower() == "per_invocation"
+    restrict_identity = not per_invocation or bool(
+        port_config.get("restrict_dataset_identity", False)
+    )
     expected_dataset = getattr(port, "dataset_id", None)
     expected_schema = getattr(port, "dataset_schema_id", None)
-    if expected_dataset not in (None, "") and str(version.dataset_id) != str(
+    if restrict_identity and expected_dataset not in (None, "") and str(version.dataset_id) != str(
         expected_dataset
     ):
         raise RuntimeInputResolutionError(
@@ -879,7 +886,7 @@ def _load_dataset_version(
             "dataset version does not satisfy the port dataset contract",
             port_key=reference.port_key,
         )
-    if expected_schema not in (None, "") and str(version.schema_id) != str(
+    if restrict_identity and expected_schema not in (None, "") and str(version.schema_id) != str(
         expected_schema
     ):
         raise RuntimeInputResolutionError(
@@ -916,7 +923,7 @@ def _load_dataset_version(
     released_schema_hash = str(
         getattr(port, "dataset_schema_hash", "") or ""
     ).strip().lower()
-    if released_schema_hash and released_schema_hash != schema_hash:
+    if restrict_identity and released_schema_hash and released_schema_hash != schema_hash:
         raise RuntimeInputResolutionError(
             "dataset_contract_mismatch",
             "dataset version schema does not satisfy the released port contract",

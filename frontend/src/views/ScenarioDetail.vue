@@ -599,6 +599,14 @@
         </template>
       </el-tab-pane>
 
+      <el-tab-pane label="能力输入" name="capability-inputs" lazy>
+        <CapabilityPortsPanel
+          :scenario-id="sid"
+          :can-write="canWrite"
+          :capability-names="capabilityNames"
+        />
+      </el-tab-pane>
+
       <el-tab-pane name="candidates" lazy>
         <template #label>
           <span>候选评审 <b class="candidate-tab-count">{{ scenarioDraftSummary.candidate_count ?? '—' }}</b></span>
@@ -1368,6 +1376,7 @@ import StructuredValueCell from '@/components/StructuredValueCell.vue'
 import StructuredValueEditor from '@/components/StructuredValueEditor.vue'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
 import CandidateReviewPanel from '@/components/CandidateReviewPanel.vue'
+import CapabilityPortsPanel from '@/components/CapabilityPortsPanel.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
 import { safeInternalReturnPath } from '@/utils/navigation'
 import {
@@ -1416,6 +1425,11 @@ const detail = ref<ScenarioDetail>({
   functions: [],
   actions: [], rules: [], events: [], workflows: [],
 })
+const capabilityNames = computed(() => Object.fromEntries([
+  ...detail.value.functions.map((item) => [`function:${item.id}`, item.name]),
+  ...detail.value.actions.map((item) => [`action:${item.id}`, item.name]),
+  ...detail.value.workflows.map((item) => [`workflow:${item.id}`, item.name]),
+]))
 // The API supplies this per current user; treat an absent value as read-only.
 const canWrite = computed(() => detail.value.can_write === true)
 const returnPath = computed(() => safeInternalReturnPath(route.query.return_to, '/scenarios'))
@@ -1427,7 +1441,7 @@ const scenarioDataSources = computed(() => dataSources.value.filter((source) => 
 const databaseDataSources = computed(() => scenarioDataSources.value.filter((source) => source.type !== 'file_bucket'))
 const fileBucketSources = computed(() => scenarioDataSources.value.filter((source) => source.type === 'file_bucket'))
 const writableFileBucketSources = computed(() => fileBucketSources.value.filter((source) => source.can_write !== false))
-const stageNames = new Set(['ontology', 'instances', 'mappings', 'functions', 'actions', 'rules', 'events', 'workflows', 'candidates'])
+const stageNames = new Set(['ontology', 'instances', 'mappings', 'functions', 'actions', 'rules', 'events', 'workflows', 'capability-inputs', 'candidates'])
 const requestedStage = Array.isArray(route.query.stage) ? route.query.stage[0] : route.query.stage
 const tab = ref(typeof requestedStage === 'string' && stageNames.has(requestedStage) ? requestedStage : 'ontology')
 const instFilter = ref('')
