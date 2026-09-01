@@ -1457,7 +1457,7 @@ class MessageOut(BaseModel):
 
 
 class AgentCapabilityTargetIn(BaseModel):
-    kind: Literal["function", "action", "workflow"]
+    kind: Literal["function", "action", "rule", "workflow"]
     key: str = Field(min_length=1, max_length=240)
 
     model_config = {"extra": "forbid"}

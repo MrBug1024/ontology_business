@@ -63,11 +63,23 @@ function changeKind(next: ValueKind) {
   else if (next === 'null') { scalar.value = ''; publish(null) }
   else { scalar.value = ''; publish('') }
 }
-function publishScalar() {
-  if (kind.value === 'number') publish(Number(scalar.value || 0))
-  else if (kind.value === 'boolean') publish(Boolean(scalar.value))
-  else if (kind.value === 'null') publish(null)
-  else publish(String(scalar.value ?? ''))
+function updateScalar(value: unknown) {
+  if (kind.value === 'number') {
+    const normalized = Number(value || 0)
+    scalar.value = normalized
+    publish(normalized)
+  } else if (kind.value === 'boolean') {
+    const normalized = Boolean(value)
+    scalar.value = normalized
+    publish(normalized)
+  } else if (kind.value === 'null') {
+    scalar.value = ''
+    publish(null)
+  } else {
+    const normalized = String(value ?? '')
+    scalar.value = normalized
+    publish(normalized)
+  }
 }
 function publishObject() {
   const value: Record<string, unknown> = {}
@@ -75,6 +87,18 @@ function publishObject() {
   publish(value)
 }
 function publishArray() { publish(arrayRows.value.map((row) => row.value)) }
+function updateObjectKey(row: ObjectRow, key: string) {
+  row.key = key
+  publishObject()
+}
+function updateObjectRow(row: ObjectRow, value: unknown) {
+  row.value = value
+  publishObject()
+}
+function updateArrayRow(row: ArrayRow, value: unknown) {
+  row.value = value
+  publishArray()
+}
 function addObjectRow() { objectRows.value.push({ id: uid(), key: '', value: '' }) }
 function addArrayRow() { arrayRows.value.push({ id: uid(), value: '' }); publishArray() }
 function removeObjectRow(id: string) { objectRows.value = objectRows.value.filter((row) => row.id !== id); publishObject() }
@@ -96,8 +120,8 @@ watch(() => props.modelValue, load, { immediate: true, deep: true })
 
     <div v-if="kind === 'object'" class="container-editor">
       <div v-for="row in objectRows" :key="row.id" class="object-row">
-        <el-input v-model="row.key" size="small" placeholder="字段名称" aria-label="字段名称" @input="publishObject" />
-        <StructuredValueEditor v-model="row.value" @update:model-value="publishObject" />
+        <el-input :model-value="row.key" size="small" placeholder="字段名称" aria-label="字段名称" @update:model-value="updateObjectKey(row, $event)" />
+        <StructuredValueEditor :model-value="row.value" @update:model-value="updateObjectRow(row, $event)" />
         <el-button text type="danger" circle aria-label="删除字段" @click="removeObjectRow(row.id)"><el-icon><Delete /></el-icon></el-button>
       </div>
       <span v-if="!objectRows.length" class="empty-hint">暂无字段</span>
@@ -107,17 +131,17 @@ watch(() => props.modelValue, load, { immediate: true, deep: true })
     <div v-else-if="kind === 'array'" class="container-editor">
       <div v-for="(row, index) in arrayRows" :key="row.id" class="array-row">
         <span class="array-index">{{ index + 1 }}</span>
-        <StructuredValueEditor v-model="row.value" @update:model-value="publishArray" />
+        <StructuredValueEditor :model-value="row.value" @update:model-value="updateArrayRow(row, $event)" />
         <el-button text type="danger" circle aria-label="删除列表项" @click="removeArrayRow(row.id)"><el-icon><Delete /></el-icon></el-button>
       </div>
       <span v-if="!arrayRows.length" class="empty-hint">暂无列表项</span>
       <el-button size="small" plain @click="addArrayRow"><el-icon><Plus /></el-icon>添加列表项</el-button>
     </div>
 
-    <el-switch v-else-if="kind === 'boolean'" v-model="scalar" inline-prompt active-text="是" inactive-text="否" aria-label="布尔值" @change="publishScalar" />
+    <el-switch v-else-if="kind === 'boolean'" :model-value="scalar" inline-prompt active-text="是" inactive-text="否" aria-label="布尔值" @update:model-value="updateScalar" />
     <span v-else-if="kind === 'null'" class="empty-hint">空值</span>
-    <el-input-number v-else-if="kind === 'number'" v-model="scalar" size="small" controls-position="right" aria-label="数值" @change="publishScalar" />
-    <el-input v-else v-model="scalar" size="small" placeholder="文本值" aria-label="文本值" @input="publishScalar" />
+    <el-input-number v-else-if="kind === 'number'" :model-value="scalar" size="small" controls-position="right" aria-label="数值" @update:model-value="updateScalar" />
+    <el-input v-else :model-value="scalar" size="small" placeholder="文本值" aria-label="文本值" @update:model-value="updateScalar" />
   </div>
 </template>
 

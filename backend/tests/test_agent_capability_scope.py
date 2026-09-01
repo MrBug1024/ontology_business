@@ -6,11 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app import database as database_module
 from app.database import Base
 from app.models import (
     Agent,
@@ -177,6 +176,7 @@ class AgentCapabilityScopeTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             name="旧版 Agent",
             capability_scope=None,
+            runtime_binding_mode="legacy",
         )
         self.db.add_all([
             self.tenant,
@@ -251,20 +251,32 @@ class AgentCapabilityScopeTests(unittest.TestCase):
             {self.function_a.id, self.function_b.id},
         )
 
-    def test_new_agent_default_can_be_rolled_back_without_rewriting_existing_rows(self) -> None:
-        with patch.object(
-            agents_router,
-            "get_settings",
-            return_value=SimpleNamespace(new_agent_runtime_binding_mode="legacy"),
-        ):
-            created_out = agents_router.create_agent(
-                AgentIn(name="回退模式 Agent", scenario_id=self.scenario.id),
+    def test_new_agent_default_is_always_capability_only(self) -> None:
+        created_out = agents_router.create_agent(
+            AgentIn(name="能力模式 Agent", scenario_id=self.scenario.id),
+            self.db,
+        )
+
+        created = self.db.get(Agent, created_out.id)
+        self.assertEqual(created.runtime_binding_mode, "capability_only")
+        self.assertEqual(self.legacy_agent.runtime_binding_mode, "legacy")
+
+    def test_new_agent_rejects_explicit_historical_runtime_mode(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            agents_router.create_agent(
+                AgentIn(
+                    name="历史模式 Agent",
+                    scenario_id=self.scenario.id,
+                    runtime_binding_mode="legacy",
+                ),
                 self.db,
             )
 
-        created = self.db.get(Agent, created_out.id)
-        self.assertEqual(created.runtime_binding_mode, "legacy")
-        self.assertEqual(self.legacy_agent.runtime_binding_mode, "legacy")
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "historical_runtime_disabled",
+        )
 
     def test_unrelated_edit_freezes_legacy_scope_without_losing_capabilities(self) -> None:
         updated = agents_router.update_agent(
@@ -492,34 +504,3 @@ class AgentCapabilityScopeTests(unittest.TestCase):
                     self.db,
                 )
             self.assertEqual(live_only_error.exception.status_code, 400)
-
-
-class AgentCapabilityMigrationTests(unittest.TestCase):
-    def test_migration_keeps_legacy_rows_null_and_is_idempotent(self) -> None:
-        engine = create_engine("sqlite:///:memory:")
-        try:
-            with engine.begin() as connection:
-                connection.exec_driver_sql(
-                    "CREATE TABLE agents (id VARCHAR(32) PRIMARY KEY, name VARCHAR(200))"
-                )
-                connection.exec_driver_sql(
-                    "INSERT INTO agents (id, name) VALUES ('legacy-agent', 'legacy')"
-                )
-            with patch.object(database_module, "engine", engine):
-                database_module._migrate_agent_capability_scope()
-                database_module._migrate_agent_capability_scope()
-            self.assertIn(
-                "capability_scope",
-                {column["name"] for column in inspect(engine).get_columns("agents")},
-            )
-            with engine.connect() as connection:
-                value = connection.exec_driver_sql(
-                    "SELECT capability_scope FROM agents WHERE id = 'legacy-agent'"
-                ).scalar_one()
-            self.assertIsNone(value)
-        finally:
-            engine.dispose()
-
-
-if __name__ == "__main__":
-    unittest.main()

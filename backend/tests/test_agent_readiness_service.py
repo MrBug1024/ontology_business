@@ -107,10 +107,16 @@ def test_zero_data_capability_is_valid_without_entities_sources_or_mappings() ->
         engine.dispose()
 
 
-def test_per_invocation_port_only_blocks_runtime_axis() -> None:
+def test_historical_mode_blocks_runtime_without_reclassifying_invocation_input() -> None:
     engine, db, scenario, llm = _session()
     try:
         agent = _agent(scenario, llm, mode="prefer_capability")
+        scope = agent_capability_service.explicit_empty_scope()
+        scope["functions"] = {
+            "mode": "explicit",
+            "selected_ids": ["function-agent-ready"],
+        }
+        agent.capability_scope = scope
         port = ScenarioCapabilityPort(
             id="port-agent-ready-input",
             tenant_id=scenario.tenant_id,
@@ -141,11 +147,11 @@ def test_per_invocation_port_only_blocks_runtime_axis() -> None:
         assert readiness["runtime_ready"] is False
         assert readiness["runtime"]["missing"] == [
             {
-                "code": "invocation_input_required",
-                "label": "调用时需提供输入：Current request documents",
-                "target": "invocation-input:request.documents",
+                "code": "historical_runtime_disabled",
+                "label": "历史 Agent 运行模式已停用",
+                "target": "agent-migration",
                 "blocking": True,
-            }
+            },
         ]
         # Opening the validation workbench remains allowed; the input is
         # supplied by that invocation rather than Agent configuration.
@@ -168,8 +174,16 @@ def test_missing_model_blocks_validation_but_not_definition_or_release() -> None
         assert readiness["definition_valid"] is True
         assert readiness["validation_ready"] is False
         assert readiness["release_ready"] is True
-        assert readiness["runtime_ready"] is True
+        assert readiness["runtime_ready"] is False
         assert readiness["validation"]["missing"][0]["code"] == "chat_model_required"
+        assert readiness["runtime"]["missing"] == [
+            {
+                "code": "historical_runtime_disabled",
+                "label": "历史 Agent 运行模式已停用",
+                "target": "agent-migration",
+                "blocking": True,
+            }
+        ]
     finally:
         db.close()
         engine.dispose()
@@ -190,6 +204,10 @@ def test_explicit_legacy_mode_keeps_fixed_data_prerequisites() -> None:
         assert "数据源" in labels
         assert "数据映射" in labels
         assert "映射数据绑定" in labels
+        assert readiness["runtime_ready"] is False
+        assert readiness["runtime"]["missing"][-1]["code"] == (
+            "historical_runtime_disabled"
+        )
         assert agents_router._agent_readiness_missing(db, agent) == [
             "对象类型",
             "数据源",

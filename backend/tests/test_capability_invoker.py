@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -31,7 +31,9 @@ from app.services import capability_invoker as capability_invoker_module
 from app.services.capability_invoker import (
     CapabilityInvocationError,
     CapabilityInvoker,
+    resolve_capability_contract,
 )
+from app.services.capability_provider_keys import BUILTIN_PROVIDER_KEYS
 from app.services.capability_registry import CapabilityProviderRegistry
 
 
@@ -138,7 +140,10 @@ def _world(db: Session, key: str) -> World:
                 f"capability-{scenario.id}": {
                     "id": f"capability-{scenario.id}",
                     "runtime_kind": "provider",
-                    "runtime_config": {"provider_key": "recording-provider"},
+                    "runtime_config": {
+                        "provider_key": "recording-provider",
+                        "provider_version": "1.0.0",
+                    },
                 }
             }
         ),
@@ -613,6 +618,128 @@ def test_unregistered_provider_is_rejected_without_database_audit(db: Session) -
 
     assert captured.value.code == "provider_not_registered"
     assert db.scalar(select(func.count(CapabilityInvocation.id))) == 0
+
+
+@pytest.mark.parametrize(
+    "registered_versions",
+    [("1.0.0",), ("1.0.0", "2.0.0")],
+)
+def test_explicit_provider_runtime_without_version_fails_closed_before_resolution(
+    db: Session,
+    registered_versions: tuple[str, ...],
+) -> None:
+    world = _world(db, f"missing-provider-version-{len(registered_versions)}")
+    resource = world.deployment.definition.functions[
+        f"capability-{world.scenario.id}"
+    ]
+    resource["runtime_config"].pop("provider_version")
+    request = _request(world, correlation_id="missing-provider-version")
+    registry = CapabilityProviderRegistry()
+    for version in registered_versions:
+        provider = RecordingProvider(_object_contract())
+        provider.provider_version = version
+        registry.register_instance(provider)
+    registry.seal()
+
+    with pytest.raises(CapabilityInvocationError) as discovery_error:
+        resolve_capability_contract(
+            db,
+            world.deployment,
+            request.capability,
+            registry=registry,
+        )
+    with pytest.raises(CapabilityInvocationError) as invocation_error:
+        CapabilityInvoker(registry).invoke(
+            db,
+            world.deployment,
+            _actor(world),
+            request,
+            invocation_source="rest",
+        )
+
+    assert discovery_error.value.code == "provider_version_missing"
+    assert invocation_error.value.code == "provider_version_missing"
+    assert db.scalar(select(func.count(CapabilityInvocation.id))) == 0
+
+
+def test_explicit_provider_runtime_selects_exact_version_from_multi_version_registry(
+    db: Session,
+) -> None:
+    world = _world(db, "exact-provider-version")
+    resource = world.deployment.definition.functions[
+        f"capability-{world.scenario.id}"
+    ]
+    resource["runtime_config"]["provider_version"] = "2.0.0"
+    first = RecordingProvider(_object_contract(), result={"version": "1.0.0"})
+    second = RecordingProvider(_object_contract(), result={"version": "2.0.0"})
+    second.provider_version = "2.0.0"
+    registry = CapabilityProviderRegistry()
+    registry.register_instance(first)
+    registry.register_instance(second)
+    registry.seal()
+    request = _request(world, correlation_id="exact-provider-version")
+
+    contract = resolve_capability_contract(
+        db,
+        world.deployment,
+        request.capability,
+        registry=registry,
+    )
+    receipt = CapabilityInvoker(registry).invoke(
+        db,
+        world.deployment,
+        _actor(world),
+        request,
+        invocation_source="rest",
+    )
+
+    assert contract["side_effect"] is False
+    assert receipt.output == {"version": "2.0.0"}
+    assert first.calls == []
+    assert len(second.calls) == 1
+
+
+def test_static_builtin_provider_binding_keeps_legacy_versionless_discovery(
+    db: Session,
+) -> None:
+    world = _world(db, "builtin-version-compatibility")
+    resource = world.deployment.definition.functions[
+        f"capability-{world.scenario.id}"
+    ]
+    resource["runtime_kind"] = "weighted_score"
+    resource["runtime_config"] = {}
+    provider = RecordingProvider(_object_contract())
+    provider.provider_key = BUILTIN_PROVIDER_KEYS["function"]
+    registry = CapabilityProviderRegistry()
+    registry.register_instance(provider)
+    registry.seal()
+    request = _request(world, correlation_id="builtin-version-compatibility")
+    capability = replace(
+        request.capability,
+        provider_key=BUILTIN_PROVIDER_KEYS["function"],
+    )
+
+    contract = resolve_capability_contract(
+        db,
+        world.deployment,
+        capability,
+        registry=registry,
+    )
+
+    assert contract["side_effect"] is False
+
+    resource["runtime_kind"] = "provider"
+    resource["runtime_config"] = {
+        "provider_key": BUILTIN_PROVIDER_KEYS["function"],
+    }
+    with pytest.raises(CapabilityInvocationError) as captured:
+        resolve_capability_contract(
+            db,
+            world.deployment,
+            capability,
+            registry=registry,
+        )
+    assert captured.value.code == "provider_version_missing"
 
 
 def test_request_id_is_independent_from_correlation_and_duplicates_are_safe(

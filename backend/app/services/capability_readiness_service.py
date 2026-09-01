@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
-from ..config import get_settings
 from ..models import (
     ArtifactTemplate,
     ArtifactTemplateVersion,
@@ -214,10 +213,7 @@ def _action_readiness(
             if not skill or not bool(skill.enabled):
                 reasons.append("Skill 操作引用的能力不存在或已停用")
     elif executor_type == "script":
-        if not get_settings().allow_unsafe_workflow_nodes:
-            reasons.append("脚本操作未在受控环境中启用")
-        if not str(config.get("script") or "").strip():
-            reasons.append("脚本操作缺少脚本定义")
+        reasons.append("Python 脚本 Action 已停用")
     elif executor_type == "template":
         template_id = str(config.get("template_id") or "").strip()
         template_file_id = str(config.get("template_file_id") or "").strip()

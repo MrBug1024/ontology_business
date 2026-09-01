@@ -20,6 +20,9 @@ if str(BACKEND_ROOT) not in sys.path:
 _DATABASE_PREFIX = "ontology_migration_verify_"
 _DATABASE_NAME_RE = re.compile(r"^ontology_migration_verify_[0-9a-f]{12}$")
 _ENVIRONMENT_KEYS = ("ALEMBIC_DATABASE_URL", "ALEMBIC_ROLE", "ALEMBIC_USE_ADMIN")
+_DETACH_FUNCTION_SIGNATURE = (
+    "public.detach_data_source_file_references(varchar,varchar,varchar[])"
+)
 
 
 def _database_url(settings, database: str) -> URL:
@@ -40,6 +43,115 @@ def _revision(database_url: URL) -> str:
             return str(
                 connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
             )
+    finally:
+        engine.dispose()
+
+
+def _verify_detach_function_contract(
+    connection,
+    *,
+    runtime_role: str,
+    expected_revision: str,
+) -> None:
+    function = connection.execute(
+        text(
+            """
+            SELECT procedure.prosecdef, procedure.proconfig,
+                   pg_get_functiondef(procedure.oid) AS definition,
+                   EXISTS (
+                       SELECT 1
+                         FROM aclexplode(
+                             COALESCE(
+                                 procedure.proacl,
+                                 acldefault('f', procedure.proowner)
+                             )
+                         ) AS acl
+                        WHERE acl.grantee = 0
+                          AND acl.privilege_type = 'EXECUTE'
+                   ) AS public_execute
+              FROM pg_proc AS procedure
+             WHERE procedure.oid = to_regprocedure(:signature)
+            """
+        ),
+        {"signature": _DETACH_FUNCTION_SIGNATURE},
+    ).one_or_none()
+    if function is None or not bool(function.prosecdef):
+        raise RuntimeError(
+            f"revision {expected_revision} detach function is missing or not SECURITY DEFINER"
+        )
+    if bool(function.public_execute):
+        raise RuntimeError(
+            f"revision {expected_revision} detach function is executable by PUBLIC"
+        )
+    if "search_path=pg_catalog, public" not in set(function.proconfig or []):
+        raise RuntimeError(
+            f"revision {expected_revision} detach function search_path is not fixed"
+        )
+    can_execute = connection.execute(
+        text(
+            "SELECT has_function_privilege("
+            ":runtime_role, :signature, 'EXECUTE')"
+        ),
+        {
+            "runtime_role": runtime_role,
+            "signature": _DETACH_FUNCTION_SIGNATURE,
+        },
+    ).scalar_one()
+    if not bool(can_execute):
+        raise RuntimeError(
+            f"runtime role cannot execute revision {expected_revision} detach function"
+        )
+
+    definition = str(function.definition)
+    common_markers = (
+        "UPDATE public.data_asset_versions AS version",
+        "DELETE FROM public.dataset_fragments AS fragment",
+    )
+    revision_17_markers = (
+        "UPDATE public.ingestion_runs AS run",
+        "UPDATE public.derivation_runs AS run",
+        "DELETE FROM public.derivation_evidence AS evidence",
+    )
+    if any(marker not in definition for marker in common_markers):
+        raise RuntimeError(
+            f"revision {expected_revision} detach function lost the v16 catalog behavior"
+        )
+    if expected_revision == "20260831_16":
+        if any(marker in definition for marker in revision_17_markers):
+            raise RuntimeError("revision 16 detach function still contains revision 17 behavior")
+    elif any(marker not in definition for marker in revision_17_markers):
+        raise RuntimeError("head detach function is missing revision 17 trace cleanup behavior")
+
+
+def _verify_revision_16_contract(database_url: URL, *, runtime_role: str) -> None:
+    expected_revision = "20260831_16"
+    if _revision(database_url) != expected_revision:
+        raise RuntimeError("isolated migration database did not reach revision 16")
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with engine.connect() as connection:
+            _verify_detach_function_contract(
+                connection,
+                runtime_role=runtime_role,
+                expected_revision=expected_revision,
+            )
+    finally:
+        engine.dispose()
+
+
+def _verify_revision_09_contract(database_url: URL) -> None:
+    expected_revision = "20260829_09"
+    if _revision(database_url) != expected_revision:
+        raise RuntimeError("isolated migration database did not reach revision 09")
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with engine.connect() as connection:
+            function = connection.execute(
+                text("SELECT to_regprocedure(:signature)"),
+                {"signature": _DETACH_FUNCTION_SIGNATURE},
+            ).scalar_one()
+            if function is not None:
+                raise RuntimeError("revision 09 unexpectedly retains the revision 16 function")
     finally:
         engine.dispose()
 
@@ -100,6 +212,11 @@ def _verify_head_contract(database_url: URL, *, runtime_role: str, head: str) ->
                 raise RuntimeError("runtime role cannot execute guarded attachment expiry")
             if bool(runtime_contract.can_update_versions):
                 raise RuntimeError("runtime role gained forbidden asset-version UPDATE")
+            _verify_detach_function_contract(
+                connection,
+                runtime_role=runtime_role,
+                expected_revision=head,
+            )
             withdrawal_columns = set(
                 connection.execute(
                     text(
@@ -167,9 +284,10 @@ def main() -> int:
 
         command.upgrade(config, head)
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
+        command.downgrade(config, "20260831_16")
+        _verify_revision_16_contract(target_url, runtime_role=runtime_role)
         command.downgrade(config, "20260829_09")
-        if _revision(target_url) != "20260829_09":
-            raise RuntimeError("isolated migration database did not reach revision 09")
+        _verify_revision_09_contract(target_url)
         command.upgrade(config, head)
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
         print(f"Alembic isolated round-trip passed at {head}")

@@ -351,10 +351,10 @@ def test_revision_10_backfill_fails_closed_without_partial_updates() -> None:
         engine.dispose()
 
 
-def test_capability_runtime_metadata_has_scoped_contracts_and_legacy_defaults() -> None:
+def test_capability_runtime_metadata_has_scoped_contracts_and_capability_default() -> None:
     assert Agent.__table__.c.runtime_binding_mode.nullable is False
-    assert Agent.__table__.c.runtime_binding_mode.default.arg == "legacy"
-    assert Agent.__table__.c.runtime_binding_mode.server_default.arg == "legacy"
+    assert Agent.__table__.c.runtime_binding_mode.default.arg == "capability_only"
+    assert Agent.__table__.c.runtime_binding_mode.server_default.arg == "capability_only"
     assert ScenarioDatasetBinding.__table__.c.environment.default.arg == "dev"
     assert ScenarioDatasetBinding.__table__.c.environment.server_default.arg == "dev"
     assert AgentMCPService.__table__.c.publication_mode.default.arg == "legacy_agent"
@@ -600,7 +600,7 @@ def test_runtime_binding_sources_and_environment_roles_are_enforced() -> None:
         db.commit()
         db.add_all([invocation, dataset_version])
         db.commit()
-        assert agent.runtime_binding_mode == "legacy"
+        assert agent.runtime_binding_mode == "capability_only"
 
         distinct_capability = CapabilityInvocation(
             id="invocation-distinct-capability",

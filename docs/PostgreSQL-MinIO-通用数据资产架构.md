@@ -56,6 +56,6 @@ MinIO 对象使用内容寻址路径，数据库保存 `bucket_name`、`object_k
 1. 复制 `backend/.env.example` 为 `backend/.env`，填写 PostgreSQL、MinIO 和 Redis 配置。
 2. 使用数据库 owner 执行 `alembic upgrade head`。
 3. 使用运行账号启动 API；启动时只核验当前迁移版本，不隐式执行 DDL。
-4. 执行 `python backend/scripts/verify_postgresql_runtime.py`，验证 PostgreSQL 权限、MinIO 数据资产、数据集查询、业务审计和 Redis 缓存往返。
+4. 执行 `python backend/scripts/verify_postgresql_runtime.py`，只读验证 PostgreSQL Schema/运行角色权限、MinIO 和可选 Redis 健康；业务能力另按 Definition 与调用契约验收。
 
 运行账号不得拥有超级用户、建库、建角色或 Schema DDL 权限。Schema 迁移只能由迁移 owner/admin 执行；Redis 不可用时，业务正确性必须仍由 PostgreSQL 和 MinIO 提供。

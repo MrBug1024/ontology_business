@@ -163,6 +163,42 @@ test('Agent chat clears the composer only after a successful stream', () => {
   assert.match(source, /activeStreamFailed = true[\s\S]*case 'error'/)
 })
 
+test('Agent chat cancellation clears every active stream state', () => {
+  const source = readFileSync(new URL('../src/views/AgentChat.vue', import.meta.url), 'utf8')
+  const cancelStart = source.indexOf('function cancelActiveStream()')
+  const stopStart = source.indexOf('function stop()', cancelStart)
+  const routeWatchStart = source.indexOf('watch(() => route.params.id', stopStart)
+  const unmountStart = source.indexOf('onBeforeUnmount(', routeWatchStart)
+  const cancelSource = source.slice(cancelStart, stopStart)
+  const stopSource = source.slice(stopStart, routeWatchStart)
+  const routeWatchSource = source.slice(routeWatchStart, unmountStart)
+
+  assert.notEqual(cancelStart, -1)
+  assert.match(cancelSource, /activeStreamFailed = true/)
+  assert.match(cancelSource, /message\.streaming = false/)
+  assert.match(cancelSource, /message\.status = ''/)
+  assert.match(cancelSource, /ctrl\?\.abort\(\)/)
+  assert.match(cancelSource, /ctrl = null/)
+  assert.match(cancelSource, /streaming\.value = false/)
+  assert.match(stopSource, /cancelActiveStream\(\)/)
+  assert.match(routeWatchSource, /cancelActiveStream\(\)/)
+})
+
+test('conversation history ignores stale responses after the selection changes', () => {
+  const source = readFileSync(new URL('../src/views/AgentChat.vue', import.meta.url), 'utf8')
+  const openStart = source.indexOf('async function openConv(')
+  const deleteStart = source.indexOf('async function delConv(', openStart)
+  const openSource = source.slice(openStart, deleteStart)
+
+  assert.match(source, /let conversationLoadRequest = 0/)
+  assert.match(openSource, /const request = \+\+conversationLoadRequest/)
+  assert.match(openSource, /const requestedConversationId = c\.id/)
+  assert.match(openSource, /request !== conversationLoadRequest/)
+  assert.match(openSource, /curConv\.value\?\.id !== requestedConversationId/)
+  assert.match(openSource, /messages\.value = loadedMessages\.map/)
+  assert.doesNotMatch(openSource, /messages\.value\.push/)
+})
+
 test('invocation composer reuses validation assets and materializes tables as datasets', () => {
   const source = readFileSync(new URL('../src/components/AgentInvocationComposer.vue', import.meta.url), 'utf8')
   assert.match(source, /api\.uploadCatalogAttachment/)

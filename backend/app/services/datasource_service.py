@@ -36,6 +36,101 @@ _engine_cache: dict[str, Engine] = {}
 # callers intentionally receive this stable, non-diagnostic public message.
 CONNECTION_TEST_FAILURE_MESSAGE = "连接测试失败，请检查数据源配置和网络可达性"
 
+POSTGRES_HOST_MAX_LENGTH = 253
+POSTGRES_DATABASE_MAX_LENGTH = 128
+POSTGRES_USER_MAX_LENGTH = 128
+POSTGRES_PASSWORD_MAX_LENGTH = 4096
+
+
+def _required_postgres_text(
+    config: Mapping[str, Any],
+    key: str,
+    *,
+    max_length: int,
+) -> str:
+    raw = config.get(key)
+    if not isinstance(raw, str):
+        raise ValueError(f"PostgreSQL 数据源配置缺少有效的 {key}")
+    value = raw.strip()
+    if not value or len(value) > max_length:
+        raise ValueError(f"PostgreSQL 数据源配置的 {key} 长度无效")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"PostgreSQL 数据源配置的 {key} 包含无效字符")
+    return value
+
+
+def normalize_postgres_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Validate and canonicalize the public PostgreSQL connection contract.
+
+    Connection identity is always explicit. This prevents a partial tenant
+    configuration from silently targeting a local/default PostgreSQL server.
+    Validation messages name fields only and never interpolate credentials.
+    """
+    if config is None or not isinstance(config, Mapping):
+        raise ValueError("PostgreSQL 数据源配置必须是对象")
+    normalized = dict(config)
+    host = _required_postgres_text(
+        config,
+        "host",
+        max_length=POSTGRES_HOST_MAX_LENGTH,
+    )
+    database = _required_postgres_text(
+        config,
+        "database",
+        max_length=POSTGRES_DATABASE_MAX_LENGTH,
+    )
+
+    raw_user = config.get("user")
+    raw_username = config.get("username")
+    if raw_user is None and raw_username is None:
+        raise ValueError("PostgreSQL 数据源配置缺少有效的 user")
+    user_config = {"user": raw_user if raw_user is not None else raw_username}
+    user = _required_postgres_text(
+        user_config,
+        "user",
+        max_length=POSTGRES_USER_MAX_LENGTH,
+    )
+    if raw_user is not None and raw_username is not None:
+        username = _required_postgres_text(
+            {"username": raw_username},
+            "username",
+            max_length=POSTGRES_USER_MAX_LENGTH,
+        )
+        if user != username:
+            raise ValueError("PostgreSQL 数据源配置的 user 与 username 不一致")
+
+    raw_port = config.get("port")
+    if isinstance(raw_port, bool):
+        raise ValueError("PostgreSQL 数据源配置的 port 必须是 1 到 65535 的整数")
+    if isinstance(raw_port, int):
+        port = raw_port
+    elif isinstance(raw_port, str) and re.fullmatch(r"[0-9]+", raw_port.strip()):
+        port = int(raw_port.strip())
+    else:
+        raise ValueError("PostgreSQL 数据源配置的 port 必须是 1 到 65535 的整数")
+    if not 1 <= port <= 65535:
+        raise ValueError("PostgreSQL 数据源配置的 port 必须是 1 到 65535 的整数")
+
+    if "password" in config:
+        password = config.get("password")
+        if (
+            not isinstance(password, str)
+            or len(password) > POSTGRES_PASSWORD_MAX_LENGTH
+            or "\x00" in password
+        ):
+            raise ValueError("PostgreSQL 数据源配置的 password 无效")
+
+    normalized.update(
+        {
+            "host": host,
+            "port": port,
+            "database": database,
+            "user": user,
+        }
+    )
+    normalized.pop("username", None)
+    return normalized
+
 
 def _schema_cache_key(ds: DataSource) -> str:
     revision = int(getattr(ds, "connector_revision", 0) or 0)
@@ -43,26 +138,27 @@ def _schema_cache_key(ds: DataSource) -> str:
 
 
 def _db_url(ds: DataSource) -> URL:
-    cfg = ds.config or {}
     if ds.type == "postgres":
+        cfg = normalize_postgres_config(ds.config)
         return URL.create(
             "postgresql+psycopg",
-            username=str(cfg.get("user") or cfg.get("username") or "postgres"),
-            password=str(cfg.get("password") or ""),
-            host=str(cfg.get("host") or "127.0.0.1"),
-            port=int(cfg.get("port") or 5432),
-            database=str(cfg.get("database") or ""),
+            username=cfg["user"],
+            password=cfg.get("password"),
+            host=cfg["host"],
+            port=cfg["port"],
+            database=cfg["database"],
         )
     raise ValueError("数据源必须是 PostgreSQL")
 
 
 def get_engine(ds: DataSource) -> Engine:
+    url = _db_url(ds)
     config_digest = hashlib.sha256(
         json.dumps(ds.config or {}, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
     key = f"{ds.id}:{config_digest}"
     if key not in _engine_cache:
-        _engine_cache[key] = create_engine(_db_url(ds), pool_pre_ping=True)
+        _engine_cache[key] = create_engine(url, pool_pre_ping=True)
     return _engine_cache[key]
 
 

@@ -10,10 +10,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, event, inspect
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import database
 from app.database import Base
 from app.models import (
     AssistantCompilationJob,
@@ -516,117 +515,3 @@ class AssistantCompilationJobLeaseTests(unittest.TestCase):
             ),
             [],
         )
-
-
-class AssistantCompilationJobLeaseMigrationTests(unittest.TestCase):
-    def test_legacy_rows_receive_safe_restart_defaults_idempotently(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-            path = Path(temp_dir) / "legacy-compilation-jobs.sqlite3"
-            engine = create_engine(f"sqlite:///{path.as_posix()}")
-            with engine.begin() as connection:
-                connection.exec_driver_sql(
-                    "CREATE TABLE assistant_compilation_jobs ("
-                    "id VARCHAR(32) PRIMARY KEY, "
-                    "status VARCHAR(20), "
-                    "error TEXT, completed_at TIMESTAMP, "
-                    "created_at TIMESTAMP)"
-                )
-                connection.exec_driver_sql(
-                    "INSERT INTO assistant_compilation_jobs "
-                    "(id, status, error, created_at) VALUES "
-                    "('legacy-job', 'running', '', CURRENT_TIMESTAMP), "
-                    "('legacy-job-2', 'succeeded', '', CURRENT_TIMESTAMP)"
-                )
-                connection.exec_driver_sql(
-                    "CREATE TABLE assistant_attachments ("
-                    "id VARCHAR(32) PRIMARY KEY, parsed_text TEXT)"
-                )
-                connection.exec_driver_sql(
-                    "INSERT INTO assistant_attachments (id, parsed_text) VALUES "
-                    "('legacy-attachment', '这是解析文本，不是原始上传字节')"
-                )
-            with patch.object(database, "engine", engine):
-                database._migrate_assistant_compilation_jobs()
-                database._migrate_assistant_compilation_jobs()
-
-            inspector = inspect(engine)
-            columns = {
-                item["name"]
-                for item in inspector.get_columns("assistant_compilation_jobs")
-            }
-            self.assertTrue({
-                "request_fingerprint",
-                "execution_input",
-                "lease_token",
-                "lease_expires_at",
-                "lease_attempt",
-            } <= columns)
-            indexes = {
-                item.get("name")
-                for item in inspector.get_indexes("assistant_compilation_jobs")
-            }
-            self.assertIn(
-                "ix_assistant_compilation_jobs_status_lease_expiry",
-                indexes,
-            )
-            guards = indexes | {
-                item.get("name")
-                for item in inspector.get_unique_constraints(
-                    "assistant_compilation_jobs"
-                )
-            }
-            self.assertIn(
-                "uq_assistant_compilation_jobs_fingerprint",
-                guards,
-            )
-            attachment_columns = {
-                item["name"]
-                for item in inspector.get_columns("assistant_attachments")
-            }
-            self.assertIn("content_hash", attachment_columns)
-            self.assertIn(
-                "ix_assistant_attachments_content_hash",
-                {
-                    item.get("name")
-                    for item in inspector.get_indexes("assistant_attachments")
-                },
-            )
-            with engine.connect() as connection:
-                row = connection.exec_driver_sql(
-                    "SELECT request_fingerprint, execution_input, lease_token, "
-                    "lease_expires_at, lease_attempt, status, error, completed_at "
-                    "FROM assistant_compilation_jobs "
-                    "WHERE id = 'legacy-job'"
-                ).one()
-                content_hash = connection.exec_driver_sql(
-                    "SELECT content_hash FROM assistant_attachments "
-                    "WHERE id = 'legacy-attachment'"
-                ).scalar_one()
-                fingerprint_count = connection.exec_driver_sql(
-                    "SELECT COUNT(DISTINCT request_fingerprint) "
-                    "FROM assistant_compilation_jobs"
-                ).scalar_one()
-                historic_status = connection.exec_driver_sql(
-                    "SELECT status FROM assistant_compilation_jobs "
-                    "WHERE id = 'legacy-job-2'"
-                ).scalar_one()
-            expected_fingerprint = hashlib.sha256(
-                "ontology-platform:assistant-compilation-job:"
-                "legacy-request-fingerprint:v1:legacy-job".encode("utf-8")
-            ).hexdigest()
-            self.assertEqual(row.request_fingerprint, expected_fingerprint)
-            self.assertEqual(json.loads(row.execution_input), {})
-            self.assertEqual(row.lease_token, "")
-            self.assertIsNone(row.lease_expires_at)
-            self.assertEqual(row.lease_attempt, 0)
-            self.assertEqual(row.status, "failed")
-            self.assertIn("缺少可验证执行输入", row.error)
-            self.assertIsNotNone(row.completed_at)
-            self.assertEqual(content_hash, "")
-            self.assertEqual(fingerprint_count, 2)
-            self.assertEqual(historic_status, "succeeded")
-            engine.dispose()
-
-
-if __name__ == "__main__":
-    unittest.main()

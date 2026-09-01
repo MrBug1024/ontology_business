@@ -64,17 +64,18 @@ class Settings(BaseSettings):
         default=600, ge=300, le=3600
     )
 
-    # OCR service (used by the ocr-parser skill and PDF/image fallback)
-    ocr_base_url: str = "https://ocr.rhzy.ai"
-    ocr_api_key: str = ""
+    # Optional server-owned OCR adapter. Every adapter field is required before
+    # document bytes may leave the platform process.
+    ocr_base_url: str = Field(default="", max_length=2048)
+    ocr_endpoint_path: str = Field(default="", max_length=512)
+    ocr_allowed_hosts: str = Field(default="", max_length=4096)
+    ocr_private_host_allowlist: str = Field(default="", max_length=4096)
+    ocr_api_key: str = Field(default="", max_length=4096)
+    ocr_engine: str = Field(default="", max_length=128)
+    ocr_language: str = Field(default="", max_length=64)
+    ocr_timeout_seconds: float = Field(default=600.0, ge=1.0, le=600.0)
 
     # Agent runtime
-    # New validation Agents use the capability runtime by default.  Keeping
-    # this deployment-controlled preserves an immediate rollback path without
-    # rewriting existing Agent rows, whose database default remains legacy.
-    new_agent_runtime_binding_mode: Literal["legacy", "capability_only"] = (
-        "capability_only"
-    )
     max_tool_rounds: int = 20
     max_query_rows: int = 200
     dataset_query_timeout_seconds: float = Field(default=30.0, ge=0.1, le=600.0)

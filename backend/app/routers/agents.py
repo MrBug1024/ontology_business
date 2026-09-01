@@ -10,7 +10,6 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from ..config import get_settings
 from ..database import SessionLocal
 from ..models import (
     Agent,
@@ -124,6 +123,24 @@ def _sync_runtime_connections(
     if unknown:
         raise HTTPException(400, "业务数据库配置不存在或不属于当前 Agent")
 
+    normalized_configs: list[dict[str, Any]] = []
+    for item in submitted:
+        source = existing.get(item.id or "")
+        submitted_config = (
+            dict(item.config or {})
+            if source is None
+            else _merge_runtime_connection_config(
+                source.config or {},
+                item.config or {},
+            )
+        )
+        try:
+            normalized_configs.append(
+                datasource_service.normalize_postgres_config(submitted_config)
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     keep: list[DataSource] = []
     principal = permission_service.require_principal(db)
     scenario = (
@@ -131,7 +148,7 @@ def _sync_runtime_connections(
         if agent.scenario_id
         else None
     )
-    for item in submitted:
+    for item, normalized_config in zip(submitted, normalized_configs, strict=True):
         source = existing.get(item.id or "")
         if source is None:
             source = DataSource(
@@ -141,7 +158,7 @@ def _sync_runtime_connections(
                 owner_agent_id=agent.id,
                 name=item.name,
                 type=item.type,
-                config=dict(item.config or {}),
+                config=normalized_config,
                 status="unknown",
                 last_error="",
             )
@@ -151,9 +168,7 @@ def _sync_runtime_connections(
             source.name = item.name
             source.type = item.type
             source.scenario_id = agent.scenario_id
-            source.config = _merge_runtime_connection_config(
-                source.config or {}, item.config or {}
-            )
+            source.config = normalized_config
             source.status = "unknown"
             source.last_error = ""
             datasource_service.invalidate_engine(source)
@@ -688,7 +703,11 @@ def _out(a: Agent, db: Session) -> AgentOut:
         definition_error = "尚未绑定业务场景"
     else:
         try:
-            definition = runtime_definition_service.resolve_authoring(db, scenario)
+            definition = runtime_definition_service.resolve_active(
+                db,
+                scenario,
+                environment=runtime_connector_service.runtime_environment(),
+            )
         except (runtime_definition_service.RuntimeDefinitionError, ValueError) as exc:
             definition_error = str(exc) or "当前环境运行定义不可用"
     if a.capability_scope is None and definition is not None:
@@ -790,7 +809,11 @@ def _validate_bindings(
                 definition=None,
             )
         elif needs_capability_definition:
-            definition = runtime_definition_service.resolve_authoring(db, scenario)
+            definition = runtime_definition_service.resolve_active(
+                db,
+                scenario,
+                environment=runtime_connector_service.runtime_environment(),
+            )
             capability_scope = agent_capability_service.validate_scope(
                 db,
                 capability_scope,
@@ -819,7 +842,11 @@ def get_agent_capability_catalog(
     scenario = tenant_service.require_scenario(db, scenario_id)
     permission_service.require_scenario_permission(db, scenario, "read")
     try:
-        definition = runtime_definition_service.resolve_authoring(db, scenario)
+        definition = runtime_definition_service.resolve_active(
+            db,
+            scenario,
+            environment=runtime_connector_service.runtime_environment(),
+        )
     except (runtime_definition_service.RuntimeDefinitionError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from exc
     return {
@@ -843,7 +870,7 @@ def get_agent_runtime_capabilities(
             db,
             agent,
             LLMConfig(name="能力契约发现"),
-            environment="dev",
+            environment=runtime_connector_service.runtime_environment(),
         )
     except agent_runtime_adapter.AgentRuntimeAdapterError as exc:
         raise HTTPException(
@@ -866,11 +893,22 @@ def list_agents(db: Session = Depends(get_tenant_db)):
 
 @router.post("", response_model=AgentOut)
 def create_agent(payload: AgentIn, db: Session = Depends(get_tenant_db)):
+    if payload.runtime_binding_mode not in {None, "capability_only"}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "historical_runtime_disabled",
+                "message": (
+                    "Historical Agent runtime modes are disabled; new Agents "
+                    "must use capability_only"
+                ),
+            },
+        )
     capability_scope = agent_capability_service.normalize_scope(
         (
             payload.capability_scope
             if payload.capability_scope is not None
-            else agent_capability_service.legacy_all_scope()
+            else agent_capability_service.explicit_empty_scope()
         ),
         legacy_default=False,
         allow_all=True,
@@ -910,6 +948,16 @@ def get_agent(agent_id: str, db: Session = Depends(get_tenant_db)):
 @router.put("/{agent_id}", response_model=AgentOut)
 def update_agent(agent_id: str, payload: AgentIn, db: Session = Depends(get_tenant_db)):
     a = _agent(db, agent_id, writable=True)
+    try:
+        agent_migration_service.assert_direct_mode_update_allowed(
+            a,
+            payload.runtime_binding_mode,
+        )
+    except agent_migration_service.AgentMigrationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
     scenario_changed = payload.scenario_id != a.scenario_id
     if payload.capability_scope is not None:
         capability_scope = agent_capability_service.normalize_scope(
@@ -919,8 +967,9 @@ def update_agent(agent_id: str, payload: AgentIn, db: Session = Depends(get_tena
         )
         stored_scope: dict[str, dict[str, Any]] | None = capability_scope
     elif scenario_changed:
-        # A changed scene receives its complete visible business capability set.
-        capability_scope = agent_capability_service.legacy_all_scope()
+        # A scenario change is a new authorization boundary. Never carry or
+        # dynamically grant capabilities from either scenario.
+        capability_scope = agent_capability_service.explicit_empty_scope()
         stored_scope = capability_scope
     else:
         # Preserve the behaviour of a pre-scope Agent during an unrelated
@@ -947,7 +996,6 @@ def update_agent(agent_id: str, payload: AgentIn, db: Session = Depends(get_tena
     for k, v in values.items():
         setattr(a, k, v)
     a.capability_scope = stored_scope
-    a.runtime_binding_mode = "capability_only"
     try:
         db.flush()
         _sync_runtime_connections(db, a, payload.runtime_connections)

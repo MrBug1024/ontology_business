@@ -11,6 +11,7 @@ from ..schemas import ApprovalDecisionIn, WorkflowApprovalOut, WorkflowRunOut
 from ..services import (
     operations_service,
     permission_service,
+    runtime_connector_service,
     runtime_definition_service,
     tenant_service,
     workflow_payload_service,
@@ -72,7 +73,8 @@ def _can_read_run(db: Session, run: WorkflowRun) -> bool:
 
 def _run_for_request(db: Session, run_id: str, *, writable: bool = False, verb: str = "read") -> WorkflowRun:
     run = db.get(WorkflowRun, run_id)
-    if not run:
+    current_environment = runtime_connector_service.runtime_environment()
+    if not run or str(run.environment or "dev") != current_environment:
         raise HTTPException(404, "任务不存在")
     tenant_service.require_scenario(db, run.scenario_id, writable=writable)
     workflow = _workflow_for_run(db, run)
@@ -151,11 +153,13 @@ def list_tasks(
     limit: int = Query(default=80, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
+    current_environment = runtime_connector_service.runtime_environment()
     stmt = (
         select(WorkflowRun)
         .join(BusinessScenario, BusinessScenario.id == WorkflowRun.scenario_id)
         .where(
             tenant_service.visible_clause(BusinessScenario, db),
+            WorkflowRun.environment == current_environment,
         )
         .order_by(WorkflowRun.created_at.desc())
         .limit(limit)
@@ -179,12 +183,14 @@ def list_approvals(
     limit: int = Query(default=80, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
+    current_environment = runtime_connector_service.runtime_environment()
     stmt = (
         select(WorkflowApprovalRequest)
         .join(WorkflowRun, WorkflowRun.id == WorkflowApprovalRequest.workflow_run_id)
         .join(BusinessScenario, BusinessScenario.id == WorkflowRun.scenario_id)
         .where(
             tenant_service.visible_clause(BusinessScenario, db),
+            WorkflowRun.environment == current_environment,
         )
         .order_by(WorkflowApprovalRequest.requested_at.asc())
         .limit(limit)

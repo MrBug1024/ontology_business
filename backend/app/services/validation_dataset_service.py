@@ -290,6 +290,17 @@ def _csv_rows(path: Path, delimiter: str) -> Iterator[Sequence[Any]]:
         yield from reader
 
 
+def _close_tabular_workbook(workbook: Any) -> None:
+    if workbook is None:
+        return
+    close = getattr(workbook, "close", None)
+    release = getattr(workbook, "release_resources", None)
+    if callable(close):
+        close()
+    elif callable(release):
+        release()
+
+
 def _materialize_raw_file(
     raw_path: Path,
     filename: str,
@@ -324,46 +335,57 @@ def _materialize_raw_file(
         )
         profile_by_name = {str(item.get("name") or ""): item for item in tables}
         candidates = []
-        nonempty_sheets = [sheet for sheet in workbook.worksheets if sheet.max_row > 0]
-        for sheet in nonempty_sheets:
-            table_profile = profile_by_name.get(sheet.title)
-            if table_profile is None:
-                continue
-            rows = sheet.iter_rows(values_only=True)
-            rows = islice(
-                rows,
-                int(table_profile.get("header_row_index") or 0) + 1,
-                None,
-            )
-            relation_name = str(table_profile.get("relation_name") or "").strip()
-            if not relation_name:
-                relation_name = catalog_ingestion_service.runtime_relation_name(
-                    filename, sheet.title, len(nonempty_sheets)
+        try:
+            # OOXML may omit worksheet dimensions. In read-only mode openpyxl
+            # then exposes max_row=None, so the verified profile is authoritative.
+            profiled_sheets = [
+                sheet for sheet in workbook.worksheets
+                if sheet.title in profile_by_name
+            ]
+            for sheet in profiled_sheets:
+                table_profile = profile_by_name[sheet.title]
+                rows = sheet.iter_rows(values_only=True)
+                rows = islice(
+                    rows,
+                    int(table_profile.get("header_row_index") or 0) + 1,
+                    None,
                 )
-            candidates.append((relation_name, table_profile, rows))
+                relation_name = str(table_profile.get("relation_name") or "").strip()
+                if not relation_name:
+                    relation_name = catalog_ingestion_service.runtime_relation_name(
+                        filename, sheet.title, len(profiled_sheets)
+                    )
+                candidates.append((relation_name, table_profile, rows))
+        except Exception:
+            _close_tabular_workbook(workbook)
+            raise
     elif extension == ".xls":
         import xlrd
 
         workbook = xlrd.open_workbook(str(raw_path), on_demand=True)
-        profile_by_name = {str(item.get("name") or ""): item for item in tables}
-        candidates = []
-        nonempty_sheets = [
-            workbook.sheet_by_index(index)
-            for index in range(workbook.nsheets)
-            if workbook.sheet_by_index(index).nrows > 0
-        ]
-        for sheet in nonempty_sheets:
-            table_profile = profile_by_name.get(sheet.name)
-            if table_profile is None:
-                continue
-            start = int(table_profile.get("header_row_index") or 0) + 1
-            rows = (sheet.row_values(index) for index in range(start, sheet.nrows))
-            relation_name = str(table_profile.get("relation_name") or "").strip()
-            if not relation_name:
-                relation_name = catalog_ingestion_service.runtime_relation_name(
-                    filename, sheet.name, len(nonempty_sheets)
-                )
-            candidates.append((relation_name, table_profile, rows))
+        try:
+            profile_by_name = {str(item.get("name") or ""): item for item in tables}
+            candidates = []
+            nonempty_sheets = [
+                workbook.sheet_by_index(index)
+                for index in range(workbook.nsheets)
+                if workbook.sheet_by_index(index).nrows > 0
+            ]
+            for sheet in nonempty_sheets:
+                table_profile = profile_by_name.get(sheet.name)
+                if table_profile is None:
+                    continue
+                start = int(table_profile.get("header_row_index") or 0) + 1
+                rows = (sheet.row_values(index) for index in range(start, sheet.nrows))
+                relation_name = str(table_profile.get("relation_name") or "").strip()
+                if not relation_name:
+                    relation_name = catalog_ingestion_service.runtime_relation_name(
+                        filename, sheet.name, len(nonempty_sheets)
+                    )
+                candidates.append((relation_name, table_profile, rows))
+        except Exception:
+            _close_tabular_workbook(workbook)
+            raise
     else:
         raise ValidationDatasetError("验证数据包目前只接受 CSV、TSV、XLS 或 XLSX")
     try:
@@ -399,13 +421,7 @@ def _materialize_raw_file(
                 }
             )
     finally:
-        if workbook is not None:
-            close = getattr(workbook, "close", None)
-            release = getattr(workbook, "release_resources", None)
-            if callable(close):
-                close()
-            elif callable(release):
-                release()
+        _close_tabular_workbook(workbook)
     if not results:
         raise ValidationDatasetError(f"{filename} 没有可物化的工作表")
     return results

@@ -909,11 +909,13 @@ def _ensure_approval_request(db: Session, run: WorkflowRun, waiting_step: dict[s
 def process_available_runs(db: Session, *, now: datetime | None = None, limit: int = 8) -> list[WorkflowRun]:
     """同步处理少量已到期队列项；由 lifespan 中的后台循环调用。"""
     now = now or utc_now()
+    worker_environment = runtime_connector_service.runtime_environment()
     run_ids = db.execute(
         select(WorkflowRun.id)
         .where(
             WorkflowRun.status.in_(DISPATCHABLE_RUN_STATUSES),
             WorkflowRun.available_at <= now,
+            WorkflowRun.environment == worker_environment,
         )
         .order_by(WorkflowRun.available_at.asc(), WorkflowRun.created_at.asc())
         .limit(max(1, min(limit, 32)))

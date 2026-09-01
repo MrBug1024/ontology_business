@@ -38,7 +38,7 @@ from .capability_invoker import (
 )
 
 
-DISCOVERABLE_CAPABILITY_KINDS = ("function", "action", "workflow")
+DISCOVERABLE_CAPABILITY_KINDS = ("function", "action", "rule", "workflow")
 _MANAGED_REFERENCE_FIELDS = {
     "dataset_version_id": "dataset_version",
     "dataset_head_id": "dataset_head",
@@ -139,6 +139,7 @@ def _resources(definition: Any, kind: str) -> Mapping[str, Any]:
     group = {
         "function": "functions",
         "action": "actions",
+        "rule": "rules",
         "workflow": "workflows",
     }.get(kind)
     if group is None:

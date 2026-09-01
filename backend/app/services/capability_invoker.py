@@ -584,6 +584,63 @@ def _definition_output_schema(
             "capability_not_found",
             "capability is not present in the resolved deployment definition",
         )
+    if capability.kind == "rule":
+        return {
+            "type": "object",
+            "properties": {
+                "rule_id": {"type": "string"},
+                "rule_name": {"type": "string"},
+                "matched": {"type": "boolean"},
+                "severity": {
+                    "type": "string",
+                    "enum": ["info", "warning", "critical"],
+                },
+                "action_on_match": {"type": "string"},
+                "trigger_action_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "trigger_actions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action_id": {"type": "string"},
+                            "action_name": {"type": "string"},
+                            "status": {"type": "string"},
+                            "executable": {"type": "boolean"},
+                            "blocked_reasons": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "requires_confirmation": {"type": "boolean"},
+                            "input_schema": {"type": "object"},
+                            "precondition": {"type": "string"},
+                            "postcondition": {"type": "string"},
+                        },
+                        "required": [
+                            "action_id",
+                            "status",
+                            "executable",
+                            "blocked_reasons",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+                "side_effects_executed": {"const": False},
+            },
+            "required": [
+                "rule_id",
+                "rule_name",
+                "matched",
+                "severity",
+                "action_on_match",
+                "trigger_action_ids",
+                "trigger_actions",
+                "side_effects_executed",
+            ],
+            "additionalProperties": False,
+        }
     schema = _read(resource, "output_schema", {}) or {}
     if not isinstance(schema, Mapping):
         raise CapabilityInvocationError(
@@ -683,6 +740,37 @@ def _expected_provider_version(
     return str(_read(resource, "provider_version", "") or "").strip()
 
 
+def _provider_version_for_resolution(
+    deployment: ResolvedDeployment,
+    capability: CapabilityRef,
+    provider_key: str,
+) -> str | None:
+    expected = _expected_provider_version(deployment, capability)
+    if expected:
+        return expected
+
+    resources = _capability_resources(deployment.definition, capability.kind)
+    resource = _find_capability_resource(resources, capability.resource_id)
+    explicit_provider_runtime = (
+        resource is not None
+        and str(_read(resource, "runtime_kind", "") or "").strip().lower()
+        == "provider"
+    )
+    static_builtin_key = builtin_provider_key(capability.kind)
+    if (
+        not explicit_provider_runtime
+        and static_builtin_key is not None
+        and provider_key == static_builtin_key
+    ):
+        # Legacy built-in definitions predate version metadata. This exception
+        # applies only to the platform's static kind-to-provider binding.
+        return None
+    raise CapabilityInvocationError(
+        "provider_version_missing",
+        "resolved capability Provider version is missing",
+    )
+
+
 def _require_provider_version(
     deployment: ResolvedDeployment,
     capability: CapabilityRef,
@@ -699,6 +787,26 @@ def _require_provider_version(
         )
 
 
+def _raise_provider_resolution_error(
+    registry: CapabilityProviderRegistry,
+    provider_key: str,
+    expected_version: str | None,
+) -> None:
+    key_is_registered = any(
+        registered_key == provider_key
+        for registered_key, _registered_version in registry.identities()
+    )
+    if expected_version and key_is_registered:
+        raise CapabilityInvocationError(
+            "provider_version_mismatch",
+            "registered Provider version does not match the resolved definition",
+        )
+    raise CapabilityInvocationError(
+        "provider_not_registered",
+        "capability provider is not registered",
+    )
+
+
 def resolve_capability_contract(
     db: Session,
     deployment: ResolvedDeployment,
@@ -710,25 +818,22 @@ def resolve_capability_contract(
 
     provider_key = resolve_provider_binding(deployment, capability)
     trusted_registry = registry or default_provider_registry
-    expected_version = _expected_provider_version(deployment, capability)
+    expected_version = _provider_version_for_resolution(
+        deployment,
+        capability,
+        provider_key,
+    )
     try:
         provider = trusted_registry.resolve(
             provider_key,
             expected_version or None,
         )
     except CapabilityRegistryError:
-        raise CapabilityInvocationError(
-            (
-                "provider_version_mismatch"
-                if expected_version
-                else "provider_not_registered"
-            ),
-            (
-                "registered Provider version does not match the resolved definition"
-                if expected_version
-                else "capability provider is not registered"
-            ),
-        ) from None
+        _raise_provider_resolution_error(
+            trusted_registry,
+            provider_key,
+            expected_version,
+        )
     _require_provider_version(deployment, capability, provider)
     try:
         provider = bind_provider(provider, db)
@@ -1246,9 +1351,10 @@ class CapabilityInvoker:
             invocation_source,
         )
         provider_key = resolve_provider_binding(deployment, request.capability)
-        expected_version = _expected_provider_version(
+        expected_version = _provider_version_for_resolution(
             deployment,
             request.capability,
+            provider_key,
         )
         try:
             provider = self._registry.resolve(
@@ -1256,18 +1362,11 @@ class CapabilityInvoker:
                 expected_version or None,
             )
         except CapabilityRegistryError:
-            raise CapabilityInvocationError(
-                (
-                    "provider_version_mismatch"
-                    if expected_version
-                    else "provider_not_registered"
-                ),
-                (
-                    "registered Provider version does not match the resolved definition"
-                    if expected_version
-                    else "capability provider is not registered"
-                ),
-            ) from None
+            _raise_provider_resolution_error(
+                self._registry,
+                provider_key,
+                expected_version,
+            )
         _require_provider_version(deployment, request.capability, provider)
         try:
             provider = bind_provider(provider, db)

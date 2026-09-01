@@ -13,14 +13,14 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 
-CapabilityKind = Literal["function", "action", "workflow"]
-_CAPABILITY_KINDS = frozenset(("function", "action", "workflow"))
+CapabilityKind = Literal["function", "action", "rule", "workflow"]
+_CAPABILITY_KINDS = frozenset(("function", "action", "rule", "workflow"))
 
 
 def _capability_kind(value: str) -> CapabilityKind:
     kind = str(value or "").strip()
     if kind not in _CAPABILITY_KINDS:
-        raise ValueError("kind 必须是 function、action 或 workflow")
+        raise ValueError("kind 必须是 function、action、rule 或 workflow")
     return kind  # type: ignore[return-value]
 
 

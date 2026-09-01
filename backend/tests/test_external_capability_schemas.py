@@ -25,9 +25,10 @@ def test_capability_scopes_are_explicit_and_supported() -> None:
 def test_external_capability_kinds_match_the_discoverable_runtime() -> None:
     adapter = TypeAdapter(ExternalCapabilityKind)
 
-    assert [adapter.validate_python(kind) for kind in ("function", "action", "workflow")] == [
+    assert [adapter.validate_python(kind) for kind in ("function", "action", "rule", "workflow")] == [
         "function",
         "action",
+        "rule",
         "workflow",
     ]
     for unsupported in ("query", "provider"):

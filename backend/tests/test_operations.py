@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.database import Base
+from app.config import get_settings
 from app.models import (
     ActionExecutionLog,
     Agent,
@@ -31,6 +34,7 @@ from app.routers import scenarios as scenarios_router
 from app.schemas import ActionIn
 from app.services.agent_engine import AgentContext
 from app.services import (
+    capability_readiness_service,
     operations_service,
     permission_service,
     workflow_payload_service,
@@ -142,6 +146,7 @@ class OperationsRuntimeTests(unittest.TestCase):
             self.assertTrue(log.input_params["redacted"])
         public_logs = scenarios_router.list_execution_logs(
             self.scenario.id,
+            environment=None,
             limit=50,
             db=self.db,
         )
@@ -668,6 +673,55 @@ class OperationsRuntimeTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("规则已停用", result["error"])
 
+    def test_rule_api_false_branch_is_serializable_and_has_no_side_effects(self) -> None:
+        rule = OntologyRule(
+            id="rule-recursive-false",
+            scenario_id=self.scenario.id,
+            name="递归条件规则",
+            condition={
+                "op": "and",
+                "conditions": [
+                    {"field": "quantity", "op": ">", "value": 2},
+                    {
+                        "op": "not",
+                        "conditions": [
+                            {
+                                "field": "service_name",
+                                "op": "==",
+                                "value": "excluded-value",
+                            }
+                        ],
+                    },
+                ],
+            },
+            action_on_match="would-trigger-only-on-match",
+            enabled=True,
+        )
+        self.db.add(rule)
+        self.db.commit()
+        logs_before = self.db.query(ActionExecutionLog).count()
+        runs_before = self.db.query(WorkflowRun).count()
+
+        result = scenarios_router.evaluate_rule(
+            rule.id,
+            {
+                "record": {
+                    "quantity": 3,
+                    "service_name": "excluded-value",
+                }
+            },
+            db=self.db,
+        )
+
+        self.assertFalse(result["matched"])
+        self.assertEqual(result["action_on_match"], "")
+        self.assertEqual(result["trigger_action_ids"], [])
+        self.assertEqual(result["trigger_actions"], [])
+        self.assertFalse(result["side_effects_executed"])
+        self.assertFalse(jsonable_encoder(result)["matched"])
+        self.assertEqual(self.db.query(ActionExecutionLog).count(), logs_before)
+        self.assertEqual(self.db.query(WorkflowRun).count(), runs_before)
+
     def test_native_http_workflow_nodes_are_rejected_and_never_dispatched_by_default(self) -> None:
         nodes, edges = _workflow_nodes("http")
         with patch(
@@ -693,6 +747,115 @@ class OperationsRuntimeTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertIn("默认停用", result["error"])
             execute_http.assert_not_called()
+
+    def test_script_action_is_rejected_even_when_unsafe_flag_is_enabled(self) -> None:
+        marker = "script-action-secret-must-not-run"
+        params: dict[str, str] = {}
+        action = SimpleNamespace(
+            executor_type="script",
+            executor_config={
+                "script": (
+                    f"params['executed'] = '{marker}'; "
+                    f"result = '{marker}'"
+                )
+            },
+        )
+
+        with patch(
+            "app.services.workflow_service.get_settings",
+            return_value=SimpleNamespace(allow_unsafe_workflow_nodes=True),
+        ), self.assertRaises(PolicyViolation) as rejected:
+            workflow_service._dispatch_executor(self.db, action, params)
+
+        self.assertEqual(params, {})
+        self.assertNotIn(marker, str(rejected.exception))
+        self.assertIn("停用", str(rejected.exception))
+
+    def test_script_action_authoring_and_readiness_stay_blocked_when_flag_is_enabled(self) -> None:
+        entity = OntologyEntity(
+            id="entity-script-disabled",
+            scenario_id=self.scenario.id,
+            name="Generic object",
+        )
+        self.db.add(entity)
+        self.db.commit()
+        payload = ActionIn(
+            entity_id=entity.id,
+            name="Untrusted script action",
+            executor_type="script",
+            executor_config={"script": "result = 'must-not-run'"},
+        )
+
+        with patch.dict(os.environ, {"ALLOW_UNSAFE_WORKFLOW_NODES": "true"}):
+            get_settings.cache_clear()
+            try:
+                self.assertTrue(get_settings().allow_unsafe_workflow_nodes)
+                with self.assertRaises(HTTPException) as create_rejected:
+                    scenarios_router.create_action(self.scenario.id, payload, self.db)
+                self.assertEqual(create_rejected.exception.status_code, 400)
+
+                historical = OntologyAction(
+                    id="action-historical-script",
+                    scenario_id=self.scenario.id,
+                    entity_id=entity.id,
+                    name="Historical script action",
+                    executor_type="script",
+                    executor_config={"script": "result = 'must-not-run'"},
+                    enabled=True,
+                )
+                self.db.add(historical)
+                self.db.commit()
+
+                readiness = capability_readiness_service.capability_readiness(
+                    "action",
+                    historical,
+                    db=self.db,
+                )
+                self.assertFalse(readiness.executable)
+                self.assertTrue(
+                    any("停用" in reason for reason in readiness.blocked_reasons)
+                )
+                with self.assertRaises(HTTPException) as update_rejected:
+                    scenarios_router.update_action(historical.id, payload, self.db)
+                self.assertEqual(update_rejected.exception.status_code, 400)
+                self.db.refresh(historical)
+                self.assertEqual(historical.name, "Historical script action")
+            finally:
+                get_settings.cache_clear()
+
+    def test_script_workflow_node_is_rejected_even_when_unsafe_flag_is_enabled(self) -> None:
+        marker = "script-workflow-secret-must-not-run"
+        nodes, edges = _workflow_nodes("script")
+        nodes[1]["data"]["script"] = (
+            f"params['executed'] = '{marker}'; result = '{marker}'"
+        )
+        workflow = OntologyWorkflow(
+            id="workflow-script-disabled",
+            scenario_id=self.scenario.id,
+            name="脚本节点必须停用",
+            nodes=nodes,
+            edges=edges,
+            status="active",
+            enabled=True,
+        )
+        self.db.add(workflow)
+        self.db.commit()
+        params: dict[str, str] = {}
+
+        with patch(
+            "app.services.workflow_service.get_settings",
+            return_value=SimpleNamespace(allow_unsafe_workflow_nodes=True),
+        ):
+            with self.assertRaises(PolicyViolation) as rejected:
+                workflow_service.validate_workflow_definition(nodes, edges)
+            result = workflow_service.execute_workflow(self.db, workflow, params)
+
+        self.assertEqual(params, {})
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["steps"], [])
+        self.assertIn("停用", result["error"])
+        self.assertNotIn(marker, str(rejected.exception))
+        self.assertNotIn(marker, json.dumps(result, ensure_ascii=False))
 
     def test_http_actions_reject_local_targets_and_unsafe_request_headers(self) -> None:
         with self.assertRaises(PolicyViolation):

@@ -205,7 +205,7 @@ async def invoke_capability(
     scenario_id: Annotated[str, Field(min_length=1, max_length=32)],
     capability_kind: Annotated[
         str,
-        Field(pattern=r"^(function|action|workflow)$"),
+        Field(pattern=r"^(function|action|rule|workflow)$"),
     ],
     capability_key: Annotated[str, Field(min_length=1, max_length=240)],
     environment: Annotated[

@@ -8,13 +8,12 @@ from unittest.mock import patch
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
 
 from app.config import get_settings
-from app import database
 from app.database import Base, get_db
 from app.models import (
     Agent,
@@ -1127,38 +1126,3 @@ class SecurityAclRegressionTests(unittest.TestCase):
             self.assertEqual(error.exception.status_code, 403)
         finally:
             db.close()
-
-    def test_conversation_ownership_migration_preserves_legacy_rows_as_unowned(self) -> None:
-        """An old transcript gets the field/index but no guessed owner backfill."""
-        migration_engine = create_engine("sqlite:///:memory:")
-        try:
-            with migration_engine.begin() as conn:
-                conn.exec_driver_sql(
-                    "CREATE TABLE conversations ("
-                    "id VARCHAR(32) PRIMARY KEY, agent_id VARCHAR(32), title VARCHAR(300)"
-                    ")"
-                )
-                conn.exec_driver_sql(
-                    "INSERT INTO conversations (id, agent_id, title) "
-                    "VALUES ('legacy-conversation', 'agent-legacy', '旧对话')"
-                )
-            original_engine = database.engine
-            database.engine = migration_engine
-            try:
-                database._migrate_conversation_ownership()
-            finally:
-                database.engine = original_engine
-
-            with migration_engine.connect() as conn:
-                owner = conn.exec_driver_sql(
-                    "SELECT created_by_user_id FROM conversations WHERE id = 'legacy-conversation'"
-                ).scalar_one()
-            self.assertIsNone(owner)
-            index_names = {index["name"] for index in inspect(migration_engine).get_indexes("conversations")}
-            self.assertIn("ix_conversations_created_by_user_id", index_names)
-        finally:
-            migration_engine.dispose()
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -9,7 +9,6 @@ from fastapi import HTTPException, Response
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from app import database
 from app.database import Base
 from app.models import (
     BusinessScenario,
@@ -279,75 +278,6 @@ class MappingRefreshJobTests(unittest.TestCase):
         ), self.assertRaises(HTTPException) as error:
             get_mapping_refresh_job(job.id, Response(), self.db)
         self.assertEqual(error.exception.status_code, 404)
-
-    def test_legacy_mapping_job_migration_cancels_active_rows_and_labels_history(self) -> None:
-        legacy_engine = create_engine("sqlite:///:memory:")
-        try:
-            with legacy_engine.begin() as connection:
-                connection.exec_driver_sql(
-                    """
-                    CREATE TABLE data_mapping_refresh_jobs (
-                        id VARCHAR(32) PRIMARY KEY,
-                        tenant_id VARCHAR(32),
-                        scenario_id VARCHAR(32),
-                        mapping_id VARCHAR(32),
-                        active_key VARCHAR(260),
-                        status VARCHAR(24),
-                        error TEXT,
-                        next_retry_at DATETIME,
-                        completed_at DATETIME
-                    )
-                    """
-                )
-                connection.exec_driver_sql(
-                    "INSERT INTO data_mapping_refresh_jobs "
-                    "(id, tenant_id, scenario_id, mapping_id, active_key, status, error) "
-                    "VALUES ('legacy-active', 'tenant', 'scenario', 'mapping', 'mapping:staging', 'queued', '')"
-                )
-                connection.exec_driver_sql(
-                    "INSERT INTO data_mapping_refresh_jobs "
-                    "(id, tenant_id, scenario_id, mapping_id, status, error) "
-                    "VALUES ('legacy-terminal', 'tenant', 'scenario', 'mapping', 'succeeded', '')"
-                )
-            original_engine = database.engine
-            database.engine = legacy_engine
-            try:
-                database._migrate_mapping_refresh_provenance()
-            finally:
-                database.engine = original_engine
-
-            with legacy_engine.connect() as connection:
-                columns = {
-                    item["name"]
-                    for item in database.inspect(connection).get_columns(
-                        "data_mapping_refresh_jobs"
-                    )
-                }
-                self.assertTrue(
-                    {
-                        "mapping_snapshot",
-                        "definition_snapshot_id",
-                        "release_id",
-                        "definition_hash",
-                        "definition_source",
-                    }.issubset(columns)
-                )
-                active = connection.exec_driver_sql(
-                    "SELECT status, active_key, mapping_snapshot, definition_source "
-                    "FROM data_mapping_refresh_jobs WHERE id = 'legacy-active'"
-                ).fetchone()
-                terminal = connection.exec_driver_sql(
-                    "SELECT status, definition_source FROM data_mapping_refresh_jobs "
-                    "WHERE id = 'legacy-terminal'"
-                ).fetchone()
-            self.assertEqual(active[0], "cancelled")
-            self.assertIsNone(active[1])
-            self.assertEqual(active[2], "{}")
-            self.assertEqual(active[3], "legacy")
-            self.assertEqual(terminal[0], "succeeded")
-            self.assertEqual(terminal[1], "legacy")
-        finally:
-            legacy_engine.dispose()
 
     def test_temporary_failure_is_redacted_and_retried(self) -> None:
         job = self._enqueue()

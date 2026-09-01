@@ -440,20 +440,16 @@ class AssistantIntentTests(unittest.TestCase):
 
 class ObjectRuntimeTests(unittest.TestCase):
     def test_object_runtime_routes_are_registered(self) -> None:
-        paths = {route.path for route in app.routes}
+        paths = set(app.openapi()["paths"])
         self.assertIn("/api/scenarios/{scenario_id}/objects", paths)
         self.assertIn("/api/scenarios/{scenario_id}/objects/{object_id}", paths)
 
     def test_relation_instance_runtime_route_exposes_read_and_write_methods(self) -> None:
-        routes = [
-            route
-            for route in app.routes
-            if route.path == "/api/scenarios/{scenario_id}/relation-instances"
+        route = app.openapi()["paths"][
+            "/api/scenarios/{scenario_id}/relation-instances"
         ]
-        methods = {method for route in routes for method in route.methods}
+        methods = {method.upper() for method in route}
         self.assertEqual(methods, {"GET", "POST"})
-        self.assertEqual(sorted(routes[0].methods), ["GET"])
-        self.assertEqual(sorted(routes[1].methods), ["POST"])
 
     def test_object_runtime_contract_keeps_provenance_and_relation_count(self) -> None:
         item = ObjectSearchItemOut(
@@ -483,7 +479,7 @@ class ObjectRuntimeTests(unittest.TestCase):
 
 class MappingRuntimeTests(unittest.TestCase):
     def test_mapping_runtime_routes_are_registered(self) -> None:
-        paths = {route.path for route in app.routes}
+        paths = set(app.openapi()["paths"])
         self.assertIn("/api/scenarios/mappings/{mapping_id}/preview", paths)
         self.assertIn("/api/scenarios/mappings/{mapping_id}/test", paths)
         self.assertIn("/api/scenarios/mappings/{mapping_id}/refresh-jobs", paths)

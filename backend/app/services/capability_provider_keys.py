@@ -15,6 +15,7 @@ BUILTIN_PROVIDER_KEYS = MappingProxyType(
     {
         "action": "builtin.ontology-action",
         "function": "builtin.ontology-function",
+        "rule": "builtin.ontology-rule",
         "workflow": "builtin.ontology-workflow",
     }
 )

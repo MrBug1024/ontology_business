@@ -2,83 +2,6 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import {
-  buildScenarioDatasetBindingRequest,
-  catalogBindingRoleMeta,
-  CATALOG_BINDING_ROLE_OPTIONS,
-} from '../src/utils/catalogBindings.ts'
-
-test('catalog exposes six explicit general-purpose binding roles', () => {
-  assert.deepEqual(
-    CATALOG_BINDING_ROLE_OPTIONS.map((option) => option.value),
-    [
-      'modeling_evidence',
-      'test_fixture',
-      'invocation_input',
-      'reference',
-      'rules',
-      'output',
-    ],
-  )
-})
-
-test('legacy input is compatibility-only and never promoted by its label', () => {
-  const meta = catalogBindingRoleMeta('input')
-
-  assert.equal(meta.compatibility, true)
-  assert.equal(meta.label, '待确认（兼容）')
-  assert.doesNotMatch(meta.label, /运行输入|正式输入|永久/)
-})
-
-test('head binding request is an allowlisted logical catalog payload', () => {
-  const request = buildScenarioDatasetBindingRequest({
-    scenario_id: ' scenario-1 ',
-    dataset_id: ' dataset-1 ',
-    binding_key: ' reference.records ',
-    environment: 'dev',
-    role: 'reference',
-    binding_mode: 'head',
-    target_id: 'head-1',
-    is_required: false,
-    table_name: 'forged_table',
-    sql: 'select * from secrets',
-    password: 'not-allowed',
-  })
-
-  assert.equal(request.scenarioId, 'scenario-1')
-  assert.deepEqual(request.payload, {
-    dataset_id: 'dataset-1',
-    binding_key: 'reference.records',
-    environment: 'dev',
-    role: 'reference',
-    binding_mode: 'head',
-    dataset_head_id: 'head-1',
-    dataset_version_id: null,
-    is_required: false,
-    status: 'active',
-    config: {},
-  })
-  assert.equal('table_name' in request.payload, false)
-  assert.equal('sql' in request.payload, false)
-  assert.equal('password' in request.payload, false)
-})
-
-test('pinned binding requires an explicit ready-version selection', () => {
-  assert.throws(
-    () => buildScenarioDatasetBindingRequest({
-      scenario_id: 'scenario-1',
-      dataset_id: 'dataset-1',
-      binding_key: 'fixture.records',
-      environment: 'staging',
-      role: 'test_fixture',
-      binding_mode: 'pinned',
-      target_id: '',
-      is_required: false,
-    }),
-    /请选择固定版本/,
-  )
-})
-
 test('modeling materials keep the old route and never become runtime data', () => {
   const viewSource = readFileSync(new URL('../src/views/DataSources.vue', import.meta.url), 'utf8')
   const apiSource = readFileSync(new URL('../src/api/index.ts', import.meta.url), 'utf8')
@@ -106,7 +29,6 @@ test('scenario removal is an auditable retirement workflow', () => {
   assert.match(listView, /已退役/)
   assert.match(listView, /退役会暂停新的验证和调用，但保留全部配置/)
   assert.match(listView, /s\.status !== 'retired'/)
-  assert.match(detailView, /detail\.status === 'retired'/)
   assert.match(detailView, /detail\.status === 'retired'/)
   assert.match(listView, /@click="restore\(s\)"/)
   assert.match(listView, /@click="openPurge\(s\)"/)

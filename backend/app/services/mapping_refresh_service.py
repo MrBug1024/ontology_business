@@ -571,9 +571,9 @@ def enqueue_mapping_refresh(
     else:
         requested_by_user_id = permission_service.require_principal(db).user_id
 
-    # Mapping refresh from the modeling/control plane always targets the live
-    # authoring definition, regardless of where this server process is hosted.
-    environment = "dev"
+    # The deployment selects its own definition; a request cannot make a
+    # staging/prod worker refresh mutable dev authoring rows.
+    environment = runtime_connector_service.runtime_environment()
     runtime_mapping, definition = resolve_mapping_runtime_definition(
         db,
         scenario,
@@ -833,11 +833,13 @@ def process_mapping_refresh_jobs(
 ) -> list[DataMappingRefreshJob]:
     """Atomically claim and process a bounded number of mapping refresh jobs."""
     dispatch_now = now or utc_now()
+    worker_environment = runtime_connector_service.runtime_environment()
     job_ids = db.execute(
         select(DataMappingRefreshJob.id)
         .where(
             DataMappingRefreshJob.status.in_(DISPATCHABLE_STATUSES),
             DataMappingRefreshJob.available_at <= dispatch_now,
+            DataMappingRefreshJob.environment == worker_environment,
         )
         .order_by(DataMappingRefreshJob.available_at.asc(), DataMappingRefreshJob.created_at.asc())
         .limit(max(1, min(limit, 16)))
@@ -854,6 +856,7 @@ def process_mapping_refresh_jobs(
                 DataMappingRefreshJob.id == job_id,
                 DataMappingRefreshJob.status.in_(DISPATCHABLE_STATUSES),
                 DataMappingRefreshJob.available_at <= claim_now,
+                DataMappingRefreshJob.environment == worker_environment,
             )
             .values(
                 status="running",

@@ -8,8 +8,6 @@ from sqlalchemy.orm import Session
 
 from ..migration_schemas import (
     AgentModeChangeIn,
-    AgentRollbackIn,
-    AgentShadowValidationIn,
     MigrationBatchIn,
     MigrationReasonIn,
 )
@@ -110,39 +108,6 @@ def get_agent_migration(
     return _call(lambda: agent_migration_service.agent_migration_status(db, agent_id), db)
 
 
-@router.post("/agents/{agent_id}/migration/shadow/refresh")
-def refresh_agent_shadow_metrics(
-    agent_id: str,
-    db: Session = Depends(get_tenant_db),
-) -> dict[str, Any]:
-    return _call(
-        lambda: agent_migration_service.refresh_shadow_observations(db, agent_id), db
-    )
-
-
-@router.post("/agents/{agent_id}/migration/shadow/validate")
-def validate_agent_shadow_execution(
-    agent_id: str,
-    payload: AgentShadowValidationIn,
-    db: Session = Depends(get_tenant_db),
-) -> dict[str, Any]:
-    return _call(
-        lambda: agent_migration_service.execute_server_shadow_validation(
-            db,
-            agent_id,
-            source_message_id=payload.source_message_id,
-            legacy_tool_result_id=payload.legacy_tool_result_id,
-            capability_kind=payload.capability_kind,
-            capability_key=payload.capability_key,
-            inputs=payload.inputs,
-            managed_inputs=[
-                item.runtime_document() for item in payload.managed_inputs
-            ],
-        ),
-        db,
-    )
-
-
 @router.post("/agents/{agent_id}/migration/mode")
 def migrate_agent_mode(
     agent_id: str,
@@ -159,23 +124,5 @@ def migrate_agent_mode(
         ),
         db,
     )
-
-
-@router.post("/agents/{agent_id}/migration/rollback")
-def rollback_agent_mode(
-    agent_id: str,
-    payload: AgentRollbackIn,
-    db: Session = Depends(get_tenant_db),
-) -> dict[str, Any]:
-    return _call(
-        lambda: agent_migration_service.rollback_agent_to_legacy(
-            db,
-            agent_id,
-            reason=payload.reason,
-            idempotency_key=payload.idempotency_key,
-        ),
-        db,
-    )
-
 
 __all__ = ["router"]

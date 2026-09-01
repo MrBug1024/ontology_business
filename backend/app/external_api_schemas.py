@@ -126,7 +126,7 @@ class ExternalObjectPageOut(BaseModel):
     has_more: bool = False
 
 
-ExternalCapabilityKind = Literal["function", "action", "workflow"]
+ExternalCapabilityKind = Literal["function", "action", "rule", "workflow"]
 ExternalCapabilityEnvironment = Literal["dev", "staging", "prod"]
 
 

@@ -175,10 +175,13 @@ def validate_workflow_definition(nodes: list[dict[str, Any]], edges: list[dict[s
             if str(node.get("type") or "") in {"http", "script"}
         }
     )
-    if unsafe_types and not get_settings().allow_unsafe_workflow_nodes:
-        labels = "、".join("原生 HTTP" if node_type == "http" else "Python 脚本" for node_type in unsafe_types)
+    if "script" in unsafe_types:
         raise PolicyViolation(
-            f"{labels} 节点默认停用；请改用经过权限、确认、幂等和审计约束的 Action"
+            "Python 脚本节点已停用；请改用经过权限、确认、幂等和审计约束的 Action"
+        )
+    if "http" in unsafe_types and not get_settings().allow_unsafe_workflow_nodes:
+        raise PolicyViolation(
+            "原生 HTTP 节点默认停用；请改用经过权限、确认、幂等和审计约束的 Action"
         )
 
 
@@ -2183,54 +2186,18 @@ def _exec_http(
 
 
 def _exec_script(cfg: dict, params: dict) -> Any:
-    """脚本执行器：执行 Python 脚本片段。
+    """Reject historical in-process Python Action executors."""
 
-    cfg: {script}  # Python 代码，可用 params 变量
-    """
-    script = cfg.get("script", "")
-    if not script:
-        raise ValueError("脚本执行器需要 script 配置")
-    if not get_settings().allow_unsafe_workflow_nodes:
-        raise PolicyViolation("脚本节点默认被禁用，请在受控环境中显式开启")
-    namespace: dict[str, Any] = {"params": params, "json": json}
-    exec(script, namespace)  # noqa: S102
-    return namespace.get("result", namespace.get("output", ""))
+    del cfg, params
+    raise PolicyViolation(
+        "Python 脚本 Action 已停用；请改用受治理的内置能力或受信 Skill"
+    )
 
 
 # ──────────────────────────────────────────────
 # 模板变量：{{params.x}} / {{n1.result}} / {{n1.output}}
 # ──────────────────────────────────────────────
 _VAR_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
-
-
-class _NodeOut:
-    """节点输出包装：同时支持属性访问（n1.result）与下标访问（n1["result"]）。"""
-
-    __slots__ = ("_d",)
-
-    def __init__(self, d: dict[str, Any]):
-        object.__setattr__(self, "_d", d)
-
-    def __getattr__(self, k: str) -> Any:
-        d = object.__getattribute__(self, "_d")
-        if k in d:
-            return d[k]
-        raise AttributeError(k)
-
-    def __getitem__(self, k: str) -> Any:
-        return self._d[k]
-
-    def __contains__(self, k: str) -> bool:
-        return k in self._d
-
-    def get(self, k: str, default: Any = None) -> Any:
-        return self._d.get(k, default)
-
-    def to_dict(self) -> dict[str, Any]:
-        return self._d
-
-    def __repr__(self) -> str:  # pragma: no cover
-        return repr(self._d)
 
 
 def _wrap_out(out: Any) -> dict[str, Any]:
@@ -2782,25 +2749,10 @@ def _execute_dag(
                 res["error"] = str(exc)
 
         elif ntype == "script":
-            script = render_template(data.get("script", ""), ctx)
             try:
-                if not get_settings().allow_unsafe_workflow_nodes:
-                    raise PolicyViolation("脚本节点默认被禁用，请在受控环境中显式开启")
-                namespace: dict[str, Any] = {
-                    "params": params,
-                    "ctx": ctx,
-                    "json": json,
-                }
-                # 将各节点输出暴露为变量：n1 / n2 ...（支持 n1.result 属性访问）
-                for nid_, nout in ctx.items():
-                    if nid_ == "params" or nid_ == node_id:
-                        continue
-                    namespace[nid_] = _NodeOut(nout if isinstance(nout, dict) else {"result": nout})
-                exec(script, namespace)  # noqa: S102
-                out = namespace.get("result", namespace.get("output", ""))
-                res["status"] = "success"
-                res["result"] = _wrap_out(out)
-                ctx[node_id] = res["result"]
+                raise PolicyViolation(
+                    "Python 脚本节点已停用；请改用受治理的内置能力或受信 Skill"
+                )
             except Exception as exc:  # noqa: BLE001
                 res["status"] = "failed"
                 res["error"] = str(exc)

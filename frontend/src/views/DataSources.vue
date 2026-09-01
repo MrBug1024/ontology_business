@@ -228,8 +228,8 @@
 
         <template v-if="form.type === 'postgres'">
           <el-row :gutter="10">
-            <el-col :span="14"><el-form-item label="主机"><el-input v-model="form.config.host" placeholder="127.0.0.1" /></el-form-item></el-col>
-            <el-col :span="10"><el-form-item label="端口"><el-input v-model.number="form.config.port" placeholder="5432" /></el-form-item></el-col>
+            <el-col :span="14"><el-form-item label="主机"><el-input v-model="form.config.host" placeholder="数据库主机或域名" /></el-form-item></el-col>
+            <el-col :span="10"><el-form-item label="端口"><el-input v-model.number="form.config.port" placeholder="连接端口" /></el-form-item></el-col>
           </el-row>
           <el-row :gutter="10">
             <el-col :span="14"><el-form-item label="数据库"><el-input v-model="form.config.database" /></el-form-item></el-col>
@@ -601,14 +601,17 @@ function onTypeChange() {
   form.value.config =
     form.value.type === 'file_bucket'
       ? {}
-      : { host: '127.0.0.1', port: 5432, database: '', username: 'postgres', password: '' }
+      : emptyPostgresConfig()
+}
+function emptyPostgresConfig() {
+  return { host: '', port: undefined, database: '', username: '', password: '' }
 }
 function openCreate() {
   form.value = {
     name: '',
     scenario_id: undefined,
     type: 'postgres',
-    config: { host: '127.0.0.1', port: 5432, database: '', username: 'postgres', password: '' },
+    config: emptyPostgresConfig(),
   }
   dlg.value = true
 }
@@ -618,6 +621,14 @@ function openEdit(ds: DataSource) {
 }
 async function save() {
   if (!form.value.name) return ElMessage.warning('请填写名称')
+  if (form.value.type === 'postgres') {
+    const config = form.value.config || {}
+    const port = Number(config.port)
+    if (!String(config.host || '').trim() || !Number.isInteger(port) || port < 1 || port > 65535
+      || !String(config.database || '').trim() || !String(config.username || '').trim()) {
+      return ElMessage.warning('请完整填写数据库主机、端口、数据库和用户名')
+    }
+  }
   saving.value = true
   try {
     const saved = form.value.id

@@ -34,6 +34,11 @@ import {
 import { cloneAgentCapabilityScope, emptyAgentCapabilityScope } from '../src/utils/agentCapabilities.ts'
 import { buildSchemaFromFields, flattenSchemaFields } from '../src/utils/schemaBuilder.ts'
 import {
+  editableRuleCondition,
+  parseRuleCondition,
+  serializeRuleCondition,
+} from '../src/utils/ruleConditions.ts'
+import {
   cleanTemplateExecutorConfig,
   isTemplateBucketInScope,
   isSupportedTemplateFilename,
@@ -66,6 +71,98 @@ test('data source labels report the configured storage authority', () => {
   assert.equal(
     dataSourceLocationLabel({ type: 'postgres', config: { host: 'db.internal' } }),
     'db.internal',
+  )
+})
+
+test('rule condition editor keeps recursive boolean groups instead of flattening them', () => {
+  const source = readFileSync(
+    new URL('../src/components/RuleConditionBuilder.vue', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(source, /RuleConditionNodeEditor/)
+  assert.doesNotMatch(source, /function leafConditions\(/)
+
+  const nested = {
+    op: 'and',
+    conditions: [
+      { field: 'amount', op: '>', value: 100 },
+      {
+        op: 'not',
+        conditions: [{
+          op: 'or',
+          conditions: [
+            { field: 'status', op: '==', value: 'closed' },
+            { field: 'reviewer', op: 'is_null' },
+          ],
+        }],
+      },
+    ],
+  }
+  const parsed = parseRuleCondition(nested)
+  assert.ok(parsed)
+  assert.deepEqual(serializeRuleCondition(editableRuleCondition(parsed)), nested)
+})
+
+test('structured value editor publishes the new nested value instead of stale row state', () => {
+  const source = readFileSync(
+    new URL('../src/components/StructuredValueEditor.vue', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(source, /function updateObjectRow\(row: ObjectRow, value: unknown\)/)
+  assert.match(source, /row\.value = value\s+publishObject\(\)/)
+  assert.match(source, /function updateArrayRow\(row: ArrayRow, value: unknown\)/)
+  assert.match(source, /row\.value = value\s+publishArray\(\)/)
+  assert.match(source, /aria-label="数值" @update:model-value="updateScalar"/)
+  assert.doesNotMatch(source, /aria-label="数值" @change="updateScalar"/)
+  assert.doesNotMatch(
+    source,
+    /<StructuredValueEditor v-model="row\.value" @update:model-value="publish(?:Object|Array)"/,
+  )
+})
+
+test('scenario detail reloads the current route id and rejects stale responses', () => {
+  const source = readFileSync(
+    new URL('../src/views/ScenarioDetail.vue', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(source, /let sid = String\(route\.params\.id/)
+  assert.match(source, /let scenarioLoadRequest = 0/)
+  assert.match(source, /watch\(\(\) => route\.params\.id/)
+  assert.match(source, /request !== scenarioLoadRequest \|\| scenarioId !== sid/)
+  assert.doesNotMatch(source, /const sid = route\.params\.id as string/)
+})
+
+test('ontology editor exposes stable entity and property API names', () => {
+  const source = readFileSync(new URL('../src/components/EditorPanel.vue', import.meta.url), 'utf8')
+  const scenarioDetail = readFileSync(new URL('../src/views/ScenarioDetail.vue', import.meta.url), 'utf8')
+
+  assert.match(source, /v-model\.trim="editor\.form\.api_name"/)
+  assert.match(source, /v-model\.trim="p\.api_name"/)
+  assert.match(source, /:disabled="Boolean\(editor\.id\)"/)
+  assert.match(source, /:disabled="isPersistedProperty\(p\)"/)
+  assert.match(source, /property\._apiNameLocked === true/)
+  assert.match(scenarioDetail, /_apiNameLocked: true/)
+  assert.match(scenarioDetail, /delete propertyPayload\._apiNameLocked/)
+  assert.match(source, /创建后不可修改/)
+  assert.match(source, /api_name: ''/)
+})
+
+test('generic authoring surfaces do not seed scenario examples or local database identities', () => {
+  const dataSources = readFileSync(new URL('../src/views/DataSources.vue', import.meta.url), 'utf8')
+  const authoringSurface = [
+    readFileSync(new URL('../src/components/EditorPanel.vue', import.meta.url), 'utf8'),
+    readFileSync(new URL('../src/views/ScenarioDetail.vue', import.meta.url), 'utf8'),
+    readFileSync(new URL('../src/views/Templates.vue', import.meta.url), 'utf8'),
+  ].join('\n')
+
+  assert.doesNotMatch(dataSources, /host:\s*'127\.0\.0\.1'/)
+  assert.doesNotMatch(dataSources, /username:\s*'postgres'/)
+  assert.doesNotMatch(
+    authoringSurface,
+    /supply\.procurement|计算订单风险等级|SELECT \* FROM orders|标记违规|疑似违规|年度审计/,
   )
 })
 

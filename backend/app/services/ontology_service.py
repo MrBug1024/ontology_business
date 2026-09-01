@@ -1467,16 +1467,12 @@ _GEN_PROMPT = """你是资深业务架构师，擅长为任意行业构建本体
 5. 对名称、枚举、约束或关系方向没有明确依据时采用保守表达，不把数据表或字段机械等同于业务实体。
 6. 只输出 JSON，不要输出任何解释文字。
 
-输出格式（严格 JSON）：
-{
-  "entities": [
-    {"name": "业务对象", "api_name": "business_object", "description": "业务领域中的核心对象", "is_abstract": false, "state_property": "",
-     "properties": [{"name": "对象ID", "api_name": "object_id", "data_type": "string", "is_key": true, "is_title": false, "is_required": true, "is_enum": false, "enum_values": [], "default_value": "", "constraints": {}, "is_sensitive": false}, {"name": "对象名称", "api_name": "object_name", "data_type": "string", "is_key": false, "is_title": true, "is_required": true, "is_enum": false, "enum_values": [], "default_value": "", "constraints": {}, "is_sensitive": false}, ...]}
-  ],
-  "relations": [
-    {"name": "关联", "api_name": "related_to", "source": "业务对象", "target": "相关对象", "source_display_name": "关联相关对象", "source_api_name": "related_objects", "target_display_name": "被业务对象关联", "target_api_name": "related_from_business_objects", "storage_kind": "none", "relation_type": "1:N", "description": ""}
-  ]
-}
+输出结构（严格 JSON）：
+- 顶层只能包含 entities 和 relations 两个数组。
+- entities 的每一项必须包含 name、api_name、description、is_abstract、state_property 和 properties。
+- properties 的每一项必须包含 name、api_name、data_type、is_key、is_title、is_required、is_enum、enum_values、default_value、constraints、is_sensitive。
+- relations 的每一项必须包含 name、api_name、source、target、source_display_name、source_api_name、target_display_name、target_api_name、storage_kind、relation_type、description。
+- 数组中只输出业务描述有依据的定义，不输出示例资源或占位资源。
 
 业务描述：
 {description}
@@ -1680,8 +1676,8 @@ def generate_ontology(db: Session, scenario: BusinessScenario, description: str)
     if not llm:
         raise ValueError("请先在「LLM 配置」中配置并启用一个默认模型")
 
-    # 注意：_GEN_PROMPT 内含 JSON 示例花括号，不能用 str.format（会触发 KeyError），
-    # 用 replace 注入业务描述。输入在调用前完成显式边界校验，不能再做切片。
+    # Only replace the designated description token so user text cannot affect
+    # the rest of the governed prompt template.
     context = _ontology_context(description)
     last_err: Exception | None = None
     data: dict[str, Any] = {}

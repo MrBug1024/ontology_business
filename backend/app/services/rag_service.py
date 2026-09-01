@@ -21,9 +21,9 @@ from ..models import BucketFile, DataSource, DocumentChunk, DocumentIndexJob, LL
 from . import datasource_service, llm_service, tenant_service
 
 
-EMBEDDING_MODEL = "local-semantic-hash-192-v1"
+EMBEDDING_MODEL = "local-semantic-hash-192-v2"
 EMBEDDING_DIMENSIONS = 192
-INDEX_VERSION = "rag-chunks-v1"
+INDEX_VERSION = "rag-chunks-v2"
 CHUNK_SIZE = 760
 CHUNK_OVERLAP = 140
 MAX_CHUNKS_PER_FILE = 5_000
@@ -31,19 +31,6 @@ DOCUMENT_JOB_MAX_ATTEMPTS = 3
 DOCUMENT_JOB_TIMEOUT_SECONDS = 300
 DOCUMENT_JOB_RETRY_SECONDS = 5
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+")
-
-# 本地回退嵌入的有限语义扩展，不替代后续可配置的专用 Embedding 模型。
-# 仅覆盖常见的通用业务同义概念，避免依赖某一个行业的数据字典。
-_SYNONYM_GROUPS = (
-    ("成本", "费用", "开支", "支出"),
-    ("客户", "用户", "消费者", "买方"),
-    ("供应商", "供方", "厂商", "vendor"),
-    ("订单", "采购单", "销售单", "交易单"),
-    ("风险", "隐患", "风险点", "异常"),
-    ("审批", "审核", "核准", "批准"),
-    ("合同", "协议", "约定"),
-)
-_SYNONYM_MAP = {term.lower(): group for group in _SYNONYM_GROUPS for term in group}
 
 
 def utc_now() -> datetime:
@@ -64,7 +51,7 @@ def _document_active_key(file_id: str) -> str:
 
 
 def _tokens(text: str) -> list[str]:
-    """以英文词、中文 1/2/3-gram 和少量同义扩展构建检索特征。"""
+    """仅以调用方文本中的英文词和中文 1/2/3-gram 构建检索特征。"""
     tokens: list[str] = []
     for match in _TOKEN_RE.finditer((text or "").lower()):
         word = match.group(0)
@@ -77,14 +64,6 @@ def _tokens(text: str) -> list[str]:
                     tokens.extend(word[index : index + width] for index in range(length - width + 1))
         else:
             tokens.append(word)
-        # 对完整词/短语做同义扩展；重复是有意的，向量权重会保留原词主导性。
-        synonyms = _SYNONYM_MAP.get(word, ())
-        if synonyms:
-            # 同一组始终投射到相同特征，避免二元同义词仅生成彼此相反的扩展。
-            tokens.append(f"syn:{synonyms[0]}")
-        for synonym in synonyms:  # 英文词也可以被映射。
-            if synonym != word:
-                tokens.append(f"syn:{synonym}")
     return tokens
 
 
@@ -103,9 +82,7 @@ def embed(text: str) -> list[float]:
         counts[token] = counts.get(token, 0) + 1
     for token, count in counts.items():
         slot, sign = _feature_slot(token)
-        # 子线索权重较低，避免扩展词压过用户输入本身。
-        weight = 0.58 if token.startswith("syn:") else 1.0
-        vector[slot] += sign * weight * (1.0 + math.log(count))
+        vector[slot] += sign * (1.0 + math.log(count))
     norm = math.sqrt(sum(value * value for value in vector))
     return [round(value / norm, 8) for value in vector] if norm else vector
 

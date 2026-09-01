@@ -23,6 +23,7 @@ from app.models import (
     FunctionDefinition,
     OntologyAction,
     OntologyEntity,
+    OntologyRule,
     OntologyWorkflow,
     ScenarioCapabilityPort,
     Skill,
@@ -41,6 +42,7 @@ from app.services import (
 )
 from app.services.capability_contracts import (
     Actor,
+    BindingOverride,
     CapabilityRef,
     DataPort,
     Request,
@@ -79,6 +81,7 @@ class World:
     action: OntologyAction
     deployment: object
     function: FunctionDefinition
+    rule: OntologyRule
     scenario: BusinessScenario
     workflow: OntologyWorkflow
 
@@ -153,6 +156,15 @@ def _world(db: Session, key: str) -> World:
         requires_confirmation=True,
         idempotency_required=True,
     )
+    rule = OntologyRule(
+        id=f"rule-{key}",
+        scenario_id=scenario.id,
+        name="Amount threshold",
+        condition={"field": "amount", "op": ">", "value": 2},
+        action_on_match="Send the record for review.",
+        severity="warning",
+        enabled=True,
+    )
     workflow = OntologyWorkflow(
         id=f"workflow-{key}",
         scenario_id=scenario.id,
@@ -174,7 +186,7 @@ def _world(db: Session, key: str) -> World:
         status="active",
         enabled=True,
     )
-    db.add_all([tenant, user, scenario, entity, function, skill, action, workflow])
+    db.add_all([tenant, user, scenario, entity, function, skill, action, rule, workflow])
     db.commit()
     permission_service.ensure_organization(db, tenant.id, owner_user_id=user.id)
     db.commit()
@@ -199,7 +211,7 @@ def _world(db: Session, key: str) -> World:
         functions={function.id: frozen_function},
         mappings={},
         relation_mappings={},
-        rules={},
+        rules={rule.id: _runtime_copy(rule, scenario)},
         events={},
         workflows={workflow.id: frozen_workflow},
         capability_ports={},
@@ -210,7 +222,7 @@ def _world(db: Session, key: str) -> World:
         principal_id=user.id,
         tenant_id=tenant.id,
     )
-    return World(actor, action, deployment, function, scenario, workflow)
+    return World(actor, action, deployment, function, rule, scenario, workflow)
 
 
 def _with_managed_connector(db: Session, world: World, key: str) -> World:
@@ -228,7 +240,7 @@ def _with_managed_connector(db: Session, world: World, key: str) -> World:
         media_kind="connector",
         is_required=True,
         cardinality="one",
-        binding_policy="scenario_default",
+        binding_policy="per_invocation",
         status="active",
     )
     binding = ConnectorBinding(
@@ -255,6 +267,7 @@ def _with_managed_connector(db: Session, world: World, key: str) -> World:
         schema=port.schema_document,
         required=True,
         binding_kinds=("connector_binding",),
+        override_policy="managed-reference",
     )
     handle = ResolvedDataHandle(
         port_key=port.port_key,
@@ -284,6 +297,16 @@ def _request(
     confirmation: dict | None = None,
     provider_key: str | None = None,
 ) -> Request:
+    managed_inputs = tuple(
+        BindingOverride(
+            port_key=handle.port_key,
+            binding_kind=handle.binding_kind,
+            reference_id=handle.reference_id,
+            signature=handle.signature,
+            version_id=handle.version_id,
+        )
+        for handle in world.deployment.data_context.handles
+    )
     return Request(
         capability=CapabilityRef(
             kind=kind,
@@ -291,6 +314,7 @@ def _request(
             provider_key=provider_key,
         ),
         inputs=inputs,
+        binding_overrides=managed_inputs,
         mode=mode,
         idempotency_key=idempotency_key,
         correlation_id=correlation_id,
@@ -316,6 +340,7 @@ def test_builtin_bindings_are_server_owned_and_registered(db: Session) -> None:
     for kind, resource_id in (
         ("function", world.function.id),
         ("action", world.action.id),
+        ("rule", world.rule.id),
         ("workflow", world.workflow.id),
     ):
         capability = CapabilityRef(kind=kind, resource_id=resource_id)
@@ -349,6 +374,63 @@ def test_builtin_bindings_are_server_owned_and_registered(db: Session) -> None:
             ),
         )
     assert captured.value.code == "provider_binding_mismatch"
+
+
+def test_rule_uses_unified_invoker_and_never_executes_side_effects(db: Session) -> None:
+    world = _world(db, "rule-invocation")
+
+    contract = resolve_capability_contract(
+        db,
+        world.deployment,
+        CapabilityRef(kind="rule", resource_id=world.rule.id),
+    )
+    assert contract["input_schema"] == {
+        "type": "object",
+        "properties": {
+            "record": {
+                "type": "object",
+                "properties": {"amount": {}},
+                "required": ["amount"],
+                "additionalProperties": False,
+            }
+        },
+        "required": ["record"],
+        "additionalProperties": False,
+    }
+    assert contract["side_effect"] is False
+    assert contract["requires_confirmation"] is False
+
+    matched = _invoke(
+        db,
+        world,
+        _request(
+            world,
+            "rule",
+            world.rule.id,
+            correlation_id="rule-matched",
+            inputs={"record": {"amount": 3}},
+        ),
+    )
+    assert matched.status == "succeeded", (matched.error_code, matched.error_message)
+    assert matched.output["matched"] is True
+    assert matched.output["action_on_match"] == "Send the record for review."
+    assert matched.output["side_effects_executed"] is False
+
+    not_matched = _invoke(
+        db,
+        world,
+        _request(
+            world,
+            "rule",
+            world.rule.id,
+            correlation_id="rule-boundary",
+            inputs={"record": {"amount": 2}},
+        ),
+    )
+    assert not_matched.status == "succeeded"
+    assert not_matched.output["matched"] is False
+    assert not_matched.output["action_on_match"] == ""
+    assert not_matched.output["side_effects_executed"] is False
 
 
 def test_contract_discovery_does_not_require_runtime_readiness(db: Session) -> None:

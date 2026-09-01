@@ -17,8 +17,17 @@
           <el-input v-model="editor.form.name" placeholder="如：业务对象、资源、事项" />
         </div>
         <div class="ep-field">
+          <label>稳定 API 名</label>
+          <el-input
+            v-model.trim="editor.form.api_name"
+            :disabled="Boolean(editor.id)"
+            placeholder="如：business_object"
+          />
+          <small class="field-help">创建后不可修改；使用小写英文、数字和下划线。</small>
+        </div>
+        <div class="ep-field">
           <label>命名空间</label>
-          <el-input v-model.trim="editor.form.namespace" placeholder="如：supply.procurement" />
+          <el-input v-model.trim="editor.form.namespace" placeholder="如：business.core" />
           <small class="field-help">以字母开头，可使用字母、数字、点、横线和下划线；留空继承场景命名空间。</small>
         </div>
         <div class="ep-row2">
@@ -74,6 +83,15 @@
             :aria-label="props.focusPropertyIndex === i ? `AI 草稿属性：${p.name || i + 1}` : undefined"
           >
             <el-input v-model="p.name" size="small" placeholder="属性名" />
+            <div class="prop-detail">
+              <label>稳定 API 名</label>
+              <el-input
+                v-model.trim="p.api_name"
+                :disabled="isPersistedProperty(p)"
+                size="small"
+                placeholder="如：object_id"
+              />
+            </div>
             <el-select v-model="p.data_type" size="small" class="prop-type" @change="handlePropertyTypeChange(i)">
               <el-option v-for="t in DATA_TYPES" :key="t.value" :label="t.label" :value="t.value" />
             </el-select>
@@ -172,11 +190,11 @@
       <template v-else-if="editor.kind === 'relation'">
         <div class="ep-field">
           <label>关系名</label>
-          <el-input v-model="editor.form.name" placeholder="如：下单、属于" />
+          <el-input v-model="editor.form.name" placeholder="如：关联、归属" />
         </div>
         <div class="ep-field">
           <label>命名空间</label>
-          <el-input v-model.trim="editor.form.namespace" placeholder="如：supply.procurement" />
+          <el-input v-model.trim="editor.form.namespace" placeholder="如：business.core" />
           <small class="field-help">以字母开头，可使用字母、数字、点、横线和下划线；留空继承场景命名空间。</small>
         </div>
         <div class="ep-field">
@@ -450,10 +468,14 @@ const accent = computed(() => {
 
 function addProp() {
   props.editor.form.properties.push({
-    name: '', data_type: 'string', is_key: false, is_title: false, is_required: false,
+    name: '', api_name: '', data_type: 'string', is_key: false, is_title: false, is_required: false,
     is_enum: false, enum_values: [], constraints: {}, description: '', is_sensitive: false,
   })
   constraintForms.value.push({})
+}
+
+function isPersistedProperty(property: Property & { _apiNameLocked?: boolean }) {
+  return property._apiNameLocked === true
 }
 
 const keyPropertyIndex = computed<number | undefined>({

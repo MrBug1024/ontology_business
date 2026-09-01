@@ -238,7 +238,7 @@ class AgentMCPPublicationTests(unittest.TestCase):
                             ]
                             self.assertEqual(
                                 kind_schema.get("pattern"),
-                                "^(function|action|workflow)$",
+                                "^(function|action|rule|workflow)$",
                             )
                             managed_schema = invoke_tool.inputSchema["properties"][
                                 "managed_inputs"

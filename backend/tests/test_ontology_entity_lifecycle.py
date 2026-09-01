@@ -4,11 +4,10 @@ from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app import database
 from app.database import Base
 from app.models import (
     BusinessScenario,
@@ -36,35 +35,6 @@ from app.services import (
     release_service,
     runtime_definition_service,
 )
-
-
-def test_legacy_entity_lifecycle_migration_backfills_idempotently() -> None:
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    try:
-        with engine.begin() as conn:
-            conn.exec_driver_sql(
-                "CREATE TABLE ontology_entities "
-                "(id VARCHAR(32) PRIMARY KEY, scenario_id VARCHAR(32), name VARCHAR(200))"
-            )
-            conn.execute(
-                text("INSERT INTO ontology_entities VALUES ('legacy', 'scenario', '旧对象')")
-            )
-        with patch.object(database, "engine", engine):
-            database._migrate_ontology_entity_lifecycle()
-            database._migrate_ontology_entity_lifecycle()
-        assert "lifecycle_status" in {
-            column["name"] for column in inspect(engine).get_columns("ontology_entities")
-        }
-        with engine.connect() as conn:
-            assert conn.execute(
-                text("SELECT lifecycle_status FROM ontology_entities WHERE id='legacy'")
-            ).scalar_one() == "active"
-    finally:
-        engine.dispose()
 
 
 def test_entity_lifecycle_schema_is_closed() -> None:

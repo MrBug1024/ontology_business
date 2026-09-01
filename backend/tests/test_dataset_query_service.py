@@ -30,7 +30,6 @@ from app.models import (
 from app.services import (
     dataset_query_service,
     datasource_service,
-    medical_audit_service,
     object_storage_service,
 )
 from app.services.policies import PolicyViolation, validate_read_only_sql
@@ -756,28 +755,3 @@ def test_datasource_routes_dataset_queries_without_sqlalchemy() -> None:
     assert result == expected
     run.assert_called_once()
     get_engine.assert_not_called()
-
-
-def test_medical_connection_accepts_dataset_source() -> None:
-    class FakeDatasetConnection:
-        def execute(self, sql, parameters):
-            assert sql == "SELECT ? AS result"
-            assert parameters == (7,)
-            return ["result"], [(7,)]
-
-        def close(self):
-            return None
-
-    source = SimpleNamespace(type="dataset", config={"dataset_version_id": "v1"})
-    with patch.object(
-        dataset_query_service,
-        "open_connection",
-        return_value=FakeDatasetConnection(),
-    ):
-        connection = medical_audit_service._AuditConnection(source)
-        try:
-            assert connection.execute("SELECT ? AS result", (7,)).fetchone() == {
-                "result": 7
-            }
-        finally:
-            connection.close()

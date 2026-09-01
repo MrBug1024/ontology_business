@@ -7,7 +7,7 @@
       </div>
       <div class="agent-header-actions">
         <el-select
-          v-model="scenarioScope"
+          :model-value="scenarioScope"
           clearable
           filterable
           aria-label="按业务场景筛选 Agent"
@@ -21,7 +21,7 @@
     </div>
 
     <el-row :gutter="16" v-loading="loading">
-      <el-col :xs="24" :sm="12" :lg="8" v-for="a in agents" :key="a.id">
+      <el-col :xs="24" :sm="12" :lg="8" v-for="a in visibleAgents" :key="a.id">
         <article class="card agent-card">
           <div class="ag-head">
             <div class="ag-avatar"><el-icon :size="20"><Cpu /></el-icon></div>
@@ -66,7 +66,7 @@
         </article>
       </el-col>
     </el-row>
-    <div v-if="!loading && !agents.length" class="empty-wrap">
+    <div v-if="!loading && !visibleAgents.length" class="empty-wrap">
       <div class="empty-icon"><el-icon :size="28"><Cpu /></el-icon></div>
       <div>暂无验证 Agent，点击右上角开始创建</div>
       <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新建验证 Agent</el-button>
@@ -215,7 +215,7 @@
                   </div>
                 </el-option>
               </el-select>
-              <p v-else class="capability-all-hint">当前以及以后新增的可见{{ category.label }}都会自动授权给此 Agent。</p>
+              <p v-else class="capability-all-hint">保存时会固定当前可见{{ category.label }}；以后新增需再次保存授权。</p>
               <div class="capability-stats" aria-live="polite">
                 <span>已选择 {{ capabilityStats(category.key).selected }}</span>
                 <span class="capability-ready">可执行 {{ capabilityStats(category.key).executable }}</span>
@@ -255,6 +255,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import { allAgentCapabilityScope, cloneAgentCapabilityScope, emptyAgentCapabilityScope } from '@/utils/agentCapabilities'
 import { normalizeAgentReadiness } from '@/utils/agentReadiness'
+import { filterAgentsByScenario, scenarioIdFromQuery } from '@/utils/agentValidationView'
 import type {
   Agent,
   AgentCapabilityCatalog,
@@ -272,7 +273,6 @@ const capabilityCategories: Array<{ key: AgentCapabilityCategory; label: string;
   { key: 'functions', label: '函数', help: '确定性计算与转换' },
   { key: 'actions', label: '操作', help: '需要确认的业务变更' },
   { key: 'rules', label: '规则', help: '业务判断与约束' },
-  { key: 'events', label: '事件', help: '业务事件发布' },
   { key: 'workflows', label: '工作流', help: '跨步骤任务编排' },
 ]
 const readinessAxes: Array<{ key: AgentReadinessAxisKey; label: string }> = [
@@ -287,11 +287,8 @@ const scenarios = ref<Scenario[]>([])
 const llms = ref<LLMConfig[]>([])
 const route = useRoute()
 const router = useRouter()
-const queryScenarioId = () => {
-  const value = route.query.scenario_id
-  return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
-}
-const scenarioScope = ref(queryScenarioId())
+const scenarioScope = computed(() => scenarioIdFromQuery(route.query.scenario_id))
+const visibleAgents = computed(() => filterAgentsByScenario(agents.value, scenarioScope.value))
 
 const dlg = ref(false)
 const saving = ref(false)
@@ -362,7 +359,7 @@ function capabilityBlockedReasons(category: AgentCapabilityCategory): string[] {
 }
 
 function capabilityTotals(agent: Partial<Agent>) {
-  const summaries = Object.values(agent.capability_summary || {})
+  const summaries = capabilityCategories.map((category) => agent.capability_summary?.[category.key])
   return summaries.reduce(
     (total, summary) => ({
       selected: total.selected + (summary?.selected_count || 0),
@@ -416,14 +413,13 @@ async function loadCapabilityCatalog(scenarioId?: string | null) {
 
 async function load() {
   const request = ++loadRequest
-  const scope = scenarioScope.value
   loading.value = true
   try {
     const [ag, sc, ll] = await Promise.all([
       api.listAgents(), api.listScenarios(), api.listLLM(),
     ])
-    if (viewDisposed || request !== loadRequest || scope !== scenarioScope.value) return
-    agents.value = scope ? ag.filter((agent) => agent.scenario_id === scope) : ag
+    if (viewDisposed || request !== loadRequest) return
+    agents.value = ag
     scenarios.value = sc
     llms.value = ll
   } catch (e: any) {
@@ -479,10 +475,10 @@ function addRuntimeConnection() {
     name: `业务数据库 ${(form.value.runtime_connections?.length || 0) + 1}`,
     type: 'postgres',
     config: {
-      host: '127.0.0.1',
-      port: 5432,
+      host: '',
+      port: undefined,
       database: '',
-      username: 'postgres',
+      username: '',
       password: '',
     },
   }
@@ -546,12 +542,12 @@ async function remove(a: Agent) {
     if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
   }
 }
-async function changeScenarioScope(value: string) {
+async function changeScenarioScope(value: unknown) {
+  const scenarioId = scenarioIdFromQuery(value)
   const query = { ...route.query }
-  if (value) query.scenario_id = value
+  if (scenarioId) query.scenario_id = scenarioId
   else delete query.scenario_id
   await router.replace({ name: 'agents', query })
-  return
 }
 onMounted(() => {
   viewDisposed = false

@@ -13,8 +13,6 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
-from app.providers.medical_audit import grounding as medical_grounding
-from app.providers.medical_audit.provider import COMPATIBILITY_MANIFEST
 from app.routers import agents as agents_router
 from app.routers import scenarios as scenarios_router
 from app.schemas import ActionExecuteRequest
@@ -70,36 +68,6 @@ def _schema(properties: dict | None = None, required: list[str] | None = None) -
         "required": required or [],
         "additionalProperties": False,
     }
-
-
-def _medical_truthful_final_content(
-    content: str,
-    *,
-    user_message: str,
-    tool_outcomes: list[dict[str, Any]],
-    controlled_medical_audit: bool = True,
-    authoritative_medical_facilities: list[str] | None = None,
-    medical_facility_lookup_succeeded: bool | None = None,
-) -> str:
-    """Exercise Provider-owned grounding through the generic Agent contract."""
-
-    del controlled_medical_audit  # compatibility with the pre-Provider test shape
-    result = medical_grounding.grounding_result(
-        tool_outcomes,
-        user_message=user_message,
-        tool_names=tuple(
-            tool.name for tool in COMPATIBILITY_MANIFEST.tool_aliases
-        ),
-        authoritative_facilities=authoritative_medical_facilities,
-        facility_lookup_succeeded=medical_facility_lookup_succeeded,
-        definition_hash="test-definition-hash",
-    )
-    return agent_engine._truthful_final_content(
-        content,
-        user_message=user_message,
-        tool_outcomes=tool_outcomes,
-        grounding_results=(result,),
-    )
 
 
 def _unverified_grounding() -> GroundingResult:
@@ -259,6 +227,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             id="source-projects",
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
+            resource_scope="agent_runtime",
+            owner_agent_id="agent-risk",
             name="项目主数据",
             type="postgres",
             config={},
@@ -364,6 +334,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             description="使用本体、映射和规则回答施工风险问题",
             system_prompt="你负责施工风险分析。",
             data_source_ids=[source.id],
+            runtime_data_source_ids=[source.id],
             capability_scope={
                 "functions": {"mode": "explicit", "selected_ids": [contract.id, function.id]},
                 "actions": {"mode": "explicit", "selected_ids": [action.id]},
@@ -394,8 +365,13 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         )
         self.db.commit()
 
-    def _context(self) -> agent_engine.AgentContext:
-        return agent_engine.AgentContext(self.db, self.agent, LLMConfig(name="工具模型"))
+    def _context(self, *, environment: str = "dev") -> agent_engine.AgentContext:
+        return agent_engine.AgentContext(
+            self.db,
+            self.agent,
+            LLMConfig(name="工具模型"),
+            environment=environment,
+        )
 
     def test_large_action_preview_remains_bounded_and_confirmable_without_echoing_params(self) -> None:
         context = self._context()
@@ -1975,12 +1951,14 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             id="source-projects-query-staging",
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
+            resource_scope="agent_runtime",
+            owner_agent_id=self.agent.id,
             name="项目查询库（预发布）",
             type="postgres",
             status="connected",
         )
         self.db.add(staging_source)
-        self.agent.data_source_ids = [staging_source.id]
+        self.agent.runtime_data_source_ids = [staging_source.id]
         live_mapping = self.db.get(DataMapping, "mapping-projects")
         live_mapping.table_name = "draft_projects"
         live_mapping.column_map = {"项目编号": "draft_project_code"}
@@ -1999,7 +1977,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                 return_value=(staging_source, {"managed": True}),
             ),
         ):
-            context = self._context()
+            context = self._context(environment="staging")
 
         raw_query_result = {
             "columns": ["__ontology_0"],
@@ -2117,6 +2095,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             id="source-projects-staging",
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
+            resource_scope="agent_runtime",
+            owner_agent_id=self.agent.id,
             name="项目库（预发布）",
             type="postgres",
             status="connected",
@@ -2131,7 +2111,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             enabled=True,
         )
         self.db.add_all([staging_source, staging_llm])
-        self.agent.data_source_ids = [staging_source.id]
+        self.agent.runtime_data_source_ids = [staging_source.id]
         self.agent.llm_config_id = staging_llm.id
         original_scenario_name = self.scenario.name
         self.scenario.name = "草稿施工风险场景"
@@ -2157,7 +2137,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                 return_value=(staging_source, {}),
             ),
         ):
-            context = self._context()
+            context = self._context(environment="staging")
 
         self.assertEqual(context.runtime_definition.snapshot_id, snapshot.id)
         self.assertEqual(context.runtime_definition.release_id, release.id)
@@ -2191,7 +2171,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
 
         with patch.object(agent_engine.llm_service, "chat_stream", fake_chat_stream):
             list(
-                agent_engine.run_agent(
+                agent_engine._run_agent(
                     self.db,
                     self.agent,
                     staging_llm,
@@ -2211,12 +2191,14 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             id="source-live-bucket-staging",
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
+            resource_scope="agent_runtime",
+            owner_agent_id=self.agent.id,
             name="Agent 显式绑定资料库",
             type="file_bucket",
             status="connected",
         )
         self.db.add(bound_bucket)
-        self.agent.data_source_ids = ["source-projects", bound_bucket.id]
+        self.agent.runtime_data_source_ids = ["source-projects", bound_bucket.id]
         self.db.commit()
 
         with (
@@ -2231,7 +2213,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                 return_value=(self.db.get(DataSource, "source-projects"), {}),
             ),
         ):
-            context = self._context()
+            context = self._context(environment="staging")
 
         self.assertIn(bound_bucket.id, {source.id for source in context.data_sources})
         self.assertIn(
@@ -2251,7 +2233,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             "runtime_environment",
             return_value="staging",
         ), self.assertRaises(runtime_definition_service.RuntimeDefinitionError):
-            self._context()
+            self._context(environment="staging")
 
     def test_agent_turn_reuses_the_context_that_authorized_history(self) -> None:
         context = self._context()
@@ -2269,7 +2251,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             ),
         ):
             events = list(
-                agent_engine.run_agent(
+                agent_engine._run_agent(
                     self.db,
                     self.agent,
                     llm,
@@ -2449,7 +2431,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             patch.object(agent_engine.llm_service, "chat_stream", fake_chat_stream),
         ):
             events = list(
-                agent_engine.run_agent(
+                agent_engine._run_agent(
                     self.db,
                     self.agent,
                     LLMConfig(name="工具模型"),
@@ -2476,7 +2458,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             return_value=iter([{"type": "token", "content": "全部工作已经完成。"}]),
         ):
             events = list(
-                agent_engine.run_agent(
+                agent_engine._run_agent(
                     self.db,
                     self.agent,
                     LLMConfig(name="工具模型"),
@@ -2537,7 +2519,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             ),
         ):
             events = list(
-                agent_engine.run_agent(
+                agent_engine._run_agent(
                     self.db,
                     self.agent,
                     LLMConfig(name="工具模型"),
@@ -2593,7 +2575,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             ),
         ):
             events = list(
-                agent_engine.run_agent(
+                agent_engine._run_agent(
                     self.db,
                     self.agent,
                     LLMConfig(name="工具模型"),
@@ -2702,7 +2684,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             ),
         ):
             events = list(
-                agent_engine.run_agent(
+                agent_engine._run_agent(
                     self.db,
                     self.agent,
                     LLMConfig(name="工具模型"),
@@ -2717,41 +2699,6 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         final_content = events[-1]["data"]
         self.assertIn("未形成可验证审计结论", final_content)
         self.assertIn("失败工具：query_mapped_objects（1 次）", final_content)
-
-    def test_controlled_medical_audit_rejects_successful_unrelated_query(self) -> None:
-        outcomes = [
-            {
-                "name": "query_business_data",
-                "arguments": {"base_entity": "医疗机构"},
-                "result": json.dumps(
-                    {
-                        "records": [{"医疗机构名称": "示例医院"}],
-                        "row_count": 1,
-                        "offset": 0,
-                        "truncated": False,
-                        "next_offset": None,
-                        "scope": {"entities": ["医疗机构"]},
-                    },
-                    ensure_ascii=False,
-                ),
-            }
-        ]
-
-        controlled = _medical_truthful_final_content(
-            "已完成重复收费违规审计。",
-            user_message="请完成医保重复收费违规审计",
-            tool_outcomes=outcomes,
-            controlled_medical_audit=True,
-        )
-        general = agent_engine._truthful_final_content(
-            "已完成项目审计。",
-            user_message="请审计项目违规情况",
-            tool_outcomes=outcomes,
-            grounding_results=(_unverified_grounding(),),
-        )
-
-        self.assertIn("未形成可验证审计结论", controlled)
-        self.assertIn("未形成可验证审计结论", general)
 
     def test_general_query_pages_cannot_substitute_for_governed_audit_proof(self) -> None:
         def mapped_page(offset: int, *, truncated: bool) -> str:
@@ -2803,571 +2750,6 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertIn("未形成可验证审计结论", incomplete)
         self.assertIn("未形成可验证审计结论", complete)
 
-    def test_truth_guard_uses_medical_summary_and_flags_incomplete_details(self) -> None:
-        arguments = {
-            "strategy": "included_service_duplicate",
-            "included_service": "电子结肠镜检查",
-            "duplicate_service": "电子乙状结肠镜检查",
-        }
-        payload = {
-            "ok": True,
-            "audit_version": "medical-audit-v1",
-            "strategy": "included_service_duplicate",
-            "summary": {"violation_count": 20, "violation_amount": 955.85},
-            "records": [{"charge_line_id": str(index)} for index in range(10)],
-            "row_count": 10,
-            "offset": 0,
-            "limit": 10,
-            "truncated": True,
-            "next_offset": 10,
-            "evidence": {
-                "source_id": "medical-source",
-                "parameters": {
-                    "facility_name": None,
-                    "included_service": "电子结肠镜检查",
-                    "duplicate_service": "电子乙状结肠镜检查",
-                },
-            },
-        }
-
-        final_content = _medical_truthful_final_content(
-            "审计完成：20 条，金额 975.95 元。",
-            user_message=(
-                "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
-                "并返回全部违规明细"
-            ),
-            tool_outcomes=[
-                {
-                    "name": "run_medical_audit",
-                    "arguments": arguments,
-                    "result": json.dumps(payload, ensure_ascii=False),
-                }
-            ],
-        )
-
-        self.assertIn("模型正文数字不一致时以此为准", final_content)
-        self.assertIn("违规 20 条（组），违规金额 955.85 元", final_content)
-        self.assertIn("本次要求全部明细", final_content)
-        self.assertIn("仅连续读取 10/20 条", final_content)
-        self.assertNotIn("未形成可验证审计结论", final_content)
-
-    def test_truth_guard_proves_a_complete_medical_pagination_chain(self) -> None:
-        base_arguments = {
-            "strategy": "included_service_duplicate",
-            "included_service": "电子结肠镜检查",
-            "duplicate_service": "电子乙状结肠镜检查",
-            "limit": 10,
-        }
-        evidence = {
-            "source_id": "medical-source",
-            "parameters": {
-                "facility_name": None,
-                "included_service": "电子结肠镜检查",
-                "duplicate_service": "电子乙状结肠镜检查",
-            },
-        }
-
-        def page(offset: int, *, truncated: bool) -> dict[str, Any]:
-            return {
-                "ok": True,
-                "audit_version": "medical-audit-v1",
-                "strategy": "included_service_duplicate",
-                "summary": {"violation_count": 20, "violation_amount": 955.85},
-                "records": [
-                    {"charge_line_id": str(index)}
-                    for index in range(offset, offset + 10)
-                ],
-                "row_count": 10,
-                "offset": offset,
-                "limit": 10,
-                "truncated": truncated,
-                "next_offset": offset + 10 if truncated else None,
-                "evidence": evidence,
-            }
-
-        tool_outcomes = [
-            {
-                "name": "run_medical_audit",
-                "arguments": {**base_arguments, "offset": 0},
-                "result": json.dumps(page(0, truncated=True), ensure_ascii=False),
-            },
-            {
-                "name": "run_medical_audit",
-                "arguments": {**base_arguments, "offset": 10},
-                "result": json.dumps(page(10, truncated=False), ensure_ascii=False),
-            },
-        ]
-
-        final_content = _medical_truthful_final_content(
-            "已完成审计。",
-            user_message=(
-                "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
-                "并返回全部违规明细"
-            ),
-            tool_outcomes=tool_outcomes,
-        )
-
-        self.assertIn("审计明细分页已完整读取 20/20 条", final_content)
-        self.assertNotIn("不能视为全部明细已交付", final_content)
-
-    def test_medical_truth_guard_rejects_strategy_or_parameter_drift(self) -> None:
-        arguments = {
-            "strategy": "included_service_duplicate",
-            "included_service": "电子结肠镜检查",
-            "duplicate_service": "电子乙状结肠镜检查",
-        }
-        payload = {
-            "ok": True,
-            "audit_version": "medical-audit-v1",
-            "strategy": "included_service_duplicate",
-            "summary": {"violation_count": 1, "violation_amount": 10.0},
-            "records": [{"charge_line_id": "line-1"}],
-            "row_count": 1,
-            "offset": 0,
-            "limit": 10,
-            "truncated": False,
-            "next_offset": None,
-            "evidence": {
-                "source_id": "medical-source",
-                "parameters": {
-                    "facility_name": None,
-                    "included_service": "电子结肠镜检查",
-                    "duplicate_service": "电子乙状结肠镜检查",
-                },
-            },
-        }
-        outcome = [{
-            "name": "run_medical_audit",
-            "arguments": arguments,
-            "result": json.dumps(payload, ensure_ascii=False),
-        }]
-
-        wrong_strategy = _medical_truthful_final_content(
-            "审计完成。",
-            user_message="请审计阿司匹林用药天数超过 7 天的违规记录",
-            tool_outcomes=outcome,
-            controlled_medical_audit=True,
-        )
-        missing_parameter = _medical_truthful_final_content(
-            "审计完成。",
-            user_message="请审计电子结肠镜检查的重复收费问题",
-            tool_outcomes=outcome,
-            controlled_medical_audit=True,
-        )
-
-        self.assertIn("未形成可验证审计结论", wrong_strategy)
-        self.assertIn("未形成可验证审计结论", missing_parameter)
-        self.assertNotIn("医保确定性汇总", wrong_strategy)
-        self.assertNotIn("医保确定性汇总", missing_parameter)
-        self.assertTrue(
-            medical_grounding._medical_number_mentioned(
-                "请审计 AP001 刮痧治疗收费大于两次的记录",
-                2,
-            )
-        )
-        self.assertFalse(
-            medical_grounding._medical_number_mentioned(
-                "请审计 AP001 刮痧治疗收费大于两次的记录",
-                1,
-            )
-        )
-
-    def test_medical_truth_guard_requires_explicit_user_facility_scope(self) -> None:
-        def outcome(facility_name: str | None) -> list[dict[str, Any]]:
-            arguments: dict[str, Any] = {
-                "strategy": "charge_threshold",
-                "service_name": "刮痧治疗",
-                "threshold": 2,
-            }
-            if facility_name is not None:
-                arguments["facility_name"] = facility_name
-            payload = {
-                "ok": True,
-                "audit_version": "medical-audit-v1",
-                "strategy": "charge_threshold",
-                "summary": {"violation_count": 1, "violation_amount": 10.0},
-                "records": [{"charge_line_id": "line-1"}],
-                "row_count": 1,
-                "offset": 0,
-                "limit": 10,
-                "truncated": False,
-                "next_offset": None,
-                "evidence": {
-                    "source_id": "medical-source",
-                    "parameters": {
-                        "facility_name": facility_name,
-                        "service_name": "刮痧治疗",
-                        "threshold": 2,
-                    },
-                },
-            }
-            return [{
-                "name": "run_medical_audit",
-                "arguments": arguments,
-                "result": json.dumps(payload, ensure_ascii=False),
-            }]
-
-        scoped_request = (
-            "请审计贵阳泰康乐综合医院刮痧治疗收费大于两次的违规记录"
-        )
-        omitted = _medical_truthful_final_content(
-            "审计完成。",
-            user_message=scoped_request,
-            tool_outcomes=outcome(None),
-            controlled_medical_audit=True,
-        )
-        wrong = _medical_truthful_final_content(
-            "审计完成。",
-            user_message=scoped_request,
-            tool_outcomes=outcome("其他医院"),
-            controlled_medical_audit=True,
-        )
-        matched = _medical_truthful_final_content(
-            "审计完成。",
-            user_message=scoped_request,
-            tool_outcomes=outcome("贵阳泰康乐综合医院"),
-            controlled_medical_audit=True,
-        )
-        project_code_only = _medical_truthful_final_content(
-            "审计完成。",
-            user_message="请审计 AP001 刮痧治疗收费大于两次的违规记录",
-            tool_outcomes=outcome(None),
-            controlled_medical_audit=True,
-        )
-
-        self.assertIn("未形成可验证审计结论", omitted)
-        self.assertIn("未形成可验证审计结论", wrong)
-        self.assertNotIn("医保确定性汇总", omitted)
-        self.assertNotIn("医保确定性汇总", wrong)
-        self.assertIn("医保确定性汇总", matched)
-        self.assertNotIn("未形成可验证审计结论", matched)
-        self.assertIn("医保确定性汇总", project_code_only)
-        self.assertNotIn("未形成可验证审计结论", project_code_only)
-        production_matched = _medical_truthful_final_content(
-            "审计完成。",
-            user_message=scoped_request,
-            tool_outcomes=outcome("贵阳泰康乐综合医院"),
-            controlled_medical_audit=True,
-            authoritative_medical_facilities=["贵阳泰康乐综合医院"],
-            medical_facility_lookup_succeeded=True,
-        )
-        global_matched = _medical_truthful_final_content(
-            "审计完成。",
-            user_message="请审计刮痧治疗收费大于 2 次的违规记录",
-            tool_outcomes=outcome(None),
-            controlled_medical_audit=True,
-            authoritative_medical_facilities=[],
-            medical_facility_lookup_succeeded=True,
-        )
-        no_facility_negative_business_term = _medical_truthful_final_content(
-            "审计完成。",
-            user_message=(
-                "请审计刮痧治疗收费大于 2 次且不包含已撤销记录的违规情况"
-            ),
-            tool_outcomes=outcome(None),
-            controlled_medical_audit=True,
-            authoritative_medical_facilities=[],
-            medical_facility_lookup_succeeded=True,
-        )
-        self.assertIn("医保确定性汇总", production_matched)
-        self.assertIn("医保确定性汇总", global_matched)
-        self.assertIn("医保确定性汇总", no_facility_negative_business_term)
-
-        service_exclusion_requests = (
-            (
-                "审计贵阳泰康乐综合医院，但不包含电子乙状结肠镜检查"
-                "以外的项目"
-            ),
-            (
-                "请审计贵阳泰康乐综合医院刮痧治疗收费数量大于2次的"
-                "违规记录，但不包含已撤销记录"
-            ),
-            (
-                "请审计贵阳泰康乐综合医院刮痧治疗收费数量大于2次的"
-                "违规记录，但排除自费项目"
-            ),
-            (
-                "请审计贵阳泰康乐综合医院刮痧治疗收费数量大于2次的"
-                "违规记录，但不涉及电子乙状结肠镜检查项目"
-            ),
-            (
-                "请审计贵阳泰康乐综合医院刮痧治疗收费数量大于2次的"
-                "违规记录，但不纳入自费项目"
-            ),
-        )
-        for service_exclusion_request in service_exclusion_requests:
-            with self.subTest(service_exclusion_request=service_exclusion_request):
-                self.assertFalse(
-                    medical_grounding._medical_request_excludes_facility(
-                        service_exclusion_request,
-                        ["贵阳泰康乐综合医院"],
-                    )
-                )
-        for auditable_service_exclusion in service_exclusion_requests[1:]:
-            with self.subTest(auditable_service_exclusion=auditable_service_exclusion):
-                verified = _medical_truthful_final_content(
-                    "审计完成。",
-                    user_message=auditable_service_exclusion,
-                    tool_outcomes=outcome("贵阳泰康乐综合医院"),
-                    controlled_medical_audit=True,
-                    authoritative_medical_facilities=["贵阳泰康乐综合医院"],
-                    medical_facility_lookup_succeeded=True,
-                )
-                self.assertIn("医保确定性汇总", verified)
-                self.assertNotIn("未形成可验证审计结论", verified)
-
-        facility = "贵阳泰康乐综合医院"
-        excluded_requests = (
-            f"除{facility}以外所有医疗机构，审计刮痧治疗收费数量大于2次的违规记录",
-            f"除{facility}之外，审计其他医疗机构刮痧治疗收费数量大于2次的违规记录",
-            f"除{facility}外，审计其他医疗机构刮痧治疗收费数量大于2次的违规记录",
-            f"{facility}除外，审计所有医疗机构刮痧治疗收费数量大于2次的违规记录",
-            f"审计不含{facility}的医疗机构刮痧治疗收费数量大于2次的违规记录",
-            f"审计不包括{facility}的医疗机构刮痧治疗收费数量大于2次的违规记录",
-            f"审计不包含{facility}的医疗机构刮痧治疗收费数量大于2次的违规记录",
-            f"排除{facility}，审计其他医疗机构刮痧治疗收费数量大于2次的违规记录",
-            f"剔除{facility}后，审计刮痧治疗收费数量大于2次的违规记录",
-            f"不要审计{facility}，只审计其他机构刮痧治疗收费数量大于2次的违规记录",
-            f"不审计{facility}，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
-            f"{facility}无需审计，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
-            f"无需对{facility}进行审计，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
-            f"{facility}不在本次审计范围内，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
-            f"{facility}暂不纳入审计，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
-            f"本次审计不涉及{facility}，请审计其他机构刮痧治疗收费数量大于2次的违规记录",
-            f"跳过{facility}，审计其他医院刮痧治疗收费数量大于2次的违规记录",
-            f"除{facility}，审计其他机构刮痧治疗收费数量大于2次的违规记录",
-        )
-        for excluded_request in excluded_requests:
-            with self.subTest(excluded_request=excluded_request):
-                self.assertTrue(
-                    medical_grounding._medical_request_excludes_facility(
-                        excluded_request,
-                        [facility],
-                    )
-                )
-                for tool_facility in (facility, None):
-                    excluded = _medical_truthful_final_content(
-                        "审计完成。",
-                        user_message=excluded_request,
-                        tool_outcomes=outcome(tool_facility),
-                        controlled_medical_audit=True,
-                        authoritative_medical_facilities=[facility],
-                        medical_facility_lookup_succeeded=True,
-                    )
-                    self.assertIn("未形成可验证审计结论", excluded)
-                    self.assertNotIn("医保确定性汇总", excluded)
-
-        alias = "泰康乐医院"
-        alias_zero_outcome = outcome(alias)
-        alias_zero_payload = json.loads(alias_zero_outcome[0]["result"])
-        alias_zero_payload["summary"] = {
-            "violation_count": 0,
-            "violation_amount": 0.0,
-        }
-        alias_zero_payload["records"] = []
-        alias_zero_payload["row_count"] = 0
-        alias_zero_outcome[0]["result"] = json.dumps(
-            alias_zero_payload,
-            ensure_ascii=False,
-        )
-        unmatched_alias = _medical_truthful_final_content(
-            "未发现违规记录。",
-            user_message=f"请审计{alias}刮痧治疗收费大于 2 次的违规记录",
-            tool_outcomes=alias_zero_outcome,
-            controlled_medical_audit=True,
-            authoritative_medical_facilities=[],
-            medical_facility_lookup_succeeded=True,
-        )
-        self.assertIn("未形成可验证审计结论", unmatched_alias)
-        self.assertNotIn("医保确定性汇总", unmatched_alias)
-        self.assertEqual(
-            medical_grounding._requested_medical_facilities(scoped_request),
-            {medical_grounding._normalized_business_text("贵阳泰康乐综合医院")},
-        )
-        self.assertEqual(
-            medical_grounding._requested_medical_facilities(
-                "请审计 AP001 项目和所有医疗机构的违规记录"
-            ),
-            set(),
-        )
-        for generic_project_scope in (
-            "请核查项目 AP001 对应的定点医院",
-            "请审计该项目中的医院收费",
-            "请审计 AP-001 医院项目的收费情况",
-        ):
-            self.assertEqual(
-                medical_grounding._requested_medical_facilities(generic_project_scope),
-                set(),
-            )
-
-        long_facility = (
-            "贵阳市观山湖区信义口腔门诊部有限公司世纪城口腔门诊部"
-        )
-        long_request = (
-            f"请审计{long_facility}刮痧治疗收费大于两次的违规记录"
-        )
-        resolved = medical_grounding._resolved_medical_facilities(
-            long_request,
-            [long_facility],
-        )
-        self.assertEqual(
-            resolved,
-            {medical_grounding._normalized_business_text(long_facility)},
-        )
-        long_omitted = _medical_truthful_final_content(
-            "审计完成。",
-            user_message=long_request,
-            tool_outcomes=outcome(None),
-            controlled_medical_audit=True,
-            authoritative_medical_facilities=[long_facility],
-            medical_facility_lookup_succeeded=True,
-        )
-        long_matched = _medical_truthful_final_content(
-            "审计完成。",
-            user_message=long_request,
-            tool_outcomes=outcome(long_facility),
-            controlled_medical_audit=True,
-            authoritative_medical_facilities=[long_facility],
-            medical_facility_lookup_succeeded=True,
-        )
-        failed_lookup = _medical_truthful_final_content(
-            "审计完成。",
-            user_message=scoped_request,
-            tool_outcomes=outcome("贵阳泰康乐综合医院"),
-            controlled_medical_audit=True,
-            authoritative_medical_facilities=[],
-            medical_facility_lookup_succeeded=False,
-        )
-        self.assertIn("未形成可验证审计结论", long_omitted)
-        self.assertIn("医保确定性汇总", long_matched)
-        self.assertNotIn("未形成可验证审计结论", long_matched)
-        self.assertIn("未形成可验证审计结论", failed_lookup)
-        self.assertNotIn("医保确定性汇总", failed_lookup)
-
-        long_station = "贵阳市观山湖区长岭街道金融城社区卫生服务站"
-        short_station = "观山湖区长岭街道金融城社区卫生服务站"
-        station_request = (
-            f"请审计{long_station}和{short_station}刮痧治疗收费大于两次的违规记录"
-        )
-        station_scopes = medical_grounding._resolved_medical_facilities(
-            station_request,
-            [long_station, short_station],
-        )
-        self.assertEqual(
-            station_scopes,
-            {
-                medical_grounding._normalized_business_text(long_station),
-                medical_grounding._normalized_business_text(short_station),
-            },
-        )
-        station_single_result = _medical_truthful_final_content(
-            "审计完成。",
-            user_message=station_request,
-            tool_outcomes=outcome(long_station),
-            controlled_medical_audit=True,
-            authoritative_medical_facilities=[long_station, short_station],
-            medical_facility_lookup_succeeded=True,
-        )
-        self.assertIn("未形成可验证审计结论", station_single_result)
-        self.assertNotIn("医保确定性汇总", station_single_result)
-
-        for facility in (
-            "观山湖区世纪城社区卫生服务站",
-            "青岩镇中心卫生室",
-            "遵义路便民服务站",
-            "益康药房",
-            "黔灵医学检验所",
-        ):
-            with self.subTest(facility_suffix=facility):
-                self.assertEqual(
-                    medical_grounding._requested_medical_facilities(
-                        f"请审计{facility}的收费记录"
-                    ),
-                    {medical_grounding._normalized_business_text(facility)},
-                )
-
-    def test_truth_guard_rejects_duplicate_or_empty_medical_page_identity(self) -> None:
-        base_arguments = {
-            "strategy": "included_service_duplicate",
-            "included_service": "电子结肠镜检查",
-            "duplicate_service": "电子乙状结肠镜检查",
-            "limit": 10,
-        }
-        evidence = {
-            "source_id": "medical-source",
-            "parameters": {
-                "facility_name": None,
-                "included_service": "电子结肠镜检查",
-                "duplicate_service": "电子乙状结肠镜检查",
-            },
-        }
-
-        def page(offset: int, identities: list[str], *, truncated: bool) -> dict[str, Any]:
-            return {
-                "ok": True,
-                "audit_version": "medical-audit-v1",
-                "strategy": "included_service_duplicate",
-                "summary": {"violation_count": 20, "violation_amount": 955.85},
-                "records": [{"charge_line_id": value} for value in identities],
-                "row_count": len(identities),
-                "offset": offset,
-                "limit": 10,
-                "truncated": truncated,
-                "next_offset": offset + len(identities) if truncated else None,
-                "evidence": evidence,
-            }
-
-        first = page(0, [str(index) for index in range(10)], truncated=True)
-        duplicate_second = page(
-            10,
-            [str(index) for index in range(10)],
-            truncated=False,
-        )
-        duplicate_content = _medical_truthful_final_content(
-            "已返回全部明细。",
-            user_message=(
-                "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
-                "并返回全部违规明细"
-            ),
-            tool_outcomes=[
-                {
-                    "name": "run_medical_audit",
-                    "arguments": {**base_arguments, "offset": 0},
-                    "result": json.dumps(first, ensure_ascii=False),
-                },
-                {
-                    "name": "run_medical_audit",
-                    "arguments": {**base_arguments, "offset": 10},
-                    "result": json.dumps(duplicate_second, ensure_ascii=False),
-                },
-            ],
-            controlled_medical_audit=True,
-        )
-        empty_identity = page(
-            0,
-            ["", *[str(index) for index in range(1, 10)]],
-            truncated=True,
-        )
-        empty_content = _medical_truthful_final_content(
-            "已返回全部明细。",
-            user_message=(
-                "请审计电子结肠镜检查包含电子乙状结肠镜检查后仍重复收费的问题，"
-                "并返回全部违规明细"
-            ),
-            tool_outcomes=[
-                {
-                    "name": "run_medical_audit",
-                    "arguments": {**base_arguments, "offset": 0},
-                    "result": json.dumps(empty_identity, ensure_ascii=False),
-                }
-            ],
-            controlled_medical_audit=True,
-        )
-
-        self.assertIn("仅连续读取 10/20 条", duplicate_content)
-        self.assertNotIn("完整读取 20/20 条", duplicate_content)
-        self.assertIn("仅连续读取 0/20 条", empty_content)
-
     def test_run_agent_emits_and_persists_fallback_when_final_summary_fails(self) -> None:
         context = self._context()
         responses = iter(
@@ -3408,7 +2790,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             ),
         ):
             events = list(
-                agent_engine.run_agent(
+                agent_engine._run_agent(
                     self.db,
                     self.agent,
                     LLMConfig(name="工具模型"),

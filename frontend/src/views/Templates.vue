@@ -204,8 +204,8 @@
           <div v-if="createForm.data_source_id && !registrationFilesLoading && !registrationFiles.length" class="field-help">该文件桶暂无支持的模板文件，可切换为“上传本地文件”。</div>
         </el-form-item>
         <div class="form-grid">
-          <el-form-item label="模板名称" required><el-input v-model.trim="createForm.name" maxlength="120" show-word-limit placeholder="如：年度审计报告" /></el-form-item>
-          <el-form-item label="业务用途" required><el-input v-model.trim="createForm.purpose" maxlength="160" show-word-limit placeholder="如：生成项目年度审计意见" /></el-form-item>
+          <el-form-item label="模板名称" required><el-input v-model.trim="createForm.name" maxlength="120" show-word-limit placeholder="如：年度业务报告" /></el-form-item>
+          <el-form-item label="业务用途" required><el-input v-model.trim="createForm.purpose" maxlength="160" show-word-limit placeholder="如：生成项目年度报告" /></el-form-item>
         </div>
         <el-form-item label="说明"><el-input v-model.trim="createForm.description" type="textarea" :rows="3" maxlength="500" show-word-limit placeholder="适用范围、填写口径或注意事项" /></el-form-item>
         <div class="form-grid">

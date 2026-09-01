@@ -3,7 +3,7 @@
 一个受 **Palantir Ontology** 启发的通用业务能力平台。核心理念是：**不绑定任何特定行业，也不把某一批数据或平台内 Agent 当成业务场景本身**。
 平台把业务语义、输入输出契约、规则、操作和工作流建设成可版本化、可治理、可由任意 Agent 或客户端调用的能力；平台内 Agent 是验证这些能力的参考客户端。
 
-当前架构升级以 [平台能力化优化升级任务计划](./docs/优化升级任务计划文档.md) 为唯一执行计划；稳定边界、Provider 规范和第三方接入方式见 [能力平台架构与接入指南](./docs/能力平台架构与接入指南.md)。旧的固定数据型 Agent 流程仅作为兼容模式保留。
+长期工程边界和完成定义以根级 [AGENTS.md](./AGENTS.md) 为准；能力契约、可选 Provider 扩展和第三方接入方式见 [能力平台架构与接入指南](./docs/能力平台架构与接入指南.md)。
 
 ```text
 场景定义版本
@@ -78,14 +78,18 @@ project-root
 
 ```powershell
 # 创建并激活虚拟环境（首次）
+python --version  # 必须为项目支持的 Python 3.12.x
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# 安装依赖（首次）
+# 安装运行依赖与测试依赖（首次）
 python -m pip install -r .\backend\requirements.txt
+python -m pip install 'pytest>=8.3,<9'
 
-# 创建本地配置（首次；不要提交真实密钥）
-Copy-Item .\backend\.env.example .\backend\.env
+# 仅在不存在时创建本地配置；不要覆盖已有密钥
+if (-not (Test-Path -LiteralPath .\backend\.env)) {
+    Copy-Item -LiteralPath .\backend\.env.example -Destination .\backend\.env
+}
 
 # 启动后端（默认使用 8000）
 python -m uvicorn app.main:app --app-dir .\backend --host 127.0.0.1 --port 8000
@@ -99,12 +103,15 @@ python -m uvicorn app.main:app --app-dir .\backend --host 127.0.0.1 --port 8000
 ### 2. 前端（Node.js）
 
 ```powershell
-# 安装依赖（首次）
-npm --prefix .\frontend install
+# 按 lockfile 安装依赖（首次；ci 不可用时才使用 install）
+node --version
+npm --version
+npm --prefix .\frontend ci
 # 若 npm 11 拦截了 postinstall 脚本：
 npm --prefix .\frontend approve-scripts esbuild vue-demi
 
-# 启动开发服务器（端口 5173，/api 自动代理到 8000）
+# 启动开发服务器（端口 5173），显式保持 /api 与后端端口一致
+$env:VITE_API_PROXY_TARGET='http://127.0.0.1:8000'
 npm --prefix .\frontend run dev
 ```
 
@@ -248,12 +255,14 @@ MAIL_TIMEOUT_SECONDS=20
 ```powershell
 $env:PYTHONPATH=(Resolve-Path .\backend).Path
 python -m pytest .\backend\tests -q
-python .\backend\scripts\verify_postgresql_runtime.py
+npm --prefix .\frontend test
 npm --prefix .\frontend run build
 ```
 
+`backend/scripts/verify_postgresql_runtime.py` 是无业务 fixture 假设的只读部署检查；它验证当前 Schema、运行角色权限、MinIO 和可选 Redis 健康，不创建、修改或删除业务数据。
+
 ## 常见问题
 
-- **需要改后端端口**：同步设置前端环境变量 `VITE_API_PROXY_TARGET`，默认代理目标是 `http://127.0.0.1:8000`。
-- **npm 11 拦截 postinstall**：执行 `npm approve-scripts esbuild vue-demi`。
+- **需要改后端端口**：启动前端前同步设置 `VITE_API_PROXY_TARGET`，不要依赖本机 `vite.config.ts` 中可能不同的默认代理端口。
+- **npm 11 拦截 postinstall**：执行 `npm --prefix .\frontend approve-scripts esbuild vue-demi`。
 - **LLM 调用失败**：检查 LLM 配置的 API Key 是否真实有效，可在 LLM 配置页点「测试」。

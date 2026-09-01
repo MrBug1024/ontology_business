@@ -90,6 +90,14 @@ class _ToolContractError(ValueError):
     """A model-correctable error in the public Agent tool contract."""
 
 
+class AgentRuntimeContextError(RuntimeError):
+    """The supported Agent entry point did not receive its capability runtime."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 _SAFE_TOOL_ERROR_CODES = frozenset(
     {
         "CAPABILITY_NOT_READY",
@@ -484,12 +492,12 @@ class AgentContext:
         agent: Agent,
         llm: LLMConfig,
         *,
-        environment: str = "dev",
+        environment: str | None = None,
     ):
         self.db = db
         self.agent = agent
         self.llm = llm
-        self.environment = str(environment or "dev").strip().lower()
+        self.environment = runtime_connector_service.runtime_environment(environment)
         # Agent 工具始终以当前租户运行；缺少上下文时拒绝，而不是隐式获得全库访问。
         self.tenant_id = tenant_service.current_tenant_id(db)
         self.scenario = (
@@ -3378,9 +3386,26 @@ def run_agent(
     ontology_summary: str,
     *,
     trace_context: dict[str, Any] | None = None,
-    runtime_context: AgentContext | None = None,
+    runtime_context: Any | None = None,
 ) -> Iterator[dict[str, Any]]:
     """执行 Agent 并在每个真实模型 trace 中保留最小可审计回链。"""
+    capability_loop = getattr(runtime_context, "run_agent", None)
+    if (
+        getattr(runtime_context, "runtime_path", None) != "capability"
+        or not callable(capability_loop)
+    ):
+        raise AgentRuntimeContextError(
+            "capability_runtime_required",
+            "Agent execution requires a resolved capability-only runtime context",
+        )
+    if (
+        getattr(runtime_context, "db", None) is not db
+        or getattr(getattr(runtime_context, "agent", None), "id", None) != agent.id
+    ):
+        raise AgentRuntimeContextError(
+            "capability_runtime_mismatch",
+            "Agent capability runtime context does not match the current request",
+        )
     previous = db.info.get("llm_trace_context")
     previous_action_audit = db.info.get("action_audit_context")
     context = dict(trace_context or {})
@@ -3396,20 +3421,7 @@ def run_agent(
         "model_name": llm.model or "",
     }
     try:
-        capability_loop = getattr(runtime_context, "run_agent", None)
-        if callable(capability_loop):
-            yield from capability_loop(history, user_message)
-            return
-        yield from _run_agent(
-            db,
-            agent,
-            llm,
-            history,
-            user_message,
-            scenario_name,
-            ontology_summary,
-            runtime_context=runtime_context,
-        )
+        yield from capability_loop(history, user_message)
     finally:
         if previous is None:
             db.info.pop("llm_trace_context", None)

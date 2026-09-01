@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -12,24 +10,18 @@ from app.database import Base, get_db
 from app.models import (
     Agent,
     BusinessScenario,
-    Conversation,
     FunctionDefinition,
     LLMConfig,
-    Message,
     PlatformMigrationCheckpoint,
     Tenant,
     User,
 )
 from app.routers import agents, platform_migrations
-from app.services import (
-    agent_capability_service,
-    agent_runtime_adapter,
-    permission_service,
-)
+from app.services import agent_capability_service, permission_service
 from app.services.auth_service import get_tenant_db
 
 
-def test_migration_control_endpoints_commit_gates_and_rollback() -> None:
+def test_migration_api_allows_only_ready_direct_capability_cutover() -> None:
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -41,6 +33,7 @@ def test_migration_control_endpoints_commit_gates_and_rollback() -> None:
     user_id = "user-migration-api"
     agent_id = "agent-migration-api"
     function_id = "function-migration-api"
+    llm_id = "llm-migration-api"
     with SessionLocal() as db:
         tenant = Tenant(id=tenant_id, name="Migration API tenant")
         user = User(
@@ -56,27 +49,12 @@ def test_migration_control_endpoints_commit_gates_and_rollback() -> None:
             name="Migration API scenario",
         )
         llm = LLMConfig(
-            id="llm-migration-api",
+            id=llm_id,
             tenant_id=tenant_id,
             name="Validation model",
             model="test-model",
             capabilities=["chat", "tool"],
             enabled=True,
-        )
-        agent = Agent(
-            id=agent_id,
-            tenant_id=tenant_id,
-            name="Validation Agent",
-            scenario_id=scenario.id,
-            llm_config_id=llm.id,
-            capability_scope={
-                **agent_capability_service.explicit_empty_scope(),
-                "functions": {
-                    "mode": "explicit",
-                    "selected_ids": [function_id],
-                },
-            },
-            runtime_binding_mode="legacy",
         )
         function = FunctionDefinition(
             id=function_id,
@@ -91,9 +69,25 @@ def test_migration_control_endpoints_commit_gates_and_rollback() -> None:
             output_schema={
                 "type": "object",
                 "properties": {"score": {"type": "number"}},
+                "additionalProperties": False,
             },
             runtime_kind="weighted_score",
-            runtime_config={"weights": {"amount": 0.5}, "bias": 2},
+            runtime_config={"weights": {"amount": 1}},
+        )
+        scope = agent_capability_service.explicit_empty_scope()
+        scope["functions"] = {
+            "mode": "explicit",
+            "selected_ids": [function_id],
+        }
+        agent = Agent(
+            id=agent_id,
+            tenant_id=tenant_id,
+            name="Validation Agent",
+            scenario_id=scenario.id,
+            llm_config_id=None,
+            capability_scope=scope,
+            data_source_ids=[],
+            runtime_binding_mode="legacy",
         )
         db.add_all([tenant, user, scenario, llm, function, agent])
         db.commit()
@@ -130,173 +124,71 @@ def test_migration_control_endpoints_commit_gates_and_rollback() -> None:
             json={
                 "name": "Validation Agent",
                 "scenario_id": "scenario-migration-api",
-                "llm_config_id": "llm-migration-api",
                 "data_source_ids": [],
-                "capability_scope": agent_capability_service.explicit_empty_scope(),
-                "runtime_binding_mode": "shadow",
+                "capability_scope": scope,
+                "runtime_binding_mode": "capability_only",
             },
         )
         assert bypass.status_code == 409, bypass.text
         assert bypass.json()["detail"]["code"] == "agent_mode_migration_required"
 
-        shadow = client.post(
-            f"/api/agents/{agent_id}/migration/mode",
-            json={
-                "target_mode": "shadow",
-                "reason": "Begin controlled validation",
-                "idempotency_key": "api-to-shadow",
-            },
-        )
-        assert shadow.status_code == 200, shadow.text
-        assert shadow.json()["runtime_binding_mode"] == "shadow"
+        for target in ("shadow", "prefer_capability", "legacy"):
+            rejected = client.post(
+                f"/api/agents/{agent_id}/migration/mode",
+                json={"target_mode": target, "reason": "Historical mode forbidden"},
+            )
+            assert rejected.status_code == 422, rejected.text
+
+        for suffix in ("shadow/refresh", "shadow/validate"):
+            retired = client.post(
+                f"/api/agents/{agent_id}/migration/{suffix}", json={}
+            )
+            assert retired.status_code == 404, retired.text
+
         blocked = client.post(
             f"/api/agents/{agent_id}/migration/mode",
             json={
-                "target_mode": "prefer_capability",
-                "reason": "Attempt before gate",
-                "idempotency_key": "api-too-early",
+                "target_mode": "capability_only",
+                "reason": "Attempt before readiness",
+                "idempotency_key": "api-direct-cutover",
             },
         )
         assert blocked.status_code == 409, blocked.text
-        assert blocked.json()["detail"]["code"] == "migration_gate_failed"
-
-        raw_marker = "RAW-API-SHADOW-MARKER-DO-NOT-LEAK"
-        message_ids: list[tuple[str, str]] = []
+        assert blocked.json()["detail"]["code"] == "migration_readiness_failed"
         with SessionLocal() as db:
-            db.info["tenant_id"] = tenant_id
-            db.info["user_id"] = user_id
-            persisted_agent = db.get(Agent, agent_id)
-            persisted_llm = db.get(LLMConfig, "llm-migration-api")
-            for index in (1, 2):
-                turn_input = agent_runtime_adapter.AgentTurnInput(
-                    structured_inputs={"amount": 8},
-                    target_kind="function",
-                    target_key=function_id,
-                )
-                context = agent_runtime_adapter.build_runtime_context(
-                    db,
-                    persisted_agent,
-                    persisted_llm,
-                    turn_input=turn_input,
-                )
-                snapshot = agent_runtime_adapter.input_snapshot(context)
-                legacy_definition_hash = snapshot["runtime"]["legacy_context"][
-                    "definition_hash"
-                ]
-                conversation_id = f"shadow-api-conversation-{index}"
-                message_id = f"shadow-api-message-{index}"
-                result_id = f"shadow-api-result-{index}"
-                conversation = Conversation(
-                    id=conversation_id,
-                    agent_id=agent_id,
-                    created_by_user_id=user_id,
-                )
-                message = Message(
-                    id=message_id,
-                    conversation_id=conversation_id,
-                    role="assistant",
-                    content=f"Persisted response {raw_marker}",
-                    tool_calls=[
-                        {
-                            "id": result_id,
-                            "type": "function",
-                            "function": {
-                                "name": "run_function",
-                                "arguments": json.dumps(
-                                    {
-                                        "function_id": function_id,
-                                        "params": {"amount": 8},
-                                    },
-                                    sort_keys=True,
-                                ),
-                            },
-                        }
-                    ],
-                    tool_results=[
-                        {
-                            "id": result_id,
-                            "name": "run_function",
-                            "result": json.dumps(
-                                {
-                                    "score": 6.0,
-                                    "definition_hash": legacy_definition_hash,
-                                }
-                            ),
-                            "private_marker": raw_marker,
-                        }
-                    ],
-                    stream_finalized=True,
-                    input_snapshot=snapshot,
-                )
-                db.add_all([conversation, message])
-                message_ids.append((message_id, result_id))
+            persisted = db.get(Agent, agent_id)
+            assert persisted.runtime_binding_mode == "legacy"
+            assert not db.query(PlatformMigrationCheckpoint).filter_by(
+                stage="agent_mode_event"
+            ).count()
+            persisted.llm_config_id = llm_id
             db.commit()
 
-        validation_receipts = []
-        for message_id, result_id in message_ids:
-            validated = client.post(
-                f"/api/agents/{agent_id}/migration/shadow/validate",
-                json={
-                    "source_message_id": message_id,
-                    "legacy_tool_result_id": result_id,
-                    "capability_kind": "function",
-                    "capability_key": function_id,
-                    "inputs": {"amount": 8},
-                    "managed_inputs": [],
-                },
-            )
-            assert validated.status_code == 200, validated.text
-            validation_receipts.append(validated.json())
-        assert validation_receipts[0]["gate"]["passed"] is False
-        assert validation_receipts[1]["gate"]["passed"] is True
-        assert raw_marker not in json.dumps(validation_receipts, sort_keys=True)
-
-        replay = client.post(
-            f"/api/agents/{agent_id}/migration/shadow/validate",
+        cutover = client.post(
+            f"/api/agents/{agent_id}/migration/mode",
             json={
-                "source_message_id": message_ids[0][0],
-                "legacy_tool_result_id": message_ids[0][1],
-                "capability_kind": "function",
-                "capability_key": function_id,
-                "inputs": {"amount": 8},
+                "target_mode": "capability_only",
+                "reason": "Attempt before readiness",
+                "idempotency_key": "api-direct-cutover",
             },
         )
-        assert replay.status_code == 200, replay.text
-        assert replay.json()["replayed"] is True
-        assert replay.json()["capability_invocation_id"] == validation_receipts[0][
-            "capability_invocation_id"
-        ]
+        assert cutover.status_code == 200, cutover.text
+        document = cutover.json()
+        assert document["runtime_binding_mode"] == "capability_only"
+        assert document["gate"]["passed"] is True
+        assert document["events"][0]["readiness_fingerprint"]
 
-        injected_metric = client.post(
-            f"/api/agents/{agent_id}/migration/shadow/validate",
-            json={
-                "source_message_id": message_ids[0][0],
-                "legacy_tool_result_id": message_ids[0][1],
-                "capability_kind": "function",
-                "capability_key": function_id,
-                "inputs": {"amount": 8},
-                "legacy_result_hash": "a" * 64,
-            },
-        )
-        assert injected_metric.status_code == 422, injected_metric.text
-        with SessionLocal() as db:
-            ledger = json.dumps(
-                [row.payload for row in db.query(PlatformMigrationCheckpoint).all()],
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-        assert raw_marker not in ledger
-        assert "score" not in ledger
-
-        rolled_back = client.post(
+        rollback = client.post(
             f"/api/agents/{agent_id}/migration/rollback",
-            json={
-                "reason": "Return to known path",
-                "idempotency_key": "api-rollback",
-            },
+            json={"reason": "Do not restore legacy"},
         )
-        assert rolled_back.status_code == 200, rolled_back.text
-        assert rolled_back.json()["runtime_binding_mode"] == "legacy"
+        assert rollback.status_code == 404, rollback.text
+        with SessionLocal() as db:
+            persisted = db.get(Agent, agent_id)
+            assert persisted.runtime_binding_mode == "capability_only"
+            assert not db.query(PlatformMigrationCheckpoint).filter_by(
+                stage="shadow_metric"
+            ).count()
     finally:
         client.close()
         engine.dispose()

@@ -490,7 +490,12 @@ class DataSourceDraftAutoRepairTests(unittest.TestCase):
                     name="待验证工资库",
                     type="postgres",
                     scenario_id=self.scenario.id,
-                    config={},
+                    config={
+                        "host": "db.example.test",
+                        "port": 5432,
+                        "database": "wage_draft",
+                        "user": "readonly",
+                    },
                 ),
                 self.db,
             )
@@ -500,7 +505,12 @@ class DataSourceDraftAutoRepairTests(unittest.TestCase):
                     name="待验证工资库（更新）",
                     type="postgres",
                     scenario_id=self.scenario.id,
-                    config={},
+                    config={
+                        "host": "db.example.test",
+                        "port": 5432,
+                        "database": "wage_draft_next",
+                        "user": "readonly",
+                    },
                 ),
                 self.db,
             )

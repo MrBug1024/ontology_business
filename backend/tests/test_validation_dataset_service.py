@@ -4,9 +4,11 @@ from contextlib import nullcontext
 from io import BytesIO
 import hashlib
 from pathlib import Path
+import re
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pyarrow.parquet as parquet
 from sqlalchemy import create_engine, func, select
@@ -324,6 +326,118 @@ class ValidationDatasetServiceTests(unittest.TestCase):
             completed["result"]["source_asset_version_ids"],
             [self.asset_version_id],
         )
+
+    def test_streaming_xlsx_without_dimension_materializes_all_profiled_sheets(self) -> None:
+        from contextlib import ExitStack
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        charge = workbook.active
+        charge.title = "charge"
+        charge.append(["charge_id", "amount"])
+        charge.append(["C-1", 12.5])
+        encounter = workbook.create_sheet("encounter")
+        encounter.append(["encounter_id", "days"])
+        encounter.append(["E-1", 3])
+        original = BytesIO()
+        workbook.save(original)
+        workbook.close()
+
+        rewritten = BytesIO()
+        with ZipFile(BytesIO(original.getvalue())) as source, ZipFile(
+            rewritten,
+            "w",
+            ZIP_DEFLATED,
+        ) as destination:
+            for member in source.infolist():
+                content = source.read(member.filename)
+                if member.filename.startswith("xl/worksheets/sheet"):
+                    content = re.sub(rb"<dimension\b[^>]*/>", b"", content)
+                destination.writestr(member, content)
+        xlsx = rewritten.getvalue()
+        digest = hashlib.sha256(xlsx).hexdigest()
+        with self._database() as db:
+            source = db.get(DataSource, self.source_id)
+            bucket_file = BucketFile(
+                id="raw-validation-xlsx",
+                data_source_id=source.id,
+                filename="validation.xlsx",
+                stored_path="minio://validation-test/platform/raw/validation.xlsx",
+                storage_provider="minio",
+                bucket_name="validation-test",
+                object_key="platform/raw/validation.xlsx",
+                object_version_id="raw-xlsx-v1",
+                object_url="minio://validation-test/platform/raw/validation.xlsx",
+                size=len(xlsx),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                content_sha256=digest,
+                status="parsed",
+            )
+            asset = DataAsset(
+                id="validation-xlsx-asset",
+                tenant_id="tenant-validation-data",
+                key="validation.workbook",
+                name="validation.xlsx",
+                media_type=bucket_file.mime,
+                labels={"catalog_purpose": "validation_asset"},
+                created_by_user_id="user-validation-data",
+            )
+            version = DataAssetVersion(
+                id="validation-xlsx-version",
+                tenant_id="tenant-validation-data",
+                asset_id=asset.id,
+                version_number=1,
+                bucket_file_id=bucket_file.id,
+                bucket_data_source_id=source.id,
+                status="ready",
+                content_sha256=digest,
+                byte_size=len(xlsx),
+                version_document={
+                    "profile": {
+                        "category": "table",
+                        "tables": [
+                            {
+                                "name": "charge",
+                                "relation_name": "validation__charge",
+                                "header_row_index": 0,
+                                "columns": [
+                                    {"name": "charge_id", "logical_type": "string"},
+                                    {"name": "amount", "logical_type": "number"},
+                                ],
+                            },
+                            {
+                                "name": "encounter",
+                                "relation_name": "validation__encounter",
+                                "header_row_index": 0,
+                                "columns": [
+                                    {"name": "encounter_id", "logical_type": "string"},
+                                    {"name": "days", "logical_type": "integer"},
+                                ],
+                            },
+                        ],
+                    }
+                },
+                created_by_user_id="user-validation-data",
+            )
+            db.add_all([bucket_file, asset, version])
+            db.commit()
+        self.raw_objects[("validation-test", "platform/raw/validation.xlsx")] = xlsx
+
+        payload = ValidationDatasetBuildIn(
+            asset_version_ids=[version.id],
+            name="Dimensionless workbook validation package",
+        )
+        with ExitStack() as stack:
+            for active_patch in self._patches():
+                stack.enter_context(active_patch)
+            with self._database() as db:
+                result = validation_dataset_service.build_validation_dataset(db, payload)
+
+        self.assertEqual(
+            result["relation_names"],
+            ["validation__charge", "validation__encounter"],
+        )
+        self.assertEqual(result["record_count"], 2)
 
 
 if __name__ == "__main__":

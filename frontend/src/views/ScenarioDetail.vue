@@ -961,7 +961,7 @@
       <el-form label-position="top" class="function-form">
         <div class="form-row">
           <el-form-item label="函数名称" required class="form-col">
-            <el-input v-model="functionForm.name" maxlength="200" show-word-limit placeholder="如：计算订单风险等级" />
+            <el-input v-model="functionForm.name" maxlength="200" show-word-limit placeholder="如：计算业务指标" />
           </el-form-item>
           <el-form-item label="可见性" class="form-col">
             <el-select v-model="functionForm.visibility" style="width:100%">
@@ -975,7 +975,7 @@
           <el-input v-model="functionForm.description" type="textarea" :rows="2" maxlength="8000" show-word-limit placeholder="说明这个业务函数的输入、输出与适用范围" />
         </el-form-item>
         <el-form-item label="标签（用逗号分隔，可选）">
-          <el-input v-model="functionForm.tags_text" maxlength="1619" placeholder="如：订单、风险、只读" />
+          <el-input v-model="functionForm.tags_text" maxlength="1619" placeholder="如：指标、只读" />
           <div class="form-help">最多 20 个标签，每个标签最多 80 个字符。</div>
         </el-form-item>
         <el-form-item label="运行方式" required>
@@ -1035,7 +1035,7 @@
       <el-form label-position="top">
         <div class="form-row">
           <el-form-item label="名称" class="form-col">
-            <el-input v-model="actionForm.name" placeholder="如：标记违规、生成报告" />
+            <el-input v-model="actionForm.name" placeholder="如：更新状态、生成报告" />
           </el-form-item>
           <el-form-item label="所属对象类型" class="form-col">
             <el-select v-model="actionForm.entity_id" style="width:100%">
@@ -1078,7 +1078,7 @@
             </el-select>
           </el-form-item>
           <el-form-item label="只读 SQL" required>
-            <el-input v-model="actionForm.executor_config.sql" type="textarea" :rows="5" class="mono" placeholder="SELECT * FROM orders WHERE order_id = {order_id}" />
+            <el-input v-model="actionForm.executor_config.sql" type="textarea" :rows="5" class="mono" placeholder="SELECT * FROM business_records WHERE record_id = {record_id}" />
             <div class="form-help">参数用 <code>{字段名}</code> 引用；系统只允许只读查询。</div>
           </el-form-item>
         </template>
@@ -1305,12 +1305,12 @@
           <RuleConditionBuilder v-model="ruleForm.condition" :fields="ruleFieldOptions" />
         </el-form-item>
         <el-form-item label="命中后动作（文本说明）">
-          <el-input v-model="ruleForm.action_on_match" placeholder="如：标记为疑似违规并通知审核员" />
+          <el-input v-model="ruleForm.action_on_match" placeholder="如：更新状态并通知负责人" />
         </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="ruleDlg = false">取消</el-button>
-        <el-button type="primary" :loading="scenarioDraftPromotionSyncing" @click="saveRule">保存</el-button>
+        <el-button type="primary" :loading="ruleSaving || scenarioDraftPromotionSyncing" :disabled="ruleSaving" @click="saveRule">保存</el-button>
       </template>
     </el-dialog>
 
@@ -1393,7 +1393,8 @@ import { draftRefToken, normalizeScenarioModelDrafts, scenarioDraftIsOpen, scena
 
 const route = useRoute()
 const router = useRouter()
-const sid = route.params.id as string
+let sid = String(route.params.id || '')
+let scenarioLoadRequest = 0
 const scenarioLoading = ref(true)
 const scenarioAccessDenied = ref(false)
 const scenarioLoadError = ref('')
@@ -1418,13 +1419,16 @@ const scenarioDraftPromotionSyncing = ref(false)
 let scenarioDraftRequest = 0
 let scenarioDraftViewDisposed = false
 
-const detail = ref<ScenarioDetail>({
-  id: sid, name: '', description: '',
-  entities: [], relations: [], data_sources: [],
-  instances: [], relation_instances: [], mappings: [], relation_mappings: [],
-  functions: [],
-  actions: [], rules: [], events: [], workflows: [],
-})
+function emptyScenarioDetail(id: string): ScenarioDetail {
+  return {
+    id, name: '', description: '',
+    entities: [], relations: [], data_sources: [],
+    instances: [], relation_instances: [], mappings: [], relation_mappings: [],
+    functions: [],
+    actions: [], rules: [], events: [], workflows: [],
+  }
+}
+const detail = ref<ScenarioDetail>(emptyScenarioDetail(sid))
 const capabilityNames = computed(() => Object.fromEntries([
   ...detail.value.functions.map((item) => [`function:${item.id}`, item.name]),
   ...detail.value.actions.map((item) => [`action:${item.id}`, item.name]),
@@ -1898,8 +1902,8 @@ function openEntity(id?: string) {
     kind: 'entity',
     id: e?.id,
     form: e
-      ? { name: e.name, color: e.color, description: e.description, is_abstract: e.is_abstract, properties: e.properties.map((p) => cloneForForm(p)) }
-      : { name: '', color: graphPalette[0], description: '', is_abstract: false, properties: [] },
+      ? { name: e.name, api_name: e.api_name || '', namespace: e.namespace || '', color: e.color, description: e.description, is_abstract: e.is_abstract, state_property: e.state_property || '', properties: e.properties.map((p) => ({ ...cloneForForm(p), _apiNameLocked: true })) }
+      : { name: '', api_name: '', namespace: '', color: graphPalette[0], description: '', is_abstract: false, state_property: '', properties: [] },
   }
 }
 function openRelation(id?: string) {
@@ -2015,8 +2019,16 @@ async function saveEditor() {
   try {
     let saved: any
     if (kind === 'entity') {
-      if (id) saved = await api.updateEntity(id, form)
-      else saved = await api.createEntity(sid, form)
+      const entityPayload = {
+        ...form,
+        properties: (form.properties || []).map((property: any) => {
+          const propertyPayload = { ...property }
+          delete propertyPayload._apiNameLocked
+          return propertyPayload
+        }),
+      }
+      if (id) saved = await api.updateEntity(id, entityPayload)
+      else saved = await api.createEntity(sid, entityPayload)
     } else if (kind === 'relation') {
       if (id) saved = await api.updateRelation(id, form)
       else saved = await api.createRelation(sid, form)
@@ -2035,7 +2047,7 @@ async function saveEditor() {
     }
     scenarioDraftSaveToast('已保存', draftResolved)
   } catch (e: any) {
-    ElMessage.error(e?.response?.data?.detail || '保存失败')
+    ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败')
   } finally {
     saving.value = false
     releaseScenarioDraftPromotionSave(promotion)
@@ -3143,6 +3155,7 @@ watch(actionParamsForm, () => {
 
 // ── 规则（Rules）──
 const ruleDlg = ref(false)
+const ruleSaving = ref(false)
 const ruleForm = ref<any>({ condition: {} })
 const ruleFieldOptions = computed(() => {
   const entity = detail.value.entities.find((item) => item.id === ruleForm.value.entity_id)
@@ -3158,10 +3171,11 @@ function openRule(id?: string) {
   ruleDlg.value = true
 }
 async function saveRule() {
-  if (!canWrite.value) return
+  if (!canWrite.value || ruleSaving.value) return
   const f = { ...ruleForm.value, condition: cloneForForm(ruleForm.value.condition || {}) }
   const promotion = claimScenarioDraftPromotionSave('rule')
   if (!promotion.allowed) return
+  ruleSaving.value = true
   try {
     const saved = f.id ? await api.updateRule(f.id, f) : await api.createRule(sid, f)
     const draftResolved = await resolveScenarioDraftAfterFormalSave('rule', saved, f.id, promotion.draft)
@@ -3171,6 +3185,7 @@ async function saveRule() {
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.detail || e?.message || '保存失败')
   } finally {
+    ruleSaving.value = false
     releaseScenarioDraftPromotionSave(promotion)
   }
 }
@@ -4036,6 +4051,8 @@ async function refreshCandidateReview(definitionChanged: boolean) {
 
 // ── 加载 ──
 async function load() {
+  const request = ++scenarioLoadRequest
+  const scenarioId = sid
   scenarioLoading.value = true
   scenarioAccessDenied.value = false
   scenarioLoadError.value = ''
@@ -4043,9 +4060,11 @@ async function load() {
     // Scenario detail is a schema projection. Runtime objects and relations
     // are always fetched through bounded pages below, so a large dataset can
     // never hold the whole page hostage.
-    const loaded = await api.getScenario(sid, { include_runtime_facts: false })
+    const loaded = await api.getScenario(scenarioId, { include_runtime_facts: false })
+    if (request !== scenarioLoadRequest || scenarioId !== sid) return
     detail.value = { ...loaded, relation_mappings: loaded.relation_mappings || [] }
   } catch (e: any) {
+    if (request !== scenarioLoadRequest || scenarioId !== sid) return
     if (Number(e?.status || e?.response?.status) === 403) {
       scenarioAccessDenied.value = true
     } else {
@@ -4053,21 +4072,25 @@ async function load() {
     }
     return
   } finally {
-    scenarioLoading.value = false
+    if (request === scenarioLoadRequest && scenarioId === sid) scenarioLoading.value = false
   }
   try {
     const [sources, configs, skillItems, mcpItems] = await Promise.all([
       api.listDataSources(), api.listLLM(), api.listSkills(), api.listMCP(),
     ])
+    if (request !== scenarioLoadRequest || scenarioId !== sid) return
     dataSources.value = sources
     llmConfigs.value = configs
     skills.value = skillItems
     mcpConfigs.value = mcpItems
   } catch (e: any) {
-    ElMessage.error(e?.response?.data?.detail || e?.message || '场景关联资源加载失败')
+    if (request === scenarioLoadRequest && scenarioId === sid) {
+      ElMessage.error(e?.response?.data?.detail || e?.message || '场景关联资源加载失败')
+    }
   } finally {
-    await loadScenarioDrafts()
+    if (request === scenarioLoadRequest && scenarioId === sid) await loadScenarioDrafts()
   }
+  if (request !== scenarioLoadRequest || scenarioId !== sid) return
   // The object explorer is only visible on the instances tab. Avoid doing a
   // runtime object scan while the ontology tab is becoming interactive.
   if (tab.value === 'instances') {
@@ -4164,23 +4187,65 @@ function workflowStatusLabel(status?: string) {
 function workflowStatusType(status?: string) {
   return status === 'active' ? 'success' : 'info'
 }
+async function openRequestedRouteAction() {
+  const editActionId = requestedEditActionId()
+  if (editActionId && canWrite.value && detail.value.actions.some((action) => action.id === editActionId)) {
+    openAction(editActionId)
+    return
+  }
+  await openGovernedActionById(requestedActionId(), consumeAssistantActionPreviewState())
+}
 onMounted(async () => {
   mappingRefreshViewDisposed = false
   objectSearchViewDisposed = false
   scenarioDraftViewDisposed = false
   if (route.query.stage !== tab.value) void router.replace({ query: { ...route.query, stage: tab.value } })
   await load()
-  const editActionId = requestedEditActionId()
-  if (editActionId && canWrite.value && detail.value.actions.some((action) => action.id === editActionId)) {
-    openAction(editActionId)
-  } else {
-    await openGovernedActionById(requestedActionId(), consumeAssistantActionPreviewState())
-  }
+  await openRequestedRouteAction()
   window.addEventListener('assistant-proposal-applied', onAssistantApplied)
   window.addEventListener('assistant-scenario-drafts-updated', onAssistantScenarioDraftsUpdated)
   window.addEventListener('open-governed-action', onOpenGovernedAction)
 })
+watch(() => route.params.id, async (value) => {
+  const nextId = Array.isArray(value) ? String(value[0] || '') : String(value || '')
+  if (!nextId || nextId === sid) return
+  scenarioLoadRequest += 1
+  scenarioDraftRequest += 1
+  objectRequestId += 1
+  mappingTableRequest += 1
+  for (const timer of mappingRefreshTimers.values()) window.clearTimeout(timer)
+  mappingRefreshTimers.clear()
+  mappingRefreshFailures.clear()
+  sid = nextId
+  detail.value = emptyScenarioDetail(sid)
+  scenarioDrafts.value = []
+  scenarioDraftSummary.value = {}
+  pendingScenarioDraftResolutions.value = []
+  activeScenarioDraftPromotion.value = null
+  editor.value = null
+  selectedObjectId.value = null
+  objectItems.value = []
+  objectDetail.value = null
+  relationInstanceRows.value = []
+  mappingDlg.value = false
+  mappingPreviewDlg.value = false
+  relationMappingDlg.value = false
+  relationInstanceDlg.value = false
+  functionDlg.value = false
+  actionDlg.value = false
+  actionExecuteDlg.value = false
+  ruleDlg.value = false
+  eventDlg.value = false
+  execResultDlg.value = false
+  recordInputDlg.value = false
+  wfEditor.value = null
+  const nextStage = Array.isArray(route.query.stage) ? route.query.stage[0] : route.query.stage
+  tab.value = typeof nextStage === 'string' && stageNames.has(nextStage) ? nextStage : 'ontology'
+  await load()
+  await openRequestedRouteAction()
+})
 onBeforeUnmount(() => {
+  scenarioLoadRequest += 1
   mappingRefreshViewDisposed = true
   mappingTableRequest += 1
   objectSearchViewDisposed = true

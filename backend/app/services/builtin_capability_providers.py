@@ -160,6 +160,78 @@ def _structured_input_audit(inputs: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _rule_condition_fields(condition: Any) -> list[str]:
+    fields: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key in ("field", "value_field"):
+                field = str(value.get(key) or "").strip()
+                if field:
+                    fields.add(field)
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                visit(nested)
+
+    visit(condition)
+    return sorted(fields)
+
+
+def _rule_property_schema(prop: Any) -> dict[str, Any]:
+    kind = str(getattr(prop, "data_type", "") or "").strip().lower()
+    schema: dict[str, Any]
+    if kind == "date":
+        schema = {"type": "string", "format": "date"}
+    elif kind == "datetime":
+        schema = {"type": "string", "format": "date-time"}
+    elif kind in {"float", "number"}:
+        schema = {"type": "number"}
+    elif kind == "integer":
+        schema = {"type": "integer"}
+    elif kind == "boolean":
+        schema = {"type": "boolean"}
+    elif kind in {"string", "text"}:
+        schema = {"type": "string"}
+    else:
+        schema = {}
+    enum_values = list(getattr(prop, "enum_values", None) or [])
+    if bool(getattr(prop, "is_enum", False)) and enum_values:
+        schema["enum"] = enum_values
+    return schema
+
+
+def _rule_input_schema(definition: Any, rule: Any) -> dict[str, Any]:
+    properties_by_field: dict[str, Any] = {}
+    entity_id = str(getattr(rule, "entity_id", "") or "")
+    entity = definition.entities.get(entity_id) if entity_id else None
+    for prop in (getattr(entity, "properties", None) or []):
+        for field in {
+            str(getattr(prop, "name", "") or "").strip(),
+            str(getattr(prop, "api_name", "") or "").strip(),
+        }:
+            if field:
+                properties_by_field[field] = prop
+    fields = _rule_condition_fields(getattr(rule, "condition", {}) or {})
+    return {
+        "type": "object",
+        "properties": {
+            "record": {
+                "type": "object",
+                "properties": {
+                    field: _rule_property_schema(properties_by_field.get(field))
+                    for field in fields
+                },
+                "required": fields,
+                "additionalProperties": False,
+            }
+        },
+        "required": ["record"],
+        "additionalProperties": False,
+    }
+
+
 @contextmanager
 def _invocation_lineage(
     db: Session,
@@ -373,6 +445,75 @@ class FunctionDefinitionProvider(_BuiltinProvider):
             message="function execution is not permitted",
         )
         return function_runtime_service.execute_function(function, request.inputs)
+
+
+@dataclass(frozen=True, slots=True)
+class OntologyRuleProvider(_BuiltinProvider):
+    provider_key: ClassVar[str] = BUILTIN_PROVIDER_KEYS["rule"]
+    capability_kind: ClassVar[str] = "rule"
+
+    def contract(
+        self,
+        capability: CapabilityRef,
+        deployment: ResolvedDeployment,
+    ) -> Mapping[str, Any]:
+        definition, rule = _resource(
+            deployment,
+            capability,
+            self.capability_kind,
+        )
+        return {
+            "input_schema": _rule_input_schema(definition, rule),
+            "required_roles": [],
+            "required_scopes": [],
+            "side_effect": False,
+            "requires_confirmation": False,
+            "idempotency_required": False,
+        }
+
+    def _evaluate(
+        self,
+        request: Request,
+        actor: Actor,
+        deployment: ResolvedDeployment,
+        data_context: RuntimeDataContext,
+    ) -> Mapping[str, Any]:
+        self._require_supported_data_context(data_context)
+        definition, rule = self._ready_resource(request.capability, deployment)
+        _session_user_id(self._session(), actor)
+        permission_service.require_scenario_permission(
+            self._session(),
+            definition.scenario,
+            "read",
+            message="rule evaluation is not permitted",
+        )
+        record = request.inputs.get("record")
+        if not isinstance(record, Mapping):
+            raise BuiltinCapabilityProviderError("rule record must be an object")
+        return workflow_service.evaluate_rule(
+            rule,
+            dict(record),
+            db=self._session(),
+            runtime_definition=definition,
+        )
+
+    def preview(
+        self,
+        request: Request,
+        actor: Actor,
+        deployment: ResolvedDeployment,
+        data_context: RuntimeDataContext,
+    ) -> Mapping[str, Any]:
+        return self._evaluate(request, actor, deployment, data_context)
+
+    def invoke(
+        self,
+        request: Request,
+        actor: Actor,
+        deployment: ResolvedDeployment,
+        data_context: RuntimeDataContext,
+    ) -> Mapping[str, Any]:
+        return self._evaluate(request, actor, deployment, data_context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,6 +772,7 @@ class OntologyWorkflowProvider(_BuiltinProvider):
 def builtin_capability_providers() -> tuple[_BuiltinProvider, ...]:
     return (
         FunctionDefinitionProvider(),
+        OntologyRuleProvider(),
         OntologyActionProvider(),
         OntologyWorkflowProvider(),
     )
@@ -640,6 +782,7 @@ __all__ = [
     "BuiltinCapabilityProviderError",
     "FunctionDefinitionProvider",
     "OntologyActionProvider",
+    "OntologyRuleProvider",
     "OntologyWorkflowProvider",
     "builtin_capability_providers",
 ]

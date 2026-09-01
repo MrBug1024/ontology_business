@@ -1,10 +1,9 @@
 """Validation-Agent adapter for the protocol-neutral capability kernel.
 
-The legacy Agent engine intentionally remains available during migration.  This
-module owns only the adapter boundary: it resolves a public capability catalog,
-keeps one immutable ``RuntimeDataContext`` for the turn, translates generic
-model tool calls into ``capability_application_service`` requests, and records
-why a migration mode selected or rejected the new path.
+Historical Agent mode values remain readable for migration audit, but they are
+not executable. This module resolves a public capability catalog, keeps one
+immutable ``RuntimeDataContext`` for the turn, and translates generic model
+tool calls into ``capability_application_service`` requests.
 
 No provider, connector, data-source, mapping, SQL, or industry-specific branch
 belongs here.  Those concerns stay behind the capability application service
@@ -56,13 +55,13 @@ from .capability_invoker import CapabilityInvocationError
 _CAPABILITY_CATEGORY_BY_KIND = {
     "function": "functions",
     "action": "actions",
+    "rule": "rules",
     "workflow": "workflows",
 }
-_SUPPORTED_MODES = {
+_HISTORICAL_MODES = {
     "legacy",
     "shadow",
     "prefer_capability",
-    "capability_only",
 }
 _CAPABILITY_TOOL_LIST = "list_available_capabilities"
 _CAPABILITY_TOOL_INVOKE = "invoke_capability"
@@ -427,7 +426,7 @@ class CapabilityAgentRuntime:
         llm: LLMConfig,
         *,
         turn_input: AgentTurnInput | None = None,
-        environment: str = "dev",
+        environment: str | None = None,
     ) -> None:
         self.db = db
         self.agent = agent
@@ -450,7 +449,7 @@ class CapabilityAgentRuntime:
             "read",
             message="没有使用该 Agent 业务场景的权限",
         )
-        self.environment = str(environment or "dev").strip().lower()
+        self.environment = runtime_connector_service.runtime_environment(environment)
         if self.environment not in {"dev", "staging", "prod"}:
             raise AgentRuntimeAdapterError(
                 "invalid_runtime_environment",
@@ -1323,69 +1322,30 @@ def _capability_runtime_fact(
     }
 
 
-def _legacy_runtime_fact(context: Any) -> dict[str, Any]:
-    definition = getattr(context, "runtime_definition", None)
-    semantic_contract = [
-        {
-            "entity_id": str(getattr(item, "entity_id", "") or ""),
-            "property_names": sorted(
-                str(name) for name in (getattr(item, "column_map", {}) or {}).keys()
-            ),
-        }
-        for item in getattr(context, "mappings", []) or []
-    ]
-    return {
-        "resolved": True,
-        "definition_hash": str(getattr(definition, "definition_hash", "") or ""),
-        "source_count": len(getattr(context, "data_sources", []) or []),
-        "mapping_count": len(getattr(context, "mappings", []) or []),
-        "semantic_contract_fingerprint": canonical_hash(
-            semantic_contract,
-            domain="agent-legacy-semantic-contract-v1",
-        ),
-    }
-
-
-def _attach_legacy_audit(
-    context: Any,
-    *,
-    turn_input: AgentTurnInput,
-    decision: Mapping[str, Any],
-) -> Any:
-    context.runtime_path = "legacy"
-    context.runtime_decision = copy.deepcopy(dict(decision))
-    context.turn_input = turn_input
-    context.input_snapshot = lambda: {
-        **_safe_turn_input(turn_input),
-        "runtime": copy.deepcopy(context.runtime_decision),
-        "invocations": [],
-    }
-    context.evidence_snapshot = lambda: []
-    return context
-
-
 def build_runtime_context(
     db: Session,
     agent: Agent,
     llm: LLMConfig,
     *,
     turn_input: AgentTurnInput | None = None,
-    environment: str = "dev",
+    environment: str | None = None,
 ) -> Any:
-    """Choose one migration path without ever silently crossing boundaries."""
+    """Build the only executable Agent runtime and reject historical modes."""
 
-    from . import agent_engine  # local import avoids an engine/adapter cycle
-
-    normalized_input = turn_input or AgentTurnInput()
     mode = str(getattr(agent, "runtime_binding_mode", "legacy") or "legacy").strip()
-    if mode not in _SUPPORTED_MODES:
+    if mode in _HISTORICAL_MODES:
+        raise AgentRuntimeAdapterError(
+            "historical_runtime_disabled",
+            "Historical Agent runtime modes are disabled; migrate the Agent to "
+            "capability_only",
+        )
+    if mode != "capability_only":
         raise AgentRuntimeAdapterError(
             "invalid_runtime_binding_mode",
             "Agent runtime binding mode is invalid",
         )
-    if mode == "legacy":
-        return agent_engine.AgentContext(db, agent, llm, environment=environment)
 
+    normalized_input = turn_input or AgentTurnInput()
     capability_runtime: CapabilityAgentRuntime | None = None
     capability_error: AgentRuntimeAdapterError | None = None
     try:
@@ -1400,98 +1360,26 @@ def build_runtime_context(
         capability_error = exc
 
     capability_fact = _capability_runtime_fact(capability_runtime, capability_error)
-    if mode == "capability_only":
-        if capability_runtime is None:
-            raise capability_error or AgentRuntimeAdapterError(
-                "capability_context_unavailable",
-                "Capability-only Agent cannot resolve its runtime context",
-            )
-        capability_runtime.set_runtime_decision(
-            {
-                "contract": "agent-runtime-decision/v1",
-                "configured_mode": mode,
-                "selected_path": "capability",
-                "fallback": {"used": False},
-                "capability_context": capability_fact,
-            }
+    if capability_runtime is None:
+        raise capability_error or AgentRuntimeAdapterError(
+            "capability_context_unavailable",
+            "Capability-only Agent cannot resolve its runtime context",
         )
-        return capability_runtime
-
-    legacy_context = agent_engine.AgentContext(db, agent, llm, environment=environment)
-    legacy_fact = _legacy_runtime_fact(legacy_context)
-    if mode == "shadow":
-        comparison = {
-            "definition_hash_equal": bool(
-                capability_runtime is not None
-                and capability_fact.get("definition_hash") == legacy_fact["definition_hash"]
-            ),
-            "readiness_differs": not bool(capability_fact.get("complete", False)),
-            "legacy_source_count": legacy_fact["source_count"],
-            "capability_data_handle_count": capability_fact.get("data_handle_count", 0),
-        }
-        return _attach_legacy_audit(
-            legacy_context,
-            turn_input=normalized_input,
-            decision={
-                "contract": "agent-runtime-decision/v1",
-                "configured_mode": mode,
-                "selected_path": "legacy",
-                "fallback": {"used": False},
-                "shadow": {"executed_path": "legacy", "comparison": comparison},
-                "capability_context": capability_fact,
-                "legacy_context": legacy_fact,
-            },
-        )
-
-    if capability_runtime is not None and capability_runtime.complete:
-        capability_runtime.set_runtime_decision(
-            {
-                "contract": "agent-runtime-decision/v1",
-                "configured_mode": mode,
-                "selected_path": "capability",
-                "fallback": {"used": False},
-                "capability_context": capability_fact,
-                "legacy_context": legacy_fact,
-            }
-        )
-        return capability_runtime
-
-    fallback_code = (
-        capability_error.code
-        if capability_error is not None
-        else "capability_context_incomplete"
-    )
-    return _attach_legacy_audit(
-        legacy_context,
-        turn_input=normalized_input,
-        decision={
+    capability_runtime.set_runtime_decision(
+        {
             "contract": "agent-runtime-decision/v1",
             "configured_mode": mode,
-            "selected_path": "legacy",
-            "fallback": {
-                "used": True,
-                "code": fallback_code,
-                "message": (
-                    capability_error.message
-                    if capability_error is not None
-                    else "Capability context is incomplete; legacy execution was selected"
-                ),
-            },
+            "selected_path": "capability",
+            "fallback": {"used": False},
             "capability_context": capability_fact,
-            "legacy_context": legacy_fact,
-        },
+        }
     )
+    return capability_runtime
 
 
 def input_snapshot(context: Any) -> dict[str, Any]:
     method = getattr(context, "input_snapshot", None)
     return method() if callable(method) else {}
-
-
-def legacy_runtime_fact(context: Any) -> dict[str, Any]:
-    """Return the credential-free legacy context fingerprint used in snapshots."""
-
-    return _legacy_runtime_fact(context)
 
 
 def evidence_snapshot(context: Any) -> list[dict[str, Any]]:
@@ -1506,5 +1394,4 @@ __all__ = [
     "build_runtime_context",
     "evidence_snapshot",
     "input_snapshot",
-    "legacy_runtime_fact",
 ]

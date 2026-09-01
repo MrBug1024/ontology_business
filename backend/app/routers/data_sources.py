@@ -182,6 +182,13 @@ def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_d
             )
         except object_storage_service.ObjectStorageError as exc:
             raise HTTPException(503, str(exc)) from exc
+    elif values.get("type") == "postgres":
+        try:
+            values["config"] = datasource_service.normalize_postgres_config(
+                values.get("config")
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     ds = DataSource(
         tenant_id=tenant_service.current_tenant_id(db),
         resource_scope="modeling",
@@ -251,6 +258,13 @@ def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(
             )
         except object_storage_service.ObjectStorageError as exc:
             raise HTTPException(503, str(exc)) from exc
+    elif values.get("type") == "postgres":
+        try:
+            values["config"] = datasource_service.normalize_postgres_config(
+                values.get("config")
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     for k, v in values.items():
         setattr(ds, k, v)
     if ds.type == "file_bucket":

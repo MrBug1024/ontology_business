@@ -38,7 +38,7 @@ export interface CapabilityAccessManifest {
     definition_hash: string
   }
   capabilities: Array<{
-    kind: 'function' | 'action' | 'workflow' | 'query' | 'provider'
+    kind: 'function' | 'action' | 'rule' | 'workflow' | 'query' | 'provider'
     key: string
     name: string
     input_schema_hash: string

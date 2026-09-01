@@ -12,7 +12,6 @@ from sqlalchemy import cast, delete, func, or_, select, String, text, update
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import Session, joinedload, load_only
 
-from ..config import get_settings
 from ..database import get_db
 from ..models import (
     ActionExecutionLog,
@@ -424,8 +423,11 @@ def _validate_action_executor(
             workflow_service.validate_http_action_config(config)
         except PolicyViolation as exc:
             raise HTTPException(400, f"外部接口操作配置无效: {exc}") from exc
-    if payload.executor_type == "script" and not get_settings().allow_unsafe_workflow_nodes:
-        raise HTTPException(400, "脚本操作默认停用；请改用受治理的操作或工作流节点")
+    if payload.executor_type == "script":
+        raise HTTPException(
+            400,
+            "脚本操作已停用；请改用受治理的内置能力或受信 Skill",
+        )
     if payload.executor_type == "template":
         if not payload.requires_confirmation or not payload.idempotency_required:
             raise HTTPException(400, "模板附件操作必须启用人工确认和幂等保护")
@@ -1611,11 +1613,22 @@ def _mapping_out(
     )
 
 
-def _authoring_definition_for_scenario(db: Session, scenario: BusinessScenario) -> Any:
+def _runtime_definition_for_scenario(db: Session, scenario: BusinessScenario) -> Any:
     try:
+        if str(scenario.status or "").strip().lower() == "retired":
+            return runtime_definition_service.resolve_retired_history(
+                db,
+                scenario,
+                environment=runtime_connector_service.runtime_environment(),
+            )
         return runtime_definition_service.resolve_authoring(db, scenario)
     except runtime_definition_service.RuntimeDefinitionError as exc:
         raise HTTPException(409, f"当前建模定义不可读取: {exc}") from exc
+
+
+def _authoring_definition_for_scenario(db: Session, scenario: BusinessScenario) -> Any:
+    """Read live authoring, or immutable deployment history after retirement."""
+    return _runtime_definition_for_scenario(db, scenario)
 
 
 def _instance_in_current_runtime(
@@ -4280,7 +4293,12 @@ def get_mapping_refresh_job(
     db: Session = Depends(get_db),
 ):
     job = db.get(DataMappingRefreshJob, job_id)
-    if not job or job.tenant_id != tenant_service.current_tenant_id(db):
+    current_environment = runtime_connector_service.runtime_environment()
+    if (
+        not job
+        or job.tenant_id != tenant_service.current_tenant_id(db)
+        or str(job.environment or "dev") != current_environment
+    ):
         raise HTTPException(404, "映射刷新任务不存在")
     _scenario_for_request(db, job.scenario_id)
     response.headers["Cache-Control"] = "no-store"
@@ -4453,7 +4471,7 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
         definition = runtime_definition_service.resolve_active(
             db,
             scenario,
-            environment=payload.environment,
+            environment=runtime_connector_service.runtime_environment(),
         )
         a = runtime_definition_service.resolve_resource(definition, "action", action_id)
     except runtime_definition_service.RuntimeDefinitionError as exc:
@@ -4674,9 +4692,7 @@ def evaluate_rule(rule_id: str, payload: dict, db: Session = Depends(get_db)):
         raise HTTPException(404, "规则不存在")
     scenario = _scenario_for_request(db, live_rule.scenario_id)
     record = (payload or {}).get("record", {})
-    environment = str((payload or {}).get("environment") or "dev").strip().lower()
-    if environment not in {"dev", "staging", "prod"}:
-        raise HTTPException(400, "environment 必须是 dev、staging 或 prod")
+    environment = runtime_connector_service.runtime_environment()
     if not isinstance(record, dict):
         raise HTTPException(400, "规则评估记录必须是对象")
     try:
@@ -4753,7 +4769,7 @@ def publish_event(event_id: str, payload: EventPublishIn, db: Session = Depends(
         definition = runtime_definition_service.resolve_active(
             db,
             scenario,
-            environment=payload.environment,
+            environment=runtime_connector_service.runtime_environment(),
         )
         event = runtime_definition_service.resolve_resource(definition, "event", event_id)
         envelope, queued_runs = operations_service.publish_event(
@@ -4886,7 +4902,7 @@ def create_workflow_run(
         definition = runtime_definition_service.resolve_active(
             db,
             scenario,
-            environment=payload.environment,
+            environment=runtime_connector_service.runtime_environment(),
         )
         workflow = runtime_definition_service.resolve_resource(
             definition, "workflow", workflow_id
@@ -4973,11 +4989,11 @@ def list_execution_logs(
     db: Session = Depends(get_db),
 ):
     _scenario_for_request(db, scenario_id)
+    current_environment = runtime_connector_service.runtime_environment()
     statement = select(ActionExecutionLog).where(
         ActionExecutionLog.scenario_id == scenario_id,
+        ActionExecutionLog.environment == current_environment,
     )
-    if environment:
-        statement = statement.where(ActionExecutionLog.environment == environment)
     logs = db.execute(
         statement
         .order_by(ActionExecutionLog.created_at.desc())

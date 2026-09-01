@@ -18,6 +18,7 @@ from app.models import (
     LLMConfig,
     LogicalDataset,
     Message,
+    OntologyRule,
     RunInputBinding,
     ScenarioCapabilityPort,
     Tenant,
@@ -164,6 +165,49 @@ def test_zero_data_capability_agent_uses_kernel_without_legacy_context(db: Sessi
     assert invocation.request_document["structured_inputs"]["outline"]["fields"] == {
         "amount": {"type": "integer"}
     }
+
+
+def test_agent_catalog_and_invocation_include_selected_dynamic_rule(db: Session) -> None:
+    _tenant, _user, scenario, llm, _function, agent = _world(db, "dynamic-rule")
+    rule = OntologyRule(
+        id="rule-dynamic-rule",
+        scenario_id=scenario.id,
+        name="Generic threshold rule",
+        condition={"field": "amount", "op": ">", "value": 2},
+        severity="warning",
+        enabled=True,
+    )
+    scope = agent_capability_service.explicit_empty_scope()
+    scope["rules"] = {
+        "mode": "explicit",
+        "selected_ids": [rule.id],
+    }
+    agent.capability_scope = scope
+    db.add(rule)
+    db.commit()
+
+    runtime = agent_runtime_adapter.build_runtime_context(db, agent, llm)
+
+    assert [
+        (item["kind"], item["key"])
+        for item in runtime.public_catalog()
+    ] == [("rule", rule.id)]
+    runtime.db.info["action_audit_context"] = {"agent_id": runtime.agent.id}
+    try:
+        receipt = json.loads(runtime.execute_tool(
+            "invoke_capability",
+            {
+                "kind": "rule",
+                "key": rule.id,
+                "inputs": {"record": {"amount": 3}},
+            },
+        ))
+    finally:
+        runtime.db.info.pop("action_audit_context", None)
+
+    assert receipt["status"] == "succeeded"
+    assert receipt["output"]["matched"] is True
+    assert receipt["output"]["side_effects_executed"] is False
 
 
 def test_same_agent_can_pin_two_data_versions_without_configuration_change(
@@ -413,54 +457,32 @@ def test_non_browser_turn_persists_safe_snapshot_and_evidence(db: Session) -> No
         assert message.evidence_refs == result["evidence_refs"]
 
 
-def test_shadow_executes_legacy_and_records_comparison(db: Session) -> None:
-    _tenant, _user, _scenario, llm, _function, agent = _world(db, "shadow")
-    agent.runtime_binding_mode = "shadow"
+@pytest.mark.parametrize("mode", ("legacy", "shadow", "prefer_capability"))
+def test_historical_modes_fail_closed_before_runtime_construction(
+    db: Session,
+    mode: str,
+) -> None:
+    _tenant, _user, _scenario, llm, _function, agent = _world(db, mode)
+    agent.runtime_binding_mode = mode
     agent.data_source_ids = []
     db.commit()
+    with (
+        patch.object(
+            agent_engine,
+            "AgentContext",
+            side_effect=AssertionError("legacy runtime must not be constructed"),
+        ),
+        patch.object(
+            agent_runtime_adapter,
+            "CapabilityAgentRuntime",
+            side_effect=AssertionError("capability runtime must not be probed"),
+        ),
+    ):
+        with pytest.raises(agent_runtime_adapter.AgentRuntimeAdapterError) as blocked:
+            agent_runtime_adapter.build_runtime_context(db, agent, llm)
 
-    context = agent_runtime_adapter.build_runtime_context(db, agent, llm)
-    snapshot = agent_runtime_adapter.input_snapshot(context)
-    assert isinstance(context, agent_engine.AgentContext)
-    assert snapshot["runtime"]["configured_mode"] == "shadow"
-    assert snapshot["runtime"]["selected_path"] == "legacy"
-    assert snapshot["runtime"]["shadow"]["executed_path"] == "legacy"
-    assert snapshot["runtime"]["capability_context"]["resolved"] is True
-
-
-def test_prefer_capability_fallback_is_explicit_and_auditable(db: Session) -> None:
-    _tenant, _user, _scenario, llm, _function, agent = _world(db, "fallback")
-    agent.runtime_binding_mode = "prefer_capability"
-    agent.data_source_ids = []
-    scope = agent_capability_service.explicit_empty_scope()
-    scope["functions"] = {
-        "mode": "explicit",
-        "selected_ids": ["missing-function"],
-    }
-    agent.capability_scope = scope
-    db.commit()
-
-    context = agent_runtime_adapter.build_runtime_context(db, agent, llm)
-    snapshot = agent_runtime_adapter.input_snapshot(context)
-    assert isinstance(context, agent_engine.AgentContext)
-    assert snapshot["runtime"]["selected_path"] == "legacy"
-    assert snapshot["runtime"]["fallback"] == {
-        "used": True,
-        "code": "capability_context_incomplete",
-        "message": "Capability context is incomplete; legacy execution was selected",
-    }
-    assert snapshot["runtime"]["capability_context"]["issues"][0]["code"] == (
-        "selected_capability_unavailable"
+    assert blocked.value.code == "historical_runtime_disabled"
+    assert blocked.value.message == (
+        "Historical Agent runtime modes are disabled; migrate the Agent to "
+        "capability_only"
     )
-
-
-def test_explicit_legacy_mode_constructs_the_unchanged_context(db: Session) -> None:
-    _tenant, _user, _scenario, llm, _function, agent = _world(db, "legacy")
-    agent.runtime_binding_mode = "legacy"
-    agent.data_source_ids = []
-    db.commit()
-    sentinel = object()
-    with patch.object(agent_engine, "AgentContext", return_value=sentinel) as factory:
-        result = agent_runtime_adapter.build_runtime_context(db, agent, llm)
-    assert result is sentinel
-    factory.assert_called_once_with(db, agent, llm, environment="dev")

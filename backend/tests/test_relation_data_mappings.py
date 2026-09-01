@@ -7,11 +7,10 @@ from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, configure_mappers
 
-from app import database
 from app.database import Base
 from app.models import (
     BusinessScenario,
@@ -933,59 +932,6 @@ def test_postgresql_mapping_identifiers_are_dialect_safe() -> None:
     )
     with pytest.raises(ValueError):
         ontology_service._quoted_mapping_table("orders; DROP TABLE users", "postgres")
-
-
-def test_title_and_unique_edge_migration_is_idempotent_and_mapper_is_wired() -> None:
-    configure_mappers()
-    assert hasattr(DataMapping, "source_relation_mappings")
-    assert hasattr(DataMapping, "target_relation_mappings")
-    assert not hasattr(DocumentChunk, "source_relation_mappings")
-    assert not hasattr(DocumentChunk, "target_relation_mappings")
-
-    legacy = create_engine("sqlite:///:memory:")
-    with legacy.begin() as connection:
-        connection.exec_driver_sql(
-            "CREATE TABLE ontology_properties ("
-            "id TEXT PRIMARY KEY, entity_id TEXT, name TEXT, is_key BOOLEAN)"
-        )
-        connection.exec_driver_sql(
-            "INSERT INTO ontology_properties VALUES "
-            "('p-2', 'e-1', '备用键', 1), ('p-1', 'e-1', '主键', 1)"
-        )
-        connection.exec_driver_sql(
-            "CREATE TABLE relation_instances ("
-            "id TEXT PRIMARY KEY, relation_id TEXT, "
-            "source_instance_id TEXT, target_instance_id TEXT)"
-        )
-        connection.exec_driver_sql(
-            "INSERT INTO relation_instances VALUES "
-            "('edge-1', 'r-1', 's-1', 't-1'), "
-            "('edge-2', 'r-1', 's-1', 't-1')"
-        )
-    with patch.object(database, "engine", legacy):
-        database._migrate_ontology_runtime_metadata()
-        database._migrate_ontology_runtime_metadata()
-
-    with legacy.connect() as connection:
-        titles = connection.exec_driver_sql(
-            "SELECT id FROM ontology_properties WHERE is_title = 1 ORDER BY id"
-        ).scalars().all()
-        edge_count = connection.exec_driver_sql(
-            "SELECT COUNT(*) FROM relation_instances"
-        ).scalar_one()
-    assert titles == ["p-1"]
-    assert edge_count == 1
-    assert "uq_relation_instances_edge" in {
-        item["name"] for item in inspect(legacy).get_indexes("relation_instances")
-    }
-    with pytest.raises(IntegrityError):
-        with legacy.begin() as connection:
-            connection.exec_driver_sql(
-                "INSERT INTO relation_instances "
-                "(id, relation_id, source_instance_id, target_instance_id) "
-                "VALUES ('edge-3', 'r-1', 's-1', 't-1')"
-            )
-    legacy.dispose()
 
 
 def test_agent_and_scenario_reads_hide_retired_mapping_and_release_facts(tmp_path) -> None:

@@ -615,8 +615,8 @@ def _reconcile_active_lineage(
         ):
             continue
         # Never infer replacement from kind/count alone. A same-kind candidate
-        # may be a newly requested resource (for example, Order beside Customer),
-        # so only a unique stable business-name match may inherit the lineage.
+        # may be a newly requested peer resource, so only a unique stable
+        # business-name match may inherit the lineage.
         # Otherwise keep both sides visible and require an explicit resolution.
         candidates = [
             predecessor for predecessor in consumed_rows_by_id.values()

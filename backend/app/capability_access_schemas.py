@@ -33,7 +33,7 @@ class CapabilityAccessPortOut(BaseModel):
 
 
 class CapabilityAccessCapabilityOut(BaseModel):
-    kind: Literal["function", "action", "workflow"]
+    kind: Literal["function", "action", "rule", "workflow"]
     key: str
     name: str
     input_schema_hash: str

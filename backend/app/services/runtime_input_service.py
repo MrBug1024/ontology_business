@@ -923,7 +923,9 @@ def _load_dataset_version(
     released_schema_hash = str(
         getattr(port, "dataset_schema_hash", "") or ""
     ).strip().lower()
-    if restrict_identity and released_schema_hash and released_schema_hash != schema_hash:
+    # Per-invocation selection may switch logical datasets, but it must still
+    # satisfy the immutable schema contract captured by the release.
+    if released_schema_hash and released_schema_hash != schema_hash:
         raise RuntimeInputResolutionError(
             "dataset_contract_mismatch",
             "dataset version schema does not satisfy the released port contract",

@@ -1,115 +1,63 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import RuleConditionNodeEditor from '@/components/RuleConditionNodeEditor.vue'
+import type { EditableRuleCondition, RuleCondition } from '@/types/ruleConditions'
+import {
+  countRuleConditionLeaves,
+  editableRuleCondition,
+  newEditableRuleGroup,
+  parseRuleCondition,
+  serializeRuleCondition,
+} from '@/utils/ruleConditions'
 
-type ConditionRow = {
-  id: string
-  field: string
-  op: string
-  valueSource: 'literal' | 'field'
-  valueType: 'text' | 'number' | 'boolean'
-  value: string | number | boolean
-  valueField: string
-}
+type EmptyCondition = Record<string, never>
 
 const props = withDefaults(defineProps<{
-  modelValue?: Record<string, any>
+  modelValue?: RuleCondition | Record<string, unknown>
   fields?: string[]
 }>(), {
   modelValue: () => ({}),
   fields: () => [],
 })
-const emit = defineEmits<{ (event: 'update:modelValue', value: Record<string, any>): void }>()
 
-const logic = ref<'and' | 'or'>('and')
-const rows = ref<ConditionRow[]>([])
-let lastEmitted = ''
+const emit = defineEmits<{
+  (event: 'update:modelValue', value: RuleCondition | EmptyCondition): void
+}>()
 
-const operators = [
-  { label: '等于', value: '==' },
-  { label: '不等于', value: '!=' },
-  { label: '大于', value: '>' },
-  { label: '大于等于', value: '>=' },
-  { label: '小于', value: '<' },
-  { label: '小于等于', value: '<=' },
-  { label: '包含', value: 'contains' },
-  { label: '不包含', value: 'not_contains' },
-  { label: '属于列表', value: 'in' },
-  { label: '不属于列表', value: 'not_in' },
-  { label: '为空', value: 'is_null' },
-  { label: '不为空', value: 'is_not_null' },
-]
-const noValueOperators = new Set(['is_null', 'is_not_null'])
-const listOperators = new Set(['in', 'not_in'])
+const root = ref<EditableRuleCondition>(newEditableRuleGroup())
+const invalidInput = ref(false)
+let lastEmitted = '{}'
 
-function inferValueType(value: any): ConditionRow['valueType'] {
-  if (typeof value === 'boolean') return 'boolean'
-  if (typeof value === 'number') return 'number'
-  return 'text'
-}
-function newRow(condition: Record<string, any> = {}): ConditionRow {
-  const sourceValue = Array.isArray(condition.value) ? condition.value.join(', ') : condition.value
-  return {
-    id: `${Date.now()}-${Math.random()}`,
-    field: String(condition.field || ''),
-    op: String(condition.op || '=='),
-    valueSource: condition.value_field ? 'field' : 'literal',
-    valueType: inferValueType(sourceValue),
-    value: sourceValue ?? '',
-    valueField: String(condition.value_field || ''),
-  }
-}
-function leafConditions(value: Record<string, any>) {
-  if (value?.op === 'and' || value?.op === 'or') {
-    logic.value = value.op
-    return Array.isArray(value.conditions) ? value.conditions.filter((item) => item && typeof item === 'object') : []
-  }
-  logic.value = 'and'
-  return value?.field ? [value] : []
-}
-function load(value: Record<string, any>) {
-  const normalized = JSON.stringify(value || {})
-  if (normalized === lastEmitted) return
-  rows.value = leafConditions(value || {}).map((condition) => newRow(condition))
-}
-function castValue(row: ConditionRow) {
-  if (noValueOperators.has(row.op)) return null
-  if (listOperators.has(row.op)) {
-    return String(row.value ?? '').split(/[,，\n]/).map((item) => item.trim()).filter(Boolean).map((item) => (
-      row.valueType === 'number' ? Number(item) : row.valueType === 'boolean' ? item === 'true' : item
-    ))
-  }
-  if (row.valueType === 'number') return Number(row.value)
-  if (row.valueType === 'boolean') return row.value === true || row.value === 'true'
-  return String(row.value ?? '')
-}
-function toCondition() {
-  const conditions = rows.value
-    .filter((row) => row.field.trim())
-    .map((row) => {
-      const condition: Record<string, any> = { field: row.field.trim(), op: row.op }
-      if (noValueOperators.has(row.op)) return condition
-      if (row.valueSource === 'field') condition.value_field = row.valueField.trim()
-      else condition.value = castValue(row)
-      return condition
-    })
-  if (!conditions.length) return {}
-  return conditions.length === 1 ? conditions[0] : { op: logic.value, conditions }
-}
-function addCondition() {
-  rows.value.push(newRow())
-}
-function removeCondition(id: string) {
-  rows.value = rows.value.filter((row) => row.id !== id)
-}
-
-const summary = computed(() => rows.value.length
-  ? `${logic.value === 'and' ? '全部满足' : '任一满足'} · ${rows.value.length} 个条件`
+const leafCount = computed(() => countRuleConditionLeaves(root.value))
+const summary = computed(() => leafCount.value
+  ? `${leafCount.value} 个判断条件，可使用嵌套组合与取反`
   : '尚未配置判断条件')
 
-watch(() => props.modelValue, (value) => load(value || {}), { immediate: true, deep: true })
-watch([rows, logic], () => {
-  const condition = toCondition()
-  lastEmitted = JSON.stringify(condition)
+function load(value: unknown) {
+  const signature = JSON.stringify(value || {})
+  if (signature === lastEmitted) return
+  const parsed = parseRuleCondition(value)
+  const empty = value !== null && typeof value === 'object' && Object.keys(value).length === 0
+  invalidInput.value = !parsed && !empty
+  if (invalidInput.value) return
+  root.value = parsed ? editableRuleCondition(parsed) : newEditableRuleGroup()
+  lastEmitted = signature
+}
+
+function resetInvalidCondition() {
+  invalidInput.value = false
+  root.value = newEditableRuleGroup()
+  lastEmitted = '{}'
+  emit('update:modelValue', {})
+}
+
+watch(() => props.modelValue, load, { immediate: true, deep: true })
+watch(root, (value) => {
+  if (invalidInput.value) return
+  const condition = serializeRuleCondition(value) || {}
+  const signature = JSON.stringify(condition)
+  if (signature === lastEmitted) return
+  lastEmitted = signature
   emit('update:modelValue', condition)
 }, { deep: true })
 </script>
@@ -118,61 +66,25 @@ watch([rows, logic], () => {
   <div class="condition-builder">
     <div class="condition-toolbar">
       <span>{{ summary }}</span>
-      <el-radio-group v-model="logic" size="small" aria-label="条件组合方式">
-        <el-radio-button value="and">全部满足</el-radio-button>
-        <el-radio-button value="or">任一满足</el-radio-button>
-      </el-radio-group>
     </div>
-    <div v-if="rows.length" class="condition-list">
-      <div v-for="(row, index) in rows" :key="row.id" class="condition-row">
-        <span class="condition-index">{{ index + 1 }}</span>
-        <el-select v-model="row.field" filterable allow-create default-first-option placeholder="选择或输入属性" aria-label="规则属性">
-          <el-option v-for="field in fields" :key="field" :label="field" :value="field" />
-        </el-select>
-        <el-select v-model="row.op" aria-label="比较方式">
-          <el-option v-for="operator in operators" :key="operator.value" :label="operator.label" :value="operator.value" />
-        </el-select>
-        <template v-if="!noValueOperators.has(row.op)">
-          <el-select v-model="row.valueSource" class="value-source" aria-label="比较值来源">
-            <el-option label="固定值" value="literal" />
-            <el-option label="另一个属性" value="field" />
-          </el-select>
-          <el-select v-if="row.valueSource === 'field'" v-model="row.valueField" filterable allow-create default-first-option placeholder="选择或输入另一个属性" aria-label="用于比较的另一个属性">
-            <el-option v-for="field in fields.filter((item) => item !== row.field)" :key="field" :label="field" :value="field" />
-          </el-select>
-          <template v-else>
-            <el-select v-model="row.valueType" class="value-type" aria-label="固定值类型">
-              <el-option label="文本" value="text" />
-              <el-option label="数值" value="number" />
-              <el-option label="是 / 否" value="boolean" />
-            </el-select>
-            <el-switch v-if="row.valueType === 'boolean'" v-model="row.value" inline-prompt active-text="是" inactive-text="否" aria-label="比较值" />
-            <el-input-number v-else-if="row.valueType === 'number' && !listOperators.has(row.op)" v-model="row.value" controls-position="right" aria-label="比较数值" />
-            <el-input v-else v-model="row.value" :placeholder="listOperators.has(row.op) ? '多个值用逗号分隔' : '比较值'" aria-label="比较值" />
-          </template>
-        </template>
-        <span v-else class="no-value">该判断无需填写比较值</span>
-        <el-button text type="danger" circle aria-label="删除条件" @click="removeCondition(row.id)"><el-icon><Delete /></el-icon></el-button>
-      </div>
-    </div>
-    <div v-else class="condition-empty">添加条件后，系统会按属性值判断规则是否命中。</div>
-    <el-button plain @click="addCondition"><el-icon><Plus /></el-icon>添加条件</el-button>
+    <el-alert
+      v-if="invalidInput"
+      type="error"
+      :closable="false"
+      title="现有条件格式无法安全编辑"
+      description="原始条件尚未被覆盖。确认重建后可重新配置。"
+      show-icon
+    >
+      <template #default>
+        <el-button size="small" type="danger" plain @click="resetInvalidCondition">重建条件</el-button>
+      </template>
+    </el-alert>
+    <RuleConditionNodeEditor v-else v-model="root" :fields="fields" />
   </div>
 </template>
 
 <style scoped>
-.condition-builder { display: grid; gap: 10px; width: 100%; }
-.condition-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.condition-toolbar > span { color: var(--text-3); font-size: 11px; }
-.condition-list { display: grid; gap: 8px; }
-.condition-row { display: grid; grid-template-columns: 24px minmax(130px, .8fr) minmax(120px, .7fr) 104px 82px minmax(130px, 1fr) 36px; gap: 7px; align-items: center; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
-.condition-index { display: inline-flex; width: 22px; height: 22px; align-items: center; justify-content: center; border-radius: 50%; background: var(--primary-soft); color: var(--primary-600); font-size: 10px; font-weight: 760; }
-.no-value { grid-column: 4 / 7; color: var(--text-3); font-size: 11px; }
-.condition-empty { padding: 17px; border: 1px dashed var(--border-strong); border-radius: 10px; color: var(--text-3); font-size: 11px; text-align: center; }
-@media (max-width: 760px) {
-  .condition-toolbar { align-items: flex-start; flex-direction: column; }
-  .condition-row { grid-template-columns: 24px minmax(0, 1fr) 36px; }
-  .condition-row > :not(.condition-index):not(.el-button) { grid-column: 2; }
-  .condition-row > .el-button { grid-column: 3; grid-row: 1; }
-}
+.condition-builder { display: grid; width: 100%; min-width: 0; gap: 10px; }
+.condition-toolbar { display: flex; min-height: 20px; align-items: center; justify-content: space-between; gap: 12px; }
+.condition-toolbar > span { color: var(--text-3); font-size: 12px; }
 </style>

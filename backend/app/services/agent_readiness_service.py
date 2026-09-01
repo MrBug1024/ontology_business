@@ -32,6 +32,7 @@ from . import (
 
 
 CAPABILITY_MODES = {"shadow", "prefer_capability", "capability_only"}
+_HISTORICAL_RUNTIME_MODES = {"legacy", "shadow", "prefer_capability"}
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -191,9 +192,19 @@ def compute_agent_readiness(
     agent: Agent,
     *,
     environment: str | None = None,
+    runtime_binding_mode: str | None = None,
 ) -> dict[str, Any]:
-    """Compute four independent readiness axes without resolving business data."""
-    mode = str(getattr(agent, "runtime_binding_mode", "legacy") or "legacy")
+    """Compute four independent readiness axes without resolving business data.
+
+    ``runtime_binding_mode`` is a server-internal target-state projection used
+    by the one-way migration gate. It avoids mutating or autoflushing the Agent
+    merely to evaluate whether ``capability_only`` would be ready.
+    """
+    mode = str(
+        runtime_binding_mode
+        if runtime_binding_mode is not None
+        else (getattr(agent, "runtime_binding_mode", "legacy") or "legacy")
+    )
     if mode not in CAPABILITY_MODES:
         legacy = legacy_chat_missing(db, agent)
         definition_missing = [] if agent.scenario_id else [
@@ -202,6 +213,14 @@ def compute_agent_readiness(
         validation_missing = [
             _issue("legacy_prerequisite_missing", label, "agent-config:legacy")
             for label in legacy
+        ]
+        runtime_missing = [
+            *validation_missing,
+            _issue(
+                "historical_runtime_disabled",
+                "历史 Agent 运行模式已停用",
+                "agent-migration",
+            ),
         ]
         readiness = {
             "source": "server",
@@ -214,7 +233,7 @@ def compute_agent_readiness(
                     "agent-migration",
                 )
             ]),
-            "runtime": _axis(validation_missing),
+            "runtime": _axis(runtime_missing),
         }
         return _with_flat_axes(readiness)
 
@@ -310,6 +329,14 @@ def compute_agent_readiness(
     elif target_definition is not None:
         runtime_issues.extend(
             _runtime_port_issues(db, agent, target_definition, target_environment)
+        )
+    if mode in _HISTORICAL_RUNTIME_MODES:
+        runtime_issues.append(
+            _issue(
+                "historical_runtime_disabled",
+                "历史 Agent 运行模式已停用",
+                "agent-migration",
+            )
         )
 
     readiness = {

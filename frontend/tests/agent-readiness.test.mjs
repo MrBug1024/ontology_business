@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import { normalizeAgentReadiness } from '../src/utils/agentReadiness.ts'
+import { filterAgentsByScenario, scenarioIdFromQuery } from '../src/utils/agentValidationView.ts'
 
 test('legacy Agent without fixed data remains validation-ready', () => {
   const readiness = normalizeAgentReadiness({
@@ -121,4 +122,50 @@ test('new validation Agents use capability mode without fixed data authoring', (
   assert.match(source, /capability_scope:\s*allAgentCapabilityScope\(\)/)
   assert.match(source, /<h3 id="runtime-connection-heading">业务数据库<\/h3>/)
   assert.doesNotMatch(source, /兼容资源|showLegacyResources/)
+})
+
+test('validation Agent capability totals only count directly invocable categories', () => {
+  const source = readFileSync(new URL('../src/views/Agents.vue', import.meta.url), 'utf8')
+
+  assert.doesNotMatch(source, /\{ key: 'events', label: '事件'/)
+  assert.match(source, /capabilityCategories\.map\(\(category\) => agent\.capability_summary\?\.\[category\.key\]\)/)
+  assert.match(source, /保存时会固定当前可见/)
+  assert.match(source, /以后新增需再次保存授权/)
+  assert.doesNotMatch(source, /以后新增的可见.*都会自动授权/)
+})
+
+test('validation Agent scenario filtering follows the current route query', () => {
+  const source = readFileSync(new URL('../src/views/Agents.vue', import.meta.url), 'utf8')
+  const loadStart = source.indexOf('async function load()')
+  const createStart = source.indexOf('function openCreate()', loadStart)
+  const loadSource = source.slice(loadStart, createStart)
+
+  assert.match(source, /:model-value="scenarioScope"/)
+  assert.doesNotMatch(source, /v-model="scenarioScope"/)
+  assert.match(source, /v-for="a in visibleAgents"/)
+  assert.match(source, /!loading && !visibleAgents\.length/)
+  assert.match(source, /const scenarioScope = computed\(\(\) => scenarioIdFromQuery\(route\.query\.scenario_id\)\)/)
+  assert.match(source, /const visibleAgents = computed\(\(\) => filterAgentsByScenario\(agents\.value, scenarioScope\.value\)\)/)
+  assert.doesNotMatch(loadSource, /scope|\.filter\(/)
+
+  const agents = [
+    { id: 'agent-a', scenario_id: 'scenario-a' },
+    { id: 'agent-b', scenario_id: 'scenario-b' },
+  ]
+  assert.equal(scenarioIdFromQuery(['scenario-b', 'ignored']), 'scenario-b')
+  assert.equal(scenarioIdFromQuery(undefined), '')
+  assert.deepEqual(filterAgentsByScenario(agents, 'scenario-b'), [agents[1]])
+  assert.equal(filterAgentsByScenario(agents, ''), agents)
+})
+
+test('new Agent runtime connections do not prefill a host port or username', () => {
+  const source = readFileSync(new URL('../src/views/Agents.vue', import.meta.url), 'utf8')
+  const addStart = source.indexOf('function addRuntimeConnection()')
+  const removeStart = source.indexOf('function removeRuntimeConnection(', addStart)
+  const addSource = source.slice(addStart, removeStart)
+
+  assert.match(addSource, /host:\s*''/)
+  assert.match(addSource, /port:\s*undefined/)
+  assert.match(addSource, /username:\s*''/)
+  assert.doesNotMatch(addSource, /127\.0\.0\.1|5432|username:\s*['"]postgres['"]/)
 })

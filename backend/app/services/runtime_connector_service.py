@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..config import get_settings
 from ..models import BusinessScenario, OntologyRelease, OntologySnapshot
 from . import connector_service, release_service
 
@@ -28,14 +29,9 @@ _DIRECT_ID_FIELDS = {
 
 
 def runtime_environment(environment: str | None = None) -> str:
-    """Normalize an explicit target independently of host deployment config.
-
-    Platform authoring defaults to ``dev`` even when the Python process is
-    deployed with ``RUNTIME_ENVIRONMENT=prod``. Durable production executions
-    carry and pass their own environment explicitly.
-    """
+    """Normalize an explicit target or use the server deployment authority."""
     if environment in (None, ""):
-        return "dev"
+        environment = get_settings().runtime_environment
     try:
         return connector_service.normalize_environment(environment)
     except connector_service.ConnectorBindingError as exc:

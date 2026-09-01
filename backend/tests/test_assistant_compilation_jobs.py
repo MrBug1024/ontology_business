@@ -14,10 +14,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException, Response
-from sqlalchemy import create_engine, event, func, inspect, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import database
 from app.database import Base
 from app.models import (
     AssistantAttachment,
@@ -814,26 +813,6 @@ class AssistantCompilationJobTests(unittest.TestCase):
             self.db.scalar(select(func.count()).select_from(AssistantCompilationJob)),
             1,
         )
-
-    def test_compilation_job_migration_is_idempotent(self) -> None:
-        with patch.object(database, "engine", self.engine):
-            database._migrate_assistant_compilation_jobs()
-            database._migrate_assistant_compilation_jobs()
-        inspector = inspect(self.engine)
-        self.assertIn(
-            "content_hash",
-            {item["name"] for item in inspector.get_columns("assistant_attachments")},
-        )
-        guards = {
-            item.get("name")
-            for item in inspector.get_unique_constraints(
-                "assistant_compilation_jobs"
-            )
-        } | {
-            item.get("name")
-            for item in inspector.get_indexes("assistant_compilation_jobs")
-        }
-        self.assertIn("uq_assistant_compilation_jobs_fingerprint", guards)
 
     def test_fingerprint_changes_for_every_output_affecting_input(self) -> None:
         base = self._identity()

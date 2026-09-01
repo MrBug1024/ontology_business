@@ -54,13 +54,23 @@ python scripts/verify_alembic_roundtrip.py
 python scripts/verify_postgresql_runtime.py
 ```
 
+Resolved on 2026-09-01 under explicit migration-governance approval: revision
+`17` now restores the revision `16` definition and least-privilege grants for
+`detach_data_source_file_references(...)` during downgrade. The isolated
+verifier checks the head contract, the exact revision `16` function semantics
+and permissions, absence at revision `09`, and the final return to head. No
+live, shared, or customer database was downgraded for this verification.
+The applied historical revisions have not been rewritten; repairing this path
+requires an explicit migration-governance decision under the root constitution.
+
 The equivalent manual commands below are for an already verified isolated
-database only. Never point them at a live or shared database:
+database only. Resolve the current single head from Alembic and never point
+them at a live or shared database:
 
 ```powershell
-python -m alembic -x use_admin=1 upgrade 20260829_12
+python -m alembic -x use_admin=1 upgrade head
 python -m alembic -x use_admin=1 downgrade 20260829_09
-python -m alembic -x use_admin=1 upgrade 20260829_12
+python -m alembic -x use_admin=1 upgrade head
 ```
 
 Downgrade fails closed if different capabilities in one scenario now use the

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -20,9 +21,31 @@ from app.models import (
     Message,
     Tenant,
 )
-from app.services.agent_engine import AgentContext, run_agent
+from app.services.agent_engine import AgentContext, _run_agent
 from app.services import rag_service
 from app.schemas import MessageOut
+
+
+class RagTokenizationTests(unittest.TestCase):
+    def test_local_fallback_uses_only_terms_present_in_caller_text(self) -> None:
+        self.assertEqual(
+            rag_service._tokens("客户 vendor"),
+            ["客", "户", "客户", "vendor"],
+        )
+
+    def test_business_vocabulary_removal_invalidates_old_local_indexes(self) -> None:
+        self.assertNotEqual(
+            rag_service.EMBEDDING_MODEL,
+            "local-semantic-hash-192-v1",
+        )
+        self.assertNotEqual(rag_service.INDEX_VERSION, "rag-chunks-v1")
+        old_index = SimpleNamespace(
+            index_status="indexed",
+            index_version="rag-chunks-v1",
+            indexed_content_hash=rag_service._content_hash("caller-defined term"),
+            parsed_text="caller-defined term",
+        )
+        self.assertFalse(rag_service._index_is_current(old_index))
 
 
 class RagRuntimeTests(unittest.TestCase):
@@ -95,6 +118,14 @@ class RagRuntimeTests(unittest.TestCase):
             status="parsed",
             parsed_text=text,
         )
+
+    def _bind_agent_runtime_source(self, agent: Agent, source: DataSource) -> None:
+        self.db.add(agent)
+        self.db.flush()
+        source.resource_scope = "agent_runtime"
+        source.owner_agent_id = agent.id
+        agent.runtime_data_source_ids = [source.id]
+        self.db.flush()
 
     def test_incremental_index_persists_chunks_and_offsets(self) -> None:
         first = rag_service.index_file(self.db, self.private_file)
@@ -230,7 +261,7 @@ class RagRuntimeTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             rag_service.search(self.db, [self.foreign_source.id], "机密")
 
-    def test_agent_treats_foreign_public_bucket_as_read_only(self) -> None:
+    def test_agent_does_not_promote_foreign_public_modeling_bucket_to_runtime_input(self) -> None:
         agent = Agent(
             tenant_id=self.tenant_a.id,
             name="公开资料阅读助手",
@@ -238,7 +269,7 @@ class RagRuntimeTests(unittest.TestCase):
         )
         context = AgentContext(self.db, agent, LLMConfig(name="测试模型"))
         tool_names = {item["function"]["name"] for item in context.build_tools()}
-        self.assertIn("search_documents", tool_names)
+        self.assertNotIn("search_documents", tool_names)
         self.assertNotIn("save_deliverable", tool_names)
         self.assertIn(
             "不直接执行",
@@ -268,8 +299,9 @@ class RagRuntimeTests(unittest.TestCase):
             name="资料引用助手",
             data_source_ids=[self.private_source.id, self.foreign_source.id],
         )
+        self._bind_agent_runtime_source(agent, self.private_source)
         conversation = Conversation(id="conversation-citation", agent_id=agent.id)
-        self.db.add_all([agent, conversation])
+        self.db.add(conversation)
         self.db.commit()
 
         responses = iter(
@@ -298,7 +330,7 @@ class RagRuntimeTests(unittest.TestCase):
             side_effect=lambda *args, **kwargs: next(responses),
         ):
             events = list(
-                run_agent(
+                _run_agent(
                     self.db,
                     agent,
                     LLMConfig(name="测试模型"),
@@ -366,7 +398,7 @@ class RagRuntimeTests(unittest.TestCase):
             side_effect=lambda *args, **kwargs: next(responses),
         ):
             events = list(
-                run_agent(
+                _run_agent(
                     self.db,
                     agent,
                     LLMConfig(name="测试模型"),
@@ -390,6 +422,7 @@ class RagRuntimeTests(unittest.TestCase):
             name="资料阅读助手",
             data_source_ids=[self.private_source.id],
         )
+        self._bind_agent_runtime_source(agent, self.private_source)
         context = AgentContext(self.db, agent, LLMConfig(name="测试模型"))
         payload = json.loads(context.execute_tool("read_document", {"file_id": self.private_file.id}))
         citation = payload["citation"]

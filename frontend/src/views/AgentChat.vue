@@ -237,6 +237,7 @@ let ctrl: AbortController | null = null
 let activeStreamFailed = false
 let viewDisposed = false
 let agentLoadRequest = 0
+let conversationLoadRequest = 0
 
 const suggestions = [
   '请说明当前场景目标、输入输出与可用能力',
@@ -694,30 +695,49 @@ async function loadConvs() {
   conversations.value = loaded
 }
 async function newConv() {
+  conversationLoadRequest += 1
   curConv.value = null
   messages.value = []
 }
 async function openConv(c: Conversation) {
+  const request = ++conversationLoadRequest
+  const requestedConversationId = c.id
+  const requestedAgentId = agent.value?.id
   curConv.value = c
   messages.value = []
-  const msgs = await api.listMessages(c.id)
-  for (const m of msgs) {
-    const resultById = new Map((m.tool_results || []).map((result: any) => [result.id, result]))
-    messages.value.push({
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      citations: citationsOf(m.citations),
-      tool_calls: (m.tool_calls || []).map((t: any) => ({
-        ...t,
-        args: t.args ?? t.arguments ?? {},
-        result: resultById.get(t.id)?.result,
-        _open: false,
-        status: 'done',
-      })),
+  try {
+    const loadedMessages = await api.listMessages(requestedConversationId)
+    if (
+      viewDisposed
+      || request !== conversationLoadRequest
+      || curConv.value?.id !== requestedConversationId
+      || agent.value?.id !== requestedAgentId
+    ) return
+    messages.value = loadedMessages.map((message) => {
+      const resultById = new Map((message.tool_results || []).map((result: any) => [result.id, result]))
+      return {
+        id: message.id,
+        role: message.role,
+        content: message.content,
+        citations: citationsOf(message.citations),
+        tool_calls: (message.tool_calls || []).map((toolCall: any) => ({
+          ...toolCall,
+          args: toolCall.args ?? toolCall.arguments ?? {},
+          result: resultById.get(toolCall.id)?.result,
+          _open: false,
+          status: 'done',
+        })),
+      }
     })
+    scrollBottom()
+  } catch (error: any) {
+    if (
+      !viewDisposed
+      && request === conversationLoadRequest
+      && curConv.value?.id === requestedConversationId
+      && agent.value?.id === requestedAgentId
+    ) ElMessage.error(error?.message || '对话记录加载失败')
   }
-  scrollBottom()
 }
 async function delConv(c: Conversation) {
   try {
@@ -746,6 +766,7 @@ function send(payload: AgentChatRequest) {
     return
   }
   if (streaming.value) return
+  conversationLoadRequest += 1
   const msg = invocationMessage(payload)
   messages.value.push({ role: 'user', content: msg })
   messages.value.push({ role: 'assistant', content: '', tool_calls: [], streaming: true, status: '正在思考…' })
@@ -827,10 +848,20 @@ async function finish(ai: ChatViewMessage, isNewConv = false) {
   scrollBottom()
 }
 
-function stop() {
+function cancelActiveStream() {
   activeStreamFailed = true
+  for (const message of messages.value) {
+    if (!message.streaming) continue
+    message.streaming = false
+    message.status = ''
+  }
   ctrl?.abort()
+  ctrl = null
   streaming.value = false
+}
+
+function stop() {
+  cancelActiveStream()
 }
 
 onMounted(() => {
@@ -839,8 +870,8 @@ onMounted(() => {
 })
 watch(() => route.params.id, (nextId, previousId) => {
   if (!previousId || nextId === previousId) return
-  ctrl?.abort()
-  ctrl = null
+  cancelActiveStream()
+  conversationLoadRequest += 1
   agent.value = null
   runtimeCapabilities.value = []
   conversations.value = []
@@ -851,7 +882,8 @@ watch(() => route.params.id, (nextId, previousId) => {
 onBeforeUnmount(() => {
   viewDisposed = true
   agentLoadRequest += 1
-  ctrl?.abort()
+  conversationLoadRequest += 1
+  cancelActiveStream()
   document.getElementById('main-content')?.classList.remove('agent-chat-active')
 })
 </script>
