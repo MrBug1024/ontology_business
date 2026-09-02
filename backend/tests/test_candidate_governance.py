@@ -492,3 +492,136 @@ def test_atomic_batch_resolves_generated_dependency_across_ai_and_manual_rows() 
         assert result["atomic"] is True
     finally:
         db.close()
+
+
+def test_batch_revalidation_replaces_global_compiler_error_with_candidate_results() -> None:
+    db, tenant, user, scenario = _session()
+    try:
+        global_issue = [{
+            "code": "COMPILER_CONTRACT_ERROR",
+            "message": "The model response did not satisfy the compiler envelope.",
+            "blocking": True,
+        }]
+        event = _draft(
+            tenant_id=tenant.id,
+            scenario_id=scenario.id,
+            user_id=user.id,
+            kind="event",
+            key="event.independent",
+            payload={
+                "name": "Independent event",
+                "payload_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                "enabled": False,
+            },
+            source="compiler_sidecar",
+        )
+        blocked_action = _draft(
+            tenant_id=tenant.id,
+            scenario_id=scenario.id,
+            user_id=user.id,
+            kind="action",
+            key="action.missing_parent",
+            payload={
+                "name": "Missing parent action",
+                "entity_id": "missing-entity",
+                "executor_type": "unbound",
+                "executor_config": {},
+                "enabled": False,
+            },
+            source="compiler_sidecar",
+        )
+        event.validation_issues = list(global_issue)
+        blocked_action.validation_issues = list(global_issue)
+        event.draft_status = "needs_attention"
+        blocked_action.draft_status = "needs_attention"
+        db.add_all([event, blocked_action])
+        db.commit()
+
+        rows, result = candidate_governance_service.revalidate_candidates(
+            db,
+            scenario,
+            tenant_id=tenant.id,
+            created_by_user_id=user.id,
+            expected_revisions={event.id: 0, blocked_action.id: 0},
+        )
+        db.commit()
+
+        by_id = {row.id: row for row in rows}
+        assert result["revalidated_count"] == 2
+        assert result["eligible_count"] == 1
+        assert result["blocked_count"] == 1
+        assert by_id[event.id].draft_status == "ready_for_review"
+        assert by_id[blocked_action.id].draft_status == "needs_attention"
+        assert all(row.revision == 1 for row in rows)
+        all_codes = {
+            issue["code"]
+            for row in rows
+            for issue in row.validation_issues
+        }
+        assert "COMPILER_CONTRACT_ERROR" not in all_codes
+        assert "formal_preflight_failed" in all_codes
+        assert all(row.enabled is False and row.publishable is False for row in rows)
+    finally:
+        db.close()
+
+
+def test_batch_revalidation_stale_revision_changes_nothing() -> None:
+    db, tenant, user, scenario = _session()
+    try:
+        rows = [
+            _draft(
+                tenant_id=tenant.id,
+                scenario_id=scenario.id,
+                user_id=user.id,
+                kind="event",
+                key=f"event.stale_{index}",
+                payload={
+                    "name": f"Stale event {index}",
+                    "payload_schema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    "enabled": False,
+                },
+                source="compiler_sidecar",
+                revision=index,
+            )
+            for index in range(2)
+        ]
+        for row in rows:
+            row.validation_issues = [{
+                "code": "candidate_revalidation_required",
+                "message": "Revalidation required.",
+                "blocking": True,
+            }]
+            row.draft_status = "needs_validation"
+        db.add_all(rows)
+        db.commit()
+
+        with pytest.raises(
+            candidate_governance_service.CandidateRevisionConflict
+        ):
+            candidate_governance_service.revalidate_candidates(
+                db,
+                scenario,
+                tenant_id=tenant.id,
+                created_by_user_id=user.id,
+                expected_revisions={rows[0].id: 0, rows[1].id: 0},
+            )
+
+        db.expire_all()
+        stored = [db.get(ScenarioModelDraftResource, row.id) for row in rows]
+        assert [row.revision for row in stored] == [0, 1]
+        assert {row.draft_status for row in stored} == {"needs_validation"}
+        assert {
+            issue["code"]
+            for row in stored
+            for issue in row.validation_issues
+        } == {"candidate_revalidation_required"}
+    finally:
+        db.close()

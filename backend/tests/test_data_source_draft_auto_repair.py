@@ -519,6 +519,50 @@ class DataSourceDraftAutoRepairTests(unittest.TestCase):
         self.assertEqual(created.status, "unknown")
         self.assertEqual(updated.status, "unknown")
 
+    def test_existing_file_bucket_can_change_modeling_scenario_without_moving_files(self) -> None:
+        other_scenario = BusinessScenario(
+            id="scenario-auto-repair-target",
+            tenant_id=self.tenant.id,
+            name="工资支付复核",
+            namespace="wage-payment-review",
+            status="draft",
+        )
+        source = self._source(
+            "source-modeling-rebind",
+            source_type="file_bucket",
+            scenario_id=None,
+        )
+        source.scenario_id = None
+        existing_file = BucketFile(
+            id="file-modeling-rebind",
+            data_source_id=source.id,
+            filename="工资台账.xlsx",
+            stored_path="test-only/modeling/wage-ledger.xlsx",
+            status="parsed",
+            parsed_text="工作表: 工资台账\n姓名 | 应发工资",
+        )
+        self.db.add_all([other_scenario, existing_file])
+        self.db.commit()
+
+        with patch(
+            "app.routers.data_sources.datasource_service.ensure_file_bucket_storage"
+        ) as ensure_storage:
+            updated = data_sources.update_data_source(
+                source.id,
+                DataSourceIn(
+                    name=source.name,
+                    type="file_bucket",
+                    scenario_id=other_scenario.id,
+                    config={},
+                ),
+                self.db,
+            )
+
+        self.assertEqual(updated.scenario_id, other_scenario.id)
+        self.assertEqual(self.db.get(BucketFile, existing_file.id).stored_path,
+                         "test-only/modeling/wage-ledger.xlsx")
+        ensure_storage.assert_called_once()
+
     def test_new_scenario_source_repairs_missing_mapping_without_confirmation(self) -> None:
         draft = self._draft("success")
 

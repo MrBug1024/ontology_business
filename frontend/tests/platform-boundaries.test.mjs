@@ -9,7 +9,9 @@ test('modeling materials keep the old route and never become runtime data', () =
 
   assert.match(viewSource, /<h1>建模资料<\/h1>/)
   assert.match(viewSource, /本页全部都是建模资料/)
-  assert.match(viewSource, /无需再声明用途/)
+  assert.match(viewSource, /可绑定到一个业务场景，也可保留为租户共享建模资料/)
+  assert.match(viewSource, /label="建模场景"/)
+  assert.match(viewSource, /只影响建模时的资料选择与访问范围/)
   assert.match(viewSource, /本页任何资料都不会自动进入正式调用/)
   assert.doesNotMatch(viewSource, /目录与用途|物理接入与文件|ScenarioDatasetBinding/)
   assert.match(apiSource, /\/catalog\/assets/)

@@ -752,6 +752,16 @@ class ScenarioModelCandidateBatchPromotionRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class ScenarioModelCandidateBatchRevalidationOut(BaseModel):
+    ok: bool = True
+    revalidated_count: int = Field(ge=0, le=200)
+    eligible_count: int = Field(ge=0, le=200)
+    blocked_count: int = Field(ge=0, le=200)
+    eligible_draft_ids: list[str] = Field(default_factory=list, max_length=200)
+
+    model_config = {"extra": "forbid"}
+
+
 class ScenarioModelCandidatePromotionOut(BaseModel):
     ok: bool = True
     atomic: bool = True

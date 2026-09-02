@@ -51,6 +51,7 @@ from .policies import PolicyViolation
 
 
 MAX_PROMOTION_BATCH = 200
+MAX_REVALIDATION_ROUNDS = 8
 FORMAL_RESOURCE_KINDS = frozenset({
     "entity",
     "property",
@@ -1210,6 +1211,187 @@ def revalidate_candidate(
     row.updated_at = datetime.now(timezone.utc)
     db.flush()
     return row, evaluation
+
+
+def revalidate_candidates(
+    db: Session,
+    scenario: BusinessScenario,
+    *,
+    tenant_id: str,
+    created_by_user_id: str,
+    expected_revisions: dict[str, int],
+    increment_revision: bool = True,
+) -> tuple[list[ScenarioModelDraftResource], dict[str, Any]]:
+    """Deterministically classify a bounded candidate set in one transaction.
+
+    The complete set is evaluated first so references between candidates can
+    close over one another. If one broken candidate prevents that compound
+    preflight, independent candidates are still evaluated and dependency
+    candidates are retried against the already-valid closure. No candidate is
+    promoted or activated here.
+    """
+    if not expected_revisions:
+        raise CandidatePromotionBlocked([
+            _issue("candidate_selection_empty", "至少选择一个候选定义。")
+        ])
+    if len(expected_revisions) > MAX_PROMOTION_BATCH:
+        raise CandidatePromotionBlocked([_issue(
+            "candidate_batch_too_large",
+            f"单次最多重新校验 {MAX_PROMOTION_BATCH} 个候选定义。",
+        )])
+    locked_scenario = db.scalars(select(BusinessScenario).where(
+        BusinessScenario.id == scenario.id,
+        BusinessScenario.tenant_id == tenant_id,
+    ).with_for_update()).first()
+    if locked_scenario is None:
+        raise CandidateNotFound("业务场景不存在")
+    rows = list(db.scalars(select(ScenarioModelDraftResource).where(
+        ScenarioModelDraftResource.id.in_(set(expected_revisions)),
+        ScenarioModelDraftResource.tenant_id == tenant_id,
+        ScenarioModelDraftResource.scenario_id == scenario.id,
+        ScenarioModelDraftResource.created_by_user_id == created_by_user_id,
+    ).with_for_update()).all())
+    by_id = {row.id: row for row in rows}
+    if set(by_id) != set(expected_revisions):
+        raise CandidateNotFound("一个或多个候选定义不存在")
+    for draft_id, expected_revision in expected_revisions.items():
+        row = by_id[draft_id]
+        if int(row.revision or 0) != expected_revision:
+            raise CandidateRevisionConflict("候选定义 revision 已变化，请刷新后重试")
+        if row.draft_status not in OPEN_LIFECYCLE_STATUSES:
+            raise CandidateRevisionConflict("候选定义生命周期已关闭")
+
+    ordered_rows = sorted(rows, key=lambda row: (
+        str(row.resource_kind or ""), str(row.resource_key or ""), row.id
+    ))
+    formal_rows = [
+        row for row in ordered_rows if row.resource_kind in FORMAL_RESOURCE_KINDS
+    ]
+    evaluations: dict[str, CandidateEvaluation] = {}
+    accepted: list[ScenarioModelDraftResource] = []
+    pending: list[ScenarioModelDraftResource] = []
+
+    compound = (
+        evaluate_candidates(db, locked_scenario, formal_rows)
+        if formal_rows else None
+    )
+    if compound is not None and compound.eligible:
+        for row in formal_rows:
+            evaluations[row.id] = compound
+        accepted = list(formal_rows)
+    else:
+        for row in formal_rows:
+            evaluation = evaluate_candidates(db, locked_scenario, [row])
+            evaluations[row.id] = evaluation
+            if evaluation.eligible:
+                accepted.append(row)
+            else:
+                pending.append(row)
+
+        # The platform's dependency depth is bounded by its definition layers
+        # (ontology -> mapping -> capability -> workflow). Eight rounds leaves
+        # headroom without allowing an unbounded O(n^2) validation loop.
+        for _round in range(MAX_REVALIDATION_ROUNDS):
+            if not pending:
+                break
+            progress = False
+            remaining: list[ScenarioModelDraftResource] = []
+            for row in pending:
+                evaluation = evaluate_candidates(
+                    db,
+                    locked_scenario,
+                    [*accepted, row],
+                )
+                if evaluation.eligible:
+                    evaluations[row.id] = evaluation
+                    accepted.append(row)
+                    progress = True
+                else:
+                    remaining.append(row)
+            pending = remaining
+            if not progress:
+                break
+
+    for row in ordered_rows:
+        evaluation = evaluations.get(row.id)
+        if evaluation is None:
+            evaluation = CandidateEvaluation(
+                eligible=False,
+                blockers=[_issue(
+                    "candidate_kind_not_formalizable",
+                    "该候选只用于建模证据或草稿表达，当前没有对应的正式定义类型。",
+                    draft_ids=[row.id],
+                    resource_keys=[row.resource_key],
+                    resolution_hint="保留为建模候选，或转换为平台支持的正式定义类型。",
+                )],
+                warnings=[],
+                payload=None,
+                fingerprint=_quality_fingerprint(row),
+                row_resource_keys={},
+            )
+        row.validation_issues = _bounded_issues([
+            *evaluation.blockers, *evaluation.warnings,
+        ])
+        row.draft_status = (
+            "ready_for_review" if evaluation.eligible else "needs_attention"
+        )
+        row.enabled = False
+        row.publishable = False
+        row.revision = expected_revisions[row.id] + (1 if increment_revision else 0)
+        row.updated_at = datetime.now(timezone.utc)
+        evaluations[row.id] = evaluation
+
+    db.flush()
+    eligible_ids = [row.id for row in ordered_rows if evaluations[row.id].eligible]
+    return ordered_rows, {
+        "revalidated_count": len(ordered_rows),
+        "eligible_count": len(eligible_ids),
+        "blocked_count": len(ordered_rows) - len(eligible_ids),
+        "eligible_draft_ids": eligible_ids,
+    }
+
+
+def revalidate_materialized_candidates(
+    db: Session,
+    scenario: BusinessScenario,
+    *,
+    tenant_id: str,
+    created_by_user_id: str,
+    proposal_id: str,
+) -> dict[str, Any]:
+    """Run the same origin-neutral gate immediately after final compilation."""
+    rows = list(db.scalars(select(ScenarioModelDraftResource).where(
+        ScenarioModelDraftResource.tenant_id == tenant_id,
+        ScenarioModelDraftResource.scenario_id == scenario.id,
+        ScenarioModelDraftResource.created_by_user_id == created_by_user_id,
+        ScenarioModelDraftResource.proposal_id == proposal_id,
+        ScenarioModelDraftResource.revision == 0,
+        ScenarioModelDraftResource.draft_status.in_(OPEN_LIFECYCLE_STATUSES),
+    )).all())
+    if not rows:
+        return {
+            "revalidated_count": 0,
+            "eligible_count": 0,
+            "blocked_count": 0,
+            "eligible_draft_ids": [],
+        }
+    if len(rows) > MAX_PROMOTION_BATCH:
+        return {
+            "revalidated_count": 0,
+            "eligible_count": 0,
+            "blocked_count": len(rows),
+            "eligible_draft_ids": [],
+            "skipped_reason": "candidate_batch_too_large",
+        }
+    _rows, summary = revalidate_candidates(
+        db,
+        scenario,
+        tenant_id=tenant_id,
+        created_by_user_id=created_by_user_id,
+        expected_revisions={row.id: int(row.revision or 0) for row in rows},
+        increment_revision=False,
+    )
+    return summary
 
 
 def _find_one_by_name(

@@ -1049,14 +1049,20 @@ class ScenarioModelDraftMaterializationTests(unittest.TestCase):
             for row in rows
             for issue in row.validation_issues
         }
-        self.assertIn("COMPILER_CONTRACT_ERROR", staging_codes)
+        self.assertNotIn("COMPILER_CONTRACT_ERROR", staging_codes)
+        self.assertIn("formal_preflight_failed", staging_codes)
         finalized = self.db.get(
             AssistantMessage,
             "message-structural-salvage",
         ).proposal
-        # Invalid salvage candidates are durable but never become applicable.
-        # The compilation run closes with gaps instead of presenting a series
-        # of confirmations that can only produce zero formal writes.
+        governance = finalized["payload"]["candidate_governance"]
+        self.assertEqual(governance["revalidated_count"], len(rows))
+        self.assertEqual(
+            governance["eligible_count"] + governance["blocked_count"],
+            len(rows),
+        )
+        # Recoverable candidates are classified independently, while invalid
+        # salvage remains inert and the compilation run closes with gaps.
         summary = finalized["payload"]["execution_summary"]
         self.assertTrue(summary["final"])
         self.assertEqual(summary["status"], "completed_with_gaps")
@@ -1079,7 +1085,10 @@ class ScenarioModelDraftMaterializationTests(unittest.TestCase):
                 ScenarioModelDraftResource.proposal_id == proposal["proposal_id"]
             )
         ).all())
-        self.assertEqual(stored_draft_statuses, {"needs_attention"})
+        self.assertEqual(
+            stored_draft_statuses,
+            {"ready_for_review", "needs_attention"},
+        )
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(OntologyEntity)),
             0,

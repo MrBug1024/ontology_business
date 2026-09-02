@@ -19,7 +19,7 @@
       <div class="resource-boundary-grid">
         <article>
           <strong>本页全部都是建模资料</strong>
-          <p>历史 Excel、文档、规则、表结构和数据库连接默认都可用于场景建模，帮助业务专家与智能顾问理解字段、关系和业务规律，无需再声明用途。</p>
+          <p>历史 Excel、文档、规则、表结构和数据库连接只用于场景建模；可绑定到一个业务场景，也可保留为租户共享建模资料。</p>
         </article>
         <article>
           <strong>正式运行数据</strong>
@@ -31,7 +31,7 @@
     <section class="resource-section-group" aria-labelledby="connections-title">
       <header class="resource-group-heading">
         <div><span class="eyebrow">MODELING MATERIALS</span><h2 id="connections-title">资料文件与数据库样本</h2></div>
-        <p>本页所有资料默认都可用于场景建模，无需选择场景或声明用途。</p>
+        <p>绑定场景后，仅该场景的建模过程可选择这些资料；未绑定的资料可供当前租户的各场景建模使用。</p>
       </header>
         <el-alert
           class="physical-connection-note"
@@ -53,6 +53,7 @@
               <div class="ds-info">
                 <div class="ds-name">{{ ds.name }}</div>
                 <div class="muted">{{ typeLabel(ds.type) }} · {{ dataSourceLocationLabel(ds) }}</div>
+                <div class="ds-scope">{{ modelingScopeLabel(ds) }}</div>
               </div>
               <el-tag v-if="ds.status === 'ok'" size="small" type="success">正常</el-tag>
               <el-tag v-else-if="ds.status === 'error'" size="small" type="danger">异常</el-tag>
@@ -72,6 +73,7 @@
           <div class="card-title">
             <el-icon><Setting /></el-icon> {{ selected.name }}
             <el-tag size="small" type="info">{{ typeLabel(selected.type) }}</el-tag>
+            <el-tag size="small" effect="plain">{{ modelingScopeLabel(selected) }}</el-tag>
             <el-tag v-if="selected.type === 'dataset' && selected.can_delete" size="small" type="warning" effect="plain">不可编辑，可删除连接</el-tag>
             <el-tag v-else-if="!selected.can_write && !selected.can_delete" size="small" type="warning" effect="plain">只读公开资源</el-tag>
             <div style="margin-left:auto;display:flex;gap:6px">
@@ -225,6 +227,23 @@
             <el-radio value="file_bucket">文件桶</el-radio>
           </el-radio-group>
         </el-form-item>
+        <el-form-item label="建模场景">
+          <el-select
+            v-model="form.scenario_id"
+            clearable
+            filterable
+            placeholder="租户共享（所有场景建模可用）"
+            aria-label="选择建模资料绑定的业务场景"
+          >
+            <el-option
+              v-for="scenario in writableScenarios"
+              :key="scenario.id"
+              :label="scenario.name"
+              :value="scenario.id"
+            />
+          </el-select>
+          <div class="form-help">只影响建模时的资料选择与访问范围；不会把资料绑定为验证或正式运行数据。</div>
+        </el-form-item>
 
         <template v-if="form.type === 'postgres'">
           <el-row :gutter="10">
@@ -271,7 +290,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onBeforeUnmount, onMounted, watch } from 'vue'
+import { computed, ref, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
@@ -280,11 +299,13 @@ import type {
   BucketFile,
   DataSource,
   RagCitation,
+  Scenario,
   TableInfo,
 } from '@/types'
 import { dataSourceLocationLabel } from '@/utils/dataSources'
 
 const dataSources = ref<DataSource[]>([])
+const scenarios = ref<Scenario[]>([])
 const selected = ref<DataSource | null>(null)
 const loading = ref(false)
 const route = useRoute()
@@ -333,6 +354,12 @@ const TYPE_LABELS: Record<string, string> = {
   postgres: 'PostgreSQL', dataset: '数据集', file_bucket: '文件桶',
 }
 function typeLabel(t: string) { return TYPE_LABELS[t] || t }
+const writableScenarios = computed(() => scenarios.value.filter((scenario) => scenario.can_write !== false))
+function modelingScopeLabel(source: Pick<DataSource, 'scenario_id'>) {
+  if (!source.scenario_id) return '租户共享建模'
+  const scenario = scenarios.value.find((item) => item.id === source.scenario_id)
+  return scenario ? `仅用于「${scenario.name}」建模` : '场景专属建模'
+}
 function fmtSize(n: number) {
   if (n < 1024) return n + ' B'
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
@@ -355,9 +382,13 @@ async function load() {
   const request = ++loadRequest
   loading.value = true
   try {
-    const ds = await api.listDataSources()
+    const [ds, scenarioRows] = await Promise.all([
+      api.listDataSources(),
+      api.listScenarios(),
+    ])
     if (viewDisposed || request !== loadRequest) return
     dataSources.value = ds
+    scenarios.value = scenarioRows
     const requestedSource = Array.isArray(route.query.source_id) ? route.query.source_id[0] : route.query.source_id
     const nextSelection = ds.find((source) => source.id === requestedSource)
       || ds.find((source) => source.id === selected.value?.id)
@@ -607,9 +638,14 @@ function emptyPostgresConfig() {
   return { host: '', port: undefined, database: '', username: '', password: '' }
 }
 function openCreate() {
+  const routeScenarioId = Array.isArray(route.query.scenario_id)
+    ? String(route.query.scenario_id[0] || '')
+    : typeof route.query.scenario_id === 'string' ? route.query.scenario_id : ''
   form.value = {
     name: '',
-    scenario_id: undefined,
+    scenario_id: writableScenarios.value.some((scenario) => scenario.id === routeScenarioId)
+      ? routeScenarioId
+      : undefined,
     type: 'postgres',
     config: emptyPostgresConfig(),
   }
@@ -728,6 +764,8 @@ onBeforeUnmount(() => {
 .ds-icon.file_bucket { background: var(--warning-soft); color: var(--warning); }
 .ds-info { flex: 1; min-width: 0; }
 .ds-info .muted { overflow-wrap: anywhere; }
+.ds-scope { margin-top: 3px; color: var(--primary-700); font-size: 11px; line-height: 1.35; }
+.form-help { width: 100%; margin-top: 6px; color: var(--text-3); font-size: 12px; line-height: 1.5; }
 .ds-name {
   font-weight: 600;
   margin-bottom: 2px;

@@ -106,6 +106,7 @@ from ..schemas import (
     ScenarioDetail,
     ScenarioIn,
     ScenarioModelCandidateBatchPromotionRequest,
+    ScenarioModelCandidateBatchRevalidationOut,
     ScenarioModelCandidateCreate,
     ScenarioModelCandidatePromotionOut,
     ScenarioModelCandidateRevisionRequest,
@@ -2089,6 +2090,77 @@ def revalidate_scenario_model_candidate(
     db.commit()
     db.refresh(row)
     return _scenario_model_draft_out(row)
+
+
+@router.post(
+    "/{scenario_id}/model-drafts/revalidate-batch",
+    response_model=ScenarioModelCandidateBatchRevalidationOut,
+)
+def revalidate_scenario_model_candidates_batch(
+    scenario_id: str,
+    payload: ScenarioModelCandidateBatchPromotionRequest,
+    db: Session = Depends(get_db),
+):
+    """Revalidate a bounded candidate closure without formalising any item."""
+    scenario = _scenario_for_request(db, scenario_id, writable=True)
+    ids = [item.draft_id for item in payload.items]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(400, {
+            "code": "candidate_selection_duplicate",
+            "message": "同一候选不能在一个校验批次中重复出现。",
+            "blockers": [],
+        })
+    tenant_id = tenant_service.current_tenant_id(db)
+    user_id = str(db.info.get("user_id") or "")
+    expected = {
+        item.draft_id: item.expected_revision for item in payload.items
+    }
+    try:
+        rows, result = candidate_governance_service.revalidate_candidates(
+            db,
+            scenario,
+            tenant_id=tenant_id,
+            created_by_user_id=user_id,
+            expected_revisions=expected,
+        )
+    except candidate_governance_service.CandidateNotFound as exc:
+        db.rollback()
+        raise HTTPException(404, "一个或多个候选定义不存在") from exc
+    except candidate_governance_service.CandidateRevisionConflict as exc:
+        db.rollback()
+        raise HTTPException(409, {
+            "code": "candidate_revision_conflict",
+            "message": str(exc),
+            "blockers": [],
+        }) from exc
+    except candidate_governance_service.CandidatePromotionBlocked as exc:
+        db.rollback()
+        raise HTTPException(400, {
+            "code": "candidate_revalidation_blocked",
+            "message": str(exc),
+            "blockers": exc.blockers,
+        }) from exc
+    db.add(AssistantAuditLog(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        scenario_id=scenario.id,
+        thread_id=None,
+        operation="revalidate_model_candidates",
+        status="success" if result["eligible_count"] else "blocked",
+        context={
+            "candidate_ids": sorted(ids),
+            "candidate_count": len(ids),
+        },
+        result={
+            "revalidated_count": result["revalidated_count"],
+            "eligible_count": result["eligible_count"],
+            "blocked_count": result["blocked_count"],
+        },
+    ))
+    db.commit()
+    for row in rows:
+        db.refresh(row)
+    return ScenarioModelCandidateBatchRevalidationOut(**result)
 
 
 def _promote_scenario_model_candidates(

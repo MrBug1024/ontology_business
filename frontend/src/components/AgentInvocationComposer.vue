@@ -12,7 +12,7 @@
           <small v-else class="attachment-error">{{ item.error || '上传失败' }}</small>
           <el-progress v-if="item.status === 'uploading'" :percentage="item.progress" :show-text="false" :stroke-width="3" />
         </div>
-        <el-button text circle size="small" :disabled="busy" :aria-label="`移除附件 ${item.filename}`" @click="removeAttachment(item.uid)">
+        <el-button text circle size="small" :disabled="busy || materializing" :aria-label="`移除附件 ${item.filename}`" @click="removeAttachment(item.uid)">
           <el-icon><Close /></el-icon>
         </el-button>
       </article>
@@ -36,23 +36,23 @@
           v-model="uploadMode"
           class="upload-mode"
           :options="uploadModeOptions"
-          :disabled="disabled || busy"
+          :disabled="disabled || busy || materializing"
           size="small"
           aria-label="附件保存方式"
         />
-        <label class="attachment-button" :class="{ disabled: disabled || busy }" :title="uploadMode === 'validation_asset' ? '上传并保存到验证资料库' : '上传仅供本次对话使用'">
+        <label class="attachment-button" :class="{ disabled: disabled || busy || materializing }" :title="uploadMode === 'validation_asset' ? '上传并保存到验证资料库' : '上传仅供本次对话使用'">
           <el-icon aria-hidden="true"><Paperclip /></el-icon>
           <span>上传</span>
           <input
             type="file"
             multiple
             :accept="AGENT_INVOCATION_FILE_ACCEPT"
-            :disabled="disabled || busy"
+            :disabled="disabled || busy || materializing"
             aria-label="上传验证附件"
             @change="onFilesPicked"
           />
         </label>
-        <el-button text :disabled="disabled || busy" title="选择已上传的验证资料" @click="openLibrary">
+        <el-button text :disabled="disabled || busy || materializing" title="选择已上传的验证资料" @click="openLibrary">
           <el-icon><FolderOpened /></el-icon>
           资料库
         </el-button>
@@ -65,9 +65,15 @@
         </el-button>
       </div>
     </div>
-    <p v-if="materializing" class="composer-status" role="status">
-      正在准备 {{ readyAttachments.filter((item) => isTableFile(item.filename)).length }} 个表格的数据集，可继续浏览其他页面
-    </p>
+    <section v-if="materializing" class="preparation-status" role="status" aria-live="polite" aria-atomic="true">
+      <div class="preparation-heading">
+        <strong>验证需求已排队</strong>
+        <span>{{ preparationStep }}</span>
+      </div>
+      <el-progress :percentage="preparationPercentage" :show-text="false" :stroke-width="5" />
+      <p>{{ preparationMessage }}</p>
+      <small>服务端正在后台流式读取并生成 Parquet；原始大文件不会进入聊天请求。离开页面后任务仍会继续，返回本 Agent 会自动恢复。</small>
+    </section>
     <p v-if="uploadError" class="composer-error" role="alert">{{ uploadError }}</p>
 
     <el-dialog v-model="libraryVisible" title="验证资料库" width="min(620px, 92vw)" append-to-body>
@@ -98,10 +104,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
-import type { AgentChatRequest, CatalogAsset, CatalogAssetVersion } from '@/types'
+import type { AgentChatRequest, CatalogAsset, CatalogAssetVersion, ValidationDataset, ValidationDatasetJob } from '@/types'
 import { AGENT_INVOCATION_FILE_ACCEPT, isSupportedInvocationFile } from '@/utils/agentInvocation'
 
 type AttachmentStatus = 'uploading' | 'ready' | 'error'
@@ -128,12 +134,26 @@ type SavedAsset = {
   createdAt: string
 }
 
+type PendingValidationPreparation = {
+  version: 1
+  agentId: string
+  jobId: string
+  tableAssetVersionIds: string[]
+  tableCount: number
+  request: AgentChatRequest
+  createdAt: string
+}
+
 const props = withDefaults(defineProps<{
+  agentId?: string
+  conversationId?: string
   disabled?: boolean
   busy?: boolean
   placeholder?: string
   acceptedAttachmentKinds?: string[]
 }>(), {
+  agentId: '',
+  conversationId: '',
   disabled: false,
   busy: false,
   placeholder: '输入业务问题或需求，也可以上传本次处理所需的文件',
@@ -158,9 +178,25 @@ const libraryVisible = ref(false)
 const libraryLoading = ref(false)
 const savedAssets = ref<SavedAsset[]>([])
 const materializing = ref(false)
+const preparationJob = ref<ValidationDatasetJob | null>(null)
+const preparationTableCount = ref(0)
+let preparationController: AbortController | null = null
+let recoveryAgentId = ''
 
 const readyAttachments = computed(() => attachments.value.filter((item) => item.status === 'ready' && item.assetVersionId))
 const uploading = computed(() => materializing.value || attachments.value.some((item) => item.status === 'uploading'))
+const preparationStep = computed(() => (
+  preparationJob.value?.status === 'running' ? '第 2/3 步 · 正在构建数据集' : '第 1/3 步 · 等待后台处理'
+))
+const preparationPercentage = computed(() => (
+  preparationJob.value?.status === 'running' ? 68 : preparationJob.value?.status === 'succeeded' ? 100 : 34
+))
+const preparationMessage = computed(() => {
+  const count = preparationTableCount.value
+  return preparationJob.value?.status === 'running'
+    ? `正在准备 ${count} 个表格；完成后会自动发送这次验证需求。`
+    : `已保存本次需求和受管文件引用，等待处理 ${count} 个表格。`
+})
 
 async function uploadOne(item: ChatAttachmentDraft) {
   if (!item.file) return
@@ -289,46 +325,197 @@ function isTableFile(filename: string) {
   return /\.(csv|tsv|xls|xlsx|xlsm)$/i.test(filename)
 }
 
+function preparationStorageKey(agentId = props.agentId) {
+  return agentId ? `ontology.validation-preparation.v1:${agentId}` : ''
+}
+
+function savePendingPreparation(pending: PendingValidationPreparation) {
+  const key = preparationStorageKey(pending.agentId)
+  if (!key) return
+  try {
+    window.sessionStorage.setItem(key, JSON.stringify(pending))
+  } catch {
+    // Session recovery is a convenience hint; the PostgreSQL job remains authoritative.
+  }
+}
+
+function clearPendingPreparation(agentId = props.agentId) {
+  const key = preparationStorageKey(agentId)
+  if (!key) return
+  try {
+    window.sessionStorage.removeItem(key)
+  } catch {
+    // Storage may be unavailable in hardened browsers.
+  }
+}
+
+function loadPendingPreparation(agentId: string): PendingValidationPreparation | null {
+  const key = preparationStorageKey(agentId)
+  if (!key) return null
+  try {
+    const parsed = JSON.parse(window.sessionStorage.getItem(key) || 'null') as PendingValidationPreparation | null
+    const createdAt = parsed?.createdAt ? Date.parse(parsed.createdAt) : 0
+    if (
+      !parsed
+      || parsed.version !== 1
+      || parsed.agentId !== agentId
+      || !Array.isArray(parsed.tableAssetVersionIds)
+      || !parsed.tableAssetVersionIds.length
+      || !parsed.request?.idempotency_key
+      || !createdAt
+      || Date.now() - createdAt > 24 * 60 * 60 * 1000
+    ) {
+      clearPendingPreparation(agentId)
+      return null
+    }
+    return parsed
+  } catch {
+    clearPendingPreparation(agentId)
+    return null
+  }
+}
+
+function invocationIdempotencyKey() {
+  const random = typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  return `validation-${random}`
+}
+
+function dispatchPreparedRequest(
+  pending: PendingValidationPreparation,
+  dataset: ValidationDataset,
+) {
+  preparationJob.value = {
+    ...(preparationJob.value || {
+      id: pending.jobId,
+      error: '',
+      created_at: pending.createdAt,
+      updated_at: new Date().toISOString(),
+    }),
+    status: 'succeeded',
+    result: dataset,
+  }
+  materializing.value = false
+  emit('submit', {
+    ...pending.request,
+    attachments: [
+      {
+        dataset_version_id: dataset.dataset_version_id,
+        expected_signature: dataset.content_hash,
+        filename: dataset.relation_names.join('、') || '验证数据包',
+      },
+      ...(pending.request.attachments || []),
+    ],
+  })
+}
+
+async function runPendingPreparation(
+  pending: PendingValidationPreparation,
+  createJob: boolean,
+) {
+  preparationController?.abort()
+  const controller = new AbortController()
+  preparationController = controller
+  preparationTableCount.value = pending.tableCount
+  materializing.value = true
+  uploadError.value = ''
+  try {
+    const onStatus = (job: ValidationDatasetJob) => {
+      preparationJob.value = job
+      pending.jobId = job.id
+      savePendingPreparation(pending)
+    }
+    const dataset = createJob
+      ? await api.buildValidationDataset(
+        pending.tableAssetVersionIds,
+        '验证数据包',
+        { signal: controller.signal, onStatus },
+      )
+      : await api.waitForValidationDatasetJob(
+        pending.jobId,
+        { signal: controller.signal, onStatus },
+      )
+    if (controller.signal.aborted) return
+    dispatchPreparedRequest(pending, dataset)
+  } catch (error: unknown) {
+    const details = error && typeof error === 'object'
+      ? error as { name?: unknown; status?: unknown; message?: unknown }
+      : {}
+    if (details.name === 'AbortError' || controller.signal.aborted) return
+    const failed = preparationJob.value?.status === 'failed'
+    if (failed || details.status === 404) clearPendingPreparation(pending.agentId)
+    const message = typeof details.message === 'string' ? details.message : ''
+    uploadError.value = failed
+      ? message || '验证数据集准备失败'
+      : `${message || '验证数据集进度连接中断'}；重新进入本 Agent 后会继续恢复。`
+    materializing.value = false
+  } finally {
+    if (preparationController === controller) preparationController = null
+  }
+}
+
+function resumePendingPreparation(agentId: string) {
+  if (!agentId || recoveryAgentId === agentId) return
+  recoveryAgentId = agentId
+  const pending = loadPendingPreparation(agentId)
+  if (pending) void runPendingPreparation(pending, !pending.jobId)
+}
+
 async function submitDraft() {
   if (props.disabled || props.busy || uploading.value) return
+  const recoverable = loadPendingPreparation(props.agentId)
+  if (recoverable) {
+    void runPendingPreparation(recoverable, !recoverable.jobId)
+    return
+  }
   const text = message.value.trim()
   if (!text && !readyAttachments.value.length) return
   const tables = readyAttachments.value.filter((item) => isTableFile(item.filename))
   const documents = readyAttachments.value.filter((item) => !isTableFile(item.filename))
-  materializing.value = tables.length > 0
   uploadError.value = ''
-  try {
-    const tableDataset = tables.length
-      ? await api.buildValidationDataset(tables.map((item) => item.assetVersionId!))
-      : null
-    emit('submit', {
-      message: text,
-      environment: 'dev',
-      attachments: [
-        ...(tableDataset ? [{
-          dataset_version_id: tableDataset.dataset_version_id,
-          expected_signature: tableDataset.content_hash,
-          filename: tableDataset.relation_names.join('、') || '验证数据包',
-        }] : []),
-        ...documents.map((item) => ({
-          asset_version_id: item.assetVersionId!,
-          expected_signature: item.expectedSignature,
-          filename: item.filename,
-        })),
-      ],
-    })
-  } catch (error: any) {
-    uploadError.value = error?.response?.data?.detail || error?.message || '验证数据集准备失败'
-  } finally {
-    materializing.value = false
+  const request: AgentChatRequest = {
+    message: text,
+    conversation_id: props.conversationId || '',
+    environment: 'dev',
+    idempotency_key: invocationIdempotencyKey(),
+    attachments: documents.map((item) => ({
+      asset_version_id: item.assetVersionId!,
+      expected_signature: item.expectedSignature,
+      filename: item.filename,
+    })),
   }
+  if (!tables.length) {
+    emit('submit', request)
+    return
+  }
+  const pending: PendingValidationPreparation = {
+    version: 1,
+    agentId: props.agentId,
+    jobId: '',
+    tableAssetVersionIds: tables.map((item) => item.assetVersionId!),
+    tableCount: tables.length,
+    request,
+    createdAt: new Date().toISOString(),
+  }
+  savePendingPreparation(pending)
+  void runPendingPreparation(pending, true)
 }
 
 function clearAfterSuccess() {
+  clearPendingPreparation()
   message.value = ''
   attachments.value = []
   uploadError.value = ''
   void nextTick(() => messageInputRef.value?.focus?.())
+}
+
+function acknowledgeQueued(idempotencyKey?: string) {
+  if (!idempotencyKey) return
+  const pending = loadPendingPreparation(props.agentId)
+  if (pending?.request.idempotency_key === idempotencyKey) {
+    clearPendingPreparation(props.agentId)
+  }
 }
 
 function submitMessage(text: string) {
@@ -350,8 +537,18 @@ function formatDate(value: string) {
 onMounted(() => {
   messageInputRef.value?.focus?.()
   void loadSavedAssets()
+  resumePendingPreparation(props.agentId)
 })
-defineExpose({ clearAfterSuccess, submitMessage })
+watch(() => props.agentId, (agentId, previousAgentId) => {
+  if (agentId === previousAgentId) return
+  preparationController?.abort()
+  recoveryAgentId = ''
+  resumePendingPreparation(agentId)
+})
+onUnmounted(() => {
+  preparationController?.abort()
+})
+defineExpose({ acknowledgeQueued, clearAfterSuccess, submitMessage })
 </script>
 
 <style scoped>
@@ -376,6 +573,11 @@ defineExpose({ clearAfterSuccess, submitMessage })
 .keyboard-hint { color: var(--text-3); font-size: 11px; }
 .composer-error { margin: 0; font-size: 11px; line-height: 1.45; }
 .composer-status { margin: 0; color: var(--text-2); font-size: 11px; line-height: 1.45; }
+.preparation-status { display: grid; gap: 7px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border)); border-radius: 8px; background: var(--primary-soft); }
+.preparation-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.preparation-heading strong { color: var(--text-1); font-size: 13px; }
+.preparation-heading span, .preparation-status small { color: var(--text-3); font-size: 11px; line-height: 1.5; }
+.preparation-status p { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.5; }
 .library-list { min-height: 140px; }
 .library-row { display: flex; min-width: 0; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
 .library-row:last-child { border-bottom: 0; }

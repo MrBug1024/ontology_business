@@ -187,6 +187,8 @@
       <div class="chat-input-area">
         <AgentInvocationComposer
           ref="composerRef"
+          :agent-id="agent?.id || ''"
+          :conversation-id="curConv?.id || ''"
           :disabled="!agentValidationReady"
           :busy="streaming"
           :placeholder="agentValidationReady ? '描述业务需求，或上传本次处理所需的文件' : validationMissingText"
@@ -235,6 +237,7 @@ const composerRef = ref<InstanceType<typeof AgentInvocationComposer>>()
 const msgRef = ref<HTMLElement>()
 let ctrl: AbortController | null = null
 let activeStreamFailed = false
+let activeRequestId = ''
 let viewDisposed = false
 let agentLoadRequest = 0
 let conversationLoadRequest = 0
@@ -773,12 +776,17 @@ function send(payload: AgentChatRequest) {
   const ai = messages.value[messages.value.length - 1]!
   streaming.value = true
   activeStreamFailed = false
-  const isNewConv = !curConv.value
+  activeRequestId = payload.idempotency_key || ''
+  const hasPinnedConversation = Object.prototype.hasOwnProperty.call(payload, 'conversation_id')
+  const targetConversationId = hasPinnedConversation
+    ? payload.conversation_id || undefined
+    : curConv.value?.id
+  const isNewConv = !targetConversationId
   scrollBottom()
 
   ctrl = streamChat(
     agent.value!.id!,
-    { ...payload, conversation_id: curConv.value?.id },
+    { ...payload, conversation_id: targetConversationId },
     (ev) => handleEvent(ev, ai),
     () => finish(ai, isNewConv),
     (e) => {
@@ -794,6 +802,10 @@ function send(payload: AgentChatRequest) {
 }
 
 function handleEvent(ev: { type: string; data: any }, ai: ChatViewMessage) {
+  if (activeRequestId) {
+    composerRef.value?.acknowledgeQueued(activeRequestId)
+    activeRequestId = ''
+  }
   switch (ev.type) {
     case 'status':
       ai.status = ev.data
@@ -836,6 +848,7 @@ async function finish(ai: ChatViewMessage, isNewConv = false) {
   ai.status = ''
   streaming.value = false
   ctrl = null
+  activeRequestId = ''
   if (succeeded) composerRef.value?.clearAfterSuccess()
   try {
     await loadConvs()

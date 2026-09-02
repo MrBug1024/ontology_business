@@ -231,7 +231,9 @@ def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(
     ds = _data_source(db, ds_id, writable=True)
     if ds.scenario_id != observed_scope:
         raise HTTPException(409, "数据源场景归属在更新期间已变化，请刷新后重试")
-    if payload.type != ds.type or payload.scenario_id != ds.scenario_id:
+    type_changed = payload.type != ds.type
+    scenario_changed = payload.scenario_id != ds.scenario_id
+    if type_changed:
         has_bucket_files = db.scalar(
             select(BucketFile.id)
             .where(BucketFile.data_source_id == ds.id)
@@ -240,14 +242,15 @@ def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(
         if has_bucket_files:
             raise HTTPException(
                 status_code=409,
-                detail="已有文件的数据源不能变更类型或场景归属，请先删除文件",
+                detail="已有文件的建模资料不能变更类型，请先删除文件",
             )
+    if type_changed or scenario_changed:
         try:
             template_catalog_service.assert_data_source_not_registered(db, ds.id)
         except template_catalog_service.TemplateCatalogError as exc:
             raise HTTPException(
                 status_code=409,
-                detail="已登记模板所在文件桶不能变更类型或场景归属，请先在模板中心解除引用并删除模板",
+                detail="已登记模板所在文件桶不能变更类型或建模场景，请先在模板中心解除引用并删除模板",
             ) from exc
     values = payload.model_dump()
     values["config"] = _merge_config(ds.config or {}, values.get("config", {}))

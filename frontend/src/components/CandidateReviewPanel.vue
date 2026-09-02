@@ -101,6 +101,15 @@
         </el-select>
       </div>
       <div class="batch-actions">
+        <el-button
+          plain
+          :loading="batchRevalidating"
+          :disabled="!canWrite || !revalidationCandidates.length || revalidationCandidates.length > 200 || (operationBusy && !batchRevalidating)"
+          @click="revalidateAll"
+        >
+          <el-icon aria-hidden="true"><CircleCheck /></el-icon>
+          一键确定性校验（{{ revalidationCandidates.length }}）
+        </el-button>
         <el-checkbox
           :model-value="allVisibleEligibleSelected"
           :indeterminate="someVisibleEligibleSelected"
@@ -288,6 +297,7 @@ const originFilter = ref<ScenarioModelCandidateOrigin | ''>('')
 const selectedIds = ref(new Set<string>())
 const revalidatingIds = ref(new Set<string>())
 const promotingIds = ref(new Set<string>())
+const batchRevalidating = ref(false)
 const batchPromoting = ref(false)
 const failure = ref<CandidateApiFailure | null>(null)
 const failureDraftIds = ref(new Set<string>())
@@ -308,6 +318,9 @@ const visibleCandidates = computed(() => {
   ))
 })
 const visibleEligibleCandidates = computed(() => visibleCandidates.value.filter((item) => item.promotion_eligible === true))
+const revalidationCandidates = computed(() => props.candidates.filter((item) => (
+  !['formalized', 'resolved', 'superseded'].includes(item.lifecycle_status)
+)))
 const selectedCount = computed(() => selectedIds.value.size)
 const allVisibleEligibleSelected = computed(() => (
   visibleEligibleCandidates.value.length > 0
@@ -319,7 +332,7 @@ const someVisibleEligibleSelected = computed(() => (
 ))
 const failureTargetCandidates = computed(() => props.candidates.filter((item) => failureDraftIds.value.has(item.id)))
 const operationBusy = computed(() => (
-  props.loading || batchPromoting.value || revalidatingIds.value.size > 0 || promotingIds.value.size > 0
+  props.loading || batchRevalidating.value || batchPromoting.value || revalidatingIds.value.size > 0 || promotingIds.value.size > 0
 ))
 
 watch(() => props.candidates.map((item) => `${item.id}:${item.revision}:${item.promotion_eligible}`).join('|'), () => {
@@ -411,6 +424,30 @@ async function revalidate(candidate: ScenarioModelDraftResource) {
     await showFailure(error, [candidate.id])
   } finally {
     setBusyId(revalidatingIds, candidate.id, false)
+  }
+}
+
+async function revalidateAll() {
+  const candidates = revalidationCandidates.value
+  if (!candidates.length || candidates.length > 200) return
+  clearFailure()
+  operationNotice.value = ''
+  batchRevalidating.value = true
+  try {
+    const result = await api.revalidateScenarioModelCandidates(props.scenarioId, {
+      items: candidates.map((candidate) => ({
+        draft_id: candidate.id,
+        expected_revision: candidate.revision,
+      })),
+    })
+    operationNotice.value = result.eligible_count
+      ? `已确定性校验 ${result.revalidated_count} 项：${result.eligible_count} 项可直接晋级，${result.blocked_count} 项仍需补全。`
+      : `已确定性校验 ${result.revalidated_count} 项；当前 ${result.blocked_count} 项都有可定位的正式化阻塞。`
+    emit('refresh', false)
+  } catch (error) {
+    await showFailure(error, candidates.map((candidate) => candidate.id))
+  } finally {
+    batchRevalidating.value = false
   }
 }
 

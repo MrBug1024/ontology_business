@@ -66,6 +66,7 @@ from ..services import (
     assistant_orchestrator,
     assistant_compilation_job_service,
     assistant_compilation_stream_service,
+    candidate_governance_service,
     catalog_ingestion_service,
     doc_parser,
     datasource_service,
@@ -2102,6 +2103,26 @@ def _is_inert_compilation_salvage(data: dict[str, Any]) -> bool:
         and str(candidate.get("validation_status") or "") == "blocked"
         for candidate in candidates
     )
+
+
+_UNAVAILABLE_COMPILATION_REASONS = frozenset({
+    "source_input_invalid",
+    "compilation_restart_input_unavailable",
+    "compiler_version_changed_since_queued",
+    "llm_config_changed_since_queued",
+    "compiler_execution_interrupted",
+    "draft_materialization_interrupted",
+})
+
+
+def _is_unavailable_compilation_placeholder(data: dict[str, Any]) -> bool:
+    salvage = data.get("draft_salvage")
+    reason = (
+        str(salvage.get("reason") or "").casefold()
+        if isinstance(salvage, dict)
+        else ""
+    )
+    return reason in _UNAVAILABLE_COMPILATION_REASONS
 
 
 def _complete_inert_salvage_proposal(
@@ -4281,6 +4302,24 @@ def _finalize_compilation_success(
             consumed_draft_revisions=consumed_revisions,
             replace_live_checkpoints=True,
         )
+        if (
+            not baseline_changed
+            and not _is_unavailable_compilation_placeholder(data)
+        ):
+            governance_summary = (
+                candidate_governance_service.revalidate_materialized_candidates(
+                    finish_db,
+                    scenario,
+                    tenant_id=tenant_id,
+                    created_by_user_id=user_id,
+                    proposal_id=str(proposal.get("proposal_id") or ""),
+                )
+            )
+            proposal_payload = proposal.get("payload")
+            if isinstance(proposal_payload, dict):
+                proposal_payload["candidate_governance"] = copy.deepcopy(
+                    governance_summary
+                )
         if continuation_proposal_id:
             scenario_model_draft_service.discard_pristine_live_checkpoints(
                 finish_db,

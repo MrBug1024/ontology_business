@@ -62,6 +62,7 @@ import type {
   ScenarioDetail,
   ScenarioModelDraftListResponse,
   ScenarioModelCandidateBatchPromotionRequest,
+  ScenarioModelCandidateBatchRevalidationResult,
   ScenarioModelCandidatePromotionResult,
   ScenarioModelCandidateRevisionRequest,
   ScenarioModelDraftResolve,
@@ -103,6 +104,44 @@ instance.interceptors.response.use(
 )
 
 export const http = instance as unknown as ApiClient
+
+type ValidationDatasetWaitOptions = {
+  signal?: AbortSignal
+  onStatus?: (job: ValidationDatasetJob) => void
+}
+
+async function waitForValidationDatasetJob(
+  jobId: string,
+  options: ValidationDatasetWaitOptions = {},
+) {
+  let job = await http.get<ValidationDatasetJob>(`/catalog/validation-dataset-jobs/${jobId}`, {
+    signal: options.signal,
+  })
+  options.onStatus?.(job)
+  const deadline = Date.now() + 4 * 60 * 60 * 1000
+  while (job.status === 'queued' || job.status === 'running') {
+    if (Date.now() >= deadline) throw new Error('验证数据集准备超时，请稍后从资料库重试')
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        window.clearTimeout(timer)
+        reject(new DOMException('Aborted', 'AbortError'))
+      }
+      const timer = window.setTimeout(() => {
+        options.signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, 1500)
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+    })
+    job = await http.get<ValidationDatasetJob>(`/catalog/validation-dataset-jobs/${job.id}`, {
+      signal: options.signal,
+    })
+    options.onStatus?.(job)
+  }
+  if (job.status === 'failed' || !job.result) {
+    throw new Error(job.error || '验证数据集准备失败')
+  }
+  return job.result
+}
 
 function agentWritePayload(agent: Partial<Agent>): Partial<Agent> {
   const {
@@ -195,6 +234,8 @@ export const api = {
     http.post<ScenarioModelDraftResource>(`/scenarios/${scenarioId}/model-drafts/${draftId}/resolve`, resolution),
   revalidateScenarioModelCandidate: (scenarioId: string, draftId: string, request: ScenarioModelCandidateRevisionRequest) =>
     http.post<ScenarioModelDraftResource>(`/scenarios/${scenarioId}/model-drafts/${draftId}/revalidate`, request),
+  revalidateScenarioModelCandidates: (scenarioId: string, request: ScenarioModelCandidateBatchPromotionRequest) =>
+    http.post<ScenarioModelCandidateBatchRevalidationResult>(`/scenarios/${scenarioId}/model-drafts/revalidate-batch`, request),
   promoteScenarioModelCandidate: (scenarioId: string, draftId: string, request: ScenarioModelCandidateRevisionRequest) =>
     http.post<ScenarioModelCandidatePromotionResult>(`/scenarios/${scenarioId}/model-drafts/${draftId}/promote`, request),
   promoteScenarioModelCandidates: (scenarioId: string, request: ScenarioModelCandidateBatchPromotionRequest) =>
@@ -344,21 +385,21 @@ export const api = {
     }),
   getValidationDatasetJob: (jobId: string) =>
     http.get<ValidationDatasetJob>(`/catalog/validation-dataset-jobs/${jobId}`),
-  buildValidationDataset: async (assetVersionIds: string[], name = '验证数据包') => {
+  waitForValidationDatasetJob,
+  buildValidationDataset: async (
+    assetVersionIds: string[],
+    name = '验证数据包',
+    options: ValidationDatasetWaitOptions = {},
+  ) => {
     let job = await http.post<ValidationDatasetJob>('/catalog/validation-dataset-jobs', {
       asset_version_ids: assetVersionIds,
       name,
-    })
-    const deadline = Date.now() + 4 * 60 * 60 * 1000
-    while (job.status === 'queued' || job.status === 'running') {
-      if (Date.now() >= deadline) throw new Error('验证数据集准备超时，请稍后从资料库重试')
-      await new Promise((resolve) => window.setTimeout(resolve, 1500))
-      job = await http.get<ValidationDatasetJob>(`/catalog/validation-dataset-jobs/${job.id}`)
+    }, { signal: options.signal })
+    options.onStatus?.(job)
+    if (job.status === 'succeeded' && job.result) {
+      return job.result
     }
-    if (job.status === 'failed' || !job.result) {
-      throw new Error(job.error || '验证数据集准备失败')
-    }
-    return job.result
+    return waitForValidationDatasetJob(job.id, options)
   },
   listLogicalDatasets: () => http.get<LogicalDataset[]>('/catalog/datasets'),
   listDatasetHeads: (datasetId: string) => http.get<DatasetHead[]>(`/catalog/datasets/${datasetId}/heads`),

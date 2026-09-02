@@ -730,6 +730,14 @@ export interface ScenarioModelCandidateBatchPromotionRequest {
   items: ScenarioModelCandidatePromotionItem[]
 }
 
+export interface ScenarioModelCandidateBatchRevalidationResult {
+  ok: boolean
+  revalidated_count: number
+  eligible_count: number
+  blocked_count: number
+  eligible_draft_ids: string[]
+}
+
 export interface ScenarioModelCandidatePromotionResultItem {
   draft_id?: string
   resource_kind?: string

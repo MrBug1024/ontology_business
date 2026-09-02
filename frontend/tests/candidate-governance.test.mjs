@@ -123,6 +123,8 @@ test('candidate review exposes every governed action without client-side activat
     'utf8',
   )
   assert.match(source, /api\.revalidateScenarioModelCandidate/)
+  assert.match(source, /api\.revalidateScenarioModelCandidates/)
+  assert.match(source, /一键确定性校验/)
   assert.match(source, /api\.promoteScenarioModelCandidate\(/)
   assert.match(source, /api\.promoteScenarioModelCandidates/)
   assert.match(source, /candidate\.promotion_eligible !== true/)
