@@ -16,8 +16,12 @@ from app.models import (
     Agent,
     BusinessScenario,
     CapabilityInvocation,
+    DataAsset,
+    DataAssetVersion,
     FunctionDefinition,
     LLMConfig,
+    RunInputBinding,
+    ScenarioCapabilityPort,
     Tenant,
     User,
 )
@@ -30,7 +34,8 @@ from app.services import (
     external_api_service,
     permission_service,
 )
-from app.services.capability_invoker import CapabilityInvoker
+from app.services.capability_invoker import CapabilityInvoker, resolve_capability_contract
+from app.services.capability_registry import CapabilityProviderRegistry
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +61,42 @@ FORBIDDEN_SCENARIO_MARKERS = (
     "项目经理",
     "项目需求分析",
 )
+
+
+class ProtocolDocumentProvider:
+    provider_key = "protocol-document"
+    provider_version = "1.0.0"
+
+    def contract(self, _capability, _deployment) -> dict:
+        return {
+            "input_schema": {
+                "type": "object",
+                "properties": {"value": {"type": "number"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "score": {"type": "number"},
+                    "asset_version_id": {"type": "string"},
+                },
+                "required": ["score", "asset_version_id"],
+                "additionalProperties": False,
+            },
+            "required_roles": [],
+            "required_scopes": [],
+            "side_effect": False,
+            "requires_confirmation": False,
+            "idempotency_required": False,
+        }
+
+    def invoke(self, request, _actor, _deployment, data_context) -> dict:
+        document = data_context.get("reference_document")
+        return {
+            "score": request.inputs["value"] * 0.5 + 2,
+            "asset_version_id": document.version_id,
+        }
 
 
 def _semantic_receipt(document: dict) -> dict:
@@ -143,8 +184,48 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
             "type": "object",
             "properties": {"score": {"type": "number"}},
         },
-        runtime_kind="weighted_score",
-        runtime_config={"weights": {"value": 0.5}, "bias": 2},
+        runtime_kind="provider",
+        runtime_config={
+            "provider_key": ProtocolDocumentProvider.provider_key,
+            "provider_version": ProtocolDocumentProvider.provider_version,
+            "provider_config": {},
+        },
+    )
+    asset = DataAsset(
+        id="asset-protocol",
+        tenant_id=tenant.id,
+        key="protocol-reference",
+        name="Protocol reference document",
+        kind="file",
+        media_type="text/plain",
+        lifecycle_status="active",
+    )
+    asset_version = DataAssetVersion(
+        id="asset-version-protocol",
+        tenant_id=tenant.id,
+        asset_id=asset.id,
+        version_number=1,
+        provenance_kind="upload",
+        status="ready",
+        content_sha256="a" * 64,
+        byte_size=28,
+    )
+    document_port = ScenarioCapabilityPort(
+        id="port-protocol-document",
+        tenant_id=tenant.id,
+        scenario_id=scenario.id,
+        capability_kind="function",
+        capability_key=function.id,
+        port_key="reference_document",
+        name="Reference document",
+        direction="input",
+        role="reference",
+        media_kind="document",
+        schema_document={"type": "string"},
+        is_required=True,
+        cardinality="one",
+        binding_policy="per_invocation",
+        status="active",
     )
     llm = LLMConfig(
         id="llm-protocol",
@@ -168,7 +249,9 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
 
     seed_db = SessionLocal()
     try:
-        seed_db.add_all([tenant, owner, scenario, function, llm, agent])
+        seed_db.add_all([tenant, owner, scenario, function, asset, llm, agent])
+        seed_db.flush()
+        seed_db.add_all([asset_version, document_port])
         seed_db.commit()
         permission_service.ensure_organization(
             seed_db,
@@ -211,7 +294,10 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
 
     app.dependency_overrides[get_db] = override_db
     client = TestClient(app)
-    shared_invoker = CapabilityInvoker()
+    provider_registry = CapabilityProviderRegistry()
+    provider_registry.register_instance(ProtocolDocumentProvider())
+    provider_registry.seal()
+    shared_invoker = CapabilityInvoker(provider_registry)
     input_document = {"value": 6}
 
     try:
@@ -221,6 +307,16 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
                 "CapabilityInvoker",
                 return_value=shared_invoker,
             ) as invoker_factory,
+            patch.object(
+                capability_application_service,
+                "resolve_capability_contract",
+                side_effect=lambda db, deployment, capability: resolve_capability_contract(
+                    db,
+                    deployment,
+                    capability,
+                    registry=provider_registry,
+                ),
+            ),
             patch.object(
                 shared_invoker,
                 "invoke",
@@ -240,7 +336,17 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
                         structured_inputs=input_document,
                         target_kind="function",
                         target_key=function.id,
+                        attachments=(
+                            agent_runtime_adapter.AgentAttachmentInput(
+                                asset_version_id=asset_version.id,
+                                filename="reference.txt",
+                                expected_signature=asset_version.content_sha256,
+                            ),
+                        ),
                     ),
+                )
+                assert runtime.public_catalog()[0]["readiness"]["ready"], (
+                    runtime.public_catalog()[0]["readiness"]
                 )
                 agent_db.info["action_audit_context"] = {"agent_id": agent.id}
                 try:
@@ -263,7 +369,17 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
                     f"function/{function.id}/invoke"
                 ),
                 headers={"X-API-Key": rest_token},
-                json={"environment": "dev", "inputs": input_document},
+                json={
+                    "environment": "dev",
+                    "inputs": input_document,
+                    "managed_inputs": [
+                        {
+                            "port_key": document_port.port_key,
+                            "asset_version_id": asset_version.id,
+                            "expected_signature": asset_version.content_sha256,
+                        }
+                    ],
+                },
             )
             assert rest_response.status_code == 200, rest_response.text
             rest_receipt = rest_response.json()
@@ -277,6 +393,13 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
                 capability_key=function.id,
                 environment="dev",
                 inputs=input_document,
+                managed_inputs=[
+                    {
+                        "port_key": document_port.port_key,
+                        "asset_version_id": asset_version.id,
+                        "expected_signature": asset_version.content_sha256,
+                    }
+                ],
             )
 
         assert invoker_factory.call_count == 3
@@ -290,7 +413,10 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
         expected_semantics = _semantic_receipt(agent_receipt)
         assert _semantic_receipt(rest_receipt) == expected_semantics
         assert _semantic_receipt(mcp_receipt) == expected_semantics
-        assert expected_semantics["output"] == {"score": 5.0}
+        assert expected_semantics["output"] == {
+            "asset_version_id": asset_version.id,
+            "score": 5.0,
+        }
 
         audit_db = SessionLocal()
         try:
@@ -305,6 +431,22 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
             assert all(invocations.values())
             assert _provenance(invocations["rest"]) == _provenance(invocations["agent"])
             assert _provenance(invocations["mcp"]) == _provenance(invocations["agent"])
+
+            bindings = list(
+                audit_db.query(RunInputBinding)
+                .filter(
+                    RunInputBinding.invocation_id.in_(
+                        [item.id for item in invocations.values()]
+                    )
+                )
+                .all()
+            )
+            assert len(bindings) == 3
+            assert {item.asset_version_id for item in bindings} == {asset_version.id}
+            assert {item.capability_port_id for item in bindings} == {document_port.id}
+            assert {item.content_hash for item in bindings} == {
+                asset_version.content_sha256
+            }
 
             agent_audit = invocations["agent"]
             assert agent_audit.invocation_source == "agent"

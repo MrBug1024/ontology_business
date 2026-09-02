@@ -2,19 +2,21 @@
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 import hashlib
-from itertools import islice
 import json
 import math
 from pathlib import Path
 import re
 import tempfile
+import threading
 from typing import Any, Iterable, Iterator, Sequence
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from ..catalog_schemas import ValidationDatasetBuildIn
@@ -30,6 +32,8 @@ from ..models import (
     DatasetSchema,
     DatasetVersion,
     DatasetVersionAsset,
+    IngestionRun,
+    IngestionRunInput,
     LogicalDataset,
 )
 from . import (
@@ -38,11 +42,18 @@ from . import (
     object_deletion_service,
     object_storage_service,
     permission_service,
+    tabular_materialization_service,
     tenant_service,
 )
 
 
 class ValidationDatasetError(ValueError):
+    pass
+
+
+class NoMaterializableTableError(ValidationDatasetError):
+    """The source is a valid table document but contains no data rows."""
+
     pass
 
 
@@ -53,6 +64,9 @@ _IDENTIFIER_MARKERS = (
 _KEY_CLEAN_RE = re.compile(r"[\x00-\x1f\x7f]")
 _BATCH_ROWS = 5_000
 _PARQUET_TARGET_BYTES = 256 * 1024 * 1024
+_VALIDATION_PIPELINE_KIND = "validation_dataset"
+_VALIDATION_PIPELINE_VERSION = "validation-dataset/v2"
+_VALIDATION_JOB_LEASE_SECONDS = 300
 
 
 def _canonical_hash(value: Any) -> str:
@@ -324,41 +338,75 @@ def _materialize_raw_file(
         )]
         workbook = None
     elif extension in {".xlsx", ".xlsm"}:
-        from openpyxl import load_workbook
-
-        workbook = load_workbook(
-            raw_path,
-            read_only=True,
-            data_only=True,
-            keep_links=False,
-            keep_vba=False,
-        )
-        profile_by_name = {str(item.get("name") or ""): item for item in tables}
-        candidates = []
-        try:
-            # OOXML may omit worksheet dimensions. In read-only mode openpyxl
-            # then exposes max_row=None, so the verified profile is authoritative.
-            profiled_sheets = [
-                sheet for sheet in workbook.worksheets
-                if sheet.title in profile_by_name
-            ]
-            for sheet in profiled_sheets:
-                table_profile = profile_by_name[sheet.title]
-                rows = sheet.iter_rows(values_only=True)
-                rows = islice(
-                    rows,
-                    int(table_profile.get("header_row_index") or 0) + 1,
-                    None,
+        requests: list[tabular_materialization_service.ExcelSheetRequest] = []
+        planned: list[tuple[str, list[dict[str, Any]]]] = []
+        planned_relation_keys = set(used_relation_keys)
+        for ordinal, table_profile in enumerate(tables):
+            sheet_name = str(table_profile.get("name") or "").strip()
+            if not sheet_name:
+                raise ValidationDatasetError("Excel 工作表 profile 缺少名称")
+            raw_relation_name = str(table_profile.get("relation_name") or "").strip()
+            if not raw_relation_name:
+                raw_relation_name = catalog_ingestion_service.runtime_relation_name(
+                    filename, sheet_name, len(tables)
                 )
-                relation_name = str(table_profile.get("relation_name") or "").strip()
-                if not relation_name:
-                    relation_name = catalog_ingestion_service.runtime_relation_name(
-                        filename, sheet.title, len(profiled_sheets)
-                    )
-                candidates.append((relation_name, table_profile, rows))
-        except Exception:
-            _close_tabular_workbook(workbook)
-            raise
+            relation_name = _relation_key(raw_relation_name, f"table_{ordinal + 1}")
+            if relation_name.casefold() in planned_relation_keys:
+                relation_name = _relation_key(
+                    f"{stem}__{relation_name}",
+                    f"table_{len(planned_relation_keys) + 1}",
+                )
+            if relation_name.casefold() in planned_relation_keys:
+                raise ValidationDatasetError(
+                    f"验证数据包包含重复关系名: {relation_name}"
+                )
+            _schema, field_contract, logical_types = _arrow_contract(
+                list(table_profile.get("columns") or [])
+            )
+            requests.append(
+                tabular_materialization_service.ExcelSheetRequest(
+                    name=sheet_name,
+                    header_row_index=int(table_profile.get("header_row_index") or 0),
+                    fields=tuple(
+                        tabular_materialization_service.ExcelField(
+                            name=str(field["name"]),
+                            logical_type=logical_types[index],
+                        )
+                        for index, field in enumerate(field_contract)
+                    ),
+                    output_stem=f"{len(used_relation_keys) + ordinal + 1:04d}-0001",
+                )
+            )
+            planned.append((relation_name, field_contract))
+            planned_relation_keys.add(relation_name.casefold())
+        try:
+            fragments, engine = (
+                tabular_materialization_service.materialize_excel_workbook(
+                    raw_path, output_dir, requests
+                )
+            )
+        except tabular_materialization_service.TabularMaterializationError as exc:
+            raise ValidationDatasetError(str(exc)) from exc
+        for (relation_name, field_contract), fragment in zip(
+            planned, fragments, strict=True
+        ):
+            if fragment is None:
+                continue
+            used_relation_keys.add(relation_name.casefold())
+            results.append(
+                {
+                    "relation_key": relation_name,
+                    "display_name": relation_name,
+                    "fields": field_contract,
+                    "fragments": [fragment],
+                    "row_count": int(fragment["row_count"]),
+                    "byte_size": int(fragment["byte_size"]),
+                    "materialization": engine,
+                }
+            )
+        if not results:
+            raise NoMaterializableTableError(f"{filename} 没有可物化的数据行")
+        return results
     elif extension == ".xls":
         import xlrd
 
@@ -397,19 +445,19 @@ def _materialize_raw_file(
                 )
             if relation_name.casefold() in used_relation_keys:
                 raise ValidationDatasetError(f"验证数据包包含重复关系名: {relation_name}")
-            used_relation_keys.add(relation_name.casefold())
             arrow_schema, field_contract, logical_types = _arrow_contract(
                 list(table_profile.get("columns") or [])
             )
             fragments = _write_parquet_fragments(
                 output_dir,
-                f"{len(used_relation_keys):04d}",
+                f"{len(used_relation_keys) + 1:04d}",
                 rows,
                 arrow_schema,
                 logical_types,
             )
             if not fragments:
                 continue
+            used_relation_keys.add(relation_name.casefold())
             results.append(
                 {
                     "relation_key": relation_name,
@@ -423,7 +471,7 @@ def _materialize_raw_file(
     finally:
         _close_tabular_workbook(workbook)
     if not results:
-        raise ValidationDatasetError(f"{filename} 没有可物化的工作表")
+        raise NoMaterializableTableError(f"{filename} 没有可物化的数据行")
     return results
 
 
@@ -458,33 +506,33 @@ def _input_identity(versions: Sequence[DataAssetVersion]) -> tuple[dict[str, Any
     return identity, identity_hash, f"validation.bundle.{identity_hash[:32]}"
 
 
-def _job_document(db: Session, dataset: LogicalDataset) -> dict[str, Any]:
-    labels = dict(dataset.labels or {})
-    version = db.scalar(
-        select(DatasetVersion)
-        .where(
-            DatasetVersion.dataset_id == dataset.id,
-            DatasetVersion.status == "ready",
-        )
-        .order_by(DatasetVersion.version_number.desc())
-    )
-    status = "succeeded" if version is not None else str(
-        labels.get("build_status") or "queued"
-    )
+def _job_document(db: Session, run: IngestionRun) -> dict[str, Any]:
+    dataset = db.get(LogicalDataset, run.dataset_id)
+    if dataset is None:
+        raise ValidationDatasetError("验证数据集任务不存在")
+    version = db.get(DatasetVersion, run.output_version_id) if run.output_version_id else None
+    status = "queued" if run.status == "pending" else run.status
     result = None
     if version is not None:
         schema = db.get(DatasetSchema, version.schema_id)
         if schema is not None:
             result = _result(dataset, version, schema, reused=True)
             result["source_asset_version_ids"] = list(
-                labels.get("source_asset_version_ids") or []
+                db.scalars(
+                    select(IngestionRunInput.asset_version_id)
+                    .where(
+                        IngestionRunInput.ingestion_run_id == run.id,
+                        IngestionRunInput.asset_version_id.is_not(None),
+                    )
+                    .order_by(IngestionRunInput.ordinal)
+                ).all()
             )
     return {
-        "id": dataset.id,
+        "id": run.id,
         "status": status,
-        "error": str(labels.get("build_error") or ""),
-        "created_at": dataset.created_at,
-        "updated_at": dataset.updated_at,
+        "error": str(run.error or ""),
+        "created_at": run.created_at,
+        "updated_at": run.finished_at or run.started_at or run.created_at,
         "result": result,
     }
 
@@ -529,92 +577,260 @@ def enqueue_validation_dataset_job(
                 "catalog_purpose": "validation_dataset",
                 "input_hash": identity_hash,
                 "source_asset_version_ids": list(payload.asset_version_ids),
-                "build_status": "queued",
-                "build_error": "",
-                "requested_by_user_id": str(db.info.get("user_id") or ""),
             },
             created_by_user_id=str(db.info.get("user_id") or "") or None,
         )
         db.add(dataset)
         db.flush()
-    else:
-        document = _job_document(db, dataset)
-        if document["status"] == "failed":
-            dataset.labels = {
-                **dict(dataset.labels or {}),
-                "build_status": "queued",
-                "build_error": "",
-            }
+    ready_version = db.scalar(
+        select(DatasetVersion)
+        .where(
+            DatasetVersion.dataset_id == dataset.id,
+            DatasetVersion.status == "ready",
+        )
+        .order_by(DatasetVersion.version_number.desc())
+    )
+    idempotency_key = f"validation-dataset:{identity_hash}"
+    run = db.scalar(
+        select(IngestionRun)
+        .where(
+            IngestionRun.tenant_id == tenant_id,
+            IngestionRun.idempotency_key == idempotency_key,
+        )
+        .with_for_update()
+    )
+    if run is None:
+        now = datetime.now(timezone.utc)
+        run = IngestionRun(
+            tenant_id=tenant_id,
+            dataset_id=dataset.id,
+            output_version_id=ready_version.id if ready_version is not None else None,
+            pipeline_kind=_VALIDATION_PIPELINE_KIND,
+            pipeline_version=_VALIDATION_PIPELINE_VERSION,
+            idempotency_key=idempotency_key,
+            status="succeeded" if ready_version is not None else "pending",
+            requested_by_user_id=str(db.info.get("user_id") or "") or None,
+            checkpoint={"input_hash": identity_hash, "lease_attempt": 0},
+            finished_at=now if ready_version is not None else None,
+        )
+        db.add(run)
+        db.flush()
+        for ordinal, version in enumerate(ordered):
+            db.add(
+                IngestionRunInput(
+                    tenant_id=tenant_id,
+                    ingestion_run_id=run.id,
+                    ordinal=ordinal,
+                    role="source",
+                    asset_version_id=version.id,
+                    content_hash=version.content_sha256,
+                    input_document={},
+                )
+            )
+    elif ready_version is not None:
+        run.status = "succeeded"
+        run.output_version_id = ready_version.id
+        run.error = ""
+        run.lease_token = ""
+        run.lease_expires_at = None
+        run.finished_at = run.finished_at or datetime.now(timezone.utc)
+    elif run.status in {"failed", "cancelled"}:
+        run.status = "pending"
+        run.error = ""
+        run.lease_token = ""
+        run.lease_expires_at = None
+        run.finished_at = None
     db.commit()
-    db.refresh(dataset)
-    return _job_document(db, dataset)
+    db.refresh(run)
+    return _job_document(db, run)
 
 
 def get_validation_dataset_job(db: Session, job_id: str) -> dict[str, Any]:
     permission_service.require_tenant_permission(db, "read")
-    dataset = db.scalar(
-        select(LogicalDataset).where(
-            LogicalDataset.id == job_id,
-            LogicalDataset.tenant_id == tenant_service.current_tenant_id(db),
+    run = db.scalar(
+        select(IngestionRun).where(
+            IngestionRun.id == job_id,
+            IngestionRun.tenant_id == tenant_service.current_tenant_id(db),
+            IngestionRun.pipeline_kind == _VALIDATION_PIPELINE_KIND,
         )
     )
-    if dataset is None or (dataset.labels or {}).get("catalog_purpose") != "validation_dataset":
+    if run is None:
         raise ValidationDatasetError("验证数据集任务不存在")
-    return _job_document(db, dataset)
+    return _job_document(db, run)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
+def _claim_validation_dataset_job(db: Session, job_id: str) -> tuple[IngestionRun, str] | None:
+    run = db.scalar(
+        select(IngestionRun)
+        .where(
+            IngestionRun.id == job_id,
+            IngestionRun.pipeline_kind == _VALIDATION_PIPELINE_KIND,
+        )
+        .with_for_update()
+    )
+    if run is None:
+        return None
+    now = datetime.now(timezone.utc)
+    expires_at = _as_utc(run.lease_expires_at)
+    if run.status != "pending" and not (
+        run.status == "running" and expires_at is not None and expires_at <= now
+    ):
+        return None
+    token = uuid.uuid4().hex
+    checkpoint = dict(run.checkpoint or {})
+    checkpoint["lease_attempt"] = int(checkpoint.get("lease_attempt") or 0) + 1
+    run.status = "running"
+    run.started_at = run.started_at or now
+    run.finished_at = None
+    run.error = ""
+    run.lease_token = token
+    run.lease_expires_at = now + timedelta(seconds=_VALIDATION_JOB_LEASE_SECONDS)
+    run.checkpoint = checkpoint
+    db.commit()
+    return run, token
+
+
+def _renew_validation_dataset_job(job_id: str, token: str) -> bool:
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        result = db.execute(
+            update(IngestionRun)
+            .where(
+                IngestionRun.id == job_id,
+                IngestionRun.pipeline_kind == _VALIDATION_PIPELINE_KIND,
+                IngestionRun.status == "running",
+                IngestionRun.lease_token == token,
+                IngestionRun.lease_expires_at.is_not(None),
+                IngestionRun.lease_expires_at > now,
+            )
+            .values(
+                lease_expires_at=now + timedelta(seconds=_VALIDATION_JOB_LEASE_SECONDS)
+            )
+        )
+        db.commit()
+        return bool(result.rowcount)
+    finally:
+        db.close()
+
+
+@contextmanager
+def _validation_job_heartbeat(job_id: str, token: str) -> Iterator[None]:
+    stopped = threading.Event()
+    lease_lost = threading.Event()
+
+    def heartbeat() -> None:
+        interval = max(1.0, _VALIDATION_JOB_LEASE_SECONDS / 3)
+        while not stopped.wait(interval):
+            try:
+                if not _renew_validation_dataset_job(job_id, token):
+                    lease_lost.set()
+                    return
+            except Exception:  # noqa: BLE001 - the fenced completion remains authoritative.
+                lease_lost.set()
+                return
+
+    thread = threading.Thread(
+        target=heartbeat,
+        name=f"validation-job-heartbeat-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield
+        if lease_lost.is_set():
+            raise ValidationDatasetError("验证数据集任务租约已失效")
+    finally:
+        stopped.set()
+        thread.join(timeout=1.0)
 
 
 def process_validation_dataset_job(job_id: str) -> bool:
     """Claim and execute one durable dataset job in a worker-owned session."""
     db = SessionLocal()
+    token = ""
     try:
-        dataset = db.scalar(
-            select(LogicalDataset)
-            .where(LogicalDataset.id == job_id)
-            .with_for_update()
-        )
-        if dataset is None:
+        claim = _claim_validation_dataset_job(db, job_id)
+        if claim is None:
             return False
-        labels = dict(dataset.labels or {})
-        if labels.get("catalog_purpose") != "validation_dataset":
-            return False
-        if str(labels.get("build_status") or "") != "queued":
-            return False
-        tenant_id = str(dataset.tenant_id)
-        user_id = str(labels.get("requested_by_user_id") or dataset.created_by_user_id or "")
-        dataset.labels = {
-            **labels,
-            "build_status": "running",
-            "build_started_at": datetime.now(timezone.utc).isoformat(),
-            "build_error": "",
-        }
-        db.commit()
+        run, token = claim
+        tenant_id = str(run.tenant_id)
+        user_id = str(run.requested_by_user_id or "")
         db.info["tenant_id"] = tenant_id
         db.info["user_id"] = user_id
+        dataset = db.get(LogicalDataset, run.dataset_id)
+        if dataset is None:
+            raise ValidationDatasetError("验证数据集任务不存在")
+        asset_version_ids = list(
+            db.scalars(
+                select(IngestionRunInput.asset_version_id)
+                .where(
+                    IngestionRunInput.ingestion_run_id == run.id,
+                    IngestionRunInput.asset_version_id.is_not(None),
+                )
+                .order_by(IngestionRunInput.ordinal)
+            ).all()
+        )
         payload = ValidationDatasetBuildIn(
-            asset_version_ids=list(labels.get("source_asset_version_ids") or []),
+            asset_version_ids=asset_version_ids,
             name=dataset.name,
         )
-        build_validation_dataset(db, payload)
-        completed = db.get(LogicalDataset, job_id)
-        if completed is not None:
-            completed.labels = {
-                **dict(completed.labels or {}),
-                "build_status": "succeeded",
-                "build_completed_at": datetime.now(timezone.utc).isoformat(),
-                "build_error": "",
-            }
-            db.commit()
+        with _validation_job_heartbeat(job_id, token):
+            result = build_validation_dataset(db, payload)
+        completed = db.scalar(
+            select(IngestionRun)
+            .where(
+                IngestionRun.id == job_id,
+                IngestionRun.status == "running",
+                IngestionRun.lease_token == token,
+            )
+            .with_for_update()
+        )
+        now = datetime.now(timezone.utc)
+        if (
+            completed is None
+            or _as_utc(completed.lease_expires_at) is None
+            or _as_utc(completed.lease_expires_at) <= now
+        ):
+            raise ValidationDatasetError("验证数据集任务租约已失效")
+        completed.status = "succeeded"
+        completed.output_version_id = str(result["dataset_version_id"])
+        completed.records_read = int(result["record_count"])
+        completed.records_written = int(result["record_count"])
+        completed.bytes_written = int(result["byte_size"])
+        completed.error = ""
+        completed.lease_token = ""
+        completed.lease_expires_at = None
+        completed.finished_at = now
+        db.commit()
         return True
     except Exception as exc:  # noqa: BLE001 - worker exposes only a stable error.
         db.rollback()
-        failed = db.get(LogicalDataset, job_id)
+        failed = db.scalar(
+            select(IngestionRun)
+            .where(
+                IngestionRun.id == job_id,
+                IngestionRun.status == "running",
+                IngestionRun.lease_token == token,
+            )
+            .with_for_update()
+        ) if token else None
         if failed is not None:
-            failed.labels = {
-                **dict(failed.labels or {}),
-                "build_status": "failed",
-                "build_completed_at": datetime.now(timezone.utc).isoformat(),
-                "build_error": str(exc or "验证数据集生成失败")[:1000],
-            }
+            failed.status = "failed"
+            failed.finished_at = datetime.now(timezone.utc)
+            failed.error = (
+                str(exc)[:1000]
+                if isinstance(exc, ValidationDatasetError)
+                else "验证数据集生成失败"
+            )
+            failed.lease_token = ""
+            failed.lease_expires_at = None
             db.commit()
         return False
     finally:
@@ -626,14 +842,12 @@ def process_next_validation_dataset_job() -> bool:
     try:
         candidates = list(
             db.scalars(
-                select(LogicalDataset)
+                select(IngestionRun)
                 .where(
-                    LogicalDataset.lifecycle_status == "active",
-                    LogicalDataset.labels["catalog_purpose"].as_string()
-                    == "validation_dataset",
-                    LogicalDataset.labels["build_status"].as_string() == "queued",
+                    IngestionRun.pipeline_kind == _VALIDATION_PIPELINE_KIND,
+                    IngestionRun.status == "pending",
                 )
-                .order_by(LogicalDataset.created_at, LogicalDataset.id)
+                .order_by(IngestionRun.created_at, IngestionRun.id)
                 .limit(1)
             ).all()
         )
@@ -641,8 +855,8 @@ def process_next_validation_dataset_job() -> bool:
             (
                 item.id
                 for item in candidates
-                if (item.labels or {}).get("catalog_purpose") == "validation_dataset"
-                and (item.labels or {}).get("build_status") == "queued"
+                if item.pipeline_kind == _VALIDATION_PIPELINE_KIND
+                and item.status == "pending"
             ),
             None,
         )
@@ -655,24 +869,19 @@ def recover_validation_dataset_jobs() -> int:
     db = SessionLocal()
     recovered = 0
     try:
-        for dataset in db.scalars(
-            select(LogicalDataset).where(
-                LogicalDataset.lifecycle_status == "active",
-                LogicalDataset.labels["catalog_purpose"].as_string()
-                == "validation_dataset",
-                LogicalDataset.labels["build_status"].as_string() == "running",
+        now = datetime.now(timezone.utc)
+        for run in db.scalars(
+            select(IngestionRun).where(
+                IngestionRun.pipeline_kind == _VALIDATION_PIPELINE_KIND,
+                IngestionRun.status == "running",
             )
         ):
-            labels = dict(dataset.labels or {})
-            if (
-                labels.get("catalog_purpose") == "validation_dataset"
-                and labels.get("build_status") == "running"
-            ):
-                dataset.labels = {
-                    **labels,
-                    "build_status": "queued",
-                    "build_error": "服务重启后自动恢复",
-                }
+            expires_at = _as_utc(run.lease_expires_at)
+            if expires_at is not None and expires_at <= now:
+                run.status = "pending"
+                run.error = "执行租约过期后自动恢复"
+                run.lease_token = ""
+                run.lease_expires_at = None
                 recovered += 1
         db.commit()
         return recovered
@@ -742,18 +951,32 @@ def build_validation_dataset(
                 result["source_asset_version_ids"] = list(payload.asset_version_ids)
                 return result
 
+    bucket_file_ids = [str(version.bucket_file_id) for version in versions]
+    bucket_files = {
+        item.id: item
+        for item in db.scalars(
+            select(BucketFile).where(BucketFile.id.in_(bucket_file_ids))
+        ).all()
+    }
+    if len(bucket_files) != len(set(bucket_file_ids)):
+        raise ValidationDatasetError("验证资料的 MinIO 对象记录不存在")
     source = catalog_ingestion_service.require_external_upload_bucket(db)
+    # The bucket resolver takes a row lock while it validates or repairs the
+    # tenant-owned internal source.  Parquet materialization can take minutes,
+    # so release that catalog transaction before any object download or CPU
+    # work.  The immutable asset/version identities are rechecked above and
+    # SessionLocal uses expire_on_commit=False.
+    db.commit()
     max_bytes = int(get_settings().catalog_max_upload_bytes)
     upload_records: list[tuple[Any, BucketFile]] = []
     try:
         with tempfile.TemporaryDirectory(prefix="ontology-validation-") as raw_dir:
             work = Path(raw_dir).resolve()
             materialized: list[dict[str, Any]] = []
+            skipped_sources: list[dict[str, str]] = []
             used_relation_keys: set[str] = set()
             for index, version in enumerate(versions):
-                bucket_file = db.get(BucketFile, version.bucket_file_id)
-                if bucket_file is None:
-                    raise ValidationDatasetError("验证资料的 MinIO 对象记录不存在")
+                bucket_file = bucket_files[str(version.bucket_file_id)]
                 raw_path = work / f"raw-{index:03d}{Path(assets[version.asset_id].name).suffix.lower()}"
                 object_storage_service.download_object_to_file(
                     bucket_file.bucket_name,
@@ -764,15 +987,27 @@ def build_validation_dataset(
                 )
                 if _file_sha256(raw_path) != version.content_sha256:
                     raise ValidationDatasetError("验证资料完整性校验失败")
-                materialized.extend(
-                    _materialize_raw_file(
+                try:
+                    relations = _materialize_raw_file(
                         raw_path,
                         assets[version.asset_id].name,
                         _profile(version),
                         work,
                         used_relation_keys,
                     )
-                )
+                except NoMaterializableTableError as exc:
+                    skipped_sources.append(
+                        {
+                            "asset_version_id": version.id,
+                            "name": assets[version.asset_id].name,
+                            "reason": str(exc),
+                        }
+                    )
+                else:
+                    materialized.extend(relations)
+
+            if not materialized:
+                raise ValidationDatasetError("所选验证资料没有可物化的表格数据")
 
             schema_relations = {
                 item["relation_key"]: [
@@ -861,6 +1096,11 @@ def build_validation_dataset(
                         if len(item["fragments"]) == 1
                         else {}
                     ),
+                    **(
+                        {"materialization": item["materialization"]}
+                        if item.get("materialization")
+                        else {}
+                    ),
                 }
                 for item in materialized
             }
@@ -869,6 +1109,7 @@ def build_validation_dataset(
                 "input": identity,
                 "relations": manifest_relations,
                 "derived_relations": {},
+                "skipped_sources": skipped_sources,
             }
             version_hash = _canonical_hash(
                 {"dataset_key": dataset_key, "schema_hash": schema_hash, "manifest": manifest}

@@ -93,6 +93,7 @@ from ..schemas import (
     ObjectSearchItemOut,
     ObjectSearchOut,
     PropertyIn,
+    PropertyOut,
     RelationIn,
     RelationInstanceIn,
     RelationInstanceOut,
@@ -1450,7 +1451,9 @@ def _entity_out(
         state_property=e.state_property or "",
         created_at=e.created_at,
         properties=[
-            PropertyIn(
+            PropertyOut(
+                id=p.id,
+                entity_id=p.entity_id,
                 name=p.name,
                 api_name=p.api_name or ontology_service.normalize_api_name(
                     display_name=p.name, prefix="property", stable_key=p.id

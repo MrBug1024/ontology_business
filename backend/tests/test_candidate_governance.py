@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 from fastapi import HTTPException
@@ -125,6 +126,225 @@ def test_origin_is_provenance_and_does_not_change_quality_state() -> None:
         assistant_quality["quality_fingerprint"]
         == manual_quality["quality_fingerprint"]
     )
+
+
+def test_unique_primary_key_becomes_title_during_candidate_preflight() -> None:
+    db, tenant, user, scenario = _session()
+    try:
+        entity = _draft(
+            tenant_id=tenant.id,
+            scenario_id=scenario.id,
+            user_id=user.id,
+            kind="entity",
+            key="entity.record",
+            payload={
+                "name": "Record",
+                "is_abstract": False,
+                "properties": [
+                    {
+                        "name": "record_id",
+                        "api_name": "record_id",
+                        "data_type": "string",
+                        "is_key": True,
+                        "is_title": False,
+                        "is_required": True,
+                        "is_enum": False,
+                        "enum_values": [],
+                        "default_value": "",
+                        "constraints": {},
+                        "is_sensitive": False,
+                    }
+                ],
+            },
+            source="compiler_sidecar",
+        )
+        db.add(entity)
+        db.commit()
+
+        evaluation = candidate_governance_service.evaluate_candidates(
+            db, scenario, [entity]
+        )
+
+        assert evaluation.eligible is True
+        assert any(
+            issue["code"] == "title_fallback_to_primary_key"
+            and issue["blocking"] is False
+            for issue in evaluation.warnings
+        )
+        assert evaluation.payload["entities"][0]["properties"][0]["is_title"] is True
+    finally:
+        db.close()
+
+
+def test_compiler_machine_refs_and_schema_aliases_revalidate_without_manual_rewrite() -> None:
+    db, tenant, user, scenario = _session()
+    try:
+        work_item = OntologyEntity(
+            id="entity-work-item",
+            scenario_id=scenario.id,
+            name="Work item",
+            api_name="entity_work_item",
+        )
+        reviewer = OntologyEntity(
+            id="entity-reviewer",
+            scenario_id=scenario.id,
+            name="Reviewer",
+            api_name="entity_reviewer",
+        )
+        work_item_draft = _draft(
+            tenant_id=tenant.id,
+            scenario_id=scenario.id,
+            user_id=user.id,
+            kind="entity",
+            key="entity.work_item",
+            payload={"key": "work_item", "name": "Work item"},
+            source="compiler_sidecar",
+            status="resolved",
+        )
+        work_item_draft.resolved_resource_id = work_item.id
+        reviewer_draft = _draft(
+            tenant_id=tenant.id,
+            scenario_id=scenario.id,
+            user_id=user.id,
+            kind="entity",
+            key="entity.reviewer",
+            payload={"key": "reviewer", "name": "Reviewer"},
+            source="compiler_sidecar",
+            status="resolved",
+        )
+        reviewer_draft.resolved_resource_id = reviewer.id
+        relation = _draft(
+            tenant_id=tenant.id,
+            scenario_id=scenario.id,
+            user_id=user.id,
+            kind="relation",
+            key="relation.work_item_reviewer",
+            payload={
+                "key": "work_item_reviewer",
+                "name": "Work item reviewer",
+                "source_ref": "work_item",
+                "target_ref": "reviewer",
+                "relation_type": "association",
+            },
+            source="compiler_sidecar",
+        )
+        action = _draft(
+            tenant_id=tenant.id,
+            scenario_id=scenario.id,
+            user_id=user.id,
+            kind="action",
+            key="action.review",
+            payload={
+                "key": "review",
+                "name": "Review",
+                "entity_ref": "work_item",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "priority": {
+                            "type": "integer",
+                            "default_value": 1,
+                        }
+                    },
+                    "additionalProperties": False,
+                },
+                "precondition": {
+                    "field": "status",
+                    "operator": "equals",
+                    "value": "pending",
+                },
+                "postcondition": {
+                    "field": "status",
+                    "operator": "equals",
+                    "value": "reviewed",
+                },
+            },
+            source="compiler_sidecar",
+        )
+        function = _draft(
+            tenant_id=tenant.id,
+            scenario_id=scenario.id,
+            user_id=user.id,
+            kind="function",
+            key="function.score",
+            payload={
+                "key": "score",
+                "name": "Score",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "weight": {
+                            "type": "number",
+                            "default_value": 1.0,
+                        }
+                    },
+                    "additionalProperties": False,
+                },
+                "output_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+            source="compiler_sidecar",
+        )
+        db.add_all([
+            work_item,
+            reviewer,
+            work_item_draft,
+            reviewer_draft,
+            relation,
+            action,
+            function,
+        ])
+        db.commit()
+
+        evaluation = candidate_governance_service.evaluate_candidates(
+            db, scenario, [relation, action, function]
+        )
+
+        assert evaluation.eligible is True, json.dumps(
+            evaluation.blockers, ensure_ascii=True
+        )
+        assert evaluation.payload is not None
+        relation_payload = evaluation.payload["relations"][0]
+        assert relation_payload["source"] == {
+            "kind": "existing",
+            "id": work_item.id,
+        }
+        assert relation_payload["target"] == {
+            "kind": "existing",
+            "id": reviewer.id,
+        }
+        action_schema = evaluation.payload["actions"][0]["input_schema"]
+        assert action_schema["properties"]["priority"]["default"] == 1
+        assert "default_value" not in action_schema["properties"]["priority"]
+        action_payload = evaluation.payload["actions"][0]
+        assert json.loads(action_payload["precondition"])["op"] == "=="
+        assert json.loads(action_payload["postcondition"])["op"] == "=="
+        function_schema = evaluation.payload["functions"][0]["input_schema"]
+        assert function_schema["properties"]["weight"]["default"] == 1.0
+
+        promoted, _result = candidate_governance_service.promote_candidates(
+            db,
+            scenario,
+            tenant_id=tenant.id,
+            created_by_user_id=user.id,
+            expected_revisions={
+                relation.id: 0,
+                action.id: 0,
+                function.id: 0,
+            },
+        )
+        db.commit()
+        assert len(promoted) == 3
+        formal_action = db.scalars(select(OntologyAction).where(
+            OntologyAction.scenario_id == scenario.id,
+            OntologyAction.name == "Review",
+        )).one()
+        assert json.loads(formal_action.precondition)["op"] == "=="
+    finally:
+        db.close()
 
 
 def test_revalidate_and_promote_action_keeps_formal_action_inactive() -> None:

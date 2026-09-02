@@ -102,6 +102,24 @@ def _plain_mapping(value: Any, label: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _sequence_list(
+    value: Any,
+    label: str,
+    *,
+    minimum: int = 0,
+    maximum: int,
+) -> list[Any]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+        or not minimum <= len(value) <= maximum
+    ):
+        raise MappedQueryError(
+            f"{label}必须是 {minimum} 到 {maximum} 项的列表"
+        )
+    return list(value)
+
+
 def _safe_identifier(value: Any, label: str, *, maximum: int = 300) -> str:
     if not isinstance(value, str):
         raise MappedQueryError(f"{label}必须是字符串")
@@ -268,7 +286,14 @@ def _property_type(prop: Any) -> str:
 def _normalize_scalar(prop: Any, value: Any) -> Any:
     name = str(getattr(prop, "name", "") or "")
     kind = _property_type(prop)
-    if value is None or isinstance(value, (dict, list)):
+    if (
+        value is None
+        or isinstance(value, Mapping)
+        or (
+            isinstance(value, Sequence)
+            and not isinstance(value, (str, bytes, bytearray))
+        )
+    ):
         raise MappedQueryError(f"属性“{name}”的过滤值必须是非空标量")
     if kind in {"string", "text"}:
         if not isinstance(value, str) or len(value) > 10_000 or "\x00" in value:
@@ -346,9 +371,12 @@ def _normalize_filter(
     if "value" not in item:
         raise MappedQueryError(f"{op} 运算符必须提供过滤值")
     if op in _SET_OPERATORS:
-        raw_values = item["value"]
-        if not isinstance(raw_values, list) or not 1 <= len(raw_values) <= 100:
-            raise MappedQueryError(f"{op} 的过滤值必须是 1 到 100 项的列表")
+        raw_values = _sequence_list(
+            item["value"],
+            f"{op} 的过滤值",
+            minimum=1,
+            maximum=100,
+        )
         values = [_normalize_scalar(prop, value) for value in raw_values]
         return {"property": name, "column": column, "op": op, "value": values}
     value = _normalize_scalar(prop, item["value"])
@@ -476,9 +504,12 @@ def prepare_query(
         raise MappedQueryError("数据映射的属性列配置无效")
     column_map = dict(mapping.column_map)
     visible = _visible_properties(db, entity)
-    raw_properties = request.get("properties")
-    if not isinstance(raw_properties, list) or not 1 <= len(raw_properties) <= 50:
-        raise MappedQueryError("properties 必须是 1 到 50 个属性名的列表")
+    raw_properties = _sequence_list(
+        request.get("properties"),
+        "properties",
+        minimum=1,
+        maximum=50,
+    )
     selected_parts = [
         _mapped_property(name, visible=visible, column_map=column_map)
         for name in raw_properties
@@ -506,9 +537,11 @@ def prepare_query(
         for index, (name, prop, column) in enumerate(selected_parts)
     )
 
-    raw_filters = request.get("filters", [])
-    if not isinstance(raw_filters, list) or len(raw_filters) > 20:
-        raise MappedQueryError("filters 必须是不超过 20 项的列表")
+    raw_filters = _sequence_list(
+        request.get("filters", ()),
+        "filters",
+        maximum=20,
+    )
     filters = [
         _normalize_filter(
             item,
@@ -518,9 +551,11 @@ def prepare_query(
         )
         for item in raw_filters
     ]
-    raw_sort = request.get("sort", [])
-    if not isinstance(raw_sort, list) or len(raw_sort) > 5:
-        raise MappedQueryError("sort 必须是不超过 5 项的列表")
+    raw_sort = _sequence_list(
+        request.get("sort", ()),
+        "sort",
+        maximum=5,
+    )
     sort = [
         _normalize_sort(
             item,

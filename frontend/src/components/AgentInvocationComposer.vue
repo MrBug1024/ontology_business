@@ -108,7 +108,11 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import type { AgentChatRequest, CatalogAsset, CatalogAssetVersion, ValidationDataset, ValidationDatasetJob } from '@/types'
-import { AGENT_INVOCATION_FILE_ACCEPT, isSupportedInvocationFile } from '@/utils/agentInvocation'
+import {
+  AGENT_INVOCATION_FILE_ACCEPT,
+  isSupportedInvocationFile,
+  isTabularInvocationAsset,
+} from '@/utils/agentInvocation'
 
 type AttachmentStatus = 'uploading' | 'ready' | 'error'
 type ChatAttachmentDraft = {
@@ -121,6 +125,7 @@ type ChatAttachmentDraft = {
   status: AttachmentStatus
   assetVersionId?: string
   expectedSignature?: string
+  contentCategory?: string
   persistent?: boolean
   error?: string
 }
@@ -131,6 +136,7 @@ type SavedAsset = {
   filename: string
   size: number
   signature: string
+  contentCategory: string | undefined
   createdAt: string
 }
 
@@ -213,6 +219,9 @@ async function uploadOne(item: ChatAttachmentDraft) {
     item.assetId = uploaded.asset.id
     item.assetVersionId = uploaded.version.id
     item.expectedSignature = uploaded.version.content_sha256
+    item.contentCategory = typeof uploaded.version.profile?.category === 'string'
+      ? uploaded.version.profile.category
+      : undefined
     item.persistent = uploaded.purpose === 'validation_asset'
     item.progress = 100
     item.status = 'ready'
@@ -265,6 +274,11 @@ async function loadSavedAssets() {
         filename: asset.name,
         size: latest.byte_size,
         signature: latest.content_sha256,
+        contentCategory: typeof latest.version_document?.profile === 'object'
+          && latest.version_document.profile !== null
+          && typeof (latest.version_document.profile as Record<string, unknown>).category === 'string'
+          ? String((latest.version_document.profile as Record<string, unknown>).category)
+          : undefined,
         createdAt: latest.created_at,
       } satisfies SavedAsset
     }))
@@ -296,6 +310,7 @@ function attachSaved(item: SavedAsset) {
     status: 'ready',
     assetVersionId: item.versionId,
     expectedSignature: item.signature,
+    contentCategory: item.contentCategory,
     persistent: true,
   })
 }
@@ -319,10 +334,6 @@ async function deleteSaved(item: SavedAsset) {
 function removeAttachment(uid: string) {
   attachments.value = attachments.value.filter((item) => item.uid !== uid)
   if (!attachments.value.some((item) => item.status === 'error')) uploadError.value = ''
-}
-
-function isTableFile(filename: string) {
-  return /\.(csv|tsv|xls|xlsx|xlsm)$/i.test(filename)
 }
 
 function preparationStorageKey(agentId = props.agentId) {
@@ -471,8 +482,12 @@ async function submitDraft() {
   }
   const text = message.value.trim()
   if (!text && !readyAttachments.value.length) return
-  const tables = readyAttachments.value.filter((item) => isTableFile(item.filename))
-  const documents = readyAttachments.value.filter((item) => !isTableFile(item.filename))
+  const tables = readyAttachments.value.filter((item) => (
+    isTabularInvocationAsset(item.contentCategory, item.filename)
+  ))
+  const documents = readyAttachments.value.filter((item) => (
+    !isTabularInvocationAsset(item.contentCategory, item.filename)
+  ))
   uploadError.value = ''
   const request: AgentChatRequest = {
     message: text,

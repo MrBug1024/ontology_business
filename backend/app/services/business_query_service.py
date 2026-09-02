@@ -26,6 +26,208 @@ _AGGREGATIONS = frozenset({"count", "sum", "avg", "min", "max"})
 _HAVING_OPERATORS = frozenset({"eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in"})
 
 
+def public_query_schema() -> dict[str, Any]:
+    """Return the protocol-neutral semantic object-set query contract."""
+
+    entity_reference = {
+        "type": "object",
+        "properties": {
+            "entity_id": {"type": "string", "minLength": 1},
+            "entity_name": {"type": "string", "minLength": 1},
+        },
+        "anyOf": [
+            {"required": ["entity_id"]},
+            {"required": ["entity_name"]},
+        ],
+        "additionalProperties": False,
+    }
+    filter_schema = {
+        "type": "object",
+        "properties": {
+            "property": {"type": "string", "minLength": 1},
+            "op": {
+                "type": "string",
+                "enum": sorted(mapped_query_service.FILTER_OPERATORS),
+            },
+            "value": {},
+        },
+        "required": ["property", "op"],
+        "additionalProperties": False,
+    }
+    entity_selector = {
+        "entity_id": {"type": "string", "minLength": 1},
+        "entity_name": {"type": "string", "minLength": 1},
+    }
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "base_entity": {
+                "description": (
+                    "主对象类型；可传对象引用或对象显示名称。"
+                    "不得传表名、列名或数据源标识。"
+                ),
+                "oneOf": [
+                    entity_reference,
+                    {"type": "string", "minLength": 1},
+                ],
+            },
+            "base_properties": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "maxItems": 50,
+            },
+            "base_filters": {
+                "type": "array",
+                "items": filter_schema,
+                "maxItems": 20,
+                "description": "主对象过滤条件，按 AND 组合。",
+            },
+            "related_entities": {
+                "type": "array",
+                "maxItems": 5,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        **entity_selector,
+                        "properties": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "maxItems": 50,
+                        },
+                        "filters": {
+                            "type": "array",
+                            "items": filter_schema,
+                            "maxItems": 20,
+                        },
+                        "join": {
+                            "type": "object",
+                            "properties": {
+                                "base_property": {"type": "string", "minLength": 1},
+                                "related_property": {"type": "string", "minLength": 1},
+                            },
+                            "required": ["base_property", "related_property"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "anyOf": [
+                        {"required": ["entity_id"]},
+                        {"required": ["entity_name"]},
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "group_by": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        **entity_selector,
+                        "property": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["property"],
+                    "anyOf": [
+                        {"required": ["entity_id"]},
+                        {"required": ["entity_name"]},
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "aggregations": {
+                "type": "array",
+                "maxItems": 20,
+                "description": (
+                    "count、sum、avg、min、max 聚合。filters 只限制当前聚合，"
+                    "可用于同一分组内的条件计数或条件求和。count 可省略 property，"
+                    "此时执行 COUNT(*)；其他聚合必须提供 property。"
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "function": {
+                            "type": "string",
+                            "enum": sorted(_AGGREGATIONS),
+                        },
+                        **entity_selector,
+                        "property": {"type": "string", "minLength": 1},
+                        "alias": {"type": "string", "minLength": 1, "maxLength": 80},
+                        "filters": {
+                            "type": "array",
+                            "items": filter_schema,
+                            "maxItems": 20,
+                        },
+                    },
+                    "required": ["function", "alias"],
+                    "anyOf": [
+                        {"required": ["entity_id"]},
+                        {"required": ["entity_name"]},
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "having": {
+                "type": "array",
+                "maxItems": 20,
+                "description": (
+                    "按聚合结果筛选。value 用于固定阈值；right_alias 用于两个"
+                    "聚合结果比较，两者必须且只能提供一个。"
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "alias": {"type": "string", "minLength": 1},
+                        "op": {
+                            "type": "string",
+                            "enum": sorted(_HAVING_OPERATORS),
+                        },
+                        "value": {},
+                        "right_alias": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["alias", "op"],
+                    "oneOf": [
+                        {"required": ["value"]},
+                        {"required": ["right_alias"]},
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "sort": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        **entity_selector,
+                        "property": {"type": "string", "minLength": 1},
+                        "alias": {"type": "string", "minLength": 1},
+                        "direction": {
+                            "type": "string",
+                            "enum": ["asc", "desc"],
+                        },
+                    },
+                    "required": ["direction"],
+                    "anyOf": [
+                        {"required": ["alias"]},
+                        {
+                            "required": ["property"],
+                            "anyOf": [
+                                {"required": ["entity_id"]},
+                                {"required": ["entity_name"]},
+                            ],
+                        },
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "limit": {"type": "integer", "minimum": 1},
+            "offset": {"type": "integer", "minimum": 0},
+        },
+        "required": ["base_entity"],
+        "additionalProperties": False,
+    }
+    return schema
+
+
 @dataclass(frozen=True)
 class _SourcePlan:
     entity: Any
@@ -89,9 +291,13 @@ def _entity_object(value: Any, label: str) -> dict[str, Any]:
 def _list(value: Any, label: str, *, maximum: int) -> list[Any]:
     if value is None:
         return []
-    if not isinstance(value, list) or len(value) > maximum:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+        or len(value) > maximum
+    ):
         raise BusinessQueryError(f"{label}必须是不超过 {maximum} 项的列表")
-    return value
+    return list(value)
 
 
 def _entity_request(value: Mapping[str, Any], label: str) -> dict[str, Any]:
@@ -544,9 +750,11 @@ def prepare_query(
         plans[str(plan.entity.id)] = plan
 
     raw_aggregations = _list(request.get("aggregations"), "aggregations", maximum=20)
-    base_properties = request.get("base_properties", [])
-    if not isinstance(base_properties, list) or len(base_properties) > 50:
-        raise BusinessQueryError("base_properties 必须是不超过 50 个属性名的列表")
+    base_properties = _list(
+        request.get("base_properties"),
+        "base_properties",
+        maximum=50,
+    )
     if not base_properties and not raw_aggregations:
         raise BusinessQueryError("查询至少需要一个普通属性或聚合结果")
     columns: list[_Column] = [
@@ -554,9 +762,11 @@ def prepare_query(
         for name in base_properties
     ]
     for plan, item, alias in related:
-        properties = item.get("properties", [])
-        if not isinstance(properties, list) or len(properties) > 50:
-            raise BusinessQueryError("关联对象 properties 必须是不超过 50 个属性名的列表")
+        properties = _list(
+            item.get("properties"),
+            "关联对象 properties",
+            maximum=50,
+        )
         for name in properties:
             label = f"{plan.entity.name}.{str(name).strip()}"
             columns.append(_column(plan, name, alias, label, allow_transform=True))
@@ -617,10 +827,15 @@ def prepare_query(
 
     aggregate_aliases: set[str] = set()
     aggregate_alias_indexes: dict[str, int] = {}
+    aggregate_expressions: dict[str, str] = {}
     for index, raw in enumerate(raw_aggregations):
         item = _object(raw, f"aggregations[{index}]")
-        if set(item) - {"function", "entity_id", "entity_name", "property", "alias"}:
-            raise BusinessQueryError("聚合只支持 function、对象、property 和 alias")
+        if set(item) - {
+            "function", "entity_id", "entity_name", "property", "alias", "filters",
+        }:
+            raise BusinessQueryError(
+                "聚合只支持 function、对象、property、alias 和 filters"
+            )
         function = str(item.get("function") or "").strip().lower()
         if function not in _AGGREGATIONS:
             raise BusinessQueryError("聚合函数只支持 count、sum、avg、min、max")
@@ -645,8 +860,27 @@ def prepare_query(
         aggregate_aliases.add(alias)
         aggregate_alias_indexes[alias] = index
         aggregate_expression = column.expression if column is not None else "*"
+        aggregate_filters = _filter_sql(
+            source_type,
+            aliases[str(entity.id)],
+            _normalize_filters(plan, item.get("filters")),
+            parameters,
+            f"aggregate_{index}_filter",
+        )
+        if aggregate_filters:
+            predicate = " AND ".join(aggregate_filters)
+            if function == "count":
+                rendered_aggregate = f"SUM(CASE WHEN {predicate} THEN 1 ELSE 0 END)"
+            else:
+                rendered_aggregate = (
+                    f"{function.upper()}(CASE WHEN {predicate} "
+                    f"THEN {aggregate_expression} ELSE NULL END)"
+                )
+        else:
+            rendered_aggregate = f"{function.upper()}({aggregate_expression})"
+        aggregate_expressions[alias] = rendered_aggregate
         select_sql.append(
-            f"{function.upper()}({aggregate_expression}) AS "
+            f"{rendered_aggregate} AS "
             f"{mapped_query_service.quote_identifier(source_type, f'q_agg_{index}')}"
         )
         output_labels.append(alias)
@@ -661,28 +895,55 @@ def prepare_query(
     having_sql: list[str] = []
     for index, raw in enumerate(_list(request.get("having"), "having", maximum=20)):
         item = _object(raw, f"having[{index}]")
-        if set(item) - {"alias", "op", "value"}:
-            raise BusinessQueryError("having 只支持聚合 alias、op 和 value")
+        if set(item) - {"alias", "op", "value", "right_alias"}:
+            raise BusinessQueryError(
+                "having 只支持聚合 alias、op、value 和 right_alias"
+            )
         alias = str(item.get("alias") or "").strip()
         if alias not in aggregate_aliases:
             raise BusinessQueryError("having 只能引用当前查询中的聚合 alias")
         op = str(item.get("op") or "").strip().lower()
         if op not in _HAVING_OPERATORS:
             raise BusinessQueryError("having 运算符只支持 eq、ne、gt、gte、lt、lte、in、not_in")
+        has_value = "value" in item
+        has_right_alias = bool(str(item.get("right_alias") or "").strip())
+        if has_value == has_right_alias:
+            raise BusinessQueryError("having 必须且只能提供 value 或 right_alias")
+        aggregate_expression = aggregate_expressions[alias]
+        binary = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+        if has_right_alias:
+            if op in {"in", "not_in"}:
+                raise BusinessQueryError("聚合 alias 之间不能使用 in 或 not_in")
+            right_alias = str(item.get("right_alias") or "").strip()
+            if right_alias not in aggregate_aliases:
+                raise BusinessQueryError("having 的 right_alias 必须引用当前查询中的聚合 alias")
+            having_sql.append(
+                f"{aggregate_expression} {binary[op]} {aggregate_expressions[right_alias]}"
+            )
+            continue
         value = item.get("value")
-        values = value if op in {"in", "not_in"} else [value]
-        if not isinstance(values, list) or not 1 <= len(values) <= 100:
+        values = (
+            _list(value, "having 的过滤值", maximum=100)
+            if op in {"in", "not_in"}
+            else [value]
+        )
+        if not values:
             raise BusinessQueryError("having 的过滤值必须是 1 到 100 项的标量列表")
         normalized_values: list[Any] = []
         for item_value in values:
-            if isinstance(item_value, bool) or item_value is None or isinstance(item_value, (dict, list)):
+            if (
+                isinstance(item_value, bool)
+                or item_value is None
+                or isinstance(item_value, Mapping)
+                or (
+                    isinstance(item_value, Sequence)
+                    and not isinstance(item_value, (str, bytes, bytearray))
+                )
+            ):
                 raise BusinessQueryError("having 的过滤值必须是非空标量")
             if op in {"gt", "gte", "lt", "lte"} and not isinstance(item_value, (int, float)):
                 raise BusinessQueryError("having 的有序比较值必须是数值")
             normalized_values.append(item_value)
-        aggregate_expression = mapped_query_service.quote_identifier(
-            source_type, f'q_agg_{aggregate_alias_indexes[alias]}'
-        )
         if op in {"in", "not_in"}:
             names = []
             for value_index, item_value in enumerate(normalized_values):
@@ -694,7 +955,6 @@ def prepare_query(
         else:
             parameter_name = f"having_{index}"
             parameters[parameter_name] = normalized_values[0]
-            binary = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
             having_sql.append(f"{aggregate_expression} {binary[op]} :{parameter_name}")
     sql = (
         f"SELECT {', '.join(select_sql)}"

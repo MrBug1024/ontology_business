@@ -162,8 +162,23 @@ def _validate_schema_node(value: Any, *, path: str, depth: int, require_type: bo
             raise FunctionDefinitionError(f"{path}.required 不能重复")
         if properties is not None and any(item not in properties for item in required):
             raise FunctionDefinitionError(f"{path}.required 引用了未声明字段")
-    if "additionalProperties" in value and not isinstance(value["additionalProperties"], bool):
-        raise FunctionDefinitionError(f"{path}.additionalProperties 必须是布尔值")
+    if "additionalProperties" in value:
+        additional_properties = value["additionalProperties"]
+        if isinstance(additional_properties, Mapping):
+            if schema_type != "object":
+                raise FunctionDefinitionError(
+                    f"{path}.additionalProperties 仅可用于 object 类型"
+                )
+            _validate_schema_node(
+                additional_properties,
+                path=f"{path}.additionalProperties",
+                depth=depth + 1,
+                require_type=False,
+            )
+        elif not isinstance(additional_properties, bool):
+            raise FunctionDefinitionError(
+                f"{path}.additionalProperties 必须是布尔值或 JSON Schema"
+            )
     if "items" in value:
         if schema_type != "array":
             raise FunctionDefinitionError(f"{path}.items 仅可用于 array 类型")

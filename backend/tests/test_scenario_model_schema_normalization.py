@@ -14,7 +14,7 @@ from app.services import (
 
 class ScenarioModelSchemaNormalizationTests(unittest.TestCase):
     def test_value_field_is_explicit_validated_and_evaluated_fail_closed(self) -> None:
-        condition = scenario_model_compiler._normalize_rule_condition({
+        condition = scenario_model_compiler.normalize_rule_condition({
             "field": "实际金额",
             "op": ">",
             "value_field": "限制金额",
@@ -89,7 +89,7 @@ class ScenarioModelSchemaNormalizationTests(unittest.TestCase):
             },
         ):
             with self.assertRaises(ValueError):
-                scenario_model_compiler._normalize_rule_condition(malformed)
+                scenario_model_compiler.normalize_rule_condition(malformed)
 
     def test_same_entity_field_name_used_as_string_literal_is_blocking(self) -> None:
         source_bundle = scenario_model_compiler.build_source_bundle(
@@ -444,6 +444,59 @@ class ScenarioModelSchemaNormalizationTests(unittest.TestCase):
                 label="输入 Schema",
             )
 
+    def test_lossless_schema_keyword_aliases_are_canonicalized_recursively(self) -> None:
+        schema = scenario_model_compiler._object_schema({
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "default_value": 0,
+                    "exclusive_minimum": -1,
+                },
+                "labels": {
+                    "type": "array",
+                    "items": {"type": "string", "min_length": 1},
+                    "unique_items": True,
+                },
+            },
+            "additionalProperties": {},
+        })
+
+        self.assertEqual(schema["additionalProperties"], True)
+        self.assertEqual(schema["properties"]["count"]["default"], 0)
+        self.assertEqual(schema["properties"]["count"]["exclusiveMinimum"], -1)
+        self.assertEqual(schema["properties"]["labels"]["uniqueItems"], True)
+        self.assertEqual(schema["properties"]["labels"]["items"]["minLength"], 1)
+
+    def test_conflicting_or_invalid_schema_aliases_remain_blocking(self) -> None:
+        with self.assertRaisesRegex(ValueError, "冲突"):
+            scenario_model_compiler._object_schema({
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "default": 1,
+                        "default_value": 2,
+                    },
+                },
+            })
+        constrained = scenario_model_compiler._object_schema({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {"type": "string"},
+        })
+        self.assertEqual(
+            constrained["additionalProperties"], {"type": "string"}
+        )
+        with self.assertRaisesRegex(
+            Exception, "additionalProperties 必须是布尔值或 JSON Schema"
+        ):
+            scenario_model_compiler._object_schema({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": [],
+            })
+
     def test_unknown_schema_type_and_conflicting_temporal_format_stay_blocking(self) -> None:
         with self.assertRaisesRegex(Exception, "type 不支持"):
             scenario_model_compiler._object_schema({
@@ -460,14 +513,14 @@ class ScenarioModelSchemaNormalizationTests(unittest.TestCase):
 
     def test_rule_operator_aliases_are_canonicalized_without_guessing(self) -> None:
         self.assertEqual(
-            scenario_model_compiler._normalize_rule_condition({
+            scenario_model_compiler.normalize_rule_condition({
                 "field": "验收日期",
                 "operator": "IS NOT NULL",
             }),
             {"field": "验收日期", "op": "is_not_null"},
         )
         self.assertEqual(
-            scenario_model_compiler._normalize_rule_condition({
+            scenario_model_compiler.normalize_rule_condition({
                 "field": "状态",
                 "operator": "=",
                 "value": "已审批",
@@ -475,7 +528,7 @@ class ScenarioModelSchemaNormalizationTests(unittest.TestCase):
             {"field": "状态", "op": "==", "value": "已审批"},
         )
         self.assertEqual(
-            scenario_model_compiler._normalize_rule_condition({
+            scenario_model_compiler.normalize_rule_condition({
                 "field": "状态",
                 "op": "不属于",
                 "value": ["已取消", "已归档"],
@@ -485,18 +538,18 @@ class ScenarioModelSchemaNormalizationTests(unittest.TestCase):
 
     def test_missing_unknown_or_conflicting_rule_operator_stays_blocking(self) -> None:
         with self.assertRaisesRegex(ValueError, "空值"):
-            scenario_model_compiler._normalize_rule_condition({
+            scenario_model_compiler.normalize_rule_condition({
                 "field": "状态",
                 "value": "已审批",
             })
         with self.assertRaisesRegex(ValueError, "不支持的运算符"):
-            scenario_model_compiler._normalize_rule_condition({
+            scenario_model_compiler.normalize_rule_condition({
                 "field": "状态",
                 "op": "approximately",
                 "value": "已审批",
             })
         with self.assertRaisesRegex(ValueError, "互相冲突"):
-            scenario_model_compiler._normalize_rule_condition({
+            scenario_model_compiler.normalize_rule_condition({
                 "field": "状态",
                 "op": "==",
                 "operator": "!=",

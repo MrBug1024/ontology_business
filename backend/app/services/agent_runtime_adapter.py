@@ -50,6 +50,7 @@ from .capability_contracts import (
     canonical_json,
 )
 from .capability_invoker import CapabilityInvocationError
+from .agent_prompt_policy import AUTHORITATIVE_DECISION_PROMPT
 
 
 _CAPABILITY_CATEGORY_BY_KIND = {
@@ -611,7 +612,55 @@ class CapabilityAgentRuntime:
                     "kind": self.turn_input.target_kind,
                 }
             )
+        if self.turn_input.attachments and not any(
+            self._capability_accepts_attachments(item)
+            for item in self.capabilities
+            if bool((item.get("readiness") or {}).get("ready", False))
+        ):
+            issues.append(
+                {
+                    "code": "attachments_not_supported",
+                    "binding_kinds": sorted(
+                        {item.binding_kind for item in self.turn_input.attachments}
+                    ),
+                    "count": len(self.turn_input.attachments),
+                }
+            )
         return issues
+
+    def _capability_accepts_attachments(
+        self,
+        capability: Mapping[str, Any],
+    ) -> bool:
+        eligible = [
+            item
+            for item in (capability.get("data_ports") or [])
+            if isinstance(item, Mapping)
+            and str(item.get("direction") or "input").strip().lower() != "output"
+            and bool(item.get("allow_override", False))
+            and str(item.get("key") or item.get("port_key") or "").strip()
+        ]
+        attachments = self.turn_input.attachments
+        if len(eligible) < len(attachments):
+            return False
+
+        def assign(index: int, used: frozenset[str]) -> bool:
+            if index >= len(attachments):
+                return True
+            attachment = attachments[index]
+            for port in eligible:
+                key = str(port.get("key") or port.get("port_key") or "").strip()
+                if key in used:
+                    continue
+                kinds = {
+                    str(kind).strip().lower()
+                    for kind in (port.get("binding_kinds") or [])
+                }
+                if attachment.binding_kind in kinds and assign(index + 1, used | {key}):
+                    return True
+            return False
+
+        return assign(0, frozenset())
 
     def set_runtime_decision(self, document: Mapping[str, Any]) -> None:
         self.runtime_decision = copy.deepcopy(dict(document))
@@ -945,6 +994,39 @@ class CapabilityAgentRuntime:
             **json.loads(canonical_json(self.turn_input.structured_inputs)),
         }
 
+    def _tool_request_identity(
+        self,
+        *,
+        kind: str,
+        key: str,
+        inputs: Mapping[str, Any],
+        binding_overrides: Sequence[DataBindingOverride],
+        mode: str,
+        capability: Mapping[str, Any],
+    ) -> tuple[str | None, str]:
+        parent_key = self.turn_input.idempotency_key
+        if parent_key is None:
+            return None, uuid4().hex
+        digest = canonical_hash(
+            {
+                "parent_idempotency_key": parent_key,
+                "tenant_id": self.tenant_id,
+                "scenario_id": self.scenario.id,
+                "agent_id": self.agent.id,
+                "kind": kind,
+                "key": key,
+                "inputs": inputs,
+                "binding_overrides": tuple(binding_overrides),
+                "mode": mode,
+                "definition_hash": str(capability.get("definition_hash") or ""),
+                "deployment_fingerprint": str(
+                    capability.get("deployment_fingerprint") or ""
+                ),
+            },
+            domain="agent-tool-request-v1",
+        )
+        return f"agent-tool:{digest}", digest
+
     def _record_receipt(self, receipt_document: Mapping[str, Any]) -> None:
         invocation_id = str(receipt_document.get("invocation_id") or "")
         if not invocation_id:
@@ -1044,22 +1126,32 @@ class CapabilityAgentRuntime:
                 args.get("connection_bindings"),
                 occupied_ports,
             )
+            request_inputs = self._request_inputs(args.get("inputs"))
+            binding_overrides = (
+                *self.turn_input.binding_overrides,
+                *attachment_overrides,
+                *connection_overrides,
+            )
+            idempotency_key, request_id = self._tool_request_identity(
+                kind=kind,
+                key=key,
+                inputs=request_inputs,
+                binding_overrides=binding_overrides,
+                mode=mode,
+                capability=capability,
+            )
             request = Request(
                 capability=CapabilityRef(kind=kind, resource_id=key),
-                inputs=self._request_inputs(args.get("inputs")),
-                binding_overrides=(
-                    *self.turn_input.binding_overrides,
-                    *attachment_overrides,
-                    *connection_overrides,
-                ),
+                inputs=request_inputs,
+                binding_overrides=binding_overrides,
                 mode=mode,
-                idempotency_key=self.turn_input.idempotency_key,
+                idempotency_key=idempotency_key,
                 correlation_id=correlation_id,
                 expected_definition_hash=str(capability.get("definition_hash") or ""),
                 expected_deployment_fingerprint=str(
                     capability.get("deployment_fingerprint") or ""
                 ),
-                request_id=uuid4().hex,
+                request_id=request_id,
             )
             receipt = capability_application_service.invoke(
                 self.db,
@@ -1134,6 +1226,7 @@ class CapabilityAgentRuntime:
                 "【能力运行约束】只使用本轮提供的通用能力工具。先核对机器可读契约，再按 kind/key 调用；"
                 "不得猜测数据源、表、列、Provider 或物理连接信息。调用结果中的定义哈希、数据上下文指纹"
                 "和证据引用是本次回答的依据。需要确认或存在副作用的能力只能生成预演，不能替用户确认。",
+                AUTHORITATIVE_DECISION_PROMPT,
                 "【当前能力目录】\n"
                 + json.dumps(catalog, ensure_ascii=False, sort_keys=True),
                 (

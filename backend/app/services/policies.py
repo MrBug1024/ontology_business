@@ -401,7 +401,7 @@ def _validate_action_value(path: str, value: Any, schema: dict[str, Any]) -> Non
         if isinstance(schema.get("items"), dict):
             for index, item in enumerate(value):
                 _validate_action_value(f"{path}[{index}]", item, schema["items"])
-    if isinstance(value, dict) and schema.get("properties"):
+    if isinstance(value, dict) and isinstance(schema.get("properties"), dict):
         properties = schema["properties"]
         required = set(schema.get("required", []))
         for key, child_schema in properties.items():
@@ -413,10 +413,16 @@ def _validate_action_value(path: str, value: Any, schema: dict[str, Any]) -> Non
                         raise PolicyViolation(f"缺少必填参数: {path}.{key}")
                 continue
             _validate_action_value(f"{path}.{key}", value[key], child_schema)
-        if schema.get("additionalProperties") is False:
-            unknown = set(value) - set(properties)
+        additional_properties = schema.get("additionalProperties")
+        unknown = set(value) - set(properties)
+        if additional_properties is False:
             if unknown:
                 raise PolicyViolation(f"存在未声明参数: {path}.{sorted(unknown)[0]}")
+        elif isinstance(additional_properties, dict):
+            for key in sorted(unknown):
+                _validate_action_value(
+                    f"{path}.{key}", value[key], additional_properties
+                )
 
 
 def validate_action_params(schema: Any, params: Any) -> dict[str, Any]:

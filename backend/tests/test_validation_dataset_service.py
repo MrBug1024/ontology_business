@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import hashlib
 from pathlib import Path
@@ -25,6 +26,7 @@ from app.models import (
     DatasetFragment,
     DatasetVersion,
     DocumentChunk,
+    IngestionRun,
     LogicalDataset,
     Tenant,
     User,
@@ -327,6 +329,87 @@ class ValidationDatasetServiceTests(unittest.TestCase):
             [self.asset_version_id],
         )
 
+    def test_active_validation_job_lease_is_not_recovered_or_reclaimed(self) -> None:
+        payload = ValidationDatasetBuildIn(
+            asset_version_ids=[self.asset_version_id],
+            name="Active lease validation package",
+        )
+        with self._database() as db:
+            queued = validation_dataset_service.enqueue_validation_dataset_job(
+                db, payload
+            )
+            run = db.get(IngestionRun, queued["id"])
+            run.status = "running"
+            run.lease_token = "active-validation-lease"
+            run.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+            db.commit()
+
+        with patch.object(validation_dataset_service, "SessionLocal", self.Session):
+            self.assertEqual(
+                validation_dataset_service.recover_validation_dataset_jobs(), 0
+            )
+            self.assertFalse(
+                validation_dataset_service.process_validation_dataset_job(queued["id"])
+            )
+
+        with self._database() as db:
+            run = db.get(IngestionRun, queued["id"])
+            self.assertEqual(run.status, "running")
+            self.assertEqual(run.lease_token, "active-validation-lease")
+
+    def test_only_expired_validation_job_lease_is_requeued(self) -> None:
+        payload = ValidationDatasetBuildIn(
+            asset_version_ids=[self.asset_version_id],
+            name="Expired lease validation package",
+        )
+        with self._database() as db:
+            queued = validation_dataset_service.enqueue_validation_dataset_job(
+                db, payload
+            )
+            run = db.get(IngestionRun, queued["id"])
+            run.status = "running"
+            run.lease_token = "expired-validation-lease"
+            run.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            db.commit()
+
+        with patch.object(validation_dataset_service, "SessionLocal", self.Session):
+            self.assertEqual(
+                validation_dataset_service.recover_validation_dataset_jobs(), 1
+            )
+
+        with self._database() as db:
+            run = db.get(IngestionRun, queued["id"])
+            self.assertEqual(run.status, "pending")
+            self.assertEqual(run.lease_token, "")
+            self.assertIsNone(run.lease_expires_at)
+
+    def test_releases_catalog_transaction_before_download_and_materialization(self) -> None:
+        from contextlib import ExitStack
+
+        payload = ValidationDatasetBuildIn(
+            asset_version_ids=[self.asset_version_id],
+            name="Transaction boundary validation package",
+        )
+        transaction_states: list[bool] = []
+        with ExitStack() as stack:
+            for active_patch in self._patches():
+                stack.enter_context(active_patch)
+            with self._database() as db:
+                def download_without_open_catalog_transaction(*args, **kwargs):
+                    transaction_states.append(db.in_transaction())
+                    return self._download(*args, **kwargs)
+
+                stack.enter_context(
+                    patch.object(
+                        object_storage_service,
+                        "download_object_to_file",
+                        side_effect=download_without_open_catalog_transaction,
+                    )
+                )
+                validation_dataset_service.build_validation_dataset(db, payload)
+
+        self.assertEqual(transaction_states, [False])
+
     def test_streaming_xlsx_without_dimension_materializes_all_profiled_sheets(self) -> None:
         from contextlib import ExitStack
         from openpyxl import Workbook
@@ -437,6 +520,105 @@ class ValidationDatasetServiceTests(unittest.TestCase):
             result["relation_names"],
             ["validation__charge", "validation__encounter"],
         )
+        self.assertEqual(result["record_count"], 2)
+
+    def test_package_keeps_queryable_tables_when_an_output_template_has_no_rows(self) -> None:
+        from contextlib import ExitStack
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "result"
+        sheet.append(["finding_id", "reason"])
+        output = BytesIO()
+        workbook.save(output)
+        workbook.close()
+
+        template = output.getvalue()
+        digest = hashlib.sha256(template).hexdigest()
+        with self._database() as db:
+            source = db.get(DataSource, self.source_id)
+            bucket_file = BucketFile(
+                id="raw-validation-output-template",
+                data_source_id=source.id,
+                filename="result-template.xlsx",
+                stored_path="minio://validation-test/platform/raw/result-template.xlsx",
+                storage_provider="minio",
+                bucket_name="validation-test",
+                object_key="platform/raw/result-template.xlsx",
+                object_version_id="raw-output-template-v1",
+                object_url="minio://validation-test/platform/raw/result-template.xlsx",
+                size=len(template),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                content_sha256=digest,
+                status="parsed",
+            )
+            asset = DataAsset(
+                id="validation-output-template-asset",
+                tenant_id="tenant-validation-data",
+                key="validation.output-template",
+                name="result-template.xlsx",
+                media_type=bucket_file.mime,
+                labels={"catalog_purpose": "validation_asset"},
+                created_by_user_id="user-validation-data",
+            )
+            version = DataAssetVersion(
+                id="validation-output-template-version",
+                tenant_id="tenant-validation-data",
+                asset_id=asset.id,
+                version_number=1,
+                bucket_file_id=bucket_file.id,
+                bucket_data_source_id=source.id,
+                status="ready",
+                content_sha256=digest,
+                byte_size=len(template),
+                version_document={
+                    "profile": {
+                        "category": "table",
+                        "tables": [
+                            {
+                                "name": "result",
+                                "relation_name": "result_template",
+                                "header_row_index": 0,
+                                "columns": [
+                                    {"name": "finding_id", "logical_type": "string"},
+                                    {"name": "reason", "logical_type": "string"},
+                                ],
+                            }
+                        ],
+                    }
+                },
+                created_by_user_id="user-validation-data",
+            )
+            db.add_all([bucket_file, asset, version])
+            db.commit()
+        self.raw_objects[
+            ("validation-test", "platform/raw/result-template.xlsx")
+        ] = template
+
+        payload = ValidationDatasetBuildIn(
+            asset_version_ids=[self.asset_version_id, version.id],
+            name="Validation package with output template",
+        )
+        with ExitStack() as stack:
+            for active_patch in self._patches():
+                stack.enter_context(active_patch)
+            with self._database() as db:
+                result = validation_dataset_service.build_validation_dataset(db, payload)
+            with self._database() as db:
+                with self.assertRaisesRegex(
+                    validation_dataset_service.ValidationDatasetError,
+                    "没有可物化的表格数据",
+                ):
+                    validation_dataset_service.build_validation_dataset(
+                        db,
+                        ValidationDatasetBuildIn(
+                            asset_version_ids=[version.id],
+                            name="Output template only",
+                        ),
+                    )
+
+        self.assertEqual(result["relation_names"], ["claims"])
         self.assertEqual(result["record_count"], 2)
 
 

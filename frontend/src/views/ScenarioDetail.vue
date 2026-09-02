@@ -253,6 +253,12 @@
           </div>
         </div>
 
+        <SemanticMappingsPanel
+          :scenario-id="sid"
+          :can-write="canWrite"
+          :entities="detail.entities"
+        />
+
         <section class="mapping-section" aria-labelledby="object-mapping-heading">
           <div class="mapping-section-head">
             <div>
@@ -384,7 +390,7 @@
                 <el-button v-if="row._isAiDraft" size="small" text @click="startEditingScenarioDraft(row._scenarioDraft)">编辑</el-button>
                 <template v-else>
                   <el-button size="small" text @click="openFunction(row.id)">编辑</el-button>
-                  <el-button v-if="row.runtime_kind !== 'contract'" size="small" text type="primary" @click="doRunFunction(row)">运行</el-button>
+                  <el-button v-if="row.runtime_kind !== 'contract' && row.runtime_kind !== 'provider'" size="small" text type="primary" @click="doRunFunction(row)">运行</el-button>
                   <el-button size="small" text type="danger" @click="removeFunction(row.id)">删除</el-button>
                 </template>
               </template>
@@ -979,22 +985,49 @@
           <div class="form-help">最多 20 个标签，每个标签最多 80 个字符。</div>
         </el-form-item>
         <el-form-item label="运行方式" required>
-          <el-select v-model="functionForm.runtime_kind" style="width:100%" @change="resetFunctionRuntime">
+          <el-select v-model="functionForm.runtime_kind" style="width:100%" @change="onFunctionRuntimeChange">
             <el-option label="仅定义输入输出（暂不可调用）" value="contract" />
+            <el-option label="本体对象集查询（受管 DatasetVersion）" value="provider" />
             <el-option label="加权评分" value="weighted_score" />
             <el-option label="阈值判断" value="threshold" />
             <el-option label="两点地理距离" value="geo_distance" />
             <el-option label="时序数值聚合" value="timeseries_aggregate" />
           </el-select>
         </el-form-item>
-        <el-form-item label="输入字段" required>
+        <el-form-item v-if="functionForm.runtime_kind !== 'provider'" label="输入字段" required>
           <SchemaFieldBuilder v-model="functionForm.input_schema" empty-text="该函数暂时不需要输入字段" />
           <div class="form-help">逐项定义函数需要的业务参数；选择可运行的计算方式后，Agent 会按这些字段调用。</div>
         </el-form-item>
-        <el-form-item label="输出字段" required>
+        <el-form-item v-if="functionForm.runtime_kind !== 'provider'" label="输出字段" required>
           <SchemaFieldBuilder v-model="functionForm.output_schema" empty-text="该函数暂时没有结构化输出" />
           <div class="form-help">逐项说明计算结果，Agent 会按这个结构理解并使用返回值。</div>
         </el-form-item>
+        <template v-if="functionForm.runtime_kind === 'provider'">
+          <el-alert
+            title="输入查询契约和输出结果由受信 Provider 固定；这里只选择该函数可查询的对象映射。"
+            type="info"
+            :closable="false"
+            show-icon
+          />
+          <el-form-item label="可查询对象映射" required>
+            <el-select
+              v-model="functionForm.runtime_config.provider_config.semantic_mapping_ids"
+              multiple
+              filterable
+              style="width:100%"
+              :loading="semanticMappingsLoading"
+              placeholder="选择已激活的 Catalog 语义映射"
+            >
+              <el-option
+                v-for="mapping in activeSemanticMappings"
+                :key="mapping.id"
+                :label="`${entName(mapping.entity_id)} · ${mapping.mapping_key}`"
+                :value="mapping.id"
+              />
+            </el-select>
+            <div class="form-help">映射 ID 会进入 Definition/Release 快照；调用数据仍由本次 Invocation 显式提供。</div>
+          </el-form-item>
+        </template>
         <template v-if="functionForm.runtime_kind === 'weighted_score'">
           <el-form-item label="字段权重" required>
             <div v-if="functionNumericFields.length" class="function-runtime-fields">
@@ -1377,6 +1410,7 @@ import StructuredValueEditor from '@/components/StructuredValueEditor.vue'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
 import CandidateReviewPanel from '@/components/CandidateReviewPanel.vue'
 import CapabilityPortsPanel from '@/components/CapabilityPortsPanel.vue'
+import SemanticMappingsPanel from '@/components/SemanticMappingsPanel.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
 import { safeInternalReturnPath } from '@/utils/navigation'
 import {
@@ -1387,7 +1421,7 @@ import {
   relationMappingModeLabel,
   relationMappingPayloadFingerprint,
 } from '@/utils/relationMappings'
-import type { ArtifactTemplate, AssistantActionPreview, ScenarioDetail, ScenarioModelCandidateSummary, ScenarioModelDraftIssue, ScenarioModelDraftResource, GraphData, GraphNode, GraphEdge, Entity, Relation, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, RelationDataMapping, RelationDataMappingInput, RelationDataMappingPreview, TableInfo, WorkflowRun } from '@/types'
+import type { ArtifactTemplate, AssistantActionPreview, ScenarioDetail, ScenarioModelCandidateSummary, ScenarioModelDraftIssue, ScenarioModelDraftResource, GraphData, GraphNode, GraphEdge, Entity, Relation, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, RelationDataMapping, RelationDataMappingInput, RelationDataMappingPreview, SemanticMapping, TableInfo, WorkflowRun } from '@/types'
 import { cleanTemplateExecutorConfig, templateFormatLabel, templatePathsToSchema, templateUnavailableReason } from '@/utils/templates'
 import { draftRefToken, normalizeScenarioModelDrafts, scenarioDraftIsOpen, scenarioDraftKindLabel, scenarioDraftStage } from '@/utils/scenarioModelDrafts'
 
@@ -2677,6 +2711,9 @@ const emptyFunctionSchema = (): Record<string, unknown> => ({
 })
 const functionDlg = ref(false)
 const functionSaving = ref(false)
+const semanticMappings = ref<SemanticMapping[]>([])
+const semanticMappingsLoading = ref(false)
+const activeSemanticMappings = computed(() => semanticMappings.value.filter((item) => item.status === 'active'))
 const functionForm = ref<FunctionForm>({
   name: '', description: '', tags_text: '', visibility: 'scenario',
   input_schema: emptyFunctionSchema(), output_schema: emptyFunctionSchema(),
@@ -2690,14 +2727,43 @@ const functionNumericFields = computed(() => functionInputFields.value.filter((f
 function functionRuntimeLabel(kind?: string) {
   return ({
     contract: '仅定义（不可调用）', weighted_score: '加权评分', threshold: '阈值判断',
-    geo_distance: '地理距离', timeseries_aggregate: '时序聚合',
+    geo_distance: '地理距离', timeseries_aggregate: '时序聚合', provider: '本体对象集查询',
   } as Record<string, string>)[kind || 'contract'] || kind || '仅定义（不可调用）'
 }
 function runtimeSchema(properties: Record<string, any>, required: string[] = Object.keys(properties)) {
   return { type: 'object', properties, required, additionalProperties: false }
 }
+function semanticQueryOutputSchema() {
+  return runtimeSchema({
+    records: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '符合条件的对象集或聚合结果' },
+    columns: { type: 'array', items: { type: 'string' }, description: '结果字段' },
+    row_count: { type: 'integer', description: '本页结果行数' },
+    truncated: { type: 'boolean', description: '结果是否受服务端上限截断' },
+    offset: { type: 'integer', description: '本页偏移量' },
+    next_offset: { anyOf: [{ type: 'integer' }, { type: 'null' }], description: '下一页偏移量；没有下一页时为空' },
+  })
+}
+async function loadSemanticMappings() {
+  semanticMappingsLoading.value = true
+  try {
+    semanticMappings.value = await api.listSemanticMappings(sid)
+  } catch (error: any) {
+    semanticMappings.value = []
+    ElMessage.error(error?.message || '语义映射加载失败')
+  } finally {
+    semanticMappingsLoading.value = false
+  }
+}
 function resetFunctionRuntime(kind: string) {
-  if (kind === 'weighted_score') {
+  if (kind === 'provider') {
+    functionForm.value.runtime_config = {
+      provider_key: 'builtin.semantic-dataset-query',
+      provider_version: '1.0.0',
+      provider_config: { semantic_mapping_ids: activeSemanticMappings.value.map((item) => item.id) },
+    }
+    functionForm.value.input_schema = emptyFunctionSchema()
+    functionForm.value.output_schema = semanticQueryOutputSchema()
+  } else if (kind === 'weighted_score') {
     functionForm.value.runtime_config = { weights: {}, bias: 0 }
     functionForm.value.output_schema = runtimeSchema({ score: { type: 'number', description: '加权计算结果' } })
   } else if (kind === 'threshold') {
@@ -2715,7 +2781,11 @@ function resetFunctionRuntime(kind: string) {
     functionForm.value.runtime_config = {}
   }
 }
-function openFunction(id?: string) {
+async function onFunctionRuntimeChange(kind: string) {
+  if (kind === 'provider') await loadSemanticMappings()
+  resetFunctionRuntime(kind)
+}
+async function openFunction(id?: string) {
   if (!canWrite.value) return
   clearActiveScenarioDraftPromotion()
   const fn = id ? detail.value.functions.find((item) => item.id === id) : null
@@ -2736,6 +2806,7 @@ function openFunction(id?: string) {
         input_schema: emptyFunctionSchema(), output_schema: emptyFunctionSchema(),
         runtime_kind: 'contract', runtime_config: {},
       }
+  if (functionForm.value.runtime_kind === 'provider') await loadSemanticMappings()
   functionDlg.value = true
 }
 function parseFunctionTags(text: string): string[] {
@@ -2748,6 +2819,13 @@ async function saveFunction() {
   if (!canWrite.value || functionSaving.value) return
   const name = functionForm.value.name.trim()
   if (!name) { ElMessage.error('请填写函数名称'); return }
+  if (
+    functionForm.value.runtime_kind === 'provider'
+    && !functionForm.value.runtime_config?.provider_config?.semantic_mapping_ids?.length
+  ) {
+    ElMessage.error('请至少选择一个已激活的对象语义映射')
+    return
+  }
   let payload: FunctionDefinition
   try {
     payload = {

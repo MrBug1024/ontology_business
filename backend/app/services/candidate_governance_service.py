@@ -343,14 +343,156 @@ def _candidate_ref(row: ScenarioModelDraftResource) -> str:
     return f"candidate:{row.id}:r{max(int(row.revision or 0), 0)}"
 
 
-def _reference(value: Any, direct_value: Any, selected_keys: set[str]) -> Any:
+_REFERENCE_MODEL_BY_KIND = {
+    "entity": OntologyEntity,
+    "relation": OntologyRelation,
+    "function": FunctionDefinition,
+    "action": OntologyAction,
+    "rule": OntologyRule,
+    "event": OntologyEvent,
+    "workflow": OntologyWorkflow,
+    "mapping": DataMapping,
+    "relation_mapping": RelationDataMapping,
+}
+
+
+@dataclass(frozen=True)
+class _ReferenceIndexes:
+    selected: dict[str, dict[str, set[str]]]
+    existing: dict[str, dict[str, set[str]]]
+
+
+def _machine_aliases(kind: str, value: Any) -> set[str]:
+    token = str(value or "").strip()
+    if not token:
+        return set()
+    aliases = {token}
+    prefixes = {str(kind or "").strip()}
+    section = _SECTION_BY_KIND.get(kind, "")
+    if section:
+        prefixes.add(section)
+    for prefix in prefixes:
+        if not prefix:
+            continue
+        for separator in (".", ":", "_"):
+            marker = f"{prefix}{separator}"
+            if token.startswith(marker) and len(token) > len(marker):
+                aliases.add(token[len(marker):])
+    return aliases
+
+
+def _index_reference(
+    index: dict[str, dict[str, set[str]]],
+    *,
+    kind: str,
+    alias: Any,
+    identity: str,
+) -> None:
+    if not identity:
+        return
+    kind_index = index.setdefault(kind, {})
+    for value in _machine_aliases(kind, alias):
+        kind_index.setdefault(value, set()).add(identity)
+
+
+def _build_reference_indexes(
+    db: Session,
+    scenario: BusinessScenario,
+    rows: list[ScenarioModelDraftResource],
+) -> _ReferenceIndexes:
+    selected: dict[str, dict[str, set[str]]] = {}
+    existing: dict[str, dict[str, set[str]]] = {}
+    for row in rows:
+        kind = str(row.resource_kind or "")
+        if kind not in _REFERENCE_MODEL_BY_KIND:
+            continue
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        for alias in (row.resource_key, payload.get("key")):
+            _index_reference(
+                selected,
+                kind=kind,
+                alias=alias,
+                identity=str(row.resource_key or ""),
+            )
+
+    resolved_rows = db.scalars(select(ScenarioModelDraftResource).where(
+        ScenarioModelDraftResource.tenant_id == str(scenario.tenant_id or ""),
+        ScenarioModelDraftResource.scenario_id == scenario.id,
+        ScenarioModelDraftResource.resolved_resource_id != "",
+    )).all()
+    for row in resolved_rows:
+        kind = str(row.resource_kind or "")
+        model = _REFERENCE_MODEL_BY_KIND.get(kind)
+        identity = str(row.resolved_resource_id or "")
+        if model is None or not identity:
+            continue
+        formal = db.get(model, identity)
+        if formal is None or str(getattr(formal, "scenario_id", "")) != scenario.id:
+            continue
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        for alias in (row.resource_key, payload.get("key")):
+            _index_reference(
+                existing, kind=kind, alias=alias, identity=identity
+            )
+
+    # Only persisted machine identifiers participate here. Display names are
+    # intentionally excluded because they are mutable and may be duplicated.
+    for kind, model in (
+        ("entity", OntologyEntity),
+        ("relation", OntologyRelation),
+    ):
+        for formal in db.scalars(select(model).where(
+            model.scenario_id == scenario.id
+        )).all():
+            _index_reference(
+                existing,
+                kind=kind,
+                alias=getattr(formal, "api_name", ""),
+                identity=str(formal.id),
+            )
+    return _ReferenceIndexes(selected=selected, existing=existing)
+
+
+def _indexed_identity(
+    index: dict[str, dict[str, set[str]]],
+    *,
+    kind: str,
+    token: str,
+) -> tuple[str, bool]:
+    identities = {
+        identity
+        for alias in _machine_aliases(kind, token)
+        for identity in index.get(kind, {}).get(alias, set())
+    }
+    if len(identities) == 1:
+        return next(iter(identities)), False
+    return "", len(identities) > 1
+
+
+def _reference(
+    value: Any,
+    direct_value: Any,
+    *,
+    kind: str,
+    indexes: _ReferenceIndexes,
+) -> Any:
     if isinstance(value, dict):
         return _json_copy(value, {})
     token = str(direct_value or value or "").strip()
     if not token:
         return None
-    if token in selected_keys:
-        return {"kind": "generated", "key": token}
+    selected_identity, selected_ambiguous = _indexed_identity(
+        indexes.selected, kind=kind, token=token
+    )
+    if selected_identity:
+        return {"kind": "generated", "key": selected_identity}
+    if selected_ambiguous:
+        return {"kind": "existing", "id": token}
+    existing_identity, _existing_ambiguous = _indexed_identity(
+        indexes.existing, kind=kind, token=token
+    )
+    if existing_identity:
+        return {"kind": "existing", "id": existing_identity}
     return {"kind": "existing", "id": token}
 
 
@@ -368,7 +510,7 @@ def _required_name(row: ScenarioModelDraftResource, item: dict[str, Any]) -> Non
 def _canonical_item(
     row: ScenarioModelDraftResource,
     *,
-    selected_keys: dict[str, set[str]],
+    reference_indexes: _ReferenceIndexes,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     kind = str(row.resource_kind or "")
     item = _json_copy(row.payload if isinstance(row.payload, dict) else {}, {})
@@ -394,17 +536,29 @@ def _canonical_item(
         item["properties"] = normalized_properties
     elif kind == "relation":
         _required_name(row, item)
+        normalized_relation_type = scenario_model_compiler.normalize_relation_type(
+            item.get("relation_type")
+        )
+        if normalized_relation_type:
+            item["relation_type"] = normalized_relation_type
         item["source"] = _reference(
-            item.get("source"), item.get("source_entity_id"), selected_keys["entity"]
+            item.get("source"),
+            item.get("source_entity_id") or item.get("source_ref"),
+            kind="entity",
+            indexes=reference_indexes,
         )
         item["target"] = _reference(
-            item.get("target"), item.get("target_entity_id"), selected_keys["entity"]
+            item.get("target"),
+            item.get("target_entity_id") or item.get("target_ref"),
+            kind="entity",
+            indexes=reference_indexes,
         )
         if item.get("inverse_relation"):
             item["inverse_relation"] = _reference(
                 item.get("inverse_relation"),
                 item.get("inverse_relation_id"),
-                selected_keys["relation"],
+                kind="relation",
+                indexes=reference_indexes,
             )
         existing_id = str(item.get("existing_id") or "")
         item["operation"] = str(
@@ -419,11 +573,27 @@ def _canonical_item(
         item.setdefault("visibility", "scenario")
         item.setdefault("runtime_kind", "contract")
         item.setdefault("runtime_config", {})
+        item["input_schema"] = scenario_model_compiler.canonicalize_resource_schema(
+            item.get("input_schema")
+        )
+        item["output_schema"] = scenario_model_compiler.canonicalize_resource_schema(
+            item.get("output_schema")
+        )
     elif kind == "action":
         _required_name(row, item)
         item["entity"] = _reference(
-            item.get("entity"), item.get("entity_id"), selected_keys["entity"]
+            item.get("entity"),
+            item.get("entity_id") or item.get("entity_ref"),
+            kind="entity",
+            indexes=reference_indexes,
         )
+        item["input_schema"] = scenario_model_compiler.canonicalize_resource_schema(
+            item.get("input_schema")
+        )
+        for field in ("precondition", "postcondition"):
+            item[field] = scenario_model_compiler.canonicalize_condition_expression_text(
+                item.get(field)
+            )
         if str(item.get("executor_type") or "unbound") != "unbound" or item.get("executor_config"):
             raise CandidatePromotionBlocked([_issue(
                 "action_binding_requires_separate_governance",
@@ -447,19 +617,33 @@ def _canonical_item(
     elif kind == "rule":
         _required_name(row, item)
         item["entity"] = _reference(
-            item.get("entity"), item.get("entity_id"), selected_keys["entity"]
-        ) if item.get("entity") or item.get("entity_id") else None
+            item.get("entity"),
+            item.get("entity_id") or item.get("entity_ref"),
+            kind="entity",
+            indexes=reference_indexes,
+        ) if item.get("entity") or item.get("entity_id") or item.get("entity_ref") else None
         trigger_values = (
             item.get("trigger_actions")
             if isinstance(item.get("trigger_actions"), list)
             else item.get("trigger_action_ids")
             if isinstance(item.get("trigger_action_ids"), list)
+            else item.get("trigger_action_refs")
+            if isinstance(item.get("trigger_action_refs"), list)
             else []
         )
         item["trigger_actions"] = [
-            _reference(value, value, selected_keys["action"])
+            _reference(
+                value,
+                value,
+                kind="action",
+                indexes=reference_indexes,
+            )
             for value in trigger_values
         ]
+        if isinstance(item.get("condition"), dict) and item.get("condition"):
+            item["condition"] = scenario_model_compiler.normalize_rule_condition(
+                item["condition"]
+            )
         if item.get("enabled") is True:
             warnings.append(_issue(
                 "activation_deferred",
@@ -471,6 +655,9 @@ def _canonical_item(
         item["enabled"] = False
     elif kind == "event":
         _required_name(row, item)
+        item["payload_schema"] = scenario_model_compiler.canonicalize_resource_schema(
+            item.get("payload_schema")
+        )
         if item.get("enabled") is True:
             warnings.append(_issue(
                 "activation_deferred",
@@ -490,9 +677,20 @@ def _canonical_item(
             data = dict(node.get("data") or {})
             node_kind = str(node.get("type") or "")
             id_field = {"action": "action_id", "rule": "rule_id", "event": "event_id"}.get(node_kind)
+            resource_ref = node.pop("resource_ref", "")
+            if id_field and "resource" not in data and resource_ref:
+                data["resource"] = _reference(
+                    None,
+                    resource_ref,
+                    kind=node_kind,
+                    indexes=reference_indexes,
+                )
             if id_field and "resource" not in data and data.get(id_field):
                 data["resource"] = _reference(
-                    None, data.pop(id_field), selected_keys[f"{node_kind}"]
+                    None,
+                    data.pop(id_field),
+                    kind=node_kind,
+                    indexes=reference_indexes,
                 )
             node["data"] = data
             nodes.append(node)
@@ -508,16 +706,22 @@ def _canonical_item(
             )])
         if item.get("trigger_type") == "event" and not item.get("trigger_event"):
             trigger_config = dict(item.get("trigger_config") or {})
-            event_id = trigger_config.pop("event_id", "")
+            event_id = trigger_config.pop("event_id", "") or trigger_config.pop(
+                "event_ref", ""
+            )
             item["trigger_config"] = trigger_config
             item["trigger_event"] = _reference(
-                None, event_id, selected_keys["event"]
+                None,
+                event_id,
+                kind="event",
+                indexes=reference_indexes,
             )
         elif item.get("trigger_type") == "event":
             item["trigger_event"] = _reference(
                 item.get("trigger_event"),
                 item.get("trigger_event"),
-                selected_keys["event"],
+                kind="event",
+                indexes=reference_indexes,
             )
         if item.get("enabled") is True or item.get("status") == "active":
             warnings.append(_issue(
@@ -531,25 +735,43 @@ def _canonical_item(
         item["enabled"] = False
     elif kind == "mapping":
         item["entity"] = _reference(
-            item.get("entity"), item.get("entity_id"), selected_keys["entity"]
+            item.get("entity"),
+            item.get("entity_id") or item.get("entity_ref"),
+            kind="entity",
+            indexes=reference_indexes,
         )
         item["data_source"] = _reference(
-            item.get("data_source"), item.get("data_source_id"), set()
+            item.get("data_source"),
+            item.get("data_source_id") or item.get("data_source_ref"),
+            kind="data_source",
+            indexes=reference_indexes,
         )
         item.setdefault("apply_plan", {"mode": "add"})
     elif kind == "relation_mapping":
         item["relation"] = _reference(
-            item.get("relation"), item.get("relation_id"), selected_keys["relation"]
+            item.get("relation"),
+            item.get("relation_id") or item.get("relation_ref"),
+            kind="relation",
+            indexes=reference_indexes,
         )
         item["source_mapping"] = _reference(
-            item.get("source_mapping"), item.get("source_mapping_id"), selected_keys["mapping"]
+            item.get("source_mapping"),
+            item.get("source_mapping_id") or item.get("source_mapping_ref"),
+            kind="mapping",
+            indexes=reference_indexes,
         )
         item["target_mapping"] = _reference(
-            item.get("target_mapping"), item.get("target_mapping_id"), selected_keys["mapping"]
+            item.get("target_mapping"),
+            item.get("target_mapping_id") or item.get("target_mapping_ref"),
+            kind="mapping",
+            indexes=reference_indexes,
         )
         if str(item.get("mode") or "") == "join_table":
             item["join_data_source"] = _reference(
-                item.get("join_data_source"), item.get("join_data_source_id"), set()
+                item.get("join_data_source"),
+                item.get("join_data_source_id") or item.get("join_data_source_ref"),
+                kind="data_source",
+                indexes=reference_indexes,
             )
         item.setdefault("apply_plan", {"mode": "add"})
     return item, warnings
@@ -702,6 +924,7 @@ def _build_compound_payload(
     selected_keys: dict[str, set[str]] = defaultdict(set)
     for row in rows:
         selected_keys[str(row.resource_kind or "")].add(str(row.resource_key or ""))
+    reference_indexes = _build_reference_indexes(db, scenario, rows)
     selected_ids = {row.id for row in rows}
     if selected_keys["entity"]:
         property_rows = list(db.scalars(select(ScenarioModelDraftResource).where(
@@ -748,7 +971,9 @@ def _build_compound_payload(
             )])
         if kind == "property":
             continue
-        item, item_warnings = _canonical_item(row, selected_keys=selected_keys)
+        item, item_warnings = _canonical_item(
+            row, reference_indexes=reference_indexes
+        )
         if kind == "entity" and str(item.get("existing_id") or ""):
             existing_entity = db.get(
                 OntologyEntity, str(item.get("existing_id") or "")
@@ -822,6 +1047,28 @@ def _build_compound_payload(
         _overlay_property(entity_item, prop)
         row_resource_keys[row.id] = parent_key
         evidence_by_key[parent_key].append(_candidate_ref(row))
+
+    for key, item in items_by_key.items():
+        if item_section.get(key) != "entities" or bool(item.get("is_abstract")):
+            continue
+        properties = [
+            prop for prop in (item.get("properties") or []) if isinstance(prop, dict)
+        ]
+        title_properties = [prop for prop in properties if bool(prop.get("is_title"))]
+        key_properties = [prop for prop in properties if bool(prop.get("is_key"))]
+        if title_properties or len(key_properties) != 1:
+            continue
+        key_property = key_properties[0]
+        key_property["is_title"] = True
+        if str(item.get("existing_id") or ""):
+            key_property["_operation"] = "update"
+            key_property["_structural_update"] = "title_fallback"
+        warnings.append(_issue(
+            "title_fallback_to_primary_key",
+            "对象类型未提供标题属性，已确定性使用唯一主键作为标题。",
+            blocking=False,
+            resource_keys=[key],
+        ))
 
     sections = {
         section: []

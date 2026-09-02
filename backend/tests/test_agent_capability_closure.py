@@ -880,6 +880,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         )
         prompt = agent_engine.build_system_prompt(context, self.scenario.name, "")
         self.assertIn("不可执行；阻塞原因", prompt)
+        self.assertIn("candidate_detected_pending_review", prompt)
+        self.assertIn("不得宣称事实已确认", prompt)
         self.assertIn("已停用", context.execute_tool("execute_action", {"action_id": "action-mark-risk"}))
         self.assertIn("已停用", context.execute_tool("evaluate_rule", {"rule_id": "rule-high-risk"}))
 
@@ -1198,7 +1200,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertIn('JOIN "contractors" "r0"', sql)
         self.assertIn('GROUP BY "b"."project_code"', sql)
         self.assertIn('COUNT("r0"."contractor_code")', sql)
-        self.assertIn('HAVING "q_agg_0" > :having_0', sql)
+        self.assertIn('HAVING COUNT("r0"."contractor_code") > :having_0', sql)
         self.assertEqual(parameters["having_0"], 0)
         self.assertEqual(parameters["bq_limit"], 11)
         self.assertEqual(parameters["bq_offset"], 3)
@@ -1312,6 +1314,77 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertFalse(invalid["ok"])
         self.assertEqual(invalid["error"]["code"], "INVALID_QUERY")
         self.assertIn("必须提供 property", invalid["error"]["message"])
+
+    def test_business_query_supports_conditional_aggregation_and_alias_comparison(self) -> None:
+        self.db.get(DataMapping, "mapping-projects").transform_rules = {}
+        self.db.commit()
+        context = self._context()
+        args = {
+            "base_entity": "项目",
+            "base_properties": ["项目编号"],
+            "group_by": [{"entity_name": "项目", "property": "项目编号"}],
+            "aggregations": [
+                {
+                    "function": "count",
+                    "entity_name": "项目",
+                    "alias": "高风险记录数",
+                    "filters": [{"property": "风险分", "op": "gte", "value": 80}],
+                },
+                {
+                    "function": "sum",
+                    "entity_name": "项目",
+                    "property": "风险分",
+                    "alias": "风险分合计",
+                },
+            ],
+            "having": [
+                {"alias": "高风险记录数", "op": "gt", "value": 0},
+                {"alias": "风险分合计", "op": "gt", "right_alias": "高风险记录数"},
+            ],
+        }
+        with patch.object(
+            agent_engine.business_query_service.datasource_service,
+            "run_parameterized_query",
+            return_value={
+                "columns": ["q_col_0", "q_agg_0", "q_agg_1"],
+                "rows": [["P-001", 1, 82.0]],
+                "row_count": 1,
+                "truncated": False,
+            },
+        ) as run_query:
+            result = json.loads(context.execute_tool("query_business_data", args))
+
+        self.assertEqual(
+            result["records"],
+            [{"项目编号": "P-001", "高风险记录数": 1, "风险分合计": 82.0}],
+        )
+        _source, sql, parameters = run_query.call_args.args
+        conditional_count = (
+            'SUM(CASE WHEN "b"."risk_score" >= :aggregate_0_filter_0 '
+            'THEN 1 ELSE 0 END)'
+        )
+        self.assertIn(conditional_count, sql)
+        self.assertIn(
+            f'HAVING {conditional_count} > :having_0 AND '
+            f'SUM("b"."risk_score") > {conditional_count}',
+            sql,
+        )
+        self.assertEqual(parameters["aggregate_0_filter_0"], 80)
+        self.assertEqual(parameters["having_0"], 0)
+
+        for invalid_having in (
+            {"alias": "高风险记录数", "op": "gt", "value": 0, "right_alias": "风险分合计"},
+            {"alias": "高风险记录数", "op": "gt"},
+            {"alias": "高风险记录数", "op": "gt", "right_alias": "不存在"},
+        ):
+            invalid = json.loads(
+                context.execute_tool(
+                    "query_business_data",
+                    {**args, "having": [invalid_having]},
+                )
+            )
+            self.assertFalse(invalid["ok"])
+            self.assertEqual(invalid["error"]["code"], "INVALID_QUERY")
 
     def test_resource_history_requires_the_exact_runtime_definition_fingerprint(self) -> None:
         context = self._context()

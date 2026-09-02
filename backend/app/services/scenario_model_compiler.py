@@ -61,7 +61,7 @@ SCHEMA_VERSION = "scenario_model.v1"
 # This version participates in the persistent assistant execution fingerprint.
 # Bump it whenever extraction/prompt semantics change in a way that should
 # permit recompiling otherwise identical inputs.
-COMPILER_VERSION = "scenario_model.compiler.v21"
+COMPILER_VERSION = "scenario_model.compiler.v22"
 MAX_SOURCE_CHARS = 100_000
 MAX_EXISTING_CATALOG_CHARS = 60_000
 MAX_MAPPING_CATALOG_CHARS = 60_000
@@ -286,11 +286,17 @@ _RULE_OPERATOR_ALIASES = {
     "<>": "!=",
     "ne": "!=",
     "gt": ">",
+    "greater_than": ">",
     "ge": ">=",
     "gte": ">=",
+    "greater_than_or_equal": ">=",
+    "greater_than_or_equals": ">=",
     "lt": "<",
+    "less_than": "<",
     "le": "<=",
     "lte": "<=",
+    "less_than_or_equal": "<=",
+    "less_than_or_equals": "<=",
     "not_in": "not_in",
     "not_contains": "not_contains",
     "does_not_contain": "not_contains",
@@ -405,7 +411,7 @@ def _text(value: Any, *, maximum: int = 8_000) -> str:
     return str(value or "").strip()[:maximum]
 
 
-def _canonicalize_resource_schema(value: Any, *, path: str = "资源 Schema") -> Any:
+def canonicalize_resource_schema(value: Any, *, path: str = "资源 Schema") -> Any:
     """Translate only lossless model-type aliases into strict JSON Schema.
 
     This adapter is intentionally compiler-local: persisted function, action
@@ -415,6 +421,36 @@ def _canonicalize_resource_schema(value: Any, *, path: str = "资源 Schema") ->
     if not isinstance(value, dict):
         return copy.deepcopy(value)
     result = copy.deepcopy(value)
+    keyword_aliases = {
+        "default_value": "default",
+        "exclusive_minimum": "exclusiveMinimum",
+        "exclusive_maximum": "exclusiveMaximum",
+        "multiple_of": "multipleOf",
+        "min_length": "minLength",
+        "max_length": "maxLength",
+        "min_items": "minItems",
+        "max_items": "maxItems",
+        "unique_items": "uniqueItems",
+        "min_properties": "minProperties",
+        "max_properties": "maxProperties",
+    }
+    for alias, canonical in keyword_aliases.items():
+        if alias not in result:
+            continue
+        if canonical in result and result[canonical] != result[alias]:
+            raise ValueError(
+                f"{path} 同时声明冲突的 {alias} 与 {canonical}"
+            )
+        result[canonical] = result.pop(alias)
+    additional_properties = result.get("additionalProperties")
+    if additional_properties == {}:
+        # In JSON Schema an empty schema accepts every value, exactly matching
+        # the boolean true supported by the platform's closed contract.
+        result["additionalProperties"] = True
+    elif isinstance(additional_properties, str):
+        token = additional_properties.strip().lower()
+        if token in {"true", "false"}:
+            result["additionalProperties"] = token == "true"
     raw_type = result.get("type")
     expected_format: str | None = None
     if isinstance(raw_type, str):
@@ -443,21 +479,21 @@ def _canonicalize_resource_schema(value: Any, *, path: str = "资源 Schema") ->
     properties = result.get("properties")
     if isinstance(properties, dict):
         result["properties"] = {
-            name: _canonicalize_resource_schema(
+            name: canonicalize_resource_schema(
                 schema,
                 path=f"{path}.properties.{name}",
             )
             for name, schema in properties.items()
         }
     if "items" in result:
-        result["items"] = _canonicalize_resource_schema(
+        result["items"] = canonicalize_resource_schema(
             result["items"], path=f"{path}.items"
         )
     for keyword in ("oneOf", "anyOf", "allOf"):
         variants = result.get(keyword)
         if isinstance(variants, list):
             result[keyword] = [
-                _canonicalize_resource_schema(
+                canonicalize_resource_schema(
                     variant,
                     path=f"{path}.{keyword}[{index}]",
                 )
@@ -473,7 +509,7 @@ def _object_schema(value: Any) -> dict[str, Any]:
         "additionalProperties": False,
     }
     return function_definition_service.normalize_schema(
-        _canonicalize_resource_schema(schema),
+        canonicalize_resource_schema(schema),
         label="资源 Schema",
     )
 
@@ -576,7 +612,7 @@ def _normalize_entity_property_type(value: Any) -> str:
     return _ENTITY_PROPERTY_TYPE_ALIASES.get(token, token)
 
 
-def _normalize_compiler_relation_type(value: Any) -> str:
+def normalize_relation_type(value: Any) -> str:
     """Return a closed platform multiplicity without truncating the token."""
     token = _text(value or "1:N", maximum=80).upper()
     normalized_token = re.sub(r"[\s-]+", "_", token)
@@ -2264,7 +2300,7 @@ def _canonicalize_merged_relation_fragment(fragment: dict[str, Any]) -> None:
     values, endpoint, name and multiplicity disagreements remain conflicts.
     """
     raw_relation_type = fragment.get("relation_type")
-    relation_type = _normalize_compiler_relation_type(raw_relation_type)
+    relation_type = normalize_relation_type(raw_relation_type)
     if relation_type:
         fragment["relation_type"] = relation_type
 
@@ -5178,7 +5214,7 @@ def _canonical_rule_operator(value: Any) -> str:
     return _RULE_OPERATOR_ALIASES.get(normalized, normalized)
 
 
-def _normalize_rule_condition(value: Any, *, depth: int = 0) -> dict[str, Any]:
+def normalize_rule_condition(value: Any, *, depth: int = 0) -> dict[str, Any]:
     if depth > 8 or not isinstance(value, dict) or not value:
         raise ValueError("规则条件必须是深度不超过 8 的非空对象")
     supplied_ops = [
@@ -5198,7 +5234,7 @@ def _normalize_rule_condition(value: Any, *, depth: int = 0) -> dict[str, Any]:
         return {
             "op": op,
             "conditions": [
-                _normalize_rule_condition(item, depth=depth + 1) for item in conditions
+                normalize_rule_condition(item, depth=depth + 1) for item in conditions
             ],
         }
     if op not in _RULE_LEAF_OPS:
@@ -5223,6 +5259,31 @@ def _normalize_rule_condition(value: Any, *, depth: int = 0) -> dict[str, Any]:
     else:
         result["value"] = value.get("value")
     return result
+
+
+def canonicalize_condition_expression_text(value: Any) -> str:
+    """Serialize structured rule gates without inventing condition semantics."""
+    if value in (None, ""):
+        return ""
+    candidate = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        try:
+            candidate = json.loads(text)
+        except (TypeError, ValueError):
+            # Legacy descriptive gates remain display-only and are rejected by
+            # runtime readiness rather than silently reinterpreted here.
+            return text
+    if not isinstance(candidate, dict):
+        raise ValueError("结构化条件必须是 JSON 对象")
+    return json.dumps(
+        normalize_rule_condition(candidate),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _normalize_rule_severity(value: Any) -> str:
@@ -6724,7 +6785,7 @@ def normalize_scenario_model(
         raw_relation_type = _text(
             value.get("relation_type") or "1:N", maximum=80
         )
-        relation_type = _normalize_compiler_relation_type(raw_relation_type)
+        relation_type = normalize_relation_type(raw_relation_type)
         if not relation_type:
             _issue(
                 unresolved,
@@ -7011,14 +7072,30 @@ def normalize_scenario_model(
         except Exception as exc:  # noqa: BLE001
             _issue(unresolved, "invalid_action_schema", f"操作 {key} 的输入契约无效：{exc}", source_refs=meta["evidence_refs"])
             input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+        try:
+            precondition = canonicalize_condition_expression_text(
+                value.get("precondition")
+            )
+            postcondition = canonicalize_condition_expression_text(
+                value.get("postcondition")
+            )
+        except Exception as exc:  # noqa: BLE001
+            _issue(
+                unresolved,
+                "invalid_action_condition",
+                f"操作 {key} 的前置或后置条件无效：{exc}",
+                source_refs=meta["evidence_refs"],
+            )
+            precondition = ""
+            postcondition = ""
         actions.append({
             **meta,
             "name": _text(value.get("name") or key, maximum=200),
             "description": _text(value.get("description")),
             "entity": entity_ref,
             "input_schema": input_schema,
-            "precondition": _text(value.get("precondition")),
-            "postcondition": _text(value.get("postcondition")),
+            "precondition": precondition,
+            "postcondition": postcondition,
             "executor_type": "unbound",
             "executor_config": {},
             "enabled": False,
@@ -7038,7 +7115,7 @@ def normalize_scenario_model(
             db=db,
         )
         try:
-            condition = _normalize_rule_condition(value.get("condition"))
+            condition = normalize_rule_condition(value.get("condition"))
         except Exception as exc:  # noqa: BLE001
             if _looks_like_class_axiom_rule(value):
                 _issue(
@@ -8581,7 +8658,7 @@ def preflight_scenario_model(
             raise PolicyViolation("候选操作必须先保持待绑定且停用")
         _object_schema(item.get("input_schema"))
     for item in payload.get("rules") or []:
-        _normalize_rule_condition(item.get("condition"))
+        normalize_rule_condition(item.get("condition"))
     for item in payload.get("events") or []:
         _object_schema(item.get("payload_schema"))
     for item in payload.get("workflows") or []:

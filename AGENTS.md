@@ -92,6 +92,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r .\backend\requirements.txt
 python -m pip install 'pytest>=8.3,<9'
+python .\backend\scripts\install_duckdb_extensions.py
 if (-not (Test-Path -LiteralPath .\backend\.env)) {
     Copy-Item -LiteralPath .\backend\.env.example -Destination .\backend\.env
 }

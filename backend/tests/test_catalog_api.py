@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -18,6 +19,7 @@ from app.models import (
     OntologyBranch,
     OntologyEntity,
     OntologyProperty,
+    OntologyRule,
     OntologyRelease,
     OntologySnapshot,
     ScenarioCapabilityPort,
@@ -27,7 +29,18 @@ from app.models import (
     User,
 )
 from app.routers import catalog
-from app.services import connector_service, permission_service
+from app.services import business_query_service, connector_service, permission_service
+from app.providers.semantic_dataset_query import SemanticDatasetQueryProvider
+from app.services import runtime_definition_service
+from app.services.capability_contracts import (
+    Actor,
+    CapabilityRef,
+    DataPort,
+    Request,
+    ResolvedDataHandle,
+    ResolvedDeployment,
+    RuntimeDataContext,
+)
 from app.services.auth_service import get_current_user, get_tenant_db
 
 
@@ -264,6 +277,347 @@ class CatalogApiTests(unittest.TestCase):
         with self.Session() as db:
             self.assertIsNotNone(db.get(LogicalDataset, dataset["id"]))
             self.assertIsNone(db.get(ScenarioDatasetBinding, binding_json["id"]))
+
+    def test_semantic_dataset_provider_uses_pinned_mapping_with_same_schema_runtime_data(self) -> None:
+        dataset, schema, version, head = self._create_dataset_contract()
+        binding = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/dataset-bindings",
+            json={
+                "dataset_id": dataset["id"],
+                "binding_key": "records.authoring",
+                "environment": "dev",
+                "role": "modeling_evidence",
+                "binding_mode": "head",
+                "dataset_head_id": head["id"],
+                "is_required": False,
+            },
+        ).json()
+        mapping = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/semantic-mappings",
+            json={
+                "scenario_dataset_binding_id": binding["id"],
+                "entity_id": self.entity.id,
+                "dataset_schema_id": schema["id"],
+                "dataset_relation_id": schema["relations"][0]["id"],
+                "mapping_key": "records.business-record",
+                "status": "active",
+                "fields": [
+                    {
+                        "ontology_property_id": self.property.id,
+                        "dataset_field_id": schema["relations"][0]["fields"][0]["id"],
+                        "direction": "input",
+                        "is_required": True,
+                    }
+                ],
+            },
+        ).json()
+
+        with self.Session() as db:
+            db.info["tenant_id"] = self.tenant.id
+            db.info["user_id"] = self.user.id
+            function = db.get(FunctionDefinition, self.function.id)
+            function.runtime_kind = "provider"
+            function.runtime_config = {
+                "provider_key": SemanticDatasetQueryProvider.provider_key,
+                "provider_version": SemanticDatasetQueryProvider.provider_version,
+                "provider_config": {"semantic_mapping_ids": [mapping["id"]]},
+            }
+            db.commit()
+            definition = runtime_definition_service.resolve_active(
+                db,
+                db.get(BusinessScenario, self.scenario.id),
+                environment="dev",
+            )
+            handle = ResolvedDataHandle(
+                port_key="records",
+                binding_kind="dataset_version",
+                reference_id=version["id"],
+                version_id=version["id"],
+                signature=version["content_hash"],
+            )
+            data_context = RuntimeDataContext(handles=(handle,))
+            deployment = ResolvedDeployment(
+                scenario_id=self.scenario.id,
+                tenant_id=self.tenant.id,
+                environment="dev",
+                definition_hash=definition.definition_hash,
+                definition=definition,
+                data_ports=(
+                    DataPort(
+                        key="records",
+                        modality="dataset",
+                        schema={},
+                        schema_hash=schema["schema_hash"],
+                        binding_kinds=("dataset_version",),
+                        override_policy="managed-reference",
+                    ),
+                ),
+                data_context=data_context,
+            )
+            provider = SemanticDatasetQueryProvider().bind_invocation(db)
+            contract = provider.contract(
+                CapabilityRef(
+                    kind="function",
+                    resource_id=self.function.id,
+                    provider_key=SemanticDatasetQueryProvider.provider_key,
+                ),
+                deployment,
+            )
+            catalog = contract["input_schema"]["x-ontology-catalog"]
+            self.assertEqual(len(catalog), 1)
+            self.assertEqual(catalog[0]["entity_id"], self.entity.id)
+            self.assertEqual(catalog[0]["entity_name"], "Business record")
+            self.assertTrue(catalog[0]["entity_api_name"])
+            self.assertEqual(catalog[0]["semantic_mapping_id"], mapping["id"])
+            self.assertEqual(len(catalog[0]["properties"]), 1)
+            self.assertEqual(
+                {
+                    key: catalog[0]["properties"][0][key]
+                    for key in (
+                        "property_name",
+                        "description",
+                        "data_type",
+                        "is_key",
+                    )
+                },
+                {
+                    "property_name": "Record ID",
+                    "description": "",
+                    "data_type": "string",
+                    "is_key": True,
+                },
+            )
+            self.assertTrue(catalog[0]["properties"][0]["api_name"])
+            base_entity_schema = contract["input_schema"]["properties"]["base_entity"]
+            self.assertEqual(
+                base_entity_schema["oneOf"][1]["enum"],
+                ["Business record"],
+            )
+            self.assertEqual(
+                contract["input_schema"]["properties"]["base_properties"]["items"]["enum"],
+                ["Record ID"],
+            )
+            request = Request(
+                capability=CapabilityRef(
+                    kind="function",
+                    resource_id=self.function.id,
+                    provider_key=SemanticDatasetQueryProvider.provider_key,
+                ),
+                inputs={
+                    "base_entity": "Business record",
+                    "base_properties": ["Record ID"],
+                },
+            )
+            actor = Actor(
+                actor_type="user",
+                principal_id=self.user.id,
+                tenant_id=self.tenant.id,
+                user_id=self.user.id,
+            )
+
+            def compile_query(session, **kwargs):
+                plan = business_query_service.prepare_query(session, **kwargs)
+                self.assertIn('"b"."record_id"', plan.sql)
+                return {
+                    "records": [{"Record ID": "R-1"}],
+                    "columns": ["Record ID"],
+                    "row_count": 1,
+                    "truncated": False,
+                    "offset": 0,
+                    "next_offset": None,
+                }
+
+            with patch(
+                "app.providers.semantic_dataset_query.business_query_service.query_business_data",
+                side_effect=compile_query,
+            ) as query:
+                result = provider.invoke(request, actor, deployment, data_context)
+
+            self.assertEqual(result["records"], [{"Record ID": "R-1"}])
+            call = query.call_args.kwargs
+            self.assertEqual(call["data_sources"][0].config["dataset_version_id"], version["id"])
+            self.assertEqual(call["mappings"][0].table_name, "records")
+            self.assertEqual(call["mappings"][0].column_map, {"Record ID": "record_id"})
+
+            function.input_schema = {
+                "type": "object",
+                "properties": {
+                    "record_id": {
+                        "type": "string",
+                        "description": "Business record identifier",
+                    }
+                },
+                "required": ["record_id"],
+                "additionalProperties": False,
+            }
+            function.runtime_config = {
+                "provider_key": SemanticDatasetQueryProvider.provider_key,
+                "provider_version": SemanticDatasetQueryProvider.provider_version,
+                "provider_config": {
+                    "semantic_mapping_ids": [mapping["id"]],
+                    "query_template": {
+                        "base_entity": {"entity_name": "Business record"},
+                        "base_properties": ["Record ID"],
+                        "base_filters": [
+                            {
+                                "property": "Record ID",
+                                "op": "eq",
+                                "value": {"$input": "record_id"},
+                            }
+                        ],
+                    },
+                },
+            }
+            db.commit()
+            templated_definition = runtime_definition_service.resolve_active(
+                db,
+                db.get(BusinessScenario, self.scenario.id),
+                environment="dev",
+            )
+            templated_deployment = ResolvedDeployment(
+                scenario_id=self.scenario.id,
+                tenant_id=self.tenant.id,
+                environment="dev",
+                definition_hash=templated_definition.definition_hash,
+                definition=templated_definition,
+                data_ports=deployment.data_ports,
+                data_context=data_context,
+            )
+            templated_contract = provider.contract(
+                CapabilityRef(
+                    kind="function",
+                    resource_id=self.function.id,
+                    provider_key=SemanticDatasetQueryProvider.provider_key,
+                ),
+                templated_deployment,
+            )
+            self.assertEqual(
+                templated_contract["input_schema"]["properties"],
+                function.input_schema["properties"],
+            )
+            templated_request = Request(
+                capability=request.capability,
+                inputs={"record_id": "R-1"},
+            )
+
+            def compile_template(session, **kwargs):
+                self.assertEqual(
+                    kwargs["args"]["base_filters"][0]["value"],
+                    "R-1",
+                )
+                return compile_query(session, **kwargs)
+
+            with patch(
+                "app.providers.semantic_dataset_query.business_query_service.query_business_data",
+                side_effect=compile_template,
+            ):
+                templated_result = provider.invoke(
+                    templated_request,
+                    actor,
+                    templated_deployment,
+                    data_context,
+                )
+            self.assertEqual(templated_result["records"], [{"Record ID": "R-1"}])
+
+            audit_rule = OntologyRule(
+                id="rule-semantic-audit",
+                scenario_id=self.scenario.id,
+                name="Duplicate record review",
+                description="Find governed duplicate-record candidates.",
+                condition={
+                    "spec_version": "semantic-audit/v1",
+                    "rule_code": "duplicate-record",
+                    "domain": "data-quality",
+                    "issue_type": "duplicate",
+                    "assessment_mode": "assisted",
+                    "source_use": "data-screening",
+                    "basis": "Governed test policy",
+                    "reference_example": "",
+                    "first_listed_year": "2026",
+                    "required_evidence": ["source record"],
+                    "query_template": {
+                        "base_entity": {"entity_name": "Business record"},
+                        "base_properties": ["Record ID"],
+                        "base_filters": [
+                            {
+                                "property": "Record ID",
+                                "op": "eq",
+                                "value": {"$input": "record_id"},
+                            }
+                        ],
+                    },
+                },
+                severity="warning",
+                enabled=True,
+            )
+            db.add(audit_rule)
+            function.input_schema = {
+                "type": "object",
+                "properties": {
+                    "rule_selector": {"type": "string", "minLength": 1},
+                    "record_id": {"type": "string", "minLength": 1},
+                },
+                "required": ["rule_selector", "record_id"],
+                "additionalProperties": False,
+            }
+            function.runtime_config = {
+                "provider_key": SemanticDatasetQueryProvider.provider_key,
+                "provider_version": SemanticDatasetQueryProvider.provider_version,
+                "provider_config": {
+                    "semantic_mapping_ids": [mapping["id"]],
+                    "rule_query": {
+                        "selector_input": "rule_selector",
+                        "spec_version": "semantic-audit/v1",
+                    },
+                },
+            }
+            db.commit()
+            audit_definition = runtime_definition_service.resolve_active(
+                db,
+                db.get(BusinessScenario, self.scenario.id),
+                environment="dev",
+            )
+            audit_deployment = ResolvedDeployment(
+                scenario_id=self.scenario.id,
+                tenant_id=self.tenant.id,
+                environment="dev",
+                definition_hash=audit_definition.definition_hash,
+                definition=audit_definition,
+                data_ports=deployment.data_ports,
+                data_context=data_context,
+            )
+            audit_contract = provider.contract(request.capability, audit_deployment)
+            self.assertEqual(
+                audit_contract["input_schema"]["properties"],
+                function.input_schema["properties"],
+            )
+
+            def compile_audit(session, **kwargs):
+                self.assertEqual(kwargs["args"]["base_filters"][0]["value"], "R-1")
+                return compile_query(session, **kwargs)
+
+            with patch(
+                "app.providers.semantic_dataset_query.business_query_service.query_business_data",
+                side_effect=compile_audit,
+            ):
+                audit_result = provider.invoke(
+                    Request(
+                        capability=request.capability,
+                        inputs={
+                            "rule_selector": "duplicate-record",
+                            "record_id": "R-1",
+                        },
+                    ),
+                    actor,
+                    audit_deployment,
+                    data_context,
+                )
+            self.assertEqual(
+                audit_result["decision_state"],
+                "candidate_detected_pending_review",
+            )
+            self.assertEqual(audit_result["audit_rule"]["code"], "duplicate-record")
+            self.assertEqual(audit_result["records"], [{"Record ID": "R-1"}])
 
     def test_dataset_head_compare_and_set_rejects_a_stale_writer(self) -> None:
         dataset, schema, version_a, _head = self._create_dataset_contract()

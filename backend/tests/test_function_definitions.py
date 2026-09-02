@@ -18,6 +18,7 @@ from app.routers import scenarios as scenarios_router
 from app.services import (
     agent_engine,
     function_definition_service,
+    policies,
     permission_service,
     release_service,
     runtime_definition_service,
@@ -62,6 +63,23 @@ class FunctionDefinitionServiceTests(unittest.TestCase):
                         "output_schema": _contract_schema(),
                     }
                 )
+
+    def test_schema_valued_additional_properties_preserve_runtime_validation(self) -> None:
+        schema = function_definition_service.normalize_schema(
+            {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": {"type": "integer", "minimum": 0},
+            },
+            label="输入 Schema",
+        )
+
+        self.assertEqual(
+            policies.validate_action_params(schema, {"low": 1, "high": 3}),
+            {"low": 1, "high": 3},
+        )
+        with self.assertRaisesRegex(Exception, "类型错误"):
+            policies.validate_action_params(schema, {"high": "3"})
 
 
 class FunctionDefinitionRouteTests(unittest.TestCase):

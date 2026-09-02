@@ -601,6 +601,11 @@ export interface ScenarioCapabilityPort {
   updated_at: string
 }
 
+export type ScenarioCapabilityPortCreate = Omit<
+  ScenarioCapabilityPort,
+  'id' | 'tenant_id' | 'scenario_id' | 'dataset_schema_hash' | 'created_by_user_id' | 'created_at' | 'updated_at'
+>
+
 export type ScenarioCapabilityPortWrite = Omit<
   ScenarioCapabilityPort,
   'id' | 'tenant_id' | 'scenario_id' | 'dataset_schema_hash' | 'created_by_user_id' | 'created_at' | 'updated_at'
@@ -883,6 +888,42 @@ export interface DatasetVersion {
   ready_at?: string | null
 }
 
+export interface DatasetField {
+  id: string
+  field_key: string
+  source_name: string
+  logical_type: string
+  physical_type: string
+  nullable: boolean
+  key_ordinal?: number | null
+  semantic_role: string
+  field_document: Record<string, unknown>
+  ordinal: number
+}
+
+export interface DatasetRelation {
+  id: string
+  relation_key: string
+  display_name: string
+  kind: string
+  ordinal: number
+  description: string
+  fields: DatasetField[]
+}
+
+export interface DatasetSchema {
+  id: string
+  tenant_id: string
+  dataset_id: string
+  schema_version: number
+  schema_hash: string
+  compatibility: string
+  schema_document: Record<string, unknown>
+  relations: DatasetRelation[]
+  created_by_user_id?: string | null
+  created_at: string
+}
+
 export interface DatasetHead {
   id: string
   tenant_id: string
@@ -923,6 +964,42 @@ export interface ScenarioDatasetBinding extends Omit<ScenarioDatasetBindingCreat
   scenario_id: string
   role: CatalogBindingRole
   resolved_dataset_version_id?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface SemanticFieldMappingCreate {
+  ontology_property_id: string
+  dataset_field_id: string
+  direction: 'input' | 'output' | 'bidirectional'
+  is_required: boolean
+  transform: Record<string, unknown>
+}
+
+export interface SemanticMappingCreate {
+  scenario_dataset_binding_id: string
+  entity_id: string
+  dataset_schema_id: string
+  dataset_relation_id: string
+  mapping_key: string
+  status: 'draft' | 'active' | 'error' | 'retired'
+  identifier_strategy: Record<string, unknown>
+  filter_expression: Record<string, unknown>
+  fields: SemanticFieldMappingCreate[]
+}
+
+export interface SemanticFieldMapping extends SemanticFieldMappingCreate {
+  id: string
+  ordinal: number
+}
+
+export interface SemanticMapping extends Omit<SemanticMappingCreate, 'status' | 'fields'> {
+  id: string
+  tenant_id: string
+  dataset_id: string
+  scenario_id: string
+  status: 'draft' | 'active' | 'error' | 'retired'
+  fields: SemanticFieldMapping[]
   created_at: string
   updated_at: string
 }

@@ -5,6 +5,7 @@ import test from 'node:test'
 import {
   isAttachmentInputPort,
   isSupportedInvocationFile,
+  isTabularInvocationAsset,
   managedBindingKindsForPort,
   parseStructuredInputs,
   validateAgentInvocationDraft,
@@ -147,10 +148,22 @@ test('duplicate managed selector and uploaded attachment are rejected across inp
 })
 
 test('supported input files cover tabular and document formats', () => {
-  for (const name of ['rows.csv', 'rows.xlsx', 'brief.docx', 'manual.pdf', 'payload.json']) {
+  for (const name of [
+    'rows.csv', 'rows.tsv', 'rows.xlsx', 'rows.xlsm',
+    'brief.docx', 'slides.pptx', 'manual.pdf',
+    'notes.markdown', 'payload.yaml', 'events.log', 'scan.tiff',
+  ]) {
     assert.equal(isSupportedInvocationFile(name), true, name)
   }
+  assert.equal(isSupportedInvocationFile('legacy.doc'), false)
   assert.equal(isSupportedInvocationFile('script.exe'), false)
+})
+
+test('server profile category is authoritative for formal input binding', () => {
+  assert.equal(isTabularInvocationAsset('table', 'opaque.bin'), true)
+  assert.equal(isTabularInvocationAsset('document', 'misleading.xlsx'), false)
+  assert.equal(isTabularInvocationAsset(undefined, 'legacy.xlsx'), true)
+  assert.equal(isTabularInvocationAsset(undefined, 'legacy.pdf'), false)
 })
 
 test('Agent chat clears the composer only after a successful stream', () => {
@@ -216,6 +229,8 @@ test('invocation composer reuses validation assets and materializes tables as da
   assert.doesNotMatch(source, /FileReader|\.arrayBuffer\(/)
   assert.match(source, /api\.deleteCatalogAsset/)
   assert.match(source, /dataset_version_id: dataset\.dataset_version_id/)
+  assert.match(source, /isTabularInvocationAsset\(item\.contentCategory, item\.filename\)/)
+  assert.doesNotMatch(source, /function isTableFile/)
   assert.doesNotMatch(source, /disabled \|\| busy \|\| !attachmentsEnabled/)
   assert.doesNotMatch(source, /当前授权能力没有兼容/)
   assert.doesNotMatch(source, /listLogicalDatasets|listScenarioConnectorBindings/)

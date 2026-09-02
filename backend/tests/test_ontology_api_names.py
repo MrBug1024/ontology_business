@@ -86,6 +86,8 @@ class OntologyApiNameTests(unittest.TestCase):
             self._entity_payload("患者", api_name="patient"),
             self.db,
         )
+        self.assertTrue(hospital.properties[0].id)
+        self.assertEqual(hospital.properties[0].entity_id, hospital.id)
         original_property_api_name = hospital.properties[0].api_name
 
         renamed = scenario_routes.update_entity(

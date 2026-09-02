@@ -1,7 +1,6 @@
-"""文档解析服务：将业务文件（excel/word/md/pdf/图片/txt/csv/pptx/json）解析为文本。
+"""文档解析服务：将业务文件解析为文本。
 
-PDF 与图片优先调用服务端配置的 OCR 适配器，
-失败时回退到本地 pypdf 提取。
+PDF 优先使用原生文本层，扫描 PDF 与图片才调用服务端配置的 OCR 适配器。
 """
 from __future__ import annotations
 
@@ -318,29 +317,33 @@ def _mime(name: str) -> str:
 
 
 def _parse_pdf(content: bytes, name: str) -> dict[str, Any]:
-    config = _ocr_configuration()
-    if config is not None:
-        r = _ocr_parse(content, name, is_image=False, config=config)
-        if r["status"] == "success":
-            return r
-        ocr_msg = r["message"]
-    else:
-        ocr_msg = "未配置 OCR 服务"
-    # 回退：本地 pypdf
     try:
         from pypdf import PdfReader
 
         reader = PdfReader(BytesIO(content))
-        pages = []
+        page_texts: list[str] = []
         for i, page in enumerate(reader.pages):
-            t = page.extract_text() or ""
-            pages.append(f"--- 第 {i + 1} 页 ---\n{t}")
-        text = "\n\n".join(pages)
-        if text.strip():
-            return {"status": "success", "text": text, "message": f"本地 pypdf 提取（{ocr_msg}）"}
+            page_texts.append(page.extract_text() or "")
+        if any(text.strip() for text in page_texts):
+            text = "\n\n".join(
+                f"--- 第 {i + 1} 页 ---\n{page_text}"
+                for i, page_text in enumerate(page_texts)
+            )
+            return {"status": "success", "text": text, "message": "本地 pypdf 提取"}
     except Exception:  # noqa: BLE001
         pass
-    return {"status": "error", "text": "", "message": f"PDF 解析失败（{ocr_msg}）"}
+
+    config = _ocr_configuration()
+    if config is None:
+        return {"status": "error", "text": "", "message": "PDF 无文本层且未配置 OCR 服务"}
+    result = _ocr_parse(content, name, is_image=False, config=config)
+    if result["status"] == "success":
+        return result
+    return {
+        "status": "error",
+        "text": "",
+        "message": f"PDF OCR 失败: {result['message']}",
+    }
 
 
 def _parse_image(content: bytes, name: str) -> dict[str, Any]:

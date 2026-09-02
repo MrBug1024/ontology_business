@@ -7,10 +7,14 @@ import type {
 } from '@/types'
 
 export const AGENT_INVOCATION_FILE_ACCEPT = [
-  '.csv', '.xlsx', '.xls', '.docx', '.doc', '.pdf', '.txt', '.md', '.json', '.pptx',
+  '.csv', '.tsv', '.xls', '.xlsx', '.xlsm',
+  '.docx', '.pptx', '.pdf',
+  '.txt', '.md', '.markdown', '.json', '.yaml', '.yml', '.xml', '.log',
+  '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp',
 ].join(',')
 
 const SUPPORTED_EXTENSIONS = new Set(AGENT_INVOCATION_FILE_ACCEPT.split(','))
+const TABULAR_EXTENSIONS = new Set(['.csv', '.tsv', '.xls', '.xlsx', '.xlsm'])
 const PORT_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
 const SIGNATURE_PATTERN = /^[a-f0-9]{64}$/i
 const MANAGED_BINDING_KINDS = new Set<AgentManagedBindingKind>([
@@ -99,6 +103,16 @@ export function isSupportedInvocationFile(filename: string) {
   const normalized = String(filename || '').trim().toLowerCase()
   const dot = normalized.lastIndexOf('.')
   return dot >= 0 && SUPPORTED_EXTENSIONS.has(normalized.slice(dot))
+}
+
+export function isTabularInvocationAsset(category: unknown, filename: string) {
+  const normalizedCategory = typeof category === 'string'
+    ? category.trim().toLowerCase()
+    : ''
+  if (normalizedCategory) return normalizedCategory === 'table'
+  const normalizedFilename = String(filename || '').trim().toLowerCase()
+  const dot = normalizedFilename.lastIndexOf('.')
+  return dot >= 0 && TABULAR_EXTENSIONS.has(normalizedFilename.slice(dot))
 }
 
 export function parseStructuredInputs(source: string): {

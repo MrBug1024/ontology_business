@@ -165,6 +165,96 @@ def test_zero_data_capability_agent_uses_kernel_without_legacy_context(db: Sessi
     assert invocation.request_document["structured_inputs"]["outline"]["fields"] == {
         "amount": {"type": "integer"}
     }
+    assert "candidate_detected_pending_review" in runtime._system_prompt()
+    assert "不得宣称事实已确认" in runtime._system_prompt()
+
+
+def test_agent_turn_derives_stable_identity_per_capability_call(db: Session) -> None:
+    _tenant, _user, _scenario, llm, function, agent = _world(
+        db,
+        "tool-idempotency",
+    )
+    runtime = agent_runtime_adapter.build_runtime_context(
+        db,
+        agent,
+        llm,
+        turn_input=agent_runtime_adapter.AgentTurnInput(
+            idempotency_key="stable-agent-turn",
+        ),
+    )
+    runtime.db.info["action_audit_context"] = {"agent_id": agent.id}
+    try:
+        first = json.loads(
+            runtime.execute_tool(
+                "invoke_capability",
+                {
+                    "kind": "function",
+                    "key": function.id,
+                    "inputs": {"amount": 8},
+                },
+            )
+        )
+        second = json.loads(
+            runtime.execute_tool(
+                "invoke_capability",
+                {
+                    "kind": "function",
+                    "key": function.id,
+                    "inputs": {"amount": 10},
+                },
+            )
+        )
+        replay = json.loads(
+            runtime.execute_tool(
+                "invoke_capability",
+                {
+                    "kind": "function",
+                    "key": function.id,
+                    "inputs": {"amount": 8},
+                },
+            )
+        )
+    finally:
+        runtime.db.info.pop("action_audit_context", None)
+
+    assert first["status"] == "succeeded"
+    assert second["status"] == "succeeded"
+    assert first["invocation_id"] != second["invocation_id"]
+    assert replay["invocation_id"] == first["invocation_id"]
+    invocations = db.scalars(
+        select(CapabilityInvocation).where(
+            CapabilityInvocation.scenario_id == runtime.scenario.id
+        )
+    ).all()
+    assert len(invocations) == 2
+    assert len({item.idempotency_key for item in invocations}) == 2
+    assert all(str(item.idempotency_key).startswith("agent-tool:") for item in invocations)
+
+
+def test_attachment_turn_without_compatible_capability_fails_closed(db: Session) -> None:
+    _tenant, _user, _scenario, llm, _function, agent = _world(
+        db,
+        "unsupported-attachment",
+    )
+    runtime = agent_runtime_adapter.build_runtime_context(
+        db,
+        agent,
+        llm,
+        turn_input=agent_runtime_adapter.AgentTurnInput(
+            attachments=(
+                agent_runtime_adapter.AgentAttachmentInput(
+                    filename="records.csv",
+                    dataset_version_id="version-unsupported-attachment",
+                    expected_signature="a" * 64,
+                ),
+            ),
+        ),
+    )
+
+    assert runtime.complete is False
+    assert {
+        item["code"] for item in runtime.context_issues
+    } == {"attachments_not_supported"}
 
 
 def test_agent_catalog_and_invocation_include_selected_dynamic_rule(db: Session) -> None:

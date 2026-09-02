@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -1531,6 +1532,8 @@ def invoke_agent_once(
         input_snapshot=agent_runtime_adapter.input_snapshot(runtime_context),
         evidence_refs=agent_runtime_adapter.evidence_snapshot(runtime_context),
     )
+    db.add(user_message)
+    db.flush()
     assistant_message_id = uuid.uuid4().hex
     assistant_message = Message(
         id=assistant_message_id,
@@ -1538,10 +1541,11 @@ def invoke_agent_once(
         role="assistant",
         content="正在准备受控工具调用。",
         stream_finalized=False,
+        created_at=user_message.created_at + timedelta(microseconds=1),
         input_snapshot=agent_runtime_adapter.input_snapshot(runtime_context),
         evidence_refs=agent_runtime_adapter.evidence_snapshot(runtime_context),
     )
-    db.add_all([user_message, assistant_message])
+    db.add(assistant_message)
     _lock_active_agent_scenario(
         db,
         scenario_id=a.scenario_id,

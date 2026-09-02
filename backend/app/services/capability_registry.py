@@ -349,9 +349,10 @@ def register_builtin_providers(
 ) -> CapabilityProviderRegistry:
     """Register the fixed platform capability adapters."""
 
+    from ..providers import trusted_capability_providers
     from .builtin_capability_providers import builtin_capability_providers
 
-    for provider in builtin_capability_providers():
+    for provider in (*builtin_capability_providers(), *trusted_capability_providers()):
         identity = (provider.provider_key, provider.provider_version)
         if identity not in registry:
             registry.register_instance(provider)

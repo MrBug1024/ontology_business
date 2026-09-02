@@ -78,6 +78,7 @@ from .capability_agent_extensions import (
     bind_agent_providers,
 )
 from .capability_contracts import RuntimeDataContext, canonical_hash
+from .agent_prompt_policy import AUTHORITATIVE_DECISION_PROMPT
 from .policies import (
     PolicyViolation,
     validate_action_params,
@@ -1073,7 +1074,7 @@ class AgentContext:
                         "aggregations": {
                             "type": "array",
                             "maxItems": 20,
-                            "description": "count、sum、avg、min、max 聚合；每项需要对象和唯一 alias。count 可省略 property 表示 COUNT(*)，其他函数必须提供 property",
+                            "description": "count、sum、avg、min、max 聚合；filters 只限制当前聚合，可用于同组条件计数或条件求和。每项需要对象和唯一 alias。count 可省略 property，此时执行 COUNT(*)；其他函数必须提供 property",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -1082,6 +1083,20 @@ class AgentContext:
                                     "entity_name": {"type": "string", "minLength": 1},
                                     "property": {"type": "string", "minLength": 1, "description": "count 可省略；sum/avg/min/max 必填"},
                                     "alias": {"type": "string", "minLength": 1},
+                                    "filters": {
+                                        "type": "array",
+                                        "maxItems": 20,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "property": {"type": "string"},
+                                                "op": {"type": "string", "enum": sorted(business_query_service.mapped_query_service.FILTER_OPERATORS)},
+                                                "value": {},
+                                            },
+                                            "required": ["property", "op"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
                                 },
                                 "required": ["function", "alias"],
                                 "anyOf": [
@@ -1094,15 +1109,20 @@ class AgentContext:
                         "having": {
                             "type": "array",
                             "maxItems": 20,
-                            "description": "对聚合 alias 做阈值筛选，例如次数大于 2；只能用于分组聚合查询",
+                            "description": "对聚合 alias 做筛选；value 表示固定阈值，right_alias 表示两个聚合结果比较；只能用于分组聚合查询",
                             "items": {
                                 "type": "object",
                                 "properties": {
                                     "alias": {"type": "string"},
                                     "op": {"type": "string", "enum": ["eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in"]},
                                     "value": {},
+                                    "right_alias": {"type": "string", "minLength": 1},
                                 },
-                                "required": ["alias", "op", "value"],
+                                "required": ["alias", "op"],
+                                "oneOf": [
+                                    {"required": ["value"]},
+                                    {"required": ["right_alias"]},
+                                ],
                                 "additionalProperties": False,
                             },
                         },
@@ -2921,6 +2941,7 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
         parts.append(f"【Agent 职责】{ctx.agent.description}")
     if scenario_name:
         parts.append(f"【当前业务场景】{scenario_name}")
+    parts.append(AUTHORITATIVE_DECISION_PROMPT)
     if ontology_summary:
         parts.append("\n【业务本体（领域模型）】\n" + ontology_summary)
         parts.append(

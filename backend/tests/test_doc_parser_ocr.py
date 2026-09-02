@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -9,6 +11,20 @@ from pydantic import ValidationError
 
 from app.config import Settings
 from app.services import doc_parser
+
+
+def test_ocr_skill_defaults_do_not_embed_credentials_or_disable_tls() -> None:
+    defaults_path = (
+        Path(__file__).resolve().parents[1]
+        / "skills"
+        / "ocr-parser"
+        / "config"
+        / "defaults.json"
+    )
+    defaults = json.loads(defaults_path.read_text(encoding="utf-8"))
+
+    assert defaults["OCR_API_KEY"] == ""
+    assert defaults["OCR_VERIFY_SSL"] is True
 
 
 def _ocr_settings(**overrides: object) -> SimpleNamespace:
@@ -57,6 +73,49 @@ def test_incomplete_ocr_configuration_does_not_send_document() -> None:
         "message": "未配置 OCR 服务，无法解析图片",
     }
     client.assert_not_called()
+
+
+def test_pdf_with_native_text_does_not_call_ocr() -> None:
+    page = MagicMock()
+    page.extract_text.return_value = "native document text"
+    reader = MagicMock()
+    reader.pages = [page]
+    with (
+        patch("pypdf.PdfReader", return_value=reader),
+        patch.object(doc_parser, "_ocr_configuration") as configure_ocr,
+        patch.object(doc_parser, "_ocr_parse") as parse_ocr,
+    ):
+        result = doc_parser.parse_bytes(b"pdf-bytes", "document.pdf")
+
+    assert result["status"] == "success"
+    assert result["message"] == "本地 pypdf 提取"
+    assert "native document text" in result["text"]
+    configure_ocr.assert_not_called()
+    parse_ocr.assert_not_called()
+
+
+def test_pdf_without_native_text_uses_configured_ocr_adapter() -> None:
+    page = MagicMock()
+    page.extract_text.return_value = ""
+    reader = MagicMock()
+    reader.pages = [page]
+    config = MagicMock()
+    with (
+        patch("pypdf.PdfReader", return_value=reader),
+        patch.object(doc_parser, "_ocr_configuration", return_value=config),
+        patch.object(
+            doc_parser,
+            "_ocr_parse",
+            return_value={"status": "success", "text": "ocr text", "message": "OCR 解析完成"},
+        ) as parse_ocr,
+    ):
+        result = doc_parser.parse_bytes(b"pdf-bytes", "scan.pdf")
+
+    assert result["status"] == "success"
+    assert result["text"] == "ocr text"
+    parse_ocr.assert_called_once_with(
+        b"pdf-bytes", "scan.pdf", is_image=False, config=config
+    )
 
 
 @pytest.mark.parametrize(

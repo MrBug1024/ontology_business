@@ -143,6 +143,9 @@ class Settings(BaseSettings):
         ge=1024 * 1024,
         le=2 * 1024 * 1024 * 1024,
     )
+    validation_dataset_materialization_timeout_seconds: float = Field(
+        default=3600.0, ge=60.0, le=86400.0
+    )
     allow_unsafe_workflow_nodes: bool = False
     # Async workflow inputs are sealed with an externally managed AES-256-GCM
     # key ring before they enter the database.  The JSON object maps stable key

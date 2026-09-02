@@ -32,6 +32,7 @@ import type {
   DocumentSearchResult,
   DataSource,
   DatasetHead,
+  DatasetSchema,
   DatasetVersion,
   EventEnvelope,
   FunctionDefinition,
@@ -58,6 +59,7 @@ import type {
   ScenarioDatasetBinding,
   ScenarioDatasetBindingCreate,
   ScenarioCapabilityPort,
+  ScenarioCapabilityPortCreate,
   ScenarioCapabilityPortWrite,
   ScenarioDetail,
   ScenarioModelDraftListResponse,
@@ -68,6 +70,8 @@ import type {
   ScenarioModelDraftResolve,
   ScenarioModelDraftResource,
   ScenarioModelDraftUpdate,
+  SemanticMapping,
+  SemanticMappingCreate,
   Skill,
   TableInfo,
   User,
@@ -249,6 +253,8 @@ export const api = {
     http.post<ScenarioPurgeResult>(`/scenarios/${id}/purge`, d),
   listScenarioCapabilityPorts: (scenarioId: string) =>
     http.get<ScenarioCapabilityPort[]>(`/scenarios/${scenarioId}/capability-ports`),
+  createScenarioCapabilityPort: (scenarioId: string, d: ScenarioCapabilityPortCreate) =>
+    http.post<ScenarioCapabilityPort>(`/scenarios/${scenarioId}/capability-ports`, d),
   updateScenarioCapabilityPort: (scenarioId: string, portId: string, d: ScenarioCapabilityPortWrite) =>
     http.put<ScenarioCapabilityPort>(`/scenarios/${scenarioId}/capability-ports/${portId}`, d),
 
@@ -402,6 +408,8 @@ export const api = {
     return waitForValidationDatasetJob(job.id, options)
   },
   listLogicalDatasets: () => http.get<LogicalDataset[]>('/catalog/datasets'),
+  listDatasetSchemas: (datasetId: string) =>
+    http.get<DatasetSchema[]>(`/catalog/datasets/${datasetId}/schemas`),
   listDatasetHeads: (datasetId: string) => http.get<DatasetHead[]>(`/catalog/datasets/${datasetId}/heads`),
   listDatasetVersions: (datasetId: string) => http.get<DatasetVersion[]>(`/catalog/datasets/${datasetId}/versions`),
   listScenarioDatasetBindings: (scenarioId: string) =>
@@ -414,6 +422,10 @@ export const api = {
     http.post<ScenarioDatasetBinding>(`/scenarios/${scenarioId}/dataset-bindings`, d),
   deleteScenarioDatasetBinding: (scenarioId: string, bindingId: string) =>
     http.delete<{ message: string }>(`/scenarios/${scenarioId}/dataset-bindings/${bindingId}`),
+  listSemanticMappings: (scenarioId: string) =>
+    http.get<SemanticMapping[]>(`/scenarios/${scenarioId}/semantic-mappings`),
+  createSemanticMapping: (scenarioId: string, d: SemanticMappingCreate) =>
+    http.post<SemanticMapping>(`/scenarios/${scenarioId}/semantic-mappings`, d),
 
   // 物理接入与文件管理（保留旧 API 兼容）。
   listDataSources: (sid?: string) =>

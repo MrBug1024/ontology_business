@@ -133,6 +133,13 @@ class PropertyIn(BaseModel):
     is_sensitive: bool = False
 
 
+class PropertyOut(PropertyIn):
+    id: str
+    entity_id: str
+
+    model_config = {"from_attributes": True}
+
+
 class EntityIn(BaseModel):
     name: str
     api_name: str = Field(default="", max_length=100)
@@ -147,6 +154,7 @@ class EntityIn(BaseModel):
 
 
 class EntityOut(EntityIn):
+    properties: list[PropertyOut] = []
     id: str
     scenario_id: str
     created_at: datetime

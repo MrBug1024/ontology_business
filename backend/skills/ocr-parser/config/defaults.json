@@ -1,7 +1,7 @@
 {
   "OCR_BASE_URL": "https://ocr.rhzy.ai",
   "OCR_TIMEOUT_SECONDS": 600,
-  "OCR_VERIFY_SSL": false,
+  "OCR_VERIFY_SSL": true,
   "OCR_BACKEND": "hybrid-auto-engine",
   "OCR_LANG_LIST": "ch",
   "OCR_TABLE_ENABLE_PDF": true,

@@ -85,6 +85,8 @@ python -m venv .venv
 # 安装运行依赖与测试依赖（首次）
 python -m pip install -r .\backend\requirements.txt
 python -m pip install 'pytest>=8.3,<9'
+# 显式安装高效 XLSX/XLSM -> Parquet 所需的官方 DuckDB 扩展；运行时不会联网安装
+python .\backend\scripts\install_duckdb_extensions.py
 
 # 仅在不存在时创建本地配置；不要覆盖已有密钥
 if (-not (Test-Path -LiteralPath .\backend\.env)) {
@@ -121,15 +123,16 @@ npm --prefix .\frontend run dev
 
 ### OCR 服务（把 `backend/.env.example` 复制为 `backend/.env`）
 
-`ocr-parser` 技能与 PDF/图片解析依赖外部 OCR 服务：
+`ocr-parser` 技能与扫描 PDF/图片解析可使用外部 OCR 服务：
 
 ```ini
 OCR_BASE_URL=https://ocr.rhzy.ai
 OCR_API_KEY=你的密钥
 ```
 
-- 未配置 `OCR_API_KEY` 时：PDF 回退到 `pypdf` 提取文本，图片解析会报错。
-- 配置后：PDF / 图片均可走 OCR 服务获得更高质量文本。
+- PDF 总是先读取原生文本层；没有文本层的扫描 PDF 才进入 OCR。
+- 未配置 `OCR_API_KEY` 时：有文本层的 PDF 正常解析，扫描 PDF 与图片明确报错。
+- OCR 是服务端受控适配器，不是正式输入类型；正式调用仍只传不可变 `asset_version_id`。
 
 ### LLM 配置（前端「能力配置 → 大模型」）
 
