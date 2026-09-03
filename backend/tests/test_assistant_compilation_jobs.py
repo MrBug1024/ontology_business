@@ -14,10 +14,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException, Response
-from sqlalchemy import create_engine, event, func, inspect, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import database
 from app.database import Base
 from app.models import (
     AssistantAttachment,
@@ -51,6 +50,10 @@ from app.services import (
     llm_service,
     permission_service,
     scenario_model_compiler,
+)
+from tests.postgresql_migration_contracts import (
+    baseline_table_ddl,
+    render_postgresql_upgrade,
 )
 
 
@@ -815,25 +818,29 @@ class AssistantCompilationJobTests(unittest.TestCase):
             1,
         )
 
-    def test_compilation_job_migration_is_idempotent(self) -> None:
-        with patch.object(database, "engine", self.engine):
-            database._migrate_assistant_compilation_jobs()
-            database._migrate_assistant_compilation_jobs()
-        inspector = inspect(self.engine)
+    def test_compilation_job_schema_is_declared_by_postgresql_migration(self) -> None:
+        ddl = baseline_table_ddl("assistant_compilation_jobs")
+        self.assertIn("request_fingerprint VARCHAR(64) NOT NULL", ddl)
+        self.assertIn("execution_input JSON NOT NULL", ddl)
+        self.assertIn("lease_token VARCHAR(64) NOT NULL", ddl)
+        self.assertIn("lease_expires_at TIMESTAMP WITH TIME ZONE", ddl)
+        self.assertIn("lease_attempt INTEGER NOT NULL", ddl)
         self.assertIn(
-            "content_hash",
-            {item["name"] for item in inspector.get_columns("assistant_attachments")},
+            "CONSTRAINT uq_assistant_compilation_jobs_fingerprint "
+            "UNIQUE (request_fingerprint)",
+            ddl,
         )
-        guards = {
-            item.get("name")
-            for item in inspector.get_unique_constraints(
-                "assistant_compilation_jobs"
-            )
-        } | {
-            item.get("name")
-            for item in inspector.get_indexes("assistant_compilation_jobs")
-        }
-        self.assertIn("uq_assistant_compilation_jobs_fingerprint", guards)
+        schema_sql = render_postgresql_upgrade("20260827_01")
+        self.assertIn(
+            "CREATE INDEX ix_assistant_compilation_jobs_status_lease_expiry "
+            "ON assistant_compilation_jobs (status, lease_expires_at)",
+            schema_sql,
+        )
+        self.assertIn(
+            "CREATE INDEX ix_assistant_attachments_content_hash "
+            "ON assistant_attachments (content_hash)",
+            schema_sql,
+        )
 
     def test_fingerprint_changes_for_every_output_affecting_input(self) -> None:
         base = self._identity()

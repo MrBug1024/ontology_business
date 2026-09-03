@@ -51,3 +51,6 @@ MinIO 对象使用内容寻址路径，数据库保存 `bucket_name`、`object_k
 4. 执行 `python backend/scripts/verify_postgresql_runtime.py`，验证 PostgreSQL 权限、MinIO 数据资产、数据集查询、业务审计和 Redis 缓存往返。
 
 运行账号不得拥有超级用户、建库、建角色或 Schema DDL 权限。Schema 迁移只能由迁移 owner/admin 执行；Redis 不可用时，业务正确性必须仍由 PostgreSQL 和 MinIO 提供。
+
+生产镜像、Nginx `/api` 代理、400 MiB 上传、专用 worker、Coolify 仓库认证及上线验收步骤见
+[生产部署手册](./生产部署.md)。

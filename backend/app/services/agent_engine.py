@@ -14,23 +14,26 @@
 - read_document       读取某个已解析文档的全文
 - list_functions      列出场景中的无副作用业务函数
 - run_function        调用确定性业务函数
-- list_actions        发现操作，execute_action 只生成预演
+- list_actions        发现操作；按操作的人工确认配置执行或生成预演
 - list_rules          发现规则，evaluate_rule 只做无副作用判定
 - list_events         发现事件，prepare_event_publish 只准备确认清单
 - list_workflows      发现工作流，execute_workflow 只准备确认清单
 
-Agent 只承担读取、检索、解释和受控 Action 预演。任何外部副作用都必须由用户
-通过类型化 Action 或任务中心的显式确认入口触发，不能由模型工具调用直接执行。
+Agent 只会通过已配置的类型化 Action 产生副作用。启用人工确认的 Action 必须由
+用户在同一对话中回复明确的“确认执行”后继续；未启用人工确认的 Action 可由 Agent
+按当前定义和幂等策略直接执行。
 """
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
+import uuid
 from collections.abc import Mapping, Sequence
 from collections import defaultdict, deque
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -338,6 +341,82 @@ def _dry_run_action_target(outcome: Mapping[str, Any]) -> tuple[str, str] | None
         else ""
     )
     return identity, label
+
+
+def _executed_action_target(outcome: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return a successfully executed Action from a server-owned tool result."""
+    parsed = _parsed_result(outcome.get("result"))
+    if not isinstance(parsed, dict):
+        return None
+    status = str(parsed.get("status") or "")
+    if status != "success" and not (
+        status == "idempotent_replay"
+        and str(parsed.get("original_status") or "") == "success"
+    ):
+        return None
+    arguments = outcome.get("arguments")
+    requested = (
+        str(arguments.get("action_id") or "").strip()
+        if isinstance(arguments, Mapping)
+        else ""
+    )
+    result = parsed.get("result")
+    plan = result.get("plan") if isinstance(result, dict) else None
+    canonical_id = (
+        str(plan.get("action_id") or parsed.get("target_id") or "").strip()
+        if isinstance(plan, dict)
+        else str(parsed.get("target_id") or "").strip()
+    )
+    identity = canonical_id or requested
+    if not identity:
+        return None
+    label = (
+        str(plan.get("action_name") or parsed.get("target_name") or "").strip()
+        if isinstance(plan, dict)
+        else str(parsed.get("target_name") or "").strip()
+    )
+    return identity, label or identity
+
+
+def _automatic_action_idempotency_key(
+    db: Session,
+    *,
+    action_id: str,
+    params: Mapping[str, Any],
+) -> str:
+    """Derive a retry-safe key for one non-confirmed Agent action invocation."""
+    trace = db.info.get("llm_trace_context")
+    correlation_id = str(trace.get("correlation_id") or "").strip() if isinstance(trace, dict) else ""
+    # Published MCP turns carry a durable replay hash from the service layer.
+    # Prefer it over the per-attempt LLM trace so a reclaimed/resent external
+    # request cannot dispatch a non-confirmed Action twice after a worker dies.
+    mcp_request_hash = str(db.info.get("agent_mcp_turn_request_hash") or "").strip()
+    turn_id = mcp_request_hash or correlation_id or uuid.uuid4().hex
+    canonical_params = json.dumps(
+        dict(params),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    fingerprint = hashlib.sha256(
+        f"{action_id}\x1f{canonical_params}".encode("utf-8")
+    ).hexdigest()[:32]
+    return f"agent:{turn_id[:32]}:{fingerprint}"
+
+
+def _assert_agent_turn_lease(db: Session) -> None:
+    """Fence a published MCP turn without coupling this module to its adapter.
+
+    Browser Agent chat does not install the guard.  The MCP service supplies a
+    small object with ``assert_active`` on the request session; keeping this
+    duck-typed prevents an import cycle while making side-effect boundaries
+    fail closed after a cross-worker lease takeover.
+    """
+    guard = db.info.get("agent_mcp_turn_lease_guard")
+    assert_active = getattr(guard, "assert_active", None)
+    if callable(assert_active):
+        assert_active()
 
 
 def _display_number(value: Any) -> str | None:
@@ -820,12 +899,25 @@ def _truthful_final_content(
         if target is not None:
             target_id, target_label = target
             preview_targets.setdefault(target_id, target_label)
+    executed_targets: dict[str, str] = {}
+    for item in action_attempts:
+        target = _executed_action_target(item)
+        if target is not None:
+            target_id, target_label = target
+            executed_targets.setdefault(target_id, target_label)
     preview_count = len(preview_targets)
+    executed_count = len(executed_targets)
     delivery_intent = (
         any(term in user_message for term in _DELIVERY_INTENT_VERBS)
         and any(term in user_message for term in _DELIVERY_INTENT_NOUNS)
     )
     if action_attempts or delivery_intent:
+        if executed_count:
+            labels = [label for label in executed_targets.values() if label]
+            target_summary = f"（目标：{'、'.join(labels)}）" if labels else ""
+            status_lines.append(
+                f"已执行 {executed_count} 个未启用人工确认的操作{target_summary}。"
+            )
         if preview_count:
             labels = [label for label in preview_targets.values() if label]
             target_summary = (
@@ -835,9 +927,9 @@ def _truthful_final_content(
             )
             status_lines.append(
                 f"已生成 {preview_count} 个可确认预演{target_summary}，"
-                "尚未正式执行或生成交付物，需用户确认。"
+                "尚未正式执行或生成交付物，请在当前对话回复“确认执行”。"
             )
-        else:
+        elif not executed_count:
             status_lines.append("未生成可确认预演，不能视为业务任务已完成。")
 
     medical_lines, verified_medical_audit = _medical_audit_status(
@@ -1021,10 +1113,30 @@ def _workflow_parameter_schema(workflow: Any, actions: list[Any]) -> dict[str, A
 class AgentContext:
     """一次 Agent 会话的运行时上下文。"""
 
-    def __init__(self, db: Session, agent: Agent, llm: LLMConfig):
+    def __init__(
+        self,
+        db: Session,
+        agent: Agent,
+        llm: LLMConfig,
+        *,
+        definition_mode: Literal["authoring", "execution"] = "authoring",
+    ):
+        """Build either an authoring chat or a governed execution context.
+
+        A deployment environment selects infrastructure bindings only.  It
+        must not turn an ordinary in-platform conversation into a 409 merely
+        because a fresh scene has not been released in that environment.
+        Browser chat and the current public MCP surface both use
+        ``authoring`` so a working Agent can be used immediately.  Durable
+        background execution still opts into ``execution`` and retains the
+        immutable release requirement.
+        """
+        if definition_mode not in {"authoring", "execution"}:
+            raise ValueError("Agent 运行定义模式无效")
         self.db = db
         self.agent = agent
         self.llm = llm
+        self.definition_mode = definition_mode
         # Agent 工具始终以当前租户运行；缺少上下文时拒绝，而不是隐式获得全库访问。
         self.tenant_id = tenant_service.current_tenant_id(db)
         self.scenario = (
@@ -1060,8 +1172,8 @@ class AgentContext:
                 ).scalars().all()
             )
         # Every definition visible to one Agent turn comes from one resolved
-        # environment definition.  In staging/prod this is the immutable active
-        # release; mixing live authoring rows into a released runtime is unsafe.
+        # definition.  Browser chat deliberately uses authoring/live data;
+        # published Agent MCP execution opts into the frozen release path.
         self.runtime_definition: runtime_definition_service.RuntimeDefinition | None = None
         # ``NULL`` is the pre-capability-scope format.  Existing Agents were
         # allowed to use the scenario's visible business resources before the
@@ -1099,11 +1211,19 @@ class AgentContext:
         if not sid or not self.scenario:
             return
 
-        definition = runtime_definition_service.resolve_active(
-            self.db,
-            self.scenario,
-            environment=runtime_connector_service.runtime_environment(),
-        )
+        environment = runtime_connector_service.runtime_environment()
+        if self.definition_mode == "authoring":
+            definition = runtime_definition_service.resolve_authoring(
+                self.db,
+                self.scenario,
+                environment=environment,
+            )
+        else:
+            definition = runtime_definition_service.resolve_execution(
+                self.db,
+                self.scenario,
+                environment=environment,
+            )
         self.runtime_definition = definition
         self.entities = list(definition.entities.values())
         self.relations = list(definition.relations.values())
@@ -1220,6 +1340,26 @@ class AgentContext:
             resource,
             definition=self.runtime_definition,
             db=self.db,
+        )
+
+    def _execution_definition(self) -> runtime_definition_service.RuntimeDefinition:
+        """Resolve the definition used by an effect in this Agent turn.
+
+        Browser chat and the current MCP publication surface deliberately use
+        the same ACL-scoped authoring/live definition.  That keeps an Agent
+        that works in the platform usable immediately after publication,
+        without making dev/prod, releases, or connector bindings feature
+        gates.  Durable execution contexts still arrive with a frozen runtime
+        definition and retain their existing release semantics.
+        """
+        if not self.scenario:
+            raise runtime_definition_service.RuntimeDefinitionError("Agent 未绑定业务场景")
+        if self.runtime_definition is not None:
+            return self.runtime_definition
+        return runtime_definition_service.resolve_execution(
+            self.db,
+            self.scenario,
+            environment=runtime_connector_service.runtime_environment(),
         )
 
     def _medical_audit_access_policy(
@@ -1751,8 +1891,9 @@ class AgentContext:
             tools.append(
                 _tool(
                     "execute_action",
-                    "预演场景中定义的某个操作。必须先用 list_actions 的 action 参数精确读取该操作，"
-                    "并严格按其 input_schema/required 填写 params；action_id 可传 id、api_name 或显示名称，不要向用户索取内部 id。",
+                    "执行场景中定义的某个操作。必须先用 list_actions 的 action 参数精确读取该操作，"
+                    "并严格按其 input_schema/required 填写 params；服务端会按 requires_confirmation 决定"
+                    "直接执行或创建确认预演。action_id 可传 id、api_name 或显示名称，不要向用户索取内部 id。",
                     {
                         "action_id": {"type": "string", "description": "操作 id、api_name 或显示名称", "required": True},
                         "params": {"type": "object", "description": "输入参数"},
@@ -1790,7 +1931,7 @@ class AgentContext:
             tools.append(
                 _tool(
                     "prepare_event_publish",
-                    "生成服务端固定的事件发布预演；本工具不会发布事件，用户可在对话卡片确认。",
+                    "生成服务端固定的事件发布预演；本工具不会发布事件，用户需在当前对话回复“确认发布”后继续。",
                     {
                         "event_id": {"type": "string", "description": "事件 id、api_name 或显示名称", "required": True},
                         "payload": {"type": "object", "description": "事件载荷", "required": True},
@@ -1820,6 +1961,9 @@ class AgentContext:
 
     # ── 工具执行 ──────────────────────────────
     def execute_tool(self, name: str, args: dict[str, Any]) -> str:
+        # Every published MCP tool call reaches this durable fencing point
+        # before it can trigger an Action, Event, Workflow or external MCP.
+        _assert_agent_turn_lease(self.db)
         if not isinstance(args, dict):
             return _tool_error(
                 "INVALID_TOOL_ARGUMENTS",
@@ -2075,36 +2219,71 @@ class AgentContext:
                         "未找到操作；请先调用 list_actions 刷新名称、input_schema 和 required。",
                         retryable=True,
                     )
-                capability_readiness_service.require_executable(
-                    "action", a, definition=self.runtime_definition, db=self.db
+                # A stale model call can name a resource that is still
+                # discoverable for authoring diagnostics but has been
+                # disabled. Report that static state before asking for a
+                # release, since no execution boundary is reached.
+                if not bool(getattr(a, "enabled", False)):
+                    return _tool_error(
+                        "CAPABILITY_NOT_READY",
+                        "操作已停用。",
+                        retryable=False,
+                    )
+                definition = self._execution_definition()
+                a = runtime_definition_service.resolve_resource(
+                    definition,
+                    "action",
+                    a.id,
                 )
-                permission_service.require_action_permission(self.db, a, "read")
-                # 对话模型只可生成 Action 预演。实际执行必须由用户在 Action/任务
-                # 界面显式确认，确保模型不能把自然语言输入直接变成外部副作用。
+                capability_readiness_service.require_executable(
+                    "action", a, definition=definition, db=self.db
+                )
+                permission_service.require_action_permission(
+                    self.db,
+                    a,
+                    "read" if a.requires_confirmation else "execute",
+                )
                 if not self.scenario:
                     return _tool_error(
                         "CAPABILITY_NOT_READY",
-                        "操作缺少业务场景，当前不能生成可确认预演。",
+                        "操作缺少业务场景，当前不能执行。",
                         retryable=False,
                     )
-                definition = self.runtime_definition
-                if definition is None:
-                    return _tool_error(
-                        "CAPABILITY_NOT_READY",
-                        "操作缺少可验证的运行定义，当前不能生成预演。",
-                        retryable=False,
-                    )
-                r = workflow_service.execute_action(
-                    self.db,
-                    a,
-                    _validated_schema_params(a.input_schema or {}, args.get("params")),
-                    dry_run=True,
-                    enforce_policy=True,
-                    runtime_environment=definition.environment,
-                    runtime_definition=definition,
+                params = _validated_schema_params(
+                    a.input_schema or {}, args.get("params")
                 )
+                if a.requires_confirmation:
+                    r = workflow_service.execute_action(
+                        self.db,
+                        a,
+                        params,
+                        dry_run=True,
+                        enforce_policy=True,
+                        runtime_environment=definition.environment,
+                        runtime_definition=definition,
+                    )
+                    r["message"] = (
+                        "这是已固定定义版本的预演结果；请在当前对话回复“确认执行”"
+                        "（多项待确认时附上操作名称）后继续。"
+                    )
+                else:
+                    r = workflow_service.execute_action(
+                        self.db,
+                        a,
+                        params,
+                        confirm=True,
+                        dry_run=False,
+                        idempotency_key=_automatic_action_idempotency_key(
+                            self.db,
+                            action_id=str(a.id),
+                            params=params,
+                        ),
+                        enforce_policy=True,
+                        runtime_environment=definition.environment,
+                        runtime_definition=definition,
+                    )
+                    r["message"] = "该操作未启用人工确认，已按当前定义执行。"
                 r["definition_hash"] = definition.definition_hash
-                r["message"] = "这是已固定定义版本的预演结果；用户可在对话卡片或操作页显式确认。"
                 return _dump(r)
             if name == "list_rules":
                 scoped_action_ids = {str(action.id) for action in self.actions}
@@ -2199,15 +2378,21 @@ class AgentContext:
                         "未找到事件；请先调用 list_events 刷新名称和载荷字段。",
                         retryable=True,
                     )
-                capability_readiness_service.require_executable(
-                    "event", event, definition=self.runtime_definition, db=self.db
-                )
-                if self.runtime_definition is None:
+                if not bool(getattr(event, "enabled", False)):
                     return _tool_error(
                         "CAPABILITY_NOT_READY",
-                        "事件缺少可验证的运行定义，当前不能生成预演。",
+                        "事件已停用。",
                         retryable=False,
                     )
+                definition = self._execution_definition()
+                event = runtime_definition_service.resolve_resource(
+                    definition,
+                    "event",
+                    event.id,
+                )
+                capability_readiness_service.require_executable(
+                    "event", event, definition=definition, db=self.db
+                )
                 return _dump(
                     agent_confirmation_service.preview_event_publish(
                         self.db,
@@ -2216,7 +2401,7 @@ class AgentContext:
                             event.payload_schema or {},
                             args.get("payload"),
                         ),
-                        runtime_definition=self.runtime_definition,
+                        runtime_definition=definition,
                     )
                 )
             if name == "list_workflows":
@@ -2257,17 +2442,28 @@ class AgentContext:
                         "未找到工作流；请先调用 list_workflows 刷新名称、params_schema 和 required。",
                         retryable=True,
                     )
-                capability_readiness_service.require_executable(
-                    "workflow", w, definition=self.runtime_definition, db=self.db
-                )
-                if self.runtime_definition is None:
+                if not bool(getattr(w, "enabled", False)) or str(
+                    getattr(w, "status", "draft") or "draft"
+                ) != "active":
                     return _tool_error(
                         "CAPABILITY_NOT_READY",
-                        "工作流缺少可验证的运行定义，当前不能生成预演。",
+                        "工作流未启用或尚未处于活动状态。",
                         retryable=False,
                     )
+                definition = self._execution_definition()
+                w = runtime_definition_service.resolve_resource(
+                    definition,
+                    "workflow",
+                    w.id,
+                )
+                capability_readiness_service.require_executable(
+                    "workflow", w, definition=definition, db=self.db
+                )
                 workflow_params = _validated_schema_params(
-                    _workflow_parameter_schema(w, self.actions),
+                    _workflow_parameter_schema(
+                        w,
+                        list(definition.actions.values()),
+                    ),
                     args.get("params"),
                 )
                 return _dump(
@@ -2275,7 +2471,7 @@ class AgentContext:
                         self.db,
                         w,
                         workflow_params,
-                        runtime_definition=self.runtime_definition,
+                        runtime_definition=definition,
                     )
                 )
             return _tool_error(
@@ -2301,7 +2497,11 @@ class AgentContext:
                 _safe_message(exc, "函数参数不符合输入契约"),
                 retryable=True,
             )
-        except (agent_confirmation_service.AgentConfirmationError, PolicyViolation) as exc:
+        except (
+            agent_confirmation_service.AgentConfirmationError,
+            PolicyViolation,
+            runtime_definition_service.RuntimeDefinitionError,
+        ) as exc:
             return _tool_error(
                 "CAPABILITY_NOT_READY",
                 _safe_message(exc, "业务能力当前不可执行"),
@@ -3416,7 +3616,8 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
                 + (f"；完成后：{a.postcondition[:100]}" if a.postcondition else "")
                 for a in ctx.actions
             )
-            + "\n用 list_actions 查看就绪状态及前置/后置条件；只有 executable=true 的操作才能生成服务端固定预演，实际执行仍须用户确认。"
+            + "\n用 list_actions 查看就绪状态、前置/后置条件和 requires_confirmation；只有 executable=true 的操作可执行。"
+            "requires_confirmation=false 的操作会直接执行；为 true 时先生成服务端固定预演，用户需在当前对话回复“确认执行”。"
         )
     if ctx.rules:
         parts.append(
@@ -3435,7 +3636,7 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
                 f"{event.description[:60]}"
                 for event in ctx.events
             )
-            + "\n用 list_events 查看事件载荷与就绪状态；prepare_event_publish 生成服务端固定预演，不会发布事件，用户可在对话卡片确认。"
+            + "\n用 list_events 查看事件载荷与就绪状态；prepare_event_publish 生成服务端固定预演，不会发布事件，用户需在当前对话回复“确认发布”。"
         )
     if ctx.workflows:
         parts.append(
@@ -3446,7 +3647,7 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
                 f"{_capability_prompt_state(ctx, 'workflow', w)}）: {w.description[:60]}"
                 for w in ctx.workflows
             )
-            + "\n用 list_workflows 查看工作流就绪状态；execute_workflow 生成服务端固定预演，不会提交任务，用户可在对话卡片确认。"
+            + "\n用 list_workflows 查看工作流就绪状态；execute_workflow 生成服务端固定预演，不会提交任务，用户需在当前对话回复“确认提交”。"
         )
     parts.append(
         "\n【工作方式】请根据用户问题，自主调用合适的工具获取数据，然后给出准确、结构化的回答。"
@@ -3478,7 +3679,8 @@ def build_system_prompt(ctx: AgentContext, scenario_name: str, ontology_summary:
         "若工具返回 retryable=true 的结构化 schema/参数错误，应依据 error.message 或 list_* 返回的 schema 修正参数，"
         "最多重试一次且不得原样重复；retryable=false 时停止重试并说明阻塞点。\n"
         "凡用户要求报告、附注、财务报表或其他附件交付，必须先调用 list_actions，找到相应的模板执行器操作，"
-        "再按每个操作的 input_schema 实际调用 execute_action 生成可确认预演；不得只写一段 Markdown、伪造下载链接或声称附件已生成。"
+        "再按每个操作的 input_schema 实际调用 execute_action；服务端会根据人工确认配置执行或生成可确认预演，"
+        "不得只写一段 Markdown、伪造下载链接或声称附件已生成。"
         "如果没有已就绪的模板操作，要明确指出缺少哪类模板操作。\n"
         "涉及审计、排查或核验时，最终结果必须包含：判断依据、数据范围、明细或明确的无结果说明、"
         "统计汇总、证据引用、数据限制和结论。若无法完成，必须明确指出缺少哪个字段、映射或能力，"
@@ -3657,6 +3859,7 @@ def _run_agent(
     tool_call_counts: defaultdict[str, int] = defaultdict(int)
     tool_outcomes: list[dict[str, Any]] = []
     for _round in range(max_rounds):
+        _assert_agent_turn_lease(db)
         # 流式获取本轮 LLM 输出
         content_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
@@ -3732,6 +3935,10 @@ def _run_agent(
                 )
             else:
                 result = ctx.execute_tool(fname, fargs)
+                # An executor may take long enough for a crashed/partitioned
+                # worker to lose its lease.  Do not expose or persist its late
+                # output as part of a newer turn's transcript.
+                _assert_agent_turn_lease(db)
             tool_call_counts[signature] += 1
             bounded_result = _bounded_tool_result(result)
             tool_outcomes.append(
@@ -3776,6 +3983,7 @@ def _run_agent(
     ]
     final_parts: list[str] = []
     try:
+        _assert_agent_turn_lease(db)
         for ev in llm_service.chat_stream(
             llm,
             final_messages,

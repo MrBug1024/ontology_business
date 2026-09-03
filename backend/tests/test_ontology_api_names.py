@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
-from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app import database
 from app.database import Base
 from app.models import (
     BusinessScenario,
@@ -21,6 +18,7 @@ from app.models import (
 from app.routers import scenarios as scenario_routes
 from app.schemas import EntityIn, PropertyIn, RelationIn
 from app.services import permission_service, scenario_model_compiler
+from tests.postgresql_migration_contracts import baseline_table_ddl
 
 
 class OntologyApiNameTests(unittest.TestCase):
@@ -213,82 +211,20 @@ class OntologyApiNameTests(unittest.TestCase):
         self.assertEqual(relation.storage_kind, "none")
 
 
-class OntologyApiNameMigrationTests(unittest.TestCase):
-    def test_legacy_schema_is_backfilled_idempotently(self) -> None:
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        try:
-            with engine.begin() as conn:
-                conn.exec_driver_sql(
-                    "CREATE TABLE ontology_entities "
-                    "(id VARCHAR(32) PRIMARY KEY, scenario_id VARCHAR(32), name VARCHAR(200))"
-                )
-                conn.exec_driver_sql(
-                    "CREATE TABLE ontology_properties "
-                    "(id VARCHAR(32) PRIMARY KEY, entity_id VARCHAR(32), name VARCHAR(200))"
-                )
-                conn.exec_driver_sql(
-                    "CREATE TABLE ontology_relations "
-                    "(id VARCHAR(32) PRIMARY KEY, scenario_id VARCHAR(32), name VARCHAR(200))"
-                )
-                conn.exec_driver_sql(
-                    "CREATE TABLE relation_data_mappings "
-                    "(relation_id VARCHAR(32), mode VARCHAR(20))"
-                )
-                conn.execute(
-                    text("INSERT INTO ontology_entities VALUES (:id, :scenario, :name)"),
-                    {"id": "entity-hospital", "scenario": "scenario-1", "name": "医院"},
-                )
-                conn.execute(
-                    text("INSERT INTO ontology_properties VALUES (:id, :entity, :name)"),
-                    {"id": "property-name", "entity": "entity-hospital", "name": "医院名称"},
-                )
-                conn.execute(
-                    text("INSERT INTO ontology_relations VALUES (:id, :scenario, :name)"),
-                    {"id": "relation-visits", "scenario": "scenario-1", "name": "接诊"},
-                )
-                conn.execute(
-                    text("INSERT INTO relation_data_mappings VALUES (:relation, :mode)"),
-                    {"relation": "relation-visits", "mode": "join_table"},
-                )
+class OntologyApiNameMigrationContractsTests(unittest.TestCase):
+    def test_postgresql_baseline_declares_stable_ontology_identifiers(self) -> None:
+        entity_ddl = baseline_table_ddl("ontology_entities")
+        property_ddl = baseline_table_ddl("ontology_properties")
+        relation_ddl = baseline_table_ddl("ontology_relations")
 
-            settings = SimpleNamespace(database_url="sqlite://")
-            with patch.object(database, "engine", engine), patch.object(
-                database, "_settings", settings
-            ):
-                database._migrate_ontology_api_names()
-                with engine.connect() as conn:
-                    first = conn.execute(text(
-                        "SELECT api_name, source_display_name, source_api_name, "
-                        "target_display_name, target_api_name, storage_kind "
-                        "FROM ontology_relations"
-                    )).mappings().one()
-                database._migrate_ontology_api_names()
-                with engine.connect() as conn:
-                    second = conn.execute(text(
-                        "SELECT api_name, source_display_name, source_api_name, "
-                        "target_display_name, target_api_name, storage_kind "
-                        "FROM ontology_relations"
-                    )).mappings().one()
-
-            self.assertEqual(dict(first), dict(second))
-            self.assertEqual(first["source_display_name"], "接诊")
-            self.assertEqual(first["target_display_name"], "接诊（反向）")
-            self.assertEqual(first["source_api_name"], first["api_name"])
-            self.assertEqual(first["target_api_name"], f"inverse_{first['api_name']}")
-            self.assertEqual(first["storage_kind"], "join_table")
-            columns = {
-                column["name"] for column in inspect(engine).get_columns("ontology_relations")
-            }
-            self.assertTrue({
-                "api_name", "source_display_name", "source_api_name",
-                "target_display_name", "target_api_name", "storage_kind",
-            }.issubset(columns))
-        finally:
-            engine.dispose()
+        self.assertIn("api_name VARCHAR(100) NOT NULL", entity_ddl)
+        self.assertIn("api_name VARCHAR(100) NOT NULL", property_ddl)
+        self.assertIn("api_name VARCHAR(100) NOT NULL", relation_ddl)
+        self.assertIn("source_display_name VARCHAR(200) NOT NULL", relation_ddl)
+        self.assertIn("source_api_name VARCHAR(100) NOT NULL", relation_ddl)
+        self.assertIn("target_display_name VARCHAR(200) NOT NULL", relation_ddl)
+        self.assertIn("target_api_name VARCHAR(100) NOT NULL", relation_ddl)
+        self.assertIn("storage_kind VARCHAR(32) NOT NULL", relation_ddl)
 
 
 if __name__ == "__main__":

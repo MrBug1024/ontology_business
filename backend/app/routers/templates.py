@@ -34,6 +34,7 @@ from ..services import (
     template_artifact_service,
     template_catalog_service,
     tenant_service,
+    upload_service,
 )
 from ..services.auth_service import get_tenant_db
 
@@ -216,7 +217,7 @@ def _save_template_upload(
     db: Session,
     source: DataSource,
     filename: str,
-    content: bytes,
+    staged: upload_service.StagedUpload,
     *,
     mime: str,
 ) -> BucketFile:
@@ -234,10 +235,12 @@ def _save_template_upload(
     with heartbeat as active_heartbeat:
         if claim is not None:
             object_deletion_service.begin_upload_put(claim)
-        saved = datasource_service.save_bucket_file(
+        saved = datasource_service.save_bucket_file_from_path(
             source,
             filename,
-            content,
+            staged.path,
+            size=staged.size,
+            content_sha256=staged.sha256,
             mime=mime,
             stable_file_id=file_id if claim is not None else None,
             upload_object_key=claim.object_key if claim is not None else None,
@@ -391,6 +394,7 @@ def _create(
     description: str,
     key: str,
     version_note: str,
+    inspection: template_artifact_service.TemplateInspection | None = None,
 ) -> ArtifactTemplateDetailOut:
     if scenario_id:
         _scenario_access(db, scenario_id, writable=True)
@@ -409,6 +413,7 @@ def _create(
             key=key,
             version_note=version_note,
             created_by_user_id=str(db.info.get("user_id") or "") or None,
+            inspection=inspection,
         )
         db.commit()
         db.refresh(template)
@@ -548,39 +553,53 @@ async def upload_template(
     _lock_template_scenarios(db, [scenario_id, observed_source.scenario_id])
     source = _source(db, data_source_id, writable=True)
     max_bytes = get_settings().max_upload_bytes
-    content = await file.read(max_bytes + 1)
-    if len(content) > max_bytes:
-        raise HTTPException(413, f"文件超过大小限制（{max_bytes // (1024 * 1024)} MB）")
+    try:
+        staged = await upload_service.stage_upload(
+            file,
+            max_bytes=max_bytes,
+        )
+    except upload_service.UploadTooLargeError as exc:
+        raise HTTPException(413, str(exc)) from exc
     filename = file.filename or "template"
-    try:
-        metadata = template_artifact_service.inspect_template(filename, content)
-        saved = _save_template_upload(
-            db,
-            source,
-            filename,
-            content,
-            mime=str(metadata["mime"]),
-        )
-    except (ValueError, template_artifact_service.TemplateArtifactError) as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except (RuntimeError, object_storage_service.ObjectStorageError) as exc:
-        raise HTTPException(503, "模板对象存储写入失败") from exc
-    try:
-        db.flush()
-        return _create(
-            db,
-            template_file=saved,
-            source=source,
-            scenario_id=scenario_id,
-            name=name,
-            purpose=purpose,
-            description=description,
-            key=key,
-            version_note=version_note,
-        )
-    except Exception:
-        _remove_uncommitted_upload(db, saved)
-        raise
+    with upload_service.cleanup_staged_upload(staged):
+        try:
+            inspection = template_artifact_service.inspect_template_file(
+                filename,
+                staged.path,
+                size=staged.size,
+                sha256=staged.sha256,
+            )
+        except (ValueError, template_artifact_service.TemplateArtifactError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        try:
+            saved = _save_template_upload(
+                db,
+                source,
+                filename,
+                staged,
+                mime=str(inspection.metadata["mime"]),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except (RuntimeError, object_storage_service.ObjectStorageError) as exc:
+            raise HTTPException(503, "模板对象存储写入失败") from exc
+        try:
+            db.flush()
+            return _create(
+                db,
+                template_file=saved,
+                source=source,
+                scenario_id=scenario_id,
+                name=name,
+                purpose=purpose,
+                description=description,
+                key=key,
+                version_note=version_note,
+                inspection=inspection,
+            )
+        except Exception:
+            _remove_uncommitted_upload(db, saved)
+            raise
 
 
 @router.get("/{template_id}", response_model=ArtifactTemplateDetailOut)
@@ -716,6 +735,7 @@ def _add_version(
     *,
     version_note: str,
     set_current: bool,
+    inspection: template_artifact_service.TemplateInspection | None = None,
 ) -> ArtifactTemplateDetailOut:
     try:
         template_catalog_service.add_version_from_bucket_file(
@@ -726,6 +746,7 @@ def _add_version(
             version_note=version_note,
             set_current=set_current,
             created_by_user_id=str(db.info.get("user_id") or "") or None,
+            inspection=inspection,
         )
         db.commit()
         db.refresh(template)
@@ -784,60 +805,73 @@ async def upload_template_version(
         raise HTTPException(409, "已停用模板不能新增版本，请先恢复模板")
     source = _source(db, data_source_id, writable=True)
     max_bytes = get_settings().max_upload_bytes
-    content = await file.read(max_bytes + 1)
-    if len(content) > max_bytes:
-        raise HTTPException(413, f"文件超过大小限制（{max_bytes // (1024 * 1024)} MB）")
+    try:
+        staged = await upload_service.stage_upload(
+            file,
+            max_bytes=max_bytes,
+        )
+    except upload_service.UploadTooLargeError as exc:
+        raise HTTPException(413, str(exc)) from exc
     filename = file.filename or "template"
-    try:
-        metadata = template_artifact_service.inspect_template(filename, content)
-    except template_artifact_service.TemplateArtifactError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    existing = db.scalar(select(ArtifactTemplateVersion).where(
-        ArtifactTemplateVersion.template_id == template.id,
-        ArtifactTemplateVersion.content_sha256 == str(metadata["sha256"]),
-    ))
-    if existing:
+    with upload_service.cleanup_staged_upload(staged):
         try:
-            template_catalog_service.resolve_version(
-                db,
-                template_id=template.id,
-                tenant_id=template.tenant_id,
-                scenario_id=template.scenario_id or "",
-                version_number=existing.version,
-                expected_sha256=existing.content_sha256,
-                require_active=False,
+            inspection = template_artifact_service.inspect_template_file(
+                filename,
+                staged.path,
+                size=staged.size,
+                sha256=staged.sha256,
             )
-        except template_catalog_service.TemplateCatalogError as exc:
-            raise HTTPException(409, f"既有同内容版本完整性校验失败：{exc}") from exc
-        if set_current:
-            template.current_version_id = existing.id
-            db.commit()
-        return _out(db, template, detail=True)
-    try:
-        saved = _save_template_upload(
-            db,
-            source,
-            filename,
-            content,
-            mime=str(metadata["mime"]),
-        )
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except (RuntimeError, object_storage_service.ObjectStorageError) as exc:
-        raise HTTPException(503, "模板对象存储写入失败") from exc
-    try:
-        db.flush()
-        return _add_version(
-            db,
-            template,
-            saved,
-            source,
-            version_note=version_note,
-            set_current=set_current,
-        )
-    except Exception:
-        _remove_uncommitted_upload(db, saved)
-        raise
+        except (ValueError, template_artifact_service.TemplateArtifactError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        existing = db.scalar(select(ArtifactTemplateVersion).where(
+            ArtifactTemplateVersion.template_id == template.id,
+            ArtifactTemplateVersion.content_sha256 == str(inspection.metadata["sha256"]),
+        ))
+        if existing:
+            try:
+                template_catalog_service.resolve_version(
+                    db,
+                    template_id=template.id,
+                    tenant_id=template.tenant_id,
+                    scenario_id=template.scenario_id or "",
+                    version_number=existing.version,
+                    expected_sha256=existing.content_sha256,
+                    require_active=False,
+                )
+            except template_catalog_service.TemplateCatalogError as exc:
+                raise HTTPException(409, f"既有同内容版本完整性校验失败：{exc}") from exc
+            if set_current:
+                template.current_version_id = existing.id
+                db.commit()
+            return _out(db, template, detail=True)
+
+        try:
+            saved = _save_template_upload(
+                db,
+                source,
+                filename,
+                staged,
+                mime=str(inspection.metadata["mime"]),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except (RuntimeError, object_storage_service.ObjectStorageError) as exc:
+            raise HTTPException(503, "模板对象存储写入失败") from exc
+        try:
+            db.flush()
+            return _add_version(
+                db,
+                template,
+                saved,
+                source,
+                version_note=version_note,
+                set_current=set_current,
+                inspection=inspection,
+            )
+        except Exception:
+            _remove_uncommitted_upload(db, saved)
+            raise
 
 
 @router.post("/{template_id}/deprecate", response_model=ArtifactTemplateDetailOut)

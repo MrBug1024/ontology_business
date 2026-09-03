@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app import database
 from app.database import Base
 from app.models import (
     BusinessScenario,
@@ -36,35 +33,19 @@ from app.services import (
     release_service,
     runtime_definition_service,
 )
+from tests.postgresql_migration_contracts import (
+    baseline_table_ddl,
+    render_postgresql_upgrade,
+)
 
 
-def test_legacy_entity_lifecycle_migration_backfills_idempotently() -> None:
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    try:
-        with engine.begin() as conn:
-            conn.exec_driver_sql(
-                "CREATE TABLE ontology_entities "
-                "(id VARCHAR(32) PRIMARY KEY, scenario_id VARCHAR(32), name VARCHAR(200))"
-            )
-            conn.execute(
-                text("INSERT INTO ontology_entities VALUES ('legacy', 'scenario', '旧对象')")
-            )
-        with patch.object(database, "engine", engine):
-            database._migrate_ontology_entity_lifecycle()
-            database._migrate_ontology_entity_lifecycle()
-        assert "lifecycle_status" in {
-            column["name"] for column in inspect(engine).get_columns("ontology_entities")
-        }
-        with engine.connect() as conn:
-            assert conn.execute(
-                text("SELECT lifecycle_status FROM ontology_entities WHERE id='legacy'")
-            ).scalar_one() == "active"
-    finally:
-        engine.dispose()
+def test_postgresql_baseline_declares_entity_lifecycle_status() -> None:
+    ddl = baseline_table_ddl("ontology_entities")
+    assert "lifecycle_status VARCHAR(20) NOT NULL" in ddl
+    assert (
+        "CREATE INDEX ix_ontology_entities_lifecycle_status "
+        "ON ontology_entities (lifecycle_status)"
+    ) in render_postgresql_upgrade("20260827_01")
 
 
 def test_entity_lifecycle_schema_is_closed() -> None:
@@ -121,8 +102,8 @@ class TestOntologyEntityLifecycleRuntime:
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="生命周期测试源",
-            type="sqlite",
-            config={"path": "unused.db"},
+            type="postgres",
+            config={"host": "unused", "database": "unused"},
         )
         self.active_mapping = DataMapping(
             id="mapping-active",
@@ -372,7 +353,7 @@ class TestOntologyEntityLifecycleRuntime:
         )
         self.db.add_all([branch, snapshot, release])
         self.db.commit()
-        frozen = runtime_definition_service.resolve_active(
+        frozen = runtime_definition_service.resolve_execution(
             self.db, self.scenario, environment="staging"
         )
         assert set(frozen.entities) == {self.active_entity.id}

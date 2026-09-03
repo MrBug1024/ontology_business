@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import copy
-import tempfile
+from contextlib import nullcontext
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -33,6 +32,8 @@ from app.routers import data_sources, scenarios, templates
 from app.schemas import ActionIn
 from app.services import (
     datasource_service,
+    object_deletion_service,
+    object_storage_service,
     permission_service,
     release_service,
     template_artifact_service,
@@ -40,19 +41,31 @@ from app.services import (
     workflow_service,
 )
 from app.services.auth_service import get_current_user, get_tenant_db
+from tests.minio_fakes import FakeMinio
 
 
 MARKDOWN_V1 = b"# {{ report.title }}\n\nCustomer: {{ project.name }}\n"
 MARKDOWN_V2 = b"# {{ report.title }}\n\nCustomer: {{ project.name }}\n\nVersion 2\n"
+TEST_MINIO_CONFIGURATION = object_storage_service.MinioConfiguration(
+    endpoint="minio.example.test",
+    access_key="access",
+    secret_key="secret",
+    bucket_name="ontology",
+    prefix="ontology-business",
+)
+TEST_MINIO_SOURCE_CONFIG = {
+    "storage_backend": "minio",
+    "bucket_name": "ontology",
+    "prefix": "ontology-business",
+}
 
 
 class TemplateCatalogTests(unittest.TestCase):
+    @staticmethod
+    def _fake_upload_claim(**kwargs):
+        return SimpleNamespace(object_key=kwargs["object_key"])
+
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.bucket_patch = patch.object(
-            datasource_service, "BUCKETS_DIR", Path(self.temp.name) / "buckets"
-        )
-        self.bucket_patch.start()
         self.engine = create_engine(
             "sqlite://",
             connect_args={"check_same_thread": False},
@@ -62,6 +75,49 @@ class TemplateCatalogTests(unittest.TestCase):
             bind=self.engine, autoflush=False, expire_on_commit=False
         )
         Base.metadata.create_all(self.engine)
+        self.minio = FakeMinio()
+        self.configuration_patch = patch.object(
+            object_storage_service,
+            "configuration",
+            return_value=TEST_MINIO_CONFIGURATION,
+        )
+        self.client_patch = patch.object(
+            object_storage_service,
+            "get_client",
+            return_value=self.minio,
+        )
+        # Template catalog behavior is covered here; the transactional outbox
+        # has dedicated tests. Avoid a second SQLite session committing the
+        # shared StaticPool connection used by this HTTP-focused test class.
+        self.upload_intent_patch = patch.object(
+            object_deletion_service,
+            "_prepare_upload_intent",
+            side_effect=self._fake_upload_claim,
+        )
+        self.heartbeat_patch = patch.object(
+            object_deletion_service,
+            "heartbeat_upload_intent",
+            side_effect=lambda _claim: nullcontext(),
+        )
+        self.begin_upload_patch = patch.object(
+            object_deletion_service,
+            "begin_upload_put",
+        )
+        self.assert_upload_patch = patch.object(
+            object_deletion_service,
+            "assert_upload_active",
+        )
+        self.retain_upload_patch = patch.object(
+            object_deletion_service,
+            "retain_bucket_file_upload",
+        )
+        self.configuration_patch.start()
+        self.client_patch.start()
+        self.upload_intent_patch.start()
+        self.heartbeat_patch.start()
+        self.begin_upload_patch.start()
+        self.assert_upload_patch.start()
+        self.retain_upload_patch.start()
         db = self.Session()
         self.tenant = Tenant(id="tenant-templates", name="模板租户")
         self.user = User(
@@ -97,6 +153,7 @@ class TemplateCatalogTests(unittest.TestCase):
             scenario_id=None,
             name="共享模板库",
             type="file_bucket",
+            config=dict(TEST_MINIO_SOURCE_CONFIG),
         )
         self.scenario_bucket = DataSource(
             id="bucket-template-a",
@@ -104,6 +161,7 @@ class TemplateCatalogTests(unittest.TestCase):
             scenario_id=self.scenario_a.id,
             name="场景模板库",
             type="file_bucket",
+            config=dict(TEST_MINIO_SOURCE_CONFIG),
         )
         self.target_bucket = DataSource(
             id="bucket-template-output",
@@ -111,6 +169,7 @@ class TemplateCatalogTests(unittest.TestCase):
             scenario_id=self.scenario_a.id,
             name="场景附件库",
             type="file_bucket",
+            config=dict(TEST_MINIO_SOURCE_CONFIG),
         )
         db.add_all([
             self.tenant,
@@ -164,8 +223,13 @@ class TemplateCatalogTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.client.close()
         self.engine.dispose()
-        self.bucket_patch.stop()
-        self.temp.cleanup()
+        self.retain_upload_patch.stop()
+        self.assert_upload_patch.stop()
+        self.begin_upload_patch.stop()
+        self.heartbeat_patch.stop()
+        self.upload_intent_patch.stop()
+        self.client_patch.stop()
+        self.configuration_patch.stop()
 
     def _db(self) -> Session:
         db = self.Session()
@@ -253,6 +317,43 @@ class TemplateCatalogTests(unittest.TestCase):
         hidden = self.client.get(f"/api/templates/{shared['id']}")
         self.assertEqual(hidden.status_code, 404)
 
+    def test_upload_uses_staged_inspection_without_reading_template_back_from_minio(self) -> None:
+        large_markdown = b"# {{ report.title }}\n" + b"x" * (3 * 1024 * 1024)
+        with patch.object(
+            template_catalog_service,
+            "inspect_bucket_file",
+            side_effect=AssertionError("uploaded template must not be read back"),
+        ):
+            uploaded = self._upload(
+                key="staged_large_template",
+                filename="staged.md",
+                content=large_markdown,
+            )
+        self.assertEqual(uploaded["current_version"]["size"], len(large_markdown))
+
+        with patch.object(
+            template_catalog_service,
+            "inspect_bucket_file",
+            side_effect=AssertionError("uploaded version must not be read back"),
+        ):
+            response = self.client.post(
+                f"/api/templates/{uploaded['id']}/versions/upload",
+                data={
+                    "data_source_id": self.global_bucket.id,
+                    "version_note": "流式修订版",
+                    "set_current": "true",
+                },
+                files={
+                    "file": (
+                        "staged-v2.md",
+                        b"# {{ report.title }}\nsecond version\n",
+                        "text/markdown",
+                    )
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["version_count"], 2)
+
     def test_existing_bucket_files_can_be_registered_and_versioned(self) -> None:
         db = self._db()
         first = datasource_service.save_bucket_file(
@@ -298,8 +399,92 @@ class TemplateCatalogTests(unittest.TestCase):
         self.assertEqual(deleted_scenario.status_code, 200, deleted_scenario.text)
         db.expire_all()
         self.assertIsNone(db.get(ArtifactTemplate, catalog["id"]))
-        self.assertIsNone(db.get(BucketFile, first_id))
+        # Scenario deletion detaches the source (its FK is SET NULL) and
+        # removes bytes through the durable-object deletion outbox. Metadata
+        # remains for audit/recovery instead of treating a MinIO URI as a
+        # cascade-owned local file.
+        remaining_file = db.get(BucketFile, first_id)
+        self.assertIsNotNone(remaining_file)
+        with self.assertRaises(FileNotFoundError):
+            datasource_service.read_bucket_file(remaining_file, self.scenario_bucket)
         db.close()
+
+    def test_delete_file_bucket_cascades_legacy_files_and_minio_objects(self) -> None:
+        db = self._db()
+        current = datasource_service.save_bucket_file(
+            self.scenario_bucket,
+            "current.md",
+            b"current file",
+        )
+        legacy_key = "ontology-business/migrations/file-buckets/legacy.md"
+        legacy_body = b"legacy file"
+        legacy_upload = object_storage_service.put_object(
+            "ontology",
+            legacy_key,
+            legacy_body,
+            content_type="text/markdown",
+        )
+        legacy_url = object_storage_service.stable_object_url("ontology", legacy_key)
+        legacy = BucketFile(
+            id="d" * 32,
+            data_source_id=self.scenario_bucket.id,
+            filename="legacy.md",
+            stored_path=legacy_url,
+            storage_provider="minio",
+            bucket_name="ontology",
+            object_key=legacy_key,
+            object_version_id=legacy_upload.version_id,
+            etag=legacy_upload.etag,
+            object_url=legacy_url,
+            size=len(legacy_body),
+            mime="text/markdown",
+        )
+        db.add_all([current, legacy])
+        db.commit()
+        source_id = self.scenario_bucket.id
+        current_id = current.id
+        legacy_id = legacy.id
+        current_key = current.object_key
+        # Simulate the deployment and the data-source policy moving to a new
+        # bucket/prefix after these records were persisted.  Deletion must use
+        # each BucketFile's controlled historical identity, not today's config.
+        rotated_configuration = object_storage_service.MinioConfiguration(
+            endpoint="minio.example.test",
+            access_key="access",
+            secret_key="secret",
+            bucket_name="ontology-current",
+            prefix="ontology-current-files",
+        )
+        source = db.get(DataSource, source_id)
+        self.assertIsNotNone(source)
+        source.config = {
+            "storage_backend": "minio",
+            "bucket_name": rotated_configuration.bucket_name,
+            "prefix": rotated_configuration.prefix,
+        }
+        db.commit()
+        db.close()
+
+        with patch.object(
+            object_storage_service,
+            "configuration",
+            return_value=rotated_configuration,
+        ):
+            deleted = self.client.delete(f"/api/data-sources/{source_id}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(deleted.json()["data"], {
+            "data_source_id": source_id,
+            "files_deleted": 2,
+            "cleanup_jobs": 2,
+        })
+
+        verify = self._db()
+        self.assertIsNone(verify.get(DataSource, source_id))
+        self.assertIsNone(verify.get(BucketFile, current_id))
+        self.assertIsNone(verify.get(BucketFile, legacy_id))
+        verify.close()
+        self.assertNotIn(("ontology", current_key), self.minio.objects)
+        self.assertNotIn(("ontology", legacy_key), self.minio.objects)
 
     def test_action_pins_version_deprecation_blocks_rebinding_but_not_existing_run(self) -> None:
         catalog = self._upload(filename="audit.md")
@@ -399,7 +584,10 @@ class TemplateCatalogTests(unittest.TestCase):
             generated.origin_template_version_id,
             artifact["template_version_id"],
         )
-        rendered_text = Path(generated.stored_path).read_text(encoding="utf-8")
+        rendered_text = datasource_service.read_bucket_file(
+            generated,
+            self.target_bucket,
+        )[0].decode("utf-8")
         self.assertIn("# 审计报告", rendered_text)
         self.assertIn("Customer: 华信", rendered_text)
         db.close()
@@ -423,13 +611,16 @@ class TemplateCatalogTests(unittest.TestCase):
 
         bucket_file_id = catalog["current_version"]["bucket_file_id"]
         bucket_file = db.get(BucketFile, bucket_file_id)
-        stored_path = Path(bucket_file.stored_path)
         blocked_file = self.client.delete(f"/api/data-sources/files/{bucket_file_id}")
         self.assertEqual(blocked_file.status_code, 409, blocked_file.text)
-        self.assertTrue(stored_path.is_file())
+        self.assertTrue(
+            datasource_service.read_bucket_file(bucket_file, self.global_bucket)[0]
+        )
         blocked_bucket = self.client.delete(f"/api/data-sources/{self.global_bucket.id}")
         self.assertEqual(blocked_bucket.status_code, 409, blocked_bucket.text)
-        self.assertTrue(stored_path.is_file())
+        self.assertTrue(
+            datasource_service.read_bucket_file(bucket_file, self.global_bucket)[0]
+        )
 
         branch = OntologyBranch(
             id="branch-template-release",
@@ -480,7 +671,10 @@ class TemplateCatalogTests(unittest.TestCase):
         db.commit()
         deleted = self.client.delete(f"/api/templates/{catalog['id']}")
         self.assertEqual(deleted.status_code, 200, deleted.text)
-        self.assertTrue(stored_path.is_file(), "catalog deletion must not delete bucket bytes")
+        self.assertTrue(
+            datasource_service.read_bucket_file(bucket_file, self.global_bucket)[0],
+            "catalog deletion must not delete bucket bytes",
+        )
         db.close()
 
     def test_hidden_scenario_references_do_not_leak_counts_but_still_protect_template(self) -> None:
@@ -692,6 +886,7 @@ class TemplateCatalogTests(unittest.TestCase):
             scenario_id=None,
             name="其他租户模板桶",
             type="file_bucket",
+            config=dict(TEST_MINIO_SOURCE_CONFIG),
         )
         db.add(foreign_source)
         db.flush()
@@ -747,6 +942,7 @@ class TemplateCatalogTests(unittest.TestCase):
             scenario_id=self.scenario_b.id,
             name="场景 B 私有模板桶",
             type="file_bucket",
+            config=dict(TEST_MINIO_SOURCE_CONFIG),
         )
         db.add(scenario_b_bucket)
         db.flush()
@@ -989,7 +1185,9 @@ class TemplateCatalogTests(unittest.TestCase):
         self.assertIsNotNone(template)
         version = db.get(ArtifactTemplateVersion, template.current_version_id)
         bucket_file = db.get(BucketFile, version.bucket_file_id)
-        self.assertTrue(Path(bucket_file.stored_path).is_file())
+        self.assertTrue(
+            datasource_service.read_bucket_file(bucket_file, self.global_bucket)[0]
+        )
         db.close()
 
     def test_same_hash_version_dedup_fails_closed_when_existing_bytes_are_corrupt(self) -> None:
@@ -998,7 +1196,12 @@ class TemplateCatalogTests(unittest.TestCase):
         template = db.get(ArtifactTemplate, catalog["id"])
         version = db.get(ArtifactTemplateVersion, template.current_version_id)
         bucket_file = db.get(BucketFile, version.bucket_file_id)
-        Path(bucket_file.stored_path).write_bytes(b"corrupted-template-bytes")
+        self.minio.overwrite_object(
+            bucket_file.bucket_name,
+            bucket_file.object_key,
+            b"corrupted-template-bytes",
+            version_id=bucket_file.object_version_id,
+        )
         db.close()
 
         response = self.client.post(

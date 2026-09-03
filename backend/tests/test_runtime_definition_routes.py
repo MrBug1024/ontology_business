@@ -449,8 +449,8 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_user_owned_scenario_with_dev_release_history_can_be_deleted(self) -> None:
-        """Deleting a draft/dev scenario also removes its immutable history."""
+    def test_user_owned_scenario_with_dev_named_release_remains_protected(self) -> None:
+        """A release is executable globally; its audit label cannot weaken ACLs."""
         self._create_staging_release()
         db = self.Session()
         try:
@@ -465,14 +465,15 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
             db.close()
 
         response = self.client.delete(f"/api/scenarios/{self.scenario.id}")
-        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("活动环境发布引用", response.json()["detail"])
 
         db = self.Session()
         try:
             db.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
-            self.assertIsNone(db.get(BusinessScenario, self.scenario.id))
-            self.assertIsNone(db.get(OntologyRelease, "release-runtime-a"))
-            self.assertIsNone(db.get(OntologySnapshot, "snapshot-runtime-a"))
-            self.assertIsNone(db.get(OntologyBranch, "branch-runtime"))
+            self.assertIsNotNone(db.get(BusinessScenario, self.scenario.id))
+            self.assertIsNotNone(db.get(OntologyRelease, "release-runtime-a"))
+            self.assertIsNotNone(db.get(OntologySnapshot, "snapshot-runtime-a"))
+            self.assertIsNotNone(db.get(OntologyBranch, "branch-runtime"))
         finally:
             db.close()

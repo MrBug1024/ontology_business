@@ -218,7 +218,7 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
 
             scenario = db.get(BusinessScenario, self.scenario.id)
             assert scenario is not None
-            frozen = runtime_definition_service.resolve_active(
+            frozen = runtime_definition_service.resolve_execution(
                 db,
                 scenario,
                 environment="staging",

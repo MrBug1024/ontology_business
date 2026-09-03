@@ -160,7 +160,7 @@ def _action_readiness(
         reasons.append("操作执行配置不是对象")
         config = {}
     if definition is not None and bool(getattr(definition, "is_frozen", False)) and executor_type in {
-        "http", "skill", "script", "template",
+        "http", "skill", "script",
     }:
         reasons.append(f"{executor_type} 操作不能在冻结发布环境执行")
     if executor_type == "sql":

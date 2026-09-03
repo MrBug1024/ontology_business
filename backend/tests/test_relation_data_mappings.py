@@ -7,11 +7,10 @@ from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, configure_mappers
 
-from app import database
 from app.database import Base
 from app.models import (
     BusinessScenario,
@@ -36,10 +35,11 @@ from app.services import (
     release_service,
     runtime_definition_service,
 )
+from tests.postgresql_migration_contracts import baseline_table_ddl
 
 
 def _binding(key: str) -> tuple[str, dict]:
-    return key, {"adapter": "sqlite", "required_capabilities": ["sql_read"]}
+    return key, {"adapter": "postgres", "required_capabilities": ["sql_read"]}
 
 
 def _write_source_database(path: str) -> None:
@@ -70,6 +70,7 @@ def _write_source_database(path: str) -> None:
 def _world(tmp_path, *, mode: str | None = "source_fk") -> SimpleNamespace:
     source_path = str(tmp_path / f"source-{mode or 'none'}.sqlite")
     _write_source_database(source_path)
+    source_engine = create_engine(f"sqlite:///{source_path}")
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     db = Session(engine, expire_on_commit=False)
@@ -135,9 +136,15 @@ def _world(tmp_path, *, mode: str | None = "source_fk") -> SimpleNamespace:
         id="source-physical",
         tenant_id=scenario.tenant_id,
         scenario=scenario,
-        name="业务 SQLite",
-        type="sqlite",
-        config={"path": source_path},
+        name="业务 PostgreSQL",
+        type="postgres",
+        config={
+            "host": "unused.test",
+            "port": 5432,
+            "database": "links",
+            "user": "test",
+            "password": "test-only",
+        },
         status="ok",
     )
     source_key, source_ref = _binding("source-binding")
@@ -180,6 +187,22 @@ def _world(tmp_path, *, mode: str | None = "source_fk") -> SimpleNamespace:
     )
     db.commit()
 
+    real_get_engine = datasource_service.get_engine
+
+    def _fixture_engine(source: DataSource):
+        if str(source.id) == data_source.id:
+            return source_engine
+        return real_get_engine(source)
+
+    # Exercise PostgreSQL identifiers and policies while using an isolated local
+    # SQL fixture as the transport implementation for these unit tests.
+    source_engine_patcher = patch.object(
+        datasource_service,
+        "get_engine",
+        side_effect=_fixture_engine,
+    )
+    source_engine_patcher.start()
+
     relation_mapping = None
     if mode:
         payload = {
@@ -210,6 +233,8 @@ def _world(tmp_path, *, mode: str | None = "source_fk") -> SimpleNamespace:
 
     return SimpleNamespace(
         engine=engine,
+        source_engine=source_engine,
+        source_engine_patcher=source_engine_patcher,
         db=db,
         source_path=source_path,
         scenario=scenario,
@@ -225,6 +250,8 @@ def _world(tmp_path, *, mode: str | None = "source_fk") -> SimpleNamespace:
 
 def _close_world(world: SimpleNamespace) -> None:
     source_id = str(world.data_source.id)
+    world.source_engine_patcher.stop()
+    world.source_engine.dispose()
     world.db.close()
     world.engine.dispose()
     for key, cached in list(datasource_service._engine_cache.items()):
@@ -243,7 +270,7 @@ def _connector_audits(world: SimpleNamespace) -> dict[str, dict]:
             "binding_id": "binding-source-dev",
             "connector_id": world.data_source.id,
             "connector_name": world.data_source.name,
-            "adapter_type": "sqlite",
+            "adapter_type": "postgres",
         },
         world.target_mapping.id: {
             "kind": "data_source",
@@ -253,7 +280,7 @@ def _connector_audits(world: SimpleNamespace) -> dict[str, dict]:
             "binding_id": "binding-target-dev",
             "connector_id": world.data_source.id,
             "connector_name": world.data_source.name,
-            "adapter_type": "sqlite",
+            "adapter_type": "postgres",
         },
     }
 
@@ -516,7 +543,7 @@ def _frozen_mapping(mapping: DataMapping, entity: OntologyEntity | None) -> Simp
     return frozen
 
 
-def test_frozen_import_requires_snapshot_entity_and_keeps_environments_isolated(tmp_path) -> None:
+def test_frozen_import_requires_snapshot_entity_and_reuses_facts_across_deployments(tmp_path) -> None:
     world = _world(tmp_path, mode="source_fk")
     try:
         missing_entity = _frozen_mapping(world.source_mapping, None)
@@ -528,6 +555,7 @@ def test_frozen_import_requires_snapshot_entity_and_keeps_environments_isolated(
                 data_source=world.data_source,
                 environment="staging",
                 relation_mappings=[],
+                definition_provenance={"source": "release"},
             )
 
         _refresh(world, world.source_mapping, relation_mappings=[])
@@ -599,7 +627,7 @@ def test_frozen_import_requires_snapshot_entity_and_keeps_environments_isolated(
         imported = world.db.scalars(
             select(OntologyInstance).where(OntologyInstance.source == "imported")
         ).all()
-        assert len(imported) == 4
+        assert len(imported) == 2
         dev_objects = [
             item
             for item in imported
@@ -633,7 +661,7 @@ def test_frozen_import_requires_snapshot_entity_and_keeps_environments_isolated(
             relation_mappings={relation_frozen.id: relation_frozen},
         )
         assert context._object_in_data_context(staging_objects[0]) is True
-        assert context._object_in_data_context(dev_objects[0]) is False
+        assert context._object_in_data_context(dev_objects[0]) is True
     finally:
         _close_world(world)
 
@@ -833,60 +861,23 @@ def test_postgresql_mapping_identifiers_are_dialect_safe() -> None:
         ontology_service._quoted_mapping_table("orders; DROP TABLE users", "postgres")
 
 
-def test_title_and_unique_edge_migration_is_idempotent_and_mapper_is_wired() -> None:
+def test_title_and_unique_edge_schema_is_declared_by_postgresql_migration() -> None:
     configure_mappers()
     assert hasattr(DataMapping, "source_relation_mappings")
     assert hasattr(DataMapping, "target_relation_mappings")
     assert not hasattr(DocumentChunk, "source_relation_mappings")
     assert not hasattr(DocumentChunk, "target_relation_mappings")
 
-    legacy = create_engine("sqlite:///:memory:")
-    with legacy.begin() as connection:
-        connection.exec_driver_sql(
-            "CREATE TABLE ontology_properties ("
-            "id TEXT PRIMARY KEY, entity_id TEXT, name TEXT, is_key BOOLEAN)"
-        )
-        connection.exec_driver_sql(
-            "INSERT INTO ontology_properties VALUES "
-            "('p-2', 'e-1', '备用键', 1), ('p-1', 'e-1', '主键', 1)"
-        )
-        connection.exec_driver_sql(
-            "CREATE TABLE relation_instances ("
-            "id TEXT PRIMARY KEY, relation_id TEXT, "
-            "source_instance_id TEXT, target_instance_id TEXT)"
-        )
-        connection.exec_driver_sql(
-            "INSERT INTO relation_instances VALUES "
-            "('edge-1', 'r-1', 's-1', 't-1'), "
-            "('edge-2', 'r-1', 's-1', 't-1')"
-        )
-    with patch.object(database, "engine", legacy):
-        database._migrate_ontology_runtime_metadata()
-        database._migrate_ontology_runtime_metadata()
-
-    with legacy.connect() as connection:
-        titles = connection.exec_driver_sql(
-            "SELECT id FROM ontology_properties WHERE is_title = 1 ORDER BY id"
-        ).scalars().all()
-        edge_count = connection.exec_driver_sql(
-            "SELECT COUNT(*) FROM relation_instances"
-        ).scalar_one()
-    assert titles == ["p-1"]
-    assert edge_count == 1
-    assert "uq_relation_instances_edge" in {
-        item["name"] for item in inspect(legacy).get_indexes("relation_instances")
-    }
-    with pytest.raises(IntegrityError):
-        with legacy.begin() as connection:
-            connection.exec_driver_sql(
-                "INSERT INTO relation_instances "
-                "(id, relation_id, source_instance_id, target_instance_id) "
-                "VALUES ('edge-3', 'r-1', 's-1', 't-1')"
-            )
-    legacy.dispose()
+    property_ddl = baseline_table_ddl("ontology_properties")
+    relation_instance_ddl = baseline_table_ddl("relation_instances")
+    assert "is_title BOOLEAN NOT NULL" in property_ddl
+    assert (
+        "CONSTRAINT uq_relation_instances_edge UNIQUE "
+        "(relation_id, source_instance_id, target_instance_id)"
+    ) in relation_instance_ddl
 
 
-def test_agent_and_scenario_reads_hide_retired_mapping_and_release_facts(tmp_path) -> None:
+def test_agent_and_scenario_reads_hide_retired_mappings_not_release_audit_facts(tmp_path) -> None:
     world = _world(tmp_path, mode="source_fk")
     try:
         provenance = {
@@ -1033,10 +1024,13 @@ def test_agent_and_scenario_reads_hide_retired_mapping_and_release_facts(tmp_pat
             ),
         ):
             assert context._ontology_object(retired_mapping_object.id)["error"]
-            assert context._ontology_object(retired_release_object.id)["error"]
+            assert context._ontology_object(retired_release_object.id)["id"] == (
+                retired_release_object.id
+            )
             agent_detail = context._ontology_object(current_source.id)
         assert {item["id"] for item in agent_detail["relations"]} == {
             current_link.id,
+            retired_release_link.id,
             manual_link.id,
         }
 
@@ -1057,17 +1051,17 @@ def test_agent_and_scenario_reads_hide_retired_mapping_and_release_facts(tmp_pat
                 scenarios.get_object(
                     world.scenario.id, retired_mapping_object.id, world.db
                 )
-            with pytest.raises(HTTPException) as retired_release_error:
-                scenarios.get_object(
-                    world.scenario.id, retired_release_object.id, world.db
-                )
+            retired_release_detail = scenarios.get_object(
+                world.scenario.id, retired_release_object.id, world.db
+            )
             scenario_detail = scenarios.get_object(
                 world.scenario.id, current_source.id, world.db
             )
         assert retired_mapping_error.value.status_code == 404
-        assert retired_release_error.value.status_code == 404
+        assert retired_release_detail.id == retired_release_object.id
         assert {item.id for item in scenario_detail.relations} == {
             current_link.id,
+            retired_release_link.id,
             manual_link.id,
         }
     finally:

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 from typing import Any
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ from sqlalchemy.orm import Session
 from ..models import (
     AssistantAttachment,
     BusinessScenario,
+    Conversation,
     EventEnvelope,
     OntologyEvent,
     OntologyWorkflow,
@@ -251,18 +253,48 @@ def _is_active(workflow: OntologyWorkflow) -> bool:
     return bool(workflow.enabled) and (workflow.status or "draft") == "active"
 
 
-def _scoped_dedupe_key(key: str | None, environment: str) -> str | None:
-    """Keep durable event/workflow dedupe isolated per deployment environment."""
+_LEGACY_RUNTIME_ENVIRONMENTS = ("dev", "staging", "prod")
+
+
+def _scoped_dedupe_key(key: str | None, environment: str | None = None) -> str | None:
+    """Return the environment-neutral business dedupe key.
+
+    ``environment`` is retained only for source compatibility.  Deployment
+    labels choose workers/connectors, not business event identity: prefixing a
+    key would allow the same external delivery to create duplicate workflow
+    runs when two deployments accidentally share a metadata database.
+    """
+    del environment
     if not key:
         return None
-    scoped = f"{environment}:{key}"
-    if len(scoped) <= 180:
-        return scoped
+    normalized = str(key)
+    if len(normalized) <= 180:
+        return normalized
     # Input schemas cap external keys at 180; this fallback preserves a stable
-    # scope for internal/legacy callers without relying on a lossy truncation.
-    import hashlib
+    # identity for internal callers without relying on a lossy truncation.
+    return f"sha256:{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"
 
-    return f"{environment}:sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+
+def _legacy_scoped_dedupe_keys(key: str | None) -> tuple[str, ...]:
+    """Find keys written before deployment labels stopped scoping identity."""
+    if not key:
+        return ()
+    raw = str(key)
+    values: list[str] = []
+    for environment in _LEGACY_RUNTIME_ENVIRONMENTS:
+        scoped = f"{environment}:{raw}"
+        if len(scoped) > 180:
+            scoped = f"{environment}:sha256:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+        values.append(scoped)
+    return tuple(values)
+
+
+def _dedupe_key_candidates(key: str | None) -> tuple[str, ...]:
+    """Return the canonical key plus all legacy deployment-prefixed aliases."""
+    canonical = _scoped_dedupe_key(key)
+    if canonical is None:
+        return ()
+    return tuple(dict.fromkeys((canonical, *_legacy_scoped_dedupe_keys(key))))
 
 
 def _definition_for_workflow(
@@ -277,7 +309,10 @@ def _definition_for_workflow(
     )
     if not scenario:
         raise PolicyViolation("工作流所属场景不存在")
-    resolved = definition or runtime_definition_service.resolve_active(
+    # Public effect boundaries resolve and pass a frozen definition explicitly.
+    # Keep direct service callers as an authoring compatibility path so the
+    # service itself does not infer product behavior from RUNTIME_ENVIRONMENT.
+    resolved = definition or runtime_definition_service.resolve_authoring(
         db,
         scenario,
         environment=runtime_connector_service.runtime_environment(),
@@ -403,16 +438,14 @@ def _automation_creator_for_workflow(
         if eligible:
             return eligible
 
+    # ``environment`` is intentionally no longer a business-history filter.
+    # A creator recorded by a prior deployment remains the same tenant member.
+    del environment
     candidates = db.execute(
         select(WorkflowRun.created_by_user_id)
         .where(
             WorkflowRun.workflow_id == workflow.id,
             WorkflowRun.created_by_user_id.is_not(None),
-            *(
-                [WorkflowRun.environment == environment]
-                if environment
-                else []
-            ),
         )
         .order_by(WorkflowRun.created_at.desc())
     ).scalars().all()
@@ -494,6 +527,9 @@ def _has_unresolved_automation_principal_block(
     future automatic runs because callers only use this guard when no creator
     was resolved.
     """
+    # The block represents one workflow's business authorization state, not a
+    # deployment-local condition.  Keep the argument for old callers only.
+    del environment
     return bool(
         db.execute(
             select(WorkflowRun.id)
@@ -501,11 +537,6 @@ def _has_unresolved_automation_principal_block(
                 WorkflowRun.workflow_id == workflow.id,
                 WorkflowRun.status == "failed",
                 WorkflowRun.error.like(f"{AUTOMATION_PRINCIPAL_BLOCK_MARKER}%"),
-                *(
-                    [WorkflowRun.environment == environment]
-                    if environment
-                    else []
-                ),
             )
             .limit(1)
         ).scalar_one_or_none()
@@ -524,6 +555,7 @@ def enqueue_workflow_run(
     created_by_user_id: str | None = None,
     available_at: datetime | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
+    agent_conversation_id: str | None = None,
 ) -> tuple[WorkflowRun, bool]:
     """把运行请求持久化到队列。返回 (run, 是否新建)。"""
     definition, workflow = _definition_for_workflow(
@@ -537,20 +569,34 @@ def enqueue_workflow_run(
         if not decision.allowed:
             raise PolicyViolation("没有提交该工作流的权限")
     policy = runtime_policy(workflow.trigger_config or {})
-    scoped_dedupe_key = _scoped_dedupe_key(dedupe_key, definition.environment)
+    creator_id = _creator_for_enqueue(db, created_by_user_id)
+    conversation_id = str(agent_conversation_id or "").strip() or None
+    if conversation_id:
+        if trigger_source != "manual":
+            raise PolicyViolation("Agent 对话关联只能用于手动工作流提交")
+        conversation = db.get(Conversation, conversation_id)
+        if (
+            conversation is None
+            or not creator_id
+            or conversation.created_by_user_id != creator_id
+            or not conversation.agent
+            or conversation.agent.scenario_id != workflow.scenario_id
+        ):
+            raise PolicyViolation("Agent 对话与工作流提交主体或场景不一致")
+    scoped_dedupe_key = _scoped_dedupe_key(dedupe_key)
+    dedupe_candidates = _dedupe_key_candidates(dedupe_key)
     if scoped_dedupe_key:
         existing = db.execute(
             select(WorkflowRun)
             .where(
                 WorkflowRun.workflow_id == workflow.id,
-                WorkflowRun.dedupe_key == scoped_dedupe_key,
+                WorkflowRun.dedupe_key.in_(dedupe_candidates),
             )
             .order_by(WorkflowRun.created_at.desc())
         ).scalars().first()
         if existing:
             return existing, False
 
-    creator_id = _creator_for_enqueue(db, created_by_user_id)
     now = utc_now()
     run = WorkflowRun(
         scenario_id=workflow.scenario_id,
@@ -563,13 +609,18 @@ def enqueue_workflow_run(
         definition_snapshot_id=definition.snapshot_id,
         release_id=definition.release_id,
         definition_hash=definition.definition_hash,
-        definition_source=definition.source,
+        definition_source=(
+            runtime_definition_service.LIVE_PINNED_RUN_SOURCE
+            if definition.source == "live"
+            else definition.source
+        ),
         status="queued",
         max_attempts=policy["max_attempts"],
         timeout_seconds=policy["timeout_seconds"],
         available_at=available_at or now,
         scheduled_for=scheduled_for,
         created_by_user_id=creator_id,
+        agent_conversation_id=conversation_id,
     )
     db.add(run)
     db.flush()
@@ -595,7 +646,9 @@ def publish_event(
     scenario = getattr(event, "scenario", None) or db.get(BusinessScenario, event.scenario_id)
     if not scenario:
         raise PolicyViolation("事件所属业务场景不存在")
-    definition = runtime_definition or runtime_definition_service.resolve_active(
+    # See _definition_for_workflow: route/MCP boundaries supply a released
+    # definition explicitly; direct authoring callers remain environment-neutral.
+    definition = runtime_definition or runtime_definition_service.resolve_authoring(
         db,
         scenario,
         environment=runtime_connector_service.runtime_environment(),
@@ -618,13 +671,14 @@ def publish_event(
     raw_payload = dict(payload or {})
     if event.payload_schema:
         raw_payload = validate_action_params(event.payload_schema, raw_payload)
-    scoped_dedupe_key = _scoped_dedupe_key(dedupe_key, definition.environment)
+    scoped_dedupe_key = _scoped_dedupe_key(dedupe_key)
+    dedupe_candidates = _dedupe_key_candidates(dedupe_key)
     if scoped_dedupe_key:
         existing = db.execute(
             select(EventEnvelope)
             .where(
                 EventEnvelope.event_id == event.id,
-                EventEnvelope.dedupe_key == scoped_dedupe_key,
+                EventEnvelope.dedupe_key.in_(dedupe_candidates),
             )
             .order_by(EventEnvelope.created_at.desc())
         ).scalars().first()
@@ -769,7 +823,6 @@ def enqueue_due_schedules(db: Session, *, now: datetime | None = None) -> list[W
                 select(WorkflowRun.scheduled_for)
                 .where(
                     WorkflowRun.workflow_id == workflow.id,
-                    WorkflowRun.environment == definition.environment,
                     WorkflowRun.scheduled_for.is_not(None),
                 )
                 .order_by(WorkflowRun.scheduled_for.desc())
@@ -785,7 +838,6 @@ def enqueue_due_schedules(db: Session, *, now: datetime | None = None) -> list[W
                 select(WorkflowRun.id)
                 .where(
                     WorkflowRun.workflow_id == workflow.id,
-                    WorkflowRun.environment == definition.environment,
                     WorkflowRun.status.in_(ACTIVE_RUN_STATUSES),
                 )
                 .limit(1)
@@ -1095,6 +1147,23 @@ def expire_stale_operations(db: Session, *, now: datetime | None = None) -> None
         run = approval.workflow_run
         _expire_approval(db, approval, run, now)
 
+    # A live-pinned approval cannot safely resume after its authoring
+    # definition has changed. Close it during normal worker maintenance rather
+    # than leaving a pending task that neither the worker nor the approver can
+    # complete.
+    live_approvals = db.execute(
+        select(WorkflowRun).where(
+            WorkflowRun.status == "awaiting_approval",
+            WorkflowRun.definition_source
+            == runtime_definition_service.LIVE_PINNED_RUN_SOURCE,
+        )
+    ).scalars().all()
+    for run in live_approvals:
+        try:
+            runtime_definition_service.resolve_for_run(db, run)
+        except runtime_definition_service.RuntimeDefinitionError:
+            _cancel_invalid_live_pinned_approval(db, run, now=now)
+
     running = db.execute(select(WorkflowRun).where(WorkflowRun.status == "running")).scalars().all()
     for run in running:
         started_at = _aware(run.started_at)
@@ -1151,6 +1220,45 @@ def _expire_approval(
     )
 
 
+def _cancel_invalid_live_pinned_approval(
+    db: Session,
+    run: WorkflowRun,
+    *,
+    now: datetime,
+) -> bool:
+    """Close a drifted live approval instead of leaving an unresumable task."""
+    if (
+        str(run.definition_source or "").strip().lower()
+        != runtime_definition_service.LIVE_PINNED_RUN_SOURCE
+        or run.status != "awaiting_approval"
+    ):
+        return False
+    message = "live 运行定义已变化或不可用，任务已取消，请重新提交"
+    updated = db.execute(
+        update(WorkflowRun)
+        .where(WorkflowRun.id == run.id, WorkflowRun.status == "awaiting_approval")
+        .values(
+            status="cancelled",
+            error=message,
+            completed_at=now,
+            next_retry_at=None,
+        )
+    ).rowcount
+    if updated != 1:
+        return False
+    db.execute(
+        update(WorkflowApprovalRequest)
+        .where(
+            WorkflowApprovalRequest.workflow_run_id == run.id,
+            WorkflowApprovalRequest.status == "pending",
+        )
+        .values(status="cancelled", resolved_at=now, comment=message)
+    )
+    db.commit()
+    db.refresh(run)
+    return True
+
+
 def decide_approval(
     db: Session,
     run: WorkflowRun,
@@ -1163,13 +1271,31 @@ def decide_approval(
     principal = permission_service.require_principal(db)
     if user_id and user_id != principal.user_id:
         raise PolicyViolation("审批用户与当前登录主体不一致")
+    now = now or utc_now()
     try:
         _, workflow = _definition_for_run(db, run)
     except PolicyViolation as exc:
+        if (
+            str(run.definition_source or "").strip().lower()
+            == runtime_definition_service.LIVE_PINNED_RUN_SOURCE
+            and run.status == "awaiting_approval"
+        ):
+            current_workflow = db.get(OntologyWorkflow, run.workflow_id)
+            if (
+                current_workflow is None
+                or current_workflow.scenario_id != run.scenario_id
+                or not permission_service.check_workflow(
+                    db, current_workflow, "approve"
+                ).allowed
+            ):
+                raise PolicyViolation("没有审批该工作流的权限") from exc
+            if _cancel_invalid_live_pinned_approval(db, run, now=now):
+                raise PolicyViolation(
+                    "live 运行定义已变化，待审批任务已取消，请重新提交"
+                ) from exc
         raise PolicyViolation("固定运行定义不可用，不能处理审批") from exc
     if not permission_service.check_workflow(db, workflow, "approve").allowed:
         raise PolicyViolation("没有审批该工作流的权限")
-    now = now or utc_now()
     db.refresh(run)
     approval = db.execute(
         select(WorkflowApprovalRequest)

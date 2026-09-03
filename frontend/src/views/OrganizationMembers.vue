@@ -1,0 +1,448 @@
+<template>
+  <main class="page members-page">
+    <header class="page-header members-header">
+      <div>
+        <div class="members-kicker">WORKSPACE ACCESS</div>
+        <h1>成员与权限</h1>
+        <div class="sub">管理当前工作区内的成员、角色与账户访问状态。</div>
+      </div>
+      <div v-if="canManage" class="members-header-actions">
+        <el-button :loading="loading" @click="load">
+          <el-icon aria-hidden="true"><Refresh /></el-icon>
+          刷新
+        </el-button>
+        <el-button @click="openCreate">
+          <el-icon aria-hidden="true"><Plus /></el-icon>
+          创建账户
+        </el-button>
+        <el-button type="primary" @click="openInvite">
+          <el-icon aria-hidden="true"><UserFilled /></el-icon>
+          邀请成员
+        </el-button>
+      </div>
+    </header>
+
+    <el-alert
+      v-if="!canManage"
+      type="warning"
+      title="当前账户没有管理工作区成员的权限。"
+      show-icon
+      :closable="false"
+    />
+
+    <section v-else class="card members-surface" v-loading="loading" aria-label="工作区成员列表">
+      <el-alert
+        v-if="loadError"
+        class="members-alert"
+        type="error"
+        :title="loadError"
+        show-icon
+        :closable="false"
+        role="alert"
+      >
+        <template #default><el-button text type="primary" @click="load">重新加载</el-button></template>
+      </el-alert>
+
+      <template v-else>
+        <div class="members-summary" aria-live="polite">
+          <span>共 {{ members.length }} 名成员</span>
+          <span v-if="activeCount">{{ activeCount }} 名已启用</span>
+          <span v-if="pendingVerificationCount">{{ pendingVerificationCount }} 名待完成邮箱验证</span>
+          <span v-if="invitedCount">{{ invitedCount }} 个待接受邀请</span>
+        </div>
+
+        <el-table :data="members" row-key="id" empty-text="当前工作区还没有成员" class="members-table">
+          <el-table-column label="成员" min-width="260">
+            <template #default="{ row }">
+              <div class="member-identity">
+                <span class="member-avatar" aria-hidden="true">{{ initials(row) }}</span>
+                <div class="member-copy">
+                  <strong :title="row.display_name || row.email">{{ row.display_name || '未命名成员' }}</strong>
+                  <span :title="row.email">{{ row.email }}</span>
+                </div>
+              </div>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="角色" min-width="154">
+            <template #default="{ row }">
+              <el-select
+                :model-value="row.role_key"
+                :disabled="!canManageMember(row) || changingMemberId === row.id"
+                aria-label="调整成员角色"
+                @change="updateRole(row, String($event))"
+              >
+                <el-option
+                  v-for="role in roleOptionsFor(row)"
+                  :key="role.key"
+                  :label="role.name"
+                  :value="role.key"
+                >
+                  <div class="role-option">
+                    <span>{{ role.name }}</span>
+                    <small>{{ role.description }}</small>
+                  </div>
+                </el-option>
+              </el-select>
+              <span v-if="isCurrentMember(row)" class="current-member-note">当前账户</span>
+              <span v-else-if="!canManageMember(row)" class="current-member-note">仅所有者可管理</span>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="状态" min-width="152">
+            <template #default="{ row }">
+              <div class="status-stack">
+                <el-tag :type="memberStatusType(row)" effect="light">{{ memberStatusLabel(row) }}</el-tag>
+                <span class="status-detail">{{ row.email_verified ? '邮箱已验证' : '邮箱未验证' }}</span>
+              </div>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="加入时间" min-width="146">
+            <template #default="{ row }"><span class="date-cell">{{ formatDate(row.created_at) }}</span></template>
+          </el-table-column>
+
+          <el-table-column label="操作" width="88" fixed="right" align="right">
+            <template #default="{ row }">
+              <el-dropdown
+                trigger="click"
+                :disabled="!canManageMember(row) || actionMemberId === row.id"
+                @command="runMemberCommand(row, String($event))"
+              >
+                <el-button
+                  text
+                  circle
+                  :loading="actionMemberId === row.id"
+                  :disabled="!canManageMember(row)"
+                  :aria-label="`打开 ${row.display_name || row.email} 的成员操作`"
+                  :title="memberActionTitle(row)"
+                ><el-icon aria-hidden="true"><MoreFilled /></el-icon></el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item v-if="row.status === 'active' && row.email_verified" command="reset-password"><el-icon aria-hidden="true"><Key /></el-icon>发送重置密码邮件</el-dropdown-item>
+                    <el-dropdown-item v-else command="reinvite"><el-icon aria-hidden="true"><RefreshRight /></el-icon>重新发送邀请</el-dropdown-item>
+                    <el-dropdown-item v-if="row.status === 'active'" divided command="disable"><el-icon aria-hidden="true"><CircleCloseFilled /></el-icon>禁用账户</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+    </section>
+
+    <el-dialog v-model="inviteDialogVisible" title="邀请成员" width="min(520px, calc(100vw - 28px))" destroy-on-close @closed="inviteError = ''">
+      <el-form label-position="top" @submit.prevent="submitInvite">
+        <el-form-item label="邮箱" required><el-input v-model.trim="inviteForm.email" type="email" autocomplete="email" placeholder="name@company.com" /></el-form-item>
+        <el-form-item label="显示名称"><el-input v-model.trim="inviteForm.display_name" autocomplete="name" placeholder="可选，默认使用邮箱前缀" /></el-form-item>
+        <el-form-item label="角色" required><el-select v-model="inviteForm.role_key" style="width: 100%"><el-option v-for="role in assignableRoleOptions" :key="role.key" :label="role.name" :value="role.key"><div class="role-option"><span>{{ role.name }}</span><small>{{ role.description }}</small></div></el-option></el-select></el-form-item>
+        <el-alert v-if="inviteError" class="dialog-error" type="error" :title="inviteError" show-icon :closable="false" role="alert" />
+      </el-form>
+      <template #footer>
+        <el-button @click="inviteDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="inviteSaving" @click="submitInvite">发送邀请</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="createDialogVisible" title="创建账户" width="min(560px, calc(100vw - 28px))" destroy-on-close @closed="createError = ''">
+      <el-form label-position="top" @submit.prevent="submitCreate">
+        <el-form-item label="邮箱" required><el-input v-model.trim="createForm.email" type="email" autocomplete="email" placeholder="name@company.com" /></el-form-item>
+        <el-form-item label="显示名称"><el-input v-model.trim="createForm.display_name" autocomplete="name" placeholder="可选，默认使用邮箱前缀" /></el-form-item>
+        <div class="dialog-form-grid">
+          <el-form-item label="初始密码" required><el-input v-model="createForm.password" :type="showCreatePassword ? 'text' : 'password'" autocomplete="new-password" placeholder="至少 8 位字符"><template #suffix><el-button text circle :aria-label="showCreatePassword ? '隐藏密码' : '显示密码'" @click="showCreatePassword = !showCreatePassword"><el-icon aria-hidden="true"><component :is="showCreatePassword ? 'View' : 'Hide'" /></el-icon></el-button></template></el-input></el-form-item>
+          <el-form-item label="确认密码" required><el-input v-model="createForm.password_confirm" :type="showCreatePasswordConfirm ? 'text' : 'password'" autocomplete="new-password" placeholder="再次输入密码"><template #suffix><el-button text circle :aria-label="showCreatePasswordConfirm ? '隐藏确认密码' : '显示确认密码'" @click="showCreatePasswordConfirm = !showCreatePasswordConfirm"><el-icon aria-hidden="true"><component :is="showCreatePasswordConfirm ? 'View' : 'Hide'" /></el-icon></el-button></template></el-input></el-form-item>
+        </div>
+        <el-form-item label="角色" required><el-select v-model="createForm.role_key" style="width: 100%"><el-option v-for="role in assignableRoleOptions" :key="role.key" :label="role.name" :value="role.key"><div class="role-option"><span>{{ role.name }}</span><small>{{ role.description }}</small></div></el-option></el-select></el-form-item>
+        <el-alert v-if="createError" class="dialog-error" type="error" :title="createError" show-icon :closable="false" role="alert" />
+      </el-form>
+      <template #footer>
+        <el-button @click="createDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="createSaving" @click="submitCreate">创建并发送验证邮件</el-button>
+      </template>
+    </el-dialog>
+  </main>
+</template>
+
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { api } from '@/api'
+import { useAuthStore } from '@/stores/auth'
+import type {
+  OrganizationInvitation,
+  OrganizationMember,
+  OrganizationRole,
+  OrganizationRoleKey,
+  OrganizationUserCreate,
+} from '@/types'
+
+const auth = useAuthStore()
+const canManage = computed(() => auth.user?.can_manage === true)
+const members = ref<OrganizationMember[]>([])
+const roles = ref<OrganizationRole[]>([])
+const loading = ref(false)
+const loadError = ref('')
+const changingMemberId = ref<string | null>(null)
+const actionMemberId = ref<string | null>(null)
+const inviteDialogVisible = ref(false)
+const inviteSaving = ref(false)
+const inviteError = ref('')
+const createDialogVisible = ref(false)
+const createSaving = ref(false)
+const createError = ref('')
+const showCreatePassword = ref(false)
+const showCreatePasswordConfirm = ref(false)
+
+const defaultRoles: OrganizationRole[] = [
+  { key: 'owner', name: '所有者', description: '管理工作区与成员' },
+  { key: 'admin', name: '管理员', description: '管理平台配置与成员' },
+  { key: 'operator', name: '运营成员', description: '创建、编辑和调试业务内容' },
+  { key: 'viewer', name: '查看成员', description: '查看已授权的业务内容' },
+]
+const roleOptions = computed(() => roles.value.length ? roles.value : defaultRoles)
+const currentRoleKey = computed(() => members.value.find((member) => member.user_id === auth.user?.id)?.role_key)
+const assignableRoleOptions = computed(() => {
+  if (currentRoleKey.value === 'owner') return roleOptions.value
+  return roleOptions.value.filter((role) => role.key !== 'owner' && role.key !== 'admin')
+})
+const activeCount = computed(() => members.value.filter((member) => member.status === 'active' && member.email_verified).length)
+const pendingVerificationCount = computed(() => members.value.filter((member) => member.status === 'active' && !member.email_verified).length)
+const invitedCount = computed(() => members.value.filter((member) => member.status === 'invited').length)
+
+function newInviteForm(): OrganizationInvitation {
+  return { email: '', display_name: '', role_key: 'operator' }
+}
+
+function newCreateForm(): OrganizationUserCreate {
+  return { email: '', display_name: '', password: '', password_confirm: '', role_key: 'operator' }
+}
+
+const inviteForm = ref<OrganizationInvitation>(newInviteForm())
+const createForm = ref<OrganizationUserCreate>(newCreateForm())
+
+function detail(error: unknown, fallback: string) {
+  const responseDetail = (error as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
+  if (typeof responseDetail === 'string' && responseDetail) return responseDetail
+  return error instanceof Error && error.message ? error.message : fallback
+}
+
+function initials(member: OrganizationMember) {
+  return (member.display_name || member.email || 'U').slice(0, 1).toUpperCase()
+}
+
+function isCurrentMember(member: OrganizationMember) {
+  return member.user_id === auth.user?.id
+}
+
+function canManageMember(member: OrganizationMember) {
+  if (isCurrentMember(member)) return false
+  if (currentRoleKey.value !== 'owner' && (member.role_key === 'owner' || member.role_key === 'admin')) {
+    return false
+  }
+  return true
+}
+
+function roleOptionsFor(member: OrganizationMember) {
+  if (canManageMember(member)) return assignableRoleOptions.value
+  const currentRole = roleOptions.value.find((role) => role.key === member.role_key)
+  return currentRole ? [currentRole] : roleOptions.value
+}
+
+function memberActionTitle(member: OrganizationMember) {
+  if (isCurrentMember(member)) return '不能操作当前登录账户'
+  if (!canManageMember(member)) return '仅所有者可以管理该成员'
+  return '成员操作'
+}
+
+function memberStatusLabel(member: OrganizationMember) {
+  if (member.status === 'active' && !member.email_verified) return '待完成邮箱验证'
+  return ({ active: '已启用', invited: '待接受邀请', disabled: '已禁用' } as Record<OrganizationMember['status'], string>)[member.status]
+}
+
+function memberStatusType(member: OrganizationMember) {
+  if (member.status === 'active' && !member.email_verified) return 'warning'
+  return ({ active: 'success', invited: 'warning', disabled: 'info' } as const)[member.status]
+}
+
+function formatDate(value: string) {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN', {
+    year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  })
+}
+
+function isRoleKey(value: string): value is OrganizationRoleKey {
+  return value === 'owner' || value === 'admin' || value === 'operator' || value === 'viewer'
+}
+
+function validEmail(value: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+}
+
+async function load() {
+  if (!canManage.value) return
+  loading.value = true
+  loadError.value = ''
+  try {
+    const [nextRoles, nextMembers] = await Promise.all([
+      api.listOrganizationRoles(),
+      api.listOrganizationMembers(),
+    ])
+    roles.value = nextRoles
+    members.value = nextMembers
+  } catch (error) {
+    loadError.value = detail(error, '成员信息加载失败，请稍后重试')
+  } finally {
+    loading.value = false
+  }
+}
+
+function openInvite() {
+  inviteForm.value = newInviteForm()
+  inviteError.value = ''
+  inviteDialogVisible.value = true
+}
+
+function openCreate() {
+  createForm.value = newCreateForm()
+  createError.value = ''
+  showCreatePassword.value = false
+  showCreatePasswordConfirm.value = false
+  createDialogVisible.value = true
+}
+
+async function submitInvite() {
+  inviteError.value = ''
+  if (!validEmail(inviteForm.value.email)) {
+    inviteError.value = '请输入有效的邮箱地址'
+    return
+  }
+  inviteSaving.value = true
+  try {
+    await api.inviteOrganizationMember(inviteForm.value)
+    inviteDialogVisible.value = false
+    ElMessage.success('邀请验证码已发送')
+    await load()
+  } catch (error) {
+    inviteError.value = detail(error, '邀请发送失败，请稍后重试')
+  } finally {
+    inviteSaving.value = false
+  }
+}
+
+async function submitCreate() {
+  createError.value = ''
+  if (!validEmail(createForm.value.email)) {
+    createError.value = '请输入有效的邮箱地址'
+    return
+  }
+  if (createForm.value.password.length < 8) {
+    createError.value = '初始密码至少需要 8 位字符'
+    return
+  }
+  if (createForm.value.password !== createForm.value.password_confirm) {
+    createError.value = '两次输入的密码不一致'
+    return
+  }
+  createSaving.value = true
+  try {
+    await api.createOrganizationUser(createForm.value)
+    createDialogVisible.value = false
+    ElMessage.success('账户已创建，验证邮件已发送')
+    await load()
+  } catch (error) {
+    createError.value = detail(error, '账户创建失败，请稍后重试')
+  } finally {
+    createSaving.value = false
+  }
+}
+
+async function updateRole(member: OrganizationMember, value: string) {
+  if (isCurrentMember(member)) return
+  if (!isRoleKey(value)) {
+    ElMessage.error('角色值无效')
+    return
+  }
+  changingMemberId.value = member.id
+  try {
+    await api.updateOrganizationMemberRole(member.id, value)
+    ElMessage.success('成员角色已更新')
+    await load()
+  } catch (error) {
+    ElMessage.error(detail(error, '角色更新失败'))
+  } finally {
+    changingMemberId.value = null
+  }
+}
+
+async function runMemberCommand(member: OrganizationMember, command: string) {
+  if (isCurrentMember(member)) return
+  actionMemberId.value = member.id
+  try {
+    if (command === 'reset-password') {
+      await api.resetOrganizationMemberPassword(member.id)
+      ElMessage.success('密码重置验证码已发送')
+    } else if (command === 'reinvite') {
+      await api.reinviteOrganizationMember(member.id)
+      ElMessage.success('新的邀请验证码已发送')
+      await load()
+    } else if (command === 'disable') {
+      await ElMessageBox.confirm(
+        `禁用「${member.display_name || member.email}」后，该账户将立即退出工作区。`,
+        '确认禁用账户',
+        { type: 'warning', confirmButtonText: '禁用', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' },
+      )
+      await api.disableOrganizationMember(member.id)
+      ElMessage.success('账户已禁用')
+      await load()
+    }
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') {
+      ElMessage.error(detail(error, command === 'disable' ? '禁用账户失败' : '操作失败，请稍后重试'))
+    }
+  } finally {
+    actionMemberId.value = null
+  }
+}
+
+onMounted(load)
+</script>
+
+<style scoped>
+.members-page { min-height: 100%; }
+.members-header { align-items: flex-end; }
+.members-kicker { margin-bottom: 5px; color: var(--primary); font-size: 10px; font-weight: 750; letter-spacing: .14em; }
+.members-header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.members-surface { min-height: 260px; overflow: hidden; padding: 0; }
+.members-alert { margin: 16px 16px 0; }
+.members-summary { display: flex; flex-wrap: wrap; gap: 7px 14px; padding: 15px 18px; border-bottom: 1px solid var(--border); color: var(--text-2); font-size: 12px; }
+.members-summary span + span::before { margin-right: 14px; color: var(--border-strong); content: '•'; }
+.members-table { width: 100%; }
+.member-identity { display: flex; min-width: 0; align-items: center; gap: 10px; }
+.member-avatar { display: inline-flex; width: 32px; height: 32px; flex: 0 0 32px; align-items: center; justify-content: center; border: 1px solid var(--border-strong); border-radius: 9px; background: var(--primary-soft); color: var(--primary-600); font-size: 12px; font-weight: 750; }
+.member-copy { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.member-copy strong, .member-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member-copy strong { color: var(--text); font-size: 13px; font-weight: 700; }
+.member-copy span { color: var(--text-3); font-size: 12px; }
+.status-stack { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.status-detail, .current-member-note { color: var(--text-3); font-size: 11px; line-height: 1.25; }
+.current-member-note { display: block; margin-top: 4px; }
+.date-cell { color: var(--text-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.role-option { display: flex; min-width: 0; flex-direction: column; gap: 2px; padding: 3px 0; }
+.role-option small { overflow: hidden; color: var(--text-3); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.dialog-error { margin-top: 4px; }
+.dialog-form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 12px; }
+
+@media (max-width: 768px) {
+  .members-header { align-items: flex-start; }
+  .members-header-actions { width: 100%; justify-content: flex-start; }
+  .members-header-actions .el-button { flex: 1 1 auto; }
+  .members-surface { margin-inline: -2px; border-radius: 12px !important; }
+  .members-summary { padding-inline: 14px; }
+  .dialog-form-grid { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .members-page { animation: none; }
+}
+</style>

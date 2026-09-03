@@ -33,6 +33,7 @@ const router = createRouter({
     { path: '/agents', name: 'agents', component: () => import('@/views/Agents.vue'), meta: { title: 'Agent' } },
     { path: '/agents/:id/chat', name: 'agent-chat', component: () => import('@/views/AgentChat.vue'), meta: { title: 'AI 对话' } },
     { path: '/tasks', name: 'tasks', component: () => import('@/views/Tasks.vue'), meta: { title: '任务中心' } },
+    { path: '/members', name: 'members', component: () => import('@/views/OrganizationMembers.vue'), meta: { title: '成员与权限' } },
     { path: '/llm', name: 'llm', component: () => import('@/views/LLMConfigs.vue'), meta: { title: '大模型配置' } },
     { path: '/mcp', name: 'mcp', component: () => import('@/views/MCP.vue'), meta: { title: '外部工具' } },
     { path: '/skills', name: 'skills', component: () => import('@/views/Skills.vue'), meta: { title: '本地技能' } },

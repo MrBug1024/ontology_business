@@ -6,11 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app import database as database_module
 from app.database import Base
 from app.models import (
     Agent,
@@ -208,6 +207,12 @@ class AgentCapabilityScopeTests(unittest.TestCase):
         self.db.commit()
         self.db.info["tenant_id"] = self.tenant.id
         self.db.info["user_id"] = self.owner.id
+        self.runtime_settings_patch = patch(
+            "app.services.runtime_connector_service.get_settings",
+            return_value=SimpleNamespace(runtime_environment="dev"),
+        )
+        self.runtime_settings_patch.start()
+        self.addCleanup(self.runtime_settings_patch.stop)
 
     def tearDown(self) -> None:
         self.db.close()
@@ -323,7 +328,7 @@ class AgentCapabilityScopeTests(unittest.TestCase):
             {"function_id": self.function_b.id, "params": {"amount": 1}},
         ))
 
-    def test_all_mode_requires_a_resolvable_runtime_definition(self) -> None:
+    def test_all_mode_uses_authoring_definition_when_unreleased(self) -> None:
         all_scope = agent_capability_service.explicit_empty_scope()
         all_scope["functions"] = {"mode": "all", "selected_ids": []}
         with patch.object(
@@ -331,17 +336,19 @@ class AgentCapabilityScopeTests(unittest.TestCase):
             "resolve_active",
             side_effect=runtime_definition_service.RuntimeDefinitionError("staging 尚未发布"),
         ):
-            with self.assertRaises(HTTPException) as error:
-                agents_router.create_agent(
-                    AgentIn(
-                        name="全部能力 Agent",
-                        scenario_id=self.scenario.id,
-                        capability_scope=AgentCapabilityScope.model_validate(all_scope),
-                    ),
-                    self.db,
-                )
-        self.assertEqual(error.exception.status_code, 409)
-        self.assertIn("尚未发布", str(error.exception.detail))
+            created = agents_router.create_agent(
+                AgentIn(
+                    name="全部能力 Agent",
+                    scenario_id=self.scenario.id,
+                    capability_scope=AgentCapabilityScope.model_validate(all_scope),
+                ),
+                self.db,
+            )
+        self.assertEqual(created.name, "全部能力 Agent")
+        self.assertEqual(
+            set(created.capability_scope.functions.selected_ids),
+            {self.function_a.id, self.function_b.id},
+        )
 
     def test_cross_scenario_and_hidden_ids_are_rejected_without_leaking_identity(self) -> None:
         with self.assertRaises(HTTPException) as cross_error:
@@ -396,7 +403,7 @@ class AgentCapabilityScopeTests(unittest.TestCase):
             for entry in updated.capability_scope.model_dump().values()
         ))
 
-    def test_staging_catalog_and_runtime_use_the_frozen_release(self) -> None:
+    def test_staging_browser_context_uses_authoring_while_execution_is_frozen(self) -> None:
         branch = OntologyBranch(
             id="branch-agent-scope",
             tenant_id=self.tenant.id,
@@ -461,48 +468,36 @@ class AgentCapabilityScopeTests(unittest.TestCase):
             return_value=settings,
         ):
             context = self._context(agent)
-            self.assertEqual([item.name for item in context.functions], [frozen_name])
+            self.assertEqual(
+                [item.name for item in context.functions], [self.function_a.name]
+            )
+            self.assertEqual(context.runtime_definition.source, "live")
+            execution_context = agent_engine.AgentContext(
+                self.db,
+                agent,
+                LLMConfig(name="发布执行模型"),
+                definition_mode="execution",
+            )
+            self.assertEqual(
+                [item.name for item in execution_context.functions], [frozen_name]
+            )
+            self.assertEqual(execution_context.runtime_definition.source, "release")
             catalog = agents_router.get_agent_capability_catalog(self.scenario.id, self.db)
             catalog_ids = {item["id"] for item in catalog["categories"]["functions"]}
             self.assertIn(self.function_a.id, catalog_ids)
-            self.assertNotIn(live_only.id, catalog_ids)
-            with self.assertRaises(HTTPException) as live_only_error:
-                agents_router.create_agent(
-                    AgentIn(
-                        name="不可越过发布边界",
-                        scenario_id=self.scenario.id,
-                        capability_scope=_scope("functions", live_only.id),
-                    ),
-                    self.db,
-                )
-            self.assertEqual(live_only_error.exception.status_code, 400)
-
-
-class AgentCapabilityMigrationTests(unittest.TestCase):
-    def test_migration_keeps_legacy_rows_null_and_is_idempotent(self) -> None:
-        engine = create_engine("sqlite:///:memory:")
-        try:
-            with engine.begin() as connection:
-                connection.exec_driver_sql(
-                    "CREATE TABLE agents (id VARCHAR(32) PRIMARY KEY, name VARCHAR(200))"
-                )
-                connection.exec_driver_sql(
-                    "INSERT INTO agents (id, name) VALUES ('legacy-agent', 'legacy')"
-                )
-            with patch.object(database_module, "engine", engine):
-                database_module._migrate_agent_capability_scope()
-                database_module._migrate_agent_capability_scope()
-            self.assertIn(
-                "capability_scope",
-                {column["name"] for column in inspect(engine).get_columns("agents")},
+            self.assertIn(live_only.id, catalog_ids)
+            created = agents_router.create_agent(
+                AgentIn(
+                    name="待发布能力 Agent",
+                    scenario_id=self.scenario.id,
+                    capability_scope=_scope("functions", live_only.id),
+                ),
+                self.db,
             )
-            with engine.connect() as connection:
-                value = connection.exec_driver_sql(
-                    "SELECT capability_scope FROM agents WHERE id = 'legacy-agent'"
-                ).scalar_one()
-            self.assertIsNone(value)
-        finally:
-            engine.dispose()
+            self.assertEqual(
+                created.capability_scope.functions.selected_ids,
+                [live_only.id],
+            )
 
 
 if __name__ == "__main__":

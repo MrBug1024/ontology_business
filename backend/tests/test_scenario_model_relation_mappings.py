@@ -53,8 +53,17 @@ class ScenarioModelRelationMappingTests(unittest.TestCase):
             tenant_id=tenant.id,
             scenario_id=self.scenario.id,
             name="项目业务库",
-            type="sqlite",
-            config={"path": "not-opened-relation-compiler.db"},
+            # The application supports PostgreSQL and versioned datasets as
+            # relation-mapping sources.  Table inspection is mocked below, so
+            # this remains a no-network unit-test connector while exercising
+            # the same production dialect/preflight contract.
+            type="postgres",
+            config={
+                "host": "relation-compiler-postgres.invalid",
+                "port": 5432,
+                "database": "relation_compiler",
+                "user": "test_only",
+            },
         )
         self.db.add_all([tenant, user, self.scenario, self.source])
         self.db.commit()

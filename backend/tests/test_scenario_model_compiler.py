@@ -1747,6 +1747,14 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 "_source_chunks",
                 side_effect=two_chunks,
             ),
+            # This regression asserts the serial malformed-JSON retry budget.
+            # Parallel extraction has dedicated deterministic-merge coverage
+            # below and intentionally uses isolated database sessions.
+            patch.object(
+                scenario_model_compiler,
+                "_chunk_parallel_worker_count",
+                return_value=1,
+            ),
             patch.object(
                 scenario_model_compiler.llm_service,
                 "chat",

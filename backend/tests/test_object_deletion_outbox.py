@@ -171,6 +171,49 @@ class ObjectDeletionOutboxTests(unittest.TestCase):
             version_id="",
         )
 
+    def test_shared_legacy_object_version_is_retained_for_other_bucket_file(self) -> None:
+        """A source cascade must not remove bytes still referenced elsewhere."""
+        legacy_key = "ontology-business/migrations/file-buckets/shared-legacy.md"
+        legacy_url = object_storage_service.stable_object_url("ontology", legacy_key)
+        deleted_record = self._bucket_file("a" * 32)
+        deleted_record.filename = "shared-legacy.md"
+        deleted_record.object_key = legacy_key
+        deleted_record.object_url = legacy_url
+        deleted_record.stored_path = legacy_url
+        deleted_record.object_version_id = "legacy-version"
+        remaining_reference = BucketFile(
+            id="b" * 32,
+            data_source_id="source-b",
+            filename="shared-legacy.md",
+            stored_path=legacy_url,
+            storage_provider="minio",
+            bucket_name="ontology",
+            object_key=legacy_key,
+            object_version_id="legacy-version",
+            object_url=legacy_url,
+        )
+        self.db.add(remaining_reference)
+        job_id = object_deletion_service.enqueue_bucket_file_deletion(
+            self.db, deleted_record, self.source
+        )
+        self.db.commit()
+
+        with patch.object(object_storage_service, "delete_object") as delete_object:
+            self.assertEqual(
+                object_deletion_service.process_object_deletion_jobs(
+                    self.db, job_ids=[job_id]
+                ),
+                1,
+            )
+
+        delete_object.assert_not_called()
+        self.assertEqual(self.db.get(ObjectDeletionJob, job_id).status, "completed")
+        guard_id = object_deletion_service._upload_intent_id(
+            "minio", "ontology", legacy_key, legacy_url
+        )
+        self.assertEqual(self.db.get(ObjectDeletionJob, guard_id).status, "retained")
+        self.assertIsNotNone(self.db.get(BucketFile, remaining_reference.id))
+
     def test_crash_after_external_delete_replays_the_same_version(self) -> None:
         bucket_file = self._bucket_file()
         job_id = object_deletion_service.enqueue_bucket_file_deletion(

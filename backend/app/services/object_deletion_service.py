@@ -729,18 +729,24 @@ def _delete_job_object(job: ObjectDeletionJob) -> None:
     raise ValueError("对象删除任务存储提供方无效")
 
 
-def _upload_object_is_referenced(db: Session, job: ObjectDeletionJob) -> bool:
+def _upload_object_is_referenced(
+    db: Session,
+    job: ObjectDeletionJob,
+    *,
+    exclude_bucket_file_id: str | None = None,
+) -> bool:
     if job.provider != "minio":
         return False
-    bucket_file_id = db.scalar(
-        select(BucketFile.id)
-        .where(
-            BucketFile.storage_provider == "minio",
-            BucketFile.bucket_name == job.bucket_name,
-            BucketFile.object_key == job.object_key,
-        )
-        .limit(1)
+    bucket_file_statement = select(BucketFile.id).where(
+        BucketFile.storage_provider == "minio",
+        BucketFile.bucket_name == job.bucket_name,
+        BucketFile.object_key == job.object_key,
     )
+    if exclude_bucket_file_id:
+        bucket_file_statement = bucket_file_statement.where(
+            BucketFile.id != exclude_bucket_file_id
+        )
+    bucket_file_id = db.scalar(bucket_file_statement.limit(1))
     if bucket_file_id is not None:
         return True
     attachment_id = db.scalar(
@@ -755,19 +761,31 @@ def _upload_object_is_referenced(db: Session, job: ObjectDeletionJob) -> bool:
     return attachment_id is not None
 
 
-def _upload_version_is_referenced(db: Session, job: ObjectDeletionJob) -> bool:
+def _upload_version_is_referenced(
+    db: Session,
+    job: ObjectDeletionJob,
+    *,
+    exclude_bucket_file_id: str | None = None,
+) -> bool:
     if job.provider != "minio" or not job.object_version_id:
         return False
-    bucket_file_id = db.scalar(
-        select(BucketFile.id)
-        .where(
-            BucketFile.storage_provider == "minio",
-            BucketFile.bucket_name == job.bucket_name,
-            BucketFile.object_key == job.object_key,
+    bucket_file_statement = select(BucketFile.id).where(
+        BucketFile.storage_provider == "minio",
+        BucketFile.bucket_name == job.bucket_name,
+        BucketFile.object_key == job.object_key,
+        # A legacy row without a version id may resolve the current object
+        # version. Keep an exact version while such a row exists rather
+        # than deleting bytes that the legacy row can still reference.
+        or_(
             BucketFile.object_version_id == job.object_version_id,
-        )
-        .limit(1)
+            BucketFile.object_version_id == "",
+        ),
     )
+    if exclude_bucket_file_id:
+        bucket_file_statement = bucket_file_statement.where(
+            BucketFile.id != exclude_bucket_file_id
+        )
+    bucket_file_id = db.scalar(bucket_file_statement.limit(1))
     if bucket_file_id is not None:
         return True
     attachment_id = db.scalar(
@@ -776,7 +794,10 @@ def _upload_version_is_referenced(db: Session, job: ObjectDeletionJob) -> bool:
             AssistantAttachment.storage_provider == "minio",
             AssistantAttachment.bucket_name == job.bucket_name,
             AssistantAttachment.object_key == job.object_key,
-            AssistantAttachment.object_version_id == job.object_version_id,
+            or_(
+                AssistantAttachment.object_version_id == job.object_version_id,
+                AssistantAttachment.object_version_id == "",
+            ),
         )
         .limit(1)
     )
@@ -1065,6 +1086,39 @@ def process_object_deletion_jobs(
             continue
 
         guard = _lock_upload_guard_for_delete(db, job)
+        excluded_bucket_file_id = (
+            job.origin_id if job.origin_type == "bucket_file" else None
+        )
+        referenced = (
+            _upload_version_is_referenced(
+                db,
+                job,
+                exclude_bucket_file_id=excluded_bucket_file_id,
+            )
+            if job.object_version_id
+            else _upload_object_is_referenced(
+                db,
+                job,
+                exclude_bucket_file_id=excluded_bucket_file_id,
+            )
+        )
+        if referenced:
+            # Deleting a data source may remove one BucketFile while another
+            # legacy record still owns the same exact object/version.  The
+            # outbox is complete for this origin, but the object itself must
+            # remain retained until its final reference is deleted.
+            job.status = "completed"
+            job.last_error = ""
+            job.completed_at = now
+            job.updated_at = now
+            if guard is not None:
+                guard.status = "retained"
+                guard.last_error = ""
+                guard.completed_at = now
+                guard.updated_at = now
+            completed += 1
+            db.commit()
+            continue
         try:
             _delete_job_object(job)
         except Exception:  # noqa: BLE001 - persist a safe retry state only.

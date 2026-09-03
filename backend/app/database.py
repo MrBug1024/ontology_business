@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from dataclasses import dataclass
 
 from fastapi import Request
 from sqlalchemy import DateTime as SQLAlchemyDateTime, create_engine, inspect, text
@@ -19,7 +20,17 @@ def orm_datetime(*, timezone: bool = True):
     return SQLAlchemyDateTime(timezone=timezone)
 
 
-POSTGRESQL_SCHEMA_REVISION = "20260828_06"
+POSTGRESQL_SCHEMA_REVISION = "20260903_11"
+# One PostgreSQL session-level advisory lock is held by the process elected to
+# run durable background work.  The connection closing on a crash releases the
+# lock automatically, so a replacement worker can take over without a stale
+# lease or a shared in-memory leader flag.
+BACKGROUND_WORKER_ADVISORY_LOCK_KEY = 6_418_602_014_221
+
+
+class BackgroundWorkerLeaseLostError(RuntimeError):
+    """The connection that held the advisory worker lease is no longer live."""
+
 
 _settings = get_settings()
 if not _settings.uses_postgresql_database:
@@ -42,6 +53,97 @@ engine = create_engine(
     pool_recycle=1800,
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+@dataclass
+class BackgroundWorkerLease:
+    """Own the database connection backing the background-worker leader lock."""
+
+    connection: object | None = None
+    backend_pid: int | None = None
+
+    @property
+    def acquired(self) -> bool:
+        return self.connection is not None and self.backend_pid is not None
+
+    def assert_held(self) -> None:
+        """Probe the original PostgreSQL session before running durable work.
+
+        A SQLAlchemy connection may reconnect after a database failover.  That
+        replacement session does not own the original advisory lock, so merely
+        executing ``SELECT 1`` would allow the old worker to continue.  The
+        recorded backend PID makes a reconnect an explicit lease-loss event.
+        """
+        connection = self.connection
+        expected_pid = self.backend_pid
+        if connection is None or expected_pid is None:
+            raise BackgroundWorkerLeaseLostError("后台 worker PostgreSQL 租约不可用")
+        try:
+            current_pid = int(connection.scalar(text("SELECT pg_backend_pid()")))
+        except Exception as exc:  # noqa: BLE001 - connection may have failed over.
+            self._discard_lost_connection(connection)
+            raise BackgroundWorkerLeaseLostError(
+                "后台 worker PostgreSQL 租约连接已失效"
+            ) from exc
+        if current_pid != expected_pid:
+            self._discard_lost_connection(connection)
+            raise BackgroundWorkerLeaseLostError(
+                "后台 worker PostgreSQL 租约已在数据库重连后丢失"
+            )
+
+    def _discard_lost_connection(self, connection: object) -> None:
+        self.connection = None
+        self.backend_pid = None
+        try:
+            connection.close()
+        except Exception:  # noqa: BLE001 - the connection is already unhealthy.
+            pass
+
+    def release(self) -> None:
+        connection = self.connection
+        self.connection = None
+        self.backend_pid = None
+        if connection is None:
+            return
+        try:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(:lock_key)"),
+                {"lock_key": BACKGROUND_WORKER_ADVISORY_LOCK_KEY},
+            )
+        except Exception:
+            # A failed-over session has already released its advisory lock.
+            pass
+        finally:
+            connection.close()
+
+
+def acquire_background_worker_lease() -> BackgroundWorkerLease:
+    """Acquire the cross-process worker lease without waiting for another API.
+
+    A failed attempt closes its connection immediately.  Keeping the successful
+    connection open is intentional: PostgreSQL advisory locks are scoped to the
+    database session, not a transaction.
+    """
+    connection = engine.connect()
+    try:
+        acquired = bool(
+            connection.scalar(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": BACKGROUND_WORKER_ADVISORY_LOCK_KEY},
+            )
+        )
+        backend_pid = (
+            int(connection.scalar(text("SELECT pg_backend_pid()")))
+            if acquired
+            else None
+        )
+    except Exception:
+        connection.close()
+        raise
+    if not acquired:
+        connection.close()
+        return BackgroundWorkerLease()
+    return BackgroundWorkerLease(connection=connection, backend_pid=backend_pid)
 
 
 def get_db(request: Request) -> Generator[Session, None, None]:

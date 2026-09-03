@@ -43,6 +43,7 @@ from app.models import (
     WorkflowRun,
 )
 from app.services import (
+    agent_confirmation_service,
     agent_engine,
     capability_readiness_service,
     datasource_service,
@@ -201,8 +202,17 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="项目主数据",
-            type="sqlite",
-            config={},
+            # Production semantic queries support PostgreSQL (or managed
+            # datasets) only. Individual tests that need an executable local
+            # engine patch it explicitly below.
+            type="postgres",
+            config={
+                "host": "postgres.test",
+                "port": 5432,
+                "database": "agent_closure",
+                "user": "readonly",
+                "password": "test-only",
+            },
             status="ok",
         )
         mapping = DataMapping(
@@ -335,15 +345,110 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         )
         self.db.commit()
 
-    def _context(self) -> agent_engine.AgentContext:
-        return agent_engine.AgentContext(self.db, self.agent, LLMConfig(name="工具模型"))
+    def _context(
+        self,
+        *,
+        definition_mode: str = "authoring",
+    ) -> agent_engine.AgentContext:
+        return agent_engine.AgentContext(
+            self.db,
+            self.agent,
+            LLMConfig(name="工具模型"),
+            definition_mode=definition_mode,
+        )
+
+    def _execution_context(self) -> agent_engine.AgentContext:
+        self._staging_release()
+        source = self.db.get(DataSource, "source-projects")
+        assert source is not None
+        # The focused fixture intentionally keeps the historical direct source
+        # ID.  Execution definition selection is under test here; substitute
+        # only the deployment-specific connector lookup.
+        with patch.object(
+            agent_engine.runtime_connector_service,
+            "resolve_connector",
+            return_value=(source, {"managed": True}),
+        ):
+            return self._context(definition_mode="execution")
+
+    def _execute_with_release_connector(
+        self,
+        context: agent_engine.AgentContext,
+        name: str,
+        args: dict[str, Any],
+    ) -> str:
+        source = self.db.get(DataSource, "source-projects")
+        assert source is not None
+        with patch.object(
+            agent_engine.runtime_connector_service,
+            "resolve_connector",
+            return_value=(source, {"managed": True}),
+        ):
+            return context.execute_tool(name, args)
+
+    def test_legacy_browser_action_uses_live_definition_without_release(self) -> None:
+        """Existing in-platform Agents must not lose usable SQL Actions on upgrade."""
+        context = self._context()
+        self.assertEqual(context.runtime_definition.source, "live")
+        self.assertIsNone(context.runtime_definition.release_id)
+        definition = context._execution_definition()
+        self.assertEqual(definition.source, "live")
+        self.assertIsNone(definition.release_id)
+
+        with patch.object(
+            agent_engine.workflow_service,
+            "execute_action",
+            return_value={"status": "dry_run", "result": {"plan": {}}},
+        ) as execute:
+            response = json.loads(
+                context.execute_tool(
+                    "execute_action",
+                    {"action_id": "action-mark-risk", "params": {"project_id": "P-001"}},
+                )
+            )
+
+        self.assertEqual(response["status"], "dry_run")
+        definition = execute.call_args.kwargs["runtime_definition"]
+        self.assertEqual(definition.source, "live")
+        self.assertIsNone(definition.release_id)
+
+    def test_legacy_live_preview_requires_the_same_authoring_definition(self) -> None:
+        context = self._context()
+        action = self.db.get(OntologyAction, "action-mark-risk")
+        assert action is not None
+        preview = ActionExecutionLog(
+            id="preview-legacy-live",
+            scenario_id=self.scenario.id,
+            target_type="action",
+            target_id=action.id,
+            target_name=action.name,
+            status="dry_run",
+            mode="dry_run",
+            environment=context.runtime_definition.environment,
+            definition_hash=context.runtime_definition.definition_hash,
+            definition_source="live",
+        )
+        self.db.add(preview)
+        self.db.commit()
+
+        _scenario, definition, resource = (
+            agent_confirmation_service._pinned_preview_resource(self.db, preview)
+        )
+        self.assertEqual(definition.source, "live")
+        self.assertEqual(resource.id, action.id)
+
+        action.description = "定义已变更"
+        self.db.commit()
+        with self.assertRaises(agent_confirmation_service.AgentConfirmationError):
+            agent_confirmation_service._pinned_preview_resource(self.db, preview)
 
     def test_large_action_preview_remains_bounded_and_confirmable_without_echoing_params(self) -> None:
-        context = self._context()
+        context = self._execution_context()
         sensitive_value = "医保敏感业务参数" * 1_500
         self.assertGreater(len(sensitive_value), agent_engine._MAX_TOOL_RESULT_CHARS)
 
-        raw = context.execute_tool(
+        raw = self._execute_with_release_connector(
+            context,
             "execute_action",
             {
                 "action_id": "action-mark-risk",
@@ -394,6 +499,9 @@ class AgentCapabilityClosureTests(unittest.TestCase):
 
     def test_every_scenario_resource_changes_agent_tools_or_context(self) -> None:
         context = self._context()
+        self.assertEqual(context.definition_mode, "authoring")
+        self.assertEqual(context.runtime_definition.source, "live")
+        self.assertIsNone(context.runtime_definition.release_id)
         tools_by_name = {
             tool["function"]["name"]: tool["function"]
             for tool in context.build_tools()
@@ -530,8 +638,10 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertIn('"field": "project_id"', action_detail["precondition"])
         self.assertIn('"field": "updated"', action_detail["postcondition"])
         self.assertEqual(action_detail["input_schema"]["required"], ["project_id"])
+        execution_context = self._execution_context()
         preview = json.loads(
-            context.execute_tool(
+            self._execute_with_release_connector(
+                execution_context,
                 "execute_action",
                 {"action_id": "action-mark-risk", "params": {"project_id": "P-001"}},
             )
@@ -564,7 +674,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertTrue(events[0]["executable"])
         self.assertEqual(events[0]["payload_schema"]["required"], ["project_id"])
         event_plan = json.loads(
-            context.execute_tool(
+            self._execute_with_release_connector(
+                execution_context,
                 "prepare_event_publish",
                 {"event_id": "event-risk-found", "payload": {"project_id": "P-001"}},
             )
@@ -578,7 +689,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertEqual(workflows[0]["params_schema"]["type"], "object")
         self.assertEqual(workflows[0]["required"], [])
         workflow_plan = json.loads(
-            context.execute_tool(
+            self._execute_with_release_connector(
+                execution_context,
                 "execute_workflow",
                 {"workflow_id": "workflow-risk-response", "params": {"project_id": "P-001"}},
             )
@@ -617,6 +729,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
 
     def test_resource_tools_resolve_id_api_name_and_display_name(self) -> None:
         context = self._context()
+        execution_context = self._execution_context()
         aliases = {
             "function-score": "calculate_project_risk",
             "action-mark-risk": "mark_high_risk",
@@ -630,6 +743,11 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             context.rules,
             context.events,
             context.workflows,
+            execution_context.functions,
+            execution_context.actions,
+            execution_context.rules,
+            execution_context.events,
+            execution_context.workflows,
         ):
             for resource in resources:
                 if resource.id in aliases:
@@ -646,7 +764,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         )
         self.assertEqual(
             json.loads(
-                context.execute_tool(
+                self._execute_with_release_connector(
+                    execution_context,
                     "execute_action",
                     {"action_id": "mark_high_risk", "params": {"project_id": "P-001"}},
                 )
@@ -663,7 +782,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         )
         self.assertEqual(
             json.loads(
-                context.execute_tool(
+                self._execute_with_release_connector(
+                    execution_context,
                     "prepare_event_publish",
                     {"event_id": "risk_found_event", "payload": {"project_id": "P-001"}},
                 )
@@ -672,7 +792,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         )
         self.assertEqual(
             json.loads(
-                context.execute_tool(
+                self._execute_with_release_connector(
+                    execution_context,
                     "execute_workflow",
                     {"workflow_id": "risk_response_workflow", "params": {}},
                 )
@@ -722,6 +843,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             {"id": "start-mark", "source": "start", "target": "mark", "label": ""},
             {"id": "mark-end", "source": "mark", "target": "end", "label": ""},
         ]
+        self.db.flush()
 
         listed = json.loads(context.execute_tool("list_workflows", {}))[0]
         self.assertEqual(listed["required"], ["project_id"])
@@ -729,8 +851,10 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             listed["params_schema"]["properties"]["project_id"]["type"],
             "string",
         )
+        execution_context = self._execution_context()
         missing = json.loads(
-            context.execute_tool(
+            self._execute_with_release_connector(
+                execution_context,
                 "execute_workflow",
                 {"workflow_id": workflow.name, "params": {}},
             )
@@ -740,7 +864,8 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertTrue(missing["error"]["retryable"])
         self.assertIn("params.project_id", missing["error"]["message"])
         preview = json.loads(
-            context.execute_tool(
+            self._execute_with_release_connector(
+                execution_context,
                 "execute_workflow",
                 {"workflow_id": workflow.name, "params": {"project_id": "P-001"}},
             )
@@ -753,42 +878,55 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="SQL Action 参数绑定",
-            type="sqlite",
-            config={"path": ":memory:"},
+            type="postgres",
+            config={
+                "host": "postgres.test",
+                "port": 5432,
+                "database": "agent_closure",
+                "user": "readonly",
+                "password": "test-only",
+            },
             status="ok",
         )
-        engine = datasource_service.get_engine(source)
+        # Keep this test self-contained while exercising the PostgreSQL source
+        # path: the local SQLite engine is only an execution double.
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
         try:
-            with engine.begin() as connection:
-                connection.execute(text("CREATE TABLE allowed_rows (code TEXT, visible TEXT)"))
-                connection.execute(text("CREATE TABLE hidden_rows (secret TEXT)"))
-                connection.execute(
-                    text("INSERT INTO allowed_rows VALUES ('SAFE', '可见记录')")
-                )
-                connection.execute(
-                    text("INSERT INTO hidden_rows VALUES ('不可越权读取')")
-                )
+            with patch.object(datasource_service, "get_engine", return_value=engine):
+                with engine.begin() as connection:
+                    connection.execute(text("CREATE TABLE allowed_rows (code TEXT, visible TEXT)"))
+                    connection.execute(text("CREATE TABLE hidden_rows (secret TEXT)"))
+                    connection.execute(
+                        text("INSERT INTO allowed_rows VALUES ('SAFE', '可见记录')")
+                    )
+                    connection.execute(
+                        text("INSERT INTO hidden_rows VALUES ('不可越权读取')")
+                    )
 
-            injected = workflow_service._exec_sql(
-                self.db,
-                {
-                    "data_source_id": source.id,
-                    "sql": "SELECT visible FROM allowed_rows WHERE code = '{code}'",
-                },
-                {"code": "X' UNION SELECT secret FROM hidden_rows --"},
-                data_source=source,
-            )
-            self.assertEqual(injected["rows"], [])
-            legitimate = workflow_service._exec_sql(
-                self.db,
-                {
-                    "data_source_id": source.id,
-                    "sql": "SELECT visible FROM allowed_rows WHERE code = {code} OR code = {code}",
-                },
-                {"code": "SAFE"},
-                data_source=source,
-            )
-            self.assertEqual(legitimate["rows"], [["可见记录"]])
+                injected = workflow_service._exec_sql(
+                    self.db,
+                    {
+                        "data_source_id": source.id,
+                        "sql": "SELECT visible FROM allowed_rows WHERE code = '{code}'",
+                    },
+                    {"code": "X' UNION SELECT secret FROM hidden_rows --"},
+                    data_source=source,
+                )
+                self.assertEqual(injected["rows"], [])
+                legitimate = workflow_service._exec_sql(
+                    self.db,
+                    {
+                        "data_source_id": source.id,
+                        "sql": "SELECT visible FROM allowed_rows WHERE code = {code} OR code = {code}",
+                    },
+                    {"code": "SAFE"},
+                    data_source=source,
+                )
+                self.assertEqual(legitimate["rows"], [["可见记录"]])
 
             for template, params in (
                 ("SELECT {missing}", {}),
@@ -930,8 +1068,14 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="未绑定隐私数据",
-            type="sqlite",
-            config={},
+            type="postgres",
+            config={
+                "host": "postgres.test",
+                "port": 5432,
+                "database": "agent_closure",
+                "user": "readonly",
+                "password": "test-only",
+            },
         )
         hidden_mapping = DataMapping(
             id="mapping-hidden",
@@ -1073,7 +1217,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             )
 
             source = self.db.get(DataSource, "source-projects")
-            source.config = {"database": "same-schema-rebound.sqlite"}
+            source.config = {"database": "agent_closure_rebound"}
             self.db.commit()
             rebound_context = self._context()
             self.assertFalse(
@@ -1900,7 +2044,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             )
         )
 
-    def test_semantic_mapping_query_uses_frozen_mapping_and_runtime_connector(self) -> None:
+    def test_execution_semantic_mapping_query_uses_frozen_mapping_and_runtime_connector(self) -> None:
         snapshot, release = self._staging_release()
         staging_source = DataSource(
             id="source-projects-query-staging",
@@ -1930,7 +2074,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                 return_value=(staging_source, {"managed": True}),
             ),
         ):
-            context = self._context()
+            context = self._context(definition_mode="execution")
 
         raw_query_result = {
             "columns": ["__ontology_0"],
@@ -2042,7 +2186,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.db.commit()
         return snapshot, release
 
-    def test_non_dev_agent_uses_one_frozen_definition_for_every_resource(self) -> None:
+    def test_execution_agent_uses_one_frozen_definition_for_every_resource(self) -> None:
         snapshot, release = self._staging_release()
         staging_source = DataSource(
             id="source-projects-staging",
@@ -2088,7 +2232,13 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                 return_value=(staging_source, {}),
             ),
         ):
-            context = self._context()
+            authoring_context = self._context()
+            context = self._context(definition_mode="execution")
+
+        self.assertEqual(authoring_context.runtime_definition.source, "live")
+        self.assertIsNone(authoring_context.runtime_definition.release_id)
+        self.assertEqual(authoring_context.runtime_definition.scenario_name, "草稿施工风险场景")
+        self.assertIn("草稿项目", {item.name for item in authoring_context.entities})
 
         self.assertEqual(context.runtime_definition.snapshot_id, snapshot.id)
         self.assertEqual(context.runtime_definition.release_id, release.id)
@@ -2136,7 +2286,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertIn(original_scenario_name, prompts[0])
         self.assertNotIn("草稿施工风险场景", prompts[0])
 
-    def test_non_dev_agent_keeps_explicit_file_bucket_as_runtime_data_boundary(self) -> None:
+    def test_execution_agent_keeps_explicit_file_bucket_as_runtime_data_boundary(self) -> None:
         self._staging_release()
         bound_bucket = DataSource(
             id="source-live-bucket-staging",
@@ -2162,7 +2312,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
                 return_value=(self.db.get(DataSource, "source-projects"), {}),
             ),
         ):
-            context = self._context()
+            context = self._context(definition_mode="execution")
 
         self.assertIn(bound_bucket.id, {source.id for source in context.data_sources})
         self.assertIn(
@@ -2170,7 +2320,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             {tool["function"]["name"] for tool in context.build_tools()},
         )
 
-    def test_non_dev_agent_rejects_legacy_snapshot_missing_resource_collection(self) -> None:
+    def test_execution_agent_rejects_legacy_snapshot_missing_resource_collection(self) -> None:
         snapshot, _release = self._staging_release()
         broken = dict(snapshot.content)
         broken.pop("functions")
@@ -2181,8 +2331,11 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             agent_engine.runtime_connector_service,
             "runtime_environment",
             return_value="staging",
-        ), self.assertRaises(runtime_definition_service.RuntimeDefinitionError):
-            self._context()
+        ):
+            authoring_context = self._context()
+            self.assertEqual(authoring_context.runtime_definition.source, "live")
+            with self.assertRaises(runtime_definition_service.RuntimeDefinitionError):
+                self._context(definition_mode="execution")
 
     def test_agent_turn_reuses_the_context_that_authorized_history(self) -> None:
         context = self._context()
@@ -2537,7 +2690,7 @@ class AgentCapabilityClosureTests(unittest.TestCase):
 
         final_content = events[-1]["data"]
         self.assertIn("已生成 1 个可确认预演", final_content)
-        self.assertIn("尚未正式执行或生成交付物，需用户确认", final_content)
+        self.assertIn("当前对话回复“确认执行”", final_content)
         self.assertNotIn("未生成可确认预演", final_content)
 
     def test_truth_guard_deduplicates_dry_runs_by_canonical_action(self) -> None:

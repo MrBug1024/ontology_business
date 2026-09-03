@@ -33,6 +33,7 @@ from ..services import (
     scenario_model_draft_service,
     template_catalog_service,
     tenant_service,
+    upload_service,
 )
 from ..config import get_settings
 from ..services.auth_service import get_tenant_db
@@ -174,7 +175,13 @@ def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_d
             )
         except object_storage_service.ObjectStorageError as exc:
             raise HTTPException(503, str(exc)) from exc
-    ds = DataSource(tenant_id=tenant_service.current_tenant_id(db), **values)
+    user_id = permission_service.require_principal(db).user_id
+    ds = DataSource(
+        tenant_id=tenant_service.current_tenant_id(db),
+        created_by_user_id=user_id,
+        owner_user_id=user_id,
+        **values,
+    )
     if ds.type == "file_bucket":
         try:
             datasource_service.ensure_file_bucket_storage(ds)
@@ -284,7 +291,18 @@ def delete_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
         db.rollback()
         raise HTTPException(409, "数据源在删除期间被业务资源引用，请刷新后重试") from exc
     object_deletion_service.drain_jobs_best_effort(db, deletion_job_ids)
-    return Msg(message="已删除")
+    return Msg(
+        message=(
+            f"已删除数据源，{len(bucket_files)} 个托管文件已进入对象清理队列"
+            if bucket_files
+            else "已删除数据源"
+        ),
+        data={
+            "data_source_id": ds_id,
+            "files_deleted": len(bucket_files),
+            "cleanup_jobs": len(deletion_job_ids),
+        },
+    )
 
 
 @router.post("/{ds_id}/test", response_model=Msg)
@@ -423,78 +441,85 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
     created: list[BucketFile] = []
     max_upload_bytes = get_settings().max_upload_bytes
     for uf in files:
-        content = await uf.read(max_upload_bytes + 1)
-        if len(content) > max_upload_bytes:
-            raise HTTPException(413, f"文件超过大小限制（{max_upload_bytes // (1024 * 1024)} MB）")
-        filename = uf.filename or "file"
-        file_id = uuid.uuid4().hex
-        upload_claim = None
-        if datasource_service.is_managed_minio_source(ds):
-            try:
-                upload_claim = object_deletion_service.prepare_bucket_file_upload(
-                    ds, file_id, filename
-                )
-            except Exception as exc:  # noqa: BLE001 - expose no DB/MinIO details.
-                raise HTTPException(503, "无法建立文件上传事务") from exc
         try:
-            heartbeat = (
-                object_deletion_service.heartbeat_upload_intent(upload_claim)
-                if upload_claim is not None
-                else nullcontext()
+            staged = await upload_service.stage_upload(
+                uf,
+                max_bytes=max_upload_bytes,
             )
-            with heartbeat as active_heartbeat:
-                if upload_claim is not None:
-                    object_deletion_service.begin_upload_put(upload_claim)
-                bf = datasource_service.save_bucket_file(
-                    ds,
-                    filename,
-                    content,
-                    stable_file_id=file_id if upload_claim is not None else None,
-                    upload_object_key=(
-                        upload_claim.object_key
-                        if upload_claim is not None
-                        else None
-                    ),
-                )
-                if upload_claim is not None:
-                    object_deletion_service.assert_upload_active(
-                        active_heartbeat, upload_claim, bf
-                    )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        except (RuntimeError, object_storage_service.ObjectStorageError) as exc:
-            raise HTTPException(503, str(exc)) from exc
-        db.add(bf)
-        try:
-            if upload_claim is not None:
-                object_deletion_service.retain_bucket_file_upload(
-                    db, upload_claim, bf, ds
-                )
-            db.flush()
-            # 文件已可靠写入对象存储；解析与 embedding 由可恢复的后台任务处理。
-            rag_service.enqueue_document_index(db, bf, parse_document=True)
-            db.commit()
-        except Exception as exc:
-            db.rollback()
-            if (
-                upload_claim is not None
-                and isinstance(
-                    exc,
-                    object_deletion_service.UploadIntentLeaseLostError,
-                )
-            ):
-                object_deletion_service.schedule_abandoned_upload_best_effort(
-                    upload_claim,
-                    bf,
-                )
-            elif upload_claim is None:
+        except upload_service.UploadTooLargeError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        with upload_service.cleanup_staged_upload(staged):
+            filename = uf.filename or "file"
+            file_id = uuid.uuid4().hex
+            upload_claim = None
+            if datasource_service.is_managed_minio_source(ds):
                 try:
-                    datasource_service.delete_bucket_file(bf, ds)
-                except Exception:  # noqa: BLE001 - preserve the database failure.
-                    pass
-            raise
-        db.refresh(bf)
-        created.append(bf)
+                    upload_claim = object_deletion_service.prepare_bucket_file_upload(
+                        ds, file_id, filename
+                    )
+                except Exception as exc:  # noqa: BLE001 - expose no DB/MinIO details.
+                    raise HTTPException(503, "无法建立文件上传事务") from exc
+            try:
+                heartbeat = (
+                    object_deletion_service.heartbeat_upload_intent(upload_claim)
+                    if upload_claim is not None
+                    else nullcontext()
+                )
+                with heartbeat as active_heartbeat:
+                    if upload_claim is not None:
+                        object_deletion_service.begin_upload_put(upload_claim)
+                    bf = datasource_service.save_bucket_file_from_path(
+                        ds,
+                        filename,
+                        staged.path,
+                        size=staged.size,
+                        content_sha256=staged.sha256,
+                        stable_file_id=file_id if upload_claim is not None else None,
+                        upload_object_key=(
+                            upload_claim.object_key
+                            if upload_claim is not None
+                            else None
+                        ),
+                    )
+                    if upload_claim is not None:
+                        object_deletion_service.assert_upload_active(
+                            active_heartbeat, upload_claim, bf
+                        )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            except (RuntimeError, object_storage_service.ObjectStorageError) as exc:
+                raise HTTPException(503, str(exc)) from exc
+            db.add(bf)
+            try:
+                if upload_claim is not None:
+                    object_deletion_service.retain_bucket_file_upload(
+                        db, upload_claim, bf, ds
+                    )
+                db.flush()
+                # 文件已可靠写入对象存储；解析与 embedding 由可恢复的后台任务处理。
+                rag_service.enqueue_document_index(db, bf, parse_document=True)
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                if (
+                    upload_claim is not None
+                    and isinstance(
+                        exc,
+                        object_deletion_service.UploadIntentLeaseLostError,
+                    )
+                ):
+                    object_deletion_service.schedule_abandoned_upload_best_effort(
+                        upload_claim,
+                        bf,
+                    )
+                elif upload_claim is None:
+                    try:
+                        datasource_service.delete_bucket_file(bf, ds)
+                    except Exception:  # noqa: BLE001 - preserve the database failure.
+                        pass
+                raise
+            db.refresh(bf)
+            created.append(bf)
     return created
 
 

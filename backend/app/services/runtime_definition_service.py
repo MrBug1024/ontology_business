@@ -1,9 +1,11 @@
-"""Resolve the definition that a deployment is actually allowed to execute.
+"""Resolve authoring and execution definitions without conflating them.
 
-``dev`` remains the authoring environment and reads the live ORM rows.  A
-``staging`` or ``prod`` deployment never reads those mutable rows for a new
-execution: it resolves the active ``OntologyRelease`` and builds small,
-read-only resource DTOs from that release's immutable snapshot instead.
+Every deployment may read the current mutable definition for ordinary scene
+authoring, browsing and configuration.  Any deployment uses an immutable
+``OntologyRelease`` only when a request is about to execute a governed
+capability.  This distinction prevents a fresh scene from returning 409 merely
+because it has not been released yet, while preserving release pins for Action,
+Workflow, Agent and MCP execution.
 
 The same resolver is also used for persisted workflow runs.  In that case a
 superseded release is still valid when it is explicitly pinned by the run;
@@ -41,6 +43,17 @@ from . import connector_service, release_service
 
 class RuntimeDefinitionError(ValueError):
     """A deployment cannot safely resolve the requested immutable definition."""
+
+
+class MissingExecutionReleaseError(RuntimeDefinitionError):
+    """The scenario predates release governance and has no execution snapshot."""
+
+
+# New authoring-originated durable tasks carry this explicit marker.  Do not
+# reuse the historic ``live`` value: pre-existing queued rows might lack the
+# complete optimistic pin required to execute safely after this compatibility
+# path is enabled.
+LIVE_PINNED_RUN_SOURCE = "live_pinned_v1"
 
 
 @dataclass(frozen=True)
@@ -382,22 +395,71 @@ def _from_snapshot(
 def _active_release(
     db: Session,
     scenario: BusinessScenario,
-    environment: str,
 ) -> OntologyRelease:
+    """Return the currently executable release for a scenario.
+
+    ``OntologyRelease.environment`` records which connector binding set was
+    checked while a release was created.  It is not a data partition and must
+    not make the definition selected by an execution depend on the deployment
+    process's ``RUNTIME_ENVIRONMENT``.  The deployment environment is carried
+    separately on :class:`RuntimeDefinition` so callers can resolve their
+    local database/Redis/MinIO/AI connector bindings.
+    """
     release = db.execute(
         select(OntologyRelease)
         .where(
             OntologyRelease.scenario_id == scenario.id,
             OntologyRelease.tenant_id == scenario.tenant_id,
-            OntologyRelease.environment == environment,
             OntologyRelease.status == "released",
         )
         .order_by(OntologyRelease.created_at.desc())
         .limit(1)
     ).scalars().first()
     if not release:
-        raise RuntimeDefinitionError(f"{environment} 环境尚未发布该业务场景")
+        raise MissingExecutionReleaseError("当前业务场景尚未发布可执行定义")
     return release
+
+
+def resolve_authoring(
+    db: Session,
+    scenario: BusinessScenario,
+    *,
+    environment: str | None = None,
+) -> RuntimeDefinition:
+    """Resolve the mutable authoring/live surface for any deployment.
+
+    ``environment`` is retained as non-authoritative provenance for callers
+    that render diagnostics.  It never changes which scenario definition is
+    visible and it never substitutes a release snapshot.
+    """
+    return _live_definition(scenario, _normalize_environment(environment), db)
+
+
+def resolve_execution(
+    db: Session,
+    scenario: BusinessScenario,
+    *,
+    environment: str | None = None,
+) -> RuntimeDefinition:
+    """Resolve the immutable definition authorized for an actual execution.
+
+    The returned definition's ``environment`` remains the current deployment
+    environment for physical connector selection.  Release selection itself
+    is intentionally global to the business scenario: changing a process from
+    dev to prod must never turn the same user data into a different ontology
+    or require a second, environment-named release.
+    """
+    normalized_environment = _normalize_environment(environment)
+    release = _active_release(db, scenario)
+    snapshot = db.get(OntologySnapshot, release.snapshot_id)
+    if not snapshot:
+        raise RuntimeDefinitionError("当前发布快照不可用")
+    return _from_snapshot(
+        scenario,
+        normalized_environment,
+        snapshot,
+        release=release,
+    )
 
 
 def resolve_active(
@@ -406,20 +468,15 @@ def resolve_active(
     *,
     environment: str | None = None,
 ) -> RuntimeDefinition:
-    """Resolve the current definition for a request entering this deployment."""
-    normalized_environment = _normalize_environment(environment)
-    if normalized_environment == "dev":
-        return _live_definition(scenario, normalized_environment, db)
-    release = _active_release(db, scenario, normalized_environment)
-    snapshot = db.get(OntologySnapshot, release.snapshot_id)
-    if not snapshot:
-        raise RuntimeDefinitionError(f"{normalized_environment} 环境的发布快照不可用")
-    return _from_snapshot(
-        scenario,
-        normalized_environment,
-        snapshot,
-        release=release,
-    )
+    """Resolve the mutable active authoring definition.
+
+    This name predates the explicit authoring/execution split.  Keep it as a
+    compatibility alias for ordinary platform reads, previews and interactive
+    debugging, all of which must work before the first release.  New effectful
+    callers must use :func:`resolve_execution` so a missing release cannot be
+    accidentally bypassed because a process is labelled ``dev``.
+    """
+    return resolve_authoring(db, scenario, environment=environment)
 
 
 def resolve_pinned(
@@ -431,14 +488,14 @@ def resolve_pinned(
     release_id: str | None,
     definition_hash: str | None,
 ) -> RuntimeDefinition:
-    """Resolve a durable non-dev definition pin for a queued operation.
+    """Resolve a durable immutable definition pin for a queued operation.
 
     A mapping-refresh worker uses this instead of the current active release,
-    so a queued read cannot fall forward after a later deployment promotion.
+    so a queued read cannot fall forward after a later release.  ``environment``
+    only asserts that the worker is using the same infrastructure deployment
+    which queued the operation; it is not an ontology-version selector.
     """
     normalized_environment = _normalize_environment(environment)
-    if normalized_environment == "dev":
-        raise RuntimeDefinitionError("开发环境不应携带发布定义固定版本")
     return _resolve_pinned_release(
         db,
         scenario,
@@ -468,7 +525,6 @@ def _resolve_pinned_release(
     if (
         release.scenario_id != scenario.id
         or release.tenant_id != scenario.tenant_id
-        or release.environment != environment
         or release.snapshot_id != snapshot.id
         or release.status not in {"released", "superseded", "rolled_back"}
     ):
@@ -479,26 +535,54 @@ def _resolve_pinned_release(
     return definition
 
 
+def _resolve_pinned_live_definition(
+    db: Session,
+    scenario: BusinessScenario,
+    *,
+    environment: str,
+    snapshot_id: str | None,
+    release_id: str | None,
+    definition_hash: str | None,
+) -> RuntimeDefinition:
+    """Resolve a newly queued live task without allowing definition drift."""
+    expected_hash = str(definition_hash or "").strip()
+    if snapshot_id or release_id:
+        raise RuntimeDefinitionError("live 运行定义不能同时携带发布快照")
+    if (
+        len(expected_hash) != 64
+        or any(char not in "0123456789abcdef" for char in expected_hash)
+    ):
+        raise RuntimeDefinitionError("live 运行定义哈希缺失或无效，已阻止执行")
+    definition = resolve_authoring(db, scenario, environment=environment)
+    if definition.definition_hash != expected_hash:
+        raise RuntimeDefinitionError("live 运行定义在任务排队后已变化，已阻止执行")
+    return definition
+
+
 def resolve_for_run(db: Session, run: WorkflowRun) -> RuntimeDefinition:
     """Resolve the version pinned when a durable run was queued.
 
-    A non-dev run is never allowed to fall forward to whatever environment
-    release happens to be active now.  That would change approval/retry meaning
-    and could rebind external effects mid-flight.
+    Released tasks resolve their immutable snapshot.  New live Agent tasks
+    resolve authoring only when its exact enqueue-time hash still matches;
+    they never fall forward after an edit.  Historical ``live`` rows remain
+    fail-closed because they predate this explicit pin contract.
     """
     scenario = db.get(BusinessScenario, run.scenario_id)
     if not scenario:
         raise RuntimeDefinitionError("工作流所属场景不存在")
     environment = _normalize_environment(run.environment)
-    if environment == "dev":
-        if run.definition_snapshot_id or run.release_id:
-            raise RuntimeDefinitionError("开发环境不应携带发布定义固定版本")
-        if not run.definition_hash:
-            raise RuntimeDefinitionError("运行定义哈希缺失，已阻止执行")
-        definition = _live_definition(scenario, environment, db)
-        if definition.definition_hash != run.definition_hash:
-            raise RuntimeDefinitionError("运行定义快照完整性校验失败")
-        return definition
+    source = str(getattr(run, "definition_source", "") or "live").strip().lower()
+    if source == LIVE_PINNED_RUN_SOURCE:
+        return _resolve_pinned_live_definition(
+            db,
+            scenario,
+            environment=environment,
+            snapshot_id=run.definition_snapshot_id,
+            release_id=run.release_id,
+            definition_hash=run.definition_hash,
+        )
+    if source != "release":
+        raise RuntimeDefinitionError("任务运行定义不可用，请重新提交任务")
     return _resolve_pinned_release(
         db,
         scenario,
@@ -536,21 +620,28 @@ def active_definitions(
     *,
     environment: str,
 ) -> Iterable[RuntimeDefinition]:
-    """Yield every released scenario definition for a non-dev scheduler tick."""
+    """Yield every released scenario definition for a scheduler tick.
+
+    Schedulers perform real workflow execution, so they never consume mutable
+    live definitions solely because the process happens to be labelled dev.
+    """
     normalized_environment = _normalize_environment(environment)
-    if normalized_environment == "dev":
-        scenarios = db.execute(select(BusinessScenario)).scalars().all()
-        return [_live_definition(scenario, normalized_environment, db) for scenario in scenarios]
     releases = db.execute(
         select(OntologyRelease)
         .where(
-            OntologyRelease.environment == normalized_environment,
             OntologyRelease.status == "released",
         )
         .order_by(OntologyRelease.created_at.desc())
     ).scalars().all()
     definitions: list[RuntimeDefinition] = []
+    seen_scenarios: set[str] = set()
     for release in releases:
+        # Historic deployments could leave one released row per deployment
+        # environment.  Choose the newest global release until normal publish
+        # traffic has superseded those legacy rows.
+        if release.scenario_id in seen_scenarios:
+            continue
+        seen_scenarios.add(release.scenario_id)
         scenario = db.get(BusinessScenario, release.scenario_id)
         snapshot = db.get(OntologySnapshot, release.snapshot_id)
         if not scenario or not snapshot:

@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import hashlib
 
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app import database
 from app.database import Base
 from app.models import (
     BusinessScenario,
@@ -21,6 +20,7 @@ from app.models import (
 )
 from app.routers import scenarios
 from app.services import scenario_model_draft_service
+from tests.postgresql_migration_contracts import baseline_table_ddl
 
 
 def _draft(
@@ -160,36 +160,17 @@ def test_edited_property_excludes_its_parent_entity_bundle() -> None:
     assert metadata["excluded_resource_keys"] == ["entity.project"]
 
 
-def test_draft_resource_startup_migration_is_idempotent() -> None:
-    migration_engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(migration_engine)
-    original_engine = database.engine
-    database.engine = migration_engine
-    try:
-        database._migrate_scenario_model_draft_resources()
-        database._migrate_scenario_model_draft_resources()
-        inspector = inspect(migration_engine)
-        columns = {
-            column["name"]
-            for column in inspector.get_columns("scenario_model_draft_resources")
-        }
-        assert {"payload", "validation_issues", "enabled", "publishable"} <= columns
-        unique_names = {
-            item.get("name")
-            for item in inspector.get_unique_constraints(
-                "scenario_model_draft_resources"
-            )
-        }
-        index_names = {
-            item.get("name")
-            for item in inspector.get_indexes("scenario_model_draft_resources")
-        }
-        assert "uq_scenario_model_draft_resource_identity" in (
-            unique_names | index_names
-        )
-    finally:
-        database.engine = original_engine
-        migration_engine.dispose()
+def test_draft_resource_schema_is_declared_by_postgresql_migration() -> None:
+    ddl = baseline_table_ddl("scenario_model_draft_resources")
+    assert "payload JSON NOT NULL" in ddl
+    assert "validation_issues JSON NOT NULL" in ddl
+    assert "enabled BOOLEAN NOT NULL" in ddl
+    assert "publishable BOOLEAN NOT NULL" in ddl
+    assert "CONSTRAINT ck_scenario_model_drafts_inert" in ddl
+    assert (
+        "CONSTRAINT uq_scenario_model_draft_resource_identity UNIQUE "
+        "(tenant_id, scenario_id, proposal_id, resource_identity)"
+    ) in ddl
 
 
 def test_property_resolve_accepts_parent_entity_and_stores_child_identity() -> None:

@@ -1413,18 +1413,15 @@ def _preserve_connector_requirements(captured: dict, source: Mapping[str, Any]) 
     return result
 
 
-def _assert_non_dev_runtime_bindings(content: Mapping[str, Any], *, environment: str) -> None:
-    """Reject a non-dev release that would inevitably fail at runtime.
+def _assert_runtime_bindings(content: Mapping[str, Any], *, environment: str) -> None:
+    """Reject a release that would inevitably fail during execution.
 
-    Dev keeps the direct-ID/default-model compatibility path while users migrate
-    legacy definitions.  Staging/prod runtime resolution is intentionally
-    fail-closed, so publishing those definitions without logical binding keys
-    would create a misleading "released" state.  Check only executable
-    connector paths here; regular binding health/signature verification remains
-    in ``_require_snapshot_connectors`` below.
+    Release policy is global to a business scenario.  ``environment`` selects
+    the physical connector binding audited for this publish operation, but it
+    must not decide whether a definition is allowed to be released.  Check
+    executable connector paths here; binding health/signature verification
+    remains in ``_require_snapshot_connectors`` below.
     """
-    if environment == "dev":
-        return
 
     missing: list[str] = []
     prohibited_actions: list[str] = []
@@ -1474,12 +1471,13 @@ def _assert_non_dev_runtime_bindings(content: Mapping[str, Any], *, environment:
         action_label = str(action.get("name") or action.get("id") or "未命名 Action")[:200]
         executor_type = str(action.get("executor_type") or "")
         config = action.get("executor_config") or {}
-        # Staging/prod must be reproducible from the released definition and
-        # an auditable connector binding.  Direct HTTP, local skills and
-        # scripts depend on host/process state outside that boundary, so they
-        # are deliberately dev-only until they have an equivalent governed
-        # connector implementation.
-        if executor_type in {"unbound", "http", "skill", "script", "template"}:
+        # Released execution must be reproducible from the immutable
+        # definition and an auditable connector binding.  Direct HTTP, local
+        # skills and scripts depend on host/process state outside that
+        # boundary, so they need an equivalent governed implementation before
+        # they can be published. Template bindings are validated separately
+        # against an immutable version/file hash below.
+        if executor_type in {"unbound", "http", "skill", "script"}:
             prohibited_actions.append(f"Action「{action_label}」使用 {executor_type}")
         elif executor_type == "sql":
             require_binding(config, kind="data_source", label=f"Action「{action_label}」")
@@ -1507,12 +1505,12 @@ def _assert_non_dev_runtime_bindings(content: Mapping[str, Any], *, environment:
 
     if prohibited_actions:
         raise ReleaseConflictError(
-            "非开发环境禁止待绑定、http、skill、script、template Action 执行器："
+            "发布定义禁止待绑定、http、skill、script Action 执行器："
             + "；".join(prohibited_actions[:12])
         )
     if missing:
         raise ReleaseConflictError(
-            "非开发环境发布必须配置运行时连接器绑定键：" + "；".join(missing[:12])
+            "发布定义必须配置运行时连接器绑定键：" + "；".join(missing[:12])
         )
 
 
@@ -1531,11 +1529,10 @@ def _require_snapshot_connectors(
     """
     try:
         normalized = normalize_snapshot_content(dict(content))
-        if environment and environment != "dev":
+        if environment:
             # A legacy snapshot that intentionally omitted mappings means
-            # "leave mappings untouched" during merge.  In a non-dev release
-            # that would make definition-hash verification inevitably fail if
-            # live mappings now exist, so require a fresh governed baseline.
+            # "leave mappings untouched" during merge.  A released definition
+            # must be complete regardless of the deployment which audits it.
             if "mappings" not in content and db.scalar(
                 select(DataMapping.id)
                 .where(DataMapping.scenario_id == scenario.id)
@@ -1552,7 +1549,7 @@ def _require_snapshot_connectors(
                 raise ReleaseConflictError(
                     "该历史快照未声明关系数据映射；请先基于当前定义创建并合并新的快照后再发布"
                 )
-            _assert_non_dev_runtime_bindings(normalized, environment=environment)
+            _assert_runtime_bindings(normalized, environment=environment)
         requirements = connector_service.normalize_snapshot_binding_requirements(
             normalized.get("connector_bindings")
         )
@@ -1805,15 +1802,13 @@ def _ensure_active_workflow_definitions_unchanged(
             WorkflowRun.status.in_(NONTERMINAL_WORKFLOW_RUN_STATUSES),
         )
     ).scalars().all()
-    # Frozen staging/prod runs resolve their own release snapshot and must not
-    # prevent dev authoring from moving forward.  Live/dev runs still require
-    # this historical mutation guard because they intentionally remain bound to
-    # the mutable authoring definition.
+    # Frozen runs resolve their own release snapshot and must not prevent
+    # authoring from moving forward.  Only legacy live runs need this mutation
+    # guard; whether their worker was labelled dev/staging/prod is irrelevant.
     active_runs = [
         run
         for run in active_runs
-        if (run.environment or "dev") == "dev"
-        and not run.definition_snapshot_id
+        if not run.definition_snapshot_id
         and (run.definition_source or "live") == "live"
     ]
     if not active_runs:
@@ -1879,13 +1874,12 @@ def assert_scenario_deletion_allowed(
     db: Session,
     scenario: BusinessScenario,
 ) -> None:
-    """Keep the scenario-level anchor while a non-dev release is active."""
+    """Keep the scenario-level anchor while an executable release is active."""
     active_release = db.execute(
         select(OntologyRelease.id)
         .where(
             OntologyRelease.scenario_id == scenario.id,
             OntologyRelease.status == "released",
-            OntologyRelease.environment.in_(("staging", "prod")),
         )
         .with_for_update()
         .limit(1)
@@ -1903,7 +1897,7 @@ def assert_resource_deletion_allowed(
 ) -> None:
     """Fail closed before a live lookup anchor is removed from an active release.
 
-    Staging/prod resolve immutable JSON, but their ordinary API routes first
+    Released execution resolves immutable JSON, but ordinary API routes first
     use the physical row to locate and authorize the resource.  The governed
     merge path already protects these anchors via ``_guard_safe_removals``;
     direct CRUD deletes must use the same deployment boundary instead of
@@ -1923,7 +1917,6 @@ def assert_resource_deletion_allowed(
         .where(
             OntologyRelease.scenario_id == scenario.id,
             OntologyRelease.status == "released",
-            OntologyRelease.environment.in_(("staging", "prod")),
         )
         .with_for_update()
     ).scalars().all()
@@ -1938,7 +1931,7 @@ def assert_resource_deletion_allowed(
             raise ReleaseConflictError("活动环境发布快照不可用，拒绝删除定义")
         try:
             # Historic snapshots that predate governed mappings cannot prove
-            # that a live mapping is absent.  A non-dev deployment with such
+            # that a live mapping is absent.  An active release with such
             # evidence must not lose a potential runtime anchor by CRUD.
             if normalized_kind in {"mapping", "relation_mapping", "function"} and collection not in (snapshot.content or {}):
                 raise ReleaseConflictError(f"活动环境发布快照缺少{label}，拒绝删除")
@@ -1981,7 +1974,7 @@ def _guard_safe_removals(
     desired_workflows = {item["id"] for item in content["workflows"]}
 
     # The physical rows remain stable lookup anchors for routes and foreign
-    # keys, while staging/prod execute immutable DTOs from the release JSON.
+    # keys, while released execution uses immutable DTOs from the release JSON.
     # Deleting an ID still referenced by an active environment release would
     # make that frozen deployment unreachable, so keep it until each affected
     # environment has moved to a new release/rollback target.
@@ -1998,7 +1991,6 @@ def _guard_safe_removals(
         select(OntologyRelease).where(
             OntologyRelease.scenario_id == scenario.id,
             OntologyRelease.status == "released",
-            OntologyRelease.environment.in_(("staging", "prod")),
         )
     ).scalars().all()
     for release in active_releases:
@@ -2874,7 +2866,6 @@ def publish_snapshot(
         for old_release in db.execute(
             select(OntologyRelease).where(
                 OntologyRelease.scenario_id == scenario.id,
-                OntologyRelease.environment == environment,
                 OntologyRelease.status == "released",
             )
         ).scalars().all():
@@ -2951,12 +2942,12 @@ def rollback_snapshot(
         if not branch.head_snapshot_id:
             raise ReleaseConflictError("分支没有当前快照")
         _validate_snapshot_template_actions(db, scenario, target.content or {})
-        # A staging/prod rollback is an environment deployment transition, not
-        # a mutation of the shared dev authoring definition.  In particular it
-        # must remain possible when dev has moved on from the branch head; the
-        # selected immutable snapshot and its environment bindings are the
-        # only inputs that need validation here.
-        if environment in {"staging", "prod"}:
+        # An explicit environment means "create an executable rollback
+        # release".  It is not a product-mode switch: dev, staging and prod
+        # all resolve the same immutable target while using their own physical
+        # connector bindings.  Omitting environment is the separate authoring
+        # rollback operation below.
+        if environment:
             connector_audit = _require_snapshot_connectors(
                 db,
                 scenario,
@@ -2967,7 +2958,6 @@ def rollback_snapshot(
                 select(OntologyRelease)
                 .where(
                     OntologyRelease.scenario_id == scenario.id,
-                    OntologyRelease.environment == environment,
                     OntologyRelease.status == "released",
                 )
                 .order_by(OntologyRelease.created_at.desc())
@@ -3060,7 +3050,6 @@ def rollback_snapshot(
             for old_release in db.execute(
                 select(OntologyRelease).where(
                     OntologyRelease.scenario_id == scenario.id,
-                    OntologyRelease.environment == environment,
                     OntologyRelease.status == "released",
                 )
             ).scalars().all():

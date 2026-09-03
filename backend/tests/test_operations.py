@@ -17,9 +17,12 @@ from app.models import (
     BusinessScenario,
     LLMConfig,
     OntologyAction,
+    OntologyBranch,
     OntologyEntity,
     OntologyEvent,
+    OntologyRelease,
     OntologyRule,
+    OntologySnapshot,
     OntologyWorkflow,
     Skill,
     Tenant,
@@ -30,7 +33,13 @@ from app.models import (
 from app.routers import scenarios as scenarios_router
 from app.schemas import ActionIn
 from app.services.agent_engine import AgentContext
-from app.services import operations_service, permission_service, workflow_service
+from app.services import (
+    operations_service,
+    permission_service,
+    release_service,
+    runtime_definition_service,
+    workflow_service,
+)
 from app.services.policies import PolicyViolation, validate_workflow_graph
 
 
@@ -75,6 +84,7 @@ class OperationsRuntimeTests(unittest.TestCase):
         self.db.commit()
         self.db.info["tenant_id"] = self.tenant.id
         self.db.info["user_id"] = self.user.id
+        self._release_revision = 0
 
     def tearDown(self) -> None:
         self.db.close()
@@ -97,9 +107,70 @@ class OperationsRuntimeTests(unittest.TestCase):
         self.db.commit()
         return workflow
 
+    def _release_current_definition(self):
+        """Create a fresh immutable definition for tests that execute work."""
+        self._release_revision += 1
+        branch = getattr(self, "_release_branch", None)
+        if branch is None:
+            branch = OntologyBranch(
+                id="branch-operations",
+                tenant_id=self.tenant.id,
+                scenario_id=self.scenario.id,
+                name="main",
+                created_by_user_id=self.user.id,
+            )
+            self.db.add(branch)
+            self.db.flush()
+            self._release_branch = branch
+
+        content = release_service.capture_snapshot_content(self.db, self.scenario)
+        snapshot = OntologySnapshot(
+            id=f"snapshot-operations-{self._release_revision}",
+            tenant_id=self.tenant.id,
+            scenario_id=self.scenario.id,
+            branch_id=branch.id,
+            kind="merge",
+            content=content,
+            content_hash=release_service.snapshot_hash(content),
+            created_by_user_id=self.user.id,
+        )
+        self.db.add(snapshot)
+        self.db.flush()
+        branch.base_snapshot_id = branch.base_snapshot_id or snapshot.id
+        branch.head_snapshot_id = snapshot.id
+        for prior_release in self.db.query(OntologyRelease).filter_by(
+            scenario_id=self.scenario.id,
+            status="released",
+        ):
+            prior_release.status = "superseded"
+        self.db.add(
+            OntologyRelease(
+                id=f"release-operations-{self._release_revision}",
+                tenant_id=self.tenant.id,
+                scenario_id=self.scenario.id,
+                branch_id=branch.id,
+                snapshot_id=snapshot.id,
+                environment="dev",
+                status="released",
+                created_by_user_id=self.user.id,
+            )
+        )
+        self.db.commit()
+        return runtime_definition_service.resolve_execution(
+            self.db,
+            self.scenario,
+            environment="dev",
+        )
+
     def test_approval_pauses_then_resumes_the_same_durable_run(self) -> None:
         workflow = self._workflow(name="approval", node_types=("approval",))
-        run, created = operations_service.enqueue_workflow_run(self.db, workflow, {"case": "A"})
+        definition = self._release_current_definition()
+        run, created = operations_service.enqueue_workflow_run(
+            self.db,
+            workflow,
+            {"case": "A"},
+            runtime_definition=definition,
+        )
         self.assertTrue(created)
         self.db.commit()
 
@@ -137,7 +208,12 @@ class OperationsRuntimeTests(unittest.TestCase):
         )
         self.db.add(workflow)
         self.db.commit()
-        run, _ = operations_service.enqueue_workflow_run(self.db, workflow)
+        definition = self._release_current_definition()
+        run, _ = operations_service.enqueue_workflow_run(
+            self.db,
+            workflow,
+            runtime_definition=definition,
+        )
         self.db.commit()
         operations_service.process_available_runs(self.db)
         approval = self.db.query(WorkflowApprovalRequest).filter_by(workflow_run_id=run.id).one()
@@ -151,7 +227,12 @@ class OperationsRuntimeTests(unittest.TestCase):
 
     def test_manual_retry_starts_a_new_attempt_and_reopens_approval(self) -> None:
         workflow = self._workflow(name="retry", node_types=("approval",))
-        run, _ = operations_service.enqueue_workflow_run(self.db, workflow)
+        definition = self._release_current_definition()
+        run, _ = operations_service.enqueue_workflow_run(
+            self.db,
+            workflow,
+            runtime_definition=definition,
+        )
         self.db.commit()
         operations_service.process_available_runs(self.db)
         operations_service.decide_approval(self.db, run, approved=True)
@@ -175,6 +256,7 @@ class OperationsRuntimeTests(unittest.TestCase):
 
     def test_agent_workflow_tool_requires_user_confirmation_instead_of_enqueuing(self) -> None:
         workflow = self._workflow(name="agent-approval", node_types=("approval",))
+        self._release_current_definition()
         agent = Agent(
             id="agent-operations",
             tenant_id=self.tenant.id,
@@ -208,16 +290,25 @@ class OperationsRuntimeTests(unittest.TestCase):
             trigger_type="event",
             trigger_config={"event_id": event.id},
         )
+        definition = self._release_current_definition()
 
         envelope, queued = operations_service.publish_event(
-            self.db, event, {"object_id": "object-1"}, dedupe_key="source-change-1"
+            self.db,
+            event,
+            {"object_id": "object-1"},
+            dedupe_key="source-change-1",
+            runtime_definition=definition,
         )
         self.db.commit()
         self.assertEqual(len(queued), 1)
         self.assertEqual(queued[0].workflow_id, subscriber.id)
 
         duplicate, duplicate_runs = operations_service.publish_event(
-            self.db, event, {"object_id": "object-1"}, dedupe_key="source-change-1"
+            self.db,
+            event,
+            {"object_id": "object-1"},
+            dedupe_key="source-change-1",
+            runtime_definition=definition,
         )
         self.assertEqual(duplicate.id, envelope.id)
         self.assertEqual(len(duplicate_runs), 1)
@@ -232,6 +323,7 @@ class OperationsRuntimeTests(unittest.TestCase):
             trigger_type="scheduled",
             trigger_config={"interval_seconds": 10, "max_attempts": 2, "timeout_seconds": 30},
         )
+        self._release_current_definition()
         now = operations_service.utc_now()
         first = operations_service.enqueue_due_schedules(self.db, now=now)
         self.db.commit()
@@ -268,6 +360,7 @@ class OperationsRuntimeTests(unittest.TestCase):
             trigger_type="event",
             trigger_config={"event_id": event.id},
         )
+        definition = self._release_current_definition()
 
         # The worker has no HTTP identity.  Earlier P1 behavior delegated this
         # situation to execution_principal, which selected the tenant owner.
@@ -279,6 +372,7 @@ class OperationsRuntimeTests(unittest.TestCase):
             event,
             {"source": "connector"},
             source="connector",
+            runtime_definition=definition,
         )
         self.db.commit()
         self.assertEqual([run.workflow_id for run in scheduled_runs], [scheduled.id])
@@ -307,23 +401,7 @@ class OperationsRuntimeTests(unittest.TestCase):
             trigger_type="scheduled",
             trigger_config={"interval_seconds": 10},
         )
-        bootstrap, _ = operations_service.enqueue_workflow_run(
-            self.db,
-            scheduled,
-            {"seed": True},
-            trigger_source="manual",
-        )
-        bootstrap.status = "succeeded"
-        self.db.commit()
-
         source = self._workflow(name="event-origin")
-        source_run, _ = operations_service.enqueue_workflow_run(
-            self.db,
-            source,
-            {"seed": "event"},
-            trigger_source="manual",
-        )
-        source_run.status = "succeeded"
         event = OntologyEvent(
             id="event-origin",
             scenario_id=self.scenario.id,
@@ -336,6 +414,24 @@ class OperationsRuntimeTests(unittest.TestCase):
             trigger_type="event",
             trigger_config={"event_id": event.id},
         )
+        definition = self._release_current_definition()
+        bootstrap, _ = operations_service.enqueue_workflow_run(
+            self.db,
+            scheduled,
+            {"seed": True},
+            trigger_source="manual",
+            runtime_definition=definition,
+        )
+        bootstrap.status = "succeeded"
+        source_run, _ = operations_service.enqueue_workflow_run(
+            self.db,
+            source,
+            {"seed": "event"},
+            trigger_source="manual",
+            runtime_definition=definition,
+        )
+        source_run.status = "succeeded"
+        self.db.commit()
 
         # Simulate a context-free worker/connector after durable user work has
         # established provenance.  The scheduler and the event chain must keep
@@ -351,6 +447,7 @@ class OperationsRuntimeTests(unittest.TestCase):
             {"source": "workflow"},
             source="workflow",
             source_run_id=source_run.id,
+            runtime_definition=definition,
         )
         self.assertEqual(scheduled_runs[0].created_by_user_id, self.user.id)
         self.assertEqual(event_runs[0].workflow_id, subscriber.id)
@@ -358,7 +455,12 @@ class OperationsRuntimeTests(unittest.TestCase):
 
     def test_manual_retry_records_the_actual_retrier(self) -> None:
         workflow = self._workflow(name="retry-origin")
-        run, _ = operations_service.enqueue_workflow_run(self.db, workflow)
+        definition = self._release_current_definition()
+        run, _ = operations_service.enqueue_workflow_run(
+            self.db,
+            workflow,
+            runtime_definition=definition,
+        )
         run.status = "failed"
         retry_user = User(
             id="user-retry",
@@ -472,7 +574,13 @@ class OperationsRuntimeTests(unittest.TestCase):
         )
         self.db.add(workflow)
         self.db.commit()
-        _, queued = operations_service.publish_event(self.db, event, {"source": "test"})
+        definition = self._release_current_definition()
+        _, queued = operations_service.publish_event(
+            self.db,
+            event,
+            {"source": "test"},
+            runtime_definition=definition,
+        )
         self.db.commit()
         self.assertEqual(len(queued), 1)
         operations_service.process_available_runs(self.db)
@@ -486,7 +594,12 @@ class OperationsRuntimeTests(unittest.TestCase):
         timeout_nodes[1] = {**timeout_nodes[1], "data": {**timeout_nodes[1]["data"], "on_timeout": "timeout"}}
         workflow.nodes = timeout_nodes
         self.db.commit()
-        run, _ = operations_service.enqueue_workflow_run(self.db, workflow)
+        definition = self._release_current_definition()
+        run, _ = operations_service.enqueue_workflow_run(
+            self.db,
+            workflow,
+            runtime_definition=definition,
+        )
         self.db.commit()
         with self.assertRaises(PolicyViolation):
             operations_service.assert_workflow_mutable(self.db, workflow.id)
@@ -503,7 +616,11 @@ class OperationsRuntimeTests(unittest.TestCase):
         self.assertEqual(approval.status, "expired")
         operations_service.assert_workflow_mutable(self.db, workflow.id)
 
-        queued, _ = operations_service.enqueue_workflow_run(self.db, workflow)
+        queued, _ = operations_service.enqueue_workflow_run(
+            self.db,
+            workflow,
+            runtime_definition=definition,
+        )
         self.db.commit()
         operations_service.cancel_run(self.db, queued, comment="不再需要")
         self.db.refresh(queued)

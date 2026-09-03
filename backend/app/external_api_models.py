@@ -146,6 +146,59 @@ class AgentMCPService(Base):
     )
 
 
+class AgentMCPConversation(Base):
+    """Bind one external MCP transport session to one durable Agent transcript.
+
+    The mapping is scoped to the published service rather than globally to the
+    opaque transport value.  A caller therefore cannot use a session id from a
+    different publication (or tenant) to resume another Agent's history.
+    """
+
+    __tablename__ = "agent_mcp_conversations"
+    __table_args__ = (
+        UniqueConstraint(
+            "service_id",
+            "external_session_hash",
+            name="uq_agent_mcp_conversations_service_session",
+        ),
+        Index("ix_agent_mcp_conversations_service_updated", "service_id", "updated_at"),
+        Index("ix_agent_mcp_conversations_tenant_updated", "tenant_id", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    service_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_mcp_services.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    agent_id: Mapped[str] = mapped_column(
+        ForeignKey("agents.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    execution_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    # Only a domain-separated digest of the transport value is retained.  MCP
+    # clients sometimes supply their own session identifiers, which must not
+    # become searchable business data or logs.
+    external_session_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    # A DB-backed fencing lease serializes Agent turns for this external
+    # session across API workers.  It is intentionally separate from the MCP
+    # transport, which remains stateless and therefore load-balancer friendly.
+    turn_lease_token: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    turn_lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    turn_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    turn_lease_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, onupdate=_now
+    )
+
+
 class AgentMCPInvocation(Base):
     """Durable audit envelope for one external ``invoke_agent`` tool call."""
 
@@ -153,6 +206,12 @@ class AgentMCPInvocation(Base):
     __table_args__ = (
         Index("ix_agent_mcp_invocations_service_created", "service_id", "created_at"),
         Index("ix_agent_mcp_invocations_tenant_created", "tenant_id", "created_at"),
+        Index(
+            "ix_agent_mcp_invocations_mcp_conversation_request",
+            "mcp_conversation_id",
+            "external_request_hash",
+            unique=True,
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -169,6 +228,15 @@ class AgentMCPInvocation(Base):
         ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
     )
     request_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    mcp_conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_mcp_conversations.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    # JSON-RPC request ids are opaque third-party input, so only a
+    # domain-separated digest is retained.  Together with the mapping id this
+    # is the durable replay key for one MCP invocation.
+    external_request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    turn_lease_token: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    turn_lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     conversation_id: Mapped[str | None] = mapped_column(
         ForeignKey("conversations.id", ondelete="SET NULL"), index=True, nullable=True
     )

@@ -87,7 +87,16 @@ def _token_hash(token: str) -> str:
 def _mail_message(email: str, code: str, purpose: str) -> EmailMessage:
     settings = get_settings()
     subject = "本体智能平台邮箱验证码"
-    action = "完成注册" if purpose == "register" else "重置密码"
+    action = {
+        "register": "完成注册",
+        "invite": "接受工作区邀请",
+        "password_reset": "重置密码",
+    }.get(purpose, "完成安全验证")
+    expires_minutes = (
+        settings.invitation_code_minutes
+        if purpose == "invite"
+        else settings.verification_code_minutes
+    )
     sender = settings.mail_from.strip() or settings.mail_username.strip()
     message = EmailMessage()
     message["Subject"] = subject
@@ -95,14 +104,14 @@ def _mail_message(email: str, code: str, purpose: str) -> EmailMessage:
     message["To"] = email
     message.set_content(
         f"您好，您正在使用本体智能平台{action}。\n\n"
-        f"验证码：{code}\n\n验证码有效期为 {settings.verification_code_minutes} 分钟。"
+        f"验证码：{code}\n\n验证码有效期为 {expires_minutes} 分钟。"
         "如果这不是您的操作，请忽略此邮件。"
     )
     message.add_alternative(
         "<div style=\"font-family:Arial,'Microsoft YaHei',sans-serif;color:#24333c;line-height:1.6\">"
         "<h2 style=\"margin:0 0 16px\">本体智能平台</h2>"
         f"<p>你的验证码是：</p><p style=\"font-size:28px;font-weight:700;letter-spacing:6px\">{html.escape(code)}</p>"
-        f"<p>验证码 {settings.verification_code_minutes} 分钟内有效。如果不是你本人操作，请忽略此邮件。</p>"
+        f"<p>验证码 {expires_minutes} 分钟内有效。如果不是你本人操作，请忽略此邮件。</p>"
         "</div>",
         subtype="html",
     )
@@ -150,7 +159,37 @@ def _authenticate_and_send(
     client.send_message(message, from_addr=sender, to_addrs=[recipient])
 
 
-def issue_email_code(db: Session, user: User, purpose: str) -> str:
+def _code_attempt_policy() -> tuple[int, int]:
+    """Read bounded verification throttles, including compatibility test stubs."""
+    settings = get_settings()
+    maximum = max(
+        1,
+        int(getattr(settings, "verification_code_max_attempts", 5) or 5),
+    )
+    lock_minutes = max(
+        1,
+        int(getattr(settings, "verification_code_lock_minutes", 30) or 30),
+    )
+    return maximum, lock_minutes
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return (
+        value.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None
+        else value.astimezone(timezone.utc)
+    )
+
+
+def issue_email_code(
+    db: Session,
+    user: User,
+    purpose: str,
+    *,
+    expires_minutes: int | None = None,
+) -> str:
     now = utc_now()
     latest = db.execute(
         select(EmailVerificationCode)
@@ -160,27 +199,78 @@ def issue_email_code(db: Session, user: User, purpose: str) -> str:
             EmailVerificationCode.used_at.is_(None),
         )
         .order_by(EmailVerificationCode.created_at.desc())
+        .with_for_update()
     ).scalars().first()
-    latest_created_at = latest.created_at if latest else None
-    if latest_created_at is not None:
-        latest_created_at = (
-            latest_created_at.replace(tzinfo=timezone.utc)
-            if latest_created_at.tzinfo is None
-            else latest_created_at.astimezone(timezone.utc)
-        )
+    latest_created_at = _as_utc(latest.created_at) if latest else None
     if latest_created_at and (now - latest_created_at).total_seconds() < 60:
         raise HTTPException(429, "验证码发送过于频繁，请稍后再试")
+    inherited_attempts = 0
+    if latest is not None:
+        locked_until = _as_utc(latest.locked_until)
+        if locked_until and locked_until > now:
+            raise HTTPException(429, "验证码校验已被临时锁定，请稍后再试")
+        if locked_until is not None:
+            latest.failed_attempts = 0
+            latest.locked_until = None
+        else:
+            inherited_attempts = max(0, int(latest.failed_attempts or 0))
     code = f"{secrets.randbelow(1_000_000):06d}"
+    valid_for_minutes = (
+        get_settings().invitation_code_minutes
+        if purpose == "invite"
+        else get_settings().verification_code_minutes
+    )
+    if expires_minutes is not None:
+        valid_for_minutes = int(expires_minutes)
+    if valid_for_minutes < 1:
+        raise ValueError("验证码有效期必须大于 0")
     db.add(
         EmailVerificationCode(
             user_id=user.id,
             email=user.email,
             purpose=purpose,
             code_hash=_hash_code(code),
-            expires_at=now + timedelta(minutes=get_settings().verification_code_minutes),
+            expires_at=now + timedelta(minutes=valid_for_minutes),
+            failed_attempts=inherited_attempts,
         )
     )
     return code
+
+
+def find_valid_email_code(
+    db: Session,
+    user: User,
+    code: str,
+    purpose: str,
+) -> EmailVerificationCode | None:
+    """Return one unconsumed code without exposing whether a user exists."""
+    now = utc_now()
+    record = db.execute(
+        select(EmailVerificationCode)
+        .where(
+            EmailVerificationCode.user_id == user.id,
+            EmailVerificationCode.purpose == purpose,
+            EmailVerificationCode.used_at.is_(None),
+            EmailVerificationCode.expires_at > now,
+        )
+        .order_by(EmailVerificationCode.created_at.desc())
+        .with_for_update()
+    ).scalars().first()
+    if not record:
+        return None
+    locked_until = _as_utc(record.locked_until)
+    if locked_until and locked_until > now:
+        return None
+    if locked_until is not None:
+        record.failed_attempts = 0
+        record.locked_until = None
+    if hmac.compare_digest(record.code_hash, _hash_code(code)):
+        return record
+    maximum, lock_minutes = _code_attempt_policy()
+    record.failed_attempts = max(0, int(record.failed_attempts or 0)) + 1
+    if record.failed_attempts >= maximum:
+        record.locked_until = now + timedelta(minutes=lock_minutes)
+    return None
 
 
 def claim_legacy_resources(db: Session, tenant_id: str) -> None:

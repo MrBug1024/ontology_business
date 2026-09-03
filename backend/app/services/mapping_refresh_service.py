@@ -11,7 +11,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from fastapi import HTTPException
 from sqlalchemy import select, update
@@ -225,21 +225,25 @@ def resolve_mapping_runtime_definition(
     mapping: DataMapping,
     *,
     environment: str | None = None,
+    definition_mode: Literal["authoring", "execution"] = "authoring",
 ) -> tuple[Any, runtime_definition_service.RuntimeDefinition]:
-    """Resolve the mapping contract authorised for this deployment.
+    """Resolve an authoring or released mapping contract explicitly.
 
-    In staging/prod the live ``DataMapping`` is used only to authorise the
-    route and locate its scenario.  The returned mapping is a detached DTO from
-    the active release snapshot, so API requests and queued work cannot read a
-    newer dev definition by accident.
+    Manual mapping refresh/preview is part of platform authoring and therefore
+    defaults to the live definition in every deployment.  An execution caller
+    can opt into a released contract, but deployment labels themselves never
+    decide which definition is visible.
     """
     resolved_environment = runtime_connector_service.runtime_environment(environment)
+    if definition_mode not in {"authoring", "execution"}:
+        raise PolicyViolation("映射运行定义模式无效")
     try:
-        definition = runtime_definition_service.resolve_active(
-            db,
-            scenario,
-            environment=resolved_environment,
+        resolver = (
+            runtime_definition_service.resolve_authoring
+            if definition_mode == "authoring"
+            else runtime_definition_service.resolve_execution
         )
+        definition = resolver(db, scenario, environment=resolved_environment)
         if not definition.is_frozen:
             return mapping, definition
         released_mapping = runtime_definition_service.resolve_resource(
@@ -279,16 +283,15 @@ def _job_runtime_mapping(
     frozen = _job_mapping_snapshot(job)
     if frozen.scenario_id != scenario.id:
         raise PolicyViolation("映射刷新快照不属于当前业务场景")
-    if job.environment == "dev":
+    if job.definition_source == "live":
         if (
-            job.definition_source != "live"
-            or job.definition_snapshot_id is not None
+            job.definition_snapshot_id is not None
             or job.release_id is not None
         ):
-            raise PolicyViolation("开发环境映射刷新任务的定义来源无效")
+            raise PolicyViolation("映射刷新任务的 authoring 定义来源无效")
         return frozen
     if job.definition_source != "release":
-        raise PolicyViolation("非开发环境映射刷新缺少发布定义来源")
+        raise PolicyViolation("映射刷新任务缺少受支持的定义来源")
     try:
         definition = runtime_definition_service.resolve_pinned(
             db,
@@ -318,12 +321,12 @@ def _job_runtime_definition(
 ) -> runtime_definition_service.RuntimeDefinition:
     """Resolve the complete definition pinned by a refresh job."""
     try:
-        if job.environment == "dev":
-            definition = runtime_definition_service.resolve_active(
-                db, scenario, environment="dev"
+        if job.definition_source == "live":
+            definition = runtime_definition_service.resolve_authoring(
+                db, scenario, environment=job.environment
             )
-            if definition.is_frozen or job.definition_source != "live":
-                raise PolicyViolation("开发环境映射刷新任务的定义来源无效")
+            if definition.is_frozen:
+                raise PolicyViolation("映射刷新任务的 authoring 定义来源无效")
             if (
                 not job.definition_hash
                 or definition.definition_hash != job.definition_hash
@@ -335,7 +338,7 @@ def _job_runtime_definition(
                 raise PolicyViolation("关系映射或其端点定义已变化，请重新提交刷新")
             return definition
         if job.definition_source != "release":
-            raise PolicyViolation("非开发环境映射刷新缺少发布定义来源")
+            raise PolicyViolation("映射刷新任务缺少受支持的定义来源")
         definition = runtime_definition_service.resolve_pinned(
             db,
             scenario,

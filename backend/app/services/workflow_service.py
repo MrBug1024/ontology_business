@@ -96,8 +96,9 @@ def _runtime_provenance(
 
     A frozen definition is not optional metadata: its environment must match
     the deployment assertion and every child action receives the same release
-    pin.  Legacy callers without a definition remain supported for dev-only
-    internal use, but no non-dev route may rely on that compatibility path.
+    pin.  Legacy callers without a definition remain an explicit authoring
+    compatibility path in every deployment; an effectful route must resolve a
+    release before reaching this service.
     """
     environment = runtime_connector_service.runtime_environment(runtime_environment)
     if runtime_definition is None:
@@ -119,14 +120,41 @@ def _runtime_provenance(
     }
 
 
-def _scoped_idempotency_key(key: str | None, environment: str) -> str | None:
-    """Make external idempotency keys environment-local without widening SQL keys."""
+_LEGACY_RUNTIME_ENVIRONMENTS = ("dev", "staging", "prod")
+
+
+def _scoped_idempotency_key(
+    key: str | None,
+    environment: str | None = None,
+) -> str | None:
+    """Return an environment-neutral Action idempotency key.
+
+    Deployment environment remains audit/connector provenance.  It cannot be
+    part of a client request's business identity, or a retried external call
+    could execute twice merely because a process moved from dev to prod.
+    """
+    del environment
     if not key:
         return None
-    scoped = f"{environment}:{key}"
-    if len(scoped) <= 120:
-        return scoped
-    return f"{environment}:sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+    normalized = str(key)
+    if len(normalized) <= 120:
+        return normalized
+    return f"sha256:{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"
+
+
+def _idempotency_key_candidates(key: str | None) -> tuple[str, ...]:
+    """Include legacy environment-prefixed values during a rolling upgrade."""
+    canonical = _scoped_idempotency_key(key)
+    if canonical is None:
+        return ()
+    raw = str(key)
+    legacy: list[str] = []
+    for environment in _LEGACY_RUNTIME_ENVIRONMENTS:
+        scoped = f"{environment}:{raw}"
+        if len(scoped) > 120:
+            scoped = f"{environment}:sha256:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+        legacy.append(scoped)
+    return tuple(dict.fromkeys((canonical, *legacy)))
 
 
 def _definition_resource(
@@ -1063,14 +1091,21 @@ def _preview_response_from_log(
     return response
 
 
-def _find_idempotent_log(db: Session, action: Any, key: str) -> ActionExecutionLog | None:
+def _find_idempotent_log(
+    db: Session,
+    action: Any,
+    key: str | tuple[str, ...],
+) -> ActionExecutionLog | None:
+    keys = (key,) if isinstance(key, str) else tuple(key)
+    if not keys:
+        return None
     return db.execute(
         select(ActionExecutionLog)
         .where(
             ActionExecutionLog.scenario_id == action.scenario_id,
             ActionExecutionLog.target_type == "action",
             ActionExecutionLog.target_id == action.id,
-            ActionExecutionLog.idempotency_key == key,
+            ActionExecutionLog.idempotency_key.in_(keys),
             ActionExecutionLog.mode == "execute",
         )
         .order_by(ActionExecutionLog.created_at.desc())
@@ -1103,9 +1138,15 @@ def _stable_template_execution_id(
     *,
     parent_action_log_id: str | None,
     scoped_idempotency_key: str | None,
-    environment: str,
+    environment: str | None = None,
 ) -> str | None:
-    """Derive a retry-stable execution/file id from the confirmed request."""
+    """Derive a retry-stable execution/file id from the confirmed request.
+
+    ``environment`` remains accepted for older internal callers, but is not
+    business identity.  A retry must keep the same artifact id after a worker
+    is moved to another deployment environment.
+    """
+    del environment
     request_identity = parent_action_log_id or scoped_idempotency_key
     if not request_identity:
         return None
@@ -1114,7 +1155,6 @@ def _stable_template_execution_id(
             "template-action-execution-v1",
             str(action.scenario_id),
             str(action.id),
-            str(environment),
             str(request_identity),
         )
     )
@@ -1216,9 +1256,8 @@ def execute_action(
         "action", action, definition=runtime_definition, db=db
     )
     provenance = _runtime_provenance(runtime_definition, runtime_environment)
-    scoped_idempotency_key = _scoped_idempotency_key(
-        idempotency_key, str(provenance["environment"])
-    )
+    scoped_idempotency_key = _scoped_idempotency_key(idempotency_key)
+    idempotency_candidates = _idempotency_key_candidates(idempotency_key)
     normalized = validate_action_params(action.input_schema or {}, params)
     _enforce_action_precondition(action, normalized)
     permission = _permission_summary(db, action, confirmed=confirm)
@@ -1263,7 +1302,7 @@ def execute_action(
             return _idempotent_replay(existing, normalized, permission)
 
     if enforce_policy and scoped_idempotency_key:
-        existing = _find_idempotent_log(db, action, scoped_idempotency_key)
+        existing = _find_idempotent_log(db, action, idempotency_candidates)
         if existing:
             return _idempotent_replay(existing, normalized, permission)
 
@@ -1274,7 +1313,6 @@ def execute_action(
             action,
             parent_action_log_id=(str(parent_action_log_id) if parent_action_log_id else None),
             scoped_idempotency_key=scoped_idempotency_key,
-            environment=str(provenance["environment"]),
         )
         if transactional_template
         else None
@@ -1305,7 +1343,7 @@ def execute_action(
             db.commit()
         except IntegrityError:
             db.rollback()
-            existing = _find_idempotent_log(db, action, scoped_idempotency_key)
+            existing = _find_idempotent_log(db, action, idempotency_candidates)
             if existing is None:
                 existing = _find_preview_execution(db, action, str(parent_action_log_id or ""))
             if existing:
@@ -1318,7 +1356,7 @@ def execute_action(
         except IntegrityError:
             db.rollback()
             existing = (
-                _find_idempotent_log(db, action, scoped_idempotency_key)
+                _find_idempotent_log(db, action, idempotency_candidates)
                 if scoped_idempotency_key
                 else None
             )
@@ -1375,10 +1413,11 @@ def _dispatch_executor(
     cfg = action.executor_config or {}
 
     # A release snapshot intentionally redacts arbitrary HTTP headers and
-    # Skill/Script execution may depend on mutable host state.  Those executor
-    # types are therefore not portable, frozen deployment semantics yet.  Keep
-    # the runtime guard even though publish-time validation rejects new ones.
-    if runtime_definition and runtime_definition.is_frozen and etype in {"http", "skill", "script", "template"}:
+    # Skill/Script execution may depend on mutable host state.  Template
+    # actions are different: their source version/file hash and target bucket
+    # are validated and captured in the released definition, so they remain
+    # reproducible under the frozen execution contract.
+    if runtime_definition and runtime_definition.is_frozen and etype in {"http", "skill", "script"}:
         raise PolicyViolation(f"{etype} Action 不能在已冻结的发布环境执行")
 
     if etype == "sql":
@@ -2289,7 +2328,11 @@ def _execute_dag(
                     key in data
                     for key in ("llm_config_id", "llm_binding_key", "llm_binding_ref")
                 )
-                if has_runtime_config or resolved_environment != "dev":
+                requires_released_binding = bool(
+                    runtime_definition is not None
+                    and runtime_definition.is_frozen
+                )
+                if has_runtime_config or requires_released_binding:
                     scenario = db.get(BusinessScenario, workflow.scenario_id)
                     if not scenario:
                         raise PolicyViolation("工作流所属业务场景不存在")

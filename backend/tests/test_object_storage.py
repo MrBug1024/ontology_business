@@ -32,6 +32,15 @@ class _NotImplementedError(Exception):
     status = 501
 
 
+class _FailingBucketProbeClient:
+    def __init__(self) -> None:
+        self.bucket_exists_calls = 0
+
+    def bucket_exists(self, _bucket_name: str) -> bool:
+        self.bucket_exists_calls += 1
+        raise RuntimeError("storage unavailable")
+
+
 class _FakeMinio:
     def __init__(self) -> None:
         self.buckets: set[str] = set()
@@ -87,6 +96,25 @@ class _FakeMinio:
             etag=etag,
             version_id=version_id,
             content_type=content_type,
+        )
+
+    def fput_object(
+        self,
+        bucket_name: str,
+        object_name: str,
+        file_path: str,
+        *,
+        content_type: str,
+        metadata: dict[str, str] | None = None,
+    ):
+        content = Path(file_path).read_bytes()
+        return self.put_object(
+            bucket_name,
+            object_name,
+            BytesIO(content),
+            len(content),
+            content_type=content_type,
+            metadata=metadata,
         )
 
     def _record(self, bucket_name: str, object_name: str, version_id: str | None):
@@ -208,6 +236,34 @@ class ObjectStorageTests(unittest.TestCase):
                 "prefix": "ontology-business",
             },
         )
+
+    def test_client_uses_bounded_timeouts_and_idempotent_retries(self) -> None:
+        configured = object_storage_service.MinioConfiguration(
+            endpoint="minio.example.test",
+            access_key="access",
+            secret_key="secret",
+            bucket_name="ontology",
+            prefix="ontology-business",
+            request_timeout_seconds=17,
+        )
+        with patch("minio.Minio") as minio_constructor:
+            object_storage_service._create_client(configured)
+
+        http_client = minio_constructor.call_args.kwargs["http_client"]
+        timeout = http_client.connection_pool_kw["timeout"]
+        retries = http_client.connection_pool_kw["retries"]
+        self.assertEqual(timeout.connect_timeout, 10)
+        self.assertEqual(timeout.read_timeout, 17)
+        self.assertEqual(retries.total, 2)
+        self.assertEqual(retries.status, 2)
+        self.assertEqual(retries.allowed_methods, frozenset({"GET", "HEAD", "OPTIONS"}))
+
+    def test_ensure_bucket_does_not_repeat_a_failed_bucket_probe(self) -> None:
+        client = _FailingBucketProbeClient()
+        with patch.object(object_storage_service, "get_client", return_value=client):
+            with self.assertRaises(object_storage_service.ObjectStorageError):
+                object_storage_service.ensure_bucket("ontology")
+        self.assertEqual(client.bucket_exists_calls, 1)
 
     def test_managed_upload_read_list_and_delete(self) -> None:
         content = "费用审批规则".encode()
@@ -356,6 +412,148 @@ class ObjectStorageTests(unittest.TestCase):
             datasource_service.read_bucket_file(legacy, self.source)[0],
             b"legacy",
         )
+
+    def test_legacy_managed_file_can_be_deleted_without_leaving_its_scope(self) -> None:
+        legacy_key = "ontology-business/migrations/file-buckets/legacy-report.md"
+        body = b"legacy report"
+        uploaded = object_storage_service.put_object(
+            "ontology",
+            legacy_key,
+            body,
+            content_type="text/markdown",
+            sha256=hashlib.sha256(body).hexdigest(),
+        )
+        legacy_url = object_storage_service.stable_object_url("ontology", legacy_key)
+        legacy = BucketFile(
+            id="2" * 32,
+            data_source_id=self.source.id,
+            filename="legacy-report.md",
+            stored_path=legacy_url,
+            storage_provider="minio",
+            bucket_name="ontology",
+            object_key=legacy_key,
+            object_version_id=uploaded.version_id,
+            etag=uploaded.etag,
+            object_url=legacy_url,
+            size=len(body),
+            mime="text/markdown",
+            content_sha256=hashlib.sha256(body).hexdigest(),
+        )
+
+        self.assertEqual(
+            datasource_service.bucket_file_deletion_identity(legacy, self.source),
+            ("minio", "ontology", legacy_key, uploaded.version_id),
+        )
+        self.assertEqual(
+            datasource_service.read_bucket_file(legacy, self.source)[0], body
+        )
+        datasource_service.delete_bucket_file(legacy, self.source)
+        with self.assertRaises(FileNotFoundError):
+            datasource_service.read_bucket_file(legacy, self.source)
+
+        moved_scenario_key = (
+            "ontology-business/tenants/tenant-a/scenarios/retired-scenario/"
+            f"data-sources/{self.source.id}/files/{'6' * 32}/legacy-report.md"
+        )
+        moved_scenario = BucketFile(
+            id="6" * 32,
+            data_source_id=self.source.id,
+            filename="legacy-report.md",
+            stored_path=object_storage_service.stable_object_url(
+                "ontology", moved_scenario_key
+            ),
+            storage_provider="minio",
+            bucket_name="ontology",
+            object_key=moved_scenario_key,
+            object_url=object_storage_service.stable_object_url(
+                "ontology", moved_scenario_key
+            ),
+        )
+        self.assertEqual(
+            datasource_service.bucket_file_deletion_identity(
+                moved_scenario, self.source
+            ),
+            ("minio", "ontology", moved_scenario_key, ""),
+        )
+
+        foreign_key = "ontology-business/tenants/tenant-b/legacy/foreign-report.md"
+        foreign = BucketFile(
+            id="3" * 32,
+            data_source_id=self.source.id,
+            filename="foreign-report.md",
+            stored_path=object_storage_service.stable_object_url(
+                "ontology", foreign_key
+            ),
+            storage_provider="minio",
+            bucket_name="ontology",
+            object_key=foreign_key,
+            object_url=object_storage_service.stable_object_url("ontology", foreign_key),
+        )
+        with self.assertRaisesRegex(ValueError, "作用域"):
+            datasource_service.bucket_file_deletion_identity(foreign, self.source)
+
+        wrong_file_key = (
+            "ontology-business/tenants/tenant-a/scenarios/scenario-a/"
+            f"data-sources/{self.source.id}/files/{'4' * 32}/legacy-report.md"
+        )
+        wrong_file = BucketFile(
+            id="5" * 32,
+            data_source_id=self.source.id,
+            filename="legacy-report.md",
+            stored_path=object_storage_service.stable_object_url(
+                "ontology", wrong_file_key
+            ),
+            storage_provider="minio",
+            bucket_name="ontology",
+            object_key=wrong_file_key,
+            object_url=object_storage_service.stable_object_url(
+                "ontology", wrong_file_key
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "作用域"):
+            datasource_service.bucket_file_deletion_identity(wrong_file, self.source)
+
+        wrong_source_key = (
+            "ontology-business/tenants/tenant-a/scenarios/retired-scenario/"
+            f"data-sources/source-b/files/{'7' * 32}/legacy-report.md"
+        )
+        wrong_source = BucketFile(
+            id="7" * 32,
+            data_source_id=self.source.id,
+            filename="legacy-report.md",
+            stored_path=object_storage_service.stable_object_url(
+                "ontology", wrong_source_key
+            ),
+            storage_provider="minio",
+            bucket_name="ontology",
+            object_key=wrong_source_key,
+            object_url=object_storage_service.stable_object_url(
+                "ontology", wrong_source_key
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "作用域"):
+            datasource_service.bucket_file_deletion_identity(wrong_source, self.source)
+
+    def test_historical_object_identity_rejects_unscoped_foreign_bucket(self) -> None:
+        """A persisted row cannot turn an arbitrary bucket/key into a delete target."""
+        foreign_bucket = "unmanaged-archive"
+        foreign_key = "unscoped/foreign-report.md"
+        foreign_url = object_storage_service.stable_object_url(
+            foreign_bucket, foreign_key
+        )
+        foreign = BucketFile(
+            id="8" * 32,
+            data_source_id=self.source.id,
+            filename="foreign-report.md",
+            stored_path=foreign_url,
+            storage_provider="minio",
+            bucket_name=foreign_bucket,
+            object_key=foreign_key,
+            object_url=foreign_url,
+        )
+
+        with self.assertRaisesRegex(ValueError, "作用域"):
+            datasource_service.bucket_file_deletion_identity(foreign, self.source)
 
     def test_stable_id_keeps_logical_identity_but_never_reuses_object_key(self) -> None:
         stable_id = "a" * 32
@@ -549,7 +747,7 @@ class ObjectStorageTests(unittest.TestCase):
             assistant_router, "_current_user_id", return_value="user-a"
         ), patch.object(
             assistant_router.doc_parser,
-            "parse_bytes",
+            "parse_file",
             return_value={"status": "success", "text": "assistant body", "message": "ok"},
         ), patch.object(
             assistant_router.object_deletion_service,

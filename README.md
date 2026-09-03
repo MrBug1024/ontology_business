@@ -65,7 +65,7 @@ project-root
     │   ├── types/             # 领域类型
     │   ├── styles/            # 全局样式
     │   └── views/             # Scenarios / ScenarioDetail / DataSources / Agents / AgentChat / Tasks / Skills / MCP / LLMConfigs
-    ├── vite.config.ts         # 端口 5173，/api 代理到 127.0.0.1:8001
+    ├── vite.config.ts         # 端口 5173，/api 代理由 VITE_API_PROXY_TARGET 配置
     └── package.json
 ```
 
@@ -103,11 +103,22 @@ npm --prefix .\frontend install
 # 若 npm 11 拦截了 postinstall 脚本：
 npm --prefix .\frontend approve-scripts esbuild vue-demi
 
-# 启动开发服务器（端口 5173，/api 自动代理到 8001）
+# 启动开发服务器（端口 5173；默认 /api 代理到本机 8001）
 npm --prefix .\frontend run dev
 ```
 
+后端位于其他容器或主机时，在启动前设置
+`VITE_API_PROXY_TARGET=http://后端服务名:8001`；生产前端不运行 Vite，而由 Nginx 将同源
+`/api` 转发给 API 容器。
+
 > 打开浏览器访问：http://127.0.0.1:5173
+
+## 生产部署
+
+生产环境使用 PostgreSQL 作为唯一关系型数据库、外部 MinIO 保存文件，并以 Nginx 提供静态
+前端和同源 `/api` 反向代理；不使用 SQLite、`/app/data/platform.db` 或 `vite preview`。完整的
+环境变量、Alembic 迁移顺序、400 MiB 上传限制、API/worker 多进程职责及 Coolify GitHub App
+认证要求见[生产部署手册](./docs/生产部署.md)。
 
 ## 配置说明
 
@@ -257,6 +268,6 @@ npm --prefix .\frontend run build
 
 ## 常见问题
 
-- **需要改后端端口**：同步设置前端环境变量 `VITE_API_PROXY_TARGET`，默认代理目标是 `http://127.0.0.1:8001`。
+- **需要改开发环境后端地址**：设置 `VITE_API_PROXY_TARGET`；它只影响 Vite 开发代理，生产静态前端始终通过 Nginx 的同源 `/api` 访问后端。
 - **npm 11 拦截 postinstall**：执行 `npm approve-scripts esbuild vue-demi`。
 - **LLM 调用失败**：检查 LLM 配置的 API Key 是否真实有效，可在 LLM 配置页点「测试」。

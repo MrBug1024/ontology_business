@@ -1,6 +1,7 @@
 """全局 AI 助手：跨页面上下文、临时附件、草稿生成与确认应用。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import hashlib
@@ -81,6 +82,7 @@ from ..services import (
     scenario_model_draft_service,
     scenario_model_compiler,
     tenant_service,
+    upload_service,
     workflow_service,
 )
 from ..services.auth_service import get_tenant_db
@@ -5892,7 +5894,10 @@ def _assistant_action_preview(
         }
         return analysis, question, f"已定位操作“{action.name}”，补齐参数后才能完成权限检查和预演。"
 
-    definition = runtime_definition_service.resolve_active(
+    # Assistant preview deliberately has no external side effect.  It remains
+    # available while a scenario is being authored; the later execute endpoint
+    # resolves a released definition again before it can mutate anything.
+    definition = runtime_definition_service.resolve_authoring(
         db,
         scenario,
         environment=runtime_connector_service.runtime_environment(),
@@ -6898,77 +6903,86 @@ def delete_thread(
 async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(get_tenant_db)):
     settings = get_settings()
     _purge_expired_attachments(db)
-    content = await file.read()
-    if len(content) > settings.max_upload_bytes:
-        raise HTTPException(413, f"附件超过 {settings.max_upload_bytes // 1024 // 1024}MB 限制")
+    try:
+        staged = await upload_service.stage_upload(
+            file,
+            max_bytes=settings.max_upload_bytes,
+        )
+    except upload_service.UploadTooLargeError as exc:
+        raise HTTPException(413, str(exc)) from exc
 
     try:
         filename = datasource_service.validate_bucket_filename(file.filename or "附件")
     except ValueError as exc:
+        with upload_service.cleanup_staged_upload(staged):
+            pass
         raise HTTPException(400, str(exc)) from exc
-    attachment = AssistantAttachment(
-        id=uuid.uuid4().hex,
-        tenant_id=_tenant(db),
-        created_by_user_id=_current_user_id(db),
-        filename=filename,
-        mime=file.content_type or "application/octet-stream",
-        size=len(content),
-        content_hash=hashlib.sha256(content).hexdigest(),
-        status="pending",
-    )
-    try:
-        upload_claim = (
-            object_deletion_service.prepare_assistant_attachment_upload(
-                attachment
-            )
+    with upload_service.cleanup_staged_upload(staged):
+        attachment = AssistantAttachment(
+            id=uuid.uuid4().hex,
+            tenant_id=_tenant(db),
+            created_by_user_id=_current_user_id(db),
+            filename=filename,
+            mime=file.content_type or "application/octet-stream",
+            size=staged.size,
+            content_hash=staged.sha256,
+            status="pending",
         )
-        with object_deletion_service.heartbeat_upload_intent(
-            upload_claim
-        ) as upload_heartbeat:
-            object_deletion_service.begin_upload_put(upload_claim)
-            datasource_service.save_assistant_attachment_object(
-                attachment,
-                content,
-                upload_object_key=upload_claim.object_key,
+        try:
+            upload_claim = (
+                object_deletion_service.prepare_assistant_attachment_upload(
+                    attachment
+                )
             )
-            object_deletion_service.assert_upload_active(
-                upload_heartbeat, upload_claim, attachment
+            with object_deletion_service.heartbeat_upload_intent(
+                upload_claim
+            ) as upload_heartbeat:
+                object_deletion_service.begin_upload_put(upload_claim)
+                datasource_service.save_assistant_attachment_file(
+                    attachment,
+                    staged.path,
+                    size=staged.size,
+                    content_sha256=staged.sha256,
+                    upload_object_key=upload_claim.object_key,
+                )
+                object_deletion_service.assert_upload_active(
+                    upload_heartbeat, upload_claim, attachment
+                )
+        except Exception as exc:  # noqa: BLE001 - storage service exposes safe errors.
+            raise HTTPException(503, "助手附件对象存储写入失败") from exc
+        try:
+            db.add(attachment)
+            object_deletion_service.retain_assistant_attachment_upload(
+                db, upload_claim, attachment
             )
-    except Exception as exc:  # noqa: BLE001 - storage service exposes safe errors.
-        raise HTTPException(503, "助手附件对象存储写入失败") from exc
-    try:
-        db.add(attachment)
-        object_deletion_service.retain_assistant_attachment_upload(
-            db, upload_claim, attachment
-        )
-        db.flush()
-        parsed = doc_parser.parse_bytes(content, filename)
-        attachment.status = "parsed" if parsed.get("status") == "success" else "error"
-        parsed_text = str(parsed.get("text") or "")
-        if attachment.status == "parsed" and len(parsed_text) > ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS:
-            raise HTTPException(
-                413,
-                f"附件“{filename}”解析出 {len(parsed_text)} 个字符，超过单份临时附件"
-                f" {ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS} 个字符的明确边界；"
-                "系统不会静默截断文档，请拆分文件后重新上传。",
-            )
-        attachment.parsed_text = parsed_text
-        attachment.error = "" if attachment.status == "parsed" else str(parsed.get("message") or "解析失败")
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        if isinstance(
-            exc,
-            object_deletion_service.UploadIntentLeaseLostError,
-        ):
-            object_deletion_service.schedule_abandoned_upload_best_effort(
-                upload_claim,
-                attachment,
-            )
-        # The independent upload intent is authoritative after an ambiguous
-        # commit response: its worker retains a committed reference or removes
-        # every object version when no metadata transaction became durable.
-        raise
+            db.flush()
+            parsed = await asyncio.to_thread(doc_parser.parse_file, staged.path, filename)
+            attachment.status = "parsed" if parsed.get("status") == "success" else "error"
+            parsed_text = str(parsed.get("text") or "")
+            if attachment.status == "parsed" and len(parsed_text) > ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS:
+                raise HTTPException(
+                    413,
+                    f"附件“{filename}”解析出 {len(parsed_text)} 个字符，超过单份临时附件"
+                    f" {ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS} 个字符的明确边界；"
+                    "系统不会静默截断文档，请拆分文件后重新上传。",
+                )
+            attachment.parsed_text = parsed_text
+            attachment.error = "" if attachment.status == "parsed" else str(parsed.get("message") or "解析失败")
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            if isinstance(
+                exc,
+                object_deletion_service.UploadIntentLeaseLostError,
+            ):
+                object_deletion_service.schedule_abandoned_upload_best_effort(
+                    upload_claim,
+                    attachment,
+                )
+            # The independent upload intent is authoritative after an ambiguous
+            # commit response: its worker retains a committed reference or removes
+            # every object version when no metadata transaction became durable.
+            raise
     db.refresh(attachment)
     return attachment
 

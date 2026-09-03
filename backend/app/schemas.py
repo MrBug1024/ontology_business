@@ -66,6 +66,53 @@ class AuthMessage(Msg):
     email: str = ""
 
 
+class OrganizationRoleOut(BaseModel):
+    key: Literal["owner", "admin", "operator", "viewer"]
+    name: str
+    description: str = ""
+
+
+class OrganizationMemberOut(BaseModel):
+    id: str
+    user_id: str
+    email: str
+    display_name: str = ""
+    role_key: Literal["owner", "admin", "operator", "viewer"]
+    role_name: str = ""
+    status: Literal["active", "invited", "disabled"]
+    email_verified: bool = False
+    created_at: datetime
+
+
+class OrganizationUserCreateIn(BaseModel):
+    email: str
+    display_name: str = Field(default="", max_length=120)
+    password: str = Field(min_length=8, max_length=128)
+    password_confirm: str
+    role_key: Literal["owner", "admin", "operator", "viewer"] = "operator"
+    # Only an organization owner may skip email verification.  It exists for
+    # initial account provisioning when SMTP is not yet configured.
+    activate_immediately: bool = False
+
+
+class OrganizationInvitationIn(BaseModel):
+    email: str
+    display_name: str = Field(default="", max_length=120)
+    role_key: Literal["owner", "admin", "operator", "viewer"] = "operator"
+
+
+class OrganizationInvitationAcceptIn(BaseModel):
+    email: str
+    code: str = Field(min_length=6, max_length=6)
+    password: str = Field(min_length=8, max_length=128)
+    password_confirm: str
+    display_name: str = Field(default="", max_length=120)
+
+
+class OrganizationMemberRoleIn(BaseModel):
+    role_key: Literal["owner", "admin", "operator", "viewer"]
+
+
 # ──────────────────────────────────────────────
 # 本体
 # ──────────────────────────────────────────────

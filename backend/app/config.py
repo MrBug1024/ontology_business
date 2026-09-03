@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     minio_aliyun_access_key_secret: str = ""
     minio_aliyun_file_path: str = ""
     minio_bucketname: str = ""
+    minio_request_timeout_seconds: int = Field(default=20, ge=3, le=300)
     # A durable upload intent protects the process-crash window between MinIO
     # PUT and the authoritative PostgreSQL metadata commit. Requests must
     # finish inside this generous lease or fail closed when the worker claims it.
@@ -107,7 +108,14 @@ class Settings(BaseSettings):
     # A job that reaches this limit fails closed and is not retried under the
     # same execution fingerprint.
     scenario_model_max_llm_calls: int = 24
-    max_upload_bytes: int = 50 * 1024 * 1024
+    # Keep this value aligned with the reverse proxy's ``client_max_body_size``.
+    # The API still enforces it itself because callers may reach the API service
+    # without passing through the web gateway.
+    max_upload_bytes: int = Field(
+        default=400 * 1024 * 1024,
+        ge=1 * 1024 * 1024,
+        le=4 * 1024 * 1024 * 1024,
+    )
     allow_unsafe_workflow_nodes: bool = False
     # HTTP Action 默认只允许公网 HTTPS 目标。开发环境如确有受控本地模拟端点，
     # 必须由部署配置显式开启，不能由 API 请求覆盖。
@@ -124,17 +132,41 @@ class Settings(BaseSettings):
     # Production deployments should set the public URL and exact proxy Host.
     agent_mcp_public_url: str = ""
     agent_mcp_allowed_hosts: str = "localhost,localhost:*,127.0.0.1,127.0.0.1:*,testserver"
+    # Shared by every API worker to sign server-issued MCP transport session
+    # identifiers.  Leave empty only for a deterministic compatibility
+    # fallback derived from the private database URL; production should set a
+    # dedicated high-entropy secret in its secret manager.
+    agent_mcp_session_signing_key: str = ""
+    # A published MCP turn can take longer than one HTTP request, but it must
+    # never monopolize its external conversation forever after a worker crash.
+    # The lease is renewed while healthy and capped by the absolute deadline.
+    agent_mcp_turn_lease_seconds: int = Field(default=90, ge=15, le=600)
+    agent_mcp_turn_wait_seconds: int = Field(default=30, ge=1, le=300)
+    agent_mcp_turn_max_seconds: int = Field(default=900, ge=60, le=3600)
 
     # A process is deployed to exactly one governed runtime environment.  This
     # value is deliberately server-side: callers cannot select prod/staging by
     # adding a request parameter to an Action or workflow invocation.
     runtime_environment: Literal["dev", "staging", "prod"] = "dev"
 
+    # Durable jobs are claimed in PostgreSQL.  API workers may run the loops in
+    # local development, but production should use one dedicated worker process.
+    # A PostgreSQL advisory lock remains a second line of defence when a process
+    # is accidentally replicated.
+    run_background_workers: bool = True
+    background_worker_poll_seconds: float = Field(default=1.0, ge=0.2, le=60.0)
+    assistant_recovery_poll_seconds: float = Field(default=10.0, ge=1.0, le=300.0)
+
     # Authentication / mail
     auth_cookie_name: str = "ontology_session"
     auth_cookie_secure: bool = False
     auth_session_days: int = 7
     verification_code_minutes: int = 10
+    invitation_code_minutes: int = Field(default=7 * 24 * 60, ge=10, le=30 * 24 * 60)
+    # A six-digit email code remains compatible with the existing clients, so
+    # failed guesses must be durably bounded across resend attempts.
+    verification_code_max_attempts: int = Field(default=5, ge=1, le=20)
+    verification_code_lock_minutes: int = Field(default=30, ge=1, le=24 * 60)
     mail_username: str = ""
     mail_password: str = ""
     mail_from: str = ""
@@ -147,6 +179,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def resolve_database_url(self) -> "Settings":
+        if self.mail_starttls and self.mail_ssl_tls:
+            raise ValueError("MAIL_STARTTLS 与 MAIL_SSL_TLS 不能同时启用")
+        if self.agent_mcp_turn_max_seconds < self.agent_mcp_turn_lease_seconds:
+            raise ValueError("AGENT_MCP_TURN_MAX_SECONDS 不能小于单次租约时长")
         explicit_url = self.database_url.strip()
         if explicit_url:
             if make_url(explicit_url).get_backend_name() != "postgresql":

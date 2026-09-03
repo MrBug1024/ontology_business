@@ -9,7 +9,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import AuthSession, EmailVerificationCode, Tenant, User
+from ..models import AuthSession, EmailVerificationCode, OrganizationMember, Tenant, User
 from ..schemas import (
     AuthMessage,
     ForgotPasswordIn,
@@ -58,18 +58,11 @@ def _can_manage_tenant(db: Session, user: User) -> bool:
 
 
 def _find_code(db: Session, user: User, code: str, purpose: str) -> EmailVerificationCode:
-    now = auth_service.utc_now()
-    record = db.execute(
-        select(EmailVerificationCode)
-        .where(
-            EmailVerificationCode.user_id == user.id,
-            EmailVerificationCode.purpose == purpose,
-            EmailVerificationCode.used_at.is_(None),
-            EmailVerificationCode.expires_at > now,
-        )
-        .order_by(EmailVerificationCode.created_at.desc())
-    ).scalars().first()
-    if not record or record.code_hash != auth_service._hash_code(code):
+    record = auth_service.find_valid_email_code(db, user, code, purpose)
+    if not record:
+        # Failed-attempt counters are security state. They must survive the
+        # HTTP exception rather than being rolled back when the request closes.
+        db.commit()
         raise HTTPException(400, "验证码不正确或已失效")
     return record
 
@@ -82,32 +75,32 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
         raise HTTPException(400, "两次输入的密码不一致")
 
     user = db.execute(select(User).where(User.email == email)).scalars().first()
-    if user and user.status == "active":
-        raise HTTPException(409, "该邮箱已注册，请直接登录")
+    if user:
+        # Registration is intentionally not an account-recovery mechanism.
+        # In particular, a disabled account must never regain access by simply
+        # re-verifying its own email address.  Administrators use the scoped
+        # organization invitation/re-enable flow instead.
+        if user.status == "disabled":
+            raise HTTPException(403, "该账户已被禁用，请联系工作区管理员")
+        raise HTTPException(409, "该邮箱已注册，请登录或重发验证码")
 
     first_user = db.execute(select(User.id)).first() is None
     created_tenant = False
-    if not user:
-        tenant = Tenant(name=f"{payload.display_name.strip() or email.split('@')[0]} 的工作区")
-        db.add(tenant)
-        db.flush()
-        created_tenant = True
-        user = User(
-            tenant_id=tenant.id,
-            email=email,
-            display_name=payload.display_name.strip() or email.split("@")[0],
-            password_hash=auth_service.hash_password(payload.password),
-            status="pending",
-        )
-        db.add(user)
-        db.flush()
-        if first_user:
-            auth_service.claim_legacy_resources(db, tenant.id)
-    else:
-        user.password_hash = auth_service.hash_password(payload.password)
-        user.display_name = payload.display_name.strip() or user.display_name
-        user.status = "pending"
-        user.email_verified_at = None
+    tenant = Tenant(name=f"{payload.display_name.strip() or email.split('@')[0]} 的工作区")
+    db.add(tenant)
+    db.flush()
+    created_tenant = True
+    user = User(
+        tenant_id=tenant.id,
+        email=email,
+        display_name=payload.display_name.strip() or email.split("@")[0],
+        password_hash=auth_service.hash_password(payload.password),
+        status="pending",
+    )
+    db.add(user)
+    db.flush()
+    if first_user:
+        auth_service.claim_legacy_resources(db, tenant.id)
 
     # 新租户创建者立即成为 owner；升级前已有同租户用户由服务统一回填为 owner/admin。
     permission_service.ensure_organization(
@@ -117,13 +110,13 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     )
 
     code = auth_service.issue_email_code(db, user, "register")
-    db.commit()
     try:
         auth_service.send_verification_email(email, code, "register")
     except Exception:  # noqa: BLE001
         db.rollback()
         logger.exception("注册验证码邮件发送失败（邮箱域名=%s）", email.rsplit("@", 1)[-1])
         raise HTTPException(503, "验证码邮件发送失败，请稍后重试")
+    db.commit()
     return AuthMessage(message="验证码已发送，请查收邮件", email=email)
 
 
@@ -131,12 +124,18 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
 def verify_email(payload: VerifyEmailIn, db: Session = Depends(get_db)):
     email = auth_service.normalize_email(payload.email)
     user = db.execute(select(User).where(User.email == email)).scalars().first()
-    if not user:
+    if not user or user.status != "pending":
         raise HTTPException(400, "验证码不正确或已失效")
     record = _find_code(db, user, payload.code, "register")
+    member = db.execute(
+        select(OrganizationMember).where(OrganizationMember.user_id == user.id)
+    ).scalars().first()
+    if not member or member.status != "active":
+        raise HTTPException(403, "当前用户没有有效组织成员身份")
     record.used_at = datetime.now(timezone.utc)
     user.status = "active"
     user.email_verified_at = datetime.now(timezone.utc)
+    member.status = "active"
     db.commit()
     return AuthMessage(message="邮箱验证成功，请登录", email=email)
 
@@ -145,16 +144,23 @@ def verify_email(payload: VerifyEmailIn, db: Session = Depends(get_db)):
 def resend_code(payload: ResendCodeIn, db: Session = Depends(get_db)):
     email = auth_service.normalize_email(payload.email)
     user = db.execute(select(User).where(User.email == email)).scalars().first()
-    if not user or user.status == "active":
+    if not user or user.status != "pending":
+        return AuthMessage(message="如果该邮箱需要验证，新的验证码已发送", email=email)
+    member = db.execute(
+        select(OrganizationMember).where(OrganizationMember.user_id == user.id)
+    ).scalars().first()
+    if not member or member.status != "active":
+        # Invitations have a dedicated acceptance path so a public resend does
+        # not mutate their purpose or turn a disabled membership active.
         return AuthMessage(message="如果该邮箱需要验证，新的验证码已发送", email=email)
     code = auth_service.issue_email_code(db, user, "register")
-    db.commit()
     try:
         auth_service.send_verification_email(email, code, "register")
     except Exception:  # noqa: BLE001
         db.rollback()
         logger.exception("重发注册验证码邮件失败（邮箱域名=%s）", email.rsplit("@", 1)[-1])
         raise HTTPException(503, "验证码邮件发送失败，请稍后重试")
+    db.commit()
     return AuthMessage(message="新的验证码已发送", email=email)
 
 
@@ -164,6 +170,8 @@ def login(payload: LoginIn, response: Response, db: Session = Depends(get_db)):
     user = db.execute(select(User).where(User.email == email)).scalars().first()
     if not user or not auth_service.verify_password(payload.password, user.password_hash):
         raise HTTPException(401, "邮箱或密码不正确")
+    if user.status == "disabled":
+        raise HTTPException(403, "账户已被禁用，请联系工作区管理员")
     if user.status != "active":
         raise HTTPException(403, "请先完成邮箱验证")
     auth_service.set_session_cookie(response, user, db)
@@ -188,13 +196,13 @@ def forgot_password(payload: ForgotPasswordIn, db: Session = Depends(get_db)):
     if not user:
         return AuthMessage(message="如果该邮箱已注册，重置验证码已发送", email=email)
     code = auth_service.issue_email_code(db, user, "password_reset")
-    db.commit()
     try:
         auth_service.send_verification_email(email, code, "password_reset")
     except Exception:  # noqa: BLE001
         db.rollback()
         logger.exception("重置密码验证码邮件发送失败（邮箱域名=%s）", email.rsplit("@", 1)[-1])
         raise HTTPException(503, "验证码邮件发送失败，请稍后重试")
+    db.commit()
     return AuthMessage(message="重置验证码已发送", email=email)
 
 

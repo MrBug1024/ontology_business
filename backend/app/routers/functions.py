@@ -50,7 +50,9 @@ def run_function(
         db, live_function.scenario_id, writable=True
     )
     try:
-        definition = runtime_definition_service.resolve_active(
+        # Deterministic functions are safe to exercise while authoring.  The
+        # deployment release boundary is reserved for effectful runtimes.
+        definition = runtime_definition_service.resolve_authoring(
             db,
             scenario,
             environment=runtime_connector_service.runtime_environment(),

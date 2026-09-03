@@ -8,13 +8,12 @@ from unittest.mock import patch
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
 
 from app.config import get_settings
-from app import database
 from app.database import Base, get_db
 from app.models import (
     Agent,
@@ -33,6 +32,7 @@ from app.models import (
     Message,
     OrganizationMember,
     OntologyEntity,
+    OntologyRelease,
     OntologyRelation,
     Skill,
     Tenant,
@@ -42,6 +42,10 @@ from app.routers import agents, assistant, data_sources, llm_configs, mcp, scena
 from app.services import datasource_service, permission_service
 from app.services import auth_service
 from app.services.auth_service import get_current_user, get_tenant_db
+from tests.postgresql_migration_contracts import (
+    baseline_table_ddl,
+    render_postgresql_upgrade,
+)
 
 
 class SecurityAclRegressionTests(unittest.TestCase):
@@ -644,6 +648,60 @@ class SecurityAclRegressionTests(unittest.TestCase):
         self.assertNotIn('"type": "error"', response.text)
         self.assertIn("关系运行时可用", response.text)
 
+    def test_prod_browser_agent_chat_uses_authoring_definition_before_release(self) -> None:
+        """Deployment labels cannot turn an unreleased browser chat into 409."""
+        db = self.Session()
+        try:
+            llm = LLMConfig(
+                id="llm-security-prod-authoring",
+                tenant_id=self.tenant.id,
+                name="生产作者聊天模型",
+                provider="openai",
+                model="test-model",
+                capabilities=["chat", "tool"],
+                enabled=True,
+            )
+            db.get(Agent, self.agent.id).llm_config_id = llm.id
+            db.add(llm)
+            db.commit()
+            self.assertIsNone(
+                db.scalar(
+                    select(OntologyRelease.id)
+                    .where(OntologyRelease.scenario_id == self.scenario.id)
+                    .limit(1)
+                )
+            )
+        finally:
+            db.close()
+
+        seen_contexts: list[object] = []
+
+        def inspect_runtime(*_args, **kwargs):
+            context = kwargs["runtime_context"]
+            seen_contexts.append(context)
+            assert context.runtime_definition.source == "live"
+            assert context.runtime_definition.environment == "prod"
+            yield {"type": "token", "data": "新场景可正常对话"}
+            yield {"type": "done", "data": "新场景可正常对话"}
+
+        with (
+            patch(
+                "app.services.runtime_connector_service.get_settings",
+                return_value=SimpleNamespace(runtime_environment="prod"),
+            ),
+            patch.object(agents, "SessionLocal", self.Session),
+            patch.object(agents.agent_engine, "run_agent", inspect_runtime),
+        ):
+            response = self.client.post(
+                f"/api/agents/{self.agent.id}/chat",
+                json={"message": "请介绍当前场景"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn('"type": "error"', response.text)
+        self.assertIn("新场景可正常对话", response.text)
+        self.assertEqual(len(seen_contexts), 1)
+
     def test_revoked_agent_binding_preserves_snapshot_but_filters_llm_replay(self) -> None:
         visible_marker = "VISIBLE_DURABLE_ANSWER"
         raw_result_marker = "STALE_BOUND_SOURCE_TOOL_RESULT"
@@ -1029,36 +1087,18 @@ class SecurityAclRegressionTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_conversation_ownership_migration_preserves_legacy_rows_as_unowned(self) -> None:
-        """An old transcript gets the field/index but no guessed owner backfill."""
-        migration_engine = create_engine("sqlite:///:memory:")
-        try:
-            with migration_engine.begin() as conn:
-                conn.exec_driver_sql(
-                    "CREATE TABLE conversations ("
-                    "id VARCHAR(32) PRIMARY KEY, agent_id VARCHAR(32), title VARCHAR(300)"
-                    ")"
-                )
-                conn.exec_driver_sql(
-                    "INSERT INTO conversations (id, agent_id, title) "
-                    "VALUES ('legacy-conversation', 'agent-legacy', '旧对话')"
-                )
-            original_engine = database.engine
-            database.engine = migration_engine
-            try:
-                database._migrate_conversation_ownership()
-            finally:
-                database.engine = original_engine
-
-            with migration_engine.connect() as conn:
-                owner = conn.exec_driver_sql(
-                    "SELECT created_by_user_id FROM conversations WHERE id = 'legacy-conversation'"
-                ).scalar_one()
-            self.assertIsNone(owner)
-            index_names = {index["name"] for index in inspect(migration_engine).get_indexes("conversations")}
-            self.assertIn("ix_conversations_created_by_user_id", index_names)
-        finally:
-            migration_engine.dispose()
+    def test_conversation_ownership_schema_keeps_owner_optional(self) -> None:
+        ddl = baseline_table_ddl("conversations")
+        self.assertIn("created_by_user_id VARCHAR(32),", ddl)
+        self.assertIn(
+            "FOREIGN KEY(created_by_user_id) REFERENCES users (id) ON DELETE SET NULL",
+            ddl,
+        )
+        self.assertIn(
+            "CREATE INDEX ix_conversations_created_by_user_id "
+            "ON conversations (created_by_user_id)",
+            render_postgresql_upgrade("20260827_01"),
+        )
 
 
 if __name__ == "__main__":

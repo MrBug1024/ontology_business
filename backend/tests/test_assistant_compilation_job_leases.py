@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
 
-from sqlalchemy import create_engine, event, inspect
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import database
 from app.database import Base
 from app.models import (
     AssistantCompilationJob,
@@ -23,6 +20,10 @@ from app.models import (
     User,
 )
 from app.services import assistant_compilation_job_service as job_service
+from tests.postgresql_migration_contracts import (
+    baseline_table_ddl,
+    render_postgresql_upgrade,
+)
 
 
 class AssistantCompilationJobLeaseTests(unittest.TestCase):
@@ -517,58 +518,20 @@ class AssistantCompilationJobLeaseTests(unittest.TestCase):
         )
 
 
-class AssistantCompilationJobLeaseMigrationTests(unittest.TestCase):
-    def test_legacy_rows_receive_safe_restart_defaults_idempotently(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-            path = Path(temp_dir) / "legacy-compilation-jobs.sqlite3"
-            engine = create_engine(f"sqlite:///{path.as_posix()}")
-            with engine.begin() as connection:
-                connection.exec_driver_sql(
-                    "CREATE TABLE assistant_compilation_jobs ("
-                    "id VARCHAR(32) PRIMARY KEY, "
-                    "request_fingerprint VARCHAR(64), "
-                    "status VARCHAR(20), "
-                    "created_at TIMESTAMP)"
-                )
-                connection.exec_driver_sql(
-                    "INSERT INTO assistant_compilation_jobs "
-                    "(id, request_fingerprint, status, created_at) VALUES "
-                    "('legacy-job', 'legacy-fingerprint', 'running', CURRENT_TIMESTAMP)"
-                )
-            with patch.object(database, "engine", engine):
-                database._migrate_assistant_compilation_jobs()
-                database._migrate_assistant_compilation_jobs()
-
-            inspector = inspect(engine)
-            columns = {
-                item["name"]
-                for item in inspector.get_columns("assistant_compilation_jobs")
-            }
-            self.assertTrue({
-                "execution_input",
-                "lease_token",
-                "lease_expires_at",
-                "lease_attempt",
-            } <= columns)
-            indexes = {
-                item.get("name")
-                for item in inspector.get_indexes("assistant_compilation_jobs")
-            }
-            self.assertIn(
-                "ix_assistant_compilation_jobs_status_lease_expiry",
-                indexes,
-            )
-            with engine.connect() as connection:
-                row = connection.exec_driver_sql(
-                    "SELECT execution_input, lease_token, lease_expires_at, "
-                    "lease_attempt FROM assistant_compilation_jobs "
-                    "WHERE id = 'legacy-job'"
-                ).one()
-            self.assertEqual(json.loads(row.execution_input), {})
-            self.assertEqual(row.lease_token, "")
-            self.assertIsNone(row.lease_expires_at)
-            self.assertEqual(row.lease_attempt, 0)
-            engine.dispose()
+class AssistantCompilationJobLeaseMigrationContractsTests(unittest.TestCase):
+    def test_postgresql_baseline_declares_restart_safe_leases(self) -> None:
+        ddl = baseline_table_ddl("assistant_compilation_jobs")
+        self.assertIn("execution_input JSON NOT NULL", ddl)
+        self.assertIn("lease_token VARCHAR(64) NOT NULL", ddl)
+        self.assertIn("lease_expires_at TIMESTAMP WITH TIME ZONE", ddl)
+        self.assertIn("lease_attempt INTEGER NOT NULL", ddl)
+        self.assertIn("result JSON NOT NULL", ddl)
+        schema_sql = render_postgresql_upgrade("20260827_01")
+        self.assertIn(
+            "CREATE INDEX ix_assistant_compilation_jobs_status_lease_expiry "
+            "ON assistant_compilation_jobs (status, lease_expires_at)",
+            schema_sql,
+        )
 
 
 if __name__ == "__main__":

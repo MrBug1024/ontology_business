@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -51,10 +51,31 @@ _HISTORIC_MODEL_REPLAY_PLACEHOLDER = (
 )
 
 
+def _context_unavailable_message(
+    definition_mode: Literal["authoring", "execution"] = "authoring",
+) -> str:
+    if definition_mode == "execution":
+        return "Agent 已发布执行定义或环境连接器不完整，已阻止执行"
+    return "Agent 当前业务上下文或连接器配置不完整，已阻止对话"
+
+
 def _stream_error_content(content: str, error: object) -> str:
     """Match the browser's durable rendering for a failed SSE turn."""
     separator = "\n\n" if content else ""
     return f"{content}{separator}[错误] {error}"
+
+
+def _assert_agent_turn_lease(db: Session) -> None:
+    """Fail closed when a published MCP worker lost its database turn lease.
+
+    Browser/SSE calls do not set this optional guard.  The MCP service owns
+    the concrete lease implementation, keeping this router independent from
+    the publication adapter and avoiding an import cycle.
+    """
+    guard = db.info.get("agent_mcp_turn_lease_guard")
+    assert_active = getattr(guard, "assert_active", None)
+    if callable(assert_active):
+        assert_active()
 
 
 def _current_user_id(db: Session) -> str:
@@ -150,6 +171,53 @@ def _agent_requires_tool_capability(
     return agent_capability_service.scope_has_business_tools(capability_scope)
 
 
+def _context_requires_tools(
+    db: Session,
+    agent: Agent,
+    *,
+    runtime_context: agent_engine.AgentContext | None = None,
+) -> bool:
+    """Use the same tool-capability decision for readiness and invocation."""
+    build_tools = getattr(runtime_context, "build_tools", None)
+    if callable(build_tools):
+        return bool(build_tools())
+    return _agent_requires_tool_capability(
+        db,
+        scenario_id=agent.scenario_id,
+        data_source_ids=agent.data_source_ids,
+        capability_scope=agent.capability_scope,
+    )
+
+
+def _resolve_agent_llm(
+    db: Session,
+    agent: Agent,
+    *,
+    requires_tools: bool,
+) -> tuple[LLMConfig | None, str | None]:
+    """Resolve exactly the model an Agent turn is allowed to use.
+
+    An explicit binding never silently falls back to another model.  Agents
+    without a binding may use the tenant's normal default routing, which is
+    how the chat endpoints have always intended to work.
+    """
+    if agent.llm_config_id:
+        llm = tenant_service.get_visible(db, LLMConfig, agent.llm_config_id)
+        if not llm or not llm_service.supports_capability(llm, "chat"):
+            return None, "Agent 绑定的 LLM 不可用或未启用聊天能力，请重新配置"
+        if requires_tools and not llm_service.supports_capability(llm, "tool"):
+            return None, "Agent 需要工具调用，但绑定的 LLM 未启用工具能力"
+        return llm, None
+
+    candidates = llm_service.routable_configs(
+        db,
+        "tool" if requires_tools else "chat",
+    )
+    if candidates:
+        return candidates[0], None
+    return None, "请先为 Agent 配置 LLM（或设置默认 LLM）"
+
+
 def _agent_readiness_missing(
     db: Session,
     agent: Agent,
@@ -213,7 +281,16 @@ def _agent_readiness_missing(
         has_bound_mapping = bool(mapped_source_ids.intersection(agent.data_source_ids or []))
     if not has_mapping:
         missing.append("数据映射")
-    if not agent.llm_config_id:
+    _llm, llm_error = _resolve_agent_llm(
+        db,
+        agent,
+        requires_tools=_context_requires_tools(
+            db,
+            agent,
+            runtime_context=runtime_context,
+        ),
+    )
+    if llm_error:
         missing.append("对话模型")
     if not has_bound_mapping:
         missing.append("映射数据绑定")
@@ -291,15 +368,26 @@ def _authorization_context(
     db: Session,
     agent: Agent,
     llm: LLMConfig | None = None,
+    *,
+    definition_mode: Literal["authoring", "execution"] = "authoring",
 ) -> agent_engine.AgentContext | None:
-    """Build the exact current runtime/ACL view used for historic replay."""
+    """Build one ACL-safe authoring or published-execution Agent view."""
     try:
         return agent_engine.AgentContext(
             db,
             agent,
             llm or LLMConfig(name="历史权限校验"),
+            definition_mode=definition_mode,
         )
-    except Exception:  # noqa: BLE001 - missing release/binding must fail closed.
+    except (
+        agent_capability_service.AgentCapabilityScopeError,
+        PermissionError,
+        runtime_connector_service.RuntimeConnectorError,
+        runtime_definition_service.RuntimeDefinitionError,
+    ):
+        # These are expected setup failures and callers turn them into a
+        # controlled readiness response. Do not hide programming/database
+        # failures behind a misleading “missing release” 409.
         return None
 
 
@@ -494,7 +582,7 @@ def _out(a: Agent, db: Session) -> AgentOut:
         definition_error = "尚未绑定业务场景"
     else:
         try:
-            definition = runtime_definition_service.resolve_active(
+            definition = runtime_definition_service.resolve_authoring(
                 db,
                 scenario,
                 environment=runtime_connector_service.runtime_environment(),
@@ -586,7 +674,7 @@ def _validate_bindings(
                 definition=None,
             )
         elif needs_capability_definition:
-            definition = runtime_definition_service.resolve_active(
+            definition = runtime_definition_service.resolve_authoring(
                 db,
                 scenario,
                 environment=runtime_connector_service.runtime_environment(),
@@ -637,7 +725,7 @@ def get_agent_capability_catalog(
     scenario = tenant_service.require_scenario(db, scenario_id)
     permission_service.require_scenario_permission(db, scenario, "read")
     try:
-        definition = runtime_definition_service.resolve_active(
+        definition = runtime_definition_service.resolve_authoring(
             db,
             scenario,
             environment=runtime_connector_service.runtime_environment(),
@@ -675,6 +763,8 @@ def create_agent(payload: AgentIn, db: Session = Depends(get_tenant_db)):
     )
     a = Agent(
         tenant_id=tenant_service.current_tenant_id(db),
+        created_by_user_id=_current_user_id(db),
+        owner_user_id=_current_user_id(db),
         **payload.model_dump(exclude={"capability_scope"}),
         capability_scope=capability_scope,
     )
@@ -837,14 +927,14 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
         conv = _conversation(db, payload.conversation_id)
         if conv.agent_id != agent_id:
             raise HTTPException(400, "对话不属于当前 Agent")
-    # Resolve exactly one definition before inspecting readiness or selecting a
-    # model.  In staging/prod those decisions must use the active release and
-    # environment-resolved connectors, never mutable live authoring rows.
+    # In-platform chat is authoring work: production/development selects
+    # infrastructure only and cannot require a release before a user may
+    # inspect, debug or discuss a newly created scene.
     history_context = _authorization_context(db, a)
     if history_context is None:
         raise HTTPException(
             409,
-            "Agent 当前运行定义、发布快照或环境连接器不完整，已阻止对话",
+            _context_unavailable_message(),
         )
     missing = _agent_readiness_missing(db, a, runtime_context=history_context)
     if missing:
@@ -852,18 +942,19 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
             409,
             "Agent 尚未就绪，请先完成：" + "、".join(missing),
         )
-    requires_tools = bool(history_context.build_tools())
-    if a.llm_config_id:
-        llm = tenant_service.get_visible(db, LLMConfig, a.llm_config_id)
-        if not llm or not llm_service.supports_capability(llm, "chat"):
-            raise HTTPException(409, "Agent 绑定的 LLM 不可用或未启用聊天能力，请重新配置")
-        if requires_tools and not llm_service.supports_capability(llm, "tool"):
-            raise HTTPException(409, "Agent 需要工具调用，但绑定的 LLM 未启用工具能力")
-    else:
-        candidates = llm_service.routable_configs(db, "tool" if requires_tools else "chat")
-        llm = candidates[0] if candidates else None
+    llm, llm_error = _resolve_agent_llm(
+        db,
+        a,
+        requires_tools=_context_requires_tools(
+            db,
+            a,
+            runtime_context=history_context,
+        ),
+    )
     if not llm:
-        raise HTTPException(400, "请先为 Agent 配置 LLM（或设置默认 LLM）")
+        # A model can be disabled between the readiness check and invocation.
+        # Preserve a deterministic response for that narrow race.
+        raise HTTPException(409 if a.llm_config_id else 400, llm_error)
     history_context.llm = llm
 
     if not conv:
@@ -890,6 +981,35 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
     db.add(current_user_message)
     db.commit()
     current_user_message_id = str(current_user_message.id)
+
+    text_confirmation = agent_confirmation_service.confirm_text_reply(
+        db,
+        agent=a,
+        conversation=conv,
+        text=payload.message,
+    )
+    if text_confirmation is not None:
+        confirmation_message = str(text_confirmation.get("message") or "确认结果已记录。")
+        db.add(
+            Message(
+                conversation_id=conv.id,
+                role="assistant",
+                content=confirmation_message,
+                stream_finalized=True,
+            )
+        )
+        db.commit()
+
+        def confirmation_stream():
+            if isinstance(text_confirmation.get("response"), dict):
+                yield f"data: {json.dumps({'type': 'confirmation', 'data': text_confirmation}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'token', 'data': confirmation_message}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            confirmation_stream(),
+            media_type="text/event-stream",
+        )
 
     conv_id = conv.id
     trace_context = {
@@ -966,7 +1086,7 @@ def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_d
             stream_agent = _agent(stream_db, agent_id)
             stream_context = _authorization_context(stream_db, stream_agent)
             if stream_context is None:
-                raise RuntimeError("Agent 当前运行定义、发布快照或环境连接器不完整，已阻止对话")
+                raise RuntimeError(_context_unavailable_message())
             stream_missing = _agent_readiness_missing(
                 stream_db,
                 stream_agent,
@@ -1082,6 +1202,8 @@ def invoke_agent_once(
     message: str,
     conversation_id: str | None,
     db: Session,
+    runtime_context: agent_engine.AgentContext | None = None,
+    definition_mode: Literal["authoring", "execution"] = "authoring",
 ) -> dict[str, Any]:
     """Run one durable Agent turn for a non-browser transport.
 
@@ -1090,6 +1212,7 @@ def invoke_agent_once(
     Only the transport envelope differs: this function returns one structured
     result instead of yielding SSE frames.
     """
+    _assert_agent_turn_lease(db)
     a = _agent(db, agent_id)
     conv = None
     if conversation_id:
@@ -1097,25 +1220,32 @@ def invoke_agent_once(
         if conv.agent_id != agent_id:
             raise HTTPException(400, "对话不属于当前 Agent")
 
-    runtime_context = _authorization_context(db, a)
-    if runtime_context is None:
-        raise HTTPException(409, "Agent 当前运行定义、发布快照或环境连接器不完整，已阻止对话")
-    missing = _agent_readiness_missing(db, a, runtime_context=runtime_context)
+    resolved_context = runtime_context or _authorization_context(
+        db,
+        a,
+        definition_mode=definition_mode,
+    )
+    if resolved_context is None:
+        raise HTTPException(409, _context_unavailable_message(definition_mode))
+    if resolved_context.db is not db or resolved_context.agent.id != a.id:
+        raise HTTPException(409, "Agent 运行上下文与当前调用不一致")
+    missing = _agent_readiness_missing(db, a, runtime_context=resolved_context)
     if missing:
         raise HTTPException(409, "Agent 尚未就绪，请先完成：" + "、".join(missing))
-    requires_tools = bool(runtime_context.build_tools())
-    if a.llm_config_id:
-        llm = tenant_service.get_visible(db, LLMConfig, a.llm_config_id)
-        if not llm or not llm_service.supports_capability(llm, "chat"):
-            raise HTTPException(409, "Agent 绑定的 LLM 不可用或未启用聊天能力，请重新配置")
-        if requires_tools and not llm_service.supports_capability(llm, "tool"):
-            raise HTTPException(409, "Agent 需要工具调用，但绑定的 LLM 未启用工具能力")
-    else:
-        candidates = llm_service.routable_configs(db, "tool" if requires_tools else "chat")
-        llm = candidates[0] if candidates else None
+    llm, llm_error = _resolve_agent_llm(
+        db,
+        a,
+        requires_tools=_context_requires_tools(
+            db,
+            a,
+            runtime_context=resolved_context,
+        ),
+    )
     if not llm:
-        raise HTTPException(400, "请先为 Agent 配置 LLM（或设置默认 LLM）")
-    runtime_context.llm = llm
+        # A model can be disabled between the readiness check and invocation.
+        # Preserve a deterministic response for that narrow race.
+        raise HTTPException(409 if a.llm_config_id else 400, llm_error)
+    resolved_context.llm = llm
 
     if conv is None:
         conv = Conversation(
@@ -1124,6 +1254,7 @@ def invoke_agent_once(
             title=message[:50] or "新对话",
         )
         db.add(conv)
+        _assert_agent_turn_lease(db)
         db.commit()
         db.refresh(conv)
 
@@ -1131,6 +1262,49 @@ def invoke_agent_once(
     scenario_name = scenario.name if scenario else ""
     ontology_summary = agent_engine.ontology_summary_for(scenario, db=db)
     user_message = Message(conversation_id=conv.id, role="user", content=message)
+    db.add(user_message)
+    _assert_agent_turn_lease(db)
+    db.commit()
+
+    _assert_agent_turn_lease(db)
+    text_confirmation = agent_confirmation_service.confirm_text_reply(
+        db,
+        agent=a,
+        conversation=conv,
+        text=message,
+    )
+    if text_confirmation is not None:
+        confirmation_message = str(text_confirmation.get("message") or "确认结果已记录。")
+        assistant_message_id = uuid.uuid4().hex
+        db.add(
+            Message(
+                id=assistant_message_id,
+                conversation_id=conv.id,
+                role="assistant",
+                content=confirmation_message,
+                stream_finalized=True,
+            )
+        )
+        _assert_agent_turn_lease(db)
+        db.commit()
+        definition = resolved_context.runtime_definition
+        return {
+            "answer": confirmation_message,
+            "conversation_id": conv.id,
+            "trace_id": uuid.uuid4().hex,
+            "assistant_message_id": assistant_message_id,
+            "citations": [],
+            "tool_calls": [],
+            "tool_results": [],
+            "confirmation": text_confirmation,
+            "runtime": {
+                "environment": definition.environment if definition else "",
+                "definition_snapshot_id": definition.snapshot_id if definition else None,
+                "release_id": definition.release_id if definition else None,
+                "definition_hash": definition.definition_hash if definition else "",
+            },
+        }
+
     assistant_message_id = uuid.uuid4().hex
     assistant_message = Message(
         id=assistant_message_id,
@@ -1139,7 +1313,8 @@ def invoke_agent_once(
         content="正在准备受控工具调用。",
         stream_finalized=False,
     )
-    db.add_all([user_message, assistant_message])
+    db.add(assistant_message)
+    _assert_agent_turn_lease(db)
     db.commit()
 
     trace_id = uuid.uuid4().hex
@@ -1151,11 +1326,12 @@ def invoke_agent_once(
         "scenario_id": a.scenario_id or "",
         "user_id": str(db.info.get("user_id") or "") or None,
     }
+    _assert_agent_turn_lease(db)
     history = _model_history(
         db,
         conv.id,
         a,
-        runtime_context,
+        resolved_context,
         excluded_message_ids={str(user_message.id), assistant_message_id},
     )
     content = ""
@@ -1172,7 +1348,7 @@ def invoke_agent_once(
             scenario_name,
             ontology_summary,
             trace_context=trace_context,
-            runtime_context=runtime_context,
+            runtime_context=resolved_context,
         ):
             event_type = event["type"]
             data = event.get("data")
@@ -1182,6 +1358,7 @@ def invoke_agent_once(
                 tool_calls.append(data)
             elif event_type == "tool_result" and isinstance(data, dict):
                 tool_results.append(data)
+                _assert_agent_turn_lease(db)
                 db.commit()
             elif event_type == "citations" and isinstance(data, list):
                 citations = data
@@ -1190,17 +1367,22 @@ def invoke_agent_once(
         assistant_message.tool_results = tool_results
         assistant_message.citations = citations
         assistant_message.stream_finalized = True
+        _assert_agent_turn_lease(db)
         db.commit()
     except Exception as exc:
+        # A superseded worker must not append an error answer after the new
+        # owner has resumed the same external MCP conversation.
+        _assert_agent_turn_lease(db)
         assistant_message.content = _stream_error_content(content, str(exc))
         assistant_message.tool_calls = tool_calls
         assistant_message.tool_results = tool_results
         assistant_message.citations = citations
         assistant_message.stream_finalized = True
+        _assert_agent_turn_lease(db)
         db.commit()
         raise
 
-    definition = runtime_context.runtime_definition
+    definition = resolved_context.runtime_definition
     return {
         "answer": content,
         "conversation_id": conv.id,

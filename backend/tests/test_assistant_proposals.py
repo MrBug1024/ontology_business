@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
-import sqlite3
 import tempfile
 import time
 import unittest
@@ -32,9 +32,12 @@ from app.models import (
     DataSource,
     FunctionDefinition,
     OntologyAction,
+    OntologyBranch,
     OntologyEntity,
     OntologyInstance,
     OntologyProperty,
+    OntologyRelease,
+    OntologySnapshot,
     OntologyWorkflow,
     Tenant,
     User,
@@ -43,11 +46,23 @@ from app.routers import agents, assistant, scenarios
 from app.schemas import ActionExecuteRequest, AssistantChatRequest, AssistantProposalApplyRequest, ChatRequest
 from app.services import (
     assistant_orchestrator,
+    connector_service,
     datasource_service,
+    object_storage_service,
     operations_service,
     permission_service,
+    release_service,
     scenario_model_compiler,
     workflow_service,
+)
+
+
+TEST_MINIO_CONFIGURATION = object_storage_service.MinioConfiguration(
+    endpoint="minio.example.test",
+    access_key="access",
+    secret_key="secret",
+    bucket_name="ontology",
+    prefix="ontology-business",
 )
 
 
@@ -84,17 +99,44 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.db.commit()
         self.db.info["tenant_id"] = self.tenant.id
         self.db.info["user_id"] = self.user.id
-        # Some Windows SQLite drivers release file handles asynchronously even
-        # after Engine.dispose(); do not turn that platform cleanup timing into
-        # a product-test failure.
-        self.runtime_sources: list[DataSource] = []
-
     def tearDown(self) -> None:
-        for source in self.runtime_sources:
-            datasource_service.invalidate_engine(source)
         self.db.close()
         self.engine.dispose()
         self.temp_dir.cleanup()
+
+    def _managed_attachment_fields(
+        self,
+        attachment_id: str,
+        filename: str,
+        content: str,
+    ) -> dict[str, object]:
+        """Model the durable MinIO identity required for temporary uploads."""
+        with patch.object(
+            object_storage_service,
+            "configuration",
+            return_value=TEST_MINIO_CONFIGURATION,
+        ):
+            object_key = datasource_service.build_assistant_attachment_object_key(
+                self.tenant.id,
+                attachment_id,
+                filename,
+                upload_id="a" * 32,
+            )
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return {
+            "mime": "text/plain",
+            "size": len(content.encode("utf-8")),
+            "content_hash": digest,
+            "storage_provider": "minio",
+            "bucket_name": TEST_MINIO_CONFIGURATION.bucket_name,
+            "object_key": object_key,
+            "object_version_id": "version-test-1",
+            "etag": digest,
+            "object_url": object_storage_service.stable_object_url(
+                TEST_MINIO_CONFIGURATION.bucket_name,
+                object_key,
+            ),
+        }
 
     def _proposal_message(
         self,
@@ -274,24 +316,21 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 ),
             ]
         )
-        source_path = Path(self.temp_dir.name) / "source.sqlite3"
-        with sqlite3.connect(source_path) as connection:
-            connection.execute(
-                "CREATE TABLE purchase_requests (request_no TEXT PRIMARY KEY, amount REAL NOT NULL)"
-            )
-            connection.execute(
-                "INSERT INTO purchase_requests(request_no, amount) VALUES ('P-1', 1200)"
-            )
         source = DataSource(
             tenant_id=self.tenant.id,
             scenario_id=scenario.id,
             name="采购数据库",
-            type="sqlite",
-            config={"path": str(source_path)},
+            type="postgres",
+            config={
+                "host": "postgres.example.test",
+                "port": 5432,
+                "database": "purchasing",
+                "user": "readonly",
+                "password": "test-only",
+            },
             status="ok",
         )
         self.db.add(source)
-        self.runtime_sources.append(source)
         self.db.commit()
         self.db.refresh(scenario)
         data = {
@@ -309,16 +348,27 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             scenario=scenario,
         )
 
-        result = assistant.apply_proposal(
-            AssistantProposalApplyRequest(
-                kind="mapping",
-                scenario_id=scenario.id,
-                thread_id=thread.id,
-                proposal_id=proposal["proposal_id"],
-                confirm=True,
-            ),
-            self.db,
-        )
+        with patch.object(
+            datasource_service,
+            "list_tables",
+            return_value=[{
+                "name": "purchase_requests",
+                "columns": [
+                    {"name": "request_no", "type": "TEXT", "pk": True},
+                    {"name": "amount", "type": "NUMERIC", "pk": False},
+                ],
+            }],
+        ):
+            result = assistant.apply_proposal(
+                AssistantProposalApplyRequest(
+                    kind="mapping",
+                    scenario_id=scenario.id,
+                    thread_id=thread.id,
+                    proposal_id=proposal["proposal_id"],
+                    confirm=True,
+                ),
+                self.db,
+            )
         mapping = self.db.get(DataMapping, result["data"]["mapping_id"])
         self.assertEqual(mapping.column_map, data["column_map"])
         self.assertTrue(result["data"]["refresh_required"])
@@ -1641,18 +1691,20 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 is_required=True,
             )
         )
-        source_path = Path(self.temp_dir.name) / "stale.sqlite3"
-        with sqlite3.connect(source_path) as connection:
-            connection.execute("CREATE TABLE orders (order_no TEXT PRIMARY KEY)")
         source = DataSource(
             tenant_id=self.tenant.id,
             scenario_id=scenario.id,
             name="订单源",
-            type="sqlite",
-            config={"path": str(source_path)},
+            type="postgres",
+            config={
+                "host": "postgres.example.test",
+                "port": 5432,
+                "database": "orders",
+                "user": "readonly",
+                "password": "test-only",
+            },
         )
         self.db.add(source)
-        self.runtime_sources.append(source)
         self.db.commit()
         self.db.refresh(scenario)
         proposal = assistant._build_proposal(
@@ -1672,17 +1724,25 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             proposal=proposal,
             scenario=scenario,
         )
-        with self.assertRaisesRegex(ValueError, "不存在的源字段"):
-            assistant.apply_proposal(
-                AssistantProposalApplyRequest(
-                    kind="mapping",
-                    scenario_id=scenario.id,
-                    thread_id=thread.id,
-                    proposal_id=proposal["proposal_id"],
-                    confirm=True,
-                ),
-                self.db,
-            )
+        with patch.object(
+            datasource_service,
+            "list_tables",
+            return_value=[{
+                "name": "orders",
+                "columns": [{"name": "order_no", "type": "TEXT", "pk": True}],
+            }],
+        ):
+            with self.assertRaisesRegex(ValueError, "不存在的源字段"):
+                assistant.apply_proposal(
+                    AssistantProposalApplyRequest(
+                        kind="mapping",
+                        scenario_id=scenario.id,
+                        thread_id=thread.id,
+                        proposal_id=proposal["proposal_id"],
+                        confirm=True,
+                    ),
+                    self.db,
+                )
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(DataMapping)),
             0,
@@ -1705,15 +1765,18 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 is_required=True,
             )
         )
-        source_path = Path(self.temp_dir.name) / "transform-preserve.sqlite3"
-        with sqlite3.connect(source_path) as connection:
-            connection.execute("CREATE TABLE orders (order_no TEXT PRIMARY KEY)")
         source = DataSource(
             tenant_id=self.tenant.id,
             scenario_id=scenario.id,
             name="订单源",
-            type="sqlite",
-            config={"path": str(source_path)},
+            type="postgres",
+            config={
+                "host": "postgres.example.test",
+                "port": 5432,
+                "database": "orders",
+                "user": "readonly",
+                "password": "test-only",
+            },
         )
         mapping = DataMapping(
             scenario=scenario,
@@ -1724,7 +1787,6 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             transform_rules={"订单号": [{"op": "trim"}]},
         )
         self.db.add_all([source, mapping])
-        self.runtime_sources.append(source)
         self.db.commit()
         self.db.refresh(scenario)
         data = {
@@ -1734,18 +1796,28 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             "column_map": {"订单号": "order_no"},
         }
 
-        updated, operation = assistant._apply_mapping_draft(
-            self.db, scenario, data
-        )
-        self.assertEqual(operation, "update")
-        self.assertEqual(updated.transform_rules, {"订单号": [{"op": "trim"}]})
+        with patch.object(
+            datasource_service,
+            "list_tables",
+            return_value=[{
+                "name": "orders",
+                "columns": [{"name": "order_no", "type": "TEXT", "pk": True}],
+            }],
+        ):
+            updated, operation = assistant._apply_mapping_draft(
+                self.db, scenario, data
+            )
+            self.assertEqual(operation, "update")
+            self.assertEqual(updated.transform_rules, {"订单号": [{"op": "trim"}]})
 
-        data["transform_rules"] = {"订单号": [{"op": "upper"}]}
-        updated, _operation = assistant._apply_mapping_draft(self.db, scenario, data)
-        self.assertEqual(updated.transform_rules, {"订单号": [{"op": "upper"}]})
-        data["transform_rules"] = {"订单号": [{"op": "python"}]}
-        with self.assertRaisesRegex(ValueError, "不支持的声明式转换"):
-            assistant._apply_mapping_draft(self.db, scenario, data)
+            data["transform_rules"] = {"订单号": [{"op": "upper"}]}
+            updated, _operation = assistant._apply_mapping_draft(
+                self.db, scenario, data
+            )
+            self.assertEqual(updated.transform_rules, {"订单号": [{"op": "upper"}]})
+            data["transform_rules"] = {"订单号": [{"op": "python"}]}
+            with self.assertRaisesRegex(ValueError, "不支持的声明式转换"):
+                assistant._apply_mapping_draft(self.db, scenario, data)
 
     def test_chat_apply_and_execute_modes_only_return_governance_guidance(self) -> None:
         before_scenarios = self.db.scalar(
@@ -2418,37 +2490,46 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             title="two",
         )
         live = AssistantAttachment(
+            id="b" * 32,
             tenant_id=self.tenant.id,
             created_by_user_id=self.user.id,
             filename="live.txt",
             status="parsed",
             parsed_text="temporary",
             expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            **self._managed_attachment_fields("b" * 32, "live.txt", "temporary"),
         )
         expired = AssistantAttachment(
+            id="c" * 32,
             tenant_id=self.tenant.id,
             created_by_user_id=self.user.id,
             filename="expired.txt",
             status="parsed",
             parsed_text="expired",
             expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+            **self._managed_attachment_fields("c" * 32, "expired.txt", "expired"),
         )
         self.db.add_all([first, second, live, expired])
         self.db.commit()
-        selected = assistant._safe_attachment_ids(
-            self.db, [live.id], thread_id=first.id
-        )
-        self.assertEqual(selected[0].thread_id, first.id)
-        self.assertIsNotNone(selected[0].consumed_at)
-        with self.assertRaisesRegex(Exception, "不可用"):
-            assistant._safe_attachment_ids(
-                self.db, [live.id], thread_id=second.id
+        with patch.object(
+            object_storage_service,
+            "configuration",
+            return_value=TEST_MINIO_CONFIGURATION,
+        ):
+            selected = assistant._safe_attachment_ids(
+                self.db, [live.id], thread_id=first.id
             )
-        with self.assertRaisesRegex(Exception, "不可用"):
-            assistant._safe_attachment_ids(
-                self.db, [expired.id], thread_id=first.id
-            )
-        assistant._purge_expired_attachments(self.db)
+            self.assertEqual(selected[0].thread_id, first.id)
+            self.assertIsNotNone(selected[0].consumed_at)
+            with self.assertRaisesRegex(Exception, "不可用"):
+                assistant._safe_attachment_ids(
+                    self.db, [live.id], thread_id=second.id
+                )
+            with self.assertRaisesRegex(Exception, "不可用"):
+                assistant._safe_attachment_ids(
+                    self.db, [expired.id], thread_id=first.id
+                )
+            assistant._purge_expired_attachments(self.db)
         self.assertIsNone(self.db.get(AssistantAttachment, expired.id))
 
     def test_nonempty_unavailable_attachment_fails_closed_and_global_ttl_is_bounded(self) -> None:
@@ -2465,56 +2546,79 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             status="active",
         )
         expired_owned = AssistantAttachment(
+            id="d" * 32,
             tenant_id=self.tenant.id,
             created_by_user_id=self.user.id,
             filename="owned-expired.txt",
             parsed_text="must-not-be-used",
             status="parsed",
             expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            **self._managed_attachment_fields(
+                "d" * 32,
+                "owned-expired.txt",
+                "must-not-be-used",
+            ),
         )
         expired_other = AssistantAttachment(
+            id="e" * 32,
             tenant_id=self.tenant.id,
             created_by_user_id=other.id,
             filename="other-expired.txt",
             parsed_text="must-be-purged",
             status="parsed",
             expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            **self._managed_attachment_fields(
+                "e" * 32,
+                "other-expired.txt",
+                "must-be-purged",
+            ),
         )
         expired_legacy = AssistantAttachment(
+            id="f" * 32,
             tenant_id=self.tenant.id,
             created_by_user_id=None,
             filename="legacy-expired.txt",
             parsed_text="must-be-purged",
             status="parsed",
             expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            **self._managed_attachment_fields(
+                "f" * 32,
+                "legacy-expired.txt",
+                "must-be-purged",
+            ),
         )
         self.db.add_all([thread, other, expired_owned, expired_other, expired_legacy])
         self.db.commit()
 
         before_messages = self.db.scalar(select(func.count()).select_from(AssistantMessage))
-        with self.assertRaisesRegex(Exception, "不可用"):
-            assistant.chat(
-                AssistantChatRequest(
-                    message="必须使用过期附件生成草稿",
-                    path="/expired",
-                    attachment_ids=[expired_owned.id],
-                    mode="draft",
-                ),
-                self.db,
+        with patch.object(
+            object_storage_service,
+            "configuration",
+            return_value=TEST_MINIO_CONFIGURATION,
+        ):
+            with self.assertRaisesRegex(Exception, "不可用"):
+                assistant.chat(
+                    AssistantChatRequest(
+                        message="必须使用过期附件生成草稿",
+                        path="/expired",
+                        attachment_ids=[expired_owned.id],
+                        mode="draft",
+                    ),
+                    self.db,
+                )
+            self.db.rollback()
+            self.assertEqual(
+                self.db.scalar(select(func.count()).select_from(AssistantMessage)),
+                before_messages,
             )
-        self.db.rollback()
-        self.assertEqual(
-            self.db.scalar(select(func.count()).select_from(AssistantMessage)),
-            before_messages,
-        )
-        self.assertEqual(
-            operations_service.purge_expired_assistant_attachments(self.db, limit=2),
-            2,
-        )
-        self.assertEqual(
-            operations_service.purge_expired_assistant_attachments(self.db, limit=2),
-            1,
-        )
+            self.assertEqual(
+                operations_service.purge_expired_assistant_attachments(self.db, limit=2),
+                2,
+            )
+            self.assertEqual(
+                operations_service.purge_expired_assistant_attachments(self.db, limit=2),
+                1,
+            )
         self.db.commit()
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(AssistantAttachment)),
@@ -2645,6 +2749,7 @@ class ActionDecisionChainTests(unittest.TestCase):
             id="entity-action-audit",
             scenario_id=self.scenario.id,
             name="审计对象",
+            is_abstract=True,
         )
         source = DataSource(
             id="source-action-audit",
@@ -2668,13 +2773,30 @@ class ActionDecisionChainTests(unittest.TestCase):
             },
             executor_type="sql",
             executor_config={
-                "data_source_id": source.id,
+                "data_source_binding_key": "action-audit-source",
+                "data_source_binding_ref": {"adapter": "sqlite"},
                 "sql": "SELECT '{reference}' AS reference",
             },
             requires_confirmation=True,
             enabled=True,
         )
         self.db.add_all([tenant, user, self.scenario, entity, source, self.action])
+        self.db.commit()
+        binding = connector_service.upsert_binding(
+            self.db,
+            self.scenario,
+            environment="dev",
+            binding_key_value="action-audit-source",
+            kind="data_source",
+            connector_id=source.id,
+            created_by_user_id=user.id,
+        )
+        binding.health_status = "healthy"
+        binding.health_message = ""
+        binding.checked_at = datetime.now(timezone.utc)
+        binding.connector_signature = connector_service.connector_signature(
+            "data_source", source
+        )
         self.db.commit()
         permission_service.ensure_organization(
             self.db,
@@ -2689,10 +2811,57 @@ class ActionDecisionChainTests(unittest.TestCase):
             "llm_config_id": None,
             "model_name": "",
         }
+        self._release_execution_definition(user.id)
 
     def tearDown(self) -> None:
         self.db.close()
         self.engine.dispose()
+
+    def _release_execution_definition(self, user_id: str) -> None:
+        branch = OntologyBranch(
+            id="branch-action-audit",
+            tenant_id=self.scenario.tenant_id,
+            scenario_id=self.scenario.id,
+            name="action-audit/main",
+            created_by_user_id=user_id,
+        )
+        self.db.add(branch)
+        self.db.flush()
+        content = release_service.capture_snapshot_content(self.db, self.scenario)
+        connector_audit = release_service._require_snapshot_connectors(
+            self.db,
+            self.scenario,
+            content,
+            environment="dev",
+        )
+        snapshot = OntologySnapshot(
+            id="snapshot-action-audit",
+            tenant_id=self.scenario.tenant_id,
+            scenario_id=self.scenario.id,
+            branch_id=branch.id,
+            kind="merge",
+            content=content,
+            content_hash=release_service.snapshot_hash(content),
+            created_by_user_id=user_id,
+        )
+        self.db.add(snapshot)
+        self.db.flush()
+        branch.base_snapshot_id = snapshot.id
+        branch.head_snapshot_id = snapshot.id
+        self.db.add(
+            OntologyRelease(
+                id="release-action-audit",
+                tenant_id=self.scenario.tenant_id,
+                scenario_id=self.scenario.id,
+                branch_id=branch.id,
+                snapshot_id=snapshot.id,
+                environment="dev",
+                status="released",
+                connector_audit=connector_audit,
+                created_by_user_id=user_id,
+            )
+        )
+        self.db.commit()
 
     def test_action_log_persists_real_actor_permission_data_and_result_chain(self) -> None:
         response = workflow_service.preview_action(

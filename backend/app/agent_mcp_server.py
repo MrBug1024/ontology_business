@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
+import hmac
 import json
+import secrets
 from typing import Annotated, Any
 from urllib.parse import urlparse
 
@@ -19,6 +22,12 @@ from .services import agent_mcp_service
 _authenticated_service = contextvars.ContextVar[str | None](
     "authenticated_agent_mcp_service", default=None
 )
+_authenticated_external_session = contextvars.ContextVar[str | None](
+    "authenticated_agent_mcp_external_session", default=None
+)
+_MCP_SESSION_ID_HEADER = b"mcp-session-id"
+_MAX_EXTERNAL_SESSION_ID_LENGTH = 128
+_MCP_SESSION_VERSION = "mcp1"
 
 
 def _allowed_hosts() -> list[str]:
@@ -68,11 +77,103 @@ class AgentMCPBearerMiddleware:
             })
             await send({"type": "http.response.body", "body": body})
             return
+
+        external_session_id = headers.get("mcp-session-id", "").strip()
+        if external_session_id and not self._valid_session_id(
+            external_session_id, authenticated.service_id
+        ):
+            body = json.dumps(
+                {"error": "invalid_session", "error_description": "MCP session id is invalid"}
+            ).encode("utf-8")
+            await send({
+                "type": "http.response.start",
+                "status": 400,
+                "headers": [
+                    (b"content-type", b"application/json; charset=utf-8"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+        # FastMCP intentionally remains stateless here so concurrent API workers
+        # do not require load-balancer affinity.  We still mint and echo the
+        # standard MCP session header; the durable service-layer mapping turns
+        # that external session into a stable platform conversation.
+        external_session_id = external_session_id or self._new_session_id(
+            authenticated.service_id
+        )
+
+        async def send_with_session(message: dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                response_headers = [
+                    (key, value)
+                    for key, value in message.get("headers", [])
+                    if key.lower() != _MCP_SESSION_ID_HEADER
+                ]
+                response_headers.append(
+                    (_MCP_SESSION_ID_HEADER, external_session_id.encode("ascii"))
+                )
+                message = {**message, "headers": response_headers}
+            await send(message)
+
         token = _authenticated_service.set(authenticated.service_id)
+        session_token = _authenticated_external_session.set(external_session_id)
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, send_with_session)
         finally:
+            _authenticated_external_session.reset(session_token)
             _authenticated_service.reset(token)
+
+    @staticmethod
+    def _session_signing_key() -> bytes:
+        settings = get_settings()
+        configured = settings.agent_mcp_session_signing_key.strip()
+        if configured:
+            return configured.encode("utf-8")
+        # Existing deployments can roll forward without an outage, but the
+        # fallback remains private because the database URL is server-only.
+        # Production configuration should still provide the dedicated key.
+        return hashlib.sha256(
+            b"ontology-platform/agent-mcp-session-signing/v1\0"
+            + settings.database_url.encode("utf-8")
+        ).digest()
+
+    @classmethod
+    def _session_signature(cls, service_id: str, nonce: str) -> str:
+        payload = (
+            b"ontology-platform/agent-mcp-session/v1\0"
+            + service_id.encode("utf-8")
+            + b"\0"
+            + nonce.encode("ascii")
+        )
+        return hmac.new(cls._session_signing_key(), payload, hashlib.sha256).hexdigest()
+
+    @classmethod
+    def _new_session_id(cls, service_id: str) -> str:
+        nonce = secrets.token_urlsafe(32)
+        signature = cls._session_signature(service_id, nonce)
+        return f"{_MCP_SESSION_VERSION}.{nonce}.{signature}"
+
+    @classmethod
+    def _valid_session_id(cls, value: str, service_id: str) -> bool:
+        if not (1 <= len(value) <= _MAX_EXTERNAL_SESSION_ID_LENGTH):
+            return False
+        version, separator, remainder = value.partition(".")
+        nonce, separator2, signature = remainder.partition(".")
+        if (
+            version != _MCP_SESSION_VERSION
+            or not separator
+            or not separator2
+            or len(nonce) < 32
+            or len(signature) != 64
+            or not all(char.isascii() and (char.isalnum() or char in "-_") for char in nonce)
+            or not all(char in "0123456789abcdef" for char in signature)
+        ):
+            return False
+        return hmac.compare_digest(
+            signature,
+            cls._session_signature(service_id, nonce),
+        )
 
 
 settings = get_settings()
@@ -104,18 +205,27 @@ async def invoke_agent(
     message: Annotated[str, Field(min_length=1, max_length=12000, description="提交给 Agent 的任务或问题")],
     conversation_id: Annotated[
         str | None,
-        Field(default=None, max_length=32, description="可选；继续此前由同一 MCP 服务创建的对话"),
+        Field(
+            default=None,
+            max_length=32,
+            description="可选；同一 MCP Session 会自动续接，跨会话时可显式继续此前返回的对话",
+        ),
     ] = None,
 ) -> dict[str, Any]:
     service_id = _authenticated_service.get()
+    external_session_id = _authenticated_external_session.get()
     if not service_id:
         raise agent_mcp_service.AgentMCPError("Agent MCP 身份上下文不存在")
+    if not external_session_id:
+        raise agent_mcp_service.AgentMCPError("Agent MCP 会话上下文不存在")
     await ctx.info("已接收请求，正在调用绑定的 Agent。")
     result = await asyncio.to_thread(
         agent_mcp_service.invoke_published_agent,
         service_id,
         message=message,
         conversation_id=conversation_id,
+        external_session_id=external_session_id,
+        external_request_id=ctx.request_id,
     )
     await ctx.info("Agent 调用完成。")
     return result

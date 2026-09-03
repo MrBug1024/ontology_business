@@ -37,6 +37,12 @@ import type {
   MCPImportResult,
   MCPTool,
   OntologyInstance,
+  OrganizationInvitation,
+  OrganizationInvitationAccept,
+  OrganizationMember,
+  OrganizationRole,
+  OrganizationRoleKey,
+  OrganizationUserCreate,
   RelationInstance,
   RelationInstanceSearchResult,
   RelationDataMapping,
@@ -97,6 +103,24 @@ export const api = {
   forgotPassword: (email: string) => http.post<AuthMessage>('/auth/forgot-password', { email }),
   resetPassword: (d: { email: string; code: string; password: string; password_confirm: string }) =>
     http.post<AuthMessage>('/auth/reset-password', d),
+
+  // 工作区成员与权限
+  listOrganizationRoles: () => http.get<OrganizationRole[]>('/organization/roles'),
+  listOrganizationMembers: () => http.get<OrganizationMember[]>('/organization/members'),
+  createOrganizationUser: (d: OrganizationUserCreate) =>
+    http.post<OrganizationMember>('/organization/users', d),
+  inviteOrganizationMember: (d: OrganizationInvitation) =>
+    http.post<AuthMessage>('/organization/invitations', d),
+  acceptOrganizationInvitation: (d: OrganizationInvitationAccept) =>
+    http.post<AuthMessage>('/organization/invitations/accept', d),
+  updateOrganizationMemberRole: (memberId: string, roleKey: OrganizationRoleKey) =>
+    http.put<OrganizationMember>(`/organization/members/${memberId}/role`, { role_key: roleKey }),
+  disableOrganizationMember: (memberId: string) =>
+    http.post<OrganizationMember>(`/organization/members/${memberId}/disable`),
+  resetOrganizationMemberPassword: (memberId: string) =>
+    http.post<AuthMessage>(`/organization/members/${memberId}/reset-password`),
+  reinviteOrganizationMember: (memberId: string) =>
+    http.post<AuthMessage>(`/organization/members/${memberId}/reinvite`),
 
   // 全局 AI 助手
   listAssistantThreads: (context: { scenario_id?: string; page?: string; path?: string } = {}) =>

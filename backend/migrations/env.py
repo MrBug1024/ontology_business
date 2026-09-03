@@ -25,13 +25,18 @@ use_admin = (
     or os.environ.get("ALEMBIC_USE_ADMIN", "").strip() == "1"
 )
 if not configured_url and use_admin:
+    migration_user = (
+        settings.postgresql_admin_user.strip()
+        or settings.postgresql_user.strip()
+    )
+    migration_password = (
+        settings.postgresql_admin_password
+        or settings.postgresql_password
+    )
     configured_url = URL.create(
         "postgresql+psycopg",
-        username=settings.postgresql_admin_user.strip() or "postgres",
-        password=(
-            settings.postgresql_admin_password
-            or settings.postgresql_password
-        ),
+        username=migration_user,
+        password=migration_password,
         host=settings.postgresql_host,
         port=settings.postgresql_port,
         database=settings.postgresql_database,

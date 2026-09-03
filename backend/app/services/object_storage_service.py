@@ -30,6 +30,7 @@ class MinioConfiguration:
     bucket_name: str
     prefix: str
     secure: bool = True
+    request_timeout_seconds: int = 20
 
     @property
     def configured(self) -> bool:
@@ -54,7 +55,7 @@ class ObjectInfo:
 
 
 _client: Any | None = None
-_client_signature: tuple[str, str, str, bool] | None = None
+_client_signature: tuple[str, str, str, bool, int] | None = None
 _client_lock = threading.Lock()
 
 
@@ -110,6 +111,9 @@ def configuration() -> MinioConfiguration:
             str(getattr(settings, "minio_aliyun_file_path", "") or "")
         ),
         secure=secure,
+        request_timeout_seconds=int(
+            getattr(settings, "minio_request_timeout_seconds", 20) or 20
+        ),
     )
 
 
@@ -127,13 +131,35 @@ def require_configuration() -> MinioConfiguration:
 def _create_client(configured: MinioConfiguration) -> Any:
     try:
         from minio import Minio
+        from urllib3 import PoolManager, Retry, Timeout
     except ImportError as exc:  # pragma: no cover - deployment dependency guard
         raise ObjectStorageConfigurationError("服务端缺少 MinIO 客户端依赖") from exc
+    timeout_seconds = max(3, int(configured.request_timeout_seconds))
+    http_client = PoolManager(
+        num_pools=4,
+        timeout=Timeout(
+            connect=min(10, timeout_seconds),
+            read=timeout_seconds,
+        ),
+        # Retry only read-only, idempotent requests. Upload writes remain
+        # single-attempt so an ambiguous upstream response cannot duplicate data.
+        retries=Retry(
+            total=2,
+            connect=1,
+            read=1,
+            status=2,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
+            raise_on_status=False,
+        ),
+    )
     return Minio(
         configured.endpoint,
         access_key=configured.access_key,
         secret_key=configured.secret_key,
         secure=configured.secure,
+        http_client=http_client,
     )
 
 
@@ -146,6 +172,7 @@ def get_client() -> Any:
         configured.access_key,
         configured.secret_key,
         configured.secure,
+        configured.request_timeout_seconds,
     )
     if _client is not None and _client_signature == signature:
         return _client
@@ -248,16 +275,21 @@ def ensure_bucket(bucket_name: str) -> None:
     bucket = _validate_bucket_name(bucket_name)
     client = get_client()
     try:
-        if not client.bucket_exists(bucket):
-            client.make_bucket(bucket)
+        bucket_exists = bool(client.bucket_exists(bucket))
     except Exception as exc:  # noqa: BLE001
-        # Another instance may have won the create race.
+        raise ObjectStorageError("MinIO bucket 状态读取失败") from exc
+    if not bucket_exists:
         try:
-            exists_after_race = bool(client.bucket_exists(bucket))
-        except Exception:  # noqa: BLE001
-            exists_after_race = False
-        if not exists_after_race:
-            raise ObjectStorageError("MinIO bucket 初始化失败") from exc
+            client.make_bucket(bucket)
+        except Exception as exc:  # noqa: BLE001
+            # Another instance may have won only the create race. Do not rerun
+            # a failed bucket probe, which can amplify a dependency timeout.
+            try:
+                exists_after_race = bool(client.bucket_exists(bucket))
+            except Exception:  # noqa: BLE001
+                exists_after_race = False
+            if not exists_after_race:
+                raise ObjectStorageError("MinIO bucket 初始化失败") from exc
     try:
         from minio.versioningconfig import ENABLED, VersioningConfig
 

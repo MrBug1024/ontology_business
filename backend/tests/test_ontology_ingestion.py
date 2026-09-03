@@ -55,6 +55,26 @@ class AssistantOntologyIngestionTests(unittest.TestCase):
         with self.assertRaisesRegex(HTTPException, "不会静默截断"):
             assistant._attachment_context([attachment])
 
+    def test_attachment_upload_maps_stream_limit_to_413(self) -> None:
+        upload = UploadFile(
+            BytesIO(b"too large"),
+            filename="too-large.md",
+            headers=Headers({"content-type": "text/markdown"}),
+        )
+        with (
+            patch.object(assistant, "_purge_expired_attachments"),
+            patch.object(
+                assistant,
+                "get_settings",
+                return_value=SimpleNamespace(max_upload_bytes=3),
+            ),
+        ):
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(assistant.upload_attachment(upload, SimpleNamespace()))
+
+        self.assertEqual(error.exception.status_code, 413)
+        self.assertIn("超过大小限制", str(error.exception.detail))
+
     def test_attachment_upload_keeps_text_beyond_legacy_twenty_four_thousand_chars(self) -> None:
         marker = "TAIL-MARKER-AFTER-LEGACY-UPLOAD-LIMIT"
         parsed_text = "施工资料" * 7_000 + marker
@@ -82,7 +102,7 @@ class AssistantOntologyIngestionTests(unittest.TestCase):
             patch.object(assistant, "_purge_expired_attachments"),
             patch.object(assistant, "_tenant", return_value="tenant-ingestion"),
             patch.object(assistant, "_current_user_id", return_value="user-ingestion"),
-            patch.object(assistant.datasource_service, "save_assistant_attachment_object"),
+            patch.object(assistant.datasource_service, "save_assistant_attachment_file"),
             patch.object(
                 assistant.object_deletion_service,
                 "prepare_assistant_attachment_upload",
@@ -105,7 +125,7 @@ class AssistantOntologyIngestionTests(unittest.TestCase):
             ),
             patch.object(
                 assistant.doc_parser,
-                "parse_bytes",
+                "parse_file",
                 return_value={"status": "success", "text": parsed_text, "message": "ok"},
             ),
         ):

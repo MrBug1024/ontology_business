@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 from typing import Generator, Iterable
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -123,7 +124,10 @@ def _resolve_principal(db: Session) -> tuple[Principal | None, str, int]:
         cache[principal_key] = result
         return result
 
-    user = db.get(User, user_id)
+    # ``clear_request_permission_cache`` is used after an owner-mutation lock
+    # wait.  Refresh the user as well as its membership so a concurrently
+    # disabled actor cannot keep using its pre-wait active status.
+    user = db.get(User, user_id, populate_existing=True)
     if not user or user.status != "active" or user.tenant_id != tenant_id:
         result = (None, "当前用户不属于请求租户或已失效", 403)
         cache[principal_key] = result
@@ -139,6 +143,10 @@ def _resolve_principal(db: Session) -> tuple[Principal | None, str, int]:
             Organization.tenant_id == tenant_id,
         )
         .limit(1)
+        # Owner-changing endpoints may wait on the organization advisory lock.
+        # When they resume, reload this session's existing member object instead
+        # of authorizing with the role it held before the wait.
+        .execution_options(populate_existing=True)
     ).scalars().first()
     if not member or not member.role:
         result = (None, "当前用户没有有效的组织成员身份", 403)
@@ -620,13 +628,30 @@ def assign_member_role(
     if not user or user.tenant_id != organization.tenant_id:
         raise HTTPException(status_code=403, detail="不能向组织添加其他租户的用户")
     role = role_for_organization(db, organization.id, role_key)
+    # Keep service callers on the same critical section as the HTTP endpoints.
+    # This helper is also used by administrative/bootstrap integrations and
+    # must not become a future bypass around the last-active-owner invariant.
+    lock_organization_owner_changes(db, organization.id)
     member = db.execute(
-        select(OrganizationMember).where(
+        select(OrganizationMember)
+        .options(joinedload(OrganizationMember.role), joinedload(OrganizationMember.user))
+        .where(
             OrganizationMember.organization_id == organization.id,
             OrganizationMember.user_id == user_id,
         )
+        .execution_options(populate_existing=True)
+        .with_for_update()
     ).scalars().first()
     if member:
+        current_role_key = str(member.role.key if member.role else "").strip().lower()
+        removes_active_owner = (
+            member.status == "active"
+            and bool(member.user and member.user.status == "active")
+            and current_role_key == "owner"
+            and role.key != "owner"
+        )
+        if removes_active_owner and owner_count(db, organization.id) <= 1:
+            raise HTTPException(status_code=409, detail="组织至少需要保留一名启用的所有者")
         member.role_id = role.id
         member.status = "active"
     else:
@@ -646,13 +671,50 @@ def owner_count(db: Session, organization_id: str) -> int:
         db.execute(
             select(OrganizationMember.id)
             .join(OrganizationMember.role)
+            .join(OrganizationMember.user)
             .where(
                 OrganizationMember.organization_id == organization_id,
                 OrganizationMember.status == "active",
                 OrganizationRole.key == "owner",
+                User.status == "active",
             )
         ).scalars().all()
     )
+
+
+def lock_organization_owner_changes(db: Session, organization_id: str) -> None:
+    """Serialize mutations which could leave an organization without an owner.
+
+    PostgreSQL is the only supported runtime database. A transaction-scoped
+    advisory lock gives every owner-removal path one organization-wide critical
+    section without depending on which member row happens to be edited. The
+    row-lock fallback keeps SQLite-backed unit tests meaningful.
+    """
+    normalized_id = str(organization_id or "").strip()
+    if not normalized_id:
+        raise ValueError("组织标识不能为空")
+    dialect_name = str(db.get_bind().dialect.name or "").lower()
+    if dialect_name == "postgresql":
+        digest = hashlib.sha256(
+            f"ontology-organization-owner-v1:{normalized_id}".encode("utf-8")
+        ).digest()
+        lock_key = int.from_bytes(digest[:8], byteorder="big", signed=True)
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": lock_key},
+        )
+        return
+    db.execute(
+        select(OrganizationMember.id)
+        .where(OrganizationMember.organization_id == normalized_id)
+        .order_by(OrganizationMember.id)
+        .with_for_update()
+    ).scalars().all()
+
+
+def clear_request_permission_cache(db: Session) -> None:
+    """Force authorization to be read again after a membership lock wait."""
+    db.info.pop("permission_cache", None)
 
 
 def validate_grant_resource(

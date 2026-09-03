@@ -180,8 +180,8 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
         self.assertTrue(task.can_execute)
         self.assertTrue(task.can_approve)
 
-        # These operational views are served by the staging deployment.  The
-        # same tenant's dev process must not read their input/result evidence.
+        # The deployment label is execution provenance only.  It must not
+        # change which same-tenant task, approval, or audit records can be read.
         with patch.object(runtime_connector_service, "runtime_environment", return_value="staging"):
             approvals = operations_router.list_approvals(
                 scenario_id=self.scenario.id,
@@ -229,38 +229,32 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
                 operations_router._run_for_request(self.db, self.run.id)
             self.assertEqual(error.exception.status_code, 404)
 
-    def test_operational_views_are_scoped_to_the_current_deployment(self) -> None:
-        """A dev control-plane process cannot inspect or operate staging work."""
+    def test_operational_views_are_not_scoped_to_the_current_deployment(self) -> None:
+        """Changing connector deployment never hides same-tenant audit records."""
         with patch.object(runtime_connector_service, "runtime_environment", return_value="dev"):
-            self.assertEqual(
-                operations_router.list_tasks(
-                    scenario_id=self.scenario.id,
-                    status=None,
-                    limit=80,
-                    db=self.db,
-                ),
-                [],
+            tasks = operations_router.list_tasks(
+                scenario_id=self.scenario.id,
+                status=None,
+                limit=80,
+                db=self.db,
             )
-            self.assertEqual(
-                operations_router.list_approvals(
-                    scenario_id=self.scenario.id,
-                    status="pending",
-                    limit=80,
-                    db=self.db,
-                ),
-                [],
+            approvals = operations_router.list_approvals(
+                scenario_id=self.scenario.id,
+                status="pending",
+                limit=80,
+                db=self.db,
             )
-            self.assertEqual(
-                scenarios_router.list_execution_logs(
-                    scenario_id=self.scenario.id,
-                    limit=80,
-                    db=self.db,
-                ),
-                [],
+            logs = scenarios_router.list_execution_logs(
+                scenario_id=self.scenario.id,
+                limit=80,
+                db=self.db,
             )
-            with self.assertRaises(HTTPException) as error:
-                operations_router._run_for_request(self.db, self.run.id)
-            self.assertEqual(error.exception.status_code, 404)
+            run = operations_router._run_for_request(self.db, self.run.id)
+
+        self.assertEqual([item.id for item in tasks], [self.run.id])
+        self.assertEqual([item.workflow_run_id for item in approvals], [self.run.id])
+        self.assertEqual([item.id for item in logs], [self.log.id])
+        self.assertEqual(run.id, self.run.id)
 
 
 if __name__ == "__main__":

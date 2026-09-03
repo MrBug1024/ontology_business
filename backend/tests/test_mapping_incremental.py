@@ -18,7 +18,9 @@ class MappingIncrementalRuntimeTests(unittest.TestCase):
         self.db = Session(self.engine)
         self.scenario = BusinessScenario(id="scenario-1", name="映射增量")
         self.source = DataSource(
-            id="source-1", scenario_id=self.scenario.id, name="源库", type="sqlite", config={}
+            # The ORM test database is in-memory only; mappings themselves use
+            # the production-supported PostgreSQL connector contract.
+            id="source-1", scenario_id=self.scenario.id, name="源库", type="postgres", config={}
         )
         self.entity = OntologyEntity(id="entity-1", scenario_id=self.scenario.id, name="费用单")
         self.key = OntologyProperty(id="property-id", entity_id=self.entity.id, name="id", is_key=True)
@@ -78,7 +80,7 @@ class MappingIncrementalRuntimeTests(unittest.TestCase):
         self.assertEqual(second["instances_created"], 0)
         self.assertEqual(self.db.query(OntologyInstance).count(), 1)
 
-    def test_same_mapping_keeps_imported_instances_isolated_by_runtime_environment(self) -> None:
+    def test_same_mapping_reuses_imported_instances_across_deployments(self) -> None:
         with patch(
             "app.services.datasource_service.run_query",
             return_value={"columns": ["id", "amount"], "rows": [["E-200", 10]]},
@@ -101,18 +103,18 @@ class MappingIncrementalRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(dev["instances_created"], 1)
-        self.assertEqual(staging["instances_created"], 1)
+        self.assertEqual(staging["instances_created"], 0)
+        self.assertEqual(staging["instances_updated"], 1)
         instances = self.db.scalars(
             select(OntologyInstance)
             .where(OntologyInstance.entity_id == self.entity.id)
             .order_by(OntologyInstance.created_at.asc())
         ).all()
-        self.assertEqual(len(instances), 2)
-        by_environment = {
-            instance.source_metadata["runtime_environment"]: instance.attributes["amount"]
-            for instance in instances
-        }
-        self.assertEqual(by_environment, {"dev": 10, "staging": 25})
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].attributes["amount"], 25)
+        # The last connector target remains auditable, but it never turns into
+        # an identity or visibility partition for tenant business facts.
+        self.assertEqual(instances[0].source_metadata["runtime_environment"], "staging")
 
 
 if __name__ == "__main__":

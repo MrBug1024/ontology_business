@@ -1,0 +1,69 @@
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # A file is limited by the application to 400 MiB (419430400 bytes). The
+    # extra 1 MiB only covers multipart framing; API routes enforce the exact
+    # file/request limit and return JSON 413 responses.
+    client_max_body_size 401m;
+    client_body_timeout 15m;
+    send_timeout 15m;
+
+    # Keep an accidental request to the API base out of the SPA fallback.
+    location = /api {
+        proxy_pass http://${API_UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 15m;
+        proxy_send_timeout 15m;
+    }
+
+    location /api/ {
+        proxy_pass http://${API_UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+
+        # Upload bytes flow through to FastAPI as they arrive; SSE/Agent streams
+        # likewise must not be buffered by the reverse proxy.
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 15m;
+        proxy_send_timeout 15m;
+    }
+
+    # Agent MCP is mounted at the API root rather than below /api.
+    location /mcp {
+        proxy_pass http://${API_UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 15m;
+        proxy_send_timeout 15m;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

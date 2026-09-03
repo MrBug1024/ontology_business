@@ -6,7 +6,7 @@ import unittest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import httpx
-from sqlalchemy import create_engine, event, select, text
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -24,6 +24,7 @@ from app.routers import external_api
 from app.services import permission_service
 from app.services.auth_service import get_tenant_db
 from sdk import ExternalApiError, OntologyPlatformClient
+from tests.postgresql_migration_contracts import baseline_table_ddl
 
 
 class ExternalApiTests(unittest.TestCase):
@@ -413,62 +414,26 @@ class ExternalApiTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_legacy_key_actor_migration_keeps_unknown_actors_null(self) -> None:
-        # Exercise the upgrade path against the pre-governance table shape.
-        # The migration must not fabricate a signer from the key subject.
-        from app import database as database_module
+    def test_postgresql_schema_keeps_external_api_actors_nullable(self) -> None:
+        key_ddl = baseline_table_ddl("external_api_keys")
+        audit_ddl = baseline_table_ddl("external_api_key_audit_events")
 
-        legacy_engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
+        self.assertIn("issued_by_user_id VARCHAR(32),", key_ddl)
+        self.assertIn("revoked_by_user_id VARCHAR(32),", key_ddl)
+        self.assertIn(
+            "FOREIGN KEY(issued_by_user_id) REFERENCES users (id) ON DELETE SET NULL",
+            key_ddl,
         )
-        with legacy_engine.begin() as connection:
-            connection.execute(
-                text(
-                    "CREATE TABLE external_api_keys ("
-                    "id VARCHAR(32) PRIMARY KEY, tenant_id VARCHAR(32), user_id VARCHAR(32), "
-                    "created_at DATETIME)"
-                )
-            )
-            connection.execute(
-                text(
-                    "CREATE TABLE external_api_key_audit_events ("
-                    "id VARCHAR(32) PRIMARY KEY, api_key_id VARCHAR(32), tenant_id VARCHAR(32), "
-                    "subject_user_id VARCHAR(32), actor_user_id VARCHAR(32), event_type VARCHAR(20), "
-                    "details JSON, created_at DATETIME)"
-                )
-            )
-            connection.execute(
-                text(
-                    "INSERT INTO external_api_keys (id, tenant_id, user_id, created_at) "
-                    "VALUES ('legacy-key', 'legacy-tenant', 'legacy-subject', CURRENT_TIMESTAMP)"
-                )
-            )
-        original_engine = database_module.engine
-        database_module.engine = legacy_engine
-        try:
-            database_module._migrate_external_api_key_audit()
-        finally:
-            database_module.engine = original_engine
-        try:
-            with legacy_engine.connect() as connection:
-                migrated = connection.execute(
-                    text(
-                        "SELECT issued_by_user_id, revoked_by_user_id "
-                        "FROM external_api_keys WHERE id = 'legacy-key'"
-                    )
-                ).one()
-                self.assertEqual(tuple(migrated), (None, None))
-                event_row = connection.execute(
-                    text(
-                        "SELECT event_type, actor_user_id, subject_user_id "
-                        "FROM external_api_key_audit_events WHERE api_key_id = 'legacy-key'"
-                    )
-                ).one()
-                self.assertEqual(tuple(event_row), ("legacy_imported", None, "legacy-subject"))
-        finally:
-            legacy_engine.dispose()
+        self.assertIn(
+            "FOREIGN KEY(revoked_by_user_id) REFERENCES users (id) ON DELETE SET NULL",
+            key_ddl,
+        )
+        self.assertIn("subject_user_id VARCHAR(32),", audit_ddl)
+        self.assertIn("actor_user_id VARCHAR(32),", audit_ddl)
+        self.assertIn(
+            "FOREIGN KEY(actor_user_id) REFERENCES users (id) ON DELETE SET NULL",
+            audit_ddl,
+        )
 
     def test_object_listing_is_bounded_with_limit_one_and_acl_safe(self) -> None:
         # More rows than a single external page must not force a full ACL walk.

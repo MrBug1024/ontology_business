@@ -3,7 +3,7 @@
     <div class="publication-toolbar">
       <div>
         <h2 id="agent-mcp-heading">Agent 发布</h2>
-        <p>将已验证的 Agent 作为远程 MCP 服务提供给第三方，调用时继承 Agent 的完整内部能力。</p>
+        <p>将当前可对话的 Agent 作为远程 MCP 服务提供给第三方，调用时继承 Agent 的当前能力。</p>
       </div>
       <el-button v-if="canManage" type="primary" @click="openCreate">
         <el-icon aria-hidden="true"><Plus /></el-icon>新建发布
@@ -95,7 +95,7 @@
       />
       <el-form class="publication-form" label-width="108px" @submit.prevent>
         <el-form-item label="绑定 Agent" required>
-          <el-select v-model="form.agent_id" class="full-width" filterable placeholder="选择已就绪 Agent" @change="onAgentChange">
+          <el-select v-model="form.agent_id" class="full-width" filterable placeholder="选择可对话 Agent" @change="onAgentChange">
             <el-option
               v-for="candidate in candidates"
               :key="candidate.id"

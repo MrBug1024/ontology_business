@@ -9,7 +9,6 @@ from fastapi import HTTPException, Response
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from app import database
 from app.database import Base
 from app.models import (
     BusinessScenario,
@@ -37,6 +36,7 @@ from app.routers.scenarios import (
     preview_mapping,
 )
 from app.schemas import DataMappingIn
+from tests.postgresql_migration_contracts import baseline_table_ddl
 
 
 class MappingRefreshJobTests(unittest.TestCase):
@@ -60,8 +60,14 @@ class MappingRefreshJobTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="订单库",
-            type="sqlite",
-            config={},
+            type="postgres",
+            config={
+                "host": "unused.test",
+                "port": 5432,
+                "database": "orders",
+                "user": "test",
+                "password": "test-only",
+            },
             status="ok",
         )
         self.entity = OntologyEntity(
@@ -107,8 +113,14 @@ class MappingRefreshJobTests(unittest.TestCase):
         self.db.commit()
         self.db.info["tenant_id"] = self.tenant.id
         self.db.info["user_id"] = self.user.id
+        self.connection_patcher = patch(
+            "app.services.datasource_service.test_connection",
+            return_value=(True, "连接成功"),
+        )
+        self.connection_patcher.start()
 
     def tearDown(self) -> None:
+        self.connection_patcher.stop()
         self.db.close()
         self.engine.dispose()
 
@@ -121,7 +133,7 @@ class MappingRefreshJobTests(unittest.TestCase):
     def _publish_mapping_to_staging(self):
         """Create the exact release/binding evidence a non-dev job requires."""
         self.mapping.data_source_binding_key = "orders-refresh-binding"
-        self.mapping.data_source_binding_ref = {"adapter": "sqlite"}
+        self.mapping.data_source_binding_ref = {"adapter": "postgres"}
         binding = connector_service.upsert_binding(
             self.db,
             self.scenario,
@@ -214,8 +226,8 @@ class MappingRefreshJobTests(unittest.TestCase):
         )
         self.assertIsNone(imported)
 
-    def test_staging_job_and_preview_use_frozen_release_mapping_and_connector_pin(self) -> None:
-        release = self._publish_mapping_to_staging()
+    def test_staging_mapping_authoring_does_not_adopt_release_by_environment(self) -> None:
+        self._publish_mapping_to_staging()
         with patch(
             "app.services.runtime_connector_service.get_settings",
             return_value=SimpleNamespace(runtime_environment="staging"),
@@ -226,18 +238,16 @@ class MappingRefreshJobTests(unittest.TestCase):
 
         stored = self.db.get(DataMappingRefreshJob, job.id)
         assert stored is not None
-        self.assertEqual(stored.definition_source, "release")
-        self.assertEqual(stored.release_id, release.id)
-        self.assertTrue(stored.definition_snapshot_id)
+        self.assertEqual(stored.definition_source, "live")
+        self.assertIsNone(stored.release_id)
+        self.assertIsNone(stored.definition_snapshot_id)
         self.assertTrue(stored.definition_hash)
         self.assertEqual(stored.mapping_snapshot["table_name"], "orders")
         self.assertEqual(stored.mapping_snapshot["column_map"], {"id": "id", "amount": "amount"})
 
-        # Simulate authoring changing after deployment.  The queued operation
-        # and non-dev preview must continue to use the release's table/map.
-        self.mapping.table_name = "orders_live_drift"
-        self.mapping.column_map = {"id": "id"}
-        self.db.commit()
+        # A release has been created, but mapping refresh/preview stays on the
+        # authoring path.  Deployment environment only selects the physical
+        # connector binding; it does not select a separate data definition.
         real_resolver = runtime_connector_service.resolve_connector
         with patch(
             "app.services.runtime_connector_service.get_settings",
@@ -255,8 +265,13 @@ class MappingRefreshJobTests(unittest.TestCase):
         refreshed = self.db.get(DataMappingRefreshJob, job.id)
         assert refreshed is not None
         self.assertEqual(refreshed.status, "succeeded")
+        # Connector health is deployment-local operational state.  The legacy
+        # top-level fields remain the dev compatibility projection, while the
+        # staging refresh records its own successful state without changing
+        # business facts or definitions.
         self.assertEqual(self.mapping.status, "unknown")
-        self.assertEqual(resolve_connector.call_args_list[0].kwargs["release_id"], release.id)
+        self.assertEqual(self.mapping.environment_status["staging"]["status"], "ok")
+        self.assertIsNone(resolve_connector.call_args_list[0].kwargs["release_id"])
         self.assertTrue(all('"orders"' in call.args[1] for call in query.call_args_list))
         self.assertEqual(preview["table_name"], "orders")
         imported = self.db.scalar(
@@ -265,83 +280,34 @@ class MappingRefreshJobTests(unittest.TestCase):
         assert imported is not None
         self.assertEqual(imported.attributes, {"id": "ORD-STAGING", "amount": 77})
 
-    def test_mapping_job_api_hides_jobs_from_another_runtime_environment(self) -> None:
+    def test_mapping_job_api_keeps_jobs_visible_across_runtime_environments(self) -> None:
         job = self._enqueue()
         with patch(
             "app.services.runtime_connector_service.get_settings",
             return_value=SimpleNamespace(runtime_environment="staging"),
-        ), self.assertRaises(HTTPException) as error:
-            get_mapping_refresh_job(job.id, Response(), self.db)
-        self.assertEqual(error.exception.status_code, 404)
+        ):
+            result = get_mapping_refresh_job(job.id, Response(), self.db)
+        self.assertEqual(result.id, job.id)
+        self.assertEqual(result.environment, "dev")
 
-    def test_legacy_mapping_job_migration_cancels_active_rows_and_labels_history(self) -> None:
-        legacy_engine = create_engine("sqlite:///:memory:")
-        try:
-            with legacy_engine.begin() as connection:
-                connection.exec_driver_sql(
-                    """
-                    CREATE TABLE data_mapping_refresh_jobs (
-                        id VARCHAR(32) PRIMARY KEY,
-                        tenant_id VARCHAR(32),
-                        scenario_id VARCHAR(32),
-                        mapping_id VARCHAR(32),
-                        active_key VARCHAR(260),
-                        status VARCHAR(24),
-                        error TEXT,
-                        next_retry_at DATETIME,
-                        completed_at DATETIME
-                    )
-                    """
-                )
-                connection.exec_driver_sql(
-                    "INSERT INTO data_mapping_refresh_jobs "
-                    "(id, tenant_id, scenario_id, mapping_id, active_key, status, error) "
-                    "VALUES ('legacy-active', 'tenant', 'scenario', 'mapping', 'mapping:staging', 'queued', '')"
-                )
-                connection.exec_driver_sql(
-                    "INSERT INTO data_mapping_refresh_jobs "
-                    "(id, tenant_id, scenario_id, mapping_id, status, error) "
-                    "VALUES ('legacy-terminal', 'tenant', 'scenario', 'mapping', 'succeeded', '')"
-                )
-            original_engine = database.engine
-            database.engine = legacy_engine
-            try:
-                database._migrate_mapping_refresh_provenance()
-            finally:
-                database.engine = original_engine
-
-            with legacy_engine.connect() as connection:
-                columns = {
-                    item["name"]
-                    for item in database.inspect(connection).get_columns(
-                        "data_mapping_refresh_jobs"
-                    )
-                }
-                self.assertTrue(
-                    {
-                        "mapping_snapshot",
-                        "definition_snapshot_id",
-                        "release_id",
-                        "definition_hash",
-                        "definition_source",
-                    }.issubset(columns)
-                )
-                active = connection.exec_driver_sql(
-                    "SELECT status, active_key, mapping_snapshot, definition_source "
-                    "FROM data_mapping_refresh_jobs WHERE id = 'legacy-active'"
-                ).fetchone()
-                terminal = connection.exec_driver_sql(
-                    "SELECT status, definition_source FROM data_mapping_refresh_jobs "
-                    "WHERE id = 'legacy-terminal'"
-                ).fetchone()
-            self.assertEqual(active[0], "cancelled")
-            self.assertIsNone(active[1])
-            self.assertEqual(active[2], "{}")
-            self.assertEqual(active[3], "legacy")
-            self.assertEqual(terminal[0], "succeeded")
-            self.assertEqual(terminal[1], "legacy")
-        finally:
-            legacy_engine.dispose()
+    def test_postgresql_mapping_job_schema_freezes_runtime_provenance(self) -> None:
+        ddl = baseline_table_ddl("data_mapping_refresh_jobs")
+        self.assertIn("mapping_snapshot JSON NOT NULL", ddl)
+        self.assertIn("definition_snapshot_id VARCHAR(32),", ddl)
+        self.assertIn("release_id VARCHAR(32),", ddl)
+        self.assertIn("definition_hash VARCHAR(64) NOT NULL", ddl)
+        self.assertIn("definition_source VARCHAR(20) NOT NULL", ddl)
+        self.assertIn("active_key VARCHAR(260),", ddl)
+        self.assertIn(
+            "CONSTRAINT uq_mapping_refresh_jobs_active_key "
+            "UNIQUE (tenant_id, active_key)",
+            ddl,
+        )
+        self.assertIn(
+            "FOREIGN KEY(definition_snapshot_id) REFERENCES ontology_snapshots (id) "
+            "ON DELETE SET NULL",
+            ddl,
+        )
 
     def test_temporary_failure_is_redacted_and_retried(self) -> None:
         job = self._enqueue()

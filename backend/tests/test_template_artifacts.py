@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import io
 import json
-import os
-import tempfile
+from contextlib import nullcontext
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,7 +26,10 @@ from app.models import (
     DataSource,
     Message,
     OntologyAction,
+    OntologyBranch,
     OntologyEntity,
+    OntologyRelease,
+    OntologySnapshot,
     Tenant,
     User,
 )
@@ -37,15 +39,31 @@ from app.schemas import ActionIn
 from app.services import (
     agent_capability_service,
     datasource_service,
+    object_deletion_service,
+    object_storage_service,
     permission_service,
+    release_service,
     runtime_definition_service,
     template_artifact_service,
     workflow_service,
 )
 from app.services.auth_service import get_current_user, get_tenant_db
+from tests.minio_fakes import FakeMinio
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "artifact_templates"
+TEST_MINIO_CONFIGURATION = object_storage_service.MinioConfiguration(
+    endpoint="minio.example.test",
+    access_key="access",
+    secret_key="secret",
+    bucket_name="ontology",
+    prefix="ontology-business",
+)
+TEST_MINIO_SOURCE_CONFIG = {
+    "storage_backend": "minio",
+    "bucket_name": "ontology",
+    "prefix": "ontology-business",
+}
 
 
 def _rewrite_zip_member(content: bytes, member_name: str, transform) -> bytes:
@@ -330,12 +348,11 @@ class TemplateRenderingTests(unittest.TestCase):
 
 
 class TemplateActionAndDownloadTests(unittest.TestCase):
+    @staticmethod
+    def _fake_upload_claim(**kwargs):
+        return SimpleNamespace(object_key=kwargs["object_key"])
+
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.bucket_patch = patch.object(
-            datasource_service, "BUCKETS_DIR", Path(self.temp.name) / "buckets"
-        )
-        self.bucket_patch.start()
         self.engine = create_engine(
             "sqlite://",
             connect_args={"check_same_thread": False},
@@ -343,6 +360,49 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
         )
         self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         Base.metadata.create_all(self.engine)
+        self.minio = FakeMinio()
+        self.configuration_patch = patch.object(
+            object_storage_service,
+            "configuration",
+            return_value=TEST_MINIO_CONFIGURATION,
+        )
+        self.client_patch = patch.object(
+            object_storage_service,
+            "get_client",
+            return_value=self.minio,
+        )
+        # Outbox transaction behavior has dedicated coverage. These template
+        # tests use one StaticPool connection for HTTP and ORM assertions, so
+        # a real upload-intent sub-session would incorrectly commit it.
+        self.upload_intent_patch = patch.object(
+            object_deletion_service,
+            "_prepare_upload_intent",
+            side_effect=self._fake_upload_claim,
+        )
+        self.heartbeat_patch = patch.object(
+            object_deletion_service,
+            "heartbeat_upload_intent",
+            side_effect=lambda _claim: nullcontext(),
+        )
+        self.begin_upload_patch = patch.object(
+            object_deletion_service,
+            "begin_upload_put",
+        )
+        self.assert_upload_patch = patch.object(
+            object_deletion_service,
+            "assert_upload_active",
+        )
+        self.retain_upload_patch = patch.object(
+            object_deletion_service,
+            "retain_bucket_file_upload",
+        )
+        self.configuration_patch.start()
+        self.client_patch.start()
+        self.upload_intent_patch.start()
+        self.heartbeat_patch.start()
+        self.begin_upload_patch.start()
+        self.assert_upload_patch.start()
+        self.retain_upload_patch.start()
         self.tenant = Tenant(id="tenant-artifacts", name="附件测试租户")
         self.user = User(
             id="user-artifacts",
@@ -371,6 +431,7 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             name="业务模板",
             type="file_bucket",
+            config=dict(TEST_MINIO_SOURCE_CONFIG),
         )
         self.outputs = DataSource(
             id="source-outputs",
@@ -378,6 +439,7 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             name="业务附件",
             type="file_bucket",
+            config=dict(TEST_MINIO_SOURCE_CONFIG),
         )
         setup_db = self.Session()
         setup_db.add_all(
@@ -438,8 +500,13 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.client.close()
         self.engine.dispose()
-        self.bucket_patch.stop()
-        self.temp.cleanup()
+        self.retain_upload_patch.stop()
+        self.assert_upload_patch.stop()
+        self.begin_upload_patch.stop()
+        self.heartbeat_patch.stop()
+        self.upload_intent_patch.stop()
+        self.client_patch.stop()
+        self.configuration_patch.stop()
 
     def _db(self) -> Session:
         db = self.Session()
@@ -478,6 +545,52 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
         db.add(action)
         db.commit()
         return action
+
+    def _release_current_definition(
+        self,
+        db: Session,
+        *,
+        branch_id: str,
+        snapshot_id: str,
+        release_id: str,
+    ) -> None:
+        branch = OntologyBranch(
+            id=branch_id,
+            tenant_id=self.tenant.id,
+            scenario_id=self.scenario.id,
+            name="main",
+            created_by_user_id=self.user.id,
+        )
+        db.add(branch)
+        db.flush()
+        content = release_service.capture_snapshot_content(db, self.scenario)
+        snapshot = OntologySnapshot(
+            id=snapshot_id,
+            tenant_id=self.tenant.id,
+            scenario_id=self.scenario.id,
+            branch_id=branch.id,
+            kind="merge",
+            content=content,
+            content_hash=release_service.snapshot_hash(content),
+            created_by_user_id=self.user.id,
+        )
+        db.add(snapshot)
+        db.flush()
+        branch.base_snapshot_id = snapshot.id
+        branch.head_snapshot_id = snapshot.id
+        db.add(
+            OntologyRelease(
+                id=release_id,
+                tenant_id=self.tenant.id,
+                scenario_id=self.scenario.id,
+                branch_id=branch.id,
+                snapshot_id=snapshot.id,
+                environment="dev",
+                status="released",
+                created_by_user_id=self.user.id,
+            )
+        )
+        db.commit()
 
     def test_template_action_pins_source_previews_then_generates_once(self) -> None:
         db = self._db()
@@ -534,7 +647,11 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
         self.assertEqual(persisted.generated_by_action_log_id, executed["log_id"])
         self.assertEqual(persisted.origin_template_file_id, self.template_file.id)
         self.assertEqual(persisted.content_sha256, artifact["sha256"])
-        self.assertEqual(Path(persisted.stored_path).parent.name, executed["log_id"])
+        self.assertEqual(persisted.stored_path, persisted.object_url)
+        self.assertIn(
+            f"/files/{persisted.id}/uploads/",
+            f"/{persisted.object_key}",
+        )
         downloaded = self.client.get(artifact["download_url"])
         self.assertEqual(downloaded.status_code, 200, downloaded.text)
         self.assertEqual(downloaded.headers["content-type"], template_artifact_service.DOCX_MIME)
@@ -549,10 +666,17 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
         self.assertEqual(corrupted.status_code, 409)
         self.assertIn("大小", corrupted.json()["detail"])
         persisted.size = original_size
-        path = Path(persisted.stored_path)
-        content = bytearray(path.read_bytes())
+        content = bytearray(
+            datasource_service.read_bucket_file(persisted, self.outputs)[0]
+        )
         content[-1] ^= 1
-        path.write_bytes(content)
+        self.minio.overwrite_object(
+            persisted.bucket_name,
+            persisted.object_key,
+            bytes(content),
+            version_id=persisted.object_version_id,
+            preserve_etag=True,
+        )
         db.commit()
         corrupted = self.client.get(artifact["download_url"])
         self.assertEqual(corrupted.status_code, 409)
@@ -583,9 +707,23 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
             idempotency_key="retry-after-rollback",
         )
         self.assertEqual(result["status"], "success")
-        output_files = list((datasource_service.bucket_dir(self.outputs) / ".generated").rglob("*.docx"))
-        self.assertEqual(len(output_files), 1)
-        self.assertEqual(output_files[0], Path(db.get(BucketFile, result["result"]["artifact"]["id"]).stored_path))
+        persisted = db.get(BucketFile, result["result"]["artifact"]["id"])
+        self.assertTrue(
+            datasource_service.read_bucket_file(persisted, self.outputs)[0].startswith(
+                b"PK"
+            )
+        )
+        scoped_objects = object_storage_service.list_objects(
+            persisted.bucket_name,
+            f"ontology-business/tenants/{self.tenant.id}/scenarios/{self.scenario.id}/"
+            f"data-sources/{self.outputs.id}/files/{persisted.id}",
+        )
+        # The failed PUT uses a different generation and is later reclaimed by
+        # the outbox. The durable metadata must point only to the retry output.
+        self.assertIn(
+            persisted.object_key,
+            [item.object_key for item in scoped_objects],
+        )
         db.close()
 
     def test_agent_confirmation_revalidates_scope_conversation_and_download_acl(self) -> None:
@@ -631,11 +769,28 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
             tool_results=[],
         )
         db.add_all([agent, conversation, message, other_conversation, other_message])
+        # This confirmation case validates a released Action. The generic
+        # fixture entity has no business key, so mark it abstract before
+        # capturing the otherwise valid release snapshot.
+        released_entity = db.get(OntologyEntity, self.entity.id)
+        assert released_entity is not None
+        released_entity.is_abstract = True
         db.commit()
-        definition = runtime_definition_service.resolve_active(
+        self._release_current_definition(
+            db,
+            branch_id="branch-template-agent",
+            snapshot_id="snapshot-template-agent",
+            release_id="release-template-agent",
+        )
+        definition = runtime_definition_service.resolve_execution(
             db,
             self.scenario,
             environment="dev",
+        )
+        released_action = runtime_definition_service.resolve_resource(
+            definition,
+            "action",
+            action.id,
         )
         db.info["action_audit_context"] = {"agent_id": agent.id}
         db.info["llm_trace_context"] = {
@@ -644,7 +799,7 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
         }
         preview = workflow_service.execute_action(
             db,
-            action,
+            released_action,
             _docx_variables(),
             dry_run=True,
             runtime_environment="dev",
@@ -733,7 +888,7 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
         )
         db.close()
 
-    def test_stable_retry_overwrites_crash_orphan_and_startup_reconciles_stale_orphans(self) -> None:
+    def test_stable_retry_uses_a_fresh_minio_generation(self) -> None:
         db = self._db()
         action = self._create_template_action(db, "action-template-crash")
         scoped_key = workflow_service._scoped_idempotency_key("crash-retry", "dev")
@@ -757,51 +912,59 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
             idempotency_key="crash-retry",
         )
         self.assertEqual(result["result"]["artifact"]["id"], stable_id)
-        self.assertEqual(Path(orphan.stored_path), Path(db.get(BucketFile, stable_id).stored_path))
-        self.assertTrue(Path(orphan.stored_path).read_bytes().startswith(b"PK"))
-
-        stale_id = "f" * 32
-        stale = datasource_service.save_bucket_file(
-            self.outputs, "orphan.md", b"orphan", stable_file_id=stale_id
-        )
-        old = 1
-        os.utime(stale.stored_path, (old, old))
-        os.utime(Path(stale.stored_path).parent, (old, old))
+        persisted = db.get(BucketFile, stable_id)
+        self.assertNotEqual(orphan.object_key, persisted.object_key)
         self.assertEqual(
-            datasource_service.reconcile_generated_file_orphans(db, older_than_seconds=1),
-            1,
+            datasource_service.read_bucket_file(orphan, self.outputs)[0],
+            b"interrupted-write-placeholder",
         )
-        self.assertFalse(Path(stale.stored_path).exists())
-        self.assertTrue(Path(orphan.stored_path).exists())
+        self.assertTrue(
+            datasource_service.read_bucket_file(persisted, self.outputs)[0].startswith(
+                b"PK"
+            )
+        )
         db.close()
 
     def test_bucket_paths_and_duplicate_names_are_safe(self) -> None:
         first = datasource_service.save_bucket_file(self.outputs, "报告.md", b"one")
         second = datasource_service.save_bucket_file(self.outputs, "报告.md", b"two")
         self.assertEqual(first.filename, "报告.md")
-        self.assertEqual(second.filename, "报告 (2).md")
-        self.assertNotEqual(first.stored_path, second.stored_path)
+        self.assertEqual(second.filename, "报告.md")
+        self.assertNotEqual(first.object_key, second.object_key)
+        self.assertEqual(
+            datasource_service.read_bucket_file(second, self.outputs)[0],
+            b"two",
+        )
         first.mime = "application/octet-stream"
-        _path, _size, canonical_mime = datasource_service.validate_bucket_file_for_download(
-            first, self.outputs
+        _content, _size, canonical_mime = datasource_service.read_bucket_file(
+            first,
+            self.outputs,
         )
         self.assertEqual(canonical_mime, template_artifact_service.MARKDOWN_MIME)
         first.mime = template_artifact_service.DOCX_MIME
         with self.assertRaisesRegex(ValueError, "MIME"):
-            datasource_service.validate_bucket_file_for_download(first, self.outputs)
+            datasource_service.read_bucket_file(first, self.outputs)
 
-        outside = Path(self.temp.name) / "outside.md"
-        outside.write_bytes(b"secret")
+        escaped_key = (
+            "ontology-business/tenants/other-tenant/scenarios/"
+            f"{self.scenario.id}/data-sources/{self.outputs.id}/files/escaped/"
+            f"uploads/{'a' * 32}/outside.md"
+        )
+        escaped_url = object_storage_service.stable_object_url("ontology", escaped_key)
         escaped = BucketFile(
             id="escaped",
             data_source_id=self.outputs.id,
             filename="outside.md",
-            stored_path=str(outside),
+            stored_path=escaped_url,
+            storage_provider="minio",
+            bucket_name="ontology",
+            object_key=escaped_key,
+            object_url=escaped_url,
             size=6,
             mime=template_artifact_service.MARKDOWN_MIME,
         )
-        with self.assertRaisesRegex(ValueError, "越界"):
-            datasource_service.validate_bucket_file_for_download(escaped, self.outputs)
+        with self.assertRaisesRegex(ValueError, "不属于指定文件桶作用域"):
+            datasource_service.read_bucket_file(escaped, self.outputs)
 
 
 if __name__ == "__main__":

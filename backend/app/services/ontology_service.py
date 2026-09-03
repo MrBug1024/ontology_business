@@ -1060,61 +1060,14 @@ def resolve_instance_display_name(
 
 
 def instance_in_runtime_environment(instance: Any, environment: str) -> bool:
-    """Keep imported runtime rows isolated while manual scenario facts stay shared."""
+    """Legacy compatibility helper: deployment config never filters facts.
 
-    if instance is None:
-        return False
-    if str(getattr(instance, "source", "manual") or "manual") != "imported":
-        return True
-    metadata = (
-        instance.source_metadata
-        if isinstance(getattr(instance, "source_metadata", None), dict)
-        else {}
-    )
-    instance_environment = str(
-        metadata.get("runtime_environment") or "dev"
-    ).strip().lower() or "dev"
-    expected_environment = str(environment or "dev").strip().lower() or "dev"
-    return instance_environment == expected_environment
-
-
-def _runtime_provenance_matches(
-    metadata: dict[str, Any],
-    definition: Any,
-) -> bool:
-    """Match one generated fact to the definition currently serving reads.
-
-    Development data is tied to the live resource ids.  A deployed fact also
-    has to prove the immutable release that produced it; accepting only the
-    environment would let rows from a superseded release leak into a newer
-    deployment.
+    ``RUNTIME_ENVIRONMENT`` chooses the process's infrastructure bindings. It
+    is recorded as audit provenance on imports, but cannot make tenant data
+    disappear when the same database is viewed by another deployment.
     """
-
-    if definition is None:
-        return False
-    expected_environment = str(
-        getattr(definition, "environment", "") or ""
-    ).strip().lower()
-    actual_environment = str(
-        metadata.get("runtime_environment") or "dev"
-    ).strip().lower() or "dev"
-    if not expected_environment or actual_environment != expected_environment:
-        return False
-    if expected_environment == "dev":
-        return True
-    if str(getattr(definition, "source", "") or "") != "release":
-        return False
-    expected = {
-        "definition_snapshot_id": getattr(definition, "snapshot_id", None),
-        "release_id": getattr(definition, "release_id", None),
-        "definition_hash": getattr(definition, "definition_hash", None),
-    }
-    if str(metadata.get("definition_source") or "") != "release":
-        return False
-    return all(
-        bool(value) and str(metadata.get(key) or "") == str(value)
-        for key, value in expected.items()
-    )
+    del environment
+    return instance is not None
 
 
 def _fact_belongs_to_runtime_scenario(fact: Any, definition: Any) -> bool:
@@ -1142,8 +1095,8 @@ def instance_in_runtime_definition(instance: Any, definition: Any) -> bool:
     """Return whether an object fact belongs to the current runtime definition.
 
     Manual objects remain scenario facts. Imported objects must name an object
-    mapping in the resolved definition and, outside dev, carry its exact
-    immutable release provenance.
+    mapping in the resolved definition. Deployment environment and the release
+    that last refreshed the row are audit facts, not a data-visibility scope.
     """
 
     if instance is None or not _fact_belongs_to_runtime_scenario(instance, definition):
@@ -1162,7 +1115,7 @@ def instance_in_runtime_definition(instance: Any, definition: Any) -> bool:
     mappings = getattr(definition, "mappings", {}) if definition is not None else {}
     if not mapping_id or mapping_id not in {str(value) for value in (mappings or {})}:
         return False
-    return _runtime_provenance_matches(metadata, definition)
+    return True
 
 
 def relation_instance_in_runtime_definition(instance: Any, definition: Any) -> bool:
@@ -1190,7 +1143,7 @@ def relation_instance_in_runtime_definition(instance: Any, definition: Any) -> b
     )
     if not mapping_id or mapping_id not in {str(value) for value in (mappings or {})}:
         return False
-    return _runtime_provenance_matches(metadata, definition)
+    return True
 
 
 def normalize_transform_rules(
@@ -2291,17 +2244,20 @@ def import_instances_from_mapping(
 ) -> dict[str, Any]:
     """按数据映射增量同步实例，并写入可审计的来源快照。
 
-    ``source_ref`` 保留短小可读的引用；精确且不会串源的映射标识、运行环境、
-    数据源、表和记录键写在 ``source_metadata``。这样同一个实体由多个数据源/
-    映射/部署环境同步时也不会互相覆盖，未变记录则可安全复用既有实例。
+    ``source_ref`` 保留短小可读的引用；映射标识、数据源、表和记录键写在
+    ``source_metadata``。部署环境只作为连接器审计信息，不能参与对象身份或
+    可见性判断；同一个数据库中的 refresh 必须复用同一映射记录。
     """
     runtime_environment = str(environment or "dev").strip().lower() or "dev"
-    if runtime_environment != "dev" and getattr(mapping, "entity", None) is None:
-        raise ValueError("非开发环境映射缺少发布快照中的对象定义")
+    definition_provenance = dict(definition_provenance or {})
+    if (
+        str(definition_provenance.get("source") or "") == "release"
+        and getattr(mapping, "entity", None) is None
+    ):
+        raise ValueError("发布快照中的对象定义不可用")
     ds, ent = _mapping_context(db, scenario, mapping, data_source=data_source)
     col_map = mapping.column_map or {}
     transform_rules = normalize_transform_rules(ent, getattr(mapping, "transform_rules", {}) or {})
-    definition_provenance = dict(definition_provenance or {})
     mapping_connector_audits = mapping_connector_audits or {}
     relation_connector_audits = relation_connector_audits or {}
 
@@ -2394,19 +2350,18 @@ def import_instances_from_mapping(
             OntologyInstance.source == "imported",
         )
     ).scalars().all()
-    # 新版使用 (mapping_id, environment, record_key) 做稳定身份；旧版用
-    # table:key 作为开发环境的一次性回退，升级后第一次刷新会补齐元数据，随后
-    # 完全按新版键去重。这样共享数据库中的 staging/prod 写入不会覆盖 dev 对象。
-    existing_by_identity: dict[tuple[str, str, str], OntologyInstance] = {}
+    # ``runtime_environment`` is deployment provenance, never business-data
+    # identity.  One mapping record therefore owns one stable row per key even
+    # if the same metadata database is served by another deployment later.
+    existing_by_identity: dict[tuple[str, str], OntologyInstance] = {}
     legacy_by_ref: dict[str, OntologyInstance] = {}
     for instance in imported_instances:
         metadata = instance.source_metadata or {}
         if isinstance(metadata, dict) and metadata.get("mapping_id") and metadata.get("record_key") is not None:
-            metadata_environment = str(metadata.get("runtime_environment") or "dev").strip().lower() or "dev"
             existing_by_identity[
-                (str(metadata["mapping_id"]), metadata_environment, str(metadata["record_key"]))
+                (str(metadata["mapping_id"]), str(metadata["record_key"]))
             ] = instance
-        if runtime_environment == "dev" and instance.source_ref:
+        if isinstance(metadata, dict) and not metadata.get("mapping_id") and instance.source_ref:
             legacy_by_ref[instance.source_ref] = instance
 
     row_instances: list[OntologyInstance] = []
@@ -2440,7 +2395,7 @@ def import_instances_from_mapping(
             record_key = f"row:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:20]}"
         legacy_ref = f"{mapping.table_name}:{record_key}"
         ref = f"{ds.id}:{mapping.table_name}:{record_key}"[:500]
-        identity = (mapping.id, runtime_environment, record_key)
+        identity = (mapping.id, record_key)
         inst = existing_by_identity.get(identity) or legacy_by_ref.get(legacy_ref)
         display = resolve_instance_display_name(
             ent,
@@ -2457,7 +2412,7 @@ def import_instances_from_mapping(
             "title_column": title_col or "",
             "record_key": record_key,
             "transform_rules": transform_rules,
-            "version": "mapping-v3",
+            "version": "mapping-v4",
             "definition_snapshot_id": definition_provenance.get("snapshot_id"),
             "release_id": definition_provenance.get("release_id"),
             "definition_hash": str(definition_provenance.get("definition_hash") or ""),
@@ -2506,15 +2461,11 @@ def import_instances_from_mapping(
     # exactly zero generated links.
     rels_created = 0
     if relation_mappings is None:
-        relation_mappings = (
-            db.execute(
-                select(RelationDataMapping).where(
-                    RelationDataMapping.scenario_id == scenario.id
-                )
-            ).scalars().all()
-            if runtime_environment == "dev"
-            else []
-        )
+        relation_mappings = db.execute(
+            select(RelationDataMapping).where(
+                RelationDataMapping.scenario_id == scenario.id
+            )
+        ).scalars().all()
     relation_data_sources = relation_data_sources or {}
     mapping_data_sources = mapping_data_sources or {mapping.id: ds}
     runtime_mappings = runtime_mappings or {
@@ -2539,11 +2490,8 @@ def import_instances_from_mapping(
             else {}
         )
         mapping_id = str(metadata.get("mapping_id") or "")
-        metadata_environment = str(
-            metadata.get("runtime_environment") or "dev"
-        ).strip().lower()
         record_key = metadata.get("record_key")
-        if mapping_id and metadata_environment == runtime_environment and record_key is not None:
+        if mapping_id and record_key is not None:
             instances_by_mapping.setdefault(mapping_id, {})[str(record_key)] = imported_instance
 
     def mapping_key_contract(runtime_mapping: Any) -> tuple[str, str, list[dict[str, Any]]]:
@@ -2632,8 +2580,6 @@ def import_instances_from_mapping(
             )
             carrier_source = mapping_data_sources.get(carrier_id)
             if carrier_source is None:
-                if runtime_environment != "dev":
-                    raise ValueError("发布关系映射缺少已解析的外键承载侧连接器")
                 carrier_source = _visible_relation_mapping_source(
                     db, scenario, str(getattr(carrier_mapping, "data_source_id", "") or "")
                 )
@@ -2680,8 +2626,6 @@ def import_instances_from_mapping(
         else:
             join_source = relation_data_sources.get(relation_mapping_id)
             if join_source is None:
-                if runtime_environment != "dev":
-                    raise ValueError("发布关系映射缺少已解析的中间表连接器")
                 join_source_id = str(
                     _relation_mapping_value(relation_mapping, "data_source_id") or ""
                 )
@@ -2819,8 +2763,7 @@ def import_instances_from_mapping(
                     target_instance_id=target_instance.id,
                     source="mapping",
                     source_ref=(
-                        f"{relation_mapping_id}:{runtime_environment}:"
-                        f"{source_key}:{target_key}"
+                        f"{relation_mapping_id}:{source_key}:{target_key}"
                     )[:500],
                     source_metadata=metadata,
                 )
@@ -2839,7 +2782,6 @@ def import_instances_from_mapping(
                 metadata = link.source_metadata if isinstance(link.source_metadata, dict) else {}
                 if (
                     str(metadata.get("relation_mapping_id") or "") != relation_mapping_id
-                    or str(metadata.get("runtime_environment") or "dev") != runtime_environment
                     or (link.source_instance_id, link.target_instance_id) in desired_instance_pairs
                 ):
                     continue
@@ -2862,8 +2804,6 @@ def import_instances_from_mapping(
                 if isinstance(link.source_metadata, dict)
                 and str(link.source_metadata.get("relation_mapping_id") or "")
                 == relation_mapping_id
-                and str(link.source_metadata.get("runtime_environment") or "dev")
-                == runtime_environment
             )
     # 后台任务需要原子提交“实例/关系 + 映射状态 + 任务终态”，不能在此提前
     # 提交出半完成同步；保留默认提交以兼容现有 seed/服务调用。

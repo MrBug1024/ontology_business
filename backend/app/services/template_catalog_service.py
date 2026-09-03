@@ -132,6 +132,40 @@ def inspect_bucket_file(
     return content, metadata, placeholders
 
 
+def _validated_uploaded_inspection(
+    template_file: BucketFile,
+    inspection: template_artifact_service.TemplateInspection,
+) -> tuple[dict[str, Any], list[str]]:
+    """Trust a staged-file inspection only when it matches the stored object row.
+
+    The upload route validates the temporary file before streaming that same
+    file to MinIO.  Avoiding a read-after-write here prevents a 400 MiB upload
+    from being materialised again in an API worker.  Later catalog resolution
+    still reads and verifies the object through the normal integrity boundary.
+    """
+    metadata = dict(inspection.metadata)
+    artifact_format, mime, suffix = template_artifact_service.template_format(
+        template_file.filename
+    )
+    expected_sha256 = str(metadata.get("sha256") or "").lower()
+    expected_size = int(metadata.get("size") or -1)
+    if (
+        metadata.get("format") != artifact_format
+        or metadata.get("mime") != mime
+        or metadata.get("suffix") != suffix
+        or expected_size < 1
+        or expected_size != int(template_file.size or 0)
+        or expected_sha256 != str(template_file.content_sha256 or "").lower()
+    ):
+        raise TemplateCatalogError("上传模板校验结果与存储对象不一致")
+    paths = sorted({str(value) for value in inspection.placeholder_paths})
+    for path in paths:
+        template_artifact_service._validated_path_parts(path)  # noqa: SLF001
+    if len(paths) != len(inspection.placeholder_paths):
+        raise TemplateCatalogError("上传模板占位符重复或无效")
+    return metadata, paths
+
+
 def create_from_bucket_file(
     db: Session,
     *,
@@ -147,13 +181,19 @@ def create_from_bucket_file(
     created_by_user_id: str | None = None,
     stable_template_id: str | None = None,
     stable_version_id: str | None = None,
+    inspection: template_artifact_service.TemplateInspection | None = None,
 ) -> ArtifactTemplate:
     _validate_source_scope(
         template_source, tenant_id=tenant_id, scenario_id=scenario_id
     )
-    _content, metadata, placeholders = inspect_bucket_file(
-        template_file, template_source
-    )
+    if inspection is None:
+        _content, metadata, placeholders = inspect_bucket_file(
+            template_file, template_source
+        )
+    else:
+        metadata, placeholders = _validated_uploaded_inspection(
+            template_file, inspection
+        )
     normalized_name = str(name or "").strip()
     if not normalized_name or len(normalized_name) > 200:
         raise TemplateCatalogError("模板名称必须是 1 到 200 个字符")
@@ -216,6 +256,7 @@ def add_version_from_bucket_file(
     created_by_user_id: str | None = None,
     stable_version_id: str | None = None,
     allow_deprecated: bool = False,
+    inspection: template_artifact_service.TemplateInspection | None = None,
 ) -> ArtifactTemplateVersion:
     if template.status != "active" and not allow_deprecated:
         raise TemplateCatalogError("已停用模板不能新增版本，请先恢复模板")
@@ -224,9 +265,14 @@ def add_version_from_bucket_file(
         tenant_id=template.tenant_id,
         scenario_id=template.scenario_id,
     )
-    _content, metadata, placeholders = inspect_bucket_file(
-        template_file, template_source
-    )
+    if inspection is None:
+        _content, metadata, placeholders = inspect_bucket_file(
+            template_file, template_source
+        )
+    else:
+        metadata, placeholders = _validated_uploaded_inspection(
+            template_file, inspection
+        )
     existing = db.scalar(select(ArtifactTemplateVersion).where(
         ArtifactTemplateVersion.template_id == template.id,
         ArtifactTemplateVersion.content_sha256 == str(metadata["sha256"]),

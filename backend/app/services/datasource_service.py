@@ -264,6 +264,30 @@ def managed_minio_location(ds: DataSource) -> tuple[str, str]:
     return bucket_name, prefix
 
 
+def persisted_minio_location(ds: DataSource) -> tuple[str, str]:
+    """Return a file bucket's durable storage policy without requiring today's policy.
+
+    New writes always go through :func:`managed_minio_location`, which pins
+    them to the deployment's active MinIO configuration. A historical
+    ``BucketFile`` must instead be located from the source policy that was
+    persisted when it was created; otherwise rotating a bucket/prefix leaves
+    the old bytes undeletable.
+    """
+    if ds.type != "file_bucket" or not _is_minio_source(ds):
+        raise ValueError("数据源未配置为 MinIO 文件桶")
+    configured = object_storage_service.require_configuration()
+    source_config = ds.config or {}
+    bucket_name = str(source_config.get("bucket_name") or configured.bucket_name).strip()
+    prefix = object_storage_service.normalize_prefix(
+        str(source_config.get("prefix") or configured.prefix)
+    )
+    try:
+        object_storage_service.stable_object_url(bucket_name, "identity-check")
+    except object_storage_service.ObjectStorageError as exc:
+        raise ValueError("文件桶持久化存储位置无效") from exc
+    return bucket_name, prefix
+
+
 def ensure_file_bucket_storage(ds: DataSource) -> None:
     """Verify that a managed file bucket exists and is writable by this service."""
     bucket_name, _prefix = managed_minio_location(ds)
@@ -284,15 +308,15 @@ def _upload_generation_segment(value: str) -> str:
     return segment
 
 
-def build_bucket_object_key(
+def _build_bucket_object_key_for_prefix(
     ds: DataSource,
     file_id: str,
     filename: str,
     *,
+    prefix: str,
     upload_id: str | None = None,
 ) -> str:
-    """Build a legacy key or a generation-scoped key for a bucket-file row."""
-    _bucket_name, prefix = managed_minio_location(ds)
+    """Build a source-owned object key below an explicit trusted prefix."""
     safe_name = validate_bucket_filename(filename)
     parts = [
         *([prefix] if prefix else []),
@@ -309,6 +333,24 @@ def build_bucket_object_key(
         parts.extend(("uploads", _upload_generation_segment(upload_id)))
     parts.append(safe_name)
     return "/".join(parts)
+
+
+def build_bucket_object_key(
+    ds: DataSource,
+    file_id: str,
+    filename: str,
+    *,
+    upload_id: str | None = None,
+) -> str:
+    """Build a legacy key or a generation-scoped key for a bucket-file row."""
+    _bucket_name, prefix = managed_minio_location(ds)
+    return _build_bucket_object_key_for_prefix(
+        ds,
+        file_id,
+        filename,
+        prefix=prefix,
+        upload_id=upload_id,
+    )
 
 
 def build_assistant_attachment_object_key(
@@ -373,6 +415,240 @@ def _validate_bucket_object_key(
     raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
 
 
+def _key_is_below_prefix(object_key: str, prefix: str) -> bool:
+    """Return whether a validated object key stays below an exact prefix."""
+    if not prefix:
+        return True
+    return object_key == prefix or object_key.startswith(f"{prefix}/")
+
+
+def _historical_structured_prefix(
+    object_key: str,
+    bf: BucketFile,
+    ds: DataSource,
+    safe_name: str,
+) -> str | None:
+    """Infer an old prefix only from a fully source-bound object layout.
+
+    A configured bucket/prefix can change after a file has been written.  We
+    may still safely use the durable bucket-file identity when its object key
+    binds the owning tenant, source, and file id exactly.  The scenario value
+    deliberately remains historical: a source may move scenarios after its
+    objects are created.
+    """
+    parts = str(object_key or "").strip("/").split("/")
+    expected_tenant = _object_scope_segment(ds.tenant_id, "public")
+    expected_source = _object_scope_segment(ds.id, "source")
+    expected_file = _object_scope_segment(bf.id, "file")
+    for index, value in enumerate(parts):
+        if value != "tenants":
+            continue
+        suffix = parts[index:]
+        if (
+            len(suffix) == 9
+            and suffix[1] == expected_tenant
+            and suffix[2] == "scenarios"
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", suffix[3])
+            and suffix[4] == "data-sources"
+            and suffix[5] == expected_source
+            and suffix[6] == "files"
+            and suffix[7] == expected_file
+            and suffix[8] == safe_name
+        ):
+            return object_storage_service.normalize_prefix("/".join(parts[:index]))
+        if (
+            len(suffix) == 11
+            and suffix[1] == expected_tenant
+            and suffix[2] == "scenarios"
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", suffix[3])
+            and suffix[4] == "data-sources"
+            and suffix[5] == expected_source
+            and suffix[6] == "files"
+            and suffix[7] == expected_file
+            and suffix[8] == "uploads"
+            and re.fullmatch(r"[a-f0-9]{32}", suffix[9])
+            and suffix[10] == safe_name
+        ):
+            return object_storage_service.normalize_prefix("/".join(parts[:index]))
+    return None
+
+
+def _historical_legacy_prefix(object_key: str, safe_name: str) -> str | None:
+    """Recognize the retired, server-owned file-bucket migration layout.
+
+    It has no tenant/source segments, so it is accepted only for a persisted
+    ``BucketFile`` already associated with the requested source and only when
+    its final layout is exactly ``migrations/file-buckets/<filename>``.  This
+    prevents a durable record from authorizing an arbitrary bucket/key while
+    keeping pre-scoping platform objects recoverable after a configuration
+    rotation.
+    """
+    parts = str(object_key or "").strip("/").split("/")
+    if (
+        len(parts) < 3
+        or parts[-3:-1] != ["migrations", "file-buckets"]
+        or parts[-1] != safe_name
+    ):
+        return None
+    return object_storage_service.normalize_prefix("/".join(parts[:-3]))
+
+
+def _historical_location_candidates(
+    bf: BucketFile,
+    ds: DataSource,
+    *,
+    bucket_name: str,
+    object_key: str,
+    safe_name: str,
+) -> list[str]:
+    """Return trusted prefix candidates for a durable object identity.
+
+    The first two candidates are server-managed policies (the persisted source
+    policy and the active deployment policy).  A changed source policy can no
+    longer describe older rows, so we additionally permit an inferred prefix
+    only where the durable key is fully source-bound or matches the narrowly
+    defined historical migration layout.  No request parameter supplies these
+    values and arbitrary bucket/key records receive no candidate.
+    """
+    candidates: list[str] = []
+
+    persisted_bucket, persisted_prefix = persisted_minio_location(ds)
+    if bucket_name == persisted_bucket and _key_is_below_prefix(
+        object_key, persisted_prefix
+    ):
+        candidates.append(persisted_prefix)
+
+    active = object_storage_service.require_configuration()
+    active_prefix = object_storage_service.normalize_prefix(active.prefix)
+    if bucket_name == active.bucket_name and _key_is_below_prefix(
+        object_key, active_prefix
+    ):
+        candidates.append(active_prefix)
+
+    structured_prefix = _historical_structured_prefix(
+        object_key, bf, ds, safe_name
+    )
+    if structured_prefix is not None:
+        candidates.append(structured_prefix)
+
+    legacy_prefix = _historical_legacy_prefix(object_key, safe_name)
+    if legacy_prefix is not None:
+        candidates.append(legacy_prefix)
+
+    return list(dict.fromkeys(candidates))
+
+
+def _validate_persisted_bucket_object_key(
+    object_key: str,
+    bf: BucketFile,
+    ds: DataSource,
+    *,
+    bucket_name: str,
+    prefix: str,
+    safe_name: str,
+) -> str:
+    """Validate a legacy object identity already owned by a ``BucketFile`` row.
+
+    New uploads must use the tenant/scenario/data-source/file layout enforced by
+    :func:`_validate_bucket_object_key`.  Historical rows predate that layout,
+    however, and must remain readable and deletable.  This fallback is only for
+    a durable database identity, never an object key supplied by a request.  It
+    is called only with a trusted prefix candidate derived from a durable
+    source policy or a source-bound historical object layout.
+    A legacy tenant-prefixed key must retain the owning tenant.  When it has a
+    data-source segment, that stable identity is authoritative because a data
+    source can legitimately move between scenarios after the object was
+    written; otherwise a recognizable scenario segment must still match.
+    """
+    recorded = str(object_key or "").strip("/")
+    if not recorded:
+        raise ValueError("MinIO 附件缺少对象身份记录")
+    try:
+        _validated_bucket, normalized = object_storage_service.parse_object_url(
+            object_storage_service.stable_object_url(bucket_name, recorded)
+        )
+    except object_storage_service.ObjectStorageError as exc:
+        raise ValueError("MinIO 附件对象身份记录无效") from exc
+
+    strict_legacy = _build_bucket_object_key_for_prefix(
+        ds,
+        bf.id,
+        safe_name,
+        prefix=prefix,
+    )
+    if _matches_generation_scoped_key(normalized, strict_legacy) or normalized == strict_legacy:
+        return normalized
+
+    prefix_parts = prefix.split("/") if prefix else []
+    key_parts = normalized.split("/")
+    if prefix_parts and key_parts[: len(prefix_parts)] != prefix_parts:
+        raise ValueError("MinIO 附件对象不属于平台托管文件桶")
+    relative_parts = key_parts[len(prefix_parts) :]
+    if not relative_parts:
+        raise ValueError("MinIO 附件对象不属于平台托管文件桶")
+
+    # Some old records already carried a partial tenant-scoped layout.  Do not
+    # let its compatibility path cross a tenant, scenario, or data-source
+    # boundary just because the final file/generation segments changed later.
+    if relative_parts[0] == "tenants":
+        expected_tenant = _object_scope_segment(ds.tenant_id, "public")
+        if len(relative_parts) < 2 or relative_parts[1] != expected_tenant:
+            raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
+        has_data_source_segment = "data-sources" in relative_parts
+        if (
+            not has_data_source_segment
+            and len(relative_parts) >= 4
+            and relative_parts[2] == "scenarios"
+        ):
+            expected_scenario = _object_scope_segment(ds.scenario_id, "global")
+            if relative_parts[3] != expected_scenario:
+                raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
+        if has_data_source_segment:
+            source_index = relative_parts.index("data-sources")
+            expected_source = _object_scope_segment(ds.id, "source")
+            if (
+                source_index + 1 >= len(relative_parts)
+                or relative_parts[source_index + 1] != expected_source
+            ):
+                raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
+        if "files" in relative_parts:
+            file_index = relative_parts.index("files")
+            expected_file = _object_scope_segment(bf.id, "file")
+            if (
+                file_index + 1 >= len(relative_parts)
+                or relative_parts[file_index + 1] != expected_file
+            ):
+                raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
+            suffix = relative_parts[file_index + 2 :]
+            if suffix == [safe_name]:
+                return normalized
+            if (
+                len(suffix) == 3
+                and suffix[0] == "uploads"
+                and re.fullmatch(r"[a-f0-9]{32}", suffix[1]) is not None
+                and suffix[2] == safe_name
+            ):
+                return normalized
+            raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
+        # Partial tenant-scoped historical layouts must at least retain the
+        # durable filename binding; otherwise a row could authorize any key
+        # below the same source prefix.
+        if relative_parts[-1] == safe_name:
+            return normalized
+        raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
+
+    # Before tenant/source/file object scoping existed, migration tooling wrote
+    # only this fixed server-owned layout. Do not accept arbitrary unscoped
+    # keys merely because they happen to sit below a persisted bucket prefix.
+    if (
+        len(relative_parts) >= 3
+        and relative_parts[-3:-1] == ["migrations", "file-buckets"]
+        and relative_parts[-1] == safe_name
+    ):
+        return normalized
+    raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
+
+
 def _validate_assistant_attachment_object_key(
     object_key: str,
     tenant_id: str,
@@ -434,6 +710,59 @@ def save_assistant_attachment_object(
     )
     attachment.content_hash = digest
     attachment.size = len(content)
+    attachment.mime = attachment.mime or _guess_mime(attachment.filename)
+    attachment.storage_provider = "minio"
+    attachment.bucket_name = configured.bucket_name
+    attachment.object_key = object_key
+    attachment.object_version_id = uploaded.version_id
+    attachment.etag = uploaded.etag
+    attachment.object_url = object_url
+    attachment._managed_object_created = True
+
+
+def save_assistant_attachment_file(
+    attachment: AssistantAttachment,
+    source_path: str | Path,
+    *,
+    size: int,
+    content_sha256: str,
+    upload_object_key: str | None = None,
+) -> None:
+    """Persist a staged assistant attachment without loading it into memory."""
+    if size < 0 or not re.fullmatch(r"[a-f0-9]{64}", str(content_sha256 or "")):
+        raise ValueError("助手附件暂存文件元数据无效")
+    configured = object_storage_service.require_configuration()
+    object_key = (
+        _validate_assistant_attachment_object_key(
+            upload_object_key,
+            attachment.tenant_id,
+            attachment.id,
+            attachment.filename,
+            require_generation=True,
+        )
+        if upload_object_key is not None
+        else build_assistant_attachment_object_key(
+            attachment.tenant_id,
+            attachment.id,
+            attachment.filename,
+            upload_id=uuid.uuid4().hex,
+        )
+    )
+    uploaded = object_storage_service.put_file(
+        configured.bucket_name,
+        object_key,
+        source_path,
+        content_type=attachment.mime or _guess_mime(attachment.filename),
+        sha256=content_sha256,
+    )
+    if uploaded.size != size:
+        raise ValueError("助手附件暂存文件大小不一致")
+    object_url = object_storage_service.stable_object_url(
+        configured.bucket_name,
+        object_key,
+    )
+    attachment.content_hash = content_sha256
+    attachment.size = size
     attachment.mime = attachment.mime or _guess_mime(attachment.filename)
     attachment.storage_provider = "minio"
     attachment.bucket_name = configured.bucket_name
@@ -603,6 +932,79 @@ def save_bucket_file(
     raise ValueError("文件桶必须使用 MinIO 存储")
 
 
+def save_bucket_file_from_path(
+    ds: DataSource,
+    filename: str,
+    source_path: str | Path,
+    *,
+    size: int,
+    content_sha256: str,
+    mime: str | None = None,
+    stable_file_id: str | None = None,
+    upload_object_key: str | None = None,
+) -> BucketFile:
+    """Save a staged multipart file through MinIO's file streaming API."""
+    if ds.type != "file_bucket":
+        raise ValueError("只有文件桶数据源可以保存文件")
+    if size < 0 or not re.fullmatch(r"[a-f0-9]{64}", str(content_sha256 or "")):
+        raise ValueError("文件暂存元数据无效")
+    requested_name = validate_bucket_filename(filename)
+    if stable_file_id is not None:
+        stable_file_id = str(stable_file_id).lower()
+        if not re.fullmatch(r"[a-f0-9]{32}", stable_file_id):
+            raise ValueError("稳定文件标识必须是 32 位十六进制字符串")
+    if not is_managed_minio_source(ds):
+        raise ValueError("文件桶必须使用 MinIO 存储")
+
+    file_id = stable_file_id or uuid.uuid4().hex
+    bucket_name, _prefix = managed_minio_location(ds)
+    object_key = (
+        _validate_bucket_object_key(
+            upload_object_key,
+            ds,
+            file_id,
+            requested_name,
+            require_generation=True,
+        )
+        if upload_object_key is not None
+        else build_bucket_object_key(
+            ds,
+            file_id,
+            requested_name,
+            upload_id=uuid.uuid4().hex,
+        )
+    )
+    resolved_mime = mime or _guess_mime(requested_name)
+    uploaded = object_storage_service.put_file(
+        bucket_name,
+        object_key,
+        source_path,
+        content_type=resolved_mime,
+        sha256=content_sha256,
+    )
+    if uploaded.size != size:
+        raise ValueError("文件暂存大小不一致")
+    object_url = object_storage_service.stable_object_url(bucket_name, object_key)
+    bucket_file = BucketFile(
+        id=file_id,
+        data_source_id=ds.id,
+        filename=requested_name,
+        stored_path=object_url,
+        storage_provider="minio",
+        bucket_name=bucket_name,
+        object_key=object_key,
+        object_version_id=uploaded.version_id,
+        etag=uploaded.etag,
+        object_url=object_url,
+        size=size,
+        mime=resolved_mime,
+        content_sha256=content_sha256,
+        status="pending",
+    )
+    bucket_file._managed_object_created = True
+    return bucket_file
+
+
 def _validated_bucket_mime(filename: str, recorded_mime: str) -> str:
     canonical_mime = _OFFICE_MIMES.get(Path(filename).suffix.lower())
     recorded_base = str(recorded_mime or "").split(";", 1)[0].strip().lower()
@@ -618,32 +1020,49 @@ def _validated_bucket_mime(filename: str, recorded_mime: str) -> str:
 def minio_file_identity(bf: BucketFile, ds: DataSource) -> tuple[str, str, str]:
     if bf.data_source_id != ds.id or ds.type != "file_bucket":
         raise ValueError("附件不属于指定文件桶")
+    storage_provider = str(getattr(bf, "storage_provider", "") or "").strip().lower()
+    if storage_provider not in {"", "minio"}:
+        raise ValueError("附件未使用 MinIO 托管存储")
     safe_name = validate_bucket_filename(bf.filename)
-    bucket_name, _prefix = managed_minio_location(ds)
     object_url = str(getattr(bf, "object_url", "") or bf.stored_path or "")
     url_bucket = ""
     url_key = ""
-    if object_url:
-        url_bucket, url_key = object_storage_service.parse_object_url(object_url)
-    recorded_bucket = str(getattr(bf, "bucket_name", "") or url_bucket).strip()
-    recorded_key = str(getattr(bf, "object_key", "") or url_key).strip("/")
-    if not recorded_bucket or not recorded_key:
-        raise ValueError("MinIO 附件缺少对象身份记录")
-    if (url_bucket and url_bucket != recorded_bucket) or (url_key and url_key != recorded_key):
-        raise ValueError("MinIO 附件对象字段与地址不一致")
     try:
-        _validate_bucket_object_key(
-            recorded_key,
+        if object_url:
+            url_bucket, url_key = object_storage_service.parse_object_url(object_url)
+        recorded_bucket = str(getattr(bf, "bucket_name", "") or url_bucket).strip()
+        recorded_key = str(getattr(bf, "object_key", "") or url_key).strip("/")
+        if not recorded_bucket or not recorded_key:
+            raise ValueError("MinIO 附件缺少对象身份记录")
+        if (url_bucket and url_bucket != recorded_bucket) or (
+            url_key and url_key != recorded_key
+        ):
+            raise ValueError("MinIO 附件对象字段与地址不一致")
+        # Validate the explicit durable fields even when an older row has no
+        # object URL and relies on bucket_name/object_key alone.
+        object_storage_service.stable_object_url(recorded_bucket, recorded_key)
+        for prefix in _historical_location_candidates(
+            bf,
             ds,
-            bf.id,
-            safe_name,
-            require_generation=False,
-        )
-    except ValueError as exc:
+            bucket_name=recorded_bucket,
+            object_key=recorded_key,
+            safe_name=safe_name,
+        ):
+            try:
+                validated_key = _validate_persisted_bucket_object_key(
+                    recorded_key,
+                    bf,
+                    ds,
+                    bucket_name=recorded_bucket,
+                    prefix=prefix,
+                    safe_name=safe_name,
+                )
+            except ValueError:
+                continue
+            return recorded_bucket, validated_key, safe_name
+    except (ValueError, object_storage_service.ObjectStorageError) as exc:
         raise ValueError("MinIO 附件对象不属于指定文件桶作用域") from exc
-    if recorded_bucket != bucket_name:
-        raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
-    return recorded_bucket, recorded_key, safe_name
+    raise ValueError("MinIO 附件对象不属于指定文件桶作用域")
 
 
 def read_bucket_file(bf: BucketFile, ds: DataSource) -> tuple[bytes, int, str]:

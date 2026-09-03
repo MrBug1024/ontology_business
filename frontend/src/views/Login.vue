@@ -43,7 +43,8 @@
             <div v-if="error" class="form-error" role="alert" aria-live="assertive"><el-icon aria-hidden="true"><WarningFilled /></el-icon>{{ error }}</div>
             <el-button class="submit-button" native-type="submit" type="primary" size="large" :loading="loading">登录 <el-icon aria-hidden="true"><ArrowRight /></el-icon></el-button>
           </el-form>
-          <div class="switch-line">还没有账户？<button class="link-button" @click="mode = 'register'; error = ''">创建个人工作区</button></div>
+          <div class="switch-line">还没有账户？<button class="link-button" @click="switchMode('register')">创建个人工作区</button></div>
+          <div class="switch-line invite-line">收到工作区邀请？<button class="link-button" @click="switchMode('invite')">接受邀请</button></div>
         </template>
 
         <template v-else-if="mode === 'register'">
@@ -56,7 +57,7 @@
             <div v-if="error" class="form-error" role="alert" aria-live="assertive"><el-icon aria-hidden="true"><WarningFilled /></el-icon>{{ error }}</div>
             <el-button class="submit-button" native-type="submit" type="primary" size="large" :loading="loading">发送验证邮件 <el-icon aria-hidden="true"><ArrowRight /></el-icon></el-button>
           </el-form>
-          <div class="switch-line">已经有账户？<button class="link-button" @click="mode = 'login'; error = ''">返回登录</button></div>
+          <div class="switch-line">已经有账户？<button class="link-button" @click="switchMode('login')">返回登录</button></div>
         </template>
 
         <template v-else-if="mode === 'verify'">
@@ -66,7 +67,7 @@
             <div v-if="error" class="form-error" role="alert" aria-live="assertive"><el-icon aria-hidden="true"><WarningFilled /></el-icon>{{ error }}</div>
             <el-button class="submit-button" native-type="submit" type="primary" size="large" :loading="loading">完成验证 <el-icon aria-hidden="true"><ArrowRight /></el-icon></el-button>
           </el-form>
-          <div class="switch-line"><button class="link-button" :disabled="resending" @click="resend">{{ resending ? '发送中…' : '重新发送验证码' }}</button><span class="dot-sep">·</span><button class="link-button" @click="mode = 'login'">返回登录</button></div>
+          <div class="switch-line"><button class="link-button" :disabled="resending" @click="resend">{{ resending ? '发送中…' : '重新发送验证码' }}</button><span class="dot-sep">·</span><button class="link-button" @click="switchMode('login')">返回登录</button></div>
         </template>
 
         <template v-else-if="mode === 'forgot'">
@@ -76,10 +77,10 @@
             <div v-if="error" class="form-error" role="alert" aria-live="assertive"><el-icon aria-hidden="true"><WarningFilled /></el-icon>{{ error }}</div>
             <el-button class="submit-button" native-type="submit" type="primary" size="large" :loading="loading">发送重置邮件 <el-icon aria-hidden="true"><ArrowRight /></el-icon></el-button>
           </el-form>
-          <div class="switch-line"><button class="link-button" @click="mode = 'login'">返回登录</button></div>
+          <div class="switch-line"><button class="link-button" @click="switchMode('login')">返回登录</button></div>
         </template>
 
-        <template v-else>
+        <template v-else-if="mode === 'reset'">
           <div class="form-heading"><div class="form-kicker">SET A NEW PASSWORD</div><h2>重置密码</h2><p>输入邮件中的验证码并设置新密码</p></div>
           <el-form @submit.prevent="submit">
             <el-form-item label="验证码"><el-input v-model="code" size="large" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位验证码"><template #prefix><el-icon><Key /></el-icon></template></el-input></el-form-item>
@@ -88,7 +89,21 @@
             <div v-if="error" class="form-error" role="alert" aria-live="assertive"><el-icon aria-hidden="true"><WarningFilled /></el-icon>{{ error }}</div>
             <el-button class="submit-button" native-type="submit" type="primary" size="large" :loading="loading">确认重置 <el-icon aria-hidden="true"><ArrowRight /></el-icon></el-button>
           </el-form>
-          <div class="switch-line"><button class="link-button" @click="mode = 'login'">返回登录</button></div>
+          <div class="switch-line"><button class="link-button" @click="switchMode('login')">返回登录</button></div>
+        </template>
+
+        <template v-else>
+          <div class="form-heading"><div class="form-kicker">JOIN YOUR WORKSPACE</div><h2>接受工作区邀请</h2><p>输入邀请邮件中的验证码，设置你的登录密码</p></div>
+          <el-form @submit.prevent="submit">
+            <el-form-item label="邮箱"><el-input v-model="email" size="large" type="email" autocomplete="email" placeholder="name@company.com"><template #prefix><el-icon><Message /></el-icon></template></el-input></el-form-item>
+            <el-form-item label="显示名称（可选）"><el-input v-model="displayName" size="large" autocomplete="name" placeholder="使用邀请中的名称或填写新的名称"><template #prefix><el-icon><User /></el-icon></template></el-input></el-form-item>
+            <el-form-item label="6 位邀请验证码"><el-input v-model="code" size="large" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="请输入邮件中的验证码" class="code-input"><template #prefix><el-icon><Key /></el-icon></template></el-input></el-form-item>
+            <el-form-item label="登录密码"><el-input v-model="password" size="large" :type="showPassword ? 'text' : 'password'" autocomplete="new-password" placeholder="至少 8 位字符"><template #prefix><el-icon><Lock /></el-icon></template><template #suffix><button class="toggle-pass" type="button" :aria-label="showPassword ? '隐藏密码' : '显示密码'" @click="showPassword = !showPassword"><el-icon aria-hidden="true"><component :is="showPassword ? 'View' : 'Hide'" /></el-icon></button></template></el-input></el-form-item>
+            <el-form-item label="确认密码"><el-input v-model="passwordConfirm" size="large" :type="showConfirmPassword ? 'text' : 'password'" autocomplete="new-password" placeholder="再次输入密码"><template #prefix><el-icon><Lock /></el-icon></template><template #suffix><button class="toggle-pass" type="button" :aria-label="showConfirmPassword ? '隐藏密码' : '显示确认密码'" @click="showConfirmPassword = !showConfirmPassword"><el-icon aria-hidden="true"><component :is="showConfirmPassword ? 'View' : 'Hide'" /></el-icon></button></template></el-input></el-form-item>
+            <div v-if="error" class="form-error" role="alert" aria-live="assertive"><el-icon aria-hidden="true"><WarningFilled /></el-icon>{{ error }}</div>
+            <el-button class="submit-button" native-type="submit" type="primary" size="large" :loading="loading">加入工作区 <el-icon aria-hidden="true"><ArrowRight /></el-icon></el-button>
+          </el-form>
+          <div class="switch-line"><button class="link-button" @click="switchMode('login')">返回登录</button></div>
         </template>
       </div>
       <div class="auth-note">© 2026 Ontology AI Platform · 你的数据属于你的工作区</div>
@@ -103,11 +118,11 @@ import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 
-type AuthMode = 'login' | 'register' | 'verify' | 'forgot' | 'reset'
+type AuthMode = 'login' | 'register' | 'verify' | 'forgot' | 'reset' | 'invite'
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
-const mode = ref<AuthMode>('login')
+const mode = ref<AuthMode>(route.query.invite === '1' ? 'invite' : 'login')
 const email = ref(String(route.query.email || ''))
 const displayName = ref('')
 const password = ref('')
@@ -131,6 +146,11 @@ function messageFromError(e: any, fallback: string) {
   return e?.response?.data?.detail || e?.message || fallback
 }
 
+function switchMode(next: AuthMode) {
+  mode.value = next
+  error.value = ''
+}
+
 async function submit() {
   error.value = ''
   loading.value = true
@@ -151,12 +171,25 @@ async function submit() {
       await api.forgotPassword(email.value)
       mode.value = 'reset'
       ElMessage.success('如果邮箱已注册，重置验证码已发送')
-    } else {
+    } else if (mode.value === 'reset') {
       await api.resetPassword({ email: email.value, code: code.value, password: password.value, password_confirm: passwordConfirm.value })
       mode.value = 'login'
       password.value = ''
       passwordConfirm.value = ''
       ElMessage.success('密码已重置')
+    } else {
+      await api.acceptOrganizationInvitation({
+        email: email.value,
+        code: code.value,
+        password: password.value,
+        password_confirm: passwordConfirm.value,
+        display_name: displayName.value,
+      })
+      mode.value = 'login'
+      code.value = ''
+      password.value = ''
+      passwordConfirm.value = ''
+      ElMessage.success('已加入工作区，请登录')
     }
   } catch (e: any) {
     error.value = messageFromError(e, '操作失败，请稍后重试')
@@ -223,6 +256,7 @@ async function resend() {
 .submit-button { width: 100%; margin-top: 4px; height: 44px; letter-spacing: .01em; }
 .submit-button .el-icon { margin-left: 7px; }
 .switch-line { text-align: center; margin-top: 26px; color: var(--text-3); font-size: 12px; }
+.invite-line { margin-top: 10px; }
 .dot-sep { margin: 0 8px; color: var(--border-strong); }
 .auth-note { color: var(--text-3); font-size: 11px; margin-top: 24px; }
 

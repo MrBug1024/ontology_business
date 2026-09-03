@@ -59,6 +59,7 @@ def _out(db: Session, service: AgentMCPService, endpoint_url: str) -> AgentMCPSe
     agent, context, missing, stale = agent_mcp_service.service_runtime_status(db, service)
     stored_agent = agent or db.get(Agent, service.agent_id)
     scenario_name = ""
+    definition = context.runtime_definition if context is not None else None
     if context is not None and context.scenario is not None:
         scenario_name = context.scenario.name
     return AgentMCPServiceOut(
@@ -76,8 +77,8 @@ def _out(db: Session, service: AgentMCPService, endpoint_url: str) -> AgentMCPSe
         token_hint=service.token_hint,
         expires_at=service.expires_at,
         last_used_at=service.last_used_at,
-        runtime_environment=service.runtime_environment,
-        definition_hash=service.definition_hash,
+        runtime_environment=str(getattr(definition, "environment", "") or service.runtime_environment),
+        definition_hash=str(getattr(definition, "definition_hash", "") or service.definition_hash),
         created_at=service.created_at,
         updated_at=service.updated_at,
     )
@@ -190,11 +191,9 @@ def update_service(
     _principal(db)
     service = _owned_service(db, service_id)
     if payload.enabled:
-        _agent, _context, missing, stale = agent_mcp_service.service_runtime_status(db, service)
+        _agent, _context, missing, _stale = agent_mcp_service.service_runtime_status(db, service)
         if missing:
             raise HTTPException(409, "Agent 尚未就绪：" + "、".join(missing))
-        if stale:
-            raise HTTPException(409, "Agent 配置已变化，请轮换令牌并重新发布")
     service.enabled = payload.enabled
     db.commit()
     db.refresh(service)
@@ -241,17 +240,16 @@ def test_service(
 ) -> AgentMCPServiceTestOut:
     _principal(db)
     service = _owned_service(db, service_id)
-    agent, context, missing, stale = agent_mcp_service.service_runtime_status(db, service)
+    agent, context, missing, _stale = agent_mcp_service.service_runtime_status(db, service)
     if not agent or context is None or missing:
         raise HTTPException(409, "Agent 尚未就绪：" + "、".join(missing))
-    if stale:
-        raise HTTPException(409, "Agent 配置或运行定义已变化，请轮换令牌后重新分发配置")
+    definition = context.runtime_definition
     return AgentMCPServiceTestOut(
         ok=True,
-        message="发布配置有效，第三方可以通过 invoke_agent 调用完整 Agent 能力",
+        message="当前 Agent 可对话，第三方可以通过 invoke_agent 调用完整 Agent 能力",
         agent_name=agent.name,
-        runtime_environment=service.runtime_environment,
-        definition_hash=service.definition_hash,
+        runtime_environment=str(getattr(definition, "environment", "") or service.runtime_environment),
+        definition_hash=str(getattr(definition, "definition_hash", "") or service.definition_hash),
     )
 
 

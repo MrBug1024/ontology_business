@@ -15,6 +15,50 @@ export interface AuthMessage {
   email?: string
 }
 
+export type OrganizationRoleKey = 'owner' | 'admin' | 'operator' | 'viewer'
+export type OrganizationMemberStatus = 'active' | 'invited' | 'disabled'
+
+export interface OrganizationRole {
+  key: OrganizationRoleKey
+  name: string
+  description: string
+}
+
+export interface OrganizationMember {
+  id: string
+  user_id: string
+  email: string
+  display_name: string
+  role_key: OrganizationRoleKey
+  role_name: string
+  status: OrganizationMemberStatus
+  email_verified: boolean
+  created_at: string
+}
+
+export interface OrganizationUserCreate {
+  email: string
+  display_name?: string
+  password: string
+  password_confirm: string
+  role_key: OrganizationRoleKey
+  activate_immediately?: boolean
+}
+
+export interface OrganizationInvitation {
+  email: string
+  display_name?: string
+  role_key: OrganizationRoleKey
+}
+
+export interface OrganizationInvitationAccept {
+  email: string
+  code: string
+  password: string
+  password_confirm: string
+  display_name?: string
+}
+
 export interface Property {
   id?: string
   name: string

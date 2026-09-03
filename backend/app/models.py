@@ -262,6 +262,12 @@ class EmailVerificationCode(Base):
     code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Keep failed verification attempts in the authoritative database so a
+    # caller cannot reset the guess budget by repeatedly requesting new codes.
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -279,6 +285,15 @@ class BusinessScenario(Base):
         ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=True
     )
     is_public: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Tenant ownership is the isolation boundary; these two optional fields
+    # preserve accountable resource provenance without guessing an owner for
+    # legacy rows that predate multi-tenant authoring.
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    owner_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     industry: Mapped[str] = mapped_column(String(100), default="")
@@ -651,6 +666,12 @@ class DataSource(Base):
         ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=True
     )
     is_public: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    owner_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     scenario_id: Mapped[str | None] = mapped_column(
         ForeignKey("business_scenarios.id", ondelete="SET NULL"), index=True, nullable=True
     )
@@ -1379,6 +1400,12 @@ class Agent(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str | None] = mapped_column(
         ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    owner_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
@@ -2457,6 +2484,14 @@ class WorkflowRun(Base):
     created_by_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Only Agent-confirmed manual submissions set this server-owned link. It
+    # binds a later workflow approval node to the initiating private chat and
+    # must never be accepted as a caller-controlled workflow parameter.
+    agent_conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
@@ -2583,9 +2618,9 @@ class ActionExecutionLog(Base):
     mode: Mapped[str] = mapped_column(String(20), default="execute")
     # 同一个业务请求的幂等键；预演和确认提醒不要求填写。
     idempotency_key: Mapped[str | None] = mapped_column(String(120), index=True, nullable=True)
-    # Provenance for an execution that came from a frozen staging/prod release.
-    # ``environment`` also scopes idempotency so equal caller keys cannot replay
-    # a result produced in another deployment environment.
+    # Deployment/connector provenance for an execution from a frozen release.
+    # It never scopes client idempotency: the same business request must not
+    # execute twice merely because a worker changes deployment environment.
     environment: Mapped[str] = mapped_column(String(20), default=_runtime_environment_default)
     definition_snapshot_id: Mapped[str | None] = mapped_column(
         ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True

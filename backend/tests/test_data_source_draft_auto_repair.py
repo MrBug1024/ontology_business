@@ -110,7 +110,7 @@ class DataSourceDraftAutoRepairTests(unittest.TestCase):
         source_id: str,
         *,
         name: str = "建筑领域工资台账",
-        source_type: str = "sqlite",
+        source_type: str = "postgres",
         status: str = "ok",
         tenant_id: str | None = None,
         scenario_id: str | None = None,
@@ -161,7 +161,7 @@ class DataSourceDraftAutoRepairTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
             name="建筑领域工资台账",
-            type="sqlite",
+            type="postgres",
             status="ok",
         )
         result = scenario_model_draft_service.auto_repair_data_source_drafts(
@@ -488,9 +488,15 @@ class DataSourceDraftAutoRepairTests(unittest.TestCase):
             created = data_sources.create_data_source(
                 DataSourceIn(
                     name="待验证工资库",
-                    type="sqlite",
+                    type="postgres",
                     scenario_id=self.scenario.id,
-                    config={"path": "test-only/not-opened.db"},
+                    config={
+                        "host": "postgres.example.test",
+                        "port": 5432,
+                        "database": "wages",
+                        "user": "readonly",
+                        "password": "test-only",
+                    },
                 ),
                 self.db,
             )
@@ -498,9 +504,15 @@ class DataSourceDraftAutoRepairTests(unittest.TestCase):
                 created.id,
                 DataSourceIn(
                     name="待验证工资库（更新）",
-                    type="sqlite",
+                    type="postgres",
                     scenario_id=self.scenario.id,
-                    config={"path": "test-only/still-not-opened.db"},
+                    config={
+                        "host": "postgres.example.test",
+                        "port": 5432,
+                        "database": "wages_updated",
+                        "user": "readonly",
+                        "password": "test-only",
+                    },
                 ),
                 self.db,
             )

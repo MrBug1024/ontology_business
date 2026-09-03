@@ -10,6 +10,7 @@ auditable variable boundary.
 from __future__ import annotations
 
 import copy
+import codecs
 import hashlib
 import io
 import json
@@ -117,6 +118,14 @@ class RenderedArtifact:
     @property
     def size(self) -> int:
         return len(self.content)
+
+
+@dataclass(frozen=True)
+class TemplateInspection:
+    """Server-derived metadata collected from a validated template file."""
+
+    metadata: dict[str, Any]
+    placeholder_paths: tuple[str, ...]
 
 
 def template_format(filename: str) -> tuple[str, str, str]:
@@ -395,44 +404,62 @@ def _render_xml_text_group(
     return changed
 
 
+def _safe_zip_infos_from_package(package: ZipFile) -> tuple[list[ZipInfo], bytes]:
+    infos = package.infolist()
+    archive_comment = package.comment
+    if not infos or len(infos) > _MAX_ZIP_ENTRIES:
+        raise TemplateArtifactError("Office 模板包结构异常或文件数量过多")
+    seen: set[str] = set()
+    total_size = 0
+    for info in infos:
+        name = info.filename
+        normalized = name.replace("\\", "/")
+        parts = normalized.split("/")
+        if (
+            not name
+            or name in seen
+            or name.startswith(("/", "\\"))
+            or "\\" in name
+            or any(
+                part in {"", ".", ".."}
+                for part in parts
+                if not (part == "" and name.endswith("/"))
+            )
+            or info.flag_bits & 0x1
+        ):
+            raise TemplateArtifactError("Office 模板包含不安全的压缩包路径或加密成员")
+        seen.add(name)
+        total_size += int(info.file_size)
+        if info.file_size > _MAX_SINGLE_ZIP_MEMBER_BYTES:
+            raise TemplateArtifactError("Office 模板中的单个文件过大")
+    if total_size > _MAX_ZIP_UNCOMPRESSED_BYTES:
+        raise TemplateArtifactError("Office 模板解压后超过安全大小限制")
+    return [copy.copy(info) for info in infos], archive_comment
+
+
 def _safe_zip_infos(content: bytes) -> tuple[list[ZipInfo], bytes]:
     try:
         with ZipFile(io.BytesIO(content), "r") as package:
-            infos = package.infolist()
-            archive_comment = package.comment
-            if not infos or len(infos) > _MAX_ZIP_ENTRIES:
-                raise TemplateArtifactError("Office 模板包结构异常或文件数量过多")
-            seen: set[str] = set()
-            total_size = 0
-            for info in infos:
-                name = info.filename
-                normalized = name.replace("\\", "/")
-                parts = normalized.split("/")
-                if (
-                    not name
-                    or name in seen
-                    or name.startswith(("/", "\\"))
-                    or "\\" in name
-                    or any(part in {"", ".", ".."} for part in parts if not (part == "" and name.endswith("/")))
-                    or info.flag_bits & 0x1
-                ):
-                    raise TemplateArtifactError("Office 模板包含不安全的压缩包路径或加密成员")
-                seen.add(name)
-                total_size += int(info.file_size)
-                if info.file_size > _MAX_SINGLE_ZIP_MEMBER_BYTES:
-                    raise TemplateArtifactError("Office 模板中的单个文件过大")
-            if total_size > _MAX_ZIP_UNCOMPRESSED_BYTES:
-                raise TemplateArtifactError("Office 模板解压后超过安全大小限制")
-            return [copy.copy(info) for info in infos], archive_comment
+            return _safe_zip_infos_from_package(package)
     except BadZipFile as exc:
         raise TemplateArtifactError("Office 模板不是有效的 OOXML 文件") from exc
+
+
+def _read_zip_member(package: ZipFile, info: ZipInfo) -> bytes:
+    try:
+        return package.read(info)
+    except (BadZipFile, RuntimeError, OSError) as exc:
+        raise TemplateArtifactError("Office 模板包读取失败") from exc
 
 
 def _read_zip_members(content: bytes, infos: list[ZipInfo]) -> dict[str, bytes]:
     try:
         with ZipFile(io.BytesIO(content), "r") as package:
-            return {info.filename: package.read(info) for info in infos}
-    except (BadZipFile, RuntimeError, OSError) as exc:
+            return {
+                info.filename: _read_zip_member(package, info)
+                for info in infos
+            }
+    except BadZipFile as exc:
         raise TemplateArtifactError("Office 模板包读取失败") from exc
 
 
@@ -514,12 +541,14 @@ def _validate_active_content(members: Mapping[str, bytes], artifact_format: str)
             raise TemplateArtifactError("Office 模板包含可执行或联网的公式指令")
 
 
-def _validate_ooxml_package(
-    content: bytes, artifact_format: str
-) -> tuple[list[ZipInfo], dict[str, bytes], bytes]:
-    infos, archive_comment = _safe_zip_infos(content)
-    members = _read_zip_members(content, infos)
-    names = set(members)
+def _validate_ooxml_parts(
+    infos: list[ZipInfo],
+    artifact_format: str,
+    read_member,
+) -> None:
+    """Validate OOXML members without requiring the whole archive in memory."""
+    names = {info.filename for info in infos}
+    info_by_name = {info.filename: info for info in infos}
     required = {"[Content_Types].xml", "_rels/.rels"}
     if artifact_format == "docx":
         required.add("word/document.xml")
@@ -540,7 +569,10 @@ def _validate_ooxml_package(
     if any(Path(name.rstrip("/")).suffix.lower() in _EXECUTABLE_MEMBER_SUFFIXES for name in names):
         raise TemplateArtifactError("Office 模板包含可执行文件成员")
 
-    types_root = _parse_xml(members["[Content_Types].xml"], "[Content_Types].xml")
+    types_root = _parse_xml(
+        read_member(info_by_name["[Content_Types].xml"]),
+        "[Content_Types].xml",
+    )
     content_type = ""
     default_types: dict[str, str] = {}
     for override in types_root:
@@ -559,8 +591,37 @@ def _validate_ooxml_package(
         content_type = default_types.get(Path(main_part).suffix.lstrip(".").lower(), "")
     if content_type != expected_type:
         raise TemplateArtifactError("Office 模板的真实内容类型与文件扩展名不匹配，或包含宏")
-    _validate_external_relationships(members)
-    _validate_active_content(members, artifact_format)
+
+    for info in infos:
+        if info.filename.endswith(".rels"):
+            _validate_external_relationships(
+                {info.filename: read_member(info)}
+            )
+
+    for info in infos:
+        name = info.filename
+        relevant = (
+            bool(re.match(r"^word/(?:document|header\d*|footer\d*|footnotes|endnotes|comments)\.xml$", name))
+            if artifact_format == "docx"
+            else name == "xl/workbook.xml"
+            or (name.startswith("xl/worksheets/") and name.endswith(".xml"))
+        )
+        if relevant:
+            _validate_active_content(
+                {name: read_member(info)}, artifact_format
+            )
+
+
+def _validate_ooxml_package(
+    content: bytes, artifact_format: str
+) -> tuple[list[ZipInfo], dict[str, bytes], bytes]:
+    infos, archive_comment = _safe_zip_infos(content)
+    members = _read_zip_members(content, infos)
+    _validate_ooxml_parts(
+        infos,
+        artifact_format,
+        lambda info: members[info.filename],
+    )
     return infos, members, archive_comment
 
 
@@ -747,6 +808,185 @@ def _render_output_filename(
     if not output_spec or not template_spec or output_spec[0] != template_spec[0]:
         raise TemplateArtifactError("输出附件必须与源模板保持相同文件格式")
     return safe
+
+
+def _validated_template_file_path(source_path: str | Path) -> Path:
+    candidate = Path(source_path).expanduser()
+    if candidate.is_symlink():
+        raise TemplateArtifactError("模板暂存文件必须是普通文件")
+    try:
+        path = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise TemplateArtifactError("模板暂存文件不存在") from exc
+    if not path.is_file():
+        raise TemplateArtifactError("模板暂存文件必须是普通文件")
+    return path
+
+
+def _stream_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise TemplateArtifactError("模板暂存文件读取失败") from exc
+    return digest.hexdigest()
+
+
+def _collect_placeholder_paths(texts: Iterable[str]) -> set[str]:
+    paths: set[str] = set()
+    for value in texts:
+        for match in _PLACEHOLDER.finditer(value):
+            path = match.group(1).strip()
+            _validated_path_parts(path)
+            paths.add(path)
+    return paths
+
+
+def _markdown_placeholder_paths_from_file(path: Path) -> set[str]:
+    """Validate UTF-8 and scan placeholders without retaining a large Markdown file."""
+    decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
+    pending = ""
+    paths: set[str] = set()
+    candidate_limit = _MAX_PLACEHOLDER_PATH_LENGTH + 64
+
+    def scan(text: str) -> None:
+        nonlocal pending
+        pending += text
+        while pending:
+            opening = pending.find("{{")
+            if opening < 0:
+                pending = pending[-1:] if pending.endswith("{") else ""
+                return
+            if opening:
+                pending = pending[opening:]
+            closing = pending.find("}}", 2)
+            if closing < 0:
+                if len(pending) > candidate_limit:
+                    raise TemplateArtifactError("模板变量路径无效或不安全")
+                return
+            candidate = pending[: closing + 2]
+            pending = pending[closing + 2 :]
+            match = _PLACEHOLDER.fullmatch(candidate)
+            if match:
+                placeholder = match.group(1).strip()
+                _validated_path_parts(placeholder)
+                paths.add(placeholder)
+
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                scan(decoder.decode(chunk))
+        scan(decoder.decode(b"", final=True))
+    except UnicodeDecodeError as exc:
+        raise TemplateArtifactError("Markdown 模板必须使用 UTF-8 编码") from exc
+    except OSError as exc:
+        raise TemplateArtifactError("模板暂存文件读取失败") from exc
+    return paths
+
+
+def _placeholder_paths_from_ooxml_package(
+    package: ZipFile,
+    infos: list[ZipInfo],
+    artifact_format: str,
+) -> set[str]:
+    paths: set[str] = set()
+    if artifact_format == "docx":
+        matcher = re.compile(
+            r"^word/(?:document|header\d*|footer\d*|footnotes|endnotes|comments)\.xml$"
+        )
+        namespace = _WORD_NS
+        item_tag = "p"
+    else:
+        matcher = re.compile(r"^xl/(?:sharedStrings|worksheets/[^/]+)\.xml$")
+        namespace = _SHEET_NS
+        item_tag = "si"
+    for info in infos:
+        name = info.filename
+        if not matcher.match(name):
+            continue
+        root = _parse_xml(_read_zip_member(package, info), name)
+        texts: list[str] = []
+        if artifact_format == "docx":
+            groups = root.iter(f"{{{namespace}}}{item_tag}")
+        elif name == "xl/sharedStrings.xml":
+            groups = root.iter(f"{{{namespace}}}si")
+        else:
+            groups = root.iter(f"{{{namespace}}}is")
+        for group in groups:
+            texts.append(
+                "".join(
+                    node.text or "" for node in group.iter(f"{{{namespace}}}t")
+                )
+            )
+        if artifact_format == "xlsx" and name.startswith("xl/worksheets/"):
+            for tag in _XLSX_HEADER_FOOTER_TAGS:
+                texts.extend(
+                    node.text or "" for node in root.iter(f"{{{namespace}}}{tag}")
+                )
+            for cell in root.iter(f"{{{namespace}}}c"):
+                if cell.get("t") == "str" and cell.find(f"{{{namespace}}}f") is None:
+                    value = cell.find(f"{{{namespace}}}v")
+                    if value is not None:
+                        texts.append(value.text or "")
+        paths.update(_collect_placeholder_paths(texts))
+    return paths
+
+
+def inspect_template_file(
+    filename: str,
+    source_path: str | Path,
+    *,
+    size: int | None = None,
+    sha256: str = "",
+) -> TemplateInspection:
+    """Validate a staged template without materialising the uploaded body."""
+    artifact_format, mime, suffix = template_format(filename)
+    path = _validated_template_file_path(source_path)
+    try:
+        actual_size = path.stat().st_size
+    except OSError as exc:
+        raise TemplateArtifactError("模板暂存文件读取失败") from exc
+    if actual_size < 1:
+        raise TemplateArtifactError("模板文件为空")
+    if actual_size > get_settings().max_upload_bytes:
+        raise TemplateArtifactError("模板文件超过系统上传大小限制")
+    if size is not None and int(size) != actual_size:
+        raise TemplateArtifactError("模板暂存大小不一致")
+    digest = str(sha256 or "").lower()
+    if digest and not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise TemplateArtifactError("模板暂存哈希无效")
+    if not digest:
+        digest = _stream_file_sha256(path)
+
+    if artifact_format == "markdown":
+        placeholders = _markdown_placeholder_paths_from_file(path)
+    else:
+        try:
+            with ZipFile(path, "r") as package:
+                infos, _archive_comment = _safe_zip_infos_from_package(package)
+                _validate_ooxml_parts(
+                    infos,
+                    artifact_format,
+                    lambda info: _read_zip_member(package, info),
+                )
+                placeholders = _placeholder_paths_from_ooxml_package(
+                    package, infos, artifact_format
+                )
+        except BadZipFile as exc:
+            raise TemplateArtifactError("Office 模板不是有效的 OOXML 文件") from exc
+
+    return TemplateInspection(
+        metadata={
+            "format": artifact_format,
+            "mime": mime,
+            "suffix": suffix,
+            "size": actual_size,
+            "sha256": digest,
+        },
+        placeholder_paths=tuple(sorted(placeholders)),
+    )
 
 
 def inspect_template(filename: str, content: bytes) -> dict[str, Any]:

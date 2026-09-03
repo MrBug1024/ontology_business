@@ -82,6 +82,7 @@
             <el-menu-item index="/mcp">外部工具</el-menu-item>
             <el-menu-item index="/skills">本地技能</el-menu-item>
           </el-sub-menu>
+          <el-menu-item v-if="auth.user?.can_manage" index="/members"><el-icon aria-hidden="true"><UserFilled /></el-icon><span>成员与权限</span></el-menu-item>
         </el-menu>
       </nav>
 
@@ -121,6 +122,7 @@
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item disabled>{{ auth.user?.email }}</el-dropdown-item>
+                <el-dropdown-item v-if="auth.user?.can_manage" command="members"><el-icon aria-hidden="true"><UserFilled /></el-icon>成员与权限</el-dropdown-item>
                 <el-dropdown-item divided command="logout">退出登录</el-dropdown-item>
               </el-dropdown-menu>
             </template>
@@ -178,6 +180,7 @@ function toggleTheme() {
   applyTheme()
 }
 function onUserCommand(command: string) {
+  if (command === 'members') router.push('/members')
   if (command === 'logout') auth.logout().then(() => router.replace('/login'))
 }
 function syncTheme(event: Event) {

@@ -11,7 +11,6 @@ from ..schemas import ApprovalDecisionIn, WorkflowApprovalOut, WorkflowRunOut
 from ..services import (
     operations_service,
     permission_service,
-    runtime_connector_service,
     runtime_definition_service,
     tenant_service,
 )
@@ -70,20 +69,9 @@ def _can_read_run(db: Session, run: WorkflowRun) -> bool:
     )
 
 
-def _deployment_environment() -> str:
-    """The task API is an operational surface of exactly one deployment.
-
-    Release records are intentionally visible to the control plane across
-    environments, but queued work, approvals and their input/result summaries
-    are not.  A shared database must therefore never make a staging/prod task
-    addressable through a dev task center (or vice versa).
-    """
-    return runtime_connector_service.runtime_environment()
-
-
 def _run_for_request(db: Session, run_id: str, *, writable: bool = False, verb: str = "read") -> WorkflowRun:
     run = db.get(WorkflowRun, run_id)
-    if not run or str(run.environment or "") != _deployment_environment():
+    if not run:
         raise HTTPException(404, "任务不存在")
     tenant_service.require_scenario(db, run.scenario_id, writable=writable)
     workflow = _workflow_for_run(db, run)
@@ -167,7 +155,6 @@ def list_tasks(
         .join(BusinessScenario, BusinessScenario.id == WorkflowRun.scenario_id)
         .where(
             tenant_service.visible_clause(BusinessScenario, db),
-            WorkflowRun.environment == _deployment_environment(),
         )
         .order_by(WorkflowRun.created_at.desc())
         .limit(limit)
@@ -197,7 +184,6 @@ def list_approvals(
         .join(BusinessScenario, BusinessScenario.id == WorkflowRun.scenario_id)
         .where(
             tenant_service.visible_clause(BusinessScenario, db),
-            WorkflowRun.environment == _deployment_environment(),
         )
         .order_by(WorkflowApprovalRequest.requested_at.asc())
         .limit(limit)

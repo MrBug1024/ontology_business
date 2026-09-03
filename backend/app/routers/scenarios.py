@@ -1315,12 +1315,15 @@ def list_scenarios(db: Session = Depends(get_db)):
 @router.post("", response_model=ScenarioOut)
 def create_scenario(payload: ScenarioIn, db: Session = Depends(get_db)):
     permission_service.require_tenant_permission(db, "write")
+    user_id = permission_service.require_principal(db).user_id
     try:
         payload.namespace = ontology_service.validate_namespace(payload.namespace)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     s = BusinessScenario(
         tenant_id=tenant_service.current_tenant_id(db),
+        created_by_user_id=user_id,
+        owner_user_id=user_id,
         **payload.model_dump(),
     )
     db.add(s)
@@ -1398,14 +1401,15 @@ def _mapping_out(m: DataMapping) -> DataMappingOut:
 
 
 def _runtime_definition_for_scenario(db: Session, scenario: BusinessScenario) -> Any:
+    """Return the mutable authoring surface for ordinary scene reads/edits."""
     try:
-        return runtime_definition_service.resolve_active(
+        return runtime_definition_service.resolve_authoring(
             db,
             scenario,
             environment=runtime_connector_service.runtime_environment(),
         )
     except runtime_definition_service.RuntimeDefinitionError as exc:
-        raise HTTPException(409, f"当前部署定义不可读取场景数据: {exc}") from exc
+        raise HTTPException(409, f"当前场景定义不可读取: {exc}") from exc
 
 
 def _instance_in_current_runtime(
@@ -3458,10 +3462,9 @@ def get_mapping_refresh_job(
     job = db.get(DataMappingRefreshJob, job_id)
     if not job or job.tenant_id != tenant_service.current_tenant_id(db):
         raise HTTPException(404, "映射刷新任务不存在")
-    if job.environment != runtime_connector_service.runtime_environment():
-        # Shared metadata storage must not expose one deployment's task state
-        # through another environment's API surface.
-        raise HTTPException(404, "映射刷新任务不存在")
+    # The environment records which connector set owns execution.  It is not
+    # a data-visibility boundary: authorized members must be able to inspect
+    # the durable task even when a control-plane process uses another setting.
     _scenario_for_request(db, job.scenario_id)
     response.headers["Cache-Control"] = "no-store"
     return _mapping_refresh_job_out(job)
@@ -3630,7 +3633,11 @@ def execute_action(action_id: str, payload: ActionExecuteRequest, db: Session = 
         db, live_action.scenario_id, writable=not payload.dry_run
     )
     try:
-        definition = runtime_definition_service.resolve_active(
+        # A dry-run creates a durable confirmation pin when the caller later
+        # submits it.  Resolve it from the same released definition as the
+        # real effect, rather than letting an authoring preview confirm a
+        # different live Action later.
+        definition = runtime_definition_service.resolve_execution(
             db,
             scenario,
             environment=runtime_connector_service.runtime_environment(),
@@ -3857,7 +3864,9 @@ def evaluate_rule(rule_id: str, payload: dict, db: Session = Depends(get_db)):
     if not isinstance(record, dict):
         raise HTTPException(400, "规则评估记录必须是对象")
     try:
-        definition = runtime_definition_service.resolve_active(
+        # Rule evaluation is an authoring/debug operation with no external
+        # side effect; it must remain available before the first release.
+        definition = runtime_definition_service.resolve_authoring(
             db,
             scenario,
             environment=runtime_connector_service.runtime_environment(),
@@ -3927,7 +3936,7 @@ def publish_event(event_id: str, payload: EventPublishIn, db: Session = Depends(
         raise HTTPException(404, "事件不存在")
     scenario = _scenario_for_request(db, live_event.scenario_id, writable=True)
     try:
-        definition = runtime_definition_service.resolve_active(
+        definition = runtime_definition_service.resolve_execution(
             db,
             scenario,
             environment=runtime_connector_service.runtime_environment(),
@@ -4060,7 +4069,7 @@ def create_workflow_run(
         raise HTTPException(404, "工作流不存在")
     scenario = _scenario_for_request(db, live_workflow.scenario_id, writable=True)
     try:
-        definition = runtime_definition_service.resolve_active(
+        definition = runtime_definition_service.resolve_execution(
             db,
             scenario,
             environment=runtime_connector_service.runtime_environment(),
@@ -4153,8 +4162,6 @@ def list_execution_logs(
         select(ActionExecutionLog)
         .where(
             ActionExecutionLog.scenario_id == scenario_id,
-            ActionExecutionLog.environment
-            == runtime_connector_service.runtime_environment(),
         )
         .order_by(ActionExecutionLog.created_at.desc())
         .limit(limit)
