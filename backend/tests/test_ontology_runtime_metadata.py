@@ -360,10 +360,11 @@ class PostgreSQLMigrationContractsTests(unittest.TestCase):
 
     def test_alembic_graph_has_one_postgresql_head(self) -> None:
         revisions = migration_revisions()
-        self.assertEqual(migration_heads(), ("20260904_13",))
+        self.assertEqual(migration_heads(), ("20260904_14",))
         from app.database import POSTGRESQL_SCHEMA_REVISION
 
         self.assertEqual(POSTGRESQL_SCHEMA_REVISION, migration_heads()[0])
+        self.assertEqual(revisions["20260904_14"], "20260904_13")
         self.assertEqual(revisions["20260904_13"], "20260904_12")
         self.assertEqual(revisions["20260904_12"], "20260903_11")
         self.assertEqual(revisions["20260903_11"], "20260903_10")
@@ -501,6 +502,17 @@ class PostgreSQLMigrationContractsTests(unittest.TestCase):
         self.assertIn(
             "CONSTRAINT uq_agent_mcp_conversations_service_conversation "
             "UNIQUE (service_id, conversation_id)",
+            sql,
+        )
+
+    def test_agent_mcp_publication_removal_preserves_audit(self) -> None:
+        sql = render_postgresql_upgrade("20260904_14")
+        self.assertIn(
+            "ALTER TABLE agent_mcp_services ADD COLUMN deleted_at TIMESTAMP WITH TIME ZONE",
+            sql,
+        )
+        self.assertIn(
+            "CREATE INDEX ix_agent_mcp_services_deleted_at ON agent_mcp_services (deleted_at)",
             sql,
         )
 

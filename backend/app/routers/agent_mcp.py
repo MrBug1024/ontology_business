@@ -48,6 +48,7 @@ def _owned_service(db: Session, service_id: str) -> AgentMCPService:
         select(AgentMCPService).where(
             AgentMCPService.id == service_id,
             AgentMCPService.tenant_id == tenant_service.current_tenant_id(db),
+            AgentMCPService.deleted_at.is_(None),
         )
     ).scalars().first()
     if not service:
@@ -62,7 +63,6 @@ def _out(db: Session, service: AgentMCPService, endpoint_url: str) -> AgentMCPSe
     definition = context.runtime_definition if context is not None else None
     if context is not None and context.scenario is not None:
         scenario_name = context.scenario.name
-    host_context_contract = agent_mcp_service.host_context_contract()
     return AgentMCPServiceOut(
         id=service.id,
         name=service.name,
@@ -80,12 +80,6 @@ def _out(db: Session, service: AgentMCPService, endpoint_url: str) -> AgentMCPSe
         last_used_at=service.last_used_at,
         runtime_environment=str(getattr(definition, "environment", "") or service.runtime_environment),
         definition_hash=str(getattr(definition, "definition_hash", "") or service.definition_hash),
-        host_context_contract=host_context_contract,
-        host_context_contract_json=json.dumps(
-            host_context_contract,
-            ensure_ascii=False,
-            indent=2,
-        ),
         created_at=service.created_at,
         updated_at=service.updated_at,
     )
@@ -138,7 +132,10 @@ def list_services(
     endpoint_url = _endpoint_url(request)
     services = db.execute(
         select(AgentMCPService)
-        .where(AgentMCPService.tenant_id == tenant_service.current_tenant_id(db))
+        .where(
+            AgentMCPService.tenant_id == tenant_service.current_tenant_id(db),
+            AgentMCPService.deleted_at.is_(None),
+        )
         .order_by(AgentMCPService.created_at.desc(), AgentMCPService.id.desc())
     ).scalars().all()
     return [_out(db, service, endpoint_url) for service in services]
@@ -270,6 +267,12 @@ def test_service(
 def delete_service(service_id: str, db: Session = Depends(get_tenant_db)) -> dict[str, str]:
     _principal(db)
     service = _owned_service(db, service_id)
-    db.delete(service)
+    service.enabled = False
+    service.expires_at = agent_mcp_service.utc_now()
+    service.deleted_at = agent_mcp_service.utc_now()
+    service.token_hash = agent_mcp_service.token_hash(
+        f"deleted:{service.id}:{service.deleted_at.isoformat()}"
+    )
+    service.name_key = f"deleted:{service.id}"
     db.commit()
     return {"message": "已删除"}

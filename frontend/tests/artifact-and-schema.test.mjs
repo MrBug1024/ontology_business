@@ -762,19 +762,15 @@ test('standard MCP config rejects missing wrappers and non-string header values'
   })), /重复键名/)
 })
 
-test('Agent MCP publication exposes the host-level verbatim input contract', () => {
+test('Agent MCP publication relies on the standard discoverable tool schema', () => {
   const source = readFileSync(
     new URL('../src/components/AgentMCPPublications.vue', import.meta.url),
     'utf8',
   )
-  assert.match(source, /第三方必须支持宿主级原文透传/)
-  assert.match(source, /ai\.rhzy\/original-user-message/)
-  assert.match(source, /ai\.rhzy\/external-conversation-id/)
-  assert.match(source, /ai\.rhzy\/external-turn-id/)
-  assert.doesNotMatch(source, /fallbackHostContextContractJson/)
-  assert.match(source, /contract\.input_contract_version === '2'/)
-  assert.match(source, /当前后端未声明有效的宿主原文透传契约/)
-  assert.match(source, /查看宿主透传契约/)
+  assert.match(source, /使用标准 MCP 工具发现与调用/)
+  assert.match(source, /tools\/list 自动发现 invoke_agent 的 message 和 conversation_id 参数/)
+  assert.doesNotMatch(source, /ai\.rhzy\//)
+  assert.doesNotMatch(source, /宿主透传契约/)
   assert.match(source, /@closed="clearCreatedService"/)
 })
 

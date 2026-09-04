@@ -518,30 +518,11 @@ class AgentMCPPublicationTests(unittest.TestCase):
             self.assertTrue(raw_token.startswith("agt_sk_"))
             self.assertIn(raw_token, payload["config_json"])
             self.assertEqual(payload["config"]["mcpServers"]["医保违规审计助手"]["url"], "http://testserver/mcp")
-            self.assertNotIn(raw_token, payload["host_context_contract_json"])
-            self.assertEqual(
-                payload["host_context_contract"]["required_request_meta"][
-                    "ai.rhzy/host-context-version"
-                ],
-                "1",
-            )
-            self.assertIn(
-                "ai.rhzy/original-user-message",
-                payload["host_context_contract_json"],
-            )
 
             listed = self.client.get("/api/agent-mcp-services")
             self.assertEqual(listed.status_code, 200, listed.text)
             self.assertNotIn("token", listed.json()[0])
             self.assertNotIn(raw_token, listed.text)
-            self.assertEqual(
-                listed.json()[0]["host_context_contract"]["input_contract_version"],
-                "2",
-            )
-            self.assertIn(
-                "ai.rhzy/external-conversation-id",
-                listed.json()[0]["host_context_contract_json"],
-            )
 
             self.current_user = self.viewer
             viewer_list = self.client.get("/api/agent-mcp-services")
@@ -664,69 +645,41 @@ class AgentMCPPublicationTests(unittest.TestCase):
                             tools = await session.list_tools()
                             self.assertEqual([tool.name for tool in tools.tools], ["invoke_agent"])
                             invoke_tool = tools.tools[0]
-                            self.assertIn("原文转交入口", invoke_tool.description)
-                            self.assertNotIn("message", invoke_tool.inputSchema["properties"])
+                            self.assertIn("完整 Agent", invoke_tool.description)
                             self.assertIn(
-                                "original_user_message",
+                                "message",
                                 invoke_tool.inputSchema["required"],
                             )
                             self.assertIn(
-                                "不得改写为检索词",
-                                invoke_tool.inputSchema["properties"]["original_user_message"][
+                                "不得只传关键词",
+                                invoke_tool.inputSchema["properties"]["message"][
                                     "description"
                                 ],
                             )
                             self.assertEqual(
                                 set(invoke_tool.inputSchema["properties"]),
-                                {"original_user_message", "conversation_id"},
+                                {"message", "conversation_id"},
                             )
                             self.assertIn(
-                                "后续每次调用必须传入",
+                                "继续同一终端用户会话",
                                 invoke_tool.inputSchema["properties"]["conversation_id"]["description"],
                             )
-                            advertised_contract = invoke_tool.meta[
-                                "ai.rhzy/input-contract"
-                            ]
-                            self.assertEqual(
-                                advertised_contract,
-                                agent_mcp_service.host_context_contract(),
-                            )
-                            self.assertEqual(
-                                advertised_contract["input_contract_version"],
-                                "2",
-                            )
-                            self.assertTrue(
-                                advertised_contract["strict_host_context_required"]
-                            )
-                            self.assertFalse(
-                                advertised_contract["trust_boundary"][
-                                    "platform_observes_third_party_ui"
-                                ]
-                            )
+                            self.assertFalse(invoke_tool.meta)
                             legacy = await session.call_tool(
                                 "invoke_agent",
-                                {"message": "不再接受的旧参数"},
+                                {"original_user_message": "不再接受的私有契约参数"},
                             )
                             self.assertTrue(legacy.isError)
-                            self.assertIn("original_user_message", legacy.content[0].text)
-                            no_host_context = await session.call_tool(
-                                "invoke_agent",
-                                {"original_user_message": original_message},
+                            self.assertIn("message", legacy.content[0].text)
+                            unknown = await session.call_tool(
+                                "query_mapped_objects",
+                                {"object_type": "Hospital"},
                             )
-                            self.assertTrue(no_host_context.isError)
-                            self.assertIn(
-                                "MISSING_HOST_CONTEXT",
-                                no_host_context.content[0].text,
-                            )
+                            self.assertTrue(unknown.isError)
+                            self.assertIn("Unknown tool", unknown.content[0].text)
                             result = await session.call_tool(
                                 "invoke_agent",
-                                {"original_user_message": original_message},
-                                meta={
-                                    "ai.rhzy/host-context-version": "1",
-                                    "ai.rhzy/original-user-message": original_message,
-                                    "ai.rhzy/external-conversation-id": "third-party-chat-1",
-                                    "ai.rhzy/external-turn-id": "third-party-message-1",
-                                },
+                                {"message": original_message},
                             )
                             self.assertFalse(result.isError)
                             self.assertEqual(result.structuredContent["answer"], "审计完成")
@@ -748,15 +701,15 @@ class AgentMCPPublicationTests(unittest.TestCase):
                                     "call_count": 1,
                                     "result_count": 1,
                                     "failed_count": 1,
-                                    "failed_tools": [
-                                        {
-                                            "name": "execute_action",
-                                            "count": 1,
-                                            "codes": ["TOOL_RESULT_TOO_LARGE"],
-                                        }
-                                    ],
                                 },
                             )
+                            public_json = json.dumps(
+                                result.structuredContent,
+                                ensure_ascii=False,
+                            )
+                            self.assertNotIn("execute_action", public_json)
+                            self.assertNotIn("TOOL_RESULT_TOO_LARGE", public_json)
+                            self.assertNotIn("query_mapped_objects", public_json)
                             self.assertNotIn(
                                 "text", result.structuredContent["citations"][0]
                             )
@@ -780,56 +733,20 @@ class AgentMCPPublicationTests(unittest.TestCase):
                             repeated = await session.call_tool(
                                 "invoke_agent",
                                 {
-                                    "original_user_message": "确认执行",
+                                    "message": "确认执行",
                                     "conversation_id": "conversation-test",
-                                },
-                                meta={
-                                    "ai.rhzy/host-context-version": "1",
-                                    "ai.rhzy/original-user-message": "确认执行",
-                                    "ai.rhzy/external-conversation-id": "third-party-chat-1",
-                                    "ai.rhzy/external-turn-id": "third-party-message-2",
                                 },
                             )
                             self.assertFalse(repeated.isError)
                             self.assertEqual(repeated.structuredContent["answer"], "审计完成")
                             self.assertEqual(
                                 repeated.structuredContent["input_receipt"]["source"],
-                                "host_context_v1",
-                            )
-                            self.assertTrue(
-                                repeated.structuredContent["input_receipt"][
-                                    "tool_argument_matched"
-                                ]
+                                "tool_argument",
                             )
                             self.assertNotIn(
                                 "conversation_binding_hash",
                                 repeated.structuredContent["input_receipt"],
                             )
-                            mismatch = await session.call_tool(
-                                "invoke_agent",
-                                {"original_user_message": "模型生成的确认摘要"},
-                                meta={
-                                    "ai.rhzy/host-context-version": "1",
-                                    "ai.rhzy/original-user-message": "确认执行",
-                                    "ai.rhzy/external-conversation-id": "third-party-chat-1",
-                                    "ai.rhzy/external-turn-id": "third-party-message-3",
-                                },
-                            )
-                            self.assertTrue(mismatch.isError)
-                            self.assertIn(
-                                "ORIGINAL_MESSAGE_MISMATCH",
-                                mismatch.content[0].text,
-                            )
-                            missing_context = await session.call_tool(
-                                "invoke_agent",
-                                {"original_user_message": "不会执行"},
-                                meta={
-                                    "ai.rhzy/host-context-version": "1",
-                                    "ai.rhzy/original-user-message": "不会执行",
-                                },
-                            )
-                            self.assertTrue(missing_context.isError)
-                            self.assertIn("host context v1 缺少", missing_context.content[0].text)
 
         with (
             patch.object(agent_mcp_service, "SessionLocal", self.Session),
@@ -848,11 +765,71 @@ class AgentMCPPublicationTests(unittest.TestCase):
         )
         self.assertEqual(received_calls[0]["message"], original_message)
         self.assertEqual(received_calls[1]["message"], "确认执行")
-        self.assertEqual(
-            received_calls[0]["external_conversation_id"],
-            "third-party-chat-1",
+        self.assertNotIn("external_conversation_id", received_calls[0])
+        self.assertNotIn("external_turn_id", received_calls[1])
+
+    def test_delete_revokes_publication_without_erasing_invocation_audit(self) -> None:
+        raw_token = self._add_published_service(service_id="service-soft-delete")
+        db = self.Session()
+        try:
+            conversation = Conversation(
+                id="conversation-soft-delete",
+                agent_id=self.agent.id,
+                created_by_user_id=self.owner.id,
+                title="保留审计",
+            )
+            db.add(conversation)
+            db.flush()
+            mapping = AgentMCPConversation(
+                id="mapping-soft-delete",
+                service_id="service-soft-delete",
+                tenant_id=self.tenant.id,
+                agent_id=self.agent.id,
+                execution_user_id=self.owner.id,
+                external_session_hash="a" * 64,
+                binding_kind="isolated_turn",
+                conversation_id=conversation.id,
+            )
+            db.add(mapping)
+            db.flush()
+            db.add(AgentMCPInvocation(
+                id="invocation-soft-delete",
+                service_id="service-soft-delete",
+                tenant_id=self.tenant.id,
+                agent_id=self.agent.id,
+                execution_user_id=self.owner.id,
+                request_id="request-soft-delete",
+                mcp_conversation_id=mapping.id,
+                conversation_id=conversation.id,
+                input_hash="b" * 64,
+                status="succeeded",
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        deleted = self.client.delete(
+            "/api/agent-mcp-services/service-soft-delete"
         )
-        self.assertEqual(received_calls[1]["external_turn_id"], "third-party-message-2")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(self.client.get("/api/agent-mcp-services").json(), [])
+
+        db = self.Session()
+        try:
+            service = db.get(AgentMCPService, "service-soft-delete")
+            self.assertIsNotNone(service)
+            self.assertFalse(service.enabled)
+            self.assertIsNotNone(service.deleted_at)
+            self.assertIsNotNone(
+                db.get(AgentMCPInvocation, "invocation-soft-delete")
+            )
+            self.assertIsNotNone(
+                db.get(AgentMCPConversation, "mapping-soft-delete")
+            )
+        finally:
+            db.close()
+        with patch.object(agent_mcp_service, "SessionLocal", self.Session):
+            self.assertIsNone(agent_mcp_service.authenticate_token(raw_token))
 
     def test_transport_session_does_not_define_end_user_conversation(self) -> None:
         self._add_published_service(service_id="service-session-a")
@@ -1405,7 +1382,7 @@ class AgentMCPPublicationTests(unittest.TestCase):
         self.assertTrue(replay["mcp_replayed"])
         self.assertEqual(
             replay["mcp_input_receipt"]["source"],
-            "tool_argument_unverified",
+            "tool_argument",
         )
         # The one model invocation represents the non-confirmed side-effect
         # boundary: a concurrent/transport retry of rpc-1 never enters it.

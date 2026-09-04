@@ -23,6 +23,7 @@ _MIGRATION_MODULES = {
     "20260903_11": "migrations.versions.20260903_11_bind_agent_workflow_runs_to_conversations",
     "20260904_12": "migrations.versions.20260904_12_add_cross_workspace_invitations",
     "20260904_13": "migrations.versions.20260904_13_canonicalize_agent_mcp_conversations",
+    "20260904_14": "migrations.versions.20260904_14_soft_delete_agent_mcp_services",
 }
 
 

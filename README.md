@@ -205,14 +205,11 @@ MCP_OPERATION_TIMEOUT_SECONDS=90
 ```env
 AGENT_MCP_PUBLIC_URL=https://api.example.com/mcp
 AGENT_MCP_ALLOWED_HOSTS=api.example.com
-AGENT_MCP_REQUIRE_HOST_CONTEXT=true
 ```
 
-`invoke_agent.original_user_message` 是终端用户消息的透传边界。它是必填参数，MCP 宿主必须把聊天框中
-的一条用户消息逐字复制到该字段并且只调用一次，不能先改写为检索词、规则查询或执行计划。工具参数由
-宿主模型生成时，这一要求只能作为模型约束，服务端无法读取宿主未发送的聊天记录，也无法自行证明参数
-就是 UI 原文。需要确定性透传的第三方必须由宿主适配层（而不是 LLM）在每次 `tools/call` 的 `_meta`
-中直接注入以下字段；服务端会优先采用其中的原文：
+第三方不需要实现平台私有协议。标准 `tools/list` 只发布一个 `invoke_agent`，其 `inputSchema` 声明必填
+字符串 `message` 和可选字符串 `conversation_id`。首次请求省略 `conversation_id`；只有继续同一平台
+Agent 对话时，才原样回传上次结果中的该值：
 
 ```json
 {
@@ -222,44 +219,29 @@ AGENT_MCP_REQUIRE_HOST_CONTEXT=true
   "params": {
     "name": "invoke_agent",
     "arguments": {
-      "original_user_message": "终端用户本轮逐字原文"
-    },
-    "_meta": {
-      "ai.rhzy/host-context-version": "1",
-      "ai.rhzy/original-user-message": "终端用户本轮逐字原文",
-      "ai.rhzy/external-conversation-id": "第三方当前 UI 会话的稳定 ID",
-      "ai.rhzy/external-turn-id": "第三方当前用户消息的稳定 ID"
+      "message": "用户本轮提交给已发布 Agent 的完整请求",
+      "conversation_id": "仅续接同一对话时填写"
     }
   }
 }
 ```
 
-这里的 host context 是第三方宿主适配层的声明，不是平台对第三方聊天框的独立取证。平台只能确认
-`original_user_message` 与 `_meta` 中收到的文本逐字一致；如果第三方把同一段改写文本同时放进两处，
-平台无法凭 MCP 请求还原未发送的 UI 原文。需要独立证明时，必须在模型调用前增加由我方控制的输入网关，
-由该网关直接接收 UI 消息并签名或转发；仅靠 MCP 工具服务端无法建立这条信任链。
+MCP Tools 按标准由宿主模型控制。`inputSchema` 可以约束参数名称、类型和必填性，description 可以明确要求
+传入完整请求，但服务端无法读取第三方未发送的聊天框内容，也无法用标准 MCP 证明 `message` 一定逐字等于
+UI 原文。若第三方宿主仍主动摘要或改写，只有该宿主原生支持的用户 Prompt/Elicitation UI，或模型调用前的
+直连输入网关，才能形成模型旁路；服务端不再要求不可发现的自定义 `_meta` 字段。
 
-默认的 `AGENT_MCP_REQUIRE_HOST_CONTEXT=true` 会强制要求完整的 host context v1；缺字段或
-`original_user_message` 与宿主原文不一致时，服务端分别返回 `MISSING_HOST_CONTEXT` 或
-`ORIGINAL_MESSAGE_MISMATCH`，并且不会创建会话或执行 Agent。只有明确接受模型改写风险的兼容部署才应
-将该配置设为 `false`。响应中的 `input_receipt` 会返回实际执行文本的 SHA-256、长度和来源；
-`request_receipt` 则描述本次请求，防止重试覆盖首次执行的审计事实。
-
-升级前已经建立的 MCP 对话按 transport session 归属，无法证明它对应第三方的哪一个 UI 会话；新版本
-不会只凭裸 `conversation_id` 自动把这类历史对话认领到新的 external conversation ID，以免再次串话。
-部署新协议后应让第三方刷新工具定义并新建会话；新会话随后可稳定续接“确认执行”等后续消息。
+升级前已经建立的 MCP 对话按 transport session 归属，无法证明它对应第三方的哪一个 UI 会话。部署后应
+让第三方重连并刷新 `tools/list`，再新建会话；新会话可用返回的 `conversation_id` 续接“确认执行”等回复。
 
 本次会话映射迁移不是旧、新 Worker 混跑兼容迁移。升级时必须先停止并排空旧版 API/Worker，再执行
 `python -m alembic -c .\\backend\\alembic.ini upgrade head`，然后启动新版服务；迁移会锁定映射表，
 阻止迁移过程中写入新的旧格式映射。不得在旧 Worker 仍接收 MCP 请求时执行该迁移。
 
-`Mcp-Session-Id` 只表示 MCP 客户端与服务端的传输会话，不能作为终端用户聊天 ID。兼容模式下未提供
-`_meta["ai.rhzy/external-conversation-id"]` 和平台 `conversation_id` 时，每个工具请求都会创建独立的平台会话，避免
-第三方复用连接时串话；宿主注入稳定的 external conversation ID 可跨 transport 自动续接。首次返回也会
-包含平台 `conversation_id`，同一终端用户会话的后续调用（包括“确认执行”等回复）可以原样回传该值。
-旧协议客户端仍应按 MCP transport 规范续传 `Mcp-Session-Id`，但它不再决定业务对话归属。
-公开响应只携带最终答案、续接标识、引用标识和工具执行摘要；完整工具参数与结果保留在平台会话及
-审计记录中，避免大型审计明细在 MCP 的 `content` / `structuredContent` 中重复传输。
+兼容旧版协议时的 `Mcp-Session-Id` 只表示 MCP 客户端与服务端的传输会话，不能作为终端用户聊天 ID。未传
+`conversation_id` 的每个工具请求都会创建独立平台会话，因此第三方复用连接也不会串话。公开响应只携带
+最终答案、显式续接句柄、引用标识和工具执行计数；`query_mapped_objects` 等内部工具完全在平台内执行，
+其名称、参数和结果不会作为外部 MCP 工具调用返回。
 
 请求头和环境变量在 API 中按只写值处理，但当前仓库不内置数据库静态加密或外部 Secret Manager。
 生产部署应启用数据库/磁盘加密并限制备份访问；安全基线要求更高时，应在连接器密钥服务中统一实施信封加密和密钥轮换。

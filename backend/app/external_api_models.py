@@ -135,6 +135,9 @@ class AgentMCPService(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     agent_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     definition_snapshot_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     release_id: Mapped[str | None] = mapped_column(String(32), nullable=True)

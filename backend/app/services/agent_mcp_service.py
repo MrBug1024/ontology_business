@@ -31,10 +31,6 @@ from . import permission_service, tenant_service
 _TOKEN_HASH_DOMAIN = b"ontology-platform/agent-mcp-token/v1\0"
 _CONVERSATION_BINDING_HASH_DOMAIN = b"ontology-platform/agent-mcp-conversation-binding/v2\0"
 _REQUEST_HASH_DOMAIN = b"ontology-platform/agent-mcp-request/v1\0"
-HOST_CONTEXT_VERSION_KEY = "ai.rhzy/host-context-version"
-HOST_ORIGINAL_MESSAGE_KEY = "ai.rhzy/original-user-message"
-HOST_CONVERSATION_ID_KEY = "ai.rhzy/external-conversation-id"
-HOST_TURN_ID_KEY = "ai.rhzy/external-turn-id"
 
 
 class AgentMCPError(ValueError):
@@ -625,35 +621,6 @@ def client_config(name: str, endpoint_url: str, token: str) -> dict[str, Any]:
     }
 
 
-def host_context_contract() -> dict[str, Any]:
-    """Return the non-secret adapter contract shipped with publication config."""
-    return {
-        "input_contract_version": "2",
-        "tool_name": "invoke_agent",
-        "tool_message_field": "original_user_message",
-        "host_context_version": "1",
-        "strict_host_context_required": get_settings().agent_mcp_require_host_context,
-        "trust_boundary": {
-            "asserted_by": "third_party_host_adapter",
-            "platform_observes_third_party_ui": False,
-            "meaning": "宿主声明的逐字原文；平台只能校验所收到的两个字段一致",
-        },
-        "required_request_meta": {
-            HOST_CONTEXT_VERSION_KEY: "1",
-            HOST_ORIGINAL_MESSAGE_KEY: "终端用户本轮逐字原文",
-            HOST_CONVERSATION_ID_KEY: "第三方当前 UI 会话的稳定 ID",
-            HOST_TURN_ID_KEY: "第三方当前用户消息的稳定 ID",
-        },
-        "requirements": [
-            "宿主适配层直接注入 _meta，不得由 LLM 生成",
-            "original_user_message 必须与 _meta 中的用户原文逐字一致",
-            "每个终端用户轮次只调用一次 invoke_agent",
-            "不同 UI 会话必须使用不同 external conversation ID",
-            "平台无法直接读取第三方 UI；第三方需保证适配层注入值来自聊天框原文",
-        ],
-    }
-
-
 def validate_agent_runtime(
     db: Session,
     agent_id: str,
@@ -716,6 +683,7 @@ def authenticate_token(raw_token: str) -> AuthenticatedAgentMCP | None:
             select(AgentMCPService).where(
                 AgentMCPService.token_hash == token_hash(raw_token),
                 AgentMCPService.enabled.is_(True),
+                AgentMCPService.deleted_at.is_(None),
             )
         ).scalars().first()
         if not service or not service.execution_user_id:
@@ -1008,7 +976,7 @@ def invoke_published_agent(
     external_request_id: str | None = None,
     external_conversation_id: str | None = None,
     external_turn_id: str | None = None,
-    input_source: str = "tool_argument_unverified",
+    input_source: str = "tool_argument",
     tool_argument_matched: bool = True,
 ) -> dict[str, Any]:
     from ..routers import agents
@@ -1142,16 +1110,10 @@ def invoke_published_agent(
             "mcp_conversation_mode": binding_mode,
             "mcp_replayed": False,
             "mcp_input_receipt": {
-                "source": str(input_source or "tool_argument_unverified")[:80],
+                "source": str(input_source or "tool_argument")[:80],
                 "message_sha256": input_hash,
                 "message_length": len(message),
                 "tool_argument_matched": bool(tool_argument_matched),
-                "verbatim_attested_by": (
-                    "third_party_host_adapter"
-                    if input_source == "host_context_v1"
-                    else ""
-                ),
-                "platform_observed_host_ui": False,
                 "external_conversation_bound": bool(external_conversation_id),
                 "external_turn_bound": bool(external_turn_id),
                 "conversation_binding_hash": binding.binding_key_hash or "",
