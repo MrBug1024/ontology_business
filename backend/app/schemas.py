@@ -51,6 +51,15 @@ class ResetPasswordIn(BaseModel):
     password_confirm: str
 
 
+class OrganizationWorkspaceOut(BaseModel):
+    organization_id: str
+    tenant_id: str
+    name: str = ""
+    role_key: Literal["owner", "admin", "operator", "viewer"]
+    role_name: str = ""
+    is_active: bool = False
+
+
 class UserOut(BaseModel):
     id: str
     email: str
@@ -60,6 +69,9 @@ class UserOut(BaseModel):
     # UI hint only. Every management endpoint remains responsible for enforcing
     # its own server-side permission check.
     can_manage: bool = False
+    active_workspace: OrganizationWorkspaceOut | None = None
+    workspaces: list[OrganizationWorkspaceOut] = Field(default_factory=list)
+    pending_invitation_count: int = 0
 
 
 class AuthMessage(Msg):
@@ -79,9 +91,15 @@ class OrganizationMemberOut(BaseModel):
     display_name: str = ""
     role_key: Literal["owner", "admin", "operator", "viewer"]
     role_name: str = ""
-    status: Literal["active", "invited", "disabled"]
+    # ``disabled`` is accepted only to render historic records. New membership
+    # revocations use ``removed`` and never affect the User account state.
+    status: Literal["active", "invited", "removed", "disabled"]
     email_verified: bool = False
     created_at: datetime
+    is_external_member: bool = False
+    invited_by_name: str = ""
+    invitation_expires_at: datetime | None = None
+    has_pending_invitation: bool = False
 
 
 class OrganizationUserCreateIn(BaseModel):
@@ -107,6 +125,16 @@ class OrganizationInvitationAcceptIn(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     password_confirm: str
     display_name: str = Field(default="", max_length=120)
+
+
+class OrganizationInvitationInboxOut(BaseModel):
+    id: str
+    organization_id: str
+    organization_name: str = ""
+    inviter_name: str = ""
+    role_key: Literal["owner", "admin", "operator", "viewer"]
+    role_name: str = ""
+    expires_at: datetime
 
 
 class OrganizationMemberRoleIn(BaseModel):

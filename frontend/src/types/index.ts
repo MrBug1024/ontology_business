@@ -7,6 +7,9 @@ export interface User {
   tenant_id: string
   email_verified?: boolean
   can_manage?: boolean
+  active_workspace?: OrganizationWorkspace | null
+  workspaces?: OrganizationWorkspace[]
+  pending_invitation_count?: number
 }
 
 export interface AuthMessage {
@@ -16,7 +19,16 @@ export interface AuthMessage {
 }
 
 export type OrganizationRoleKey = 'owner' | 'admin' | 'operator' | 'viewer'
-export type OrganizationMemberStatus = 'active' | 'invited' | 'disabled'
+export type OrganizationMemberStatus = 'active' | 'invited' | 'removed' | 'disabled'
+
+export interface OrganizationWorkspace {
+  organization_id: string
+  tenant_id: string
+  name: string
+  role_key: OrganizationRoleKey
+  role_name: string
+  is_active: boolean
+}
 
 export interface OrganizationRole {
   key: OrganizationRoleKey
@@ -34,15 +46,10 @@ export interface OrganizationMember {
   status: OrganizationMemberStatus
   email_verified: boolean
   created_at: string
-}
-
-export interface OrganizationUserCreate {
-  email: string
-  display_name?: string
-  password: string
-  password_confirm: string
-  role_key: OrganizationRoleKey
-  activate_immediately?: boolean
+  is_external_member: boolean
+  invited_by_name?: string
+  invitation_expires_at?: string | null
+  has_pending_invitation?: boolean
 }
 
 export interface OrganizationInvitation {
@@ -57,6 +64,16 @@ export interface OrganizationInvitationAccept {
   password: string
   password_confirm: string
   display_name?: string
+}
+
+export interface OrganizationInvitationInboxItem {
+  id: string
+  organization_id: string
+  organization_name: string
+  inviter_name: string
+  role_key: OrganizationRoleKey
+  role_name: string
+  expires_at: string
 }
 
 export interface Property {

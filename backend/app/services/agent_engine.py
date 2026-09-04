@@ -101,6 +101,10 @@ _SAFE_TOOL_ERROR_CODES = frozenset(
     }
 )
 _MAX_TOOL_RESULT_CHARS = 8_000
+# Governed Action responses include execution provenance in addition to their
+# tabular result. A modestly larger boundary lets ordinary complete audit
+# results reach the model without weakening the default catalog/query limit.
+_MAX_ACTION_TOOL_RESULT_CHARS = 16_000
 _WORKFLOW_PARAM_RE = re.compile(r"\{\{\s*params\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _AUDIT_INTENT_TERMS = ("审计", "核验", "核查", "排查", "违规")
 _DELIVERY_INTENT_VERBS = ("生成", "完成", "出具", "编制", "交付", "导出", "制作", "产出", "提交")
@@ -282,7 +286,7 @@ def _is_safe_tool_error(value: Any) -> bool:
     )
 
 
-def _bounded_tool_result(value: Any) -> str:
+def _bounded_tool_result(value: Any, *, tool_name: str = "") -> str:
     """Keep the model-facing and persisted tool result complete and parseable.
 
     Cutting an arbitrary JSON string at the prompt budget boundary corrupts
@@ -291,7 +295,12 @@ def _bounded_tool_result(value: Any) -> str:
     exact-reference mode exposed by discovery tools such as ``list_actions``.
     """
     result = value if isinstance(value, str) else _dump(value)
-    if len(result) <= _MAX_TOOL_RESULT_CHARS:
+    max_chars = (
+        _MAX_ACTION_TOOL_RESULT_CHARS
+        if tool_name == "execute_action"
+        else _MAX_TOOL_RESULT_CHARS
+    )
+    if len(result) <= max_chars:
         return result
     return _tool_error(
         "TOOL_RESULT_TOO_LARGE",
@@ -3940,7 +3949,7 @@ def _run_agent(
                 # output as part of a newer turn's transcript.
                 _assert_agent_turn_lease(db)
             tool_call_counts[signature] += 1
-            bounded_result = _bounded_tool_result(result)
+            bounded_result = _bounded_tool_result(result, tool_name=fname)
             tool_outcomes.append(
                 {
                     "name": fname,

@@ -39,10 +39,11 @@ import type {
   OntologyInstance,
   OrganizationInvitation,
   OrganizationInvitationAccept,
+  OrganizationInvitationInboxItem,
   OrganizationMember,
   OrganizationRole,
   OrganizationRoleKey,
-  OrganizationUserCreate,
+  OrganizationWorkspace,
   RelationInstance,
   RelationInstanceSearchResult,
   RelationDataMapping,
@@ -78,10 +79,21 @@ const instance = axios.create({ baseURL: apiBaseUrl, timeout: 120000, withCreden
 instance.interceptors.response.use(
   (r) => r.data,
   (err) => {
-    if (err.response?.status === 401 && !String(err.config?.url || '').startsWith('/auth') && window.location.pathname !== '/login') {
+    const responseDetail = err.response?.data?.detail
+    const isConfirmedSessionFailure = typeof responseDetail === 'string' && [
+      '请先登录',
+      '登录已失效，请重新登录',
+      '当前登录会话不可用',
+    ].includes(responseDetail)
+    if (
+      err.response?.status === 401
+      && isConfirmedSessionFailure
+      && !String(err.config?.url || '').startsWith('/auth')
+      && window.location.pathname !== '/login'
+    ) {
       window.location.assign('/login')
     }
-    const msg = err.response?.data?.detail || err.message || '请求失败'
+    const msg = responseDetail || err.response?.data?.error_description || err.message || '请求失败'
     const error = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg)) as Error & { status?: number }
     error.status = Number(err.response?.status || 0) || undefined
     return Promise.reject(error)
@@ -107,18 +119,23 @@ export const api = {
   // 工作区成员与权限
   listOrganizationRoles: () => http.get<OrganizationRole[]>('/organization/roles'),
   listOrganizationMembers: () => http.get<OrganizationMember[]>('/organization/members'),
-  createOrganizationUser: (d: OrganizationUserCreate) =>
-    http.post<OrganizationMember>('/organization/users', d),
+  listOrganizationWorkspaces: () => http.get<OrganizationWorkspace[]>('/organization/workspaces'),
+  switchOrganizationWorkspace: (organizationId: string) =>
+    http.post<User>(`/organization/workspaces/${organizationId}/switch`),
   inviteOrganizationMember: (d: OrganizationInvitation) =>
     http.post<AuthMessage>('/organization/invitations', d),
   acceptOrganizationInvitation: (d: OrganizationInvitationAccept) =>
     http.post<AuthMessage>('/organization/invitations/accept', d),
+  listMyOrganizationInvitations: () =>
+    http.get<OrganizationInvitationInboxItem[]>('/organization/invitations/inbox'),
+  acceptMyOrganizationInvitation: (invitationId: string) =>
+    http.post<User>(`/organization/invitations/${invitationId}/accept`),
+  declineMyOrganizationInvitation: (invitationId: string) =>
+    http.post<AuthMessage>(`/organization/invitations/${invitationId}/decline`),
   updateOrganizationMemberRole: (memberId: string, roleKey: OrganizationRoleKey) =>
     http.put<OrganizationMember>(`/organization/members/${memberId}/role`, { role_key: roleKey }),
-  disableOrganizationMember: (memberId: string) =>
-    http.post<OrganizationMember>(`/organization/members/${memberId}/disable`),
-  resetOrganizationMemberPassword: (memberId: string) =>
-    http.post<AuthMessage>(`/organization/members/${memberId}/reset-password`),
+  removeOrganizationMember: (memberId: string) =>
+    http.post<AuthMessage>(`/organization/members/${memberId}/remove`),
   reinviteOrganizationMember: (memberId: string) =>
     http.post<AuthMessage>(`/organization/members/${memberId}/reinvite`),
 

@@ -2551,6 +2551,27 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         self.assertTrue(parsed["error"]["retryable"])
         self.assertEqual(replayed_results, [tool_result])
 
+    def test_execute_action_has_room_for_complete_bounded_audit_result(self) -> None:
+        action_result = json.dumps(
+            {
+                "status": "success",
+                "result": {"rows": ["x" * 500 for _ in range(20)]},
+            },
+            ensure_ascii=False,
+        )
+        self.assertGreater(len(action_result), agent_engine._MAX_TOOL_RESULT_CHARS)
+        self.assertLess(len(action_result), agent_engine._MAX_ACTION_TOOL_RESULT_CHARS)
+
+        self.assertEqual(
+            agent_engine._bounded_tool_result(
+                action_result,
+                tool_name="execute_action",
+            ),
+            action_result,
+        )
+        generic = json.loads(agent_engine._bounded_tool_result(action_result))
+        self.assertEqual(generic["error"]["code"], "TOOL_RESULT_TOO_LARGE")
+
     def test_run_agent_truth_guard_rejects_delivery_claim_without_tools(self) -> None:
         context = self._context()
         with patch.object(

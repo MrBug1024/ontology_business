@@ -171,6 +171,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Mcp-Session-Id"],
 )
 
 app.include_router(scenarios.router, prefix=settings.api_prefix)

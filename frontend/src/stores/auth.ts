@@ -18,6 +18,21 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  async function refresh() {
+    try {
+      user.value = await api.me()
+    } catch {
+      user.value = null
+    } finally {
+      initialized.value = true
+    }
+  }
+
+  function setUser(nextUser: User) {
+    user.value = nextUser
+    initialized.value = true
+  }
+
   async function login(email: string, password: string) {
     user.value = await api.login({ email, password })
     initialized.value = true
@@ -32,5 +47,5 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  return { user, initialized, initialize, login, logout }
+  return { user, initialized, initialize, refresh, setUser, login, logout }
 })

@@ -86,14 +86,19 @@ python -m pip install -r .\backend\requirements.txt
 # 创建本地配置（首次；不要提交真实密钥）
 Copy-Item .\backend\.env.example .\backend\.env
 
-# 启动后端（默认使用 8001）
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
+# 启动后端（默认使用 8001；命令从仓库根目录执行）
+python -m uvicorn app.main:app --app-dir .\backend --host 127.0.0.1 --port 8001
 ```
 
 > 后端 API 文档：http://127.0.0.1:8001/docs
 
 后端启动前，PostgreSQL 必须已升级到 Alembic head。当前存储边界、首次建库、迁移和回退要求见
 [PostgreSQL / MinIO 通用数据资产架构](./docs/PostgreSQL-MinIO-通用数据资产架构.md)。`init_db()` 只校验迁移版本，不会在生产库隐式建表。
+
+```powershell
+# 每次升级后，在启动 API 前执行（命令从仓库根目录执行）
+python -m alembic -c .\backend\alembic.ini upgrade head
+```
 
 ### 2. 前端（Node.js）
 
@@ -201,6 +206,13 @@ MCP_OPERATION_TIMEOUT_SECONDS=90
 AGENT_MCP_PUBLIC_URL=https://api.example.com/mcp
 AGENT_MCP_ALLOWED_HOSTS=api.example.com
 ```
+
+`invoke_agent.message` 是终端用户消息的透传边界：MCP 宿主应把一条用户消息完整、原样地调用一次，
+不要先改写为检索词或拆成多次工具调用。首次返回会包含 `conversation_id`；同一终端用户会话的后续
+调用（包括“确认执行”等回复）必须回传该值，即使 MCP transport 已重新连接。兼容仍使用
+`Mcp-Session-Id` 的客户端时，客户端也应在同一 transport session 的后续请求中原样续传该响应头。
+公开响应只携带最终答案、续接标识、引用标识和工具执行摘要；完整工具参数与结果保留在平台会话及
+审计记录中，避免大型审计明细在 MCP 的 `content` / `structuredContent` 中重复传输。
 
 请求头和环境变量在 API 中按只写值处理，但当前仓库不内置数据库静态加密或外部 Secret Manager。
 生产部署应启用数据库/磁盘加密并限制备份访问；安全基线要求更高时，应在连接器密钥服务中统一实施信封加密和密钥轮换。

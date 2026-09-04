@@ -360,10 +360,11 @@ class PostgreSQLMigrationContractsTests(unittest.TestCase):
 
     def test_alembic_graph_has_one_postgresql_head(self) -> None:
         revisions = migration_revisions()
-        self.assertEqual(migration_heads(), ("20260903_11",))
+        self.assertEqual(migration_heads(), ("20260904_12",))
         from app.database import POSTGRESQL_SCHEMA_REVISION
 
         self.assertEqual(POSTGRESQL_SCHEMA_REVISION, migration_heads()[0])
+        self.assertEqual(revisions["20260904_12"], "20260903_11")
         self.assertEqual(revisions["20260903_11"], "20260903_10")
         self.assertEqual(revisions["20260903_10"], "20260903_09")
         self.assertEqual(revisions["20260903_09"], "20260903_08")
@@ -453,6 +454,28 @@ class PostgreSQLMigrationContractsTests(unittest.TestCase):
         self.assertIn(
             "CREATE INDEX ix_workflow_runs_agent_conversation_id "
             "ON workflow_runs (agent_conversation_id)",
+            sql,
+        )
+
+    def test_head_migration_adds_cross_workspace_invitation_state(self) -> None:
+        sql = render_postgresql_upgrade("20260904_12")
+        self.assertIn(
+            "ALTER TABLE auth_sessions ADD COLUMN active_tenant_id VARCHAR(32)",
+            sql,
+        )
+        self.assertIn(
+            "ALTER TABLE organization_members ADD COLUMN invited_by_user_id VARCHAR(32)",
+            sql,
+        )
+        self.assertIn("CREATE TABLE organization_invitations", sql)
+        self.assertIn(
+            "CONSTRAINT ck_organization_invitations_status CHECK "
+            "(status IN ('pending', 'accepted', 'declined', 'revoked', 'expired'))",
+            sql,
+        )
+        self.assertIn(
+            "CREATE INDEX ix_organization_invitations_user_status "
+            "ON organization_invitations (user_id, status)",
             sql,
         )
 

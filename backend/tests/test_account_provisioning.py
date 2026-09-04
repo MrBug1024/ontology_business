@@ -25,6 +25,7 @@ from app.schemas import (
     OrganizationInvitationAcceptIn,
     OrganizationInvitationIn,
     OrganizationMemberRoleIn,
+    OrganizationUserCreateIn,
     RegisterIn,
     VerifyEmailIn,
 )
@@ -203,7 +204,43 @@ class AccountProvisioningTests(unittest.TestCase):
         self.assertEqual(invited.status, "active")
         self.assertIsNotNone(invited.email_verified_at)
         self.assertEqual(member.status, "active")
+        self.assertNotEqual(invited.tenant_id, self.tenant.id)
+        home_membership = self.db.scalar(
+            select(OrganizationMember)
+            .join(OrganizationMember.organization)
+            .where(
+                OrganizationMember.user_id == invited.id,
+                OrganizationMember.organization_id != self.organization.id,
+                OrganizationMember.status == "active",
+            )
+        )
+        self.assertIsNotNone(home_membership)
+        assert home_membership is not None
+        self.assertEqual(home_membership.role.key, "owner")
         self.assertTrue(auth_service.verify_password("InvitedPassword123", invited.password_hash))
+
+    def test_workspace_member_api_cannot_manage_platform_accounts(self) -> None:
+        user_count = self.db.scalar(select(func.count()).select_from(User))
+        with self.assertRaises(HTTPException) as raised:
+            organization.create_user(
+                OrganizationUserCreateIn(
+                    email="not-created@example.test",
+                    password="NoAccountManagement123",
+                    password_confirm="NoAccountManagement123",
+                    role_key="operator",
+                ),
+                self.db,
+            )
+        self.assertEqual(raised.exception.status_code, 410)
+
+        with self.assertRaises(HTTPException) as raised:
+            organization.disable_member("any-member", self.db)
+        self.assertEqual(raised.exception.status_code, 410)
+
+        with self.assertRaises(HTTPException) as raised:
+            organization.send_member_password_reset("any-member", self.db)
+        self.assertEqual(raised.exception.status_code, 410)
+        self.assertEqual(self.db.scalar(select(func.count()).select_from(User)), user_count)
 
     def test_wrong_invitation_codes_are_persisted_and_lock_the_challenge(self) -> None:
         delivered: dict[str, str] = {}
@@ -465,18 +502,36 @@ class AccountProvisioningTests(unittest.TestCase):
             permission_service.require_principal(self.db)
         self.assertEqual(raised.exception.status_code, 403)
 
-    def test_owner_disable_uses_organization_guard_and_leaves_an_owner(self) -> None:
-        second_owner = self._add_active_owner("disable-owner@example.test")
+    def test_owner_removal_uses_organization_guard_and_leaves_an_owner(self) -> None:
+        second_owner = self._add_active_owner("remove-owner@example.test")
         original_lock = permission_service.lock_organization_owner_changes
         with patch.object(
             permission_service,
             "lock_organization_owner_changes",
             wraps=original_lock,
         ) as guard:
-            organization.disable_member(second_owner.id, self.db)
+            organization.remove_member(second_owner.id, self.db)
 
         guard.assert_called_once_with(self.db, self.organization.id)
         self.assertEqual(permission_service.owner_count(self.db, self.organization.id), 1)
+        self.db.refresh(second_owner)
+        self.assertEqual(second_owner.status, "removed")
+        removed_user = self.db.get(User, second_owner.user_id)
+        assert removed_user is not None
+        self.assertEqual(removed_user.status, "active")
+        self.assertNotEqual(removed_user.tenant_id, self.tenant.id)
+        home_membership = self.db.scalar(
+            select(OrganizationMember)
+            .join(OrganizationMember.organization)
+            .where(
+                OrganizationMember.user_id == removed_user.id,
+                OrganizationMember.organization_id != self.organization.id,
+                OrganizationMember.status == "active",
+            )
+        )
+        self.assertIsNotNone(home_membership)
+        assert home_membership is not None
+        self.assertEqual(home_membership.role.key, "owner")
 
     def test_mutually_exclusive_smtp_tls_modes_are_rejected_at_configuration_time(self) -> None:
         with self.assertRaises(ValueError):

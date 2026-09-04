@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 import unittest
@@ -58,6 +59,18 @@ def test_mcp_session_mapping_migration_grants_runtime_role() -> None:
     assert "agent_mcp_conversations" in statement
     assert "GRANT SELECT, INSERT, UPDATE, DELETE" in statement
     assert "TO ontology_app" in statement
+
+
+def test_browser_mcp_clients_can_read_session_response_header() -> None:
+    from app.main import app
+
+    cors = next(
+        middleware
+        for middleware in app.user_middleware
+        if middleware.cls.__name__ == "CORSMiddleware"
+    )
+    exposed = {str(value).casefold() for value in cors.kwargs.get("expose_headers", [])}
+    assert "mcp-session-id" in exposed
 
 
 class AgentMCPPublicationTests(unittest.TestCase):
@@ -435,7 +448,62 @@ class AgentMCPPublicationTests(unittest.TestCase):
 
         def invoke(_service_id: str, **kwargs):
             received_session_ids.append(kwargs["external_session_id"])
-            return {"answer": "审计完成", "conversation_id": "conversation-test"}
+            return {
+                "answer": "审计完成",
+                "conversation_id": "conversation-test",
+                "trace_id": "trace-test",
+                "assistant_message_id": "message-test",
+                "citations": [
+                    {
+                        "citation_id": "C1",
+                        "file_id": "file-test",
+                        "filename": "依据.txt",
+                        "text": "不应在公开 MCP 结果中重复的检索正文" * 1_000,
+                    }
+                ],
+                "tool_calls": [{"id": "tool-1", "name": "execute_action"}],
+                "tool_results": [
+                    {
+                        "id": "tool-1",
+                        "name": "execute_action",
+                        "result": json.dumps(
+                            {
+                                "ok": False,
+                                "error": {
+                                    "code": "TOOL_RESULT_TOO_LARGE",
+                                    "message": "结果过大",
+                                    "retryable": True,
+                                },
+                                "internal_rows": ["敏感明细" * 1_000],
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+                "runtime": {"environment": "prod"},
+                "request_id": "request-test",
+                "mcp_service_id": "service-agent-mcp",
+                "mcp_service_name": "医保违规审计助手",
+                "confirmation": {
+                    "status": "confirmed",
+                    "preview_log_id": "preview-test",
+                    "message": "已生成审计文件。",
+                    "response": {
+                        "status": "success",
+                        "log_id": "log-test",
+                        "result": {
+                            "row_count": 20,
+                            "rows": ["不应重复传输的确认结果" * 1_000],
+                            "artifact": {
+                                "id": "artifact-test",
+                                "filename": "审计结果.xlsx",
+                                "format": "xlsx",
+                                "download_url": "/api/files/artifact-test",
+                            },
+                        },
+                    },
+                },
+            }
 
         async def exercise() -> None:
             transport = httpx.ASGITransport(app=agent_mcp_server.mcp_app)
@@ -453,11 +521,68 @@ class AgentMCPPublicationTests(unittest.TestCase):
                             self.assertEqual(initialized.serverInfo.name, "Ontology Platform Agent Gateway")
                             tools = await session.list_tools()
                             self.assertEqual([tool.name for tool in tools.tools], ["invoke_agent"])
+                            invoke_tool = tools.tools[0]
+                            self.assertIn("完整原始消息", invoke_tool.description)
+                            self.assertIn(
+                                "不得摘要、改写",
+                                invoke_tool.inputSchema["properties"]["message"]["description"],
+                            )
+                            self.assertIn(
+                                "后续每次调用必须传入",
+                                invoke_tool.inputSchema["properties"]["conversation_id"]["description"],
+                            )
                             result = await session.call_tool(
                                 "invoke_agent", {"message": "执行医保违规审计"}
                             )
                             self.assertFalse(result.isError)
                             self.assertEqual(result.structuredContent["answer"], "审计完成")
+                            self.assertEqual(result.content[0].text, "审计完成")
+                            continuation = json.loads(result.content[1].text)
+                            self.assertEqual(
+                                continuation["mcp_continuation"]["conversation_id"],
+                                "conversation-test",
+                            )
+                            self.assertNotIn("tool_calls", result.structuredContent)
+                            self.assertNotIn("tool_results", result.structuredContent)
+                            self.assertEqual(
+                                result.structuredContent["continuation"]["conversation_id"],
+                                "conversation-test",
+                            )
+                            self.assertEqual(
+                                result.structuredContent["tool_execution"],
+                                {
+                                    "call_count": 1,
+                                    "result_count": 1,
+                                    "failed_count": 1,
+                                    "failed_tools": [
+                                        {
+                                            "name": "execute_action",
+                                            "count": 1,
+                                            "codes": ["TOOL_RESULT_TOO_LARGE"],
+                                        }
+                                    ],
+                                },
+                            )
+                            self.assertNotIn(
+                                "text", result.structuredContent["citations"][0]
+                            )
+                            confirmation_result = result.structuredContent["confirmation"][
+                                "response"
+                            ]["result"]
+                            self.assertEqual(confirmation_result["row_count"], 20)
+                            self.assertEqual(
+                                confirmation_result["artifact"]["id"], "artifact-test"
+                            )
+                            self.assertNotIn("rows", confirmation_result)
+                            self.assertLess(
+                                len(
+                                    json.dumps(
+                                        result.model_dump(mode="json"),
+                                        ensure_ascii=False,
+                                    ).encode("utf-8")
+                                ),
+                                10_000,
+                            )
                             repeated = await session.call_tool(
                                 "invoke_agent", {"message": "继续审计"}
                             )
@@ -552,6 +677,12 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 conversation_id=None,
                 external_session_id="third-party-session-1",
             )
+            resumed_after_reconnect = agent_mcp_service.invoke_published_agent(
+                "service-session-a",
+                message="重连后的确认回复",
+                conversation_id=first["conversation_id"],
+                external_session_id="third-party-session-2",
+            )
             other_service = agent_mcp_service.invoke_published_agent(
                 "service-session-b",
                 message="隔离会话",
@@ -560,12 +691,22 @@ class AgentMCPPublicationTests(unittest.TestCase):
             )
 
         self.assertEqual(first["conversation_id"], second["conversation_id"])
+        self.assertEqual(
+            first["conversation_id"], resumed_after_reconnect["conversation_id"]
+        )
         self.assertNotEqual(first["conversation_id"], other_service["conversation_id"])
-        self.assertEqual(observed_conversations[:2], [first["conversation_id"], second["conversation_id"]])
+        self.assertEqual(
+            observed_conversations[:3],
+            [
+                first["conversation_id"],
+                second["conversation_id"],
+                resumed_after_reconnect["conversation_id"],
+            ],
+        )
         db = self.Session()
         try:
             mappings = db.execute(select(AgentMCPConversation)).scalars().all()
-            self.assertEqual(len(mappings), 2)
+            self.assertEqual(len(mappings), 3)
             self.assertEqual(
                 {mapping.service_id for mapping in mappings},
                 {"service-session-a", "service-session-b"},
@@ -579,7 +720,7 @@ class AgentMCPPublicationTests(unittest.TestCase):
             )
             self.assertEqual(
                 len(db.execute(select(AgentMCPInvocation)).scalars().all()),
-                3,
+                4,
             )
             self.assertEqual(
                 len(db.execute(select(Conversation)).scalars().all()),

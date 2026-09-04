@@ -20,7 +20,7 @@ def orm_datetime(*, timezone: bool = True):
     return SQLAlchemyDateTime(timezone=timezone)
 
 
-POSTGRESQL_SCHEMA_REVISION = "20260903_11"
+POSTGRESQL_SCHEMA_REVISION = "20260904_12"
 # One PostgreSQL session-level advisory lock is held by the process elected to
 # run durable background work.  The connection closing on a crash releases the
 # lock automatically, so a replacement worker can take over without a stale

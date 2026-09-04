@@ -104,7 +104,14 @@ class User(Base):
     tenant: Mapped[Tenant] = relationship(back_populates="users")
     sessions: Mapped[list["AuthSession"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     organization_memberships: Mapped[list["OrganizationMember"]] = relationship(
-        back_populates="user", cascade="all, delete-orphan"
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="OrganizationMember.user_id",
+    )
+    organization_invitations: Mapped[list["OrganizationInvitation"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="OrganizationInvitation.user_id",
     )
     authorization_grants: Mapped[list["AuthorizationGrant"]] = relationship(
         back_populates="user",
@@ -142,6 +149,9 @@ class Organization(Base):
     grants: Mapped[list["AuthorizationGrant"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
+    invitations: Mapped[list["OrganizationInvitation"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
 
 
 class OrganizationRole(Base):
@@ -168,7 +178,7 @@ class OrganizationRole(Base):
 
 
 class OrganizationMember(Base):
-    """用户在当前租户组织中的唯一成员身份。"""
+    """A user's membership in one workspace, including cross-workspace access."""
 
     __tablename__ = "organization_members"
     __table_args__ = (
@@ -184,6 +194,12 @@ class OrganizationMember(Base):
     role_id: Mapped[str] = mapped_column(
         ForeignKey("organization_roles.id", ondelete="RESTRICT"), index=True
     )
+    # Records the manager who brought this user into the workspace.  It is
+    # intentionally separate from ``created_by_user_id`` audit fields on
+    # resources: removal transfers present ownership while preserving authorship.
+    invited_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     status: Mapped[str] = mapped_column(String(20), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
@@ -191,8 +207,63 @@ class OrganizationMember(Base):
     )
 
     organization: Mapped[Organization] = relationship(back_populates="members")
-    user: Mapped[User] = relationship(back_populates="organization_memberships")
+    user: Mapped[User] = relationship(
+        back_populates="organization_memberships", foreign_keys=[user_id]
+    )
     role: Mapped[OrganizationRole] = relationship(back_populates="members")
+    invited_by_user: Mapped[User | None] = relationship(
+        foreign_keys=[invited_by_user_id]
+    )
+    invitations: Mapped[list["OrganizationInvitation"]] = relationship(
+        back_populates="member", cascade="all, delete-orphan"
+    )
+
+
+class OrganizationInvitation(Base):
+    """A time-boxed invitation for a registered or provisioned user.
+
+    Membership remains the authorization source of truth.  This record keeps
+    the invitation lifecycle, expiry and issuer separate from the target
+    account, allowing a user to retain their own home workspace and data.
+    """
+
+    __tablename__ = "organization_invitations"
+    __table_args__ = (
+        Index("ix_organization_invitations_user_status", "user_id", "status"),
+        Index("ix_organization_invitations_member_status", "member_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), index=True
+    )
+    member_id: Mapped[str] = mapped_column(
+        ForeignKey("organization_members.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    invited_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    organization: Mapped[Organization] = relationship(back_populates="invitations")
+    member: Mapped[OrganizationMember] = relationship(back_populates="invitations")
+    user: Mapped[User] = relationship(
+        back_populates="organization_invitations", foreign_keys=[user_id]
+    )
+    invited_by_user: Mapped[User | None] = relationship(
+        foreign_keys=[invited_by_user_id]
+    )
 
 
 class AuthorizationGrant(Base):
@@ -244,6 +315,12 @@ class AuthSession(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # A user can be a member of several workspaces.  Their account's tenant is
+    # still the home workspace; this nullable pointer selects the active one
+    # for an individual session and falls back to the home tenant for old rows.
+    active_tenant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

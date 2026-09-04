@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 
@@ -162,7 +162,12 @@ class Settings(BaseSettings):
     auth_cookie_secure: bool = False
     auth_session_days: int = 7
     verification_code_minutes: int = 10
-    invitation_code_minutes: int = Field(default=7 * 24 * 60, ge=10, le=30 * 24 * 60)
+    # Keep accepting the former configurable environment variable so an
+    # existing deployment can boot after upgrade.  Its value is normalized
+    # below: workspace invitations are always valid for exactly 24 hours.
+    invitation_code_minutes: int = Field(
+        default=24 * 60, ge=1, le=30 * 24 * 60
+    )
     # A six-digit email code remains compatible with the existing clients, so
     # failed guesses must be durably bounded across resend attempts.
     verification_code_max_attempts: int = Field(default=5, ge=1, le=20)
@@ -176,6 +181,12 @@ class Settings(BaseSettings):
     mail_ssl_tls: bool = True
     mail_use_credentials: bool = True
     mail_timeout_seconds: int = 20
+
+    @field_validator("invitation_code_minutes")
+    @classmethod
+    def normalize_workspace_invitation_lifetime(cls, _: int) -> int:
+        """Preserve the fixed 24-hour invitation contract across upgrades."""
+        return 24 * 60
 
     @model_validator(mode="after")
     def resolve_database_url(self) -> "Settings":

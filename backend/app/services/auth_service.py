@@ -14,7 +14,7 @@ from email.utils import formataddr
 from typing import Generator
 
 from fastapi import Depends, HTTPException, Request, Response, status
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
@@ -27,8 +27,10 @@ from ..models import (
     EmailVerificationCode,
     LLMConfig,
     MCPConfig,
+    OrganizationInvitation,
     User,
 )
+from ..schemas import OrganizationWorkspaceOut, UserOut
 from . import permission_service
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -84,19 +86,37 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def _mail_message(email: str, code: str, purpose: str) -> EmailMessage:
+def _mail_message(
+    email: str,
+    code: str,
+    purpose: str,
+    *,
+    workspace_name: str = "",
+    inviter_name: str = "",
+    expires_minutes: int | None = None,
+) -> EmailMessage:
     settings = get_settings()
     subject = "本体智能平台邮箱验证码"
     action = {
         "register": "完成注册",
         "invite": "接受工作区邀请",
+        "workspace_invite": "接受工作区邀请",
         "password_reset": "重置密码",
     }.get(purpose, "完成安全验证")
-    expires_minutes = (
+    valid_for_minutes = (
         settings.invitation_code_minutes
-        if purpose == "invite"
+        if purpose in {"invite", "workspace_invite"}
         else settings.verification_code_minutes
     )
+    if expires_minutes is not None:
+        valid_for_minutes = int(expires_minutes)
+    workspace_copy = ""
+    if workspace_name:
+        sender_name = inviter_name or "工作区管理员"
+        workspace_copy = (
+            f"\n邀请人：{sender_name}\n工作区：{workspace_name}\n"
+            "登录平台后可在“工作区邀请”中直接同意，不会修改你的账户密码或原工作区数据。\n"
+        )
     sender = settings.mail_from.strip() or settings.mail_username.strip()
     message = EmailMessage()
     message["Subject"] = subject
@@ -104,26 +124,49 @@ def _mail_message(email: str, code: str, purpose: str) -> EmailMessage:
     message["To"] = email
     message.set_content(
         f"您好，您正在使用本体智能平台{action}。\n\n"
-        f"验证码：{code}\n\n验证码有效期为 {expires_minutes} 分钟。"
+        f"验证码：{code}\n{workspace_copy}\n验证码有效期为 {valid_for_minutes} 分钟。"
         "如果这不是您的操作，请忽略此邮件。"
     )
+    workspace_html = ""
+    if workspace_name:
+        workspace_html = (
+            f"<p>邀请人：{html.escape(inviter_name or '工作区管理员')}<br>"
+            f"工作区：{html.escape(workspace_name)}<br>"
+            "登录平台后可在“工作区邀请”中直接同意，不会修改你的账户密码或原工作区数据。</p>"
+        )
     message.add_alternative(
         "<div style=\"font-family:Arial,'Microsoft YaHei',sans-serif;color:#24333c;line-height:1.6\">"
         "<h2 style=\"margin:0 0 16px\">本体智能平台</h2>"
         f"<p>你的验证码是：</p><p style=\"font-size:28px;font-weight:700;letter-spacing:6px\">{html.escape(code)}</p>"
-        f"<p>验证码 {expires_minutes} 分钟内有效。如果不是你本人操作，请忽略此邮件。</p>"
+        f"{workspace_html}"
+        f"<p>验证码 {valid_for_minutes} 分钟内有效。如果不是你本人操作，请忽略此邮件。</p>"
         "</div>",
         subtype="html",
     )
     return message
 
 
-def send_verification_email(email: str, code: str, purpose: str) -> None:
+def send_verification_email(
+    email: str,
+    code: str,
+    purpose: str,
+    *,
+    workspace_name: str = "",
+    inviter_name: str = "",
+    expires_minutes: int | None = None,
+) -> None:
     settings = get_settings()
     sender = settings.mail_from.strip() or settings.mail_username.strip()
     if not settings.mail_server.strip() or not sender:
         raise MailConfigurationError("邮件服务未配置")
-    message = _mail_message(email, code, purpose)
+    message = _mail_message(
+        email,
+        code,
+        purpose,
+        workspace_name=workspace_name,
+        inviter_name=inviter_name,
+        expires_minutes=expires_minutes,
+    )
     context = ssl.create_default_context()
     timeout = max(3, settings.mail_timeout_seconds)
     if settings.mail_ssl_tls:
@@ -141,6 +184,33 @@ def send_verification_email(email: str, code: str, purpose: str) -> None:
             smtp.starttls(context=context)
             smtp.ehlo()
         _authenticate_and_send(smtp, sender, email, message, settings)
+
+
+def issue_workspace_invitation_code() -> str:
+    """Create the code delivered with an in-product workspace invitation."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def hash_workspace_invitation_code(code: str) -> str:
+    return _hash_code(code)
+
+
+def send_workspace_invitation_email(
+    email: str,
+    code: str,
+    *,
+    workspace_name: str,
+    inviter_name: str,
+) -> None:
+    """Send a registered user a 24-hour workspace invitation code."""
+    send_verification_email(
+        email,
+        code,
+        "workspace_invite",
+        workspace_name=workspace_name,
+        inviter_name=inviter_name,
+        expires_minutes=24 * 60,
+    )
 
 
 def _authenticate_and_send(
@@ -306,25 +376,57 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     ).scalars().first()
     if not session or not session.user or session.user.status != "active":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已失效，请重新登录")
-    request.state.user_id = session.user.id
-    request.state.tenant_id = session.user.tenant_id
-    db.info["user_id"] = session.user.id
-    db.info["tenant_id"] = session.user.tenant_id
+    user = session.user
+    active_tenant_id = str(session.active_tenant_id or user.tenant_id or "").strip()
+    if not active_tenant_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="当前用户没有可用工作区")
+    request.state.user_id = user.id
+    request.state.auth_session_id = session.id
+    request.state.tenant_id = active_tenant_id
+    db.info["user_id"] = user.id
+    db.info["tenant_id"] = active_tenant_id
     # 仅初始化尚不存在的组织及其历史成员；绝不因一次登录把已被管理员移除的
     # 用户重新补成 admin。缺失成员身份会在权限校验时保持拒绝，直到管理员显式添加。
-    permission_service.ensure_organization(db, session.user.tenant_id)
-    if not permission_service.ensure_user_membership(db, session.user):
-        db.commit()
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="当前用户没有有效组织成员身份")
+    permission_service.ensure_organization(db, user.tenant_id)
+    if not permission_service.ensure_user_membership(
+        db, user, tenant_id=active_tenant_id
+    ):
+        # A manager may remove a collaborator while that collaborator is still
+        # browsing the shared workspace.  Fall back to the user's home
+        # workspace on the next request rather than leaving the session pointed
+        # at a workspace it can no longer enter.
+        home_tenant_id = str(user.tenant_id or "").strip()
+        can_fall_back = (
+            active_tenant_id != home_tenant_id
+            and home_tenant_id
+            and permission_service.ensure_user_membership(
+                db, user, tenant_id=home_tenant_id
+            )
+        )
+        if not can_fall_back:
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="当前用户没有有效组织成员身份",
+            )
+        session.active_tenant_id = home_tenant_id
+        active_tenant_id = home_tenant_id
+        request.state.tenant_id = active_tenant_id
+        db.info["tenant_id"] = active_tenant_id
     db.commit()
-    return session.user
+    return user
 
 
-def get_tenant_db(user: User = Depends(get_current_user)) -> Generator[Session, None, None]:
+def get_tenant_db(
+    request: Request,
+    user: User = Depends(get_current_user),
+) -> Generator[Session, None, None]:
     """受保护路由使用的数据库会话，同时携带当前用户与租户上下文。"""
     db = SessionLocal()
     db.info["user_id"] = user.id
-    db.info["tenant_id"] = user.tenant_id
+    db.info["tenant_id"] = str(
+        getattr(request.state, "tenant_id", "") or user.tenant_id
+    )
     try:
         yield db
     finally:
@@ -338,11 +440,104 @@ def tenant_id(db: Session) -> str:
     return str(value)
 
 
+def set_session_active_tenant(
+    request: Request,
+    db: Session,
+    *,
+    user_id: str,
+    tenant_id: str,
+) -> None:
+    """Persist a verified workspace selection on the current browser session."""
+    session_id = str(getattr(request.state, "auth_session_id", "") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=401, detail="当前登录会话不可用")
+    session = db.execute(
+        select(AuthSession)
+        .where(AuthSession.id == session_id, AuthSession.user_id == user_id)
+        .with_for_update()
+    ).scalars().first()
+    if not session:
+        raise HTTPException(status_code=401, detail="当前登录会话不可用")
+    session.active_tenant_id = tenant_id
+    request.state.tenant_id = tenant_id
+    db.info["tenant_id"] = tenant_id
+
+
+def build_user_out(
+    db: Session,
+    user: User,
+    *,
+    active_tenant_id: str | None = None,
+) -> UserOut:
+    """Build the account payload against the session's active workspace."""
+    selected_tenant_id = str(
+        active_tenant_id or db.info.get("tenant_id") or user.tenant_id or ""
+    ).strip()
+    prior_tenant_id = db.info.get("tenant_id")
+    prior_user_id = db.info.get("user_id")
+    db.info["tenant_id"] = selected_tenant_id
+    db.info["user_id"] = user.id
+    try:
+        memberships = permission_service.active_workspace_memberships(db, user.id)
+        workspaces = [
+            OrganizationWorkspaceOut(
+                organization_id=member.organization_id,
+                tenant_id=str(member.organization.tenant_id),
+                name=member.organization.name or "",
+                role_key=str(member.role.key),
+                role_name=member.role.name or "",
+                is_active=str(member.organization.tenant_id) == selected_tenant_id,
+            )
+            for member in memberships
+            if member.organization and member.role
+        ]
+        active_workspace = next(
+            (workspace for workspace in workspaces if workspace.is_active), None
+        )
+        pending_invitation_count = int(
+            db.scalar(
+                select(func.count())
+                .select_from(OrganizationInvitation)
+                .where(
+                    OrganizationInvitation.user_id == user.id,
+                    OrganizationInvitation.status == "pending",
+                    OrganizationInvitation.expires_at > utc_now(),
+                )
+            )
+            or 0
+        )
+        can_manage = bool(
+            active_workspace
+            and permission_service.check_tenant_permission(db, "manage").allowed
+        )
+        return UserOut(
+            id=user.id,
+            email=user.email,
+            display_name=user.display_name,
+            tenant_id=selected_tenant_id,
+            email_verified=bool(user.email_verified_at),
+            can_manage=can_manage,
+            active_workspace=active_workspace,
+            workspaces=workspaces,
+            pending_invitation_count=pending_invitation_count,
+        )
+    finally:
+        if prior_tenant_id is None:
+            db.info.pop("tenant_id", None)
+        else:
+            db.info["tenant_id"] = prior_tenant_id
+        if prior_user_id is None:
+            db.info.pop("user_id", None)
+        else:
+            db.info["user_id"] = prior_user_id
+
+
 def set_session_cookie(response: Response, user: User, db: Session) -> None:
     token = secrets.token_urlsafe(48)
     db.add(
         AuthSession(
             user_id=user.id,
+            active_tenant_id=user.tenant_id,
             token_hash=_token_hash(token),
             expires_at=utc_now() + timedelta(days=get_settings().auth_session_days),
         )

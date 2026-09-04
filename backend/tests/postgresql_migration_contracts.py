@@ -21,6 +21,7 @@ _MIGRATION_MODULES = {
     "20260903_09": "migrations.versions.20260903_09_persist_agent_mcp_session_conversations",
     "20260903_10": "migrations.versions.20260903_10_serialize_agent_mcp_session_turns",
     "20260903_11": "migrations.versions.20260903_11_bind_agent_workflow_runs_to_conversations",
+    "20260904_12": "migrations.versions.20260904_12_add_cross_workspace_invitations",
 }
 
 

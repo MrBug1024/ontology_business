@@ -12,12 +12,14 @@ import hashlib
 from typing import Generator, Iterable
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select, text
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     AuthorizationGrant,
+    Agent,
     BusinessScenario,
+    DataSource,
     OntologyAction,
     OntologyEntity,
     OntologyInstance,
@@ -128,8 +130,11 @@ def _resolve_principal(db: Session) -> tuple[Principal | None, str, int]:
     # wait.  Refresh the user as well as its membership so a concurrently
     # disabled actor cannot keep using its pre-wait active status.
     user = db.get(User, user_id, populate_existing=True)
-    if not user or user.status != "active" or user.tenant_id != tenant_id:
-        result = (None, "当前用户不属于请求租户或已失效", 403)
+    # A registered user may join another organization's workspace without
+    # moving their home tenant.  The active membership below, rather than the
+    # account's home tenant, is the authorization boundary for this request.
+    if not user or user.status != "active":
+        result = (None, "当前用户已失效", 403)
         cache[principal_key] = result
         return result
 
@@ -571,13 +576,21 @@ def ensure_organization(
     return organization
 
 
-def ensure_user_membership(db: Session, user: User) -> bool:
-    """返回用户是否已有有效成员身份，不在登录时隐式恢复被移除成员。"""
+def ensure_user_membership(
+    db: Session,
+    user: User,
+    *,
+    tenant_id: str | None = None,
+) -> bool:
+    """Check an active membership without restoring a removed user implicitly."""
+    target_tenant_id = str(tenant_id or user.tenant_id or "").strip()
+    if not target_tenant_id:
+        return False
     existing = db.execute(
         select(OrganizationMember)
         .join(OrganizationMember.organization)
         .where(
-            Organization.tenant_id == user.tenant_id,
+            Organization.tenant_id == target_tenant_id,
             OrganizationMember.user_id == user.id,
         )
         .limit(1)
@@ -625,8 +638,8 @@ def assign_member_role(
     role_key: str,
 ) -> OrganizationMember:
     user = db.get(User, user_id)
-    if not user or user.tenant_id != organization.tenant_id:
-        raise HTTPException(status_code=403, detail="不能向组织添加其他租户的用户")
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
     role = role_for_organization(db, organization.id, role_key)
     # Keep service callers on the same critical section as the HTTP endpoints.
     # This helper is also used by administrative/bootstrap integrations and
@@ -634,7 +647,12 @@ def assign_member_role(
     lock_organization_owner_changes(db, organization.id)
     member = db.execute(
         select(OrganizationMember)
-        .options(joinedload(OrganizationMember.role), joinedload(OrganizationMember.user))
+        .options(
+            joinedload(OrganizationMember.role),
+            joinedload(OrganizationMember.user),
+            joinedload(OrganizationMember.organization),
+            joinedload(OrganizationMember.invited_by_user),
+        )
         .where(
             OrganizationMember.organization_id == organization.id,
             OrganizationMember.user_id == user_id,
@@ -664,6 +682,58 @@ def assign_member_role(
         db.add(member)
     db.flush()
     return member
+
+
+def active_workspace_memberships(
+    db: Session,
+    user_id: str,
+) -> list[OrganizationMember]:
+    """Return every active workspace a user may switch into."""
+    return list(
+        db.execute(
+            select(OrganizationMember)
+            .join(OrganizationMember.organization)
+            .options(
+                joinedload(OrganizationMember.organization),
+                joinedload(OrganizationMember.role),
+            )
+            .where(
+                OrganizationMember.user_id == user_id,
+                OrganizationMember.status == "active",
+            )
+            .order_by(Organization.created_at.asc(), Organization.id.asc())
+        ).scalars().all()
+    )
+
+
+def transfer_workspace_resource_ownership(
+    db: Session,
+    *,
+    tenant_id: str,
+    from_user_id: str,
+    to_user_id: str,
+) -> int:
+    """Transfer the removable member's shared-workspace resource ownership.
+
+    ``created_by_user_id`` remains untouched as immutable authorship audit
+    data.  Only the explicit owner pointer of collaborative resources moves to
+    the inviter, so private conversations and personal workspace data remain
+    with the removed account.
+    """
+    if not from_user_id or not to_user_id or from_user_id == to_user_id:
+        return 0
+    transferred = 0
+    for model in (BusinessScenario, DataSource, Agent):
+        result = db.execute(
+            update(model)
+            .where(
+                model.tenant_id == tenant_id,
+                model.owner_user_id == from_user_id,
+            )
+            .values(owner_user_id=to_user_id)
+        )
+        transferred += max(0, int(result.rowcount or 0))
+    return transferred
 
 
 def owner_count(db: Session, organization_id: str) -> int:
