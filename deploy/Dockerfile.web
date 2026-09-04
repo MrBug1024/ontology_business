@@ -7,10 +7,10 @@ RUN npm ci
 
 COPY frontend/ ./
 
-# Browser clients use one same-origin API path.  Coolify routes the public
-# hostname directly to the Vite preview server; no development proxy is baked
-# into the frontend bundle.
-ARG VITE_API_BASE_URL=/api
+# The frontend is served directly by Vite preview; there is no Nginx reverse
+# proxy in this deployment. Set this to the public API URL in Coolify when the
+# API and frontend use different hostnames.
+ARG VITE_API_BASE_URL=https://ontology-api.rhzy.ai/api
 ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
 RUN npm run build
 
@@ -21,6 +21,9 @@ COPY --from=build /app/frontend/package.json /app/frontend/package-lock.json ./
 RUN apk add --no-cache curl
 COPY --from=build /app/frontend/node_modules ./node_modules
 COPY --from=build /app/frontend/dist ./dist
+# vite preview reads preview.allowedHosts at runtime, so retain the config in
+# the runtime image rather than only using it during the build.
+COPY --from=build /app/frontend/vite.config.ts ./vite.config.ts
 
 # Coolify's HTTP router targets this port.  Vite preview serves the built SPA
 # and binds on all interfaces inside the container.
