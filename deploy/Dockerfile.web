@@ -19,7 +19,7 @@ FROM node:22-alpine
 WORKDIR /app/frontend
 COPY --from=build /app/frontend/package.json /app/frontend/package-lock.json ./
 RUN apk add --no-cache curl
-RUN npm ci
+COPY --from=build /app/frontend/node_modules ./node_modules
 COPY --from=build /app/frontend/dist ./dist
 
 # Coolify's HTTP router targets this port.  Vite preview serves the built SPA
