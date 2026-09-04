@@ -5,7 +5,7 @@ import { fileURLToPath, URL } from 'node:url'
 export default defineConfig(({ mode }) => {
   // Vite does not automatically expose .env values while evaluating this
   // config file. Loading them here makes VITE_API_PROXY_TARGET work for local
-  // development and preview; production uses Nginx rather than Vite preview.
+  // development. Production uses the built-in API base URL from the bundle.
   const env = loadEnv(mode, process.cwd(), '')
   const apiTarget = process.env.VITE_API_PROXY_TARGET
     || env.VITE_API_PROXY_TARGET
@@ -17,6 +17,9 @@ export default defineConfig(({ mode }) => {
       alias: {
         '@': fileURLToPath(new URL('./src', import.meta.url)),
       },
+    },
+    preview: {
+      allowedHosts: ['ontology.rhzy.ai'],
     },
     server: {
       port: 5173,
