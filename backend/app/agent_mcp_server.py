@@ -6,13 +6,14 @@ import contextvars
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from typing import Annotated, Any
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import Annotations, CallToolResult, TextContent
+from mcp.types import CallToolResult, TextContent
 from pydantic import Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -26,9 +27,19 @@ _authenticated_service = contextvars.ContextVar[str | None](
 _authenticated_external_session = contextvars.ContextVar[str | None](
     "authenticated_agent_mcp_external_session", default=None
 )
+_negotiated_protocol_version = contextvars.ContextVar[str](
+    "agent_mcp_protocol_version", default=""
+)
 _MCP_SESSION_ID_HEADER = b"mcp-session-id"
 _MAX_EXTERNAL_SESSION_ID_LENGTH = 128
 _MCP_SESSION_VERSION = "mcp1"
+
+
+def _supports_structured_tool_results(protocol_version: str) -> bool:
+    """Structured tool results entered the MCP schema in the 2025-06 release."""
+    return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", protocol_version)) and (
+        protocol_version >= "2025-06-18"
+    )
 
 
 def _parsed_tool_payload(value: Any) -> dict[str, Any] | None:
@@ -261,9 +272,13 @@ class AgentMCPBearerMiddleware:
 
         token = _authenticated_service.set(authenticated.service_id)
         session_token = _authenticated_external_session.set(external_session_id)
+        protocol_token = _negotiated_protocol_version.set(
+            headers.get("mcp-protocol-version", "").strip()
+        )
         try:
             await self.app(scope, receive, send_with_session)
         finally:
+            _negotiated_protocol_version.reset(protocol_token)
             _authenticated_external_session.reset(session_token)
             _authenticated_service.reset(token)
 
@@ -343,13 +358,12 @@ mcp_server = FastMCP(
 
 @mcp_server.tool(
     name="invoke_agent",
-    title="调用已发布 Agent",
     description=(
         "调用平台中已发布的完整 Agent。message 必须包含用户本轮完整请求，不要改写成关键词、"
         "规则检索或执行计划，也不要拆成多个工具调用。平台会在内部完成查询、推理和操作；"
         "外部只需调用本工具。首次调用不传 conversation_id，继续同一对话时原样传回上次返回值。"
     ),
-    structured_output=True,
+    structured_output=False,
 )
 async def invoke_agent(
     ctx: Context,
@@ -379,14 +393,13 @@ async def invoke_agent(
             ),
         ),
     ] = None,
-) -> dict[str, Any]:
+) -> CallToolResult:
     service_id = _authenticated_service.get()
     external_session_id = _authenticated_external_session.get()
     if not service_id:
         raise agent_mcp_service.AgentMCPError("Agent MCP 身份上下文不存在")
     if not external_session_id:
         raise agent_mcp_service.AgentMCPError("Agent MCP 会话上下文不存在")
-    await ctx.info("已接收请求，正在调用绑定的 Agent。")
     result = await asyncio.to_thread(
         agent_mcp_service.invoke_published_agent,
         service_id,
@@ -396,7 +409,6 @@ async def invoke_agent(
         external_request_id=ctx.request_id,
         input_source="tool_argument",
     )
-    await ctx.info("Agent 调用完成。")
     public_result = _public_agent_result(result)
     request_receipt = {
         "source": "tool_argument",
@@ -405,28 +417,36 @@ async def invoke_agent(
     }
     if "input_receipt" not in public_result:
         public_result["input_receipt"] = request_receipt
-    continuation_text = json.dumps(
+    answer = str(public_result.get("answer", "") or "")
+    metadata_result = {
+        key: value for key, value in public_result.items() if key != "answer"
+    }
+    metadata_text = json.dumps(
         {
-            "mcp_continuation": public_result["continuation"],
-            "input_receipt": public_result["input_receipt"],
+            "mcp_result": metadata_result,
+            # Retain the original text envelope for already-integrated clients.
+            "mcp_continuation": metadata_result["continuation"],
+            "input_receipt": metadata_result["input_receipt"],
         },
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    result_kwargs: dict[str, Any] = {}
+    if _supports_structured_tool_results(_negotiated_protocol_version.get()):
+        result_kwargs["structuredContent"] = public_result
     return CallToolResult(
         content=[
             TextContent(
                 type="text",
-                text=public_result["answer"] or "Agent 调用完成，但没有返回文本答案。",
+                text=answer or "Agent 调用完成，但没有返回文本答案。",
             ),
             TextContent(
                 type="text",
-                text=continuation_text,
-                annotations=Annotations(audience=["assistant"], priority=1.0),
+                text=metadata_text,
             ),
         ],
-        structuredContent=public_result,
         isError=False,
+        **result_kwargs,
     )
 
 

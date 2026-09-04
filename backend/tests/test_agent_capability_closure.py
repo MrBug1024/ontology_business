@@ -2572,6 +2572,568 @@ class AgentCapabilityClosureTests(unittest.TestCase):
         generic = json.loads(agent_engine._bounded_tool_result(action_result))
         self.assertEqual(generic["error"]["code"], "TOOL_RESULT_TOO_LARGE")
 
+    def test_published_mcp_returns_complete_action_table_without_a_summary_round(
+        self,
+    ) -> None:
+        action = self.db.get(OntologyAction, "action-mark-risk")
+        assert action is not None
+        action.name = "执行医疗收费只读审计"
+        action.description = "通用只读审计算子，按机构和项目返回候选证据。"
+        action.requires_confirmation = False
+        action.input_schema = _schema(
+            {
+                "hospital_name": {
+                    "type": "string",
+                    "description": "医疗机构：精确匹配的机构名称",
+                },
+                "item_keyword": {
+                    "type": "string",
+                    "description": "收费项目：待核查的项目关键词",
+                },
+                "quantity_threshold": {
+                    "type": "string",
+                    "description": "数量阈值：明细数量必须严格大于该值",
+                },
+            },
+            ["hospital_name", "item_keyword", "quantity_threshold"],
+        )
+        action.executor_config = {
+            "data_source_id": "source-projects",
+            "sql": (
+                "SELECT {hospital_name} AS hospital_name, "
+                "{item_keyword} AS item_keyword, "
+                "{quantity_threshold} AS quantity_threshold"
+            ),
+        }
+        self.scenario.namespace = "medical_audit"
+        self.db.commit()
+        context = self._context()
+        action_result = json.dumps(
+            {
+                "status": "success",
+                "result": {
+                    "columns": [
+                        "审计算子",
+                        "判定口径",
+                        "违规标记",
+                        "医疗机构名称",
+                        "收费项目名称",
+                        "就诊编号",
+                        "违规金额",
+                        "审计依据",
+                    ],
+                    "rows": [
+                        [
+                            "收费数量阈值",
+                            "数量大于两次",
+                            "疑似违规（待复核）",
+                            "贵阳泰康乐综合医院",
+                            "刮痧治疗",
+                            "JZ-001",
+                            12.5,
+                            "按机构、项目及数量筛选",
+                        ],
+                        [
+                            "收费数量阈值",
+                            "数量大于两次",
+                            "疑似违规（待复核）",
+                            "贵阳泰康乐综合医院",
+                            "刮痧治疗",
+                            "JZ-002",
+                            18.0,
+                            "按机构、项目及数量筛选",
+                        ],
+                    ],
+                    "row_count": 2,
+                    "truncated": False,
+                },
+            },
+            ensure_ascii=False,
+        )
+        model_call_count = 0
+
+        def fake_chat_stream(_llm, _messages, **_kwargs):
+            nonlocal model_call_count
+            model_call_count += 1
+            if model_call_count > 1:
+                raise AssertionError("完整 Action 结果后不应再调用模型总结")
+            return iter(
+                [
+                    {
+                        "type": "tool_calls",
+                        "tool_calls": [
+                            {
+                                "id": "audit-action-1",
+                                "function": {
+                                    "name": "execute_action",
+                                    "arguments": {
+                                        "action_id": "action-mark-risk",
+                                        "params": {
+                                            "hospital_name": "贵阳泰康乐综合医院",
+                                            "item_keyword": "刮痧",
+                                            "quantity_threshold": "2",
+                                        },
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ]
+            )
+
+        self.db.info["agent_mcp_deterministic_action_result"] = True
+        try:
+            with (
+                patch.object(context, "execute_tool", return_value=action_result),
+                patch.object(
+                    context,
+                    "_medical_facility_names_in_message",
+                    return_value=["贵阳泰康乐综合医院"],
+                ),
+                patch.object(
+                    agent_engine.llm_service,
+                    "chat_stream",
+                    side_effect=fake_chat_stream,
+                ),
+            ):
+                events = list(
+                    agent_engine.run_agent(
+                        self.db,
+                        self.agent,
+                        LLMConfig(name="工具模型"),
+                        [],
+                        "审计贵阳泰康乐综合医院刮痧治疗收费大于两次的全部违规数据",
+                        self.scenario.name,
+                        "",
+                        runtime_context=context,
+                    )
+                )
+        finally:
+            self.db.info.pop("agent_mcp_deterministic_action_result", None)
+
+        self.assertEqual(model_call_count, 1)
+        self.assertEqual(events[-1]["type"], "done")
+        answer = events[-1]["data"]
+        self.assertIn("共返回 2 条候选明细", answer)
+        self.assertIn("执行医疗收费只读审计", answer)
+        # Once in the explicit execution scope and once in the de-duplicated
+        # fixed fields, rather than once per returned row.
+        self.assertEqual(answer.count("贵阳泰康乐综合医院"), 2)
+        self.assertEqual(answer.count("刮痧治疗"), 1)
+        self.assertEqual(answer.count("刮痧"), 2)
+        self.assertEqual(answer.count("疑似违规（待复核）"), 1)
+        self.assertIn("JZ-001", answer)
+        self.assertIn("JZ-002", answer)
+        self.assertIn("12.5", answer)
+        self.assertIn("18.0", answer)
+        self.assertNotIn("execute_action", answer)
+
+    def test_terminal_action_parameters_are_bound_to_original_semantic_slots(
+        self,
+    ) -> None:
+        hospital = "贵阳泰康乐综合医院"
+        threshold_message = (
+            "审计 贵阳泰康乐综合医院 刮痧治疗收费大于两次 的全部违规数据"
+        )
+        self.assertTrue(
+            agent_engine._terminal_action_params_match_user(
+                "charge_threshold",
+                {
+                    "hospital_name": hospital,
+                    "item_keyword": "刮痧",
+                    "quantity_threshold": "2",
+                },
+                user_message=threshold_message,
+            )
+        )
+        self.assertFalse(
+            agent_engine._terminal_action_params_match_user(
+                "charge_threshold",
+                {
+                    "hospital_name": hospital,
+                    "item_keyword": "刮痧",
+                    "quantity_threshold": "2",
+                },
+                user_message=(
+                    "审计贵阳泰康乐综合医院刮痧治疗收费大于三次，患者年龄两岁"
+                ),
+            )
+        )
+        self.assertFalse(
+            agent_engine._terminal_action_params_match_user(
+                "charge_threshold",
+                {
+                    "hospital_name": hospital,
+                    "item_keyword": "刮",
+                    "quantity_threshold": "2",
+                },
+                user_message=threshold_message,
+            )
+        )
+        self.assertFalse(
+            agent_engine._terminal_action_params_match_user(
+                "charge_threshold",
+                {
+                    "hospital_name": hospital,
+                    "item_keyword": "刮痧",
+                    "quantity_threshold": "2",
+                },
+                user_message=(
+                    "先查询患者年龄分布，再审计贵阳泰康乐综合医院"
+                    "刮痧治疗收费大于两次"
+                ),
+            )
+        )
+
+        duplicate_message = (
+            "审计贵阳泰康乐综合医院开展电子结肠镜检查，"
+            "重复收取电子乙状结肠镜检查费用的全部违规数据"
+        )
+        duplicate_params = {
+            "hospital_name": hospital,
+            "primary_item_keyword": "电子结肠镜检查",
+            "secondary_item_keywords": "电子乙状结肠镜检查",
+        }
+        self.assertTrue(
+            agent_engine._terminal_action_params_match_user(
+                "included_service_duplicate",
+                duplicate_params,
+                user_message=duplicate_message,
+            )
+        )
+        self.assertFalse(
+            agent_engine._terminal_action_params_match_user(
+                "included_service_duplicate",
+                {
+                    **duplicate_params,
+                    "primary_item_keyword": duplicate_params[
+                        "secondary_item_keywords"
+                    ],
+                    "secondary_item_keywords": duplicate_params[
+                        "primary_item_keyword"
+                    ],
+                },
+                user_message=duplicate_message,
+            )
+        )
+        self.assertTrue(
+            agent_engine._terminal_result_scope_matches_user(
+                "charge_threshold",
+                {
+                    "hospital_name": hospital,
+                    "item_keyword": "刮痧",
+                    "quantity_threshold": "2",
+                },
+                ["收费项目名称"],
+                [["刮痧治疗"]],
+                user_message=threshold_message,
+            )
+        )
+        self.assertFalse(
+            agent_engine._terminal_result_scope_matches_user(
+                "charge_threshold",
+                {
+                    "hospital_name": hospital,
+                    "item_keyword": "刮痧",
+                    "quantity_threshold": "2",
+                },
+                ["收费项目名称"],
+                [["治疗"]],
+                user_message=threshold_message,
+            )
+        )
+        self.assertFalse(
+            agent_engine._terminal_result_scope_matches_user(
+                "daily_overstay",
+                {"hospital_name": hospital, "item_keywords": "床位费"},
+                ["收费项目名称"],
+                [["护理费"]],
+                user_message="审计贵阳泰康乐综合医院床位费日计价超过住院天数",
+            )
+        )
+
+    def test_terminal_action_shortcut_rejects_composite_delivery_intent(self) -> None:
+        self.assertEqual(
+            agent_engine._requested_medical_strategies(
+                "审计某医院刮痧收费大于两次并检查重复收费"
+            ),
+            {"charge_threshold", "included_service_duplicate"},
+        )
+        self.assertEqual(
+            agent_engine._requested_medical_strategies(
+                "审计某医院床位费日计价数量超过住院天数"
+            ),
+            {"daily_overstay"},
+        )
+        self.assertEqual(
+            agent_engine._requested_medical_strategies(
+                "审计某医院床位费日计价超过住院天数，"
+                "并审计刮痧治疗收费大于两次"
+            ),
+            {"daily_overstay", "charge_threshold"},
+        )
+        self.assertTrue(agent_engine._has_delivery_intent("审计后生成审计报告"))
+        self.assertTrue(agent_engine._terminal_sql_has_row_limit("SELECT * FROM t LIMIT 10"))
+        self.assertTrue(
+            agent_engine._terminal_sql_has_row_limit(
+                "SELECT TOP (10) * FROM t"
+            )
+        )
+        self.assertFalse(
+            agent_engine._terminal_sql_has_row_limit(
+                "SELECT 'LIMIT 10' AS note, \"limit\" FROM t"
+            )
+        )
+        huge_integer = "1" + "0" * 400
+        self.assertFalse(
+            agent_engine._action_parameter_matches_user(
+                huge_integer,
+                user_message=huge_integer,
+            )
+        )
+        self.assertFalse(
+            agent_engine._action_parameter_matches_user(
+                10**400,
+                user_message=huge_integer,
+            )
+        )
+
+    def test_terminal_action_shortcut_rejects_incomplete_audit_contracts(self) -> None:
+        params = {
+            "hospital_name": "贵阳泰康乐综合医院",
+            "item_keyword": "刮痧",
+            "quantity_threshold": "2",
+        }
+        action = SimpleNamespace(
+            id="audit-action",
+            api_name="",
+            name="执行医疗收费只读审计",
+            description="通用只读审计算子，按机构返回候选证据。",
+            enabled=True,
+            requires_confirmation=False,
+            executor_type="sql",
+            executor_config={
+                "sql": (
+                    "SELECT {hospital_name}, {item_keyword}, "
+                    "{quantity_threshold} FROM charges"
+                )
+            },
+            input_schema=_schema(
+                {
+                    "hospital_name": {"type": "string"},
+                    "item_keyword": {"type": "string"},
+                    "quantity_threshold": {"type": "string"},
+                },
+                ["hospital_name", "item_keyword", "quantity_threshold"],
+            ),
+        )
+        columns = [
+            "审计算子",
+            "判定口径",
+            "违规标记",
+            "医疗机构名称",
+            "收费项目名称",
+            "审计依据",
+        ]
+        row = [
+            "收费数量阈值",
+            "数量严格大于阈值",
+            "疑似违规（待复核）",
+            "贵阳泰康乐综合医院",
+            "刮痧治疗",
+            "按机构、项目及数量筛选",
+        ]
+        arguments = {"action_id": action.id, "params": params}
+
+        def answer(
+            *,
+            selected_action: Any = action,
+            selected_row: list[Any] = row,
+            user_message: str = (
+                "审计贵阳泰康乐综合医院刮痧治疗收费大于两次的全部违规数据"
+            ),
+            facility_lookup_succeeded: bool | None = None,
+        ) -> str | None:
+            outcome = {
+                "name": "execute_action",
+                "arguments": arguments,
+                "result": json.dumps(
+                    {
+                        "status": "success",
+                        "result": {
+                            "columns": columns,
+                            "rows": [selected_row],
+                            "row_count": 1,
+                            "truncated": False,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+            return agent_engine._deterministic_tabular_action_answer(
+                [outcome],
+                current_tool_calls=[
+                    {"function": {"name": "execute_action", "arguments": arguments}}
+                ],
+                actions=[selected_action],
+                user_message=user_message,
+                medical_facility_lookup_succeeded=facility_lookup_succeeded,
+            )
+
+        self.assertIsNotNone(answer())
+        limited_action = SimpleNamespace(
+            **{
+                **vars(action),
+                "executor_config": {
+                    "sql": action.executor_config["sql"] + " LIMIT 1"
+                },
+            }
+        )
+        self.assertIsNone(answer(selected_action=limited_action))
+        empty_evidence_row = list(row)
+        empty_evidence_row[columns.index("审计依据")] = None
+        self.assertIsNone(answer(selected_row=empty_evidence_row))
+        self.assertIsNone(answer(facility_lookup_succeeded=False))
+        self.assertIsNone(
+            answer(
+                user_message=(
+                    "先查询患者年龄分布，再审计贵阳泰康乐综合医院"
+                    "刮痧治疗收费大于两次"
+                )
+            )
+        )
+
+    def test_published_mcp_does_not_shortcut_partial_action_results(self) -> None:
+        action = SimpleNamespace(
+            id="audit-action",
+            api_name="",
+            name="执行医疗收费只读审计",
+            description="通用只读审计算子，按机构返回候选证据。",
+            enabled=True,
+            requires_confirmation=False,
+            executor_type="sql",
+            executor_config={
+                "sql": (
+                    "SELECT {hospital_name} AS hospital_name, "
+                    "{item_keyword} AS item_keyword, "
+                    "{quantity_threshold} AS quantity_threshold"
+                ),
+            },
+            input_schema=_schema(
+                {
+                    "hospital_name": {"type": "string"},
+                    "item_keyword": {"type": "string"},
+                    "quantity_threshold": {"type": "string"},
+                },
+                ["hospital_name", "item_keyword", "quantity_threshold"],
+            ),
+        )
+        outcome = {
+            "name": "execute_action",
+            "arguments": {
+                "action_id": "audit-action",
+                "params": {
+                    "hospital_name": "贵阳泰康乐综合医院",
+                    "item_keyword": "刮痧治疗",
+                    "quantity_threshold": "2",
+                },
+            },
+            "result": json.dumps(
+                {
+                    "status": "success",
+                    "result": {
+                        "columns": ["编号"],
+                        "rows": [["JZ-001"]],
+                        "row_count": 1,
+                        "truncated": True,
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        }
+        self.assertIsNone(
+            agent_engine._deterministic_tabular_action_answer(
+                [outcome],
+                current_tool_calls=[
+                    {
+                        "function": {
+                            "name": "execute_action",
+                            "arguments": outcome["arguments"],
+                        }
+                    }
+                ],
+                actions=[action],
+                user_message="审计贵阳泰康乐综合医院刮痧治疗收费大于两次的全部违规数据",
+            )
+        )
+
+    def test_published_mcp_does_not_shortcut_an_action_with_rewritten_scope(self) -> None:
+        action = SimpleNamespace(
+            id="audit-action",
+            api_name="",
+            name="执行医疗收费只读审计",
+            description="通用只读审计算子，按机构返回候选证据。",
+            enabled=True,
+            requires_confirmation=False,
+            executor_type="sql",
+            executor_config={
+                "sql": (
+                    "SELECT {hospital_name} AS hospital_name, "
+                    "{item_keyword} AS item_keyword, "
+                    "{quantity_threshold} AS quantity_threshold"
+                ),
+            },
+            input_schema=_schema(
+                {
+                    "hospital_name": {"type": "string"},
+                    "item_keyword": {"type": "string"},
+                    "quantity_threshold": {"type": "string"},
+                },
+                ["hospital_name", "item_keyword", "quantity_threshold"],
+            ),
+        )
+        arguments = {
+            "action_id": "audit-action",
+            "params": {
+                "hospital_name": "医院",
+                "item_keyword": "刮痧治疗",
+                "quantity_threshold": "2",
+            },
+        }
+        outcome = {
+            "name": "execute_action",
+            "arguments": arguments,
+            "result": json.dumps(
+                {
+                    "status": "success",
+                    "result": {
+                        "columns": [
+                            "审计算子",
+                            "判定口径",
+                            "违规标记",
+                            "医疗机构名称",
+                            "审计依据",
+                        ],
+                        "rows": [["算子", "口径", "疑似", "医院", "依据"]],
+                        "row_count": 1,
+                        "truncated": False,
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        }
+
+        self.assertIsNone(
+            agent_engine._deterministic_tabular_action_answer(
+                [outcome],
+                current_tool_calls=[
+                    {"function": {"name": "execute_action", "arguments": arguments}}
+                ],
+                actions=[action],
+                user_message="审计贵阳泰康乐综合医院刮痧治疗收费大于两次的全部违规数据",
+            )
+        )
+
     def test_run_agent_truth_guard_rejects_delivery_claim_without_tools(self) -> None:
         context = self._context()
         with patch.object(
@@ -3054,11 +3616,22 @@ class AgentCapabilityClosureTests(unittest.TestCase):
             tool_outcomes=outcome,
             controlled_medical_audit=True,
         )
+        incomplete_composite = agent_engine._truthful_final_content(
+            "两项审计均已完成。",
+            user_message=(
+                "请审计电子结肠镜检查包含电子乙状结肠镜检查后重复收费的问题，"
+                "并审计刮痧治疗收费大于两次的违规记录"
+            ),
+            tool_outcomes=outcome,
+            controlled_medical_audit=True,
+        )
 
         self.assertIn("未形成可验证审计结论", wrong_strategy)
         self.assertIn("未形成可验证审计结论", missing_parameter)
         self.assertNotIn("医保确定性汇总", wrong_strategy)
         self.assertNotIn("医保确定性汇总", missing_parameter)
+        self.assertIn("医保确定性汇总", incomplete_composite)
+        self.assertIn("未形成可验证审计结论", incomplete_composite)
         self.assertTrue(
             agent_engine._medical_number_mentioned(
                 "请审计 AP001 刮痧治疗收费大于两次的记录",

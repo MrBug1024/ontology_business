@@ -987,8 +987,16 @@ def invoke_published_agent(
     lease: AgentMCPTurnLease | None = None
     previous_guard: Any = None
     previous_request_hash: Any = None
+    previous_deterministic_action_result: Any = None
     had_guard = False
     had_request_hash = False
+    had_deterministic_action_result = (
+        "agent_mcp_deterministic_action_result" in db.info
+    )
+    if had_deterministic_action_result:
+        previous_deterministic_action_result = db.info.get(
+            "agent_mcp_deterministic_action_result"
+        )
     try:
         service = db.get(AgentMCPService, service_id)
         if not service or not service.enabled or not service.execution_user_id:
@@ -1092,6 +1100,7 @@ def invoke_published_agent(
             db.add(invocation)
             db.commit()
 
+        db.info["agent_mcp_deterministic_action_result"] = True
         result = agents.invoke_agent_once(
             service.agent_id,
             message=message,
@@ -1171,4 +1180,10 @@ def invoke_published_agent(
             db.info["agent_mcp_turn_request_hash"] = previous_request_hash
         else:
             db.info.pop("agent_mcp_turn_request_hash", None)
+        if had_deterministic_action_result:
+            db.info["agent_mcp_deterministic_action_result"] = (
+                previous_deterministic_action_result
+            )
+        else:
+            db.info.pop("agent_mcp_deterministic_action_result", None)
         db.close()

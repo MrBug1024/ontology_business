@@ -563,9 +563,13 @@ class AgentMCPPublicationTests(unittest.TestCase):
             name="医保违规审计助手",
         )
         received_calls: list[dict] = []
+        received_protocol_versions: list[str] = []
 
         def invoke(_service_id: str, **kwargs):
             received_calls.append(kwargs)
+            received_protocol_versions.append(
+                agent_mcp_server._negotiated_protocol_version.get()
+            )
             return {
                 "answer": "审计完成",
                 "conversation_id": "conversation-test",
@@ -641,6 +645,10 @@ class AgentMCPPublicationTests(unittest.TestCase):
                     ) as (read_stream, write_stream, _):
                         async with ClientSession(read_stream, write_stream) as session:
                             initialized = await session.initialize()
+                            self.assertEqual(
+                                initialized.protocolVersion,
+                                "2025-03-26",
+                            )
                             self.assertEqual(initialized.serverInfo.name, "Ontology Platform Agent Gateway")
                             tools = await session.list_tools()
                             self.assertEqual([tool.name for tool in tools.tools], ["invoke_agent"])
@@ -664,6 +672,8 @@ class AgentMCPPublicationTests(unittest.TestCase):
                                 "继续同一终端用户会话",
                                 invoke_tool.inputSchema["properties"]["conversation_id"]["description"],
                             )
+                            self.assertIsNone(invoke_tool.title)
+                            self.assertIsNone(invoke_tool.outputSchema)
                             self.assertFalse(invoke_tool.meta)
                             legacy = await session.call_tool(
                                 "invoke_agent",
@@ -682,21 +692,49 @@ class AgentMCPPublicationTests(unittest.TestCase):
                                 {"message": original_message},
                             )
                             self.assertFalse(result.isError)
-                            self.assertEqual(result.structuredContent["answer"], "审计完成")
+                            result_payload = result.model_dump(
+                                mode="json",
+                                by_alias=True,
+                                exclude_none=True,
+                            )
+                            self.assertEqual(
+                                set(result_payload),
+                                {"content", "isError"},
+                            )
+                            self.assertIsNone(result.structuredContent)
                             self.assertEqual(result.content[0].text, "审计完成")
-                            continuation = json.loads(result.content[1].text)
                             self.assertEqual(
-                                continuation["mcp_continuation"]["conversation_id"],
-                                "conversation-test",
-                            )
-                            self.assertNotIn("tool_calls", result.structuredContent)
-                            self.assertNotIn("tool_results", result.structuredContent)
-                            self.assertEqual(
-                                result.structuredContent["continuation"]["conversation_id"],
-                                "conversation-test",
+                                set(result_payload["content"][0]),
+                                {"type", "text"},
                             )
                             self.assertEqual(
-                                result.structuredContent["tool_execution"],
+                                set(result_payload["content"][1]),
+                                {"type", "text"},
+                            )
+                            self.assertIsNone(result.content[0].annotations)
+                            self.assertIsNone(result.content[1].annotations)
+                            metadata_envelope = json.loads(result.content[1].text)
+                            continuation = metadata_envelope["mcp_result"]
+                            self.assertEqual(
+                                continuation["continuation"]["conversation_id"],
+                                "conversation-test",
+                            )
+                            self.assertEqual(
+                                metadata_envelope["mcp_continuation"],
+                                continuation["continuation"],
+                            )
+                            self.assertEqual(
+                                metadata_envelope["input_receipt"],
+                                continuation["input_receipt"],
+                            )
+                            self.assertNotIn("tool_calls", continuation)
+                            self.assertNotIn("tool_results", continuation)
+                            self.assertEqual(
+                                continuation["continuation"]["conversation_id"],
+                                "conversation-test",
+                            )
+                            self.assertEqual(
+                                continuation["tool_execution"],
                                 {
                                     "call_count": 1,
                                     "result_count": 1,
@@ -704,16 +742,16 @@ class AgentMCPPublicationTests(unittest.TestCase):
                                 },
                             )
                             public_json = json.dumps(
-                                result.structuredContent,
+                                continuation,
                                 ensure_ascii=False,
                             )
                             self.assertNotIn("execute_action", public_json)
                             self.assertNotIn("TOOL_RESULT_TOO_LARGE", public_json)
                             self.assertNotIn("query_mapped_objects", public_json)
                             self.assertNotIn(
-                                "text", result.structuredContent["citations"][0]
+                                "text", continuation["citations"][0]
                             )
-                            confirmation_result = result.structuredContent["confirmation"][
+                            confirmation_result = continuation["confirmation"][
                                 "response"
                             ]["result"]
                             self.assertEqual(confirmation_result["row_count"], 20)
@@ -738,14 +776,18 @@ class AgentMCPPublicationTests(unittest.TestCase):
                                 },
                             )
                             self.assertFalse(repeated.isError)
-                            self.assertEqual(repeated.structuredContent["answer"], "审计完成")
+                            self.assertIsNone(repeated.structuredContent)
+                            self.assertEqual(repeated.content[0].text, "审计完成")
+                            repeated_metadata = json.loads(repeated.content[1].text)[
+                                "mcp_result"
+                            ]
                             self.assertEqual(
-                                repeated.structuredContent["input_receipt"]["source"],
+                                repeated_metadata["input_receipt"]["source"],
                                 "tool_argument",
                             )
                             self.assertNotIn(
                                 "conversation_binding_hash",
-                                repeated.structuredContent["input_receipt"],
+                                repeated_metadata["input_receipt"],
                             )
 
         with (
@@ -755,9 +797,11 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 "invoke_published_agent",
                 side_effect=invoke,
             ),
+            patch("mcp.types.LATEST_PROTOCOL_VERSION", "2025-03-26"),
         ):
             asyncio.run(exercise())
         self.assertEqual(len(received_calls), 2)
+        self.assertEqual(received_protocol_versions, ["2025-03-26", "2025-03-26"])
         self.assertTrue(received_calls[0]["external_session_id"])
         self.assertEqual(
             received_calls[0]["external_session_id"],
@@ -767,6 +811,62 @@ class AgentMCPPublicationTests(unittest.TestCase):
         self.assertEqual(received_calls[1]["message"], "确认执行")
         self.assertNotIn("external_conversation_id", received_calls[0])
         self.assertNotIn("external_turn_id", received_calls[1])
+
+    def test_structured_tool_results_are_only_sent_to_supporting_protocols(self) -> None:
+        self.assertFalse(agent_mcp_server._supports_structured_tool_results(""))
+        self.assertFalse(
+            agent_mcp_server._supports_structured_tool_results("2025-03-26")
+        )
+        self.assertTrue(
+            agent_mcp_server._supports_structured_tool_results("2025-06-18")
+        )
+        self.assertTrue(
+            agent_mcp_server._supports_structured_tool_results("2025-11-25")
+        )
+        self.assertFalse(
+            agent_mcp_server._supports_structured_tool_results("latest")
+        )
+
+        async def invoke_with_current_protocol():
+            service_token = agent_mcp_server._authenticated_service.set(
+                "service-agent-mcp"
+            )
+            session_token = agent_mcp_server._authenticated_external_session.set(
+                "mcp1.test.signature"
+            )
+            protocol_token = agent_mcp_server._negotiated_protocol_version.set(
+                "2025-11-25"
+            )
+            try:
+                return await agent_mcp_server.invoke_agent(
+                    SimpleNamespace(request_id="rpc-test"),
+                    "审计原始请求",
+                )
+            finally:
+                agent_mcp_server._negotiated_protocol_version.reset(protocol_token)
+                agent_mcp_server._authenticated_external_session.reset(session_token)
+                agent_mcp_server._authenticated_service.reset(service_token)
+
+        with patch.object(
+            agent_mcp_service,
+            "invoke_published_agent",
+            return_value={
+                "answer": "审计完成",
+                "conversation_id": "conversation-test",
+                "request_id": "request-test",
+            },
+        ):
+            result = asyncio.run(invoke_with_current_protocol())
+        self.assertEqual(result.structuredContent["answer"], "审计完成")
+        self.assertEqual(
+            result.structuredContent["continuation"]["conversation_id"],
+            "conversation-test",
+        )
+        metadata = json.loads(result.content[1].text)
+        self.assertEqual(
+            metadata["mcp_continuation"],
+            metadata["mcp_result"]["continuation"],
+        )
 
     def test_delete_revokes_publication_without_erasing_invocation_audit(self) -> None:
         raw_token = self._add_published_service(service_id="service-soft-delete")

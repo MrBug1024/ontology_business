@@ -28,6 +28,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
@@ -118,6 +119,10 @@ _DELIVERY_INTENT_NOUNS = (
     "全部工作任务",
 )
 _COMPLETE_DETAIL_TERMS = ("全部", "全量", "所有", "完整", "逐条", "明细")
+_CHARGE_THRESHOLD_CLAUSE_RE = re.compile(
+    r"(?:收费|计费)(?:数量|次数)?(?:大于|高于|超过|超出)"
+    r"(?:\d+(?:\.0+)?|[零一二三四五六七八九十两]+)(?:次|次数)"
+)
 _MEDICAL_STRATEGY_LABELS = {
     "charge_threshold": "单条收费数量阈值",
     "daily_overstay": "日计价超过住院天数",
@@ -129,6 +134,19 @@ _MEDICAL_STRATEGY_ARGUMENTS = {
     "daily_overstay": ("service_names",),
     "included_service_duplicate": ("included_service", "duplicate_service"),
     "limited_drug_duration": ("drug_name", "max_days"),
+}
+_TERMINAL_SQL_AUDIT_PARAMS = {
+    "charge_threshold": frozenset(
+        {"hospital_name", "item_keyword", "quantity_threshold"}
+    ),
+    "daily_overstay": frozenset({"hospital_name", "item_keywords"}),
+    "included_service_duplicate": frozenset(
+        {
+            "hospital_name",
+            "primary_item_keyword",
+            "secondary_item_keywords",
+        }
+    ),
 }
 _MEDICAL_RECORD_IDENTITY_FIELDS = {
     "charge_threshold": ("charge_line_id",),
@@ -387,6 +405,347 @@ def _executed_action_target(outcome: Mapping[str, Any]) -> tuple[str, str] | Non
     return identity, label or identity
 
 
+def _markdown_table_value(value: Any) -> str:
+    """Render one JSON-compatible value without corrupting a Markdown table."""
+    if isinstance(value, str):
+        rendered = value
+    else:
+        rendered = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    return (
+        rendered.replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\r\n", "<br>")
+        .replace("\n", "<br>")
+        .replace("\r", "<br>")
+    )
+
+
+def _action_parameter_matches_user(value: Any, *, user_message: str) -> bool:
+    """Require every terminal Action input to be traceable to the user text."""
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return _medical_number_mentioned(user_message, value)
+    if isinstance(value, list):
+        return bool(value) and all(
+            _action_parameter_matches_user(item, user_message=user_message)
+            for item in value
+        )
+    if not isinstance(value, str) or not value.strip():
+        return False
+    stripped = value.strip()
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", stripped):
+        try:
+            numeric = float(stripped)
+        except (OverflowError, ValueError):
+            return False
+        return math.isfinite(numeric) and _medical_number_mentioned(
+            user_message,
+            numeric,
+        )
+    normalized_user = _normalized_business_text(user_message)
+    values = [part.strip() for part in stripped.split("|")]
+    return all(
+        (normalized := _normalized_business_text(part))
+        and normalized in normalized_user
+        for part in values
+    )
+
+
+def _action_parameter_label(action: Any, name: str) -> str:
+    schema = _normalized_object_schema(getattr(action, "input_schema", {}) or {})
+    definition = schema.get("properties", {}).get(name)
+    description = (
+        str(definition.get("description") or "").strip()
+        if isinstance(definition, dict)
+        else ""
+    )
+    label = re.split(r"[：:]", description, maxsplit=1)[0].strip()
+    return label if 0 < len(label) <= 30 else name
+
+
+def _terminal_sql_has_row_limit(sql: str) -> bool:
+    """Reject SQL-level caps that make an application `truncated=false` ambiguous."""
+    without_comments = re.sub(r"--[^\n]*|/\*.*?\*/", " ", sql, flags=re.S)
+    scanned = re.sub(
+        r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`",
+        " ",
+        without_comments,
+    )
+    return re.search(
+        r"\blimit\b|\bfetch\s+(?:first|next)\b|\btop\s*(?:\(|\d)",
+        scanned,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _deterministic_tabular_action_answer(
+    tool_outcomes: Sequence[Mapping[str, Any]],
+    *,
+    current_tool_calls: Sequence[Mapping[str, Any]],
+    actions: Sequence[Any],
+    user_message: str,
+    authoritative_medical_facilities: Sequence[str] | None = None,
+    medical_facility_lookup_succeeded: bool | None = None,
+) -> str | None:
+    """Return a verified read-only Action table without another model round.
+
+    Published MCP callers commonly impose a hard tool timeout.  Once a governed
+    Action has already returned a complete tabular result, another model round
+    can only restate that evidence and may make an otherwise successful call
+    miss the caller's deadline. This renderer fails closed unless the current
+    round contains one terminal, read-only audit Action whose parameters and
+    returned facility are bound to the user's original request.
+    """
+    if (
+        len(current_tool_calls) != 1
+        or str(current_tool_calls[0].get("function", {}).get("name") or "")
+        != "execute_action"
+    ):
+        return None
+
+    action_attempts = [
+        outcome
+        for outcome in tool_outcomes
+        if str(outcome.get("name") or "") == "execute_action"
+    ]
+    if len(action_attempts) != 1:
+        return None
+    latest_action = action_attempts[0]
+    arguments = latest_action.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return None
+    current_arguments = current_tool_calls[0].get("function", {}).get("arguments")
+    if not isinstance(current_arguments, Mapping) or dict(current_arguments) != dict(arguments):
+        return None
+    try:
+        action = _resource_by_reference(
+            list(actions),
+            arguments.get("action_id"),
+            "操作",
+        )
+    except _ToolContractError:
+        return None
+    if action is None:
+        return None
+    action_name = str(getattr(action, "name", "") or "").strip()
+    action_description = str(getattr(action, "description", "") or "").strip()
+    if (
+        getattr(action, "enabled", False) is not True
+        or bool(getattr(action, "requires_confirmation", True))
+        or str(getattr(action, "executor_type", "") or "").strip().lower() != "sql"
+        or "审计" not in action_name + action_description
+        or "只读" not in action_description
+    ):
+        return None
+    executor_config = getattr(action, "executor_config", {}) or {}
+    sql = executor_config.get("sql") if isinstance(executor_config, dict) else None
+    if not isinstance(sql, str) or not sql.strip():
+        return None
+    try:
+        validate_read_only_sql(sql)
+    except PolicyViolation:
+        return None
+    if _terminal_sql_has_row_limit(sql):
+        return None
+
+    params = arguments.get("params")
+    if not isinstance(params, Mapping):
+        return None
+    requested_strategies = _requested_medical_strategies(user_message)
+    if len(requested_strategies) != 1 or _has_delivery_intent(user_message):
+        return None
+    strategy = next(iter(requested_strategies))
+    expected_params = _TERMINAL_SQL_AUDIT_PARAMS.get(strategy)
+    if expected_params is None or set(params) != expected_params:
+        return None
+    schema = _normalized_object_schema(getattr(action, "input_schema", {}) or {})
+    required_params = set(_schema_required_fields(schema))
+    if (
+        required_params != expected_params
+        or any(f"{{{name}}}" not in sql for name in expected_params)
+        or any(
+            not _action_parameter_matches_user(value, user_message=user_message)
+            for value in params.values()
+        )
+        or not _terminal_action_params_match_user(
+            strategy,
+            params,
+            user_message=user_message,
+        )
+    ):
+        return None
+
+    parsed = _parsed_result(latest_action.get("result"))
+    if not isinstance(parsed, dict):
+        return None
+    status = str(parsed.get("status") or "")
+    if status != "success" and not (
+        status == "idempotent_replay"
+        and str(parsed.get("original_status") or "") == "success"
+    ):
+        return None
+
+    result = parsed.get("result")
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"columns", "rows", "row_count", "truncated"}
+        or result.get("truncated") is not False
+    ):
+        return None
+    columns = result.get("columns")
+    rows = result.get("rows")
+    row_count = result.get("row_count")
+    if (
+        not isinstance(columns, list)
+        or not columns
+        or not all(isinstance(column, str) and column.strip() for column in columns)
+        or len(set(columns)) != len(columns)
+        or not isinstance(rows, list)
+        or isinstance(row_count, bool)
+        or not isinstance(row_count, int)
+        or row_count != len(rows)
+        or not all(isinstance(row, list) and len(row) == len(columns) for row in rows)
+        or not _terminal_result_scope_matches_user(
+            strategy,
+            params,
+            columns,
+            rows,
+            user_message=user_message,
+        )
+    ):
+        return None
+
+    required_audit_columns = {"审计算子", "判定口径", "违规标记", "审计依据"}
+    if not required_audit_columns.issubset(columns):
+        return None
+    required_audit_indexes = [columns.index(column) for column in required_audit_columns]
+    if any(
+        not isinstance(row[index], str) or not row[index].strip()
+        for row in rows
+        for index in required_audit_indexes
+    ):
+        return None
+    facility_name = params.get("hospital_name")
+    if not isinstance(facility_name, str) or not facility_name.strip():
+        return None
+    facility_column = next(
+        (
+            candidate
+            for candidate in ("医疗机构名称", "定点医药机构名称", "医疗机构")
+            if candidate in columns
+        ),
+        None,
+    )
+    if facility_column is None:
+        return None
+    facility_index = columns.index(facility_column)
+    normalized_facility = _normalized_business_text(facility_name)
+    normalized_authoritative_facilities = {
+        normalized
+        for value in authoritative_medical_facilities or ()
+        if (normalized := _normalized_business_text(value))
+    }
+    if medical_facility_lookup_succeeded is False:
+        return None
+    if medical_facility_lookup_succeeded is True:
+        requested_facilities = normalized_authoritative_facilities
+    else:
+        requested_facilities = _resolved_medical_facilities(user_message)
+    if (
+        _medical_request_excludes_facility(
+            user_message,
+            authoritative_medical_facilities,
+        )
+        or requested_facilities != {normalized_facility}
+        or any(
+            _normalized_business_text(row[facility_index]) != normalized_facility
+            for row in rows
+        )
+    ):
+        return None
+
+    scope_lines = [
+        f"- **{_markdown_table_value(_action_parameter_label(action, name))}**："
+        f"{_markdown_table_value(value)}"
+        for name, value in params.items()
+    ]
+    if row_count == 0:
+        answer = "\n".join(
+            [
+                f"只读审计数据操作「{action_name}」执行成功，未返回候选明细；动作结果完整（未截断）。",
+                "",
+                "执行范围：",
+                *scope_lines,
+                "",
+                "结论口径：结果由已配置的只读审计算子生成；未命中候选明细不等于对范围外数据作出结论。",
+            ]
+        )
+        return answer if len(answer.encode("utf-8")) <= 32_000 else None
+
+    def canonical(value: Any) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    constant_indexes = [
+        index
+        for index in range(len(columns))
+        if all(canonical(row[index]) == canonical(rows[0][index]) for row in rows[1:])
+    ]
+    variable_indexes = [
+        index for index in range(len(columns)) if index not in constant_indexes
+    ]
+    lines = [
+        f"只读审计数据操作「{action_name}」执行成功，共返回 {row_count} 条候选明细；"
+        "动作结果完整（未截断）。",
+        "",
+        "执行范围：",
+        *scope_lines,
+        "",
+        "结论口径：结果由已配置的只读审计算子生成；最终认定以表内“违规标记”、"
+        "“审计依据”及业务复核为准。",
+    ]
+    if constant_indexes:
+        lines.extend(["", "固定字段："])
+        lines.extend(
+            f"- **{_markdown_table_value(columns[index])}**："
+            f"{_markdown_table_value(rows[0][index])}"
+            for index in constant_indexes
+        )
+    if variable_indexes:
+        lines.extend(
+            [
+                "",
+                "明细：",
+                "| "
+                + " | ".join(
+                    _markdown_table_value(columns[index]) for index in variable_indexes
+                )
+                + " |",
+                "| " + " | ".join("---" for _ in variable_indexes) + " |",
+            ]
+        )
+        lines.extend(
+            "| "
+            + " | ".join(
+                _markdown_table_value(row[index]) for index in variable_indexes
+            )
+            + " |"
+            for row in rows
+        )
+    answer = "\n".join(lines)
+    return answer if len(answer.encode("utf-8")) <= 32_000 else None
+
+
 def _automatic_action_idempotency_key(
     db: Session,
     *,
@@ -605,7 +964,12 @@ def _chinese_integer(value: int) -> set[str]:
 def _medical_number_mentioned(user_message: str, value: Any) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError):
+        return False
+    if not math.isfinite(numeric):
+        return False
     raw_user = str(user_message or "").casefold()
     numeric_forms = {format(numeric, ".12g")}
     chinese_forms: set[str] = set()
@@ -626,20 +990,205 @@ def _medical_number_mentioned(user_message: str, value: Any) -> bool:
     )
 
 
-def _requested_medical_strategy(user_message: str) -> str | None:
+def _requested_medical_strategies(user_message: str) -> set[str]:
+    """Return every strategy requested, so terminal shortcuts cannot drop work."""
     text = _normalized_business_text(user_message)
+    strategies: set[str] = set()
     if any(term in text for term in ("重复收费", "重复收取", "另行收费", "包含项目", "已包含")):
-        return "included_service_duplicate"
+        strategies.add("included_service_duplicate")
     if any(term in text for term in ("限疗程", "超疗程", "用药天数", "用药时长", "疗程天数")):
-        return "limited_drug_duration"
-    if any(term in text for term in ("住院天数", "日计价", "按日计费", "每日计费")):
-        return "daily_overstay"
+        strategies.add("limited_drug_duration")
+    daily_overstay = any(
+        term in text for term in ("住院天数", "日计价", "按日计费", "每日计费")
+    )
+    if daily_overstay:
+        strategies.add("daily_overstay")
+    if _CHARGE_THRESHOLD_CLAUSE_RE.search(text):
+        strategies.add("charge_threshold")
+    return strategies
+
+
+def _has_delivery_intent(user_message: str) -> bool:
+    return (
+        any(term in user_message for term in _DELIVERY_INTENT_VERBS)
+        and any(term in user_message for term in _DELIVERY_INTENT_NOUNS)
+    )
+
+
+def _terminal_threshold_forms(value: Any) -> set[str]:
+    """Return exact integer spellings accepted in a quantity-threshold clause."""
+    if isinstance(value, bool):
+        return set()
+    try:
+        raw = str(value).strip()
+    except (OverflowError, ValueError):
+        return set()
+    if not re.fullmatch(r"\d+(?:\.0+)?", raw):
+        return set()
+    try:
+        integer = int(raw.split(".", maxsplit=1)[0])
+    except (OverflowError, ValueError):
+        return set()
+    return {str(integer), *_chinese_integer(integer)}
+
+
+def _terminal_action_params_match_user(
+    strategy: str,
+    params: Mapping[str, Any],
+    *,
+    user_message: str,
+) -> bool:
+    """Bind terminal SQL inputs to their semantic slots in the original text."""
+    text = _normalized_business_text(user_message)
+    facility = _normalized_business_text(params.get("hospital_name"))
+    facility_start = text.find(facility) if facility else -1
+    facility_end = facility_start + len(facility)
+    request_prefix = text[:facility_start] if facility_start >= 0 else ""
     if (
-        any(term in text for term in ("大于", "高于", "超过", "超出"))
-        and any(term in text for term in ("收费", "数量", "次数", "次"))
+        not facility
+        or facility_start < 0
+        or re.fullmatch(
+            r"(?:请|帮我|麻烦|审计|核验|核查|排查|检查|查询|分析|对|针对|在)*",
+            request_prefix,
+        )
+        is None
     ):
-        return "charge_threshold"
-    return None
+        return False
+    scope = text[facility_end:]
+    leading = r"(?:的|开展|实施|进行|提供|发生|存在|做|对|针对)*"
+    ending = r"(?:的)?(?:全部|全量|所有|完整)?(?:违规)?(?:数据|明细|记录|结果)?"
+
+    if strategy == "charge_threshold":
+        item = _normalized_business_text(params.get("item_keyword"))
+        threshold_forms = _terminal_threshold_forms(params.get("quantity_threshold"))
+        if not item or not threshold_forms:
+            return False
+        threshold = "(?:" + "|".join(
+            re.escape(value) for value in sorted(threshold_forms, key=len, reverse=True)
+        ) + ")"
+        return re.fullmatch(
+            leading
+            + re.escape(item)
+            + r"(?:项目|服务|治疗)?(?:收费|计费)(?:数量|次数)?"
+            + r"(?:大于|高于|超过|超出)"
+            + threshold
+            + r"(?:次|次数)"
+            + ending,
+            scope,
+        ) is not None
+
+    if strategy == "included_service_duplicate":
+        primary = _normalized_business_text(params.get("primary_item_keyword"))
+        secondary_values = [
+            _normalized_business_text(value)
+            for value in str(params.get("secondary_item_keywords") or "").split("|")
+            if _normalized_business_text(value)
+        ]
+        if not primary or len(secondary_values) != 1:
+            return False
+        secondary = secondary_values[0]
+        for cue in ("重复收取", "重复收费", "另行收取", "另行收费"):
+            cue_index = scope.find(cue)
+            if cue_index < 0:
+                continue
+            primary_scope = scope[:cue_index]
+            secondary_scope = scope[cue_index + len(cue):]
+            if (
+                re.fullmatch(
+                    leading + re.escape(primary) + r"(?:检查|项目|服务|费用|收费)?",
+                    primary_scope,
+                )
+                and re.fullmatch(
+                    r"(?:了)?"
+                    + re.escape(secondary)
+                    + r"(?:检查|项目|服务|费用|收费)*"
+                    + ending,
+                    secondary_scope,
+                )
+            ):
+                return True
+        return False
+
+    if strategy == "daily_overstay":
+        item_values = [
+            _normalized_business_text(value)
+            for value in str(params.get("item_keywords") or "").split("|")
+            if _normalized_business_text(value)
+        ]
+        if len(item_values) != 1:
+            return False
+        item = item_values[0]
+        return re.fullmatch(
+            leading
+            + re.escape(item)
+            + r"(?:项目|服务|费用)?(?:日计价|按日计费|每日计费)"
+            + r"(?:数量|次数)?(?:大于|高于|超过|超出)(?:实际)?住院天数"
+            + ending,
+            scope,
+        ) is not None
+
+    return False
+
+
+def _terminal_result_scope_matches_user(
+    strategy: str,
+    params: Mapping[str, Any],
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    *,
+    user_message: str,
+) -> bool:
+    """Ensure a keyword SQL Action did not return rows beyond the stated item."""
+    if strategy == "charge_threshold":
+        item_column = next(
+            (
+                candidate
+                for candidate in ("收费项目名称", "医疗服务项目名称", "项目名称")
+                if candidate in columns
+            ),
+            None,
+        )
+        if item_column is None:
+            return False
+        item_index = columns.index(item_column)
+        text = _normalized_business_text(user_message)
+        facility = _normalized_business_text(params.get("hospital_name"))
+        facility_start = text.find(facility) if facility else -1
+        if facility_start < 0:
+            return False
+        scope = text[facility_start + len(facility):]
+        item = _normalized_business_text(params.get("item_keyword"))
+        treatment_suffix = re.fullmatch(
+            r"(?:的|开展|实施|进行|提供|发生|存在|做|对|针对)*"
+            + re.escape(item)
+            + r"(?P<treatment>治疗)?(?:项目|服务)?(?:收费|计费).*",
+            scope,
+        )
+        if not item or treatment_suffix is None:
+            return False
+        requested_item = item + (
+            treatment_suffix.group("treatment") or ""
+        )
+        return all(
+            _normalized_business_text(row[item_index]) == requested_item
+            for row in rows
+        )
+    if strategy == "included_service_duplicate":
+        if "主项目" not in columns or "疑似重复项目" not in columns:
+            return False
+        primary_index = columns.index("主项目")
+        secondary_index = columns.index("疑似重复项目")
+        primary = _normalized_business_text(params.get("primary_item_keyword"))
+        secondary = _normalized_business_text(params.get("secondary_item_keywords"))
+        return bool(primary and secondary) and all(
+            _normalized_business_text(row[primary_index]) == primary
+            and _normalized_business_text(row[secondary_index]) == secondary
+            for row in rows
+        )
+    # The daily-overstay Action accepts a pipe-delimited keyword set. Until its
+    # output contract exposes an exact requested-item mapping, leave its final
+    # synthesis to the model instead of claiming a deterministic full result.
+    return False
 
 
 def _medical_request_matches_user(
@@ -653,7 +1202,10 @@ def _medical_request_matches_user(
 ) -> bool:
     """Bind deterministic medical evidence to the user's stated audit task."""
 
-    if not isinstance(arguments, Mapping) or _requested_medical_strategy(user_message) != strategy:
+    if (
+        not isinstance(arguments, Mapping)
+        or strategy not in _requested_medical_strategies(user_message)
+    ):
         return False
     parameters = evidence.get("parameters")
     if not isinstance(parameters, Mapping):
@@ -786,7 +1338,8 @@ def _medical_audit_status(
         groups.setdefault(signature, []).append({**outcome, "payload": payload})
 
     lines: list[str] = []
-    verified = False
+    requested_strategies = _requested_medical_strategies(user_message)
+    verified_strategies: set[str] = set()
     wants_complete_details = any(term in user_message for term in _COMPLETE_DETAIL_TERMS)
     for pages in groups.values():
         first = pages[0]["payload"]
@@ -795,8 +1348,8 @@ def _medical_audit_status(
         amount = _display_number(summary.get("violation_amount"))
         if isinstance(count, bool) or not isinstance(count, int) or count < 0 or amount is None:
             continue
-        verified = True
         strategy = str(first.get("strategy") or "")
+        verified_strategies.add(strategy)
         label = _MEDICAL_STRATEGY_LABELS.get(strategy, strategy or "未知策略")
         summary_parts = [f"{label}：违规 {count} 条（组）", f"违规金额 {amount} 元"]
         for field, field_label in (
@@ -887,7 +1440,11 @@ def _medical_audit_status(
                 f"{qualifier}审计统计可用，但明细仅连续读取 {delivered_rows}/{count} 条，"
                 "不能视为全部明细已交付。"
             )
-    return lines, verified
+    return (
+        lines,
+        bool(requested_strategies)
+        and requested_strategies.issubset(verified_strategies),
+    )
 
 
 def _truthful_final_content(
@@ -916,10 +1473,7 @@ def _truthful_final_content(
             executed_targets.setdefault(target_id, target_label)
     preview_count = len(preview_targets)
     executed_count = len(executed_targets)
-    delivery_intent = (
-        any(term in user_message for term in _DELIVERY_INTENT_VERBS)
-        and any(term in user_message for term in _DELIVERY_INTENT_NOUNS)
-    )
+    delivery_intent = _has_delivery_intent(user_message)
     if action_attempts or delivery_intent:
         if executed_count:
             labels = [label for label in executed_targets.values() if label]
@@ -3969,6 +4523,21 @@ def _run_agent(
                     "content": bounded_result,
                 }
             )
+        if db.info.get("agent_mcp_deterministic_action_result") is True:
+            deterministic_answer = _deterministic_tabular_action_answer(
+                tool_outcomes,
+                current_tool_calls=tool_calls,
+                actions=ctx.actions,
+                user_message=user_message,
+                authoritative_medical_facilities=authoritative_medical_facilities,
+                medical_facility_lookup_succeeded=medical_facility_lookup_succeeded,
+            )
+            if deterministic_answer is not None:
+                if ctx.citations:
+                    yield {"type": "citations", "data": ctx.citation_snapshot()}
+                yield {"type": "token", "data": deterministic_answer}
+                yield {"type": "done", "data": deterministic_answer}
+                return
         if repeated_tool_call:
             messages.append(
                 {
