@@ -115,8 +115,9 @@ npm --prefix .\frontend run dev
 
 ## 生产部署
 
-生产环境使用 PostgreSQL 作为唯一关系型数据库、外部 MinIO 保存文件，并以 Nginx 提供静态
-前端和同源 `/api` 反向代理；不使用 SQLite、`/app/data/platform.db` 或 `vite preview`。完整的
+生产环境使用 PostgreSQL 作为唯一关系型数据库、外部 MinIO 保存文件，并由 Coolify 直接将
+前端域名路由到前端容器；不使用 SQLite、`/app/data/platform.db` 或 Nginx。前端容器使用
+`vite preview` 提供已构建的静态 SPA，API 通过独立的 `ontology-api.rhzy.ai` 入口访问。完整的
 环境变量、Alembic 迁移顺序、400 MiB 上传限制、API/worker 多进程职责及 Coolify GitHub App
 认证要求见[生产部署手册](./docs/生产部署.md)。
 
