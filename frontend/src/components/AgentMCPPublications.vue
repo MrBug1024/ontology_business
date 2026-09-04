@@ -18,6 +18,15 @@
       show-icon
       :closable="false"
     />
+    <el-alert
+      v-else
+      class="host-contract-notice"
+      type="warning"
+      title="第三方必须支持宿主级原文透传"
+      description="仅导入 URL 和令牌不能保证语义不被改写；第三方适配层还需注入用户原文、UI 会话 ID 和消息 ID。"
+      show-icon
+      :closable="false"
+    />
 
     <div class="publication-grid" v-loading="loading" :aria-busy="loading">
       <article v-for="service in services" :key="service.id" class="card publication-card">
@@ -56,8 +65,16 @@
 
         <p v-if="service.stale" class="service-warning" role="status">Agent 配置已变化，请轮换凭证后重新分发配置。</p>
         <p v-else-if="service.missing?.length" class="service-warning" role="status">缺少：{{ service.missing.join('、') }}</p>
+        <p v-if="contractCapabilityError(service)" class="service-warning" role="status">
+          {{ contractCapabilityError(service) }}
+        </p>
 
         <footer v-if="canManage" class="publication-actions">
+          <el-tooltip content="查看宿主透传契约" placement="top">
+            <el-button size="small" plain aria-label="查看宿主透传契约" @click="openHostContract(service)">
+              <el-icon aria-hidden="true"><Document /></el-icon>
+            </el-button>
+          </el-tooltip>
           <el-button size="small" plain :loading="testingId === service.id" @click="testService(service)">
             <el-icon aria-hidden="true"><Link /></el-icon>测试
           </el-button>
@@ -136,14 +153,29 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="secretDialog" title="MCP 配置已生成" width="min(720px, 94vw)" :close-on-click-modal="false">
+    <el-dialog
+      v-model="secretDialog"
+      title="MCP 配置已生成"
+      width="min(720px, 94vw)"
+      :close-on-click-modal="false"
+      @closed="clearCreatedService"
+    >
       <el-alert
         title="此配置包含完整访问令牌，关闭后平台不会再次显示。丢失后请轮换凭证。"
         type="warning"
         :closable="false"
         show-icon
       />
-      <label class="config-label" for="agent-mcp-config">第三方 MCP 配置</label>
+      <el-alert
+        v-if="createdContractError"
+        class="dialog-error contract-capability-error"
+        type="error"
+        :title="createdContractError"
+        description="已阻止复制交付配置。请先升级并重启全部后端服务，再轮换凭证生成新配置。"
+        :closable="false"
+        show-icon
+      />
+      <label class="config-label" for="agent-mcp-config">第三方 MCP 连接配置</label>
       <el-input
         id="agent-mcp-config"
         :model-value="createdService?.config_json || ''"
@@ -152,10 +184,59 @@
         readonly
         :rows="11"
       />
+      <el-collapse v-if="!createdContractError" class="contract-details">
+        <el-collapse-item title="宿主透传契约" name="host-contract">
+          <el-alert
+            type="info"
+            title="该契约不含访问令牌，请与第三方宿主适配团队一并交付。"
+            :closable="false"
+            show-icon
+          />
+          <el-input
+            :model-value="hostContextContractJson"
+            class="config-output contract-output"
+            type="textarea"
+            readonly
+            :rows="12"
+            aria-label="宿主透传契约 JSON"
+          />
+          <el-button class="contract-copy" plain @click="copyHostContract">
+            <el-icon aria-hidden="true"><DocumentCopy /></el-icon>复制宿主契约
+          </el-button>
+        </el-collapse-item>
+      </el-collapse>
       <template #footer>
         <el-button @click="secretDialog = false">关闭</el-button>
-        <el-button type="primary" @click="copyConfig">
-          <el-icon aria-hidden="true"><DocumentCopy /></el-icon>复制完整配置
+        <el-button type="primary" :disabled="Boolean(createdContractError)" @click="copyConfig">
+          <el-icon aria-hidden="true"><DocumentCopy /></el-icon>复制连接配置
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="contractDialog"
+      title="宿主透传契约"
+      width="min(720px, 94vw)"
+      @closed="selectedContractService = null"
+    >
+      <el-alert
+        type="info"
+        title="该契约不含访问令牌，可单独交付给第三方宿主适配团队。"
+        :closable="false"
+        show-icon
+      />
+      <el-input
+        :model-value="selectedContractJson"
+        class="config-output contract-output"
+        type="textarea"
+        readonly
+        :rows="15"
+        aria-label="已发布服务的宿主透传契约 JSON"
+      />
+      <template #footer>
+        <el-button @click="contractDialog = false">关闭</el-button>
+        <el-button type="primary" @click="copySelectedHostContract">
+          <el-icon aria-hidden="true"><DocumentCopy /></el-icon>复制宿主契约
         </el-button>
       </template>
     </el-dialog>
@@ -163,7 +244,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import type { AgentMCPCandidate, AgentMCPService, AgentMCPServiceCreated } from '@/types'
@@ -178,7 +259,50 @@ const testingId = ref('')
 const rotatingId = ref('')
 const createDialog = ref(false)
 const secretDialog = ref(false)
+const contractDialog = ref(false)
 const createdService = ref<AgentMCPServiceCreated | null>(null)
+const selectedContractService = ref<AgentMCPService | null>(null)
+const requiredHostMetaKeys = [
+  'ai.rhzy/host-context-version',
+  'ai.rhzy/original-user-message',
+  'ai.rhzy/external-conversation-id',
+  'ai.rhzy/external-turn-id',
+]
+
+function isHostContract(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const contract = value as Record<string, unknown>
+  const requestMeta = contract.required_request_meta
+  return contract.input_contract_version === '2'
+    && contract.tool_name === 'invoke_agent'
+    && contract.tool_message_field === 'original_user_message'
+    && contract.host_context_version === '1'
+    && Boolean(requestMeta && typeof requestMeta === 'object' && !Array.isArray(requestMeta))
+    && requiredHostMetaKeys.every((key) => key in (requestMeta as Record<string, unknown>))
+}
+
+function verifiedContractJson(service: AgentMCPService | null | undefined): string {
+  if (!service || !isHostContract(service.host_context_contract)) return ''
+  if (!service.host_context_contract_json) return ''
+  try {
+    const parsed = JSON.parse(service.host_context_contract_json)
+    return isHostContract(parsed) ? service.host_context_contract_json : ''
+  } catch {
+    return ''
+  }
+}
+
+function contractCapabilityError(service: AgentMCPService | null | undefined): string {
+  return verifiedContractJson(service)
+    ? ''
+    : '当前后端未声明有效的宿主原文透传契约'
+}
+
+const hostContextContractJson = computed(
+  () => verifiedContractJson(createdService.value),
+)
+const createdContractError = computed(() => contractCapabilityError(createdService.value))
+const selectedContractJson = computed(() => verifiedContractJson(selectedContractService.value))
 const formError = ref('')
 const form = reactive({ name: '', agent_id: '', expires_in_days: 365 })
 
@@ -297,12 +421,11 @@ async function removeService(service: AgentMCPService) {
   }
 }
 
-async function copyConfig() {
-  const value = createdService.value?.config_json || ''
+async function copyText(value: string, successMessage: string) {
   if (!value) return
   try {
     await navigator.clipboard.writeText(value)
-    ElMessage.success('完整 MCP 配置已复制')
+    ElMessage.success(successMessage)
   } catch {
     const textarea = document.createElement('textarea')
     textarea.value = value
@@ -312,8 +435,45 @@ async function copyConfig() {
     textarea.select()
     document.execCommand('copy')
     textarea.remove()
-    ElMessage.success('完整 MCP 配置已复制')
+    ElMessage.success(successMessage)
   }
+}
+
+async function copyConfig() {
+  if (createdContractError.value) {
+    ElMessage.error(createdContractError.value)
+    return
+  }
+  await copyText(createdService.value?.config_json || '', 'MCP 连接配置已复制')
+}
+
+async function copyHostContract() {
+  if (createdContractError.value) {
+    ElMessage.error(createdContractError.value)
+    return
+  }
+  await copyText(
+    hostContextContractJson.value,
+    '宿主透传契约已复制',
+  )
+}
+
+function openHostContract(service: AgentMCPService) {
+  const error = contractCapabilityError(service)
+  if (error) {
+    ElMessage.error(`${error}，请先升级全部后端服务`)
+    return
+  }
+  selectedContractService.value = service
+  contractDialog.value = true
+}
+
+async function copySelectedHostContract() {
+  await copyText(selectedContractJson.value, '宿主透传契约已复制')
+}
+
+function clearCreatedService() {
+  createdService.value = null
 }
 
 function statusLabel(service: AgentMCPService) {
@@ -362,11 +522,15 @@ onMounted(load)
 .publication-actions { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-top: auto; padding-top: 14px; }
 .publication-actions .el-switch { margin-left: auto; }
 .readonly-notice { margin-bottom: 16px; }
+.host-contract-notice { margin-bottom: 16px; }
 .dialog-error { margin-bottom: 14px; }
 .full-width { width: 100%; }
 .candidate-option { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .config-label { display: block; margin: 16px 0 7px; color: var(--text-2); font-size: 12px; font-weight: 700; }
 .config-output :deep(.el-textarea__inner) { font: 12px/1.65 'Cascadia Code', Consolas, monospace; }
+.contract-details { margin-top: 14px; }
+.contract-output { margin-top: 12px; }
+.contract-copy { margin-top: 10px; }
 
 @media (max-width: 1100px) {
   .publication-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

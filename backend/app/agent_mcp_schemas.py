@@ -53,6 +53,8 @@ class AgentMCPServiceOut(BaseModel):
     last_used_at: datetime | None = None
     runtime_environment: str
     definition_hash: str
+    host_context_contract: dict
+    host_context_contract_json: str
     created_at: datetime
     updated_at: datetime
 

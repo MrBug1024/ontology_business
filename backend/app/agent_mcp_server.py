@@ -29,6 +29,10 @@ _authenticated_external_session = contextvars.ContextVar[str | None](
 _MCP_SESSION_ID_HEADER = b"mcp-session-id"
 _MAX_EXTERNAL_SESSION_ID_LENGTH = 128
 _MCP_SESSION_VERSION = "mcp1"
+_HOST_CONTEXT_VERSION_KEY = agent_mcp_service.HOST_CONTEXT_VERSION_KEY
+_HOST_ORIGINAL_MESSAGE_KEY = agent_mcp_service.HOST_ORIGINAL_MESSAGE_KEY
+_HOST_CONVERSATION_ID_KEY = agent_mcp_service.HOST_CONVERSATION_ID_KEY
+_HOST_TURN_ID_KEY = agent_mcp_service.HOST_TURN_ID_KEY
 
 
 def _parsed_tool_payload(value: Any) -> dict[str, Any] | None:
@@ -41,6 +45,44 @@ def _parsed_tool_payload(value: Any) -> dict[str, Any] | None:
     except (TypeError, json.JSONDecodeError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _request_meta(ctx: Context) -> dict[str, Any]:
+    """Return namespaced client metadata that is outside model tool arguments."""
+    meta = ctx.request_context.meta
+    extra = getattr(meta, "model_extra", None) if meta is not None else None
+    return extra if isinstance(extra, dict) else {}
+
+
+def _host_meta_string(
+    meta: dict[str, Any],
+    key: str,
+    *,
+    max_length: int,
+    preserve_whitespace: bool = False,
+) -> str | None:
+    value = meta.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise agent_mcp_service.AgentMCPError(
+            f"INVALID_HOST_CONTEXT: MCP _meta.{key} 必须是字符串"
+        )
+    if not value.strip():
+        raise agent_mcp_service.AgentMCPError(
+            f"INVALID_HOST_CONTEXT: MCP _meta.{key} 不能为空"
+        )
+    if len(value) > max_length:
+        raise agent_mcp_service.AgentMCPError(
+            f"INVALID_HOST_CONTEXT: MCP _meta.{key} 超过长度限制"
+        )
+    if preserve_whitespace:
+        return value
+    if value != value.strip():
+        raise agent_mcp_service.AgentMCPError(
+            f"INVALID_HOST_CONTEXT: MCP _meta.{key} 不能包含首尾空白"
+        )
+    return value
 
 
 def _public_citations(value: Any) -> list[dict[str, Any]]:
@@ -169,10 +211,31 @@ def _public_agent_result(result: dict[str, Any]) -> dict[str, Any]:
     public["continuation"] = {
         "conversation_id": conversation_id,
         "instruction": (
-            "Pass this conversation_id unchanged on every later invoke_agent call "
-            "for the same end-user conversation, including confirmation replies."
+            "Keep external_conversation_id stable for the same host UI chat. If the host "
+            "cannot inject one, pass this conversation_id unchanged on every later "
+            "invoke_agent call, including confirmation replies."
         ),
     }
+    conversation_mode = str(result.get("mcp_conversation_mode") or "")
+    if conversation_mode:
+        public["conversation_mode"] = conversation_mode
+    public["replayed"] = bool(result.get("mcp_replayed"))
+    input_receipt = result.get("mcp_input_receipt")
+    if isinstance(input_receipt, dict):
+        public["input_receipt"] = {
+            key: input_receipt[key]
+            for key in (
+                "source",
+                "message_sha256",
+                "message_length",
+                "tool_argument_matched",
+                "verbatim_attested_by",
+                "platform_observed_host_ui",
+                "external_conversation_bound",
+                "external_turn_bound",
+            )
+            if key in input_receipt
+        }
     return public
 
 
@@ -242,9 +305,9 @@ class AgentMCPBearerMiddleware:
             await send({"type": "http.response.body", "body": body})
             return
         # FastMCP intentionally remains stateless here so concurrent API workers
-        # do not require load-balancer affinity.  We still mint and echo the
-        # standard MCP session header; the durable service-layer mapping turns
-        # that external session into a stable platform conversation.
+        # do not require load-balancer affinity. We still mint and echo the
+        # transport session header, but it never identifies an end-user chat;
+        # only an explicit host conversation id can provide that continuity.
         external_session_id = external_session_id or self._new_session_id(
             authenticated.service_id
         )
@@ -326,11 +389,13 @@ settings = get_settings()
 mcp_server = FastMCP(
     name="Ontology Platform Agent Gateway",
     instructions=(
-        "The invoke_agent tool calls the complete configured Agent runtime, including its "
-        "governed data, skills, MCP tools and business capabilities. Pass each end user's "
-        "complete message verbatim in one call; do not summarize, rewrite, or split it. "
-        "For every later message in the same conversation, pass the conversation_id returned "
-        "by the prior call, even after reconnecting the MCP transport."
+        "The invoke_agent tool is a transparent handoff to the complete configured Agent, "
+        "not a search or planning sub-tool. Copy the end user's latest message character for "
+        "character into original_user_message and call exactly once for that user turn. Never "
+        "replace it with keywords, a plan, a rule lookup, or multiple calls. MCP transport "
+        "sessions are not end-user conversations. The host adapter must inject the original "
+        "message, external conversation id and turn id through the advertised namespaced "
+        "request _meta keys, or the call is rejected."
     ),
     streamable_http_path="/mcp",
     stateless_http=True,
@@ -347,20 +412,25 @@ mcp_server = FastMCP(
     name="invoke_agent",
     title="调用已发布 Agent",
     description=(
-        "将终端用户的一条完整原始消息交给当前凭证绑定的平台 Agent，并返回最终回答、引用和工具执行摘要。"
-        "每条用户消息只调用一次，不得先改写成检索词或拆成多次调用。首次调用不传 conversation_id；"
-        "后续消息（尤其是“确认执行”等回复）必须原样传入，并携带上次返回的 conversation_id。"
+        "这是完整 Agent 的原文转交入口，不是检索或规划工具。必须把终端用户本轮输入逐字复制到 "
+        "original_user_message，并且每个用户轮次只调用一次。禁止把审计请求改写成关键词、规则检索、"
+        "执行计划或多次子调用。MCP 连接不代表用户会话；第三方适配层必须通过工具 _meta 直接注入用户"
+        "原文、UI 会话 ID 和消息 ID，不能交给模型生成；缺失或原文不一致时调用会被拒绝。"
     ),
+    meta={"ai.rhzy/input-contract": agent_mcp_service.host_context_contract()},
     structured_output=True,
 )
 async def invoke_agent(
     ctx: Context,
-    message: Annotated[
+    original_user_message: Annotated[
         str,
         Field(
             min_length=1,
             max_length=12000,
-            description="终端用户本轮完整原文；必须逐字传入，不得摘要、改写、扩写或拆分",
+            description=(
+                "终端用户聊天框中本轮输入的逐字原文，包括原有空格、引号和换行。直接复制，"
+                "不得改写为检索词、规则查询、执行参数、摘要或计划"
+            ),
         ),
     ],
     conversation_id: Annotated[
@@ -381,6 +451,65 @@ async def invoke_agent(
         raise agent_mcp_service.AgentMCPError("Agent MCP 身份上下文不存在")
     if not external_session_id:
         raise agent_mcp_service.AgentMCPError("Agent MCP 会话上下文不存在")
+    request_meta = _request_meta(ctx)
+    host_context_version = _host_meta_string(
+        request_meta,
+        _HOST_CONTEXT_VERSION_KEY,
+        max_length=16,
+    )
+    if host_context_version not in {None, "1"}:
+        raise agent_mcp_service.AgentMCPError(
+            "UNSUPPORTED_HOST_CONTEXT: 不支持的 ai.rhzy host context 版本"
+        )
+    if settings.agent_mcp_require_host_context and host_context_version != "1":
+        raise agent_mcp_service.AgentMCPError(
+            "MISSING_HOST_CONTEXT: 当前 Agent MCP 发布要求宿主注入 host context v1"
+        )
+    host_message = _host_meta_string(
+        request_meta,
+        _HOST_ORIGINAL_MESSAGE_KEY,
+        max_length=12000,
+        preserve_whitespace=True,
+    )
+    host_conversation_id = _host_meta_string(
+        request_meta,
+        _HOST_CONVERSATION_ID_KEY,
+        max_length=256,
+    )
+    host_turn_id = _host_meta_string(
+        request_meta,
+        _HOST_TURN_ID_KEY,
+        max_length=256,
+    )
+    if host_context_version == "1":
+        missing_host_context = [
+            key
+            for key, value in (
+                (_HOST_ORIGINAL_MESSAGE_KEY, host_message),
+                (_HOST_CONVERSATION_ID_KEY, host_conversation_id),
+                (_HOST_TURN_ID_KEY, host_turn_id),
+            )
+            if value is None
+        ]
+        if missing_host_context:
+            raise agent_mcp_service.AgentMCPError(
+                "MISSING_HOST_CONTEXT: MCP host context v1 缺少："
+                + "、".join(missing_host_context)
+            )
+        if original_user_message != host_message:
+            raise agent_mcp_service.AgentMCPError(
+                "ORIGINAL_MESSAGE_MISMATCH: original_user_message 与宿主注入的用户原文不一致"
+            )
+    message = host_message if host_message is not None else original_user_message
+    resolved_external_conversation_id = host_conversation_id
+    resolved_external_turn_id = host_turn_id
+    input_source = (
+        "host_context_v1"
+        if host_context_version == "1"
+        else "host_context"
+        if host_message is not None
+        else "tool_argument_unverified"
+    )
     await ctx.info("已接收请求，正在调用绑定的 Agent。")
     result = await asyncio.to_thread(
         agent_mcp_service.invoke_published_agent,
@@ -389,11 +518,35 @@ async def invoke_agent(
         conversation_id=conversation_id,
         external_session_id=external_session_id,
         external_request_id=ctx.request_id,
+        external_conversation_id=resolved_external_conversation_id,
+        external_turn_id=resolved_external_turn_id,
+        input_source=input_source,
+        tool_argument_matched=original_user_message == message,
     )
     await ctx.info("Agent 调用完成。")
     public_result = _public_agent_result(result)
+    request_receipt = {
+        "source": input_source,
+        "host_context_version": host_context_version or "",
+        "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        "message_length": len(message),
+        "tool_argument_matched": original_user_message == message,
+        "verbatim_attested_by": (
+            "third_party_host_adapter" if host_context_version == "1" else ""
+        ),
+        "platform_observed_host_ui": False,
+        "external_conversation_bound": bool(resolved_external_conversation_id),
+        "external_turn_bound": bool(resolved_external_turn_id),
+    }
+    if "input_receipt" not in public_result:
+        public_result["input_receipt"] = request_receipt
+    public_result["request_receipt"] = request_receipt
     continuation_text = json.dumps(
-        {"mcp_continuation": public_result["continuation"]},
+        {
+            "mcp_continuation": public_result["continuation"],
+            "input_receipt": public_result["input_receipt"],
+            "request_receipt": public_result["request_receipt"],
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )

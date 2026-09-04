@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -17,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 
 from app import agent_mcp_server
@@ -59,6 +60,120 @@ def test_mcp_session_mapping_migration_grants_runtime_role() -> None:
     assert "agent_mcp_conversations" in statement
     assert "GRANT SELECT, INSERT, UPDATE, DELETE" in statement
     assert "TO ontology_app" in statement
+
+
+def test_mcp_conversation_canonicalization_migration_is_chained() -> None:
+    from importlib import import_module
+
+    migration = import_module(
+        "migrations.versions.20260904_13_canonicalize_agent_mcp_conversations"
+    )
+    assert migration.down_revision == "20260904_12"
+    statement = str(migration._canonicalize_statement())
+    assert "ROW_NUMBER() OVER" in statement
+    assert "legacy_conversation_id = mapping.conversation_id" in statement
+    assert "binding_kind = 'legacy_duplicate'" in statement
+    assert "turn_lease_token = ''" in statement
+    interrupted = str(migration._fail_interrupted_duplicate_invocations_statement())
+    assert "AgentMCPMigrationInterrupted" in interrupted
+    assert "invocation.status = 'running'" in interrupted
+    restored = str(migration._restore_legacy_conversations_statement())
+    assert "conversation_id = legacy_conversation_id" in restored
+
+
+def test_mcp_conversation_canonicalization_preserves_duplicate_audit_rows() -> None:
+    from importlib import import_module
+
+    migration = import_module(
+        "migrations.versions.20260904_13_canonicalize_agent_mcp_conversations"
+    )
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """CREATE TABLE agent_mcp_conversations (
+                id TEXT PRIMARY KEY,
+                service_id TEXT NOT NULL,
+                conversation_id TEXT,
+                legacy_conversation_id TEXT,
+                binding_kind TEXT NOT NULL,
+                turn_lease_token TEXT NOT NULL,
+                turn_lease_expires_at TEXT,
+                turn_lease_deadline_at TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.exec_driver_sql(
+            """CREATE TABLE agent_mcp_invocations (
+                id TEXT PRIMARY KEY,
+                mcp_conversation_id TEXT,
+                status TEXT NOT NULL,
+                error_code TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                completed_at TEXT
+            )"""
+        )
+        connection.execute(
+            text(
+                """INSERT INTO agent_mcp_conversations
+                (id, service_id, conversation_id, legacy_conversation_id,
+                 binding_kind, turn_lease_token, created_at)
+                VALUES
+                ('mapping-a', 'service-a', 'conversation-a', NULL,
+                 'legacy_transport', '', '2026-09-04 01:00:00'),
+                ('mapping-b', 'service-a', 'conversation-a', NULL,
+                 'legacy_transport', 'old-owner', '2026-09-04 02:00:00')"""
+            )
+        )
+        connection.execute(
+            text(
+                """INSERT INTO agent_mcp_invocations
+                (id, mcp_conversation_id, status, error_code, error_message)
+                VALUES ('invocation-b', 'mapping-b', 'running', '', '')"""
+            )
+        )
+        connection.execute(
+            migration._fail_interrupted_duplicate_invocations_statement()
+        )
+        connection.execute(migration._canonicalize_statement())
+
+        mappings = connection.execute(
+            text(
+                """SELECT id, conversation_id, legacy_conversation_id,
+                          binding_kind, turn_lease_token
+                   FROM agent_mcp_conversations ORDER BY id"""
+            )
+        ).all()
+        invocation = connection.execute(
+            text(
+                """SELECT status, error_code
+                   FROM agent_mcp_invocations WHERE id = 'invocation-b'"""
+            )
+        ).one()
+        assert tuple(mappings[0]) == (
+            "mapping-a",
+            "conversation-a",
+            None,
+            "legacy_transport",
+            "",
+        )
+        assert tuple(mappings[1]) == (
+            "mapping-b",
+            None,
+            "conversation-a",
+            "legacy_duplicate",
+            "",
+        )
+        assert tuple(invocation) == ("failed", "AgentMCPMigrationInterrupted")
+
+        connection.execute(migration._restore_legacy_conversations_statement())
+        restored = connection.execute(
+            text(
+                """SELECT conversation_id FROM agent_mcp_conversations
+                   WHERE id = 'mapping-b'"""
+            )
+        ).scalar_one()
+        assert restored == "conversation-a"
+    engine.dispose()
 
 
 def test_browser_mcp_clients_can_read_session_response_header() -> None:
@@ -396,16 +511,37 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 json={"name": "医保违规审计助手", "agent_id": self.agent.id, "expires_in_days": 30},
             )
             self.assertEqual(created.status_code, 201, created.text)
+            self.assertEqual(created.headers["cache-control"], "no-store")
+            self.assertEqual(created.headers["pragma"], "no-cache")
             payload = created.json()
             raw_token = payload["token"]
             self.assertTrue(raw_token.startswith("agt_sk_"))
             self.assertIn(raw_token, payload["config_json"])
             self.assertEqual(payload["config"]["mcpServers"]["医保违规审计助手"]["url"], "http://testserver/mcp")
+            self.assertNotIn(raw_token, payload["host_context_contract_json"])
+            self.assertEqual(
+                payload["host_context_contract"]["required_request_meta"][
+                    "ai.rhzy/host-context-version"
+                ],
+                "1",
+            )
+            self.assertIn(
+                "ai.rhzy/original-user-message",
+                payload["host_context_contract_json"],
+            )
 
             listed = self.client.get("/api/agent-mcp-services")
             self.assertEqual(listed.status_code, 200, listed.text)
             self.assertNotIn("token", listed.json()[0])
             self.assertNotIn(raw_token, listed.text)
+            self.assertEqual(
+                listed.json()[0]["host_context_contract"]["input_contract_version"],
+                "2",
+            )
+            self.assertIn(
+                "ai.rhzy/external-conversation-id",
+                listed.json()[0]["host_context_contract_json"],
+            )
 
             self.current_user = self.viewer
             viewer_list = self.client.get("/api/agent-mcp-services")
@@ -425,6 +561,7 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 json={"expires_in_days": 60},
             )
             self.assertEqual(rotated.status_code, 200, rotated.text)
+            self.assertEqual(rotated.headers["cache-control"], "no-store")
             new_token = rotated.json()["token"]
             self.assertNotEqual(new_token, raw_token)
             with patch.object(agent_mcp_service, "SessionLocal", self.Session):
@@ -444,10 +581,10 @@ class AgentMCPPublicationTests(unittest.TestCase):
             service_id="service-agent-mcp",
             name="医保违规审计助手",
         )
-        received_session_ids: list[str] = []
+        received_calls: list[dict] = []
 
         def invoke(_service_id: str, **kwargs):
-            received_session_ids.append(kwargs["external_session_id"])
+            received_calls.append(kwargs)
             return {
                 "answer": "审计完成",
                 "conversation_id": "conversation-test",
@@ -505,6 +642,11 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 },
             }
 
+        original_message = (
+            '审计 贵阳泰康乐综合医院  开展"电子结肠镜"检查，\n'
+            "重复收取电子乙状结肠镜检查费用 的全部违规数据"
+        )
+
         async def exercise() -> None:
             transport = httpx.ASGITransport(app=agent_mcp_server.mcp_app)
             async with agent_mcp_server.mcp_server.session_manager.run():
@@ -522,17 +664,69 @@ class AgentMCPPublicationTests(unittest.TestCase):
                             tools = await session.list_tools()
                             self.assertEqual([tool.name for tool in tools.tools], ["invoke_agent"])
                             invoke_tool = tools.tools[0]
-                            self.assertIn("完整原始消息", invoke_tool.description)
+                            self.assertIn("原文转交入口", invoke_tool.description)
+                            self.assertNotIn("message", invoke_tool.inputSchema["properties"])
                             self.assertIn(
-                                "不得摘要、改写",
-                                invoke_tool.inputSchema["properties"]["message"]["description"],
+                                "original_user_message",
+                                invoke_tool.inputSchema["required"],
+                            )
+                            self.assertIn(
+                                "不得改写为检索词",
+                                invoke_tool.inputSchema["properties"]["original_user_message"][
+                                    "description"
+                                ],
+                            )
+                            self.assertEqual(
+                                set(invoke_tool.inputSchema["properties"]),
+                                {"original_user_message", "conversation_id"},
                             )
                             self.assertIn(
                                 "后续每次调用必须传入",
                                 invoke_tool.inputSchema["properties"]["conversation_id"]["description"],
                             )
+                            advertised_contract = invoke_tool.meta[
+                                "ai.rhzy/input-contract"
+                            ]
+                            self.assertEqual(
+                                advertised_contract,
+                                agent_mcp_service.host_context_contract(),
+                            )
+                            self.assertEqual(
+                                advertised_contract["input_contract_version"],
+                                "2",
+                            )
+                            self.assertTrue(
+                                advertised_contract["strict_host_context_required"]
+                            )
+                            self.assertFalse(
+                                advertised_contract["trust_boundary"][
+                                    "platform_observes_third_party_ui"
+                                ]
+                            )
+                            legacy = await session.call_tool(
+                                "invoke_agent",
+                                {"message": "不再接受的旧参数"},
+                            )
+                            self.assertTrue(legacy.isError)
+                            self.assertIn("original_user_message", legacy.content[0].text)
+                            no_host_context = await session.call_tool(
+                                "invoke_agent",
+                                {"original_user_message": original_message},
+                            )
+                            self.assertTrue(no_host_context.isError)
+                            self.assertIn(
+                                "MISSING_HOST_CONTEXT",
+                                no_host_context.content[0].text,
+                            )
                             result = await session.call_tool(
-                                "invoke_agent", {"message": "执行医保违规审计"}
+                                "invoke_agent",
+                                {"original_user_message": original_message},
+                                meta={
+                                    "ai.rhzy/host-context-version": "1",
+                                    "ai.rhzy/original-user-message": original_message,
+                                    "ai.rhzy/external-conversation-id": "third-party-chat-1",
+                                    "ai.rhzy/external-turn-id": "third-party-message-1",
+                                },
                             )
                             self.assertFalse(result.isError)
                             self.assertEqual(result.structuredContent["answer"], "审计完成")
@@ -584,10 +778,58 @@ class AgentMCPPublicationTests(unittest.TestCase):
                                 10_000,
                             )
                             repeated = await session.call_tool(
-                                "invoke_agent", {"message": "继续审计"}
+                                "invoke_agent",
+                                {
+                                    "original_user_message": "确认执行",
+                                    "conversation_id": "conversation-test",
+                                },
+                                meta={
+                                    "ai.rhzy/host-context-version": "1",
+                                    "ai.rhzy/original-user-message": "确认执行",
+                                    "ai.rhzy/external-conversation-id": "third-party-chat-1",
+                                    "ai.rhzy/external-turn-id": "third-party-message-2",
+                                },
                             )
                             self.assertFalse(repeated.isError)
                             self.assertEqual(repeated.structuredContent["answer"], "审计完成")
+                            self.assertEqual(
+                                repeated.structuredContent["input_receipt"]["source"],
+                                "host_context_v1",
+                            )
+                            self.assertTrue(
+                                repeated.structuredContent["input_receipt"][
+                                    "tool_argument_matched"
+                                ]
+                            )
+                            self.assertNotIn(
+                                "conversation_binding_hash",
+                                repeated.structuredContent["input_receipt"],
+                            )
+                            mismatch = await session.call_tool(
+                                "invoke_agent",
+                                {"original_user_message": "模型生成的确认摘要"},
+                                meta={
+                                    "ai.rhzy/host-context-version": "1",
+                                    "ai.rhzy/original-user-message": "确认执行",
+                                    "ai.rhzy/external-conversation-id": "third-party-chat-1",
+                                    "ai.rhzy/external-turn-id": "third-party-message-3",
+                                },
+                            )
+                            self.assertTrue(mismatch.isError)
+                            self.assertIn(
+                                "ORIGINAL_MESSAGE_MISMATCH",
+                                mismatch.content[0].text,
+                            )
+                            missing_context = await session.call_tool(
+                                "invoke_agent",
+                                {"original_user_message": "不会执行"},
+                                meta={
+                                    "ai.rhzy/host-context-version": "1",
+                                    "ai.rhzy/original-user-message": "不会执行",
+                                },
+                            )
+                            self.assertTrue(missing_context.isError)
+                            self.assertIn("host context v1 缺少", missing_context.content[0].text)
 
         with (
             patch.object(agent_mcp_service, "SessionLocal", self.Session),
@@ -598,11 +840,21 @@ class AgentMCPPublicationTests(unittest.TestCase):
             ),
         ):
             asyncio.run(exercise())
-        self.assertEqual(len(received_session_ids), 2)
-        self.assertTrue(received_session_ids[0])
-        self.assertEqual(received_session_ids[0], received_session_ids[1])
+        self.assertEqual(len(received_calls), 2)
+        self.assertTrue(received_calls[0]["external_session_id"])
+        self.assertEqual(
+            received_calls[0]["external_session_id"],
+            received_calls[1]["external_session_id"],
+        )
+        self.assertEqual(received_calls[0]["message"], original_message)
+        self.assertEqual(received_calls[1]["message"], "确认执行")
+        self.assertEqual(
+            received_calls[0]["external_conversation_id"],
+            "third-party-chat-1",
+        )
+        self.assertEqual(received_calls[1]["external_turn_id"], "third-party-message-2")
 
-    def test_external_mcp_session_reuses_one_conversation_and_is_service_scoped(self) -> None:
+    def test_transport_session_does_not_define_end_user_conversation(self) -> None:
         self._add_published_service(service_id="service-session-a")
         other_tenant = Tenant(id="tenant-agent-mcp-other", name="另一组织")
         other_owner = User(
@@ -670,27 +922,33 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 message="第一轮",
                 conversation_id=None,
                 external_session_id="third-party-session-1",
+                external_request_id="rpc-1",
             )
             second = agent_mcp_service.invoke_published_agent(
                 "service-session-a",
                 message="第二轮",
                 conversation_id=None,
                 external_session_id="third-party-session-1",
+                # JSON-RPC ids may be reused after a completed response. The
+                # changed payload must still start an isolated transcript.
+                external_request_id="rpc-1",
             )
             resumed_after_reconnect = agent_mcp_service.invoke_published_agent(
                 "service-session-a",
                 message="重连后的确认回复",
                 conversation_id=first["conversation_id"],
                 external_session_id="third-party-session-2",
+                external_request_id="rpc-1",
             )
             other_service = agent_mcp_service.invoke_published_agent(
                 "service-session-b",
                 message="隔离会话",
                 conversation_id=None,
                 external_session_id="third-party-session-1",
+                external_request_id="rpc-1",
             )
 
-        self.assertEqual(first["conversation_id"], second["conversation_id"])
+        self.assertNotEqual(first["conversation_id"], second["conversation_id"])
         self.assertEqual(
             first["conversation_id"], resumed_after_reconnect["conversation_id"]
         )
@@ -700,7 +958,7 @@ class AgentMCPPublicationTests(unittest.TestCase):
             [
                 first["conversation_id"],
                 second["conversation_id"],
-                resumed_after_reconnect["conversation_id"],
+                first["conversation_id"],
             ],
         )
         db = self.Session()
@@ -724,8 +982,193 @@ class AgentMCPPublicationTests(unittest.TestCase):
             )
             self.assertEqual(
                 len(db.execute(select(Conversation)).scalars().all()),
+                3,
+            )
+        finally:
+            db.close()
+
+    def test_external_conversation_id_reuses_across_transport_sessions(self) -> None:
+        self._add_published_service(service_id="service-external-conversation")
+        observed: list[tuple[str, str, str]] = []
+
+        def runtime_status(db, service):
+            return db.get(Agent, service.agent_id), self.context, [], False
+
+        def invoke(
+            _agent_id: str,
+            *,
+            message: str,
+            conversation_id: str | None,
+            db,
+            runtime_context,
+        ):
+            assert conversation_id is not None
+            observed.append(
+                (
+                    message,
+                    conversation_id,
+                    str(db.info.get("agent_mcp_turn_request_hash") or ""),
+                )
+            )
+            return {
+                "answer": message,
+                "conversation_id": conversation_id,
+                "trace_id": f"trace-{len(observed)}",
+                "tool_calls": [],
+                "tool_results": [],
+            }
+
+        original = '审计 贵阳泰康乐综合医院  刮痧"治疗"收费大于两次\n的全部违规数据'
+        with (
+            patch.object(agent_mcp_service, "SessionLocal", self.Session),
+            patch.object(agent_mcp_service, "service_runtime_status", side_effect=runtime_status),
+            patch("app.routers.agents.invoke_agent_once", side_effect=invoke),
+        ):
+            first = agent_mcp_service.invoke_published_agent(
+                "service-external-conversation",
+                message=original,
+                conversation_id=None,
+                external_session_id="transport-1",
+                external_request_id="rpc-1",
+                external_conversation_id="ui-chat-a",
+                external_turn_id="ui-message-a1",
+            )
+            continued = agent_mcp_service.invoke_published_agent(
+                "service-external-conversation",
+                message="确认执行",
+                conversation_id=None,
+                external_session_id="transport-2",
+                external_request_id="rpc-1",
+                external_conversation_id="ui-chat-a",
+                external_turn_id="ui-message-a2",
+            )
+            separate = agent_mcp_service.invoke_published_agent(
+                "service-external-conversation",
+                message="另一会话",
+                conversation_id=None,
+                external_session_id="transport-2",
+                external_request_id="rpc-2",
+                external_conversation_id="ui-chat-b",
+                external_turn_id="ui-message-a1",
+            )
+            with self.assertRaisesRegex(
+                agent_mcp_service.AgentMCPError,
+                "CONVERSATION_BINDING_CONFLICT",
+            ):
+                agent_mcp_service.invoke_published_agent(
+                    "service-external-conversation",
+                    message="不得串接",
+                    conversation_id=first["conversation_id"],
+                    external_session_id="transport-2",
+                    external_request_id="rpc-3",
+                    external_conversation_id="ui-chat-c",
+                    external_turn_id="ui-message-c1",
+                )
+
+        self.assertEqual(observed[0][0], original)
+        self.assertEqual(first["conversation_id"], continued["conversation_id"])
+        self.assertNotEqual(first["conversation_id"], separate["conversation_id"])
+        self.assertNotEqual(observed[0][2], observed[2][2])
+        self.assertEqual(first["mcp_conversation_mode"], "external_conversation_id")
+        self.assertEqual(
+            first["mcp_input_receipt"]["conversation_binding_hash"],
+            continued["mcp_input_receipt"]["conversation_binding_hash"],
+        )
+        self.assertNotEqual(
+            first["mcp_input_receipt"]["conversation_binding_hash"],
+            separate["mcp_input_receipt"]["conversation_binding_hash"],
+        )
+        db = self.Session()
+        try:
+            self.assertEqual(
+                len(db.execute(select(AgentMCPConversation)).scalars().all()),
                 2,
             )
+            self.assertEqual(
+                len(db.execute(select(Conversation)).scalars().all()),
+                2,
+            )
+            invocations = db.execute(select(AgentMCPInvocation)).scalars().all()
+            self.assertEqual(len(invocations), 3)
+            self.assertTrue(
+                all(item.result["mcp_input_receipt"]["message_sha256"] for item in invocations)
+            )
+            self.assertEqual(
+                {mapping.binding_kind for mapping in db.execute(
+                    select(AgentMCPConversation)
+                ).scalars().all()},
+                {"external_conversation_id"},
+            )
+        finally:
+            db.close()
+
+    def test_host_conversation_refuses_ambiguous_legacy_mapping_adoption(self) -> None:
+        self._add_published_service(service_id="service-adopt-legacy-mapping")
+        observed: list[tuple[str, str]] = []
+
+        def runtime_status(db, service):
+            return db.get(Agent, service.agent_id), self.context, [], False
+
+        def invoke(
+            _agent_id: str,
+            *,
+            message: str,
+            conversation_id: str | None,
+            db,
+            runtime_context,
+        ):
+            assert conversation_id is not None
+            observed.append((message, conversation_id))
+            return {
+                "answer": message,
+                "conversation_id": conversation_id,
+                "trace_id": f"trace-{len(observed)}",
+                "tool_calls": [],
+                "tool_results": [],
+            }
+
+        with (
+            patch.object(agent_mcp_service, "SessionLocal", self.Session),
+            patch.object(agent_mcp_service, "service_runtime_status", side_effect=runtime_status),
+            patch("app.routers.agents.invoke_agent_once", side_effect=invoke),
+        ):
+            legacy = agent_mcp_service.invoke_published_agent(
+                "service-adopt-legacy-mapping",
+                message="需要确认的历史请求",
+                conversation_id=None,
+                external_session_id="legacy-transport",
+                external_request_id="rpc-legacy",
+            )
+            db = self.Session()
+            try:
+                before = db.execute(select(AgentMCPConversation)).scalar_one()
+                before_mapping_id = before.id
+                self.assertEqual(before.binding_kind, "isolated_turn")
+            finally:
+                db.close()
+
+            with self.assertRaisesRegex(
+                agent_mcp_service.AgentMCPError,
+                "CONVERSATION_BINDING_CONFLICT",
+            ):
+                agent_mcp_service.invoke_published_agent(
+                    "service-adopt-legacy-mapping",
+                    message="确认执行",
+                    conversation_id=legacy["conversation_id"],
+                    external_session_id="new-transport",
+                    external_request_id="rpc-confirm",
+                    external_conversation_id="host-ui-chat-42",
+                    external_turn_id="host-ui-turn-2",
+                    input_source="host_context_v1",
+                )
+
+        self.assertEqual([item[0] for item in observed], ["需要确认的历史请求"])
+        db = self.Session()
+        try:
+            mappings = db.execute(select(AgentMCPConversation)).scalars().all()
+            self.assertEqual(len(mappings), 1)
+            self.assertEqual(mappings[0].id, before_mapping_id)
+            self.assertEqual(mappings[0].binding_kind, "isolated_turn")
         finally:
             db.close()
 
@@ -738,12 +1181,13 @@ class AgentMCPPublicationTests(unittest.TestCase):
             db.connection().exec_driver_sql("PRAGMA foreign_keys = ON")
             service = db.get(AgentMCPService, "service-conversation-fk-order")
             assert service is not None
-            binding = agent_mcp_service._conversation_for_external_session(
+            binding = agent_mcp_service._conversation_for_external_binding(
                 db,
                 service,
                 message="外部 MCP 会话初始化",
                 conversation_id=None,
-                external_session_id="mcp-session-fk-order",
+                binding_key="isolated-turn\0mcp-session-fk-order\0rpc-1",
+                binding_mode="isolated_turn",
                 agents=SimpleNamespace(),
             )
             mapping = db.get(AgentMCPConversation, binding.mapping_id)
@@ -839,9 +1283,10 @@ class AgentMCPPublicationTests(unittest.TestCase):
             )
         )
 
-    def test_same_session_serializes_turns_and_replays_one_request(self) -> None:
+    def test_same_business_conversation_serializes_turns_and_replays_one_request(self) -> None:
         self._add_published_service(service_id="service-serialized-session")
         external_session_id = "signed-session-test"
+        external_conversation_id = "third-party-chat-serialized"
         db = self.Session()
         try:
             conversation = Conversation(
@@ -856,8 +1301,8 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 tenant_id=self.tenant.id,
                 agent_id=self.agent.id,
                 execution_user_id=self.owner.id,
-                external_session_hash=agent_mcp_service.external_session_hash(
-                    external_session_id
+                external_session_hash=agent_mcp_service.conversation_binding_hash(
+                    f"external-conversation\0{external_conversation_id}"
                 ),
                 conversation_id=conversation.id,
             )
@@ -906,6 +1351,7 @@ class AgentMCPPublicationTests(unittest.TestCase):
                     conversation_id=None,
                     external_session_id=external_session_id,
                     external_request_id=request_id,
+                    external_conversation_id=external_conversation_id,
                 )
             except BaseException as exc:  # test thread must report failures.
                 errors[key] = exc
@@ -940,14 +1386,27 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 conversation_id=None,
                 external_session_id=external_session_id,
                 external_request_id="rpc-1",
+                external_conversation_id=external_conversation_id,
+                input_source="host_context_v1",
             )
 
         self.assertFalse(errors, errors)
         self.assertEqual([item[0] for item in observed], ["first", "second"])
         self.assertEqual(results["first"]["answer"], "first")
-        self.assertEqual(results["retry"], results["first"])
+        self.assertEqual(results["retry"]["answer"], results["first"]["answer"])
+        self.assertEqual(
+            results["retry"]["conversation_id"],
+            results["first"]["conversation_id"],
+        )
+        self.assertFalse(results["first"]["mcp_replayed"])
+        self.assertTrue(results["retry"]["mcp_replayed"])
         self.assertEqual(results["second"]["answer"], "second")
-        self.assertEqual(replay, results["first"])
+        self.assertEqual(replay["answer"], results["first"]["answer"])
+        self.assertTrue(replay["mcp_replayed"])
+        self.assertEqual(
+            replay["mcp_input_receipt"]["source"],
+            "tool_argument_unverified",
+        )
         # The one model invocation represents the non-confirmed side-effect
         # boundary: a concurrent/transport retry of rpc-1 never enters it.
         self.assertEqual(sum(1 for item in observed if item[0] == "first"), 1)
@@ -964,7 +1423,11 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 item
                 for item in invocations
                 if item.external_request_hash
-                == agent_mcp_service.external_request_hash("rpc-1")
+                == agent_mcp_service.external_request_hash(
+                    "transport-request\0"
+                    f"{external_session_id}\0rpc-1\0"
+                    + hashlib.sha256(b"first").hexdigest()
+                )
             )
             self.assertEqual(first_invocation.status, "succeeded")
             self.assertEqual(first_invocation.result["answer"], "first")
@@ -987,8 +1450,8 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 tenant_id=self.tenant.id,
                 agent_id=self.agent.id,
                 execution_user_id=self.owner.id,
-                external_session_hash=agent_mcp_service.external_session_hash(
-                    "expired-session"
+                external_session_hash=agent_mcp_service.conversation_binding_hash(
+                    "external-conversation\0expired-session"
                 ),
                 conversation_id=conversation.id,
             )
@@ -999,7 +1462,7 @@ class AgentMCPPublicationTests(unittest.TestCase):
             binding = agent_mcp_service.MCPConversationBinding(
                 mapping_id=mapping.id,
                 conversation_id=conversation.id,
-                external_session_hash=mapping.external_session_hash,
+                binding_key_hash=mapping.external_session_hash,
             )
             first = agent_mcp_service._claim_mcp_turn(
                 db,
@@ -1054,6 +1517,253 @@ class AgentMCPPublicationTests(unittest.TestCase):
             self.assertEqual(replacement_invocation.status, "succeeded")
         finally:
             db.close()
+
+    def test_claim_refreshes_cached_mapping_before_deciding_lease_owner(self) -> None:
+        self._add_published_service(service_id="service-refresh-claim-lease")
+        db = self.Session()
+        other = self.Session()
+        try:
+            conversation = Conversation(
+                id="conversation-refresh-claim-lease",
+                agent_id=self.agent.id,
+                created_by_user_id=self.owner.id,
+                title="缓存租约测试",
+            )
+            mapping = AgentMCPConversation(
+                id="mapping-refresh-claim-lease",
+                service_id="service-refresh-claim-lease",
+                tenant_id=self.tenant.id,
+                agent_id=self.agent.id,
+                execution_user_id=self.owner.id,
+                external_session_hash=agent_mcp_service.conversation_binding_hash(
+                    "external-conversation\0refresh-claim"
+                ),
+                binding_kind="external_conversation_id",
+                conversation_id=conversation.id,
+            )
+            db.add_all([conversation, mapping])
+            db.commit()
+            service = db.get(AgentMCPService, "service-refresh-claim-lease")
+            cached_mapping = db.get(AgentMCPConversation, mapping.id)
+            assert service is not None
+            assert cached_mapping is not None
+            db.commit()
+
+            current = other.get(AgentMCPConversation, mapping.id)
+            assert current is not None
+            current.turn_lease_token = "current-owner"
+            current.turn_lease_generation = 7
+            current.turn_lease_expires_at = (
+                agent_mcp_service.utc_now() + timedelta(seconds=30)
+            )
+            current.turn_lease_deadline_at = (
+                agent_mcp_service.utc_now() + timedelta(seconds=60)
+            )
+            other.commit()
+
+            claim = agent_mcp_service._claim_mcp_turn_once(
+                db,
+                service=service,
+                binding=agent_mcp_service.MCPConversationBinding(
+                    mapping_id=mapping.id,
+                    conversation_id=conversation.id,
+                    binding_key_hash=mapping.external_session_hash,
+                ),
+                request_hash=agent_mcp_service.external_request_hash("waiting-request"),
+                input_hash="c" * 64,
+                request_id="waiting-internal-request",
+            )
+            self.assertIsNone(claim)
+            self.assertEqual(cached_mapping.turn_lease_token, "current-owner")
+            self.assertEqual(cached_mapping.turn_lease_generation, 7)
+        finally:
+            other.close()
+            db.close()
+
+    def test_late_failure_refreshes_rows_and_preserves_newer_lease(self) -> None:
+        self._add_published_service(service_id="service-refresh-fail-lease")
+        db = self.Session()
+        other = self.Session()
+        try:
+            conversation = Conversation(
+                id="conversation-refresh-fail-lease",
+                agent_id=self.agent.id,
+                created_by_user_id=self.owner.id,
+                title="失败围栏测试",
+            )
+            mapping = AgentMCPConversation(
+                id="mapping-refresh-fail-lease",
+                service_id="service-refresh-fail-lease",
+                tenant_id=self.tenant.id,
+                agent_id=self.agent.id,
+                execution_user_id=self.owner.id,
+                external_session_hash=agent_mcp_service.conversation_binding_hash(
+                    "external-conversation\0refresh-fail"
+                ),
+                binding_kind="external_conversation_id",
+                conversation_id=conversation.id,
+                turn_lease_token="old-owner",
+                turn_lease_generation=1,
+                turn_lease_expires_at=agent_mcp_service.utc_now() + timedelta(seconds=30),
+                turn_lease_deadline_at=agent_mcp_service.utc_now() + timedelta(seconds=60),
+            )
+            invocation = AgentMCPInvocation(
+                id="invocation-refresh-fail-lease",
+                service_id="service-refresh-fail-lease",
+                tenant_id=self.tenant.id,
+                agent_id=self.agent.id,
+                execution_user_id=self.owner.id,
+                request_id="request-refresh-fail",
+                mcp_conversation_id=mapping.id,
+                external_request_hash=agent_mcp_service.external_request_hash(
+                    "request-refresh-fail"
+                ),
+                turn_lease_token="old-owner",
+                turn_lease_generation=1,
+                conversation_id=conversation.id,
+                input_hash="d" * 64,
+                status="running",
+            )
+            db.add_all([conversation, mapping, invocation])
+            db.commit()
+            cached_mapping = db.get(AgentMCPConversation, mapping.id)
+            cached_invocation = db.get(AgentMCPInvocation, invocation.id)
+            assert cached_mapping is not None
+            assert cached_invocation is not None
+            db.commit()
+
+            current_mapping = other.get(AgentMCPConversation, mapping.id)
+            current_invocation = other.get(AgentMCPInvocation, invocation.id)
+            assert current_mapping is not None
+            assert current_invocation is not None
+            current_mapping.turn_lease_token = "new-owner"
+            current_mapping.turn_lease_generation = 2
+            current_invocation.turn_lease_token = "new-owner"
+            current_invocation.turn_lease_generation = 2
+            other.commit()
+
+            agent_mcp_service._fail_mcp_turn(
+                db,
+                lease=agent_mcp_service.AgentMCPTurnLease(
+                    mapping_id=mapping.id,
+                    invocation_id=invocation.id,
+                    token="old-owner",
+                    generation=1,
+                    deadline_at=agent_mcp_service.utc_now() + timedelta(seconds=60),
+                    session_factory=self.Session,
+                ),
+                error=RuntimeError("late failure"),
+                latency_ms=1,
+            )
+        finally:
+            other.close()
+            db.close()
+
+        verify = self.Session()
+        try:
+            final_mapping = verify.get(AgentMCPConversation, "mapping-refresh-fail-lease")
+            final_invocation = verify.get(
+                AgentMCPInvocation, "invocation-refresh-fail-lease"
+            )
+            assert final_mapping is not None
+            assert final_invocation is not None
+            self.assertEqual(final_mapping.turn_lease_token, "new-owner")
+            self.assertEqual(final_mapping.turn_lease_generation, 2)
+            self.assertEqual(final_invocation.turn_lease_token, "new-owner")
+            self.assertEqual(final_invocation.status, "running")
+        finally:
+            verify.close()
+
+    def test_completion_refreshes_expiry_extended_by_lease_heartbeat(self) -> None:
+        self._add_published_service(service_id="service-refresh-complete-lease")
+        db = self.Session()
+        heartbeat = self.Session()
+        try:
+            now = agent_mcp_service.utc_now()
+            conversation = Conversation(
+                id="conversation-refresh-complete-lease",
+                agent_id=self.agent.id,
+                created_by_user_id=self.owner.id,
+                title="续租完成测试",
+            )
+            mapping = AgentMCPConversation(
+                id="mapping-refresh-complete-lease",
+                service_id="service-refresh-complete-lease",
+                tenant_id=self.tenant.id,
+                agent_id=self.agent.id,
+                execution_user_id=self.owner.id,
+                external_session_hash=agent_mcp_service.conversation_binding_hash(
+                    "external-conversation\0refresh-complete"
+                ),
+                binding_kind="external_conversation_id",
+                conversation_id=conversation.id,
+                turn_lease_token="heartbeat-owner",
+                turn_lease_generation=4,
+                # Keep an expired value in the main Session's identity map.
+                turn_lease_expires_at=now - timedelta(seconds=1),
+                turn_lease_deadline_at=now + timedelta(seconds=120),
+            )
+            invocation = AgentMCPInvocation(
+                id="invocation-refresh-complete-lease",
+                service_id="service-refresh-complete-lease",
+                tenant_id=self.tenant.id,
+                agent_id=self.agent.id,
+                execution_user_id=self.owner.id,
+                request_id="request-refresh-complete",
+                mcp_conversation_id=mapping.id,
+                external_request_hash=agent_mcp_service.external_request_hash(
+                    "request-refresh-complete"
+                ),
+                turn_lease_token="heartbeat-owner",
+                turn_lease_generation=4,
+                conversation_id=conversation.id,
+                input_hash="e" * 64,
+                status="running",
+            )
+            db.add_all([conversation, mapping, invocation])
+            db.commit()
+            cached_mapping = db.get(AgentMCPConversation, mapping.id)
+            assert cached_mapping is not None
+            db.commit()
+
+            renewed = heartbeat.get(AgentMCPConversation, mapping.id)
+            assert renewed is not None
+            renewed.turn_lease_expires_at = now + timedelta(seconds=60)
+            heartbeat.commit()
+
+            agent_mcp_service._complete_mcp_turn(
+                db,
+                lease=agent_mcp_service.AgentMCPTurnLease(
+                    mapping_id=mapping.id,
+                    invocation_id=invocation.id,
+                    token="heartbeat-owner",
+                    generation=4,
+                    deadline_at=now + timedelta(seconds=120),
+                    session_factory=self.Session,
+                ),
+                result={"answer": "completed", "conversation_id": conversation.id},
+                latency_ms=1,
+            )
+            self.assertGreater(cached_mapping.turn_lease_generation, 0)
+        finally:
+            heartbeat.close()
+            db.close()
+
+        verify = self.Session()
+        try:
+            final_mapping = verify.get(
+                AgentMCPConversation, "mapping-refresh-complete-lease"
+            )
+            final_invocation = verify.get(
+                AgentMCPInvocation, "invocation-refresh-complete-lease"
+            )
+            assert final_mapping is not None
+            assert final_invocation is not None
+            self.assertEqual(final_mapping.turn_lease_token, "")
+            self.assertEqual(final_invocation.status, "succeeded")
+            self.assertEqual(final_invocation.result["answer"], "completed")
+        finally:
+            verify.close()
 
 
 if __name__ == "__main__":

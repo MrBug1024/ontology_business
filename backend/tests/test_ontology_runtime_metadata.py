@@ -360,10 +360,11 @@ class PostgreSQLMigrationContractsTests(unittest.TestCase):
 
     def test_alembic_graph_has_one_postgresql_head(self) -> None:
         revisions = migration_revisions()
-        self.assertEqual(migration_heads(), ("20260904_12",))
+        self.assertEqual(migration_heads(), ("20260904_13",))
         from app.database import POSTGRESQL_SCHEMA_REVISION
 
         self.assertEqual(POSTGRESQL_SCHEMA_REVISION, migration_heads()[0])
+        self.assertEqual(revisions["20260904_13"], "20260904_12")
         self.assertEqual(revisions["20260904_12"], "20260903_11")
         self.assertEqual(revisions["20260903_11"], "20260903_10")
         self.assertEqual(revisions["20260903_10"], "20260903_09")
@@ -476,6 +477,30 @@ class PostgreSQLMigrationContractsTests(unittest.TestCase):
         self.assertIn(
             "CREATE INDEX ix_organization_invitations_user_status "
             "ON organization_invitations (user_id, status)",
+            sql,
+        )
+
+    def test_head_migration_canonicalizes_agent_mcp_conversations(self) -> None:
+        sql = render_postgresql_upgrade("20260904_13")
+        self.assertIn(
+            "LOCK TABLE agent_mcp_conversations IN ACCESS EXCLUSIVE MODE",
+            sql,
+        )
+        self.assertIn(
+            "ALTER TABLE agent_mcp_conversations ADD COLUMN binding_kind ",
+            sql,
+        )
+        self.assertIn(
+            "ALTER TABLE agent_mcp_conversations ADD COLUMN legacy_conversation_id ",
+            sql,
+        )
+        self.assertIn("fk_agent_mcp_conversations_legacy_conversation", sql)
+        self.assertIn("ROW_NUMBER() OVER", sql)
+        self.assertIn("binding_kind = 'legacy_duplicate'", sql)
+        self.assertIn("AgentMCPMigrationInterrupted", sql)
+        self.assertIn(
+            "CONSTRAINT uq_agent_mcp_conversations_service_conversation "
+            "UNIQUE (service_id, conversation_id)",
             sql,
         )
 

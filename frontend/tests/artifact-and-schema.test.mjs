@@ -762,6 +762,22 @@ test('standard MCP config rejects missing wrappers and non-string header values'
   })), /重复键名/)
 })
 
+test('Agent MCP publication exposes the host-level verbatim input contract', () => {
+  const source = readFileSync(
+    new URL('../src/components/AgentMCPPublications.vue', import.meta.url),
+    'utf8',
+  )
+  assert.match(source, /第三方必须支持宿主级原文透传/)
+  assert.match(source, /ai\.rhzy\/original-user-message/)
+  assert.match(source, /ai\.rhzy\/external-conversation-id/)
+  assert.match(source, /ai\.rhzy\/external-turn-id/)
+  assert.doesNotMatch(source, /fallbackHostContextContractJson/)
+  assert.match(source, /contract\.input_contract_version === '2'/)
+  assert.match(source, /当前后端未声明有效的宿主原文透传契约/)
+  assert.match(source, /查看宿主透传契约/)
+  assert.match(source, /@closed="clearCreatedService"/)
+})
+
 test('nested object and array schema survives no-JSON editor round trip', () => {
   const source = {
     type: 'object',

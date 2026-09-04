@@ -13,7 +13,7 @@ from time import monotonic, perf_counter, sleep
 from typing import Any, Callable
 
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -29,8 +29,12 @@ from . import permission_service, tenant_service
 
 
 _TOKEN_HASH_DOMAIN = b"ontology-platform/agent-mcp-token/v1\0"
-_SESSION_HASH_DOMAIN = b"ontology-platform/agent-mcp-session/v1\0"
+_CONVERSATION_BINDING_HASH_DOMAIN = b"ontology-platform/agent-mcp-conversation-binding/v2\0"
 _REQUEST_HASH_DOMAIN = b"ontology-platform/agent-mcp-request/v1\0"
+HOST_CONTEXT_VERSION_KEY = "ai.rhzy/host-context-version"
+HOST_ORIGINAL_MESSAGE_KEY = "ai.rhzy/original-user-message"
+HOST_CONVERSATION_ID_KEY = "ai.rhzy/external-conversation-id"
+HOST_TURN_ID_KEY = "ai.rhzy/external-turn-id"
 
 
 class AgentMCPError(ValueError):
@@ -38,11 +42,11 @@ class AgentMCPError(ValueError):
 
 
 class AgentMCPTurnBusyError(AgentMCPError):
-    """A prior turn for this durable external session is still running."""
+    """A prior turn for this durable business conversation is still running."""
 
 
 class AgentMCPTurnLeaseLostError(AgentMCPError):
-    """A worker lost its fenced right to persist or execute a session turn."""
+    """A worker lost its fenced right to persist or execute a conversation turn."""
 
 
 @dataclass(frozen=True)
@@ -54,11 +58,11 @@ class AuthenticatedAgentMCP:
 
 @dataclass(frozen=True)
 class MCPConversationBinding:
-    """The durable transcript and mapping used by one external MCP session."""
+    """The durable transcript and mapping used by one business conversation."""
 
     mapping_id: str | None
     conversation_id: str | None
-    external_session_hash: str | None
+    binding_key_hash: str | None
 
 
 @dataclass(frozen=True)
@@ -152,10 +156,10 @@ def token_hash(token: str) -> str:
     return hashlib.sha256(_TOKEN_HASH_DOMAIN + token.encode("utf-8")).hexdigest()
 
 
-def external_session_hash(session_id: str) -> str:
-    """Hash an opaque transport session before using it as a durable key."""
+def conversation_binding_hash(binding_key: str) -> str:
+    """Hash an opaque business binding key before persisting it."""
     return hashlib.sha256(
-        _SESSION_HASH_DOMAIN + session_id.encode("utf-8")
+        _CONVERSATION_BINDING_HASH_DOMAIN + binding_key.encode("utf-8")
     ).hexdigest()
 
 
@@ -164,6 +168,51 @@ def external_request_hash(request_id: str) -> str:
     return hashlib.sha256(
         _REQUEST_HASH_DOMAIN + request_id.encode("utf-8")
     ).hexdigest()
+
+
+def _external_identifier(value: str | None, *, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AgentMCPError(f"{label} 必须是字符串")
+    cleaned = value.strip()
+    if not cleaned:
+        raise AgentMCPError(f"{label} 不能为空")
+    if cleaned != value:
+        raise AgentMCPError(f"{label} 不能包含首尾空白")
+    if len(cleaned) > 256:
+        raise AgentMCPError(f"{label} 超过长度限制")
+    return cleaned
+
+
+def _conversation_binding_key(
+    *,
+    message: str,
+    conversation_id: str | None,
+    external_conversation_id: str | None,
+    external_session_id: str | None,
+    external_request_id: str | None,
+) -> tuple[str | None, str]:
+    """Separate business conversation identity from MCP transport identity."""
+    external_conversation_id = _external_identifier(
+        external_conversation_id,
+        label="external_conversation_id",
+    )
+    if external_conversation_id:
+        return f"external-conversation\0{external_conversation_id}", "external_conversation_id"
+    if conversation_id:
+        return f"platform-conversation\0{conversation_id}", "conversation_id"
+    if external_session_id:
+        # Without an explicit business handle, one tool request is one isolated
+        # transcript. Reusing a transport across several UI chats can no longer
+        # merge their history. The request id keeps an HTTP retry idempotent.
+        request_identity = str(external_request_id or "").strip() or uuid.uuid4().hex
+        message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        return (
+            f"isolated-turn\0{external_session_id}\0{request_identity}\0{message_hash}",
+            "isolated_turn",
+        )
+    return None, "direct"
 
 
 def _normalized_datetime(value: datetime | None) -> datetime | None:
@@ -238,6 +287,7 @@ def _renew_mcp_turn_lease(lease: AgentMCPTurnLease) -> None:
         mapping = db.execute(
             select(AgentMCPConversation)
             .where(AgentMCPConversation.id == lease.mapping_id)
+            .execution_options(populate_existing=True)
             .with_for_update()
         ).scalars().first()
         now = utc_now()
@@ -284,6 +334,7 @@ def _claim_mcp_turn_once(
                 AgentMCPConversation.id == binding.mapping_id,
                 AgentMCPConversation.service_id == service.id,
             )
+            .execution_options(populate_existing=True)
             .with_for_update()
         ).scalars().first()
         if mapping is None:
@@ -302,6 +353,7 @@ def _claim_mcp_turn_once(
                 AgentMCPInvocation.mcp_conversation_id == mapping.id,
                 AgentMCPInvocation.external_request_hash == request_hash,
             )
+            .execution_options(populate_existing=True)
             .with_for_update()
         ).scalars().first()
         if invocation is not None:
@@ -310,6 +362,7 @@ def _claim_mcp_turn_once(
             if invocation.status == "succeeded":
                 mapping.last_used_at = utc_now()
                 replay = _copy_result(invocation.result)
+                replay["mcp_replayed"] = True
                 db.commit()
                 return AgentMCPTurnClaim(replay_result=replay)
 
@@ -334,6 +387,7 @@ def _claim_mcp_turn_once(
                     AgentMCPInvocation.mcp_conversation_id == mapping.id,
                     AgentMCPInvocation.status == "running",
                 )
+                .execution_options(populate_existing=True)
                 .with_for_update()
             ).scalars().all()
             for stale in stale_invocations:
@@ -439,7 +493,7 @@ def _claim_mcp_turn(
         remaining = wait_deadline - monotonic()
         if remaining <= 0:
             raise AgentMCPTurnBusyError(
-                "同一 MCP 会话的上一轮仍在执行，请在稍后重试"
+                "同一外部业务会话的上一轮仍在执行，请在稍后重试"
             )
         sleep(min(0.1, remaining))
 
@@ -457,6 +511,7 @@ def _complete_mcp_turn(
         mapping = db.execute(
             select(AgentMCPConversation)
             .where(AgentMCPConversation.id == lease.mapping_id)
+            .execution_options(populate_existing=True)
             .with_for_update()
         ).scalars().first()
         now = utc_now()
@@ -465,6 +520,7 @@ def _complete_mcp_turn(
         invocation = db.execute(
             select(AgentMCPInvocation)
             .where(AgentMCPInvocation.id == lease.invocation_id)
+            .execution_options(populate_existing=True)
             .with_for_update()
         ).scalars().first()
         if (
@@ -504,11 +560,13 @@ def _fail_mcp_turn(
         mapping = db.execute(
             select(AgentMCPConversation)
             .where(AgentMCPConversation.id == lease.mapping_id)
+            .execution_options(populate_existing=True)
             .with_for_update()
         ).scalars().first()
         invocation = db.execute(
             select(AgentMCPInvocation)
             .where(AgentMCPInvocation.id == lease.invocation_id)
+            .execution_options(populate_existing=True)
             .with_for_update()
         ).scalars().first()
         if (
@@ -564,6 +622,35 @@ def client_config(name: str, endpoint_url: str, token: str) -> dict[str, Any]:
                 "headers": {"Authorization": f"Bearer {token}"},
             }
         }
+    }
+
+
+def host_context_contract() -> dict[str, Any]:
+    """Return the non-secret adapter contract shipped with publication config."""
+    return {
+        "input_contract_version": "2",
+        "tool_name": "invoke_agent",
+        "tool_message_field": "original_user_message",
+        "host_context_version": "1",
+        "strict_host_context_required": get_settings().agent_mcp_require_host_context,
+        "trust_boundary": {
+            "asserted_by": "third_party_host_adapter",
+            "platform_observes_third_party_ui": False,
+            "meaning": "宿主声明的逐字原文；平台只能校验所收到的两个字段一致",
+        },
+        "required_request_meta": {
+            HOST_CONTEXT_VERSION_KEY: "1",
+            HOST_ORIGINAL_MESSAGE_KEY: "终端用户本轮逐字原文",
+            HOST_CONVERSATION_ID_KEY: "第三方当前 UI 会话的稳定 ID",
+            HOST_TURN_ID_KEY: "第三方当前用户消息的稳定 ID",
+        },
+        "requirements": [
+            "宿主适配层直接注入 _meta，不得由 LLM 生成",
+            "original_user_message 必须与 _meta 中的用户原文逐字一致",
+            "每个终端用户轮次只调用一次 invoke_agent",
+            "不同 UI 会话必须使用不同 external conversation ID",
+            "平台无法直接读取第三方 UI；第三方需保证适配层注入值来自聊天框原文",
+        ],
     }
 
 
@@ -687,37 +774,38 @@ def _new_external_conversation(service: AgentMCPService, message: str) -> Conver
     )
 
 
-def _conversation_for_external_session(
+def _conversation_for_external_binding(
     db: Session,
     service: AgentMCPService,
     *,
     message: str,
     conversation_id: str | None,
-    external_session_id: str | None,
+    binding_key: str | None,
+    binding_mode: str,
     agents: Any,
+    _retry_on_integrity: bool = True,
 ) -> MCPConversationBinding:
-    """Resolve a durable transcript for one MCP transport session.
+    """Resolve a durable transcript from an explicit business binding.
 
-    A unique database constraint is the cross-worker single-flight boundary
-    for a first call.  If two workers see a new external session concurrently,
-    one transaction wins and the loser reloads the winner's conversation rather
-    than creating a second transcript.
+    A transport session is deliberately not a transcript key: MCP clients often
+    reuse one connection across unrelated UI chats. A unique hashed binding is
+    still the cross-worker single-flight boundary for a first call or retry.
     """
-    if not external_session_id:
+    if not binding_key:
         if conversation_id:
             return MCPConversationBinding(
                 mapping_id=None,
                 conversation_id=_owned_conversation(
                     db, service, conversation_id, agents=agents
                 ).id,
-                external_session_hash=None,
+                binding_key_hash=None,
             )
         # Backward-compatible direct service calls are still possible, but the
-        # HTTP gateway always supplies an external MCP session identifier.
+        # HTTP gateway always supplies a per-conversation binding key.
         return MCPConversationBinding(
             mapping_id=None,
             conversation_id=None,
-            external_session_hash=None,
+            binding_key_hash=None,
         )
 
     requested = (
@@ -725,15 +813,83 @@ def _conversation_for_external_session(
         if conversation_id
         else None
     )
-    session_hash = external_session_hash(external_session_id)
-    mapping = db.execute(
-        select(AgentMCPConversation)
-        .where(
-            AgentMCPConversation.service_id == service.id,
-            AgentMCPConversation.external_session_hash == session_hash,
+    binding_hash = conversation_binding_hash(binding_key)
+    identity_predicate = AgentMCPConversation.external_session_hash == binding_hash
+    if requested is not None:
+        identity_predicate = or_(
+            identity_predicate,
+            AgentMCPConversation.conversation_id == requested.id,
         )
-        .with_for_update()
-    ).scalars().first()
+    # Discover candidate ids without locks, then lock every involved row in one
+    # primary-key order. Crossed bad requests therefore cannot create A->B / B->A
+    # lock cycles between an external key and a platform conversation.
+    candidate_ids = sorted(
+        set(
+            db.execute(
+                select(AgentMCPConversation.id).where(
+                    AgentMCPConversation.service_id == service.id,
+                    identity_predicate,
+                )
+            )
+            .scalars()
+            .all()
+        )
+    )
+    mappings = (
+        db.execute(
+            select(AgentMCPConversation)
+            .where(AgentMCPConversation.id.in_(candidate_ids))
+            .order_by(AgentMCPConversation.id.asc())
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        ).scalars().all()
+        if candidate_ids
+        else []
+    )
+    mapping_by_key = next(
+        (item for item in mappings if item.external_session_hash == binding_hash),
+        None,
+    )
+    mapping_by_conversation = next(
+        (
+            item
+            for item in mappings
+            if requested is not None and item.conversation_id == requested.id
+        ),
+        None,
+    )
+    if (
+        mapping_by_key is not None
+        and mapping_by_conversation is not None
+        and mapping_by_key.id != mapping_by_conversation.id
+    ):
+        raise AgentMCPError(
+            "CONVERSATION_BINDING_CONFLICT: external_conversation_id 与平台对话绑定不一致"
+        )
+
+    mapping = mapping_by_key or mapping_by_conversation
+    if (
+        binding_mode == "external_conversation_id"
+        and requested is not None
+        and mapping_by_key is None
+        and mapping_by_conversation is not None
+    ):
+        # A bare platform id proves only that this publication used the
+        # transcript; it cannot prove which host UI chat owns it. Automatically
+        # re-keying legacy transport mappings would recreate the original
+        # cross-chat bug when a host carries A's continuation into chat B.
+        raise AgentMCPError(
+            "CONVERSATION_BINDING_CONFLICT: 旧平台对话不能由新的外部会话标识自动认领"
+        )
+
+    if (
+        mapping_by_key is not None
+        and mapping_by_key.conversation_id is None
+        and requested is not None
+    ):
+        raise AgentMCPError(
+            "CONVERSATION_BINDING_CONFLICT: 已删除的外部会话不能绑定到其他平台对话"
+        )
 
     if mapping is not None:
         if (
@@ -747,15 +903,17 @@ def _conversation_for_external_session(
             and mapping.conversation_id
             and mapping.conversation_id != requested.id
         ):
-            raise AgentMCPError("MCP 会话已绑定到另一条对话")
+            raise AgentMCPError(
+                "CONVERSATION_BINDING_CONFLICT: MCP 会话已绑定到另一条对话"
+            )
         bound_id = requested.id if requested is not None else mapping.conversation_id
         if bound_id:
             try:
                 bound = agents._conversation(db, bound_id)
             except HTTPException as exc:
                 # Conversation deletion intentionally does not delete the
-                # external session record.  A later call starts a new clean
-                # transcript under the same still-valid MCP session.
+                # binding record. A later call starts a new clean transcript
+                # under the same explicit external conversation identity.
                 if exc.status_code != 404:
                     raise
                 bound = None
@@ -772,11 +930,26 @@ def _conversation_for_external_session(
             db.flush()
             mapping.conversation_id = bound.id
         mapping.last_used_at = utc_now()
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            if _retry_on_integrity:
+                return _conversation_for_external_binding(
+                    db,
+                    service,
+                    message=message,
+                    conversation_id=conversation_id,
+                    binding_key=binding_key,
+                    binding_mode=binding_mode,
+                    agents=agents,
+                    _retry_on_integrity=False,
+                )
+            raise AgentMCPError("MCP 会话绑定并发冲突，请重试") from exc
         return MCPConversationBinding(
             mapping_id=mapping.id,
             conversation_id=bound.id,
-            external_session_hash=session_hash,
+            binding_key_hash=mapping.external_session_hash,
         )
 
     bound = requested or _new_external_conversation(service, message)
@@ -786,7 +959,10 @@ def _conversation_for_external_session(
         tenant_id=service.tenant_id,
         agent_id=service.agent_id,
         execution_user_id=service.execution_user_id,
-        external_session_hash=session_hash,
+        # Physical column name is retained for migration compatibility. Its
+        # value is now a business binding hash, never a transport-session key.
+        external_session_hash=binding_hash,
+        binding_kind=binding_mode,
         conversation_id=bound.id,
         last_used_at=utc_now(),
     )
@@ -802,33 +978,25 @@ def _conversation_for_external_session(
         return MCPConversationBinding(
             mapping_id=mapping.id,
             conversation_id=bound.id,
-            external_session_hash=session_hash,
+            binding_key_hash=binding_hash,
         )
-    except IntegrityError:
-        # Another process inserted the same service/session mapping first.  The
-        # rolled-back transient Conversation is not persisted; reload the
-        # winner and use its durable transcript.
+    except IntegrityError as exc:
+        # A concurrent caller may have won either the business-key constraint
+        # or the canonical service/conversation constraint. Rediscover and lock
+        # both identities before deciding whether this is a replay or conflict.
         db.rollback()
-        winner = db.execute(
-            select(AgentMCPConversation).where(
-                AgentMCPConversation.service_id == service.id,
-                AgentMCPConversation.external_session_hash == session_hash,
+        if _retry_on_integrity:
+            return _conversation_for_external_binding(
+                db,
+                service,
+                message=message,
+                conversation_id=conversation_id,
+                binding_key=binding_key,
+                binding_mode=binding_mode,
+                agents=agents,
+                _retry_on_integrity=False,
             )
-        ).scalars().first()
-        if winner is None or not winner.conversation_id:
-            raise AgentMCPError("MCP 会话初始化冲突，请重试")
-        if requested is not None and winner.conversation_id != requested.id:
-            raise AgentMCPError("MCP 会话已绑定到另一条对话")
-        winner_conversation = agents._conversation(db, winner.conversation_id)
-        if winner_conversation.agent_id != service.agent_id:
-            raise AgentMCPError("MCP 会话绑定的对话无效")
-        winner.last_used_at = utc_now()
-        db.commit()
-        return MCPConversationBinding(
-            mapping_id=winner.id,
-            conversation_id=winner_conversation.id,
-            external_session_hash=session_hash,
-        )
+        raise AgentMCPError("MCP 会话初始化并发冲突，请重试") from exc
 
 
 def invoke_published_agent(
@@ -838,6 +1006,10 @@ def invoke_published_agent(
     conversation_id: str | None,
     external_session_id: str | None = None,
     external_request_id: str | None = None,
+    external_conversation_id: str | None = None,
+    external_turn_id: str | None = None,
+    input_source: str = "tool_argument_unverified",
+    tool_argument_matched: bool = True,
 ) -> dict[str, Any]:
     from ..routers import agents
 
@@ -862,12 +1034,20 @@ def invoke_published_agent(
             raise AgentMCPError("Agent 当前不可用：" + "、".join(missing))
         if missing:
             raise AgentMCPError("Agent 尚未就绪：" + "、".join(missing))
-        binding = _conversation_for_external_session(
+        binding_key, binding_mode = _conversation_binding_key(
+            message=message,
+            conversation_id=conversation_id,
+            external_conversation_id=external_conversation_id,
+            external_session_id=external_session_id,
+            external_request_id=external_request_id,
+        )
+        binding = _conversation_for_external_binding(
             db,
             service,
             message=message,
             conversation_id=conversation_id,
-            external_session_id=external_session_id,
+            binding_key=binding_key,
+            binding_mode=binding_mode,
             agents=agents,
         )
 
@@ -878,7 +1058,26 @@ def invoke_published_agent(
             # predate the gateway still receive a deterministic payload key,
             # which makes a retry safe rather than silently duplicating an
             # automatic action.
-            request_identity = str(external_request_id or "").strip()
+            external_turn_id = _external_identifier(
+                external_turn_id,
+                label="external_turn_id",
+            )
+            if external_turn_id:
+                # Host turn ids are commonly local counters such as "1". Scope
+                # them to the publication and business conversation before the
+                # hash also reaches automatic Action idempotency keys.
+                request_identity = (
+                    f"external-turn\0{service.id}\0"
+                    f"{binding.binding_key_hash or binding.mapping_id}\0"
+                    f"{external_turn_id}"
+                )
+            else:
+                rpc_request_id = str(external_request_id or "").strip()
+                request_identity = (
+                    f"transport-request\0{external_session_id or ''}\0{rpc_request_id}\0{input_hash}"
+                    if rpc_request_id
+                    else ""
+                )
             if not request_identity:
                 request_identity = f"payload:{input_hash}"
             request_hash = external_request_hash(request_identity)
@@ -908,9 +1107,9 @@ def invoke_published_agent(
             lease.start()
             lease.assert_active()
         else:
-            # The HTTP gateway always supplies a session id.  Keep this
+            # The HTTP gateway always supplies a binding key. Keep this
             # narrow fallback for in-process callers built before published
-            # MCP sessions existed; it does not claim cross-worker ordering.
+            # MCP conversation mappings existed; it has no cross-worker ordering.
             conversation_id = binding.conversation_id
             invocation = AgentMCPInvocation(
                 service_id=service.id,
@@ -940,6 +1139,23 @@ def invoke_published_agent(
             "request_id": invocation.request_id if invocation is not None else request_id,
             "mcp_service_id": service.id,
             "mcp_service_name": service.name,
+            "mcp_conversation_mode": binding_mode,
+            "mcp_replayed": False,
+            "mcp_input_receipt": {
+                "source": str(input_source or "tool_argument_unverified")[:80],
+                "message_sha256": input_hash,
+                "message_length": len(message),
+                "tool_argument_matched": bool(tool_argument_matched),
+                "verbatim_attested_by": (
+                    "third_party_host_adapter"
+                    if input_source == "host_context_v1"
+                    else ""
+                ),
+                "platform_observed_host_ui": False,
+                "external_conversation_bound": bool(external_conversation_id),
+                "external_turn_bound": bool(external_turn_id),
+                "conversation_binding_hash": binding.binding_key_hash or "",
+            },
         })
         # The audit result doubles as the exact retry response.  Normalize it
         # once here so a first response and a durable replay have identical

@@ -974,6 +974,8 @@ export interface AgentMCPService {
   last_used_at?: string | null
   runtime_environment: string
   definition_hash: string
+  host_context_contract?: Record<string, unknown>
+  host_context_contract_json?: string
   created_at: string
   updated_at: string
 }

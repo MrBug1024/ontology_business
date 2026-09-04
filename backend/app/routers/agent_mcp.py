@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -62,6 +62,7 @@ def _out(db: Session, service: AgentMCPService, endpoint_url: str) -> AgentMCPSe
     definition = context.runtime_definition if context is not None else None
     if context is not None and context.scenario is not None:
         scenario_name = context.scenario.name
+    host_context_contract = agent_mcp_service.host_context_contract()
     return AgentMCPServiceOut(
         id=service.id,
         name=service.name,
@@ -79,6 +80,12 @@ def _out(db: Session, service: AgentMCPService, endpoint_url: str) -> AgentMCPSe
         last_used_at=service.last_used_at,
         runtime_environment=str(getattr(definition, "environment", "") or service.runtime_environment),
         definition_hash=str(getattr(definition, "definition_hash", "") or service.definition_hash),
+        host_context_contract=host_context_contract,
+        host_context_contract_json=json.dumps(
+            host_context_contract,
+            ensure_ascii=False,
+            indent=2,
+        ),
         created_at=service.created_at,
         updated_at=service.updated_at,
     )
@@ -141,8 +148,11 @@ def list_services(
 def create_service(
     payload: AgentMCPServiceCreateIn,
     request: Request,
+    response: Response,
     db: Session = Depends(get_tenant_db),
 ) -> AgentMCPServiceCreatedOut:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     principal = _principal(db)
     agent, context, missing = agent_mcp_service.validate_agent_runtime(
         db, payload.agent_id, writable=True
@@ -205,8 +215,11 @@ def rotate_token(
     service_id: str,
     payload: AgentMCPTokenRotateIn,
     request: Request,
+    response: Response,
     db: Session = Depends(get_tenant_db),
 ) -> AgentMCPServiceCreatedOut:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     _principal(db)
     service = _owned_service(db, service_id)
     agent, context, missing = agent_mcp_service.validate_agent_runtime(

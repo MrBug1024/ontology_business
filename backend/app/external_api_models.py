@@ -147,11 +147,11 @@ class AgentMCPService(Base):
 
 
 class AgentMCPConversation(Base):
-    """Bind one external MCP transport session to one durable Agent transcript.
+    """Bind one explicit business-conversation key to one Agent transcript.
 
-    The mapping is scoped to the published service rather than globally to the
-    opaque transport value.  A caller therefore cannot use a session id from a
-    different publication (or tenant) to resume another Agent's history.
+    The mapping is scoped to the published service. MCP transport sessions are
+    deliberately excluded from business identity because one client connection
+    may serve several unrelated end-user chats.
     """
 
     __tablename__ = "agent_mcp_conversations"
@@ -160,6 +160,11 @@ class AgentMCPConversation(Base):
             "service_id",
             "external_session_hash",
             name="uq_agent_mcp_conversations_service_session",
+        ),
+        UniqueConstraint(
+            "service_id",
+            "conversation_id",
+            name="uq_agent_mcp_conversations_service_conversation",
         ),
         Index("ix_agent_mcp_conversations_service_updated", "service_id", "updated_at"),
         Index("ix_agent_mcp_conversations_tenant_updated", "tenant_id", "updated_at"),
@@ -178,16 +183,24 @@ class AgentMCPConversation(Base):
     execution_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
     )
-    # Only a domain-separated digest of the transport value is retained.  MCP
-    # clients sometimes supply their own session identifiers, which must not
-    # become searchable business data or logs.
+    # Historical physical name retained for migration compatibility. New rows
+    # contain a domain-separated digest of an external conversation id, a
+    # platform continuation handle, or an isolated request identity, never a
+    # bare MCP transport-session id.
     external_session_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    binding_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="legacy_transport", server_default="legacy_transport"
+    )
     conversation_id: Mapped[str | None] = mapped_column(
         ForeignKey("conversations.id", ondelete="SET NULL"), index=True, nullable=True
     )
-    # A DB-backed fencing lease serializes Agent turns for this external
-    # session across API workers.  It is intentionally separate from the MCP
-    # transport, which remains stateless and therefore load-balancer friendly.
+    # The migration detaches duplicate legacy lease rows but preserves their
+    # former target for audit and reversible downgrade.
+    legacy_conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True
+    )
+    # A DB-backed fencing lease serializes Agent turns for this business
+    # conversation across API workers. It is independent of MCP transport.
     turn_lease_token: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     turn_lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     turn_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

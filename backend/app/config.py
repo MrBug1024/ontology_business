@@ -137,6 +137,10 @@ class Settings(BaseSettings):
     # fallback derived from the private database URL; production should set a
     # dedicated high-entropy secret in its secret manager.
     agent_mcp_session_signing_key: str = ""
+    # A model-generated tool argument cannot prove that it matches the host UI
+    # message. Production-safe publications require host-injected namespaced
+    # metadata by default; legacy best-effort behavior is an explicit opt-out.
+    agent_mcp_require_host_context: bool = True
     # A published MCP turn can take longer than one HTTP request, but it must
     # never monopolize its external conversation forever after a worker crash.
     # The lease is renewed while healthy and capped by the absolute deadline.
