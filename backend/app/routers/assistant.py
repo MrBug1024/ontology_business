@@ -29,6 +29,7 @@ from ..models import (
     AssistantCompilationJob,
     AssistantMessage,
     AssistantProposalApplication,
+    AssistantRequestRun,
     AssistantRouteDecision,
     AssistantThread,
     BusinessScenario,
@@ -43,7 +44,6 @@ from ..models import (
     OntologyEvent,
     OntologyRule,
     OntologyRelation,
-    OntologyWorkflow,
     Skill,
 )
 from ..schemas import (
@@ -56,7 +56,9 @@ from ..schemas import (
     AssistantMessageOut,
     AssistantModelTaskContinuationRequest,
     AssistantProposalApplyRequest,
+    AssistantQuestionOut,
     AssistantReplyOut,
+    AssistantRequestRunOut,
     AssistantThreadOut,
     DataMappingIn,
     Msg,
@@ -65,13 +67,18 @@ from ..schemas import (
 from ..services import (
     assistant_orchestrator,
     assistant_compilation_job_service,
+    assistant_request_run_service,
     assistant_compilation_stream_service,
+    capability_contracts,
     candidate_governance_service,
     catalog_ingestion_service,
+    catalog_service,
+    content_retrieval_service,
     doc_parser,
     datasource_service,
     llm_service,
     mapping_refresh_service,
+    managed_upload_run_service,
     ontology_service,
     object_deletion_service,
     object_storage_service,
@@ -93,13 +100,56 @@ router = APIRouter(prefix="/assistant", tags=["assistant"])
 logger = logging.getLogger(__name__)
 
 
-# Temporary assistant attachments are fed directly to draft generators rather
-# than indexed/retrieved in chunks.  Keep a generous, explicit single-request
-# boundary and reject larger inputs instead of silently dropping the tail of a
-# business document.  The ontology generator has a slightly larger envelope for
-# the user's message and authorised RAG excerpts around this attachment body.
+# Temporary assistant attachments retain parsed text only as a server-side
+# retrieval source. Models receive a small manifest and bounded cited passages.
 ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS = 1_000_000
-ASSISTANT_ATTACHMENT_CONTEXT_MAX_CHARS = 80_000
+# Compatibility alias for callers that previously inspected the direct-context
+# ceiling. It now denotes the absolute retrieval-result ceiling, not a prompt
+# body allowance.
+ASSISTANT_ATTACHMENT_CONTEXT_MAX_CHARS = (
+    content_retrieval_service.MAX_RETRIEVAL_CHARS
+)
+_LEGACY_MODELING_PROPOSAL_KINDS = frozenset({
+    "scenario",
+    "ontology",
+    "mapping",
+    "workflow",
+})
+_LEGACY_READ_ONLY_PROPOSAL_KINDS = frozenset({
+    "ontology",
+    "mapping",
+    "workflow",
+})
+_LEGACY_READ_ONLY_APPLY_DETAIL = (
+    "旧版助手建模建议仅供审阅，不能直接写入正式模型；"
+    "请通过“完整场景建模”入口生成并治理候选。"
+)
+_LEGACY_MODELING_SOURCE_EVIDENCE_KEY = "modeling_source_evidence"
+_LEGACY_MODELING_SOURCE_EVIDENCE_VERSION = "assistant-modeling-source/v1"
+_LEGACY_MODELING_SOURCE_EVIDENCE_FIELDS = frozenset({
+    "version",
+    "kind",
+    "thread_id",
+    "assistant_message_id",
+    "proposal_id",
+    "user_message_id",
+    "user_message_hash",
+    "payload_hash",
+    "modeling_material_sources",
+    "fingerprint",
+})
+_LEGACY_MODELING_RAG_SOURCE_FIELDS = frozenset({
+    "kind",
+    "data_source_id",
+    "file_id",
+    "chunk_id",
+    "content_hash",
+    "file_content_hash",
+    "index_version",
+    "char_start",
+    "char_end",
+})
+_MAX_LEGACY_MODELING_RAG_SOURCES = 5
 
 # Compound compilation is proposal-only and each job has a durable single-
 # flight claim. A small process-local pool keeps provider work independent of
@@ -176,7 +226,7 @@ def _restore_durable_prepared_context(value: Any) -> dict[str, Any]:
 def _compilation_execution_input(
     *,
     compiler_message: str,
-    compiler_documents: list[dict[str, str]],
+    compiler_documents: list[dict[str, Any]],
     prepared_context: dict[str, Any],
     llm_config_id: str,
     context: dict[str, Any],
@@ -185,7 +235,7 @@ def _compilation_execution_input(
     recovery_issue: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     value = {
-        "version": 1,
+        "version": 2,
         "compiler_message": str(compiler_message),
         "compiler_documents": copy.deepcopy(compiler_documents),
         "prepared_context": _durable_prepared_context(prepared_context),
@@ -213,7 +263,7 @@ def _load_compilation_execution_input(
         token=lease_token,
         attempt=lease_attempt,
     )
-    if int(value.get("version") or 0) != 1:
+    if int(value.get("version") or 0) not in {1, 2}:
         raise ValueError("持久化编译任务缺少受支持的执行输入版本")
     compiler_message = value.get("compiler_message")
     compiler_documents = value.get("compiler_documents")
@@ -227,6 +277,15 @@ def _load_compilation_execution_input(
         isinstance(item, dict) for item in compiler_documents
     ):
         raise ValueError("持久化编译任务附件格式无效")
+    # Version 1 jobs may contain legacy full-text documents.  They remain
+    # recoverable, but only the retrieval service's bounded projection may
+    # cross into the compiler/model context.
+    compiler_documents = content_retrieval_service.bounded_documents(
+        compiler_documents,
+        query=compiler_message,
+        top_k=content_retrieval_service.COMPILER_TOP_K,
+        max_chars=content_retrieval_service.COMPILER_MAX_CHARS,
+    )
     if not isinstance(context, dict) or not isinstance(sources, list):
         raise ValueError("持久化编译任务会话上下文格式无效")
     if not isinstance(execution_policy, dict):
@@ -998,7 +1057,11 @@ def _build_proposal(
     proposal_id = uuid.uuid4().hex
     proposal_status = "pending"
     requires_confirmation = True
-    if kind == "scenario_model":
+    if kind in _LEGACY_READ_ONLY_PROPOSAL_KINDS:
+        proposal_status = "read_only"
+        requires_confirmation = False
+        summary = f"{summary} 此建议仅供审阅；请通过“完整场景建模”入口形成受治理候选。"
+    elif kind == "scenario_model":
         data["run_id"] = proposal_id
         execution_status = str(data.get("execution_status") or "")
         proposal_status = (
@@ -1479,7 +1542,7 @@ def _model_task_execution_summary(payload: dict[str, Any]) -> dict[str, Any]:
             f"计划仍在执行：已推进 {processed}/{len(tasks)} 项，当前停留在"
             f"「{current.get('title') or '当前任务'}」"
             + (
-                "等待你开始生成；原始资料和已确认定义会一并保留。"
+                "等待你开始生成；内容身份、有界引用片段和已确认定义会一并保留。"
                 if waiting_for_generation
                 else "等待确认；确认前不会结束本计划。"
             )
@@ -1850,7 +1913,7 @@ def _refresh_model_task_states(
                 "task_title": str(current_task.get("title") or ""),
                 "requires_confirmation": False,
                 "can_generate": True,
-                "message": "上一项已处理。请确认开始生成本任务；原始资料和已确认定义会一并作为依据。",
+                "message": "上一项已处理。请确认开始生成本任务；有界引用片段和已确认定义会一并作为依据。",
             }
         else:
             result["next_action"] = {
@@ -4947,15 +5010,46 @@ def _run_compilation_job_in_background(
                         guidance_message = str(item.get("message") or "").strip()
                         if guidance_message:
                             guidance_blocks.append(guidance_message)
-                        attachment_text = str(item.get("attachment_text") or "").strip()
-                        if attachment_text:
-                            active_documents.append({
-                                "id": f"guidance-{hashlib.sha256(guidance_id.encode('utf-8')).hexdigest()[:40]}",
-                                "filename": "运行中补充资料",
-                                "status": "parsed",
-                                "error": "",
-                                "text": attachment_text,
-                            })
+                        guidance_documents = item.get("attachment_documents")
+                        if isinstance(guidance_documents, list):
+                            active_documents.extend(
+                                content_retrieval_service.bounded_documents(
+                                    guidance_documents,
+                                    query=guidance_message,
+                                    top_k=content_retrieval_service.COMPILER_TOP_K,
+                                    max_chars=content_retrieval_service.COMPILER_MAX_CHARS,
+                                )
+                            )
+                        else:
+                            # Legacy queued guidance may contain a raw text
+                            # field. It is read only by the bounded retrieval
+                            # adapter and never appended to model documents.
+                            attachment_text = str(
+                                item.get("attachment_text") or ""
+                            ).strip()
+                            if attachment_text:
+                                active_documents.extend(
+                                    content_retrieval_service.bounded_documents(
+                                        [{
+                                            "id": (
+                                                "guidance-"
+                                                + hashlib.sha256(
+                                                    guidance_id.encode("utf-8")
+                                                ).hexdigest()[:40]
+                                            ),
+                                            "filename": "运行中补充资料",
+                                            "status": "parsed",
+                                            "text": attachment_text,
+                                        }],
+                                        query=guidance_message,
+                                        top_k=(
+                                            content_retrieval_service.COMPILER_TOP_K
+                                        ),
+                                        max_chars=(
+                                            content_retrieval_service.COMPILER_MAX_CHARS
+                                        ),
+                                    )
+                                )
                     if guidance_blocks:
                         active_message = (
                             f"{active_message}\n\n"
@@ -5011,7 +5105,7 @@ def _run_compilation_job_in_background(
         )
         reply = (
             f"「{task_definition['title']}」的候选草稿已生成。请先核对并确认本任务；"
-            "后续任务尚未生成，原始资料和已确认定义会保留，等待你继续。"
+            "后续任务尚未生成，内容身份、有界引用片段和已确认定义会保留，等待你继续。"
             if task_definition is not None
             else "已根据业务资料生成并持久化本轮完整业务模型的待审核草稿；"
             "这不代表正式定义已经应用。任务需要逐项确认，不能安全写入的候选保持停用，"
@@ -5205,46 +5299,59 @@ def recover_expired_compilation_jobs(*, limit: int = 4) -> int:
 def _attachment_context(
     attachments: list[AssistantAttachment],
     *,
-    include_text: bool = True,
-    enforce_context_limit: bool = True,
+    query: str = "",
+    top_k: int = content_retrieval_service.CHAT_TOP_K,
+    max_chars: int = content_retrieval_service.CHAT_MAX_CHARS,
+    db: Session,
+    tenant_id: str,
+    user_id: str,
+    thread_id: str,
 ) -> tuple[str, list[dict[str, Any]]]:
     if not attachments:
         return "", []
-    parts: list[str] = []
-    sources: list[dict[str, Any]] = []
-    included_chars = 0
-    for item in attachments:
-        parsed_text = str(item.parsed_text or "")
-        sources.append({
-            "id": item.id,
-            "filename": item.filename,
-            "status": item.status,
-            "characters": len(parsed_text),
-            "truncated": False,
-        })
-        if not include_text:
-            continue
-        if item.status == "parsed" and item.parsed_text:
-            part = f"【附件：{item.filename}】\n{parsed_text}"
-        elif item.error:
-            part = f"【附件：{item.filename}】解析失败：{item.error}"
-        else:
-            continue
-        projected = included_chars + (len(parsed_text) if parsed_text else len(part))
-        if (
-            enforce_context_limit
-            and projected > ASSISTANT_ATTACHMENT_CONTEXT_MAX_CHARS
-        ):
-            raise HTTPException(
-                413,
-                "所选附件正文合计"
-                f" {projected} 个字符，超过单次助手建模上下文"
-                f" {ASSISTANT_ATTACHMENT_CONTEXT_MAX_CHARS} 个字符的明确边界；"
-                "系统不会静默截断文档，请拆分附件后分批生成并审阅本体草稿。",
-            )
-        parts.append(part)
-        included_chars = projected
-    return "\n\n".join(parts), sources
+    try:
+        authorized = content_retrieval_service.authorized_attachments(
+            db,
+            attachments,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
+    except PermissionError as exc:
+        raise HTTPException(
+            409, "附件不可用、已过期或无权访问，请重新上传"
+        ) from exc
+    bounded = content_retrieval_service.bounded_documents(
+        authorized,
+        query=query,
+        top_k=top_k,
+        max_chars=max_chars,
+    )
+    return (
+        content_retrieval_service.prompt_context(bounded),
+        content_retrieval_service.source_metadata(authorized, bounded),
+    )
+
+
+def _managed_attachment_context(
+    attachments: list[managed_upload_run_service.ManagedInvocationAttachment],
+    *,
+    query: str,
+    top_k: int = content_retrieval_service.CHAT_TOP_K,
+    max_chars: int = content_retrieval_service.CHAT_MAX_CHARS,
+) -> tuple[str, list[dict[str, Any]]]:
+    if not attachments:
+        return "", []
+    bounded = content_retrieval_service.bounded_documents(
+        attachments,
+        query=query,
+        top_k=top_k,
+        max_chars=max_chars,
+    )
+    return (
+        content_retrieval_service.prompt_context(bounded),
+        content_retrieval_service.source_metadata(attachments, bounded),
+    )
 
 
 def _authorized_rag_context(
@@ -5264,6 +5371,7 @@ def _authorized_rag_context(
             select(DataSource.id).where(
                 DataSource.scenario_id == scenario.id,
                 DataSource.type == "file_bucket",
+                DataSource.resource_scope == "modeling",
             )
         ).all()
     )
@@ -5348,6 +5456,7 @@ def _current_rag_source(
         # temporarily public must not become durable private-thread context.
         or source.tenant_id != _tenant(db)
         or source.type != "file_bucket"
+        or source.resource_scope != "modeling"
         or source.scenario_id != thread.scenario_id
     ):
         return None
@@ -5379,6 +5488,233 @@ def _current_rag_source(
     if expected_chunk_hash and chunk.content_hash != expected_chunk_hash:
         return None
     return source, bucket_file, chunk
+
+
+def _legacy_modeling_description(
+    user_message: str,
+    *,
+    modeling_material_context: str = "",
+) -> str:
+    """Build legacy modeling input without accepting invocation-plane text."""
+
+    message = str(user_message or "").strip()
+    context = str(modeling_material_context or "").strip()
+    return (
+        f"{message}\n\n已授权建模资料依据：\n{context}"
+        if context
+        else message
+    )
+
+
+def _legacy_modeling_rag_source(source: object) -> dict[str, Any]:
+    if not isinstance(source, dict) or source.get("kind") != "rag":
+        raise ValueError("legacy modeling source must be an authorized RAG citation")
+    char_start = source.get("char_start")
+    char_end = source.get("char_end")
+    document = {
+        "kind": "rag",
+        "data_source_id": str(source.get("data_source_id") or ""),
+        "file_id": str(source.get("file_id") or ""),
+        "chunk_id": str(source.get("chunk_id") or ""),
+        "content_hash": str(source.get("content_hash") or ""),
+        "file_content_hash": str(source.get("file_content_hash") or ""),
+        "index_version": str(source.get("index_version") or ""),
+        "char_start": char_start,
+        "char_end": char_end,
+    }
+    if (
+        not all(
+            document[key]
+            for key in (
+                "data_source_id",
+                "file_id",
+                "chunk_id",
+                "content_hash",
+                "file_content_hash",
+                "index_version",
+            )
+        )
+        or isinstance(char_start, bool)
+        or not isinstance(char_start, int)
+        or isinstance(char_end, bool)
+        or not isinstance(char_end, int)
+        or char_start < 0
+        or char_end < char_start
+    ):
+        raise ValueError("legacy modeling source citation is incomplete")
+    return document
+
+
+def _ordered_legacy_modeling_rag_sources(
+    sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized = [_legacy_modeling_rag_source(source) for source in sources]
+    normalized.sort(
+        key=lambda item: (
+            item["data_source_id"],
+            item["file_id"],
+            item["chunk_id"],
+            item["char_start"],
+            item["char_end"],
+        )
+    )
+    identities = {
+        capability_contracts.canonical_hash(
+            item, domain="assistant-modeling-rag-source-v1"
+        )
+        for item in normalized
+    }
+    if len(identities) != len(normalized):
+        raise ValueError("legacy modeling source citations must be unique")
+    return normalized
+
+
+def _legacy_modeling_source_evidence(
+    *,
+    kind: str,
+    thread_id: str,
+    assistant_message_id: str,
+    proposal: dict[str, Any],
+    user_message_id: str,
+    user_message: str,
+    modeling_material_sources: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if kind not in _LEGACY_MODELING_PROPOSAL_KINDS:
+        raise ValueError("source evidence is only defined for legacy modeling proposals")
+    if str(proposal.get("kind") or "") != kind:
+        raise ValueError("proposal kind does not match its source evidence")
+    payload = proposal.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("legacy modeling proposal payload must be an object")
+    sources = _ordered_legacy_modeling_rag_sources(modeling_material_sources)
+    if len(sources) > _MAX_LEGACY_MODELING_RAG_SOURCES:
+        raise ValueError("legacy modeling proposal has too many source citations")
+    body = {
+        "version": _LEGACY_MODELING_SOURCE_EVIDENCE_VERSION,
+        "kind": kind,
+        "thread_id": str(thread_id or ""),
+        "assistant_message_id": str(assistant_message_id or ""),
+        "proposal_id": str(proposal.get("proposal_id") or ""),
+        "user_message_id": str(user_message_id or ""),
+        "user_message_hash": capability_contracts.canonical_hash(
+            {"content": str(user_message)},
+            domain="assistant-user-message-v1",
+        ),
+        "payload_hash": capability_contracts.canonical_hash(
+            {"kind": kind, "payload": payload},
+            domain="assistant-legacy-proposal-payload-v1",
+        ),
+        "modeling_material_sources": sources,
+    }
+    if not all(
+        body[key]
+        for key in (
+            "thread_id",
+            "assistant_message_id",
+            "proposal_id",
+            "user_message_id",
+        )
+    ):
+        raise ValueError("legacy modeling source evidence identity is incomplete")
+    return {
+        **body,
+        "fingerprint": capability_contracts.canonical_hash(
+            body, domain="assistant-modeling-source-evidence-v1"
+        ),
+    }
+
+
+def _require_legacy_modeling_source_evidence(
+    db: Session,
+    thread: AssistantThread,
+    message: AssistantMessage,
+    proposal: dict[str, Any],
+) -> None:
+    kind = str(proposal.get("kind") or "")
+    if kind not in _LEGACY_MODELING_PROPOSAL_KINDS:
+        return
+
+    def reject() -> None:
+        raise HTTPException(
+            409,
+            "变更草稿缺少可验证的建模来源证明，请重新生成",
+        )
+
+    context = message.context if isinstance(message.context, dict) else {}
+    evidence = context.get(_LEGACY_MODELING_SOURCE_EVIDENCE_KEY)
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != _LEGACY_MODELING_SOURCE_EVIDENCE_FIELDS
+        or evidence.get("version") != _LEGACY_MODELING_SOURCE_EVIDENCE_VERSION
+        or evidence.get("kind") != kind
+        or evidence.get("thread_id") != thread.id
+        or evidence.get("assistant_message_id") != message.id
+        or evidence.get("proposal_id") != proposal.get("proposal_id")
+    ):
+        reject()
+    raw_sources = evidence.get("modeling_material_sources")
+    if (
+        not isinstance(raw_sources, list)
+        or len(raw_sources) > _MAX_LEGACY_MODELING_RAG_SOURCES
+    ):
+        reject()
+    try:
+        if any(
+            not isinstance(source, dict)
+            or set(source) != _LEGACY_MODELING_RAG_SOURCE_FIELDS
+            for source in raw_sources
+        ):
+            reject()
+        normalized_sources = _ordered_legacy_modeling_rag_sources(raw_sources)
+        if normalized_sources != raw_sources:
+            reject()
+        payload = proposal.get("payload")
+        if not isinstance(payload, dict):
+            reject()
+        body = {
+            key: evidence[key]
+            for key in _LEGACY_MODELING_SOURCE_EVIDENCE_FIELDS
+            if key != "fingerprint"
+        }
+        if evidence.get("fingerprint") != capability_contracts.canonical_hash(
+            body, domain="assistant-modeling-source-evidence-v1"
+        ):
+            reject()
+        if evidence.get("payload_hash") != capability_contracts.canonical_hash(
+            {"kind": kind, "payload": payload},
+            domain="assistant-legacy-proposal-payload-v1",
+        ):
+            reject()
+        user_message = db.get(AssistantMessage, str(evidence.get("user_message_id") or ""))
+        if (
+            user_message is None
+            or user_message.thread_id != thread.id
+            or user_message.role != "user"
+            or evidence.get("user_message_hash")
+            != capability_contracts.canonical_hash(
+                {"content": str(user_message.content or "")},
+                domain="assistant-user-message-v1",
+            )
+        ):
+            reject()
+        persisted_sources = _ordered_legacy_modeling_rag_sources([
+            source
+            for source in (
+                message.attachments if isinstance(message.attachments, list) else []
+            )
+            if _is_rag_source(source)
+        ])
+        if persisted_sources != normalized_sources:
+            reject()
+        if any(
+            _current_rag_source(db, thread, source) is None
+            for source in normalized_sources
+        ):
+            reject()
+    except HTTPException:
+        raise
+    except (TypeError, ValueError, capability_contracts.CapabilityContractError):
+        reject()
 
 
 def _has_invalid_historic_rag_source(
@@ -5415,9 +5751,25 @@ def _assistant_message_out(
         )
     result = AssistantMessageOut.model_validate(message)
     context = message.context if isinstance(message.context, dict) else {}
+    result.questions = _public_assistant_questions(context.get("questions"))
+    result.suggestions = _public_assistant_suggestions(context.get("suggestions"))
     evidence = context.get("evidence") if isinstance(context.get("evidence"), dict) else {}
     uncertainties = evidence.get("uncertainties") if isinstance(evidence, dict) else []
     routing = context.get("routing") if isinstance(context.get("routing"), dict) else {}
+    diagnostic = (
+        context.get("diagnostic")
+        if isinstance(context.get("diagnostic"), dict)
+        else {}
+    )
+    if message.role == "assistant" and diagnostic.get("code") == "workflow_generation_invalid":
+        public_error = (
+            "无法生成可安全保存的工作流草稿；系统未执行任何变更，请完善场景资源后重试。"
+        )
+        result.content = public_error
+        result.evidence = {**evidence, "uncertainties": [public_error]}
+        result.proposal = {}
+        result.action_preview = {}
+        return result
     if (
         message.role == "assistant"
         and routing.get("source") == "model_fallback"
@@ -5470,6 +5822,35 @@ def _assistant_message_out(
     return result
 
 
+def _public_assistant_questions(value: Any) -> list[AssistantQuestionOut]:
+    if not isinstance(value, list):
+        return []
+    result: list[AssistantQuestionOut] = []
+    for item in value[:8]:
+        try:
+            result.append(AssistantQuestionOut.model_validate(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _public_assistant_suggestions(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        text_value[:160]
+        for item in value[:8]
+        if (text_value := str(item or "").strip())
+    ]
+
+
+def _assistant_questions_context(value: Any) -> list[dict[str, Any]]:
+    return [
+        item.model_dump(mode="json")
+        for item in _public_assistant_questions(value)
+    ]
+
+
 def _assistant_planner_context(
     db: Session,
     scenario: BusinessScenario | None,
@@ -5505,7 +5886,16 @@ def _request_route_plan(
     has_attachments: bool,
     request_id: str,
 ) -> assistant_orchestrator.AssistantRoutePlan:
-    history = _history_messages(db, thread, "") if thread is not None else []
+    history = (
+        _history_messages(
+            db,
+            thread,
+            "",
+            exclude_request_id=(request_id if payload.upload_run_ids else ""),
+        )
+        if thread is not None
+        else []
+    )
     active_draft_scopes = (
         scenario_model_draft_service.active_working_draft_scopes(db, scenario)
         if scenario
@@ -5553,19 +5943,203 @@ def _assistant_route_fingerprint(
         "page": payload.page,
         "selection": payload.selection,
         "attachment_ids": sorted(set(payload.attachment_ids)),
+        "upload_run_ids": sorted(set(payload.upload_run_ids)),
         "llm_config_id": payload.llm_config_id or "",
         "skill_ids": sorted(set(payload.skill_ids)),
         "mcp_ids": sorted(set(payload.mcp_ids)),
         "mode": payload.mode,
         "draft_kind": payload.draft_kind,
     }
-    return hashlib.sha256(json.dumps(
-        canonical,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    ).encode("utf-8")).hexdigest()
+    try:
+        return capability_contracts.canonical_hash(
+            canonical,
+            domain="assistant-request-route-v1",
+        )
+    except capability_contracts.CapabilityContractError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_assistant_request",
+                "message": "助手请求必须使用有限、可确定的 JSON 值",
+            },
+        ) from exc
+
+
+def _assistant_request_message_id(
+    kind: str,
+    *,
+    tenant_id: str,
+    user_id: str,
+    request_id: str,
+) -> str:
+    return assistant_request_run_service.request_message_id(
+        kind,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        request_id=request_id,
+    )
+
+
+def _accept_attachment_backed_request(
+    db: Session,
+    payload: AssistantChatRequest,
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    """Atomically persist the visible messages and durable execution intent."""
+
+    tenant_id = _tenant(db)
+    user_id = _current_user_id(db)
+    scope_key = _context_scope(payload.scenario_id, payload.path)
+    fingerprint = _assistant_route_fingerprint(payload, scope_key=scope_key)
+    existing = db.scalar(
+        select(AssistantRequestRun).where(
+            AssistantRequestRun.tenant_id == tenant_id,
+            AssistantRequestRun.requested_by_user_id == user_id,
+            AssistantRequestRun.request_id == request_id,
+        )
+    )
+    if existing is not None:
+        if existing.request_fingerprint != fingerprint:
+            raise HTTPException(409, "request_id 已用于不同的助手输入，请重新发送")
+        if payload.thread_id and existing.thread_id != payload.thread_id:
+            raise HTTPException(409, "request_id 已绑定到另一助手会话")
+        return assistant_request_run_service.get_request(db, existing.id)
+
+    # First admission still enforces the current scenario boundary. Replays
+    # above remain stable even if that scenario is retired after acceptance.
+    _scenario(db, payload.scenario_id, require_active=True)
+
+    # Upload readiness belongs to first-time admission. Exact request replay is
+    # answered from the durable run even after its temporary uploads expire.
+    runs = managed_upload_run_service.get_invocation_upload_runs(
+        db, payload.upload_run_ids
+    )
+
+    thread_id = payload.thread_id or _assistant_request_message_id(
+        "thread", tenant_id=tenant_id, user_id=user_id, request_id=request_id
+    )
+    thread = _thread(db, thread_id, for_update=True) if payload.thread_id else None
+    if thread is not None:
+        _assert_thread_scope(thread, payload.scenario_id, payload.page, payload.path)
+    else:
+        thread = AssistantThread(
+            id=thread_id,
+            tenant_id=tenant_id,
+            created_by_user_id=user_id,
+            scenario_id=payload.scenario_id,
+            scope_key=scope_key,
+            title=payload.message[:80] or "新的助手任务",
+        )
+        db.add(thread)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            concurrent = db.scalar(
+                select(AssistantRequestRun).where(
+                    AssistantRequestRun.tenant_id == tenant_id,
+                    AssistantRequestRun.requested_by_user_id == user_id,
+                    AssistantRequestRun.request_id == request_id,
+                )
+            )
+            if concurrent is not None:
+                if concurrent.request_fingerprint != fingerprint:
+                    raise HTTPException(
+                        409, "request_id 已用于不同的助手输入，请重新发送"
+                    )
+                return assistant_request_run_service.get_request(db, concurrent.id)
+            thread = _thread(db, thread_id, for_update=True)
+            _assert_thread_scope(
+                thread, payload.scenario_id, payload.page, payload.path
+            )
+
+    legacy_attachments = _safe_attachment_ids(
+        db, payload.attachment_ids, thread_id=thread_id, consume=False
+    )
+    upload_meta = [
+        {
+            "id": run.id,
+            "upload_run_id": run.id,
+            "filename": run.filename,
+            "status": run.status,
+            "error": run.error_message,
+        }
+        for run in runs
+    ]
+    attachment_meta = [
+        {"id": item.id, "filename": item.filename, "status": item.status}
+        for item in legacy_attachments
+    ] + upload_meta
+    run_id = _assistant_request_message_id(
+        "run", tenant_id=tenant_id, user_id=user_id, request_id=request_id
+    )
+    waiting_context = {
+        "request_id": request_id,
+        "page": payload.page,
+        "path": payload.path,
+        "scenario_id": payload.scenario_id,
+        "selection": payload.selection,
+        "mode": payload.mode,
+        "draft_kind": payload.draft_kind,
+        "llm_config_id": payload.llm_config_id,
+        "skill_ids": payload.skill_ids,
+        "mcp_ids": payload.mcp_ids,
+        "upload_run_ids": payload.upload_run_ids,
+        "status": "waiting_for_upload",
+        "assistant_request_run_id": run_id,
+        "assistant_request_status": "waiting_upload",
+        "assistant_request_revision": 1,
+    }
+    user_message_id = _assistant_request_message_id(
+        "user",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        request_id=request_id,
+    )
+    assistant_message_id = _assistant_request_message_id(
+        "assistant",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        request_id=request_id,
+    )
+    _save_message(
+        db,
+        thread,
+        "user",
+        payload.message,
+        waiting_context,
+        attachment_meta,
+        message_id=user_message_id,
+    )
+    # Give the accepted user message a stable position before the assistant
+    # placeholder is inserted; batch defaults otherwise share one timestamp.
+    db.flush()
+    _save_message(
+        db,
+        thread,
+        "assistant",
+        "消息已接收；正在等待后台完成附件上传与解析。",
+        waiting_context,
+        message_id=assistant_message_id,
+    )
+    try:
+        return assistant_request_run_service.enqueue_request(
+            db,
+            run_id=run_id,
+            request_id=request_id,
+            request_fingerprint=fingerprint,
+            thread_id=thread_id,
+            user_message_id=user_message_id,
+            assistant_message_id=assistant_message_id,
+            payload_document=payload.model_copy(
+                update={"thread_id": thread_id, "request_id": request_id}
+            ).model_dump(mode="json"),
+            upload_run_ids=list(payload.upload_run_ids),
+        )
+    except assistant_request_run_service.AssistantRequestError as exc:
+        db.rollback()
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": exc.message}) from exc
 
 
 def _route_plan_from_claim(claim: AssistantRouteDecision) -> assistant_orchestrator.AssistantRoutePlan:
@@ -5641,6 +6215,9 @@ def _claimed_request_route_plan(
         payload.attachment_ids,
         thread_id=candidate_thread_id,
         consume=False,
+    )
+    upload_runs = managed_upload_run_service.get_invocation_upload_runs(
+        db, payload.upload_run_ids
     )
     wait_deadline = time.monotonic() + 22
     lease_token = uuid.uuid4().hex
@@ -5734,7 +6311,7 @@ def _claimed_request_route_plan(
         scenario,
         thread,
         payload,
-        has_attachments=bool(attachments),
+        has_attachments=bool(attachments or upload_runs),
         request_id=request_id,
     )
     persisted = db.execute(
@@ -5777,6 +6354,30 @@ def _mode_safety_context(mode: str) -> str:
     return "\n当前是智能协助：按本条语义回答问题或准备待确认草稿，但不得直接应用或执行。"
 
 
+def _assistant_selection_prompt(selection: dict[str, Any] | None) -> str:
+    """Expose only bounded resource identity to a model, never Action parameters."""
+
+    if not selection:
+        return ""
+    public_keys = (
+        "label",
+        "kind",
+        "id",
+        "type",
+        "action_id",
+        "action_name",
+        "entity_id",
+        "data_source_id",
+        "table_name",
+    )
+    public = {
+        key: selection[key]
+        for key in public_keys
+        if isinstance(selection.get(key), str) and selection[key]
+    }
+    return json.dumps(public, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _route_fallback_public_notice() -> str:
     return (
         "这次语义规划没有完成，我无法安全判断你是在提问还是要求建设内容。"
@@ -5816,7 +6417,7 @@ def _assistant_evidence(
         "ontology": ("ontology_validation", "实体、属性、关系和约束在应用边界重新校验"),
         "mapping": ("mapping_reference_validation", "实体、数据源、表、列、主键和必填字段必须真实存在"),
         "workflow": ("workflow_dag_validation", "节点、连线和操作引用在应用边界重新校验"),
-        "scenario_model": ("compound_model_validation", "全文来源覆盖、跨资源引用和冲突通过后才允许同一事务应用"),
+        "scenario_model": ("compound_model_validation", "有界引用覆盖、跨资源引用和冲突通过后才允许同一事务应用"),
         "apply_guidance": ("explicit_confirmation", "聊天不会写入正式业务模型，只有已保存提案的 confirm=true 可应用"),
         "execute_guidance": ("typed_action_only", "聊天只预演，真实执行必须进入场景中已配置的操作或任务审批"),
         "capability_update_guidance": (
@@ -6044,6 +6645,7 @@ def _mapping_catalog(
             select(DataSource).where(
                 tenant_service.visible_clause(DataSource, db),
                 or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == scenario.id),
+                DataSource.resource_scope == "modeling",
                 DataSource.type != "file_bucket",
             )
             .order_by(DataSource.created_at, DataSource.id)
@@ -6106,6 +6708,7 @@ def _validate_mapping_draft(
     if (
         not source
         or source.scenario_id not in (None, scenario.id)
+        or source.resource_scope != "modeling"
         or source.type == "file_bucket"
     ):
         raise ValueError("数据映射草稿引用的数据源不可用或不属于当前场景")
@@ -6214,7 +6817,7 @@ def _generate_mapping_draft(
         "只输出 JSON，字段为 entity_id、data_source_id、table_name、column_map。"
         "column_map 的键必须是本体属性名，值必须是候选表中的真实列名；"
         "必须覆盖主键和所有必填属性，不得输出 SQL、连接配置、凭据或新资源。\n\n"
-        f"当前选择：{json.dumps(selection or {}, ensure_ascii=False)}\n"
+        f"当前选择：{_assistant_selection_prompt(selection)}\n"
         f"本体实体：{json.dumps(entities, ensure_ascii=False)}\n"
         f"可用表结构：{json.dumps(catalog, ensure_ascii=False)}\n"
         f"用户说明：{description[:12000]}"
@@ -6542,6 +7145,8 @@ def _history_messages(
     db: Session,
     thread: AssistantThread,
     user_message_id: str,
+    *,
+    exclude_request_id: str = "",
 ) -> list[dict[str, str]]:
     """读取助手历史，排除本次刚保存的用户消息。"""
     history = db.execute(
@@ -6555,6 +7160,12 @@ def _history_messages(
     ).scalars().all()
     result: list[dict[str, str]] = []
     for item in reversed(history):
+        if (
+            exclude_request_id
+            and isinstance(item.context, dict)
+            and item.context.get("request_id") == exclude_request_id
+        ):
+            continue
         if item.role not in ("user", "assistant") or not item.content:
             continue
         content = (
@@ -6793,7 +7404,31 @@ def submit_compilation_guidance(
         thread_id=thread.id,
         consume=False,
     )
-    attachment_text, sources = _attachment_context(attachments)
+    attachment_text, sources = _attachment_context(
+        attachments,
+        query=payload.message,
+        db=db,
+        tenant_id=_tenant(db),
+        user_id=_current_user_id(db),
+        thread_id=thread.id,
+    )
+    try:
+        managed_attachments = managed_upload_run_service.invocation_attachment_documents(
+            db, payload.upload_run_ids
+        )
+    except managed_upload_run_service.ManagedUploadError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    _managed_text, managed_sources = _managed_attachment_context(
+        managed_attachments,
+        query=payload.message,
+        top_k=content_retrieval_service.COMPILER_TOP_K,
+        max_chars=content_retrieval_service.COMPILER_MAX_CHARS,
+    )
+    sources = [*sources, *managed_sources]
+    compiler_attachments = [*attachments, *managed_attachments]
     try:
         queued_job, accepted = assistant_compilation_job_service.enqueue_guidance(
             db,
@@ -6802,7 +7437,12 @@ def submit_compilation_guidance(
             created_by_user_id=_current_user_id(db),
             guidance_id=payload.request_id,
             message=payload.message,
-            attachment_text=attachment_text,
+            attachment_documents=(
+                assistant_compilation_job_service.canonical_compiler_documents(
+                    compiler_attachments,
+                    query=payload.message,
+                )
+            ),
             sources=sources,
         )
     except (LookupError, ValueError) as exc:
@@ -7017,7 +7657,16 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
     except ValueError as exc:
         staged.remove()
         raise HTTPException(400, str(exc)) from exc
-    table_file = Path(filename).suffix.lower() in {".csv", ".tsv", ".xls", ".xlsx", ".xlsm"}
+    try:
+        detected_media_type, content_profile = (
+            catalog_ingestion_service.build_profile_path(
+                staged.path, filename, content_type
+            )
+        )
+    except catalog_service.CatalogError as exc:
+        staged.remove()
+        raise HTTPException(400, str(exc)) from exc
+    table_file = content_profile.get("category") == "table"
     document_limit = int(
         getattr(settings, "document_parse_max_bytes", settings.max_upload_bytes)
     )
@@ -7032,7 +7681,7 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
         tenant_id=_tenant(db),
         created_by_user_id=_current_user_id(db),
         filename=filename,
-        mime=content_type,
+        mime=detected_media_type,
         size=staged.byte_size,
         content_hash=staged.content_sha256,
         status="pending",
@@ -7073,15 +7722,15 @@ async def upload_attachment(file: UploadFile = File(...), db: Session = Depends(
         )
         db.flush()
         if table_file:
-            _media_type, profile = catalog_ingestion_service.build_profile_path(
-                staged.path, filename, content_type
-            )
             parsed_text = catalog_ingestion_service.profile_summary_text(
-                profile, filename
+                content_profile, filename
             )
             parsed = {"status": "success", "text": parsed_text, "message": "表格结构解析完成"}
         else:
-            parsed = doc_parser.parse_bytes(staged.path.read_bytes(), filename)
+            canonical_extension = str(content_profile.get("extension") or ".txt")
+            parsed = doc_parser.parse_bytes(
+                staged.path.read_bytes(), f"document{canonical_extension}"
+            )
             parsed_text = str(parsed.get("text") or "")
         attachment.status = "parsed" if parsed.get("status") == "success" else "error"
         if attachment.status == "parsed" and len(parsed_text) > ASSISTANT_ATTACHMENT_TEXT_MAX_CHARS:
@@ -7144,9 +7793,105 @@ def delete_attachment(attachment_id: str, db: Session = Depends(get_tenant_db)):
     return Msg(message="附件已移除")
 
 
+def _assert_assistant_request_worker_lease(
+    db: Session,
+    *,
+    for_update: bool = False,
+    refresh_authorization: bool = False,
+    scenario_verb: str = "read",
+) -> None:
+    run_id = str(db.info.get("assistant_request_run_id") or "")
+    if not run_id:
+        return
+    lease_token = str(db.info.get("assistant_request_lease_token") or "")
+    lease_generation = int(
+        db.info.get("assistant_request_lease_generation") or 0
+    )
+    if refresh_authorization:
+        authorization_db = SessionLocal()
+        authorization_db.info.update({
+            "tenant_id": str(db.info.get("tenant_id") or ""),
+            "user_id": str(db.info.get("user_id") or ""),
+        })
+        try:
+            assistant_request_run_service.assert_execution_lease(
+                authorization_db,
+                run_id,
+                lease_token=lease_token,
+                lease_generation=lease_generation,
+                scenario_verb=scenario_verb,
+            )
+        finally:
+            authorization_db.close()
+        permission_service.refresh_request_authorization(db)
+    assistant_request_run_service.assert_execution_lease(
+        db,
+        run_id,
+        lease_token=lease_token,
+        lease_generation=lease_generation,
+        for_update=for_update,
+        scenario_verb=scenario_verb,
+    )
+
+
+def execute_assistant_request_run(
+    payload_document: dict[str, Any],
+    tenant_id: str,
+    user_id: str,
+    run_id: str,
+    lease_token: str,
+    lease_generation: int,
+) -> None:
+    """Restore the original principal and execute one fenced durable send."""
+
+    worker_db = SessionLocal()
+    worker_db.info.update({
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "assistant_request_worker": True,
+        "assistant_request_run_id": run_id,
+        "assistant_request_lease_token": lease_token,
+        "assistant_request_lease_generation": lease_generation,
+    })
+    try:
+        payload = AssistantChatRequest.model_validate(payload_document)
+        chat(payload, worker_db)
+    finally:
+        worker_db.close()
+
+
 @router.post("/chat/stream")
 def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     """全局助手 SSE：流式回答，同时发送可展开的安全处理摘要。"""
+    if payload.upload_run_ids and not db.info.get("assistant_request_worker"):
+        effective_request_id = str(payload.request_id or uuid.uuid4().hex)
+        run = _accept_attachment_backed_request(
+            db, payload, request_id=effective_request_id
+        )
+
+        def accepted_stream():
+            yield _sse(
+                "assistant_request_run",
+                AssistantRequestRunOut.model_validate(run).model_dump(mode="json"),
+            )
+            yield _sse("meta", {
+                "thread_id": run["thread_id"],
+                "proposal": {},
+                "questions": [],
+                "suggestions": [],
+                "sources": [],
+                "thinking": [],
+                "evidence": {},
+                "action_preview": {},
+            })
+            yield _sse("done", {"thread_id": run["thread_id"]})
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            accepted_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     scenario = _scenario(db, payload.scenario_id, require_active=True)
     _configure_assistant_runtime(db, payload)
     capability_context = _assistant_capability_context(db, payload)
@@ -7198,9 +7943,30 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         _consume_attachments(db, attachments, thread_id=thread.id)
     attachment_text, sources = _attachment_context(
         attachments,
-        include_text=intent != "scenario_model",
-        enforce_context_limit=intent != "scenario_model",
+        query=payload.message,
+        db=db,
+        tenant_id=_tenant(db),
+        user_id=_current_user_id(db),
+        thread_id=thread.id,
     )
+    try:
+        managed_attachments = managed_upload_run_service.invocation_attachment_documents(
+            db, payload.upload_run_ids
+        )
+    except managed_upload_run_service.ManagedUploadError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    managed_text, managed_sources = _managed_attachment_context(
+        managed_attachments,
+        query=payload.message,
+    )
+    attachment_text = "\n\n".join(
+        value for value in (attachment_text, managed_text) if value
+    )
+    sources = [*sources, *managed_sources]
+    attachments = [*attachments, *managed_attachments]
     rag_context, rag_sources = _authorized_rag_context(db, scenario, payload.message)
     sources = [*sources, *rag_sources]
     context = {
@@ -7217,10 +7983,36 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         "routing": route_plan.public_context(),
     }
     attachment_meta = [{"id": x.id, "filename": x.filename, "status": x.status} for x in attachments]
-    user_message = _save_message(db, thread, "user", payload.message, context, attachment_meta)
+    user_message = _save_message(
+        db,
+        thread,
+        "user",
+        payload.message,
+        context,
+        attachment_meta,
+        message_id=(
+            _assistant_request_message_id(
+                "user",
+                tenant_id=_tenant(db),
+                user_id=_current_user_id(db),
+                request_id=effective_request_id,
+            )
+            if payload.upload_run_ids
+            else None
+        ),
+    )
     db.flush()
     thread_id = thread.id
-    assistant_message_id = uuid.uuid4().hex
+    assistant_message_id = (
+        _assistant_request_message_id(
+            "assistant",
+            tenant_id=_tenant(db),
+            user_id=_current_user_id(db),
+            request_id=effective_request_id,
+        )
+        if payload.upload_run_ids
+        else uuid.uuid4().hex
+    )
     if intent in {"execute_guidance", "scenario_model"}:
         _save_message(
             db,
@@ -7240,7 +8032,14 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
     db.commit()
 
     llm = _llm(db)
-    history = _history_messages(db, thread, user_message.id)
+    history = _history_messages(
+        db,
+        thread,
+        user_message.id,
+        exclude_request_id=(
+            effective_request_id if payload.upload_run_ids else ""
+        ),
+    )
     llm_messages: list[dict[str, str]] = [
         {
             "role": "system",
@@ -7257,7 +8056,11 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 + _read_only_chat_contract()
                 + _scenario_context(db, scenario)
                 + (f"\n\n当前页面：{payload.page}（{payload.path}）" if payload.page else "")
-                + (f"\n当前选择：{payload.selection}" if payload.selection else "")
+                + (
+                    f"\n当前选择：{_assistant_selection_prompt(payload.selection)}"
+                    if payload.selection
+                    else ""
+                )
                 + capability_context
                 + (f"\n\n{attachment_text}" if attachment_text else "")
                 + (f"\n\n{rag_context}" if rag_context else "")
@@ -7278,6 +8081,8 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         action_preview: dict[str, Any],
         *,
         write_audit: bool = True,
+        questions: list[dict[str, Any]] | None = None,
+        suggestions: list[str] | None = None,
     ) -> None:
         save_db = SessionLocal()
         try:
@@ -7308,7 +8113,22 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 **context,
                 "evidence": evidence,
                 "action_preview": action_preview,
+                "questions": _assistant_questions_context(questions),
+                "suggestions": _public_assistant_suggestions(suggestions),
             }
+            proposal_kind = str(proposal.get("kind") or "")
+            if proposal_kind in _LEGACY_MODELING_PROPOSAL_KINDS:
+                assistant_context[_LEGACY_MODELING_SOURCE_EVIDENCE_KEY] = (
+                    _legacy_modeling_source_evidence(
+                        kind=proposal_kind,
+                        thread_id=thread_id,
+                        assistant_message_id=assistant_message_id,
+                        proposal=proposal,
+                        user_message_id=user_message.id,
+                        user_message=payload.message,
+                        modeling_material_sources=rag_sources,
+                    )
+                )
             if status == "route_fallback":
                 assistant_context["status"] = "route_fallback"
             elif proposal.get("kind") == "scenario_model":
@@ -7405,7 +8225,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
             })
             if attachments:
                 attachment_detail = (
-                    f"已读取并校验 {len(attachments)} 个会话附件，正文只用于本轮已授权上下文。"
+                    f"已校验 {len(attachments)} 个会话附件，并按本次需求检索有界引用片段。"
                 )
                 yield _sse("tool_event", {
                     "tool": "read_attachments",
@@ -7414,14 +8234,14 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                         "id": "tool-read-attachments",
                         "kind": "tool",
                         "step_id": "attachments",
-                        "title": "读取会话附件",
+                        "title": "检索会话附件",
                         "detail": attachment_detail,
                         "status": "done",
                     },
                 })
                 yield progress({
                     "id": "attachments",
-                    "title": "读取会话附件",
+                    "title": "检索会话附件",
                     "detail": attachment_detail,
                     "status": "done",
                 })
@@ -7532,12 +8352,13 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield _sse("token", reply)
             elif intent == "scenario":
                 yield progress({"id": "scenario", "title": "生成业务场景草稿", "detail": "正在整理业务目标、角色和边界。", "status": "running"})
-                description = payload.message + (
-                    f"\n\n参考附件内容：\n{attachment_text}" if attachment_text else ""
+                description = _legacy_modeling_description(
+                    payload.message,
+                    modeling_material_context=rag_context,
                 )
                 data = _generate_scenario_draft(db, description)
                 proposal = _build_proposal("scenario", data)
-                reply = "我已生成业务场景草稿。确认前不会创建场景，附件也不会进入正式数据源。"
+                reply = "我已根据你的说明和已授权建模资料生成业务场景草稿。会话附件不会成为建模来源；确认前不会创建场景。"
                 done_event = progress({"id": "scenario", "title": "生成业务场景草稿", "detail": "场景名称、目标与边界已整理完成。", "status": "done"})
                 persist_result(
                     reply,
@@ -7565,7 +8386,8 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 )
                 compiler_documents = (
                     assistant_compilation_job_service.canonical_compiler_documents(
-                        attachments
+                        attachments,
+                        query=compiler_message,
                     )
                 )
                 prepared_context = (
@@ -7589,14 +8411,14 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 for item in plan:
                     if item["id"] == "analyze":
                         item["status"] = "done"
-                        item["detail"] = f"已读取 {len(source_bundle_preview['paragraphs'])} 个来源段落。"
+                        item["detail"] = f"已检索 {len(source_bundle_preview['paragraphs'])} 个可引用来源片段。"
                     elif item["id"] == "plan":
                         item["status"] = "done"
                         item["detail"] = "已拆解为资料分析、计划和 6 个连续建模任务。"
                 yield progress({
                     "id": "analyze",
                     "title": "分析业务资料",
-                    "detail": f"已读取 {len(source_bundle_preview['paragraphs'])} 个来源段落，正在建立可追溯来源。",
+                    "detail": f"已检索 {len(source_bundle_preview['paragraphs'])} 个可引用来源片段，正在建立可追溯来源。",
                     "status": "done",
                 })
                 yield progress({
@@ -7775,14 +8597,13 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     })
             elif intent == "ontology" and scenario:
                 yield progress({"id": "ontology", "title": "生成本体草稿", "detail": "正在整理实体、属性和关系建议。", "status": "running"})
-                description = (
-                    payload.message
-                    + (f"\n\n参考附件内容：\n{attachment_text}" if attachment_text else "")
-                    + (f"\n\n已授权资料依据：\n{rag_context}" if rag_context else "")
+                description = _legacy_modeling_description(
+                    payload.message,
+                    modeling_material_context=rag_context,
                 )
                 data = ontology_service.generate_ontology(db, scenario, description)
                 proposal = _build_proposal("ontology", data, scenario)
-                reply = "我已经根据当前场景和附件生成了本体草稿。请检查变更内容，确认后再应用到场景。"
+                reply = "我已经根据当前场景、你的说明和已授权建模资料生成本体草稿。请检查变更内容，确认后再应用到场景。"
                 done_event = progress({"id": "ontology", "title": "生成本体草稿", "detail": "实体和关系建议已整理完成。", "status": "done"})
                 persist_result(
                     reply,
@@ -7803,8 +8624,9 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield _sse("token", reply)
             elif intent == "mapping" and scenario:
                 yield progress({"id": "mapping", "title": "生成数据映射草稿", "detail": "正在核对实体、数据源、表和字段。", "status": "running"})
-                description = payload.message + (
-                    f"\n\n参考附件内容：\n{attachment_text}" if attachment_text else ""
+                description = _legacy_modeling_description(
+                    payload.message,
+                    modeling_material_context=rag_context,
                 )
                 data = _generate_mapping_draft(db, scenario, description, payload.selection)
                 proposal = _build_proposal("mapping", data, scenario)
@@ -7829,10 +8651,9 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield _sse("token", reply)
             elif intent == "workflow" and scenario:
                 yield progress({"id": "workflow", "title": "编排工作流草稿", "detail": "正在识别触发条件、节点和分支关系。", "status": "running"})
-                description = (
-                    payload.message
-                    + (f"\n\n参考附件内容：\n{attachment_text}" if attachment_text else "")
-                    + (f"\n\n已授权资料依据：\n{rag_context}" if rag_context else "")
+                description = _legacy_modeling_description(
+                    payload.message,
+                    modeling_material_context=rag_context,
                 )
                 data = workflow_service.generate_workflow(db, scenario, description)
                 proposal = _build_proposal("workflow", data, scenario)
@@ -7889,7 +8710,16 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 uncertainties=[route_notice] if route_notice else [],
             )
             if not compilation_queued:
-                persist_result(reply, proposal, thinking, saved_status, evidence, action_preview)
+                persist_result(
+                    reply,
+                    proposal,
+                    thinking,
+                    saved_status,
+                    evidence,
+                    action_preview,
+                    questions=questions,
+                    suggestions=suggestions,
+                )
             yield _sse("meta", {
                 "thread_id": thread_id,
                 "proposal": _public_recovery_proposal(proposal),
@@ -7965,7 +8795,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 public_error = (
                     assistant_compilation_job_service.PublicCompilationError(
                         "workflow_generation_invalid",
-                        str(exc),
+                        "无法生成可安全保存的工作流草稿；系统未执行任何变更，请完善场景资源后重试。",
                     )
                 )
             else:
@@ -8002,7 +8832,16 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     preview=action_preview,
                     uncertainties=[public_error.message],
                 )
-                persist_result(reply, proposal, thinking, saved_status, evidence, action_preview)
+                persist_result(
+                    reply,
+                    proposal,
+                    thinking,
+                    saved_status,
+                    evidence,
+                    action_preview,
+                    questions=questions,
+                    suggestions=suggestions,
+                )
                 yield _sse("meta", {
                     "thread_id": thread_id,
                     "proposal": _public_recovery_proposal(proposal),
@@ -8028,6 +8867,16 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
 
 @router.post("/chat", response_model=AssistantReplyOut)
 def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
+    if payload.upload_run_ids and not db.info.get("assistant_request_worker"):
+        run = _accept_attachment_backed_request(
+            db,
+            payload,
+            request_id=str(payload.request_id or uuid.uuid4().hex),
+        )
+        return AssistantReplyOut(
+            thread_id=run["thread_id"],
+            reply="消息已接收；后台将在附件准备完成后继续处理。",
+        )
     scenario = _scenario(db, payload.scenario_id, require_active=True)
     _configure_assistant_runtime(db, payload)
     capability_context = _assistant_capability_context(db, payload)
@@ -8074,13 +8923,33 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         db.flush()
     elif thread.title == "新的助手任务":
         thread.title = payload.message[:80] or thread.title
-    if attachments:
-        _consume_attachments(db, attachments, thread_id=thread.id)
     attachment_text, sources = _attachment_context(
         attachments,
-        include_text=intent != "scenario_model",
-        enforce_context_limit=intent != "scenario_model",
+        query=payload.message,
+        db=db,
+        tenant_id=_tenant(db),
+        user_id=_current_user_id(db),
+        thread_id=thread.id,
     )
+    try:
+        managed_attachments = managed_upload_run_service.invocation_attachment_documents(
+            db, payload.upload_run_ids
+        )
+    except managed_upload_run_service.ManagedUploadError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    managed_text, managed_sources = _managed_attachment_context(
+        managed_attachments,
+        query=payload.message,
+    )
+    attachment_text = "\n\n".join(
+        value for value in (attachment_text, managed_text) if value
+    )
+    sources = [*sources, *managed_sources]
+    legacy_attachments = attachments
+    attachments = [*attachments, *managed_attachments]
     rag_context, rag_sources = _authorized_rag_context(db, scenario, payload.message)
     sources = [*sources, *rag_sources]
     context = {
@@ -8097,7 +8966,32 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         "routing": route_plan.public_context(),
     }
     attachment_meta = [{"id": x.id, "filename": x.filename, "status": x.status} for x in attachments]
-    user_message = _save_message(db, thread, "user", payload.message, context, attachment_meta)
+    # Durable retries reuse deterministic message IDs. Acquire the current run
+    # fence before touching those rows, and release it in the short staging
+    # commit below; no model or external call runs while this lock is held.
+    _assert_assistant_request_worker_lease(db, for_update=True)
+    if legacy_attachments:
+        # Managed uploads retain their own owner, lease and expiry lifecycle;
+        # they are not rows in the legacy AssistantAttachment table.
+        _consume_attachments(db, legacy_attachments, thread_id=thread.id)
+    user_message = _save_message(
+        db,
+        thread,
+        "user",
+        payload.message,
+        context,
+        attachment_meta,
+        message_id=(
+            _assistant_request_message_id(
+                "user",
+                tenant_id=_tenant(db),
+                user_id=_current_user_id(db),
+                request_id=effective_request_id,
+            )
+            if payload.upload_run_ids
+            else None
+        ),
+    )
     db.flush()
 
     reply = ""
@@ -8105,10 +8999,21 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     questions: list[dict[str, Any]] = []
     action_preview: dict[str, Any] = {}
     error_uncertainties: list[str] = []
+    request_execution_error: Exception | None = None
+    request_execution_error_code = ""
     route_notice = _route_fallback_notice(route_plan)
     if route_notice:
         error_uncertainties.append(route_notice)
-    assistant_message_id = uuid.uuid4().hex
+    assistant_message_id = (
+        _assistant_request_message_id(
+            "assistant",
+            tenant_id=_tenant(db),
+            user_id=_current_user_id(db),
+            request_id=effective_request_id,
+        )
+        if payload.upload_run_ids
+        else uuid.uuid4().hex
+    )
     tenant_id = _tenant(db)
     user_id = _current_user_id(db)
     if intent in {"execute_guidance", "scenario_model"}:
@@ -8129,6 +9034,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     # any downstream generation model runs, so the database does not hold a write
     # transaction while waiting on the provider.
     db.commit()
+    _assert_assistant_request_worker_lease(db)
     suggestions = (
         ["创建业务场景草稿", "说明建模所需资料"]
         if not scenario
@@ -8173,12 +9079,13 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             })
             reply = "当前助手会话已绑定现有业务场景，不能在这里创建另一个场景。"
         elif intent == "scenario":
-            description = payload.message
-            if attachment_text:
-                description += f"\n\n参考附件内容：\n{attachment_text}"
+            description = _legacy_modeling_description(
+                payload.message,
+                modeling_material_context=rag_context,
+            )
             data = _generate_scenario_draft(db, description)
             proposal = _build_proposal("scenario", data)
-            reply = "我已生成业务场景草稿。确认前不会创建场景，附件也不会进入正式数据源。"
+            reply = "我已根据你的说明和已授权建模资料生成业务场景草稿。会话附件不会成为建模来源；确认前不会创建场景。"
         elif intent == "scenario_model" and scenario:
             # Persist the conversation parent before the unique job insert.
             # A duplicate fingerprint intentionally rolls back its failed
@@ -8193,7 +9100,8 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             )
             compiler_documents = (
                 assistant_compilation_job_service.canonical_compiler_documents(
-                    attachments
+                    attachments,
+                    query=compiler_message,
                 )
             )
             prepared_context = (
@@ -8355,27 +9263,26 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                             "不会从头重复建模。"
                         )
         elif intent == "ontology" and scenario:
-            description = payload.message
-            if attachment_text:
-                description += f"\n\n参考附件内容：\n{attachment_text}"
-            if rag_context:
-                description += f"\n\n已授权资料依据：\n{rag_context}"
+            description = _legacy_modeling_description(
+                payload.message,
+                modeling_material_context=rag_context,
+            )
             data = ontology_service.generate_ontology(db, scenario, description)
             proposal = _build_proposal("ontology", data, scenario)
-            reply = "我已经根据当前场景和附件生成了本体草稿。请检查变更内容，确认后再应用到场景。"
+            reply = "我已经根据当前场景、你的说明和已授权建模资料生成本体草稿。请检查变更内容，确认后再应用到场景。"
         elif intent == "mapping" and scenario:
-            description = payload.message
-            if attachment_text:
-                description += f"\n\n参考附件内容：\n{attachment_text}"
+            description = _legacy_modeling_description(
+                payload.message,
+                modeling_material_context=rag_context,
+            )
             data = _generate_mapping_draft(db, scenario, description, payload.selection)
             proposal = _build_proposal("mapping", data, scenario)
             reply = "我已生成并校验数据映射草稿。确认后才会保存映射，刷新数据仍需单独提交。"
         elif intent == "workflow" and scenario:
-            description = payload.message
-            if attachment_text:
-                description += f"\n\n参考附件内容：\n{attachment_text}"
-            if rag_context:
-                description += f"\n\n已授权资料依据：\n{rag_context}"
+            description = _legacy_modeling_description(
+                payload.message,
+                modeling_material_context=rag_context,
+            )
             data = workflow_service.generate_workflow(db, scenario, description)
             proposal = _build_proposal("workflow", data, scenario)
             reply = "我已经生成了工作流草稿。请先检查节点、分支和动作引用，确认后再保存。"
@@ -8398,14 +9305,25 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                             + _read_only_chat_contract()
                             + _scenario_context(db, scenario)
                             + (f"\n\n当前页面：{payload.page}（{payload.path}）" if payload.page else "")
-                            + (f"\n当前选择：{payload.selection}" if payload.selection else "")
+                            + (
+                                f"\n当前选择：{_assistant_selection_prompt(payload.selection)}"
+                                if payload.selection
+                                else ""
+                            )
                             + capability_context
                             + (f"\n\n{attachment_text}" if attachment_text else "")
                             + (f"\n\n{rag_context}" if rag_context else "")
                         ),
                     }
                 ]
-                messages.extend(_history_messages(db, thread, user_message.id))
+                messages.extend(_history_messages(
+                    db,
+                    thread,
+                    user_message.id,
+                    exclude_request_id=(
+                        effective_request_id if payload.upload_run_ids else ""
+                    ),
+                ))
                 answer = llm_service.chat(
                     llm,
                     messages + [{"role": "user", "content": payload.message}],
@@ -8415,6 +9333,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             else:
                 reply = _fallback_reply(intent, scenario)
     except Exception as exc:  # noqa: BLE001
+        request_execution_error = exc
         logger.exception(
             "assistant request failed",
             extra={"assistant_intent": intent, "assistant_request_id": context.get("request_id")},
@@ -8426,7 +9345,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         elif isinstance(exc, workflow_service.WorkflowGenerationError):
             public_error = assistant_compilation_job_service.PublicCompilationError(
                 "workflow_generation_invalid",
-                str(exc),
+                "无法生成可安全保存的工作流草稿；系统未执行任何变更，请完善场景资源后重试。",
             )
         else:
             public_error = assistant_compilation_job_service.PublicCompilationError(
@@ -8434,6 +9353,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 "这次助手请求未完成，系统未执行任何变更；服务端已保留诊断记录，请稍后重试。",
             )
         reply = public_error.message
+        request_execution_error_code = public_error.code
         context["diagnostic"] = {
             "code": public_error.code,
             "type": type(exc).__name__[:120],
@@ -8470,7 +9390,22 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         **context,
         "evidence": evidence,
         "action_preview": action_preview,
+        "questions": _assistant_questions_context(questions),
+        "suggestions": _public_assistant_suggestions(suggestions),
     }
+    proposal_kind = str(proposal.get("kind") or "")
+    if proposal_kind in _LEGACY_MODELING_PROPOSAL_KINDS:
+        assistant_context[_LEGACY_MODELING_SOURCE_EVIDENCE_KEY] = (
+            _legacy_modeling_source_evidence(
+                kind=proposal_kind,
+                thread_id=thread.id,
+                assistant_message_id=assistant_message_id,
+                proposal=proposal,
+                user_message_id=user_message.id,
+                user_message=payload.message,
+                modeling_material_sources=rag_sources,
+            )
+        )
     if route_notice:
         assistant_context["status"] = "route_fallback"
     if proposal.get("kind") == "scenario_model":
@@ -8483,6 +9418,15 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         intent == "scenario_model"
         and bool(str(context.get("compilation_job_id") or ""))
     )
+    # The model/provider call ran outside the lease transaction. Re-check the
+    # durable fence immediately before any terminal message/audit write so a
+    # reclaimed worker cannot publish a late result.
+    _assert_assistant_request_worker_lease(
+        db,
+        for_update=True,
+        refresh_authorization=True,
+        scenario_verb="write" if intent == "scenario_model" else "read",
+    )
     if not job_bound_message:
         _save_message(
             db,
@@ -8494,6 +9438,21 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             proposal,
             message_id=assistant_message_id,
         )
+    if db.info.get("assistant_request_worker"):
+        committed_message = db.get(AssistantMessage, assistant_message_id)
+        if committed_message is not None and committed_message.thread_id == thread.id:
+            committed_message.context = {
+                **dict(committed_message.context or {}),
+                "assistant_request_run_id": str(
+                    db.info.get("assistant_request_run_id") or ""
+                ),
+                "assistant_request_status": (
+                    "failure_committed"
+                    if request_execution_error is not None
+                    else "result_committed"
+                ),
+                "assistant_request_error_code": request_execution_error_code,
+            }
     db.add(
         AssistantAuditLog(
             tenant_id=_tenant(db),
@@ -8502,7 +9461,9 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             thread_id=thread.id,
             operation="propose" if proposal else "chat",
             status=(
-                "route_fallback"
+                "failed"
+                if request_execution_error is not None
+                else "route_fallback"
                 if route_notice
                 else "success" if not questions or proposal else "needs_input"
             ),
@@ -8512,6 +9473,8 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     )
     db.commit()
     db.refresh(thread)
+    if db.info.get("assistant_request_worker") and request_execution_error is not None:
+        raise RuntimeError("durable assistant request execution failed") from request_execution_error
     return AssistantReplyOut(
         thread_id=thread.id,
         reply=reply,
@@ -8589,8 +9552,14 @@ def continue_model_task(
         isinstance(item, dict) for item in compiler_documents
     ):
         raise HTTPException(409, "原始建模资料格式无效，请重新发送资料后开始新的计划")
+    compiler_documents = content_retrieval_service.bounded_documents(
+        compiler_documents,
+        query=compiler_message,
+        top_k=content_retrieval_service.COMPILER_TOP_K,
+        max_chars=content_retrieval_service.COMPILER_MAX_CHARS,
+    )
     if source_execution.get("recovery_issue"):
-        raise HTTPException(409, "原始资料尚不可完整读取，请先补充或重新上传后再继续")
+        raise HTTPException(409, "当前有界引用不足以继续，请补充或重新上传资料")
 
     prepared_context = scenario_model_compiler.prepare_compilation_context(db, scenario)
     source_bundle, recovery_issue = _source_bundle_preview_with_recovery(
@@ -8617,7 +9586,14 @@ def continue_model_task(
     identity_attachments = [
         {
             "filename": str(item.get("filename") or item.get("id") or "业务资料"),
-            "parsed_text": str(item.get("text") or ""),
+            "content_hash": str(
+                item.get("content_hash") or item.get("parsed_text_hash") or ""
+            ),
+            "parsed_text": "\n\n".join(
+                str(passage.get("text") or "")
+                for passage in (item.get("passages") or [])
+                if isinstance(passage, dict)
+            ),
             "status": "parsed",
         }
         for item in compiler_documents
@@ -8661,13 +9637,13 @@ def continue_model_task(
     for item in plan:
         if item["id"] == "analyze":
             item["status"] = "done"
-            item["detail"] = "已恢复原始资料及已确认的场景定义。"
+            item["detail"] = "已恢复内容身份、有界引用片段及已确认的场景定义。"
         elif item["id"] == "plan":
             item["status"] = "done"
             item["detail"] = f"已确认继续生成“{definition['title']}”。"
         elif item["id"] == "ontology":
             item["title"] = f"生成{definition['title']}"
-            item["detail"] = "正在逐段读取原始资料并结合已确认定义生成候选。"
+            item["detail"] = "正在按当前任务检索有界引用片段，并结合已确认定义生成候选。"
     job, acquired = assistant_compilation_job_service.claim_compilation(
         db,
         identity=identity,
@@ -8703,7 +9679,15 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
     thread, proposal_message, saved_proposal = _find_saved_proposal(db, payload.thread_id, payload.proposal_id)
     if saved_proposal.get("kind") != payload.kind:
         raise HTTPException(409, "变更草稿类型与请求不一致")
+    _require_legacy_modeling_source_evidence(
+        db,
+        thread,
+        proposal_message,
+        saved_proposal,
+    )
     kind = payload.kind
+    if kind in _LEGACY_READ_ONLY_PROPOSAL_KINDS:
+        raise HTTPException(409, _LEGACY_READ_ONLY_APPLY_DETAIL)
     task_id = str(payload.task_id or "").strip()
     if kind == "scenario_model" and not task_id:
         raise HTTPException(409, "完整场景建模计划必须指定当前任务，不能整体应用或重放")
@@ -8884,64 +9868,10 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
             db.add(scenario)
             db.flush()
             result = {"kind": kind, "scenario_id": scenario.id, "status": "draft"}
-        elif kind == "ontology":
-            assert scenario is not None
-            entities = data.get("entities") or []
-            relations = data.get("relations") or []
-            if not entities:
-                raise PolicyViolation("本体草稿没有实体，不能应用")
-            applied = ontology_service.apply_generated_ontology(
-                db,
-                scenario,
-                {"entities": entities, "relations": relations},
-                commit=False,
-            )
-            result = {"kind": kind, **applied}
-        elif kind == "mapping":
-            assert scenario is not None
-            mapping, operation = _apply_mapping_draft(db, scenario, data)
-            result = {
-                "kind": kind,
-                "mapping_id": mapping.id,
-                "operation": operation,
-                "entity_id": mapping.entity_id,
-                "data_source_id": mapping.data_source_id,
-                "table_name": mapping.table_name,
-                "field_count": len(mapping.column_map or {}),
-                # Saving a definition does not read/import source rows.
-                "refresh_required": True,
-            }
-        elif kind == "workflow":
-            assert scenario is not None
-            nodes = data.get("nodes") or []
-            edges = data.get("edges") or []
-            workflow_service.validate_workflow_definition(nodes, edges)
-            workflow_service.canonicalize_workflow_references(
-                db,
-                scenario.id,
-                steps=[],
-                nodes=nodes,
-            )
-            workflow_service.validate_workflow_references(
-                db,
-                scenario.id,
-                steps=[],
-                nodes=nodes,
-            )
-            workflow = OntologyWorkflow(
-                scenario_id=scenario.id,
-                name=str(data.get("name") or "AI 生成工作流"),
-                description=str(data.get("description") or ""),
-                trigger_type="manual",
-                steps=[],
-                nodes=nodes,
-                edges=edges,
-                status="draft",
-                enabled=False,
-            )
-            db.add(workflow)
-            db.flush()
-            result = {"kind": kind, "workflow_id": workflow.id, "nodes": len(nodes), "edges": len(edges)}
+        elif kind in _LEGACY_READ_ONLY_PROPOSAL_KINDS:
+            # Defensive duplicate of the pre-claim gate above: these legacy
+            # suggestions never share the governed candidate/apply pipeline.
+            raise HTTPException(409, _LEGACY_READ_ONLY_APPLY_DETAIL)
         elif kind == "scenario_model" and task_id:
             assert scenario is not None
             tasks = data.get("tasks") or scenario_model_compiler.build_model_task_plan(data)
@@ -9302,7 +10232,7 @@ def apply_proposal(payload: AssistantProposalApplyRequest, db: Session = Depends
         elif next_action.get("type") == "generate_task":
             task_update_text += (
                 f" 下一步是「{next_action.get('task_title') or '下一任务'}」；"
-                "原始资料和已确认定义已保留，等待你开始生成该任务。"
+                "内容身份、有界引用片段和已确认定义已保留，等待你开始生成该任务。"
             )
         result = {
             **result,

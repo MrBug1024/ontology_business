@@ -21,13 +21,13 @@
   - **数据源**：
   - 版本化数据集：PostgreSQL Catalog 管理元数据，MinIO 保存不可变文件与 Parquet，DuckDB 执行只读查询。
   - PostgreSQL 连接器：表浏览与受控只读 SQL；PostgreSQL 也是平台控制面唯一关系型存储。
-  - 文件桶（file bucket）：上传 Excel / Word / Markdown / PDF / 图片，自动解析入库用于 RAG 检索。
+  - 文件桶（file bucket）：上传 Excel / Word / Markdown / PDF / 图片，自动解析入库用于 RAG 检索；验证 Agent 的附件先登记持久上传任务、流式写入 MinIO，再由后台 worker 解析，页面请求不等待解析完成。
 - **技能（Skill）**：安装受控的本地能力，供已配置的操作或工作流调用；内置 `ocr-parser`（OCR 文档解析）与 `data-analyzer`。
 - **MCP 服务**：接入 Model Context Protocol 工具服务（SSE / Streamable HTTP，以及由运维显式开启的 stdio）；支持表单配置请求头，也支持批量导入常见客户端的 `mcpServers` JSON。
 - **LLM 配置**：OpenAI 兼容协议（OpenAI / DeepSeek / 通义 / Ollama / vLLM…），多配置、可设默认、可测试连通性。
 - **业务能力**：用结构化表单配置无副作用函数、可预演操作、规则、事件和可视化工作流，无需手写 JSON。
-- **验证 Agent**：平台内用于验证场景能力、模型、运行输入和证据链的参考客户端。是否可验证按能力契约动态判断；没有数据端口的能力不要求数据源或映射。
-- **AI 对话**：场景内可选择完整建模、本体、映射、业务能力、工作流、只读解释或操作预演；完整建模会生成带来源证据、冲突检查和原子确认的跨资源变更清单。Agent 对话的 ReAct 工具循环可查询对象与数据、检索文档、调用确定性函数、评估规则、生成操作预演并协助提交工作流。
+- **验证 Agent**：平台内用于验证场景能力、模型、运行输入和证据链的参考客户端。Agent Turn 可引用仍在上传/解析的持久任务，消息先落库并返回 `202 Accepted`，后台再准备输入和执行；页面可恢复 SSE 进度，并通过 revision 控制取消和重试冲突。是否可验证按能力契约动态判断；没有数据端口的能力不要求数据源或映射。
+- **AI 对话**：场景内可选择完整建模、本体、映射、业务能力、工作流、只读解释或操作预演；完整建模会生成带来源证据、冲突检查和原子确认的跨资源变更清单。带附件的全局顾问消息会先连同占位回复和持久请求台账原子落库，再由后台等待附件并执行，刷新后可恢复、取消或显式重试；重试创建父子审计链，不改写旧终态。文档全文和表格原始行只作为服务端索引/查询来源，LLM 只接收有界检索片段、引用元数据和受限工具结果，不能把未检索部分表述为已阅读。
 - **任务中心**：集中处理工作流状态、重试和人工审批；运行时内部保留权限、连接解析和定义快照等安全内核，但不作为独立业务菜单暴露。
 
 ## 技术栈
@@ -60,7 +60,7 @@ project-root
 │   └── requirements.txt
 └── frontend/
     ├── src/
-    │   ├── api/               # axios 实例 + streamChat（SSE）
+    │   ├── api/               # HTTP 客户端 + 可恢复的持久 Turn SSE
     │   ├── router/            # 路由
     │   ├── stores/            # Pinia
     │   ├── types/             # 领域类型
@@ -99,8 +99,8 @@ python -m uvicorn app.main:app --app-dir .\backend --host 127.0.0.1 --port 8000
 
 > 后端 API 文档：http://127.0.0.1:8000/docs
 
-后端启动前，PostgreSQL 必须已升级到 Alembic head。当前存储边界、首次建库、迁移和回退要求见
-[PostgreSQL / MinIO 通用数据资产架构](./docs/PostgreSQL-MinIO-通用数据资产架构.md)。`init_db()` 只校验迁移版本，不会在生产库隐式建表。
+后端启动前，PostgreSQL 必须已升级到仓库实际的 Alembic single head；必须通过 `alembic heads` 读取仓库事实，并用 `alembic current` 核对目标库。当前存储边界、首次建库、迁移和回退要求见
+[PostgreSQL / MinIO 通用数据资产架构](./docs/PostgreSQL-MinIO-通用数据资产架构.md)。`init_db()` 只校验迁移版本，不会在生产库隐式建表；部署仍须以实际 `alembic heads` 和 `alembic current` 为准。
 
 ### 2. 前端（Node.js）
 
@@ -226,28 +226,28 @@ MAIL_TIMEOUT_SECONDS=20
 平台的目标主链路为：
 
 1. **定义业务语义与交互**：建立对象、属性、关系、能力、规则、事件、工作流和输入输出端口。数据不是所有场景的必选前置条件。
-2. **登记证据与资源用途**：需要数据时，明确区分建模证据、测试夹具、调用输入、参考知识、规则和输出。Excel/Word/数据库样本用于理解结构，并不自动成为永久运行数据。
+2. **登记证据与资源用途**：Catalog 资产和数据集用权威 `usage_plane` 区分 `modeling_material`、`invocation_input` 与 `generated_output`；端口再声明建模证据、测试夹具、调用输入、参考知识、规则或输出角色。Excel/Word/数据库样本只有进入 `modeling_material` 才能贡献建模元数据，验证中心的上传、解析结果和运行数据包不能反向成为建模来源。
 3. **建立可移植映射与绑定要求**：映射连接到逻辑 Dataset Schema 或环境 binding key，不把客户数据库 ID、表名或凭据写入能力定义。
 4. **验证并发布能力版本**：确定性校验通过的定义进入治理快照；副作用、凭据和生产发布继续执行风险门禁。
 5. **按调用提供当前业务输入**：验证 Agent 或第三方客户端可以提交文本、文档、结构化参数和受管数据版本；更换数据批次不要求重建能力。
 
-## 内置工具（Agent 可调用）
+## 统一能力工具（Agent 可调用）
 
 | 工具 | 说明 |
 | --- | --- |
-| `list_data_sources` | 列出 Agent 绑定的数据源 |
-| `list_tables` | 列出版本化数据集或外部数据库的逻辑关系与字段结构 |
-| `run_sql` | 对固定数据集版本或外部连接器执行受控只读 SQL |
-| `search_documents` | 在文件桶中做 RAG 语义/关键词检索 |
-| `read_document` | 读取指定文档全文 |
-| `list_functions` / `run_function` | 查看并调用无副作用的确定性业务函数 |
-| `list_rules` / `evaluate_rule` | 查看并评估业务规则 |
-| `list_actions` / `execute_action` | 查看操作并生成安全预演；真实副作用仍需用户确认 |
-| `list_workflows` / `execute_workflow` | 查看工作流并返回显式提交指引 |
+| `list_available_capabilities` | 列出当前部署中已授权的 Function、Rule、Action、Workflow 及其输入契约和 readiness |
+| `invoke_capability` | 通过统一 `CapabilityInvoker` 调用一个已列出的能力；数据输入、Receipt、预演、确认和幂等语义与 REST/MCP/SDK 一致 |
+
+Agent 不再暴露 `run_function`、`run_sql` 或 Provider 自定义工具名等第二套执行入口。数据查询、文档检索、规则判定和其他行业能力都必须作为受治理能力发布，再由上述两个通用工具发现和调用。
 
 ## 平台边界与安全策略
 
 - `backend/app` 的能力内核只实现通用平台契约；零售、医疗、财务等具体逻辑必须位于独立 Provider 包或由用户在定义中配置，通过受信注册表接入，不能在 Agent、REST、MCP 或调用内核中按场景名分支。
+- Provider 必须按精确 `(provider_key, provider_version)` 静态注册；场景编辑器只消费服务端发布的受限 manifest，保存和发布时仍由对应 Provider 确定性校验配置，缺少精确版本不会回退到最新版。
+- `DataAsset` 与 `LogicalDataset` 的 `usage_plane` 是服务端和数据库共同约束的用途事实；建模资料不会因文件名、标签、前端选择或 LLM 判断被隐式提升为正式运行输入。
+- 输入内容契约是可选的；定义后按解析出的表头、字段别名、逻辑类型和最低行数匹配，不依赖文件名。未命中任何端口的额外文件可随本次 Turn 保留；必填端口必须命中，绑定到端口的输入必须通过该端口已定义的契约。
+- 数据连接器显式健康检查会持久化有界、无凭据的结构轮廓及 SHA-256 fingerprint；声明内容契约的 connector 端口只消费这份受检轮廓，不让 LLM 读取整库或信任客户端结构描述。
+- Agent 只向 LLM 展示 typed input 的有界、无值结构清单和内容哈希；完整 typed input 由统一调用内核直接传给最终选中的 Provider。批量业务值必须通过受管附件、数据集或连接器进入工具链，不能作为 prompt 正文绕过数据边界。
 - 数据源、Agent、本体扩展和工作流引用都会校验资源是否存在以及是否属于当前业务场景；Catalog、语义映射和推导证据还通过数据库复合外键约束租户与数据集作用域。
 - Agent 与工作流中的 SQL 仅允许单条只读查询，并受最大返回行数限制；脚本节点默认关闭，只有受控部署显式开启后才可执行。
 - LLM API Key、数据源密码等凭据不会通过 API 回显；编辑时留空表示保留原凭据。

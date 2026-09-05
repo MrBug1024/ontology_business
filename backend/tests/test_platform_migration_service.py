@@ -238,6 +238,7 @@ def test_semantic_mapping_backfills_only_from_explicit_catalog_facts() -> None:
             tenant_id=tenant.id,
             key="business.records",
             name="Business records",
+            usage_plane="modeling_material",
         )
         schema = DatasetSchema(
             id="schema-semantic",

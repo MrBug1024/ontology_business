@@ -19,6 +19,19 @@ from . import catalog_service
 
 
 CAPABILITY_MODELING_VERSION = 2
+MODELING_MATERIAL_USAGE_PLANE = "modeling_material"
+NON_MODELING_METADATA_ISSUE_CODE = "NON_MODELING_METADATA_SOURCE"
+VERIFIED_METADATA_MATERIALIZATION_SOURCE = "compiler_verified_metadata"
+NON_MODELING_METADATA_MATERIALIZATION_SOURCE = "compiler_non_modeling"
+METADATA_GOVERNED_RESOURCE_KINDS = frozenset({
+    "function",
+    "action",
+    "workflow",
+    "mapping",
+    "relation_mapping",
+    "conceptual_mapping",
+    "capability_port",
+})
 
 # These keys identify platform storage or binding identities.  They may exist
 # in source catalogs while compiling, but never in a suggested logical port or
@@ -122,6 +135,72 @@ def _canonical_hash(value: Any) -> str:
 
 def _bounded_text(value: Any, maximum: int) -> str:
     return str(value or "").strip()[:maximum]
+
+
+def metadata_source_policy(source_bundle: Any) -> dict[str, Any]:
+    """Classify compiler sources without trusting names or extracted content."""
+    bundle = source_bundle if isinstance(source_bundle, dict) else {}
+    blocked_source_ids: set[str] = set()
+    for raw in bundle.get("documents") or []:
+        if not isinstance(raw, dict):
+            continue
+        source_id = _bounded_text(raw.get("source_id"), 80)
+        source_kind = _bounded_text(raw.get("source_kind"), 40)
+        if not source_id:
+            continue
+        if source_kind == "attachment":
+            authoritative = (
+                _bounded_text(raw.get("usage_plane"), 30)
+                == MODELING_MATERIAL_USAGE_PLANE
+            )
+        elif source_kind == "working_draft":
+            authoritative = raw.get("metadata_authoritative") is True
+        else:
+            authoritative = source_kind == "user_request"
+        if not authoritative:
+            blocked_source_ids.add(source_id)
+
+    blocked_refs = sorted({
+        _bounded_text(raw.get("ref"), 300)
+        for raw in (bundle.get("paragraphs") or [])
+        if isinstance(raw, dict)
+        and _bounded_text(raw.get("source_id"), 80) in blocked_source_ids
+        and _bounded_text(raw.get("ref"), 300)
+    })
+    return {
+        "metadata_source_authoritative": not blocked_source_ids,
+        "non_authoritative_source_refs": blocked_refs,
+        "blocked_source_ids": sorted(blocked_source_ids),
+    }
+
+
+def metadata_materialization_is_authoritative(
+    *,
+    resource_kind: Any,
+    materialization_source: Any,
+    source_refs: Iterable[Any] = (),
+) -> bool:
+    """Keep the immutable source-plane decision across edits and revalidation."""
+    kind = _bounded_text(resource_kind, 40)
+    if kind not in METADATA_GOVERNED_RESOURCE_KINDS:
+        return True
+    source = _bounded_text(materialization_source, 30).casefold()
+    if source == VERIFIED_METADATA_MATERIALIZATION_SOURCE:
+        return True
+    if source == NON_MODELING_METADATA_MATERIALIZATION_SOURCE:
+        return False
+    if source == "manual" or source.startswith("manual_") or source.startswith("import"):
+        return True
+
+    # Old compiler rows predate the explicit marker. Request and working-draft
+    # refs use reserved server-generated prefixes; any other evidenced source
+    # is unverifiable and therefore remains ineligible until regenerated.
+    refs = [str(value or "").strip() for value in source_refs if str(value or "").strip()]
+    return not any(
+        not ref.startswith("request:p")
+        and not ref.startswith("working-draft:")
+        for ref in refs
+    )
 
 
 def _confidence(value: Any, *, default: float = 0.0) -> float:
@@ -634,6 +713,8 @@ def _document_role_suggestions(
     schemas: list[dict[str, Any]],
     semantics: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    source_policy = metadata_source_policy(source_bundle)
+    blocked_source_ids = set(source_policy["blocked_source_ids"])
     refs_by_source: dict[str, list[str]] = defaultdict(list)
     for item in source_bundle.get("paragraphs") or []:
         if not isinstance(item, dict):
@@ -647,6 +728,8 @@ def _document_role_suggestions(
         if not isinstance(raw, dict):
             continue
         source_id = str(raw.get("source_id") or "")
+        if source_id in blocked_source_ids:
+            continue
         refs = list(dict.fromkeys(refs_by_source.get(source_id, [])))
         ref_set = set(refs)
         fingerprint = _bounded_text(raw.get("sha256"), 64)
@@ -712,6 +795,7 @@ def build_capability_modeling_sidecar(
         semantics=semantics,
     )
     data_roles.extend(_catalog_schema_evidence(mapping_catalog))
+    metadata_policy = metadata_source_policy(source_bundle)
     sidecar = {
         "version": CAPABILITY_MODELING_VERSION,
         "ports": ports,
@@ -720,6 +804,12 @@ def build_capability_modeling_sidecar(
         "policy": {
             "source_default_role": "modeling_evidence",
             "runtime_binding_inferred": False,
+            "metadata_source_authoritative": metadata_policy[
+                "metadata_source_authoritative"
+            ],
+            "non_authoritative_source_refs": metadata_policy[
+                "non_authoritative_source_refs"
+            ],
         },
     }
     physical_paths = _physical_reference_paths(sidecar)
@@ -814,6 +904,28 @@ def merge_capability_modeling_sidecars(
             target["role"] = "modeling_evidence"
             target["runtime_binding"] = False
 
+    current_policy = (
+        current_value.get("policy")
+        if isinstance(current_value.get("policy"), dict)
+        else {}
+    )
+    staged_policy = (
+        staged_value.get("policy")
+        if isinstance(staged_value.get("policy"), dict)
+        else {}
+    )
+    metadata_source_authoritative = bool(
+        current_policy.get("metadata_source_authoritative", True)
+        and staged_policy.get("metadata_source_authoritative", True)
+    )
+    non_authoritative_source_refs = list(dict.fromkeys(
+        str(ref)[:300]
+        for ref in [
+            *(current_policy.get("non_authoritative_source_refs") or []),
+            *(staged_policy.get("non_authoritative_source_refs") or []),
+        ]
+        if str(ref).strip()
+    ))
     sidecar = {
         "version": CAPABILITY_MODELING_VERSION,
         "ports": ports,
@@ -822,6 +934,8 @@ def merge_capability_modeling_sidecars(
         "policy": {
             "source_default_role": "modeling_evidence",
             "runtime_binding_inferred": False,
+            "metadata_source_authoritative": metadata_source_authoritative,
+            "non_authoritative_source_refs": non_authoritative_source_refs,
         },
     }
     physical_paths = _physical_reference_paths(sidecar)
@@ -838,6 +952,15 @@ def capability_port_draft_candidates(
 ) -> list[dict[str, Any]]:
     """Project validated suggestions into the existing inert candidate lane."""
     result: list[dict[str, Any]] = []
+    policy = sidecar.get("policy") if isinstance(sidecar.get("policy"), dict) else {}
+    metadata_source_authoritative = (
+        policy.get("metadata_source_authoritative", True) is True
+    )
+    blocked_source_refs = [
+        str(ref)[:300]
+        for ref in (policy.get("non_authoritative_source_refs") or [])
+        if str(ref).strip()
+    ]
     for raw in sidecar.get("ports") or []:
         if not isinstance(raw, dict) or not isinstance(raw.get("port"), dict):
             continue
@@ -855,6 +978,16 @@ def capability_port_draft_candidates(
             "evidence_refs": _json_copy(raw.get("evidence_refs"), []),
             "confidence": _confidence(raw.get("confidence")),
         }
+        validation_issues = [] if metadata_source_authoritative else [{
+            "code": NON_MODELING_METADATA_ISSUE_CODE,
+            "message": (
+                "普通调用、验证或生成附件只能用于本轮解释，不能生成可晋级的能力端口。"
+            ),
+            "source_refs": blocked_source_refs,
+            "blocking": True,
+            "resolution_hint": "将资料显式登记为 modeling_material 后重新编译。",
+            "affected_change_keys": [port.port_key],
+        }]
         result.append({
             "resource_kind": "capability_port",
             "resource_key": port.port_key,
@@ -862,10 +995,17 @@ def capability_port_draft_candidates(
             "display_name": port.name,
             "payload": payload,
             "evidence_refs": list(payload["evidence_refs"]),
-            "validation_issues": [],
-            "validation_status": "ready",
+            "validation_issues": validation_issues,
+            "validation_status": (
+                "ready" if metadata_source_authoritative else "blocked"
+            ),
             "formal_candidate": True,
-            "promotion_eligible": True,
+            "promotion_eligible": metadata_source_authoritative,
+            "materialization_source": (
+                VERIFIED_METADATA_MATERIALIZATION_SOURCE
+                if metadata_source_authoritative
+                else NON_MODELING_METADATA_MATERIALIZATION_SOURCE
+            ),
             "activation_status": "inactive",
             "enabled": False,
             "publishable": False,

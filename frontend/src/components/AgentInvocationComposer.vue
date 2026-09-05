@@ -1,18 +1,31 @@
 <template>
   <div class="chat-composer">
-    <div v-if="attachments.length" class="attachment-list" aria-label="本次对话附件">
+    <div v-if="attachments.length" class="attachment-list" aria-label="本次对话附件" aria-live="polite">
       <article v-for="item in attachments" :key="item.uid" class="attachment-item">
         <el-icon aria-hidden="true"><Document /></el-icon>
         <div class="attachment-copy">
           <strong>{{ item.filename }}</strong>
-          <small v-if="item.status === 'uploading'">正在上传 {{ item.progress }}%</small>
+          <small v-if="item.status === 'registering'">正在登记附件</small>
+          <small v-else-if="item.status === 'uploading'">正在上传 {{ item.progress }}%，可立即发送</small>
+          <small v-else-if="item.status === 'processing'">已接收，正在后台准备</small>
           <small v-else-if="item.status === 'ready'">
             {{ item.persistent ? '验证资料库' : '仅本次' }} · {{ formatSize(item.size) }}
           </small>
           <small v-else class="attachment-error">{{ item.error || '上传失败' }}</small>
           <el-progress v-if="item.status === 'uploading'" :percentage="item.progress" :show-text="false" :stroke-width="3" />
         </div>
-        <el-button text circle size="small" :disabled="busy || materializing" :aria-label="`移除附件 ${item.filename}`" @click="removeAttachment(item.uid)">
+        <el-button
+          v-if="item.status === 'error'"
+          text
+          circle
+          size="small"
+          :disabled="busy"
+          :aria-label="`重试附件 ${item.filename}`"
+          @click="retryUpload(item)"
+        >
+          <el-icon><RefreshRight /></el-icon>
+        </el-button>
+        <el-button text circle size="small" :disabled="busy" :aria-label="`移除附件 ${item.filename}`" @click="removeAttachment(item.uid)">
           <el-icon><Close /></el-icon>
         </el-button>
       </article>
@@ -36,23 +49,23 @@
           v-model="uploadMode"
           class="upload-mode"
           :options="uploadModeOptions"
-          :disabled="disabled || busy || materializing"
+          :disabled="disabled || busy"
           size="small"
           aria-label="附件保存方式"
         />
-        <label class="attachment-button" :class="{ disabled: disabled || busy || materializing }" :title="uploadMode === 'validation_asset' ? '上传并保存到验证资料库' : '上传仅供本次对话使用'">
+        <label class="attachment-button" :class="{ disabled: disabled || busy }" :title="uploadMode === 'validation_asset' ? '上传并保存到验证资料库' : '上传仅供本次对话使用'">
           <el-icon aria-hidden="true"><Paperclip /></el-icon>
           <span>上传</span>
           <input
             type="file"
             multiple
             :accept="AGENT_INVOCATION_FILE_ACCEPT"
-            :disabled="disabled || busy || materializing"
+            :disabled="disabled || busy"
             aria-label="上传验证附件"
             @change="onFilesPicked"
           />
         </label>
-        <el-button text :disabled="disabled || busy || materializing" title="选择已上传的验证资料" @click="openLibrary">
+        <el-button text :disabled="disabled || busy" title="选择已上传的验证资料" @click="openLibrary">
           <el-icon><FolderOpened /></el-icon>
           资料库
         </el-button>
@@ -60,20 +73,11 @@
       </div>
       <div class="submit-actions">
         <el-button v-if="busy" @click="$emit('stop')"><el-icon><VideoPause /></el-icon>停止</el-button>
-        <el-button v-else type="primary" :loading="materializing" :disabled="disabled || uploading || (!message.trim() && !readyAttachments.length)" @click="submitDraft">
+        <el-button v-else type="primary" :disabled="disabled || submissionBlocked || (!message.trim() && !submittableAttachments.length)" @click="submitDraft">
           <el-icon><Promotion /></el-icon>发送
         </el-button>
       </div>
     </div>
-    <section v-if="materializing" class="preparation-status" role="status" aria-live="polite" aria-atomic="true">
-      <div class="preparation-heading">
-        <strong>验证需求已排队</strong>
-        <span>{{ preparationStep }}</span>
-      </div>
-      <el-progress :percentage="preparationPercentage" :show-text="false" :stroke-width="5" />
-      <p>{{ preparationMessage }}</p>
-      <small>服务端正在后台流式读取并生成 Parquet；原始大文件不会进入聊天请求。离开页面后任务仍会继续，返回本 Agent 会自动恢复。</small>
-    </section>
     <p v-if="uploadError" class="composer-error" role="alert">{{ uploadError }}</p>
 
     <el-dialog v-model="libraryVisible" title="验证资料库" width="min(620px, 92vw)" append-to-body>
@@ -104,17 +108,16 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
-import type { AgentChatRequest, CatalogAsset, CatalogAssetVersion, ValidationDataset, ValidationDatasetJob } from '@/types'
+import type { AgentChatRequest, CatalogAsset, CatalogAssetVersion, ManagedUploadRun } from '@/types'
 import {
   AGENT_INVOCATION_FILE_ACCEPT,
   isSupportedInvocationFile,
-  isTabularInvocationAsset,
 } from '@/utils/agentInvocation'
 
-type AttachmentStatus = 'uploading' | 'ready' | 'error'
+type AttachmentStatus = 'registering' | 'uploading' | 'processing' | 'ready' | 'error'
 type ChatAttachmentDraft = {
   uid: string
   file?: File
@@ -123,6 +126,9 @@ type ChatAttachmentDraft = {
   size: number
   progress: number
   status: AttachmentStatus
+  uploadRunId?: string
+  uploadRunRevision?: number
+  uploadRunStatus?: ManagedUploadRun['status']
   assetVersionId?: string
   expectedSignature?: string
   contentCategory?: string
@@ -137,16 +143,6 @@ type SavedAsset = {
   size: number
   signature: string
   contentCategory: string | undefined
-  createdAt: string
-}
-
-type PendingValidationPreparation = {
-  version: 1
-  agentId: string
-  jobId: string
-  tableAssetVersionIds: string[]
-  tableCount: number
-  request: AgentChatRequest
   createdAt: string
 }
 
@@ -183,54 +179,162 @@ const uploadModeOptions = [
 const libraryVisible = ref(false)
 const libraryLoading = ref(false)
 const savedAssets = ref<SavedAsset[]>([])
-const materializing = ref(false)
-const preparationJob = ref<ValidationDatasetJob | null>(null)
-const preparationTableCount = ref(0)
-let preparationController: AbortController | null = null
-let recoveryAgentId = ''
+const uploadControllers = new Map<string, AbortController>()
+const CONTENT_UPLOAD_ATTEMPTS = 3
+const submittableAttachments = computed(() => attachments.value.filter((item) => (
+  Boolean(item.assetVersionId) || Boolean(item.uploadRunId)
+)))
+const submissionBlocked = computed(() => attachments.value.some((item) => (
+  item.status === 'registering' || item.status === 'error'
+)))
 
-const readyAttachments = computed(() => attachments.value.filter((item) => item.status === 'ready' && item.assetVersionId))
-const uploading = computed(() => materializing.value || attachments.value.some((item) => item.status === 'uploading'))
-const preparationStep = computed(() => (
-  preparationJob.value?.status === 'running' ? '第 2/3 步 · 正在构建数据集' : '第 1/3 步 · 等待后台处理'
-))
-const preparationPercentage = computed(() => (
-  preparationJob.value?.status === 'running' ? 68 : preparationJob.value?.status === 'succeeded' ? 100 : 34
-))
-const preparationMessage = computed(() => {
-  const count = preparationTableCount.value
-  return preparationJob.value?.status === 'running'
-    ? `正在准备 ${count} 个表格；完成后会自动发送这次验证需求。`
-    : `已保存本次需求和受管文件引用，等待处理 ${count} 个表格。`
-})
+function updateFromUploadRun(item: ChatAttachmentDraft, run: ManagedUploadRun) {
+  item.uploadRunId = run.id
+  item.uploadRunRevision = run.revision
+  item.uploadRunStatus = run.status
+  if (run.status === 'ready') {
+    item.assetId = run.result?.asset.id || run.asset_id || undefined
+    item.assetVersionId = run.result?.version.id || run.asset_version_id || undefined
+    item.expectedSignature = run.result?.version.content_sha256 || run.content_sha256 || undefined
+    item.contentCategory = typeof run.result?.version.profile?.category === 'string'
+      ? String(run.result.version.profile.category)
+      : undefined
+    item.persistent = run.purpose === 'validation_asset'
+    item.progress = 100
+    item.status = 'ready'
+    if (item.persistent) void loadSavedAssets()
+  } else if (run.status === 'failed' || run.status === 'cancelled') {
+    item.status = 'error'
+    item.error = run.error?.message || '附件后台准备失败'
+  } else if (run.status === 'stored' || run.status === 'processing') {
+    item.status = 'processing'
+    item.progress = 100
+  }
+}
+
+function waitForPoll(milliseconds: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException('aborted', 'AbortError'))
+      return
+    }
+    const onAbort = () => {
+      window.clearTimeout(timer)
+      reject(new DOMException('aborted', 'AbortError'))
+    }
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, milliseconds)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function pollUploadRun(item: ChatAttachmentDraft, signal: AbortSignal): Promise<ManagedUploadRun | null> {
+  while (!signal.aborted && item.uploadRunId) {
+    const run = await api.getManagedUploadRun(item.uploadRunId, signal)
+    updateFromUploadRun(item, run)
+    if (
+      ['ready', 'failed', 'cancelled'].includes(run.status)
+      || (run.status === 'awaiting_upload' && Boolean(run.error))
+    ) return run
+    await waitForPoll(1000, signal)
+  }
+  return null
+}
+
+async function uploadContentWithRetry(
+  item: ChatAttachmentDraft,
+  file: File,
+  initialRun: ManagedUploadRun,
+  controller: AbortController,
+): Promise<ManagedUploadRun> {
+  let run = initialRun
+  let lastError: unknown
+  for (let attempt = 0; attempt < CONTENT_UPLOAD_ATTEMPTS; attempt += 1) {
+    try {
+      return await api.uploadManagedRunContent({
+        runId: run.id,
+        expectedRevision: run.revision,
+        file,
+        signal: controller.signal,
+        onProgress: (percent) => { item.progress = percent },
+      })
+    } catch (error: unknown) {
+      lastError = error
+      if (controller.signal.aborted) throw error
+      try {
+        const observed = await api.getManagedUploadRun(run.id, controller.signal)
+        updateFromUploadRun(item, observed)
+        run = observed.status === 'uploading'
+          ? (await pollUploadRun(item, controller.signal) || observed)
+          : observed
+      } catch (reconciliationError: unknown) {
+        if (controller.signal.aborted) throw reconciliationError
+      }
+      if (run.status !== 'awaiting_upload') return run
+      if (attempt + 1 >= CONTENT_UPLOAD_ATTEMPTS) throw lastError
+      await waitForPoll(500 * (attempt + 1), controller.signal)
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('附件上传失败')
+}
 
 async function uploadOne(item: ChatAttachmentDraft) {
   if (!item.file) return
-  item.status = 'uploading'
+  const previous = uploadControllers.get(item.uid)
+  previous?.abort()
+  const controller = new AbortController()
+  uploadControllers.set(item.uid, controller)
   item.progress = 0
   item.error = ''
   uploadError.value = ''
   try {
-    const uploaded = await api.uploadCatalogAttachment({
-      file: item.file,
-      purpose: uploadMode.value,
-      onProgress: (percent) => { item.progress = percent },
-    })
-    item.assetId = uploaded.asset.id
-    item.assetVersionId = uploaded.version.id
-    item.expectedSignature = uploaded.version.content_sha256
-    item.contentCategory = typeof uploaded.version.profile?.category === 'string'
-      ? uploaded.version.profile.category
-      : undefined
-    item.persistent = uploaded.purpose === 'validation_asset'
-    item.progress = 100
-    item.status = 'ready'
-    if (item.persistent) void loadSavedAssets()
+    let run: ManagedUploadRun
+    if (!item.uploadRunId) {
+      item.status = 'registering'
+      run = await api.createManagedUploadRun({
+        filename: item.file.name,
+        byte_size: item.file.size,
+        media_type: item.file.type,
+        purpose: item.persistent ? 'validation_asset' : 'invocation_attachment',
+        idempotency_key: `attachment-${item.uid}`,
+      })
+      updateFromUploadRun(item, run)
+    } else {
+      run = await api.getManagedUploadRun(item.uploadRunId, controller.signal)
+      if (run.status === 'failed') {
+        run = await api.retryManagedUploadRun(run.id, run.revision)
+      }
+      updateFromUploadRun(item, run)
+    }
+    if (run.status === 'awaiting_upload') {
+      item.status = 'uploading'
+      run = await uploadContentWithRetry(item, item.file, run, controller)
+      updateFromUploadRun(item, run)
+    }
+    if (!['ready', 'failed', 'cancelled'].includes(run.status)) {
+      await pollUploadRun(item, controller.signal)
+    }
   } catch (error: any) {
+    if (controller.signal.aborted) return
     item.status = 'error'
-    item.error = error?.response?.data?.detail || error?.message || '附件上传失败'
-    uploadError.value = item.error || '附件上传失败'
+    const detail = error?.response?.data?.detail
+    item.error = (typeof detail === 'object' ? detail?.message : detail)
+      || error?.message
+      || '附件上传失败'
+    if (attachments.value.some((entry) => entry.uid === item.uid)) {
+      uploadError.value = item.error || '附件上传失败'
+    }
+  } finally {
+    if (uploadControllers.get(item.uid) === controller && ['ready', 'error'].includes(item.status)) {
+      uploadControllers.delete(item.uid)
+    }
   }
+}
+
+function retryUpload(item: ChatAttachmentDraft) {
+  void uploadOne(item)
 }
 
 function onFilesPicked(event: Event) {
@@ -248,7 +352,7 @@ function onFilesPicked(event: Event) {
       filename: file.name,
       size: file.size,
       progress: 0,
-      status: 'uploading',
+      status: 'registering',
       persistent: uploadMode.value === 'validation_asset',
     })
     attachments.value.push(draft)
@@ -259,7 +363,7 @@ function onFilesPicked(event: Event) {
 async function loadSavedAssets() {
   libraryLoading.value = true
   try {
-    const assets = (await api.listCatalogAssets()).filter((item: CatalogAsset) => (
+    const assets = (await api.listCatalogAssets('invocation_input')).filter((item: CatalogAsset) => (
       item.lifecycle_status === 'active' && item.labels?.catalog_purpose === 'validation_asset'
     ))
     const rows = await Promise.all(assets.map(async (asset: CatalogAsset) => {
@@ -332,58 +436,10 @@ async function deleteSaved(item: SavedAsset) {
 }
 
 function removeAttachment(uid: string) {
+  uploadControllers.get(uid)?.abort()
+  uploadControllers.delete(uid)
   attachments.value = attachments.value.filter((item) => item.uid !== uid)
   if (!attachments.value.some((item) => item.status === 'error')) uploadError.value = ''
-}
-
-function preparationStorageKey(agentId = props.agentId) {
-  return agentId ? `ontology.validation-preparation.v1:${agentId}` : ''
-}
-
-function savePendingPreparation(pending: PendingValidationPreparation) {
-  const key = preparationStorageKey(pending.agentId)
-  if (!key) return
-  try {
-    window.sessionStorage.setItem(key, JSON.stringify(pending))
-  } catch {
-    // Session recovery is a convenience hint; the PostgreSQL job remains authoritative.
-  }
-}
-
-function clearPendingPreparation(agentId = props.agentId) {
-  const key = preparationStorageKey(agentId)
-  if (!key) return
-  try {
-    window.sessionStorage.removeItem(key)
-  } catch {
-    // Storage may be unavailable in hardened browsers.
-  }
-}
-
-function loadPendingPreparation(agentId: string): PendingValidationPreparation | null {
-  const key = preparationStorageKey(agentId)
-  if (!key) return null
-  try {
-    const parsed = JSON.parse(window.sessionStorage.getItem(key) || 'null') as PendingValidationPreparation | null
-    const createdAt = parsed?.createdAt ? Date.parse(parsed.createdAt) : 0
-    if (
-      !parsed
-      || parsed.version !== 1
-      || parsed.agentId !== agentId
-      || !Array.isArray(parsed.tableAssetVersionIds)
-      || !parsed.tableAssetVersionIds.length
-      || !parsed.request?.idempotency_key
-      || !createdAt
-      || Date.now() - createdAt > 24 * 60 * 60 * 1000
-    ) {
-      clearPendingPreparation(agentId)
-      return null
-    }
-    return parsed
-  } catch {
-    clearPendingPreparation(agentId)
-    return null
-  }
 }
 
 function invocationIdempotencyKey() {
@@ -393,144 +449,36 @@ function invocationIdempotencyKey() {
   return `validation-${random}`
 }
 
-function dispatchPreparedRequest(
-  pending: PendingValidationPreparation,
-  dataset: ValidationDataset,
-) {
-  preparationJob.value = {
-    ...(preparationJob.value || {
-      id: pending.jobId,
-      error: '',
-      created_at: pending.createdAt,
-      updated_at: new Date().toISOString(),
-    }),
-    status: 'succeeded',
-    result: dataset,
-  }
-  materializing.value = false
-  emit('submit', {
-    ...pending.request,
-    attachments: [
-      {
-        dataset_version_id: dataset.dataset_version_id,
-        expected_signature: dataset.content_hash,
-        filename: dataset.relation_names.join('、') || '验证数据包',
-      },
-      ...(pending.request.attachments || []),
-    ],
-  })
-}
-
-async function runPendingPreparation(
-  pending: PendingValidationPreparation,
-  createJob: boolean,
-) {
-  preparationController?.abort()
-  const controller = new AbortController()
-  preparationController = controller
-  preparationTableCount.value = pending.tableCount
-  materializing.value = true
-  uploadError.value = ''
-  try {
-    const onStatus = (job: ValidationDatasetJob) => {
-      preparationJob.value = job
-      pending.jobId = job.id
-      savePendingPreparation(pending)
-    }
-    const dataset = createJob
-      ? await api.buildValidationDataset(
-        pending.tableAssetVersionIds,
-        '验证数据包',
-        { signal: controller.signal, onStatus },
-      )
-      : await api.waitForValidationDatasetJob(
-        pending.jobId,
-        { signal: controller.signal, onStatus },
-      )
-    if (controller.signal.aborted) return
-    dispatchPreparedRequest(pending, dataset)
-  } catch (error: unknown) {
-    const details = error && typeof error === 'object'
-      ? error as { name?: unknown; status?: unknown; message?: unknown }
-      : {}
-    if (details.name === 'AbortError' || controller.signal.aborted) return
-    const failed = preparationJob.value?.status === 'failed'
-    if (failed || details.status === 404) clearPendingPreparation(pending.agentId)
-    const message = typeof details.message === 'string' ? details.message : ''
-    uploadError.value = failed
-      ? message || '验证数据集准备失败'
-      : `${message || '验证数据集进度连接中断'}；重新进入本 Agent 后会继续恢复。`
-    materializing.value = false
-  } finally {
-    if (preparationController === controller) preparationController = null
-  }
-}
-
-function resumePendingPreparation(agentId: string) {
-  if (!agentId || recoveryAgentId === agentId) return
-  recoveryAgentId = agentId
-  const pending = loadPendingPreparation(agentId)
-  if (pending) void runPendingPreparation(pending, !pending.jobId)
-}
-
 async function submitDraft() {
-  if (props.disabled || props.busy || uploading.value) return
-  const recoverable = loadPendingPreparation(props.agentId)
-  if (recoverable) {
-    void runPendingPreparation(recoverable, !recoverable.jobId)
-    return
-  }
+  if (props.disabled || props.busy || submissionBlocked.value) return
   const text = message.value.trim()
-  if (!text && !readyAttachments.value.length) return
-  const tables = readyAttachments.value.filter((item) => (
-    isTabularInvocationAsset(item.contentCategory, item.filename)
-  ))
-  const documents = readyAttachments.value.filter((item) => (
-    !isTabularInvocationAsset(item.contentCategory, item.filename)
-  ))
+  if (!text && !submittableAttachments.value.length) return
   uploadError.value = ''
-  const request: AgentChatRequest = {
+  emit('submit', {
     message: text,
     conversation_id: props.conversationId || '',
     environment: 'dev',
     idempotency_key: invocationIdempotencyKey(),
-    attachments: documents.map((item) => ({
-      asset_version_id: item.assetVersionId!,
-      expected_signature: item.expectedSignature,
-      filename: item.filename,
-    })),
-  }
-  if (!tables.length) {
-    emit('submit', request)
-    return
-  }
-  const pending: PendingValidationPreparation = {
-    version: 1,
-    agentId: props.agentId,
-    jobId: '',
-    tableAssetVersionIds: tables.map((item) => item.assetVersionId!),
-    tableCount: tables.length,
-    request,
-    createdAt: new Date().toISOString(),
-  }
-  savePendingPreparation(pending)
-  void runPendingPreparation(pending, true)
+    attachments: submittableAttachments.value.map((item) => (
+      item.assetVersionId
+        ? {
+            asset_version_id: item.assetVersionId,
+            expected_signature: item.expectedSignature,
+            filename: item.filename,
+          }
+        : {
+            upload_run_id: String(item.uploadRunId),
+            filename: item.filename,
+          }
+    )),
+  })
 }
 
-function clearAfterSuccess() {
-  clearPendingPreparation()
+function clearAfterAccepted() {
   message.value = ''
   attachments.value = []
   uploadError.value = ''
   void nextTick(() => messageInputRef.value?.focus?.())
-}
-
-function acknowledgeQueued(idempotencyKey?: string) {
-  if (!idempotencyKey) return
-  const pending = loadPendingPreparation(props.agentId)
-  if (pending?.request.idempotency_key === idempotencyKey) {
-    clearPendingPreparation(props.agentId)
-  }
 }
 
 function submitMessage(text: string) {
@@ -552,18 +500,12 @@ function formatDate(value: string) {
 onMounted(() => {
   messageInputRef.value?.focus?.()
   void loadSavedAssets()
-  resumePendingPreparation(props.agentId)
 })
-watch(() => props.agentId, (agentId, previousAgentId) => {
-  if (agentId === previousAgentId) return
-  preparationController?.abort()
-  recoveryAgentId = ''
-  resumePendingPreparation(agentId)
+onBeforeUnmount(() => {
+  for (const controller of uploadControllers.values()) controller.abort()
+  uploadControllers.clear()
 })
-onUnmounted(() => {
-  preparationController?.abort()
-})
-defineExpose({ acknowledgeQueued, clearAfterSuccess, submitMessage })
+defineExpose({ clearAfterAccepted, submitMessage })
 </script>
 
 <style scoped>
@@ -588,11 +530,6 @@ defineExpose({ acknowledgeQueued, clearAfterSuccess, submitMessage })
 .keyboard-hint { color: var(--text-3); font-size: 11px; }
 .composer-error { margin: 0; font-size: 11px; line-height: 1.45; }
 .composer-status { margin: 0; color: var(--text-2); font-size: 11px; line-height: 1.45; }
-.preparation-status { display: grid; gap: 7px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border)); border-radius: 8px; background: var(--primary-soft); }
-.preparation-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.preparation-heading strong { color: var(--text-1); font-size: 13px; }
-.preparation-heading span, .preparation-status small { color: var(--text-3); font-size: 11px; line-height: 1.5; }
-.preparation-status p { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.5; }
 .library-list { min-height: 140px; }
 .library-row { display: flex; min-width: 0; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
 .library-row:last-child { border-bottom: 0; }

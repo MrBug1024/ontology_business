@@ -14,6 +14,7 @@ from jsonschema import Draft202012Validator
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
+from app.providers import builtin_function_evaluator
 from app.models import (
     ActionExecutionLog,
     Base,
@@ -32,7 +33,6 @@ from app.models import (
     WorkflowRun,
 )
 from app.services import (
-    function_runtime_service,
     mcp_service,
     operations_service,
     permission_service,
@@ -55,7 +55,10 @@ from app.services.capability_invoker import (
     resolve_capability_contract,
     resolve_provider_binding,
 )
-from app.services.capability_provider_keys import BUILTIN_PROVIDER_KEYS
+from app.services.capability_provider_keys import (
+    BUILTIN_PROVIDER_KEYS,
+    BUILTIN_PROVIDER_VERSION,
+)
 from app.services.capability_provider_keys import derive_provider_execution_key
 from app.services.capability_registry import default_provider_registry
 from app.services.deployment_service import build_resolved_deployment
@@ -506,6 +509,50 @@ def test_function_provider_uses_frozen_runtime_definition_and_preview_is_safe(
 
 
 @pytest.mark.parametrize(
+    ("runtime_kind", "runtime_config", "params", "expected"),
+    (
+        (
+            "weighted_score",
+            {"weights": {"amount": 0.5}, "bias": 2},
+            {"amount": 10},
+            {"score": 7.0},
+        ),
+        (
+            "threshold",
+            {"field": "amount", "threshold": 10, "operator": ">="},
+            {"amount": 10},
+            {"matched": True, "value": 10, "threshold": 10},
+        ),
+        (
+            "geo_distance",
+            {"unit": "km"},
+            {"origin": [120, 30], "target": [120, 30]},
+            {"distance": 0.0, "unit": "km"},
+        ),
+        (
+            "timeseries_aggregate",
+            {"aggregation": "sum"},
+            {"values": [1, 2, 3]},
+            {"aggregation": "sum", "value": 6, "count": 3},
+        ),
+    ),
+)
+def test_declarative_function_evaluators_are_provider_owned(
+    runtime_kind: str,
+    runtime_config: dict,
+    params: dict,
+    expected: dict,
+) -> None:
+    function = SimpleNamespace(
+        input_schema={"type": "object", "properties": {}},
+        runtime_kind=runtime_kind,
+        runtime_config=runtime_config,
+    )
+
+    assert builtin_function_evaluator.evaluate_function(function, params) == expected
+
+
+@pytest.mark.parametrize(
     ("kind", "mode", "inputs"),
     (
         ("function", "execute", {"amount": 10}),
@@ -524,8 +571,8 @@ def test_builtin_providers_fail_closed_before_ignoring_managed_runtime_inputs(
     world = _with_managed_connector(db, _world(db, f"managed-{kind}"), kind)
     calls: list[str] = []
     monkeypatch.setattr(
-        function_runtime_service,
-        "execute_function",
+        builtin_function_evaluator,
+        "evaluate_function",
         lambda *_args, **_kwargs: calls.append("function") or {"score": 999},
     )
     monkeypatch.setattr(
@@ -614,10 +661,12 @@ def test_side_effecting_builtin_entry_points_reject_context_before_execution(
         confirmation={"preview_invocation_id": "not-consulted"},
     )
     action_provider = default_provider_registry.resolve(
-        BUILTIN_PROVIDER_KEYS["action"]
+        BUILTIN_PROVIDER_KEYS["action"],
+        BUILTIN_PROVIDER_VERSION,
     ).bind_invocation(db)
     workflow_provider = default_provider_registry.resolve(
-        BUILTIN_PROVIDER_KEYS["workflow"]
+        BUILTIN_PROVIDER_KEYS["workflow"],
+        BUILTIN_PROVIDER_VERSION,
     ).bind_invocation(db)
 
     for operation in (

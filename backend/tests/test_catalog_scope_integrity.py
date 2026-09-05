@@ -20,6 +20,12 @@ REVISION_PATH = (
     / "versions"
     / "20260827_04_close_catalog_tenant_and_reasoning_scope.py"
 )
+SCHEMA_FIRST_REVISION_PATH = (
+    BACKEND_ROOT
+    / "migrations"
+    / "versions"
+    / "20260905_23_make_semantic_mappings_schema_first.py"
+)
 
 
 def _load_revision():
@@ -53,6 +59,13 @@ def test_revision_04_constraint_contract_matches_orm_metadata() -> None:
     for name, source, target, local, remote, ondelete in revision.FOREIGN_KEYS:
         if name.endswith("_fkey"):
             continue
+        if name in {
+            "fk_semantic_relations_source_mapping",
+            "fk_semantic_relations_target_mapping",
+        }:
+            # Revision 23 removes only the legacy binding column from these
+            # endpoint scope keys.
+            continue
         constraint = _named_constraint(source, name)
         assert isinstance(constraint, ForeignKeyConstraint)
         assert tuple(column.name for column in constraint.columns) == tuple(local)
@@ -83,6 +96,35 @@ def test_scope_columns_are_non_nullable_where_identity_requires_them() -> None:
                 table_name,
                 column_name,
             )
+
+
+def test_revision_23_semantic_mapping_scope_is_schema_first() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "semantic_schema_first_revision", SCHEMA_FIRST_REVISION_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    revision = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(revision)
+    assert revision.revision == "20260905_23"
+    assert revision.down_revision == "20260904_22"
+
+    semantic = Base.metadata.tables["semantic_mappings"]
+    semantic_relation = Base.metadata.tables["semantic_relation_mappings"]
+    assert semantic.c.scenario_dataset_binding_id.nullable is True
+    assert semantic_relation.c.scenario_dataset_binding_id.nullable is True
+    for name in (
+        "fk_semantic_relations_source_mapping",
+        "fk_semantic_relations_target_mapping",
+    ):
+        constraint = _named_constraint("semantic_relation_mappings", name)
+        assert isinstance(constraint, ForeignKeyConstraint)
+        assert "scenario_dataset_binding_id" not in {
+            column.name for column in constraint.columns
+        }
+
+    migration = SCHEMA_FIRST_REVISION_PATH.read_text(encoding="utf-8")
+    assert "duplicate scenario/entity/schema ownership" in migration
+    assert "FROM semantic_relation_mappings" in migration
 
 
 def test_catalog_scope_tables_compile_for_postgresql() -> None:
@@ -152,6 +194,20 @@ def _valid_privileges() -> dict[str, dict[str, bool]]:
             "update": True,
             "delete": True,
         }
+    for table_name in runtime.RUNTIME_APPEND_ONLY_TABLES:
+        privileges[table_name] = {
+            "select": True,
+            "insert": True,
+            "update": False,
+            "delete": False,
+        }
+    for table_name in runtime.RUNTIME_MUTABLE_CONTROL_TABLES:
+        privileges[table_name] = {
+            "select": True,
+            "insert": True,
+            "update": True,
+            "delete": False,
+        }
     return privileges
 
 
@@ -164,13 +220,23 @@ def test_runtime_privilege_contract_preserves_state_updates_only() -> None:
         "ingestion_runs",
         "derivation_runs",
     }
+    assert set(runtime.RUNTIME_APPEND_ONLY_TABLES) == {"agent_turn_events"}
+    assert set(runtime.RUNTIME_MUTABLE_CONTROL_TABLES) == {
+        "agent_turn_runs",
+        "assistant_request_runs",
+        "managed_upload_runs",
+    }
     result = _validate_runtime_table_privileges(
         _valid_privileges(),
         immutable_tables=runtime.RUNTIME_IMMUTABLE_TABLES,
         ledger_tables=runtime.RUNTIME_MIGRATION_LEDGER_TABLES,
         required_update_tables=runtime.RUNTIME_REQUIRED_UPDATE_TABLES,
+        append_only_tables=runtime.RUNTIME_APPEND_ONLY_TABLES,
+        mutable_control_tables=runtime.RUNTIME_MUTABLE_CONTROL_TABLES,
     )
     assert result["immutable_tables"] == len(runtime.RUNTIME_IMMUTABLE_TABLES)
+    assert result["append_only_tables"] == 1
+    assert result["mutable_control_tables"] == 3
 
 
 @pytest.mark.parametrize(
@@ -180,15 +246,47 @@ def test_runtime_privilege_contract_preserves_state_updates_only() -> None:
         ("assertions", "delete"),
         ("alembic_version", "insert"),
         ("platform_migration_runs", "update"),
+        ("agent_turn_events", "update"),
+        ("agent_turn_runs", "delete"),
+        ("assistant_request_runs", "delete"),
+        ("managed_upload_runs", "truncate"),
     ),
 )
 def test_runtime_privilege_contract_rejects_mutation(table_name: str, privilege: str) -> None:
     privileges = _valid_privileges()
     privileges[table_name][privilege] = True
-    with pytest.raises(RuntimeError, match="mutat"):
+    with pytest.raises(RuntimeError, match="mutat|excessive"):
         _validate_runtime_table_privileges(
             privileges,
             immutable_tables=runtime.RUNTIME_IMMUTABLE_TABLES,
             ledger_tables=runtime.RUNTIME_MIGRATION_LEDGER_TABLES,
             required_update_tables=runtime.RUNTIME_REQUIRED_UPDATE_TABLES,
+            append_only_tables=runtime.RUNTIME_APPEND_ONLY_TABLES,
+            mutable_control_tables=runtime.RUNTIME_MUTABLE_CONTROL_TABLES,
+        )
+
+
+@pytest.mark.parametrize(
+    ("table_name", "privilege"),
+    (
+        ("agent_turn_events", "insert"),
+        ("agent_turn_runs", "update"),
+        ("assistant_request_runs", "insert"),
+        ("managed_upload_runs", "insert"),
+    ),
+)
+def test_runtime_privilege_contract_requires_durable_worker_access(
+    table_name: str,
+    privilege: str,
+) -> None:
+    privileges = _valid_privileges()
+    privileges[table_name][privilege] = False
+    with pytest.raises(RuntimeError, match="lacks"):
+        _validate_runtime_table_privileges(
+            privileges,
+            immutable_tables=runtime.RUNTIME_IMMUTABLE_TABLES,
+            ledger_tables=runtime.RUNTIME_MIGRATION_LEDGER_TABLES,
+            required_update_tables=runtime.RUNTIME_REQUIRED_UPDATE_TABLES,
+            append_only_tables=runtime.RUNTIME_APPEND_ONLY_TABLES,
+            mutable_control_tables=runtime.RUNTIME_MUTABLE_CONTROL_TABLES,
         )

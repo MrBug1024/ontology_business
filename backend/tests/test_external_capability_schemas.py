@@ -100,8 +100,22 @@ def test_invocation_confirmation_shape_is_mode_bound_and_strict() -> None:
         )
 
 
-def test_invocation_rejects_duplicate_port_keys_case_insensitively() -> None:
-    with pytest.raises(ValidationError, match="不能重复"):
+def test_invocation_allows_many_port_refs_but_rejects_exact_duplicates() -> None:
+    request = ExternalCapabilityInvocationIn(
+        managed_inputs=[
+            {
+                "port_key": "records.input",
+                "dataset_version_id": "version-1",
+            },
+            {
+                "port_key": "Records.Input",
+                "dataset_head_id": "head-1",
+            },
+        ]
+    )
+    assert len(request.managed_inputs) == 2
+
+    with pytest.raises(ValidationError, match="相同受管输入"):
         ExternalCapabilityInvocationIn(
             managed_inputs=[
                 {
@@ -110,7 +124,7 @@ def test_invocation_rejects_duplicate_port_keys_case_insensitively() -> None:
                 },
                 {
                     "port_key": "Records.Input",
-                    "dataset_head_id": "head-1",
+                    "dataset_version_id": "version-1",
                 },
             ]
         )

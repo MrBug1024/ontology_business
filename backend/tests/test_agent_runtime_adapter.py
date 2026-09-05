@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -12,6 +12,7 @@ from app.models import (
     Agent,
     BusinessScenario,
     CapabilityInvocation,
+    Conversation,
     DatasetSchema,
     DatasetVersion,
     FunctionDefinition,
@@ -29,6 +30,7 @@ from app.services import (
     agent_engine,
     agent_runtime_adapter,
     permission_service,
+    input_contract_validator,
 )
 from app.routers import agents as agents_router
 from app.schemas import ChatRequest
@@ -136,17 +138,13 @@ def test_zero_data_capability_agent_uses_kernel_without_legacy_context(db: Sessi
 
     # capability_only must not construct the fixed DataSource/DataMapping
     # context even when stale fixed ids remain on the compatibility row.
-    with patch.object(
-        agent_engine,
-        "AgentContext",
-        side_effect=AssertionError("legacy context must not be read"),
-    ):
-        runtime = agent_runtime_adapter.build_runtime_context(
-            db,
-            agent,
-            llm,
-            turn_input=turn_input,
-        )
+    assert not hasattr(agent_engine, "AgentContext")
+    runtime = agent_runtime_adapter.build_runtime_context(
+        db,
+        agent,
+        llm,
+        turn_input=turn_input,
+    )
 
     assert isinstance(runtime, agent_runtime_adapter.CapabilityAgentRuntime)
     assert runtime.runtime_data_context.handles == ()
@@ -165,8 +163,9 @@ def test_zero_data_capability_agent_uses_kernel_without_legacy_context(db: Sessi
     assert invocation.request_document["structured_inputs"]["outline"]["fields"] == {
         "amount": {"type": "integer"}
     }
-    assert "candidate_detected_pending_review" in runtime._system_prompt()
-    assert "不得宣称事实已确认" in runtime._system_prompt()
+    assert "Receipt" in runtime._system_prompt()
+    assert "不得把中间、待处理或不确定状态改写为最终结论" in runtime._system_prompt()
+    assert "candidate_detected_pending_review" not in runtime._system_prompt()
 
 
 def test_agent_turn_derives_stable_identity_per_capability_call(db: Session) -> None:
@@ -231,7 +230,7 @@ def test_agent_turn_derives_stable_identity_per_capability_call(db: Session) -> 
     assert all(str(item.idempotency_key).startswith("agent-tool:") for item in invocations)
 
 
-def test_attachment_turn_without_compatible_capability_fails_closed(db: Session) -> None:
+def test_supplementary_attachment_does_not_block_zero_data_capability(db: Session) -> None:
     _tenant, _user, _scenario, llm, _function, agent = _world(
         db,
         "unsupported-attachment",
@@ -251,10 +250,211 @@ def test_attachment_turn_without_compatible_capability_fails_closed(db: Session)
         ),
     )
 
-    assert runtime.complete is False
-    assert {
-        item["code"] for item in runtime.context_issues
-    } == {"attachments_not_supported"}
+    assert runtime.complete is True
+    assert runtime.context_issues == []
+
+
+def _attachment_runtime(
+    *,
+    attachments: tuple[agent_runtime_adapter.AgentAttachmentInput, ...],
+    profiles: tuple[dict, ...],
+) -> agent_runtime_adapter.CapabilityAgentRuntime:
+    runtime = object.__new__(agent_runtime_adapter.CapabilityAgentRuntime)
+    runtime.turn_input = agent_runtime_adapter.AgentTurnInput(attachments=attachments)
+    runtime._attachment_observations_cache = tuple(
+        input_contract_validator.ObservedInput(
+            index=index,
+            binding_kind=attachment.binding_kind,
+            reference_id=attachment.reference_id,
+            profile=profiles[index],
+        )
+        for index, attachment in enumerate(attachments)
+    )
+    return runtime
+
+
+def _attachment_capability(
+    *,
+    cardinality: str = "one",
+    binding_kinds: list[str] | None = None,
+) -> dict:
+    return {
+        "data_ports": [
+            {
+                "port_key": "records",
+                "direction": "input",
+                "allow_override": True,
+                "required": True,
+                "cardinality": cardinality,
+                "binding_kinds": binding_kinds or ["asset_version"],
+                "schema_document": {
+                    input_contract_validator.CONTENT_CONTRACT_KEY: {
+                        "version": "tabular-content/v1",
+                        "relations": [
+                            {
+                                "fields": [
+                                    {
+                                        "name": "record_id",
+                                        "logical_types": ["string"],
+                                        "required": True,
+                                    }
+                                ],
+                                "minimum_data_rows": 1,
+                                "allow_additional_fields": True,
+                            }
+                        ],
+                        "allow_additional_relations": True,
+                    }
+                },
+            }
+        ]
+    }
+
+
+def _records_profile() -> dict:
+    return {
+        "category": "table",
+        "tables": [
+            {
+                "name": "ignored-name",
+                "sample_row_count": 1,
+                "columns": [{"name": "record_id", "logical_type": "string"}],
+            }
+        ],
+    }
+
+
+def test_adapter_binds_matching_content_and_keeps_supplementary_attachment() -> None:
+    attachments = (
+        agent_runtime_adapter.AgentAttachmentInput(
+            filename="notes.txt", asset_version_id="asset-notes"
+        ),
+        agent_runtime_adapter.AgentAttachmentInput(
+            filename="renamed.csv", asset_version_id="asset-records"
+        ),
+    )
+    runtime = _attachment_runtime(
+        attachments=attachments,
+        profiles=({"category": "document"}, _records_profile()),
+    )
+
+    overrides = runtime._attachment_overrides(_attachment_capability(), None)
+
+    assert [(item.port_key, item.reference_id) for item in overrides] == [
+        ("records", "asset-records")
+    ]
+
+
+def test_adapter_many_port_binds_each_compatible_attachment() -> None:
+    attachments = (
+        agent_runtime_adapter.AgentAttachmentInput(
+            filename="first.csv", asset_version_id="asset-first"
+        ),
+        agent_runtime_adapter.AgentAttachmentInput(
+            filename="second.csv", asset_version_id="asset-second"
+        ),
+    )
+    runtime = _attachment_runtime(
+        attachments=attachments,
+        profiles=(_records_profile(), _records_profile()),
+    )
+
+    overrides = runtime._attachment_overrides(
+        _attachment_capability(cardinality="many"), None
+    )
+
+    assert [(item.port_key, item.reference_id) for item in overrides] == [
+        ("records", "asset-first"),
+        ("records", "asset-second"),
+    ]
+
+
+def test_adapter_auto_and_explicit_mapping_accept_many_relation_bundle() -> None:
+    attachment = agent_runtime_adapter.AgentAttachmentInput(
+        filename="受管数据包",
+        dataset_version_id="dataset-bundle",
+    )
+    profile = _records_profile()
+    profile["tables"].append(
+        {
+            **profile["tables"][0],
+            "name": "another-ignored-name",
+        }
+    )
+    runtime = _attachment_runtime(
+        attachments=(attachment,),
+        profiles=(profile,),
+    )
+    capability = _attachment_capability(
+        cardinality="many",
+        binding_kinds=["dataset_version"],
+    )
+
+    automatic = runtime._attachment_overrides(capability, None)
+    explicit = runtime._attachment_overrides(
+        capability,
+        [{"attachment_index": 0, "port_key": "records"}],
+    )
+
+    assert [(item.port_key, item.reference_id) for item in automatic] == [
+        ("records", "dataset-bundle")
+    ]
+    assert explicit == automatic
+
+
+def test_attachment_port_without_kind_restriction_accepts_managed_asset() -> None:
+    attachment = agent_runtime_adapter.AgentAttachmentInput(
+        filename="notes.txt", asset_version_id="asset-notes"
+    )
+    runtime = _attachment_runtime(
+        attachments=(attachment,),
+        profiles=({"category": "document"},),
+    )
+    capability = {
+        "data_ports": [
+            {
+                "port_key": "supplement",
+                "direction": "input",
+                "allow_override": True,
+                "required": True,
+                "cardinality": "one",
+                "binding_kinds": [],
+                "schema_document": {},
+            }
+        ]
+    }
+
+    overrides = runtime._attachment_overrides(capability, None)
+
+    assert [(item.port_key, item.reference_id) for item in overrides] == [
+        ("supplement", "asset-notes")
+    ]
+
+
+def test_supplementary_attachment_does_not_satisfy_connector_only_port() -> None:
+    attachment = agent_runtime_adapter.AgentAttachmentInput(
+        filename="notes.txt", asset_version_id="asset-notes"
+    )
+    runtime = _attachment_runtime(
+        attachments=(attachment,),
+        profiles=({"category": "document"},),
+    )
+    capability = {
+        "data_ports": [
+            {
+                "port_key": "warehouse",
+                "direction": "input",
+                "allow_override": True,
+                "required": True,
+                "cardinality": "one",
+                "binding_kinds": ["connector_binding"],
+                "schema_document": {},
+            }
+        ]
+    }
+
+    assert runtime._capability_accepts_attachments(capability) is True
+    assert runtime._attachment_overrides(capability, None) == ()
 
 
 def test_agent_catalog_and_invocation_include_selected_dynamic_rule(db: Session) -> None:
@@ -531,6 +731,9 @@ def test_non_browser_turn_persists_safe_snapshot_and_evidence(db: Session) -> No
 
     assert result["answer"] == "The governed capability completed."
     assert result["evidence_refs"][0]["kind"] == "capability_invocation"
+    # Non-durable/MCP-style calls retain their existing self-commit behavior.
+    db.rollback()
+    db.expire_all()
     messages = db.scalars(
         select(Message)
         .where(Message.conversation_id == result["conversation_id"])
@@ -547,6 +750,327 @@ def test_non_browser_turn_persists_safe_snapshot_and_evidence(db: Session) -> No
         assert message.evidence_refs == result["evidence_refs"]
 
 
+def test_incomplete_turn_contract_is_rejected_before_model_call(db: Session) -> None:
+    _tenant, _user, _scenario, _llm, _function, agent = _world(
+        db,
+        "incomplete-turn-contract",
+    )
+    runtime = Mock()
+    runtime.complete = False
+    runtime.context_issues = [
+        {
+            "code": "attachments_not_supported",
+            "binding_kinds": ["dataset_version"],
+            "count": 1,
+        }
+    ]
+    runtime.build_tools.return_value = []
+
+    with (
+        patch.object(agents_router, "_authorization_context", return_value=runtime),
+        patch.object(agents_router, "_agent_readiness_missing", return_value=[]),
+        patch.object(
+            agent_engine,
+            "run_agent",
+            side_effect=AssertionError("LLM must not receive an incomplete runtime"),
+        ),
+    ):
+        with pytest.raises(agent_runtime_adapter.AgentRuntimeAdapterError) as blocked:
+            agents_router.invoke_agent_once(
+                agent.id,
+                message="Use the uploaded table.",
+                conversation_id=None,
+                db=db,
+            )
+
+    assert blocked.value.code == "runtime_input_contract_unsatisfied"
+    assert blocked.value.message == "上传内容未满足所选能力的基础输入契约"
+
+
+def test_large_capability_receipt_is_bounded_before_model_and_message_use(
+    db: Session,
+) -> None:
+    _tenant, _user, _scenario, llm, function, agent = _world(
+        db,
+        "bounded-receipt",
+    )
+    runtime = agent_runtime_adapter.build_runtime_context(db, agent, llm)
+    sentinel = "RAW_RESULT_MUST_NOT_REACH_MODEL"
+    document = {
+        "invocation_id": "invocation-bounded-receipt",
+        "status": "succeeded",
+        "capability": {"kind": "function", "key": function.id},
+        "definition_hash": "a" * 64,
+        "deployment_fingerprint": "b" * 64,
+        "data_context_fingerprint": "c" * 64,
+        "output": {
+            "rows": [
+                {"physical_column": sentinel + ("x" * 9_000)},
+                {"physical_column": sentinel + ("y" * 9_000)},
+            ]
+        },
+        "audit_ref": {"invocation_id": "invocation-bounded-receipt"},
+        "confirmation": None,
+        "error": None,
+    }
+
+    with (
+        patch.object(
+            agent_runtime_adapter.capability_application_service,
+            "invoke",
+            return_value=object(),
+        ),
+        patch.object(
+            agent_runtime_adapter.capability_application_service,
+            "receipt_document",
+            return_value=document,
+        ),
+    ):
+        raw_result = runtime.execute_tool(
+            "invoke_capability",
+            {
+                "kind": "function",
+                "key": function.id,
+                "inputs": {"amount": 8},
+            },
+        )
+
+    projected = json.loads(raw_result)
+    assert len(raw_result.encode("utf-8")) <= (
+        agent_runtime_adapter._MAX_MODEL_RECEIPT_BYTES
+    )
+    assert projected["contract"] == (
+        "agent-capability-receipt-model-view/v1"
+    )
+    assert projected["invocation_id"] == document["invocation_id"]
+    assert projected["status"] == "succeeded"
+    assert projected["capability"] == document["capability"]
+    assert projected["result_omitted"] is True
+    assert len(projected["receipt_hash"]) == 64
+    assert len(projected["result_hash"]) == 64
+    assert projected["result_outline"] == {
+        "root_type": "object",
+        "node_type_counts": {
+            "array": 1,
+            "object": 3,
+            "string": 2,
+        },
+        "object_field_count": 3,
+        "array_item_count": 2,
+        "max_depth": 3,
+    }
+    assert "output" not in projected
+    assert "audit_ref" not in projected
+    assert "physical_column" not in raw_result
+    assert sentinel not in raw_result
+    # The application-service receipt passed into the adapter remains intact;
+    # only its model/message view is projected.
+    assert document["output"]["rows"][0]["physical_column"].startswith(sentinel)
+
+
+def test_historic_large_receipt_replay_uses_the_same_bounded_projection(
+    db: Session,
+) -> None:
+    _tenant, user, _scenario, llm, function, agent = _world(
+        db,
+        "bounded-history",
+    )
+    runtime = agent_runtime_adapter.build_runtime_context(db, agent, llm)
+    sentinel = "HISTORIC_RAW_RESULT_MUST_NOT_REACH_MODEL"
+    document = {
+        "invocation_id": "invocation-bounded-history",
+        "status": "succeeded",
+        "capability": {"kind": "function", "key": function.id},
+        "definition_hash": "d" * 64,
+        "deployment_fingerprint": "e" * 64,
+        "data_context_fingerprint": "f" * 64,
+        "output": {"rows": [{"private_value": sentinel + ("z" * 12_000)}]},
+        "audit_ref": {"invocation_id": "invocation-bounded-history"},
+        "confirmation": None,
+        "error": None,
+    }
+    conversation = Conversation(
+        id="conversation-bounded-history",
+        agent_id=agent.id,
+        created_by_user_id=user.id,
+        title="Bounded history",
+    )
+    message = Message(
+        id="message-bounded-history",
+        conversation_id=conversation.id,
+        role="assistant",
+        content="The governed capability completed.",
+        tool_calls=[
+            {
+                "id": "call-bounded-history",
+                "name": "invoke_capability",
+                "arguments": {
+                    "kind": "function",
+                    "key": function.id,
+                    "inputs": {"amount": 8},
+                },
+            }
+        ],
+        # Simulate a legacy pre-boundary row. Authorization may accept the
+        # canonical record, but replay must replace it with today's projection.
+        tool_results=[
+            {
+                "id": "call-bounded-history",
+                "name": "invoke_capability",
+                "result": json.dumps(document, ensure_ascii=False, sort_keys=True),
+            }
+        ],
+    )
+    db.add_all([conversation, message])
+    db.commit()
+
+    with patch.object(
+        agent_runtime_adapter.capability_application_service,
+        "get_receipt",
+        return_value=document,
+    ):
+        history = agents_router._model_history(
+            db,
+            conversation.id,
+            agent,
+            runtime,
+        )
+
+    tool_messages = [item for item in history if item.get("role") == "tool"]
+    assert len(tool_messages) == 1
+    projected = json.loads(tool_messages[0]["content"])
+    assert projected == agent_runtime_adapter._model_receipt_projection(document)
+    assert len(tool_messages[0]["content"].encode("utf-8")) <= (
+        agent_runtime_adapter._MAX_MODEL_RECEIPT_BYTES
+    )
+    assert sentinel not in json.dumps(history, ensure_ascii=False)
+    assert "private_value" not in json.dumps(history, ensure_ascii=False)
+
+
+def test_model_history_character_budget_keeps_tool_exchange_atomic() -> None:
+    tool_group = [
+        {
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "x" * 500,
+        },
+    ]
+    newest_group = [{"role": "user", "content": "latest"}]
+    budget = len(json.dumps(newest_group, ensure_ascii=False, separators=(",", ":")))
+    budget += len(
+        json.dumps([tool_group[0]], ensure_ascii=False, separators=(",", ":"))
+    )
+
+    history = agents_router._bounded_model_history(
+        [tool_group, newest_group],
+        maximum_characters=budget,
+    )
+
+    assert history == newest_group
+    assert len(
+        json.dumps(history, ensure_ascii=False, separators=(",", ":"))
+    ) <= budget
+
+
+def test_model_history_queries_only_the_newest_persisted_records(db: Session) -> None:
+    _tenant, user, _scenario, _llm, _function, agent = _world(
+        db,
+        "recent-history",
+    )
+    conversation = Conversation(
+        id="conversation-recent-history",
+        agent_id=agent.id,
+        created_by_user_id=user.id,
+        title="Recent history",
+    )
+    messages = [
+        Message(
+            id=f"recent-history-{index:02d}",
+            conversation_id=conversation.id,
+            role="user",
+            content=f"message-{index:02d}",
+        )
+        for index in range(agents_router._MODEL_HISTORY_MAX_RECORDS + 6)
+    ]
+    db.add_all([conversation, *messages])
+    db.commit()
+
+    history = agents_router._model_history(
+        db,
+        conversation.id,
+        agent,
+        Mock(),
+    )
+
+    assert len(history) == agents_router._MODEL_HISTORY_MAX_RECORDS
+    assert history[0]["content"] == "message-06"
+    assert history[-1]["content"] == "message-29"
+
+
+def test_capability_loop_runs_boundary_before_every_llm_round(db: Session) -> None:
+    _tenant, _user, _scenario, llm, _function, agent = _world(
+        db,
+        "llm-boundary",
+    )
+    runtime = agent_runtime_adapter.build_runtime_context(db, agent, llm)
+    boundary_calls: list[bool] = []
+    llm_transaction_states: list[bool] = []
+    model_calls = 0
+
+    def before_llm_call() -> None:
+        boundary_calls.append(db.in_transaction())
+        db.commit()
+
+    def fake_chat_stream(*_args, **_kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        llm_transaction_states.append(db.in_transaction())
+        if model_calls == 1:
+            yield {
+                "type": "tool_calls",
+                "tool_calls": [
+                    {
+                        "id": "list-capabilities",
+                        "function": {
+                            "name": "list_available_capabilities",
+                            "arguments": {},
+                        },
+                    }
+                ],
+            }
+            return
+        yield {"type": "token", "content": "done"}
+
+    with patch.object(
+        agent_runtime_adapter.llm_service,
+        "chat_stream",
+        fake_chat_stream,
+    ):
+        events = list(
+            agent_engine.run_agent(
+                db,
+                agent,
+                llm,
+                [],
+                "List the governed capabilities.",
+                "Capability scenario",
+                "",
+                runtime_context=runtime,
+                before_llm_call=before_llm_call,
+            )
+        )
+
+    assert model_calls == 2
+    assert len(boundary_calls) == model_calls
+    assert llm_transaction_states == [False, False]
+    assert events[-1] == {"type": "done", "data": "done"}
+
+
 @pytest.mark.parametrize("mode", ("legacy", "shadow", "prefer_capability"))
 def test_historical_modes_fail_closed_before_runtime_construction(
     db: Session,
@@ -556,17 +1080,11 @@ def test_historical_modes_fail_closed_before_runtime_construction(
     agent.runtime_binding_mode = mode
     agent.data_source_ids = []
     db.commit()
-    with (
-        patch.object(
-            agent_engine,
-            "AgentContext",
-            side_effect=AssertionError("legacy runtime must not be constructed"),
-        ),
-        patch.object(
-            agent_runtime_adapter,
-            "CapabilityAgentRuntime",
-            side_effect=AssertionError("capability runtime must not be probed"),
-        ),
+    assert not hasattr(agent_engine, "AgentContext")
+    with patch.object(
+        agent_runtime_adapter,
+        "CapabilityAgentRuntime",
+        side_effect=AssertionError("capability runtime must not be probed"),
     ):
         with pytest.raises(agent_runtime_adapter.AgentRuntimeAdapterError) as blocked:
             agent_runtime_adapter.build_runtime_context(db, agent, llm)

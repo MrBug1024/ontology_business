@@ -110,6 +110,22 @@ def _request_permission_cache(db: Session) -> dict[tuple[object, ...], object]:
     return cache
 
 
+def refresh_request_authorization(db: Session) -> None:
+    """Discard request-local identity and ACL snapshots before a durable write."""
+
+    db.info.pop("permission_cache", None)
+    authorization_types = (
+        User,
+        Organization,
+        OrganizationMember,
+        OrganizationRole,
+        AuthorizationGrant,
+    )
+    for instance in list(db.identity_map.values()):
+        if isinstance(instance, authorization_types):
+            db.expire(instance)
+
+
 def _resolve_principal(db: Session) -> tuple[Principal | None, str, int]:
     """返回已验证主体；第三个值是错误时应返回的 HTTP 状态。"""
     tenant_id = _context_value(db, "tenant_id")

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from pathlib import Path
 from urllib.parse import quote
 import uuid
 
@@ -25,9 +24,11 @@ from ..schemas import (
     TableInfo,
 )
 from ..services import (
+    catalog_service,
     catalog_ingestion_service,
     connector_service,
     datasource_service,
+    modeling_contract_source_service,
     object_deletion_service,
     object_storage_service,
     permission_service,
@@ -296,6 +297,7 @@ def delete_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     bucket_files = list(ds.files)
     try:
+        modeling_contract_source_service.retire_for_data_source_deletion(db, ds)
         deletion_job_ids = [
             object_deletion_service.enqueue_bucket_file_deletion(
                 db, bucket_file, ds
@@ -462,6 +464,12 @@ def list_files(ds_id: str, db: Session = Depends(get_tenant_db)):
     ds = _data_source(db, ds_id)
     if ds.type != "file_bucket":
         return []
+    refs = modeling_contract_source_service.refs_for_bucket_files(db, ds, list(ds.files))
+    for item in ds.files:
+        ref = refs.get(item.id)
+        if ref is not None:
+            item.modeling_contract_dataset_id = ref.dataset_id
+            item.modeling_contract_schema_id = ref.schema_id
     return list(ds.files)
 
 
@@ -488,19 +496,23 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
                 f"{int(settings.catalog_max_upload_bytes) // (1024 * 1024)} MB）",
             ) from exc
         file_id = uuid.uuid4().hex
-        table_file = Path(filename).suffix.lower() in {".csv", ".tsv", ".xls", ".xlsx", ".xlsm"}
+        staged_digest = staged.content_sha256
+        table_file = False
+        table_profile: dict | None = None
         table_profile_text = ""
-        if table_file:
-            try:
-                _media_type, table_profile = catalog_ingestion_service.build_profile_path(
-                    staged.path, filename, content_type
-                )
+        try:
+            profiled = catalog_ingestion_service.build_tabular_profile_path(
+                staged.path, filename, content_type
+            )
+            if profiled is not None:
+                _media_type, table_profile = profiled
+                table_file = True
                 table_profile_text = catalog_ingestion_service.profile_summary_text(
                     table_profile, filename
                 )
-            except ValueError as exc:
-                staged.remove()
-                raise HTTPException(400, str(exc)) from exc
+        except ValueError as exc:
+            staged.remove()
+            raise HTTPException(400, str(exc)) from exc
         upload_claim = None
         if datasource_service.is_managed_minio_source(ds):
             try:
@@ -567,18 +579,29 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
                 bf.status = "parsed"
                 bf.parsed_text = table_profile_text
                 rag_service.enqueue_document_index(db, bf, parse_document=False)
+                try:
+                    contract_ref = modeling_contract_source_service.materialize_tabular_contract_source(
+                        db,
+                        source=ds,
+                        bucket_file=bf,
+                        profile=table_profile or {},
+                        content_sha256=staged_digest,
+                    )
+                except catalog_service.CatalogError as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"表格能力契约来源生成失败：{exc}",
+                    ) from exc
+                if contract_ref is None:
+                    raise HTTPException(422, "表格内容未生成能力输入契约来源")
+                bf.modeling_contract_dataset_id = contract_ref.dataset_id
+                bf.modeling_contract_schema_id = contract_ref.schema_id
             else:
                 rag_service.enqueue_document_index(db, bf, parse_document=True)
             db.commit()
         except Exception as exc:
             db.rollback()
-            if (
-                upload_claim is not None
-                and isinstance(
-                    exc,
-                    object_deletion_service.UploadIntentLeaseLostError,
-                )
-            ):
+            if upload_claim is not None:
                 object_deletion_service.schedule_abandoned_upload_best_effort(
                     upload_claim,
                     bf,
@@ -599,9 +622,40 @@ def reparse_file(file_id: str, db: Session = Depends(get_tenant_db)):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
-    _data_source(db, bf.data_source_id, writable=True)
-    if Path(bf.filename).suffix.lower() in {".csv", ".tsv", ".xls", ".xlsx", ".xlsm"}:
-        raise HTTPException(409, "表格业务数据必须通过数据集通道解析，不能建立文档全文索引")
+    source = _data_source(db, bf.data_source_id, writable=True)
+    existing_ref = modeling_contract_source_service.refs_for_bucket_files(
+        db, source, [bf]
+    ).get(bf.id)
+    if existing_ref is not None:
+        raise HTTPException(409, "该文件已按表格内容生成能力契约来源，无需全文重解析")
+    try:
+        existing_profile = modeling_contract_source_service.profile_existing_tabular_file(
+            source, bf
+        )
+        if existing_profile is not None:
+            contract_ref = modeling_contract_source_service.materialize_tabular_contract_source(
+                db,
+                source=source,
+                bucket_file=bf,
+                profile=existing_profile.profile,
+                content_sha256=existing_profile.content_sha256,
+            )
+            if contract_ref is None:
+                raise catalog_service.CatalogError("表格内容未生成能力输入契约来源")
+            bf.status = "parsed"
+            bf.error = ""
+            bf.parsed_text = catalog_ingestion_service.profile_summary_text(
+                existing_profile.profile, bf.filename
+            )
+            rag_service.enqueue_document_index(db, bf, parse_document=False, force=True)
+            db.commit()
+            db.refresh(bf)
+            bf.modeling_contract_dataset_id = contract_ref.dataset_id
+            bf.modeling_contract_schema_id = contract_ref.schema_id
+            return bf
+    except catalog_service.CatalogError as exc:
+        db.rollback()
+        raise HTTPException(422, f"表格能力契约来源生成失败：{exc}") from exc
     bf.status = "pending"
     bf.error = ""
     bf.parsed_text = ""
@@ -669,6 +723,7 @@ def delete_file(file_id: str, db: Session = Depends(get_tenant_db)):
     except template_catalog_service.TemplateCatalogError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     try:
+        modeling_contract_source_service.retire_for_file_deletion(db, source, bf)
         deletion_job_id = object_deletion_service.enqueue_bucket_file_deletion(
             db, bf, source
         )

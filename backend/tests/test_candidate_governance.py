@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.database import Base
 from app.models import (
     BusinessScenario,
+    FunctionDefinition,
     OntologyAction,
     OntologyEntity,
     OntologyEvent,
@@ -126,6 +127,72 @@ def test_origin_is_provenance_and_does_not_change_quality_state() -> None:
         assistant_quality["quality_fingerprint"]
         == manual_quality["quality_fingerprint"]
     )
+
+
+@pytest.mark.parametrize(
+    ("provider_key", "provider_version"),
+    [
+        ("builtin.not-registered", "1.0.0"),
+        ("builtin.semantic-audit", "999.0.0"),
+    ],
+)
+def test_candidate_provider_identity_must_resolve_exactly(
+    provider_key: str,
+    provider_version: str,
+) -> None:
+    db, tenant, user, scenario = _session()
+    try:
+        row = _draft(
+            tenant_id=tenant.id,
+            scenario_id=scenario.id,
+            user_id=user.id,
+            kind="function",
+            key=f"function.invalid_provider_{provider_key}_{provider_version}",
+            payload={
+                "name": "Invalid provider binding",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                "output_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                "tags": [],
+                "visibility": "scenario",
+                "runtime_kind": "provider",
+                "runtime_config": {
+                    "provider_key": provider_key,
+                    "provider_version": provider_version,
+                    "provider_config": {},
+                },
+            },
+            source="manual",
+        )
+        db.add(row)
+        db.commit()
+
+        evaluation = candidate_governance_service.evaluate_candidates(
+            db,
+            scenario,
+            [row],
+        )
+        assert evaluation.eligible is False
+        assert evaluation.blockers[0]["code"] == "formal_preflight_failed"
+
+        with pytest.raises(candidate_governance_service.CandidatePromotionBlocked):
+            candidate_governance_service.promote_candidates(
+                db,
+                scenario,
+                tenant_id=tenant.id,
+                created_by_user_id=user.id,
+                expected_revisions={row.id: 0},
+            )
+        assert db.scalars(select(FunctionDefinition)).all() == []
+    finally:
+        db.close()
 
 
 def test_unique_primary_key_becomes_title_during_candidate_preflight() -> None:

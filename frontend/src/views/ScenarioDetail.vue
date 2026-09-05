@@ -987,46 +987,93 @@
         <el-form-item label="运行方式" required>
           <el-select v-model="functionForm.runtime_kind" style="width:100%" @change="onFunctionRuntimeChange">
             <el-option label="仅定义输入输出（暂不可调用）" value="contract" />
-            <el-option label="本体对象集查询（受管 DatasetVersion）" value="provider" />
+            <el-option label="受信 Provider" value="provider" />
             <el-option label="加权评分" value="weighted_score" />
             <el-option label="阈值判断" value="threshold" />
             <el-option label="两点地理距离" value="geo_distance" />
             <el-option label="时序数值聚合" value="timeseries_aggregate" />
           </el-select>
         </el-form-item>
-        <el-form-item v-if="functionForm.runtime_kind !== 'provider'" label="输入字段" required>
+        <el-form-item
+          v-if="functionForm.runtime_kind !== 'provider' || selectedFunctionProvider?.input_schema_mode === 'editable'"
+          label="输入字段"
+          required
+        >
           <SchemaFieldBuilder v-model="functionForm.input_schema" empty-text="该函数暂时不需要输入字段" />
           <div class="form-help">逐项定义函数需要的业务参数；选择可运行的计算方式后，Agent 会按这些字段调用。</div>
         </el-form-item>
-        <el-form-item v-if="functionForm.runtime_kind !== 'provider'" label="输出字段" required>
+        <el-form-item
+          v-if="functionForm.runtime_kind !== 'provider' || selectedFunctionProvider?.output_schema_mode === 'editable'"
+          label="输出字段"
+          required
+        >
           <SchemaFieldBuilder v-model="functionForm.output_schema" empty-text="该函数暂时没有结构化输出" />
           <div class="form-help">逐项说明计算结果，Agent 会按这个结构理解并使用返回值。</div>
         </el-form-item>
         <template v-if="functionForm.runtime_kind === 'provider'">
           <el-alert
-            title="输入查询契约和输出结果由受信 Provider 固定；这里只选择该函数可查询的对象映射。"
+            v-if="functionProviderLoadError"
+            :title="functionProviderLoadError"
+            type="error"
+            :closable="false"
+            show-icon
+          />
+          <el-button
+            v-if="functionProviderLoadError"
+            plain
+            :loading="functionProviderManifestsLoading"
+            @click="loadFunctionProviderManifests"
+          >
+            重试加载 Provider 清单
+          </el-button>
+          <el-alert
+            v-else-if="selectedFunctionProvider"
+            :title="selectedFunctionProvider.description || '配置由服务端受信 Provider 清单约束。'"
             type="info"
             :closable="false"
             show-icon
           />
-          <el-form-item label="可查询对象映射" required>
+          <el-form-item label="Provider" required>
             <el-select
-              v-model="functionForm.runtime_config.provider_config.semantic_mapping_ids"
-              multiple
-              filterable
-              style="width:100%"
-              :loading="semanticMappingsLoading"
-              placeholder="选择已激活的 Catalog 语义映射"
+              :model-value="selectedFunctionProviderIdentity"
+              :loading="functionProviderManifestsLoading"
+              placeholder="选择受信 Provider 和精确版本"
+              style="width: 100%"
+              @update:model-value="selectFunctionProvider"
             >
               <el-option
-                v-for="mapping in activeSemanticMappings"
-                :key="mapping.id"
-                :label="`${entName(mapping.entity_id)} · ${mapping.mapping_key}`"
-                :value="mapping.id"
+                v-for="manifest in functionProviderManifests"
+                :key="providerManifestIdentity(manifest.provider_key, manifest.provider_version)"
+                :label="`${manifest.display_name} · ${manifest.provider_version}${manifest.deprecated ? '（已停用）' : ''}`"
+                :value="providerManifestIdentity(manifest.provider_key, manifest.provider_version)"
+                :disabled="manifest.deprecated"
               />
             </el-select>
-            <div class="form-help">映射 ID 会进入 Definition/Release 快照；调用数据仍由本次 Invocation 显式提供。</div>
+            <div class="form-help">Definition 固定 Provider key 与 version，运行时不会按已安装版本猜测。</div>
           </el-form-item>
+          <ProviderConfigEditor
+            v-if="selectedFunctionProvider"
+            :model-value="functionForm.runtime_config"
+            :manifest="selectedFunctionProvider"
+            :semantic-mappings="semanticMappings"
+            :loading="semanticMappingsLoading"
+            @update:model-value="updateFunctionProviderRuntimeConfig"
+          />
+          <div
+            v-if="functionProviderValidationError"
+            class="form-error-summary"
+            role="alert"
+            tabindex="-1"
+          >
+            {{ functionProviderValidationError }}
+          </div>
+          <el-alert
+            v-else-if="selectedFunctionProviderIdentity && !functionProviderManifestsLoading"
+            title="当前 Definition 固定的 Provider 不在服务端受信清单中；可查看原值，但不能保存或替换执行语义。"
+            type="warning"
+            :closable="false"
+            show-icon
+          />
         </template>
         <template v-if="functionForm.runtime_kind === 'weighted_score'">
           <el-form-item label="字段权重" required>
@@ -1403,6 +1450,7 @@ import { cloneForForm } from '@/utils/clone'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import EditorPanel from '@/components/EditorPanel.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
+import ProviderConfigEditor from '@/components/ProviderConfigEditor.vue'
 import RuleConditionBuilder from '@/components/RuleConditionBuilder.vue'
 import SchemaFieldBuilder from '@/components/SchemaFieldBuilder.vue'
 import StructuredValueCell from '@/components/StructuredValueCell.vue'
@@ -1414,6 +1462,15 @@ import SemanticMappingsPanel from '@/components/SemanticMappingsPanel.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
 import { safeInternalReturnPath } from '@/utils/navigation'
 import {
+  captureFunctionContractSchemas,
+  createProviderRuntimeConfig,
+  functionRuntimeConfigForSave,
+  providerConfigValidationError,
+  providerManifestIdentity,
+  restoreFunctionContractSchemas,
+  runtimeProviderIdentity,
+} from '@/utils/providerManifests'
+import {
   RELATION_MAPPING_MODES,
   buildRelationMappingPayload,
   missingRelationMappingFields,
@@ -1421,7 +1478,8 @@ import {
   relationMappingModeLabel,
   relationMappingPayloadFingerprint,
 } from '@/utils/relationMappings'
-import type { ArtifactTemplate, AssistantActionPreview, ScenarioDetail, ScenarioModelCandidateSummary, ScenarioModelDraftIssue, ScenarioModelDraftResource, GraphData, GraphNode, GraphEdge, Entity, Relation, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, ObjectDetail, ObjectSearchItem, RelationDataMapping, RelationDataMappingInput, RelationDataMappingPreview, SemanticMapping, TableInfo, WorkflowRun } from '@/types'
+import type { ArtifactTemplate, AssistantActionPreview, ScenarioDetail, ScenarioModelCandidateSummary, ScenarioModelDraftIssue, ScenarioModelDraftResource, GraphData, GraphNode, GraphEdge, Entity, Relation, RelationInstance, DataMapping, DataMappingPreview, DataMappingRefreshJob, FunctionDefinition, FunctionProviderManifest, ObjectDetail, ObjectSearchItem, RelationDataMapping, RelationDataMappingInput, RelationDataMappingPreview, SemanticMapping, TableInfo, WorkflowRun } from '@/types'
+import type { FunctionContractSchemas } from '@/utils/providerManifests'
 import { cleanTemplateExecutorConfig, templateFormatLabel, templatePathsToSchema, templateUnavailableReason } from '@/utils/templates'
 import { draftRefToken, normalizeScenarioModelDrafts, scenarioDraftIsOpen, scenarioDraftKindLabel, scenarioDraftStage } from '@/utils/scenarioModelDrafts'
 
@@ -2711,9 +2769,15 @@ const emptyFunctionSchema = (): Record<string, unknown> => ({
 })
 const functionDlg = ref(false)
 const functionSaving = ref(false)
+const functionProviderManifests = ref<FunctionProviderManifest[]>([])
+const functionProviderManifestsLoading = ref(false)
+const functionProviderLoadError = ref('')
+const functionProviderValidationError = ref('')
+let functionProviderManifestRequest = 0
+let functionRuntimeKindBeforeChange = 'contract'
+let functionContractSchemaSnapshot: FunctionContractSchemas | null = null
 const semanticMappings = ref<SemanticMapping[]>([])
 const semanticMappingsLoading = ref(false)
-const activeSemanticMappings = computed(() => semanticMappings.value.filter((item) => item.status === 'active'))
 const functionForm = ref<FunctionForm>({
   name: '', description: '', tags_text: '', visibility: 'scenario',
   input_schema: emptyFunctionSchema(), output_schema: emptyFunctionSchema(),
@@ -2724,24 +2788,35 @@ const functionInputFields = computed(() => {
   return Object.entries(root.properties).map(([name, schema]: [string, any]) => ({ name, type: String(schema?.type || 'string') }))
 })
 const functionNumericFields = computed(() => functionInputFields.value.filter((field) => ['number', 'integer'].includes(field.type)))
+const selectedFunctionProviderIdentity = computed(() => runtimeProviderIdentity(functionForm.value.runtime_config))
+const selectedFunctionProvider = computed(() => functionProviderManifests.value.find(
+  (manifest) => providerManifestIdentity(manifest.provider_key, manifest.provider_version) === selectedFunctionProviderIdentity.value,
+))
 function functionRuntimeLabel(kind?: string) {
   return ({
     contract: '仅定义（不可调用）', weighted_score: '加权评分', threshold: '阈值判断',
-    geo_distance: '地理距离', timeseries_aggregate: '时序聚合', provider: '本体对象集查询',
+    geo_distance: '地理距离', timeseries_aggregate: '时序聚合', provider: '受信 Provider',
   } as Record<string, string>)[kind || 'contract'] || kind || '仅定义（不可调用）'
 }
 function runtimeSchema(properties: Record<string, any>, required: string[] = Object.keys(properties)) {
   return { type: 'object', properties, required, additionalProperties: false }
 }
-function semanticQueryOutputSchema() {
-  return runtimeSchema({
-    records: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '符合条件的对象集或聚合结果' },
-    columns: { type: 'array', items: { type: 'string' }, description: '结果字段' },
-    row_count: { type: 'integer', description: '本页结果行数' },
-    truncated: { type: 'boolean', description: '结果是否受服务端上限截断' },
-    offset: { type: 'integer', description: '本页偏移量' },
-    next_offset: { anyOf: [{ type: 'integer' }, { type: 'null' }], description: '下一页偏移量；没有下一页时为空' },
-  })
+async function loadFunctionProviderManifests() {
+  const request = ++functionProviderManifestRequest
+  const requestSid = sid
+  functionProviderManifestsLoading.value = true
+  functionProviderLoadError.value = ''
+  try {
+    const manifests = await api.listFunctionProviderManifests(requestSid)
+    if (request !== functionProviderManifestRequest || requestSid !== sid) return
+    functionProviderManifests.value = manifests
+  } catch (error: any) {
+    if (request !== functionProviderManifestRequest || requestSid !== sid) return
+    functionProviderManifests.value = []
+    functionProviderLoadError.value = error?.message || '受信 Provider 清单加载失败'
+  } finally {
+    if (request === functionProviderManifestRequest) functionProviderManifestsLoading.value = false
+  }
 }
 async function loadSemanticMappings() {
   semanticMappingsLoading.value = true
@@ -2755,14 +2830,18 @@ async function loadSemanticMappings() {
   }
 }
 function resetFunctionRuntime(kind: string) {
+  const previousKind = functionRuntimeKindBeforeChange
+  functionProviderValidationError.value = ''
   if (kind === 'provider') {
-    functionForm.value.runtime_config = {
-      provider_key: 'builtin.semantic-dataset-query',
-      provider_version: '1.0.0',
-      provider_config: { semantic_mapping_ids: activeSemanticMappings.value.map((item) => item.id) },
-    }
+    functionContractSchemaSnapshot = previousKind === 'contract'
+      ? captureFunctionContractSchemas(
+          functionForm.value.input_schema,
+          functionForm.value.output_schema,
+        )
+      : null
+    functionForm.value.runtime_config = {}
     functionForm.value.input_schema = emptyFunctionSchema()
-    functionForm.value.output_schema = semanticQueryOutputSchema()
+    functionForm.value.output_schema = emptyFunctionSchema()
   } else if (kind === 'weighted_score') {
     functionForm.value.runtime_config = { weights: {}, bias: 0 }
     functionForm.value.output_schema = runtimeSchema({ score: { type: 'number', description: '加权计算结果' } })
@@ -2779,15 +2858,39 @@ function resetFunctionRuntime(kind: string) {
     functionForm.value.output_schema = runtimeSchema({ aggregation: { type: 'string' }, value: { type: 'number' }, count: { type: 'integer' } })
   } else {
     functionForm.value.runtime_config = {}
+    if (previousKind === 'provider') {
+      const contractSchemas = restoreFunctionContractSchemas(functionContractSchemaSnapshot)
+      functionForm.value.input_schema = contractSchemas.input_schema
+      functionForm.value.output_schema = contractSchemas.output_schema
+    }
   }
+  if (kind !== 'provider') functionContractSchemaSnapshot = null
+  functionRuntimeKindBeforeChange = kind
 }
 async function onFunctionRuntimeChange(kind: string) {
-  if (kind === 'provider') await loadSemanticMappings()
   resetFunctionRuntime(kind)
+  if (kind === 'provider') {
+    await Promise.all([loadFunctionProviderManifests(), loadSemanticMappings()])
+  }
+}
+function selectFunctionProvider(identity: string) {
+  const manifest = functionProviderManifests.value.find(
+    (item) => providerManifestIdentity(item.provider_key, item.provider_version) === identity,
+  )
+  if (!manifest || manifest.deprecated) return
+  functionProviderValidationError.value = ''
+  functionForm.value.runtime_config = createProviderRuntimeConfig(manifest)
+  functionForm.value.input_schema = cloneForForm(manifest.input_schema)
+  functionForm.value.output_schema = cloneForForm(manifest.output_schema)
+}
+function updateFunctionProviderRuntimeConfig(value: Record<string, unknown>) {
+  functionProviderValidationError.value = ''
+  functionForm.value.runtime_config = value
 }
 async function openFunction(id?: string) {
   if (!canWrite.value) return
   clearActiveScenarioDraftPromotion()
+  functionProviderValidationError.value = ''
   const fn = id ? detail.value.functions.find((item) => item.id === id) : null
   functionForm.value = fn
     ? {
@@ -2806,8 +2909,12 @@ async function openFunction(id?: string) {
         input_schema: emptyFunctionSchema(), output_schema: emptyFunctionSchema(),
         runtime_kind: 'contract', runtime_config: {},
       }
-  if (functionForm.value.runtime_kind === 'provider') await loadSemanticMappings()
+  functionRuntimeKindBeforeChange = functionForm.value.runtime_kind
+  functionContractSchemaSnapshot = null
   functionDlg.value = true
+  if (functionForm.value.runtime_kind === 'provider') {
+    await Promise.all([loadFunctionProviderManifests(), loadSemanticMappings()])
+  }
 }
 function parseFunctionTags(text: string): string[] {
   const tags = [...new Set(text.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean))]
@@ -2819,12 +2926,22 @@ async function saveFunction() {
   if (!canWrite.value || functionSaving.value) return
   const name = functionForm.value.name.trim()
   if (!name) { ElMessage.error('请填写函数名称'); return }
-  if (
-    functionForm.value.runtime_kind === 'provider'
-    && !functionForm.value.runtime_config?.provider_config?.semantic_mapping_ids?.length
-  ) {
-    ElMessage.error('请至少选择一个已激活的对象语义映射')
-    return
+  if (functionForm.value.runtime_kind === 'provider') {
+    const manifest = selectedFunctionProvider.value
+    if (!manifest) {
+      functionProviderValidationError.value = '请选择服务端受信 Provider 和精确版本'
+      ElMessage.error(functionProviderValidationError.value)
+      return
+    }
+    const providerError = providerConfigValidationError(
+      manifest,
+      functionForm.value.runtime_config,
+    )
+    if (providerError) {
+      functionProviderValidationError.value = providerError
+      ElMessage.error(providerError)
+      return
+    }
   }
   let payload: FunctionDefinition
   try {
@@ -2836,7 +2953,10 @@ async function saveFunction() {
       input_schema: functionForm.value.input_schema,
       output_schema: functionForm.value.output_schema,
       runtime_kind: functionForm.value.runtime_kind,
-      runtime_config: functionForm.value.runtime_config,
+      runtime_config: functionRuntimeConfigForSave(
+        functionForm.value.runtime_kind,
+        functionForm.value.runtime_config,
+      ),
     }
   } catch (error: any) {
     ElMessage.error(error?.message || '函数声明格式错误')
@@ -3941,6 +4061,8 @@ async function startEditingScenarioDraft(item: ScenarioModelDraftResource) {
       runtime_kind: 'contract',
       runtime_config: {},
     }
+    functionRuntimeKindBeforeChange = functionForm.value.runtime_kind
+    functionContractSchemaSnapshot = null
     functionDlg.value = true
     return
   }

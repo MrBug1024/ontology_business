@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services import semantic_audit_rule_service
+from app.providers import semantic_audit
 
 
 def _rule(
@@ -17,7 +17,7 @@ def _rule(
     extra: dict | None = None,
 ) -> SimpleNamespace:
     condition = {
-        "spec_version": semantic_audit_rule_service.SPEC_VERSION,
+        "spec_version": semantic_audit.SPEC_VERSION,
         "rule_code": code,
         "domain": "test",
         "issue_type": "test-finding",
@@ -44,14 +44,14 @@ def test_resolve_rule_accepts_stable_code_name_and_unambiguous_partial_name() ->
     second = _rule("rule-2", "Cross-record correlation review", "cross-record")
     definition = SimpleNamespace(rules={first.id: first, second.id: second})
 
-    assert semantic_audit_rule_service.resolve_rule(definition, "daily-threshold")[0] is first
-    assert semantic_audit_rule_service.resolve_rule(definition, "Cross record")[0] is second
+    assert semantic_audit.resolve_rule(definition, "daily-threshold")[0] is first
+    assert semantic_audit.resolve_rule(definition, "Cross record")[0] is second
 
 
 def test_manual_rule_is_formal_but_does_not_claim_automatic_evaluation() -> None:
     rule = _rule("rule-manual", "On-site evidence review", "onsite-review", mode="manual")
 
-    spec = semantic_audit_rule_service.normalize_spec(rule)
+    spec = semantic_audit.normalize_spec(rule)
 
     assert spec is not None
     assert spec["assessment_mode"] == "manual"
@@ -66,10 +66,10 @@ def test_automatic_rule_requires_a_bounded_query_and_closed_spec() -> None:
         mode="automatic",
     )
     with pytest.raises(
-        semantic_audit_rule_service.SemanticAuditRuleError,
+        semantic_audit.SemanticAuditProviderError,
         match="require a query template",
     ):
-        semantic_audit_rule_service.normalize_spec(missing_query)
+        semantic_audit.normalize_spec(missing_query)
 
     unknown_field = _rule(
         "rule-extra",
@@ -78,10 +78,10 @@ def test_automatic_rule_requires_a_bounded_query_and_closed_spec() -> None:
         extra={"python_path": "package.module:function"},
     )
     with pytest.raises(
-        semantic_audit_rule_service.SemanticAuditRuleError,
+        semantic_audit.SemanticAuditProviderError,
         match="unsupported fields",
     ):
-        semantic_audit_rule_service.normalize_spec(unknown_field)
+        semantic_audit.normalize_spec(unknown_field)
 
 
 @pytest.mark.parametrize("invalid_number", [float("nan"), float("inf"), float("-inf")])
@@ -94,7 +94,7 @@ def test_query_template_rejects_non_finite_numbers(invalid_number: float) -> Non
     )
 
     with pytest.raises(
-        semantic_audit_rule_service.SemanticAuditRuleError,
+        semantic_audit.SemanticAuditProviderError,
         match="invalid value",
     ):
-        semantic_audit_rule_service.normalize_spec(rule)
+        semantic_audit.normalize_spec(rule)

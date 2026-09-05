@@ -191,12 +191,35 @@ def source_origin(row: ScenarioModelDraftResource) -> str:
         return "manual"
     if source.startswith("import"):
         return "imported"
-    if source in {
-        "compiler", "compiler_sidecar", "compiled_payload", "live_checkpoint",
-        "user_checkpoint_edit",
+    if source.startswith("compiler") or source in {
+        "compiled_payload", "live_checkpoint", "user_checkpoint_edit",
     }:
         return "assistant"
     return "unknown"
+
+
+def _metadata_source_blockers(
+    rows: Iterable[ScenarioModelDraftResource],
+) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    for row in rows:
+        if assistant_capability_modeling_service.metadata_materialization_is_authoritative(
+            resource_kind=row.resource_kind,
+            materialization_source=row.materialization_source,
+            source_refs=row.source_refs or [],
+        ):
+            continue
+        blockers.append(_issue(
+            assistant_capability_modeling_service.NON_MODELING_METADATA_ISSUE_CODE,
+            (
+                "普通调用、验证或生成附件不是建模资料，不能晋级为输入输出契约、"
+                "能力端口或映射元数据。"
+            ),
+            draft_ids=[row.id],
+            resource_keys=[row.resource_key],
+            resolution_hint="将资料显式登记为 modeling_material 后重新编译。",
+        ))
+    return _bounded_issues(blockers)
 
 
 def _quality_fingerprint(row: ScenarioModelDraftResource) -> str:
@@ -227,6 +250,7 @@ def governance_projection(
         if include_stored_issues
         else []
     )
+    issues = _bounded_issues([*issues, *_metadata_source_blockers([row])])
     blockers = [item for item in issues if item.get("blocking", True)]
     status = str(row.draft_status or "needs_attention")
     kind = str(row.resource_kind or "")
@@ -1289,6 +1313,16 @@ def evaluate_candidates(
             draft_ids=[row.id for row in values],
         )]
         return CandidateEvaluation(False, blockers, [], None, fingerprint, {})
+    metadata_source_blockers = _metadata_source_blockers(values)
+    if metadata_source_blockers:
+        return CandidateEvaluation(
+            False,
+            metadata_source_blockers,
+            [],
+            None,
+            fingerprint,
+            {},
+        )
     try:
         port_rows = [
             row for row in values if row.resource_kind == "capability_port"

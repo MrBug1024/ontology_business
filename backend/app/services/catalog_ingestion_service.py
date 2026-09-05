@@ -81,6 +81,11 @@ _PHYSICAL_METADATA_KEYS = {
     "storage_path",
     "token",
 }
+_GENERIC_MEDIA_TYPES = frozenset(
+    {"", "application/octet-stream", "binary/octet-stream"}
+)
+_GENERIC_TEXT_MEDIA_TYPES = frozenset({"text/plain"})
+_DELIMITERS = "\t,;|"
 
 
 @dataclass(frozen=True)
@@ -237,20 +242,167 @@ def _media_base(value: str | None) -> str:
     return str(value or "").split(";", 1)[0].strip().lower()
 
 
-def _format_spec(filename: str, client_media_type: str | None) -> FormatSpec:
-    extension = Path(filename).suffix.lower()
-    spec = _FORMAT_SPECS.get(extension)
-    if spec is None:
-        raise catalog_service.CatalogError(f"不支持的目录上传文件类型: {extension or '无扩展名'}")
+def _validate_detected_media_type(
+    spec: FormatSpec, client_media_type: str | None
+) -> None:
     supplied = _media_base(client_media_type)
     accepted = {
         _media_base(spec.media_type),
         *(_media_base(item) for item in spec.compatible_media_types),
-        "application/octet-stream",
-        "",
+        *_GENERIC_MEDIA_TYPES,
     }
     if supplied not in accepted:
-        raise catalog_service.CatalogError("文件 MIME 与扩展名不一致")
+        raise catalog_service.CatalogError("文件 MIME 与实际内容不一致")
+
+
+def _zip_format_spec(archive: ZipFile) -> FormatSpec | None:
+    infos = archive.infolist()
+    if not infos or len(infos) > MAX_ZIP_MEMBERS:
+        raise catalog_service.CatalogError("Office 文件容器条目数量异常")
+    names = {
+        str(PurePosixPath(info.filename.replace("\\", "/")))
+        for info in infos
+    }
+    families = {
+        prefix
+        for prefix in ("xl/", "word/", "ppt/")
+        if any(name.startswith(prefix) for name in names)
+    }
+    if len(families) > 1:
+        raise catalog_service.CatalogError("Office 文件容器类型不明确")
+    if "xl/" in families:
+        extension = ".xlsm" if "xl/vbaProject.bin" in names else ".xlsx"
+        return _FORMAT_SPECS[extension]
+    if "word/" in families:
+        return _FORMAT_SPECS[".docx"]
+    if "ppt/" in families:
+        return _FORMAT_SPECS[".pptx"]
+    return None
+
+
+def _binary_signature_spec(prefix: bytes) -> FormatSpec | None:
+    stripped = prefix.lstrip()
+    if stripped.startswith(b"%PDF-"):
+        return _FORMAT_SPECS[".pdf"]
+    if prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+        return _FORMAT_SPECS[".png"]
+    if prefix.startswith(b"\xff\xd8\xff"):
+        return _FORMAT_SPECS[".jpg"]
+    if prefix.startswith((b"GIF87a", b"GIF89a")):
+        return _FORMAT_SPECS[".gif"]
+    if prefix.startswith(b"BM"):
+        return _FORMAT_SPECS[".bmp"]
+    if prefix.startswith((b"II*\x00", b"MM\x00*")):
+        return _FORMAT_SPECS[".tif"]
+    if prefix.startswith(b"RIFF") and len(prefix) >= 12 and prefix[8:12] == b"WEBP":
+        return _FORMAT_SPECS[".webp"]
+    if prefix.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
+        return _FORMAT_SPECS[".xls"]
+    return None
+
+
+def _reject_known_unsupported_binary(prefix: bytes) -> None:
+    if prefix.startswith(
+        (
+            b"MZ",
+            b"\x7fELF",
+            b"\xfe\xed\xfa\xce",
+            b"\xfe\xed\xfa\xcf",
+            b"\xce\xfa\xed\xfe",
+            b"\xcf\xfa\xed\xfe",
+        )
+    ):
+        raise catalog_service.CatalogError("不支持的上传文件内容类型")
+
+
+def _delimiter_from_text(text: str, supplied_media_type: str | None) -> str | None:
+    sample = text[:65536]
+    candidates: list[tuple[int, int, str]] = []
+    for delimiter in _DELIMITERS:
+        try:
+            rows = [
+                row
+                for row in csv.reader(StringIO(sample, newline=""), delimiter=delimiter)
+                if any(str(value).strip() for value in row)
+            ][:25]
+        except csv.Error:
+            continue
+        if not rows or len(rows[0]) < 2 or len(rows[0]) > MAX_PROFILE_COLUMNS:
+            continue
+        width = len(rows[0])
+        consistent = sum(len(row) == width for row in rows)
+        if len(rows) > 1 and consistent * 5 < len(rows) * 4:
+            continue
+        candidates.append((consistent, width, delimiter))
+    if candidates:
+        return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+    supplied = _media_base(supplied_media_type)
+    if supplied == "text/tab-separated-values":
+        return "\t"
+    if supplied in {"text/csv", "application/vnd.ms-excel"}:
+        return ","
+    return None
+
+
+def _text_format_spec(text: str, client_media_type: str | None) -> FormatSpec:
+    supplied = _media_base(client_media_type)
+    stripped = text.lstrip()
+    if supplied in {"application/json", "text/json"}:
+        try:
+            json.loads(text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise catalog_service.CatalogError("文件 MIME 与实际内容不一致") from exc
+        return _FORMAT_SPECS[".json"]
+    if supplied in {"application/xml", "text/xml"}:
+        if not stripped.startswith(("<?xml", "<")):
+            raise catalog_service.CatalogError("文件 MIME 与实际内容不一致")
+        return _FORMAT_SPECS[".xml"]
+    document_media_specs = {
+        "text/markdown": _FORMAT_SPECS[".md"],
+        "application/yaml": _FORMAT_SPECS[".yaml"],
+        "text/yaml": _FORMAT_SPECS[".yaml"],
+    }
+    if supplied in document_media_specs:
+        return document_media_specs[supplied]
+
+    if stripped.startswith(("{", "[")):
+        try:
+            json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        else:
+            if supplied in _GENERIC_MEDIA_TYPES | _GENERIC_TEXT_MEDIA_TYPES:
+                return _FORMAT_SPECS[".json"]
+    if stripped.startswith("<?xml"):
+        if supplied in _GENERIC_MEDIA_TYPES | _GENERIC_TEXT_MEDIA_TYPES:
+            return _FORMAT_SPECS[".xml"]
+    delimiter = _delimiter_from_text(text, client_media_type)
+    if delimiter is not None:
+        return _FORMAT_SPECS[".tsv" if delimiter == "\t" else ".csv"]
+    if supplied not in _GENERIC_MEDIA_TYPES | _GENERIC_TEXT_MEDIA_TYPES:
+        raise catalog_service.CatalogError("文件 MIME 与实际内容不一致")
+    return _FORMAT_SPECS[".txt"]
+
+
+def _detect_format_spec(
+    content: bytes, client_media_type: str | None
+) -> FormatSpec:
+    prefix = content[:65536]
+    _reject_known_unsupported_binary(prefix)
+    if prefix.startswith(b"PK"):
+        try:
+            with ZipFile(BytesIO(content)) as archive:
+                spec = _zip_format_spec(archive)
+        except BadZipFile as exc:
+            raise catalog_service.CatalogError("压缩文件容器无效") from exc
+        if spec is None:
+            raise catalog_service.CatalogError("不支持的压缩文件内容类型")
+    else:
+        spec = _binary_signature_spec(prefix)
+        if spec is None:
+            spec = _text_format_spec(_decode_text(content), client_media_type)
+    _validate_detected_media_type(spec, client_media_type)
     return spec
 
 
@@ -408,7 +560,14 @@ def _merged_type(observed: Iterable[str]) -> str:
     return "string"
 
 
-def _table_contract(name: str, header: list[Any], rows: list[list[Any]], *, truncated: bool) -> dict[str, Any]:
+def _table_contract(
+    name: str,
+    header: list[Any],
+    rows: list[list[Any]],
+    *,
+    truncated: bool,
+    record_count: int | None = None,
+) -> dict[str, Any]:
     width = max([len(header), *(len(row) for row in rows)], default=0)
     if width <= 0:
         raise catalog_service.CatalogError("表格没有可识别的列")
@@ -442,6 +601,7 @@ def _table_contract(name: str, header: list[Any], rows: list[list[Any]], *, trun
         "name": str(name)[:300] or "table",
         "columns": columns,
         "sample_row_count": len(rows),
+        "record_count": len(rows) if record_count is None else record_count,
         "sample_truncated": truncated,
     }
 
@@ -478,27 +638,22 @@ def _with_runtime_relation_names(profile: dict[str, Any], filename: str) -> dict
 
 def _csv_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
     text = _decode_text(content)
-    sample = text[:65536]
-    allowed_delimiters = "\t,;|"
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=allowed_delimiters)
-        delimiter = dialect.delimiter
-    except csv.Error:
-        delimiter = "\t" if spec.extension == ".tsv" else ","
+    delimiter = _delimiter_from_text(text, spec.media_type)
+    if delimiter is None:
+        raise catalog_service.CatalogError("CSV/TSV 文件缺少可识别的表头")
     reader = csv.reader(StringIO(text, newline=""), delimiter=delimiter)
     header: list[Any] | None = None
     rows: list[list[Any]] = []
-    truncated = False
+    record_count = 0
     for row in reader:
         if not any(str(value).strip() for value in row):
             continue
         if header is None:
             header = list(row)
             continue
-        if len(rows) >= MAX_PROFILE_ROWS:
-            truncated = True
-            break
-        rows.append(list(row))
+        record_count += 1
+        if len(rows) < MAX_PROFILE_ROWS:
+            rows.append(list(row))
     if header is None:
         raise catalog_service.CatalogError("CSV/TSV 文件为空")
     return {
@@ -506,13 +661,25 @@ def _csv_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
         "category": "table",
         "extension": spec.extension,
         "media_type": spec.media_type,
-        "tables": [{**_table_contract("data", header, rows, truncated=truncated), "header_row_index": 0}],
+        "tables": [
+            {
+                **_table_contract(
+                    "data",
+                    header,
+                    rows,
+                    truncated=record_count > len(rows),
+                    record_count=record_count,
+                ),
+                "header_row_index": 0,
+                "delimiter": delimiter,
+            }
+        ],
     }
 
 
 def _sheet_profile_rows(
     values: Iterable[Iterable[Any]],
-) -> tuple[int, list[Any], list[list[Any]], bool] | None:
+) -> tuple[int, list[Any], list[list[Any]], bool, int] | None:
     """Detect a header after optional title rows, then retain a bounded sample."""
     buffered: list[tuple[int, list[Any]]] = []
     iterator = iter(values)
@@ -532,16 +699,22 @@ def _sheet_profile_rows(
     )
     header_index, header = buffered[header_position]
     rows = [row for _index, row in buffered[header_position + 1 :]]
-    truncated = False
+    record_count = len(rows)
     for raw in iterator:
         row = list(raw)
         if not any(_logical_type(value) is not None for value in row):
             continue
-        if len(rows) >= MAX_PROFILE_ROWS:
-            truncated = True
-            break
-        rows.append(row)
-    return header_index, header, rows[:MAX_PROFILE_ROWS], truncated
+        record_count += 1
+        if len(rows) < MAX_PROFILE_ROWS:
+            rows.append(row)
+    sampled_rows = rows[:MAX_PROFILE_ROWS]
+    return (
+        header_index,
+        header,
+        sampled_rows,
+        record_count > len(sampled_rows),
+        record_count,
+    )
 
 
 def _xlsx_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
@@ -562,10 +735,16 @@ def _xlsx_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
         for sheet in workbook.worksheets:
             detected = _sheet_profile_rows(sheet.iter_rows(values_only=True))
             if detected is not None:
-                header_index, header, rows, truncated = detected
+                header_index, header, rows, truncated, record_count = detected
                 tables.append(
                     {
-                        **_table_contract(sheet.title, header, rows, truncated=truncated),
+                        **_table_contract(
+                            sheet.title,
+                            header,
+                            rows,
+                            truncated=truncated,
+                            record_count=record_count,
+                        ),
                         "header_row_index": header_index,
                     }
                 )
@@ -624,6 +803,7 @@ def _xls_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
                     header,
                     rows,
                     truncated=sheet.nrows - 1 > MAX_PROFILE_ROWS,
+                    record_count=max(0, sheet.nrows - 1),
                 )
             )
     finally:
@@ -639,10 +819,10 @@ def _xls_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
     }
 
 
-def _document_profile(content: bytes, filename: str, spec: FormatSpec) -> dict[str, Any]:
+def _document_profile(content: bytes, _filename: str, spec: FormatSpec) -> dict[str, Any]:
     if spec.extension in {".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".xml", ".log"}:
         _decode_text(content)
-    parsed = doc_parser.parse_bytes(content, filename)
+    parsed = doc_parser.parse_bytes(content, f"document{spec.extension}")
     succeeded = parsed.get("status") == "success"
     text = str(parsed.get("text") or "") if succeeded else ""
     return {
@@ -665,7 +845,7 @@ def build_profile(content: bytes, filename: str, client_media_type: str | None =
     if not content:
         raise catalog_service.CatalogError("上传文件不能为空")
     safe_name = datasource_service.validate_bucket_filename(filename)
-    spec = _format_spec(safe_name, client_media_type)
+    spec = _detect_format_spec(content, client_media_type)
     _validate_signature(content, spec)
     if spec.extension in {".csv", ".tsv"}:
         profile = _csv_profile(content, spec)
@@ -690,11 +870,13 @@ def _text_encoding_from_sample(sample: bytes) -> str:
     if b"\x00" in sample[:8192]:
         raise catalog_service.CatalogError("文本文件包含二进制内容")
     for encoding in ("utf-8-sig", "gb18030"):
-        try:
-            sample.decode(encoding)
-            return encoding
-        except UnicodeDecodeError:
-            continue
+        for trim in range(0, min(4, len(sample)) + 1):
+            candidate = sample if trim == 0 else sample[:-trim]
+            try:
+                candidate.decode(encoding)
+                return encoding
+            except UnicodeDecodeError:
+                continue
     raise catalog_service.CatalogError("文本文件编码不受支持")
 
 
@@ -702,14 +884,13 @@ def _csv_profile_path(path: Path, spec: FormatSpec) -> dict[str, Any]:
     with path.open("rb") as raw:
         sample_bytes = raw.read(65536)
     encoding = _text_encoding_from_sample(sample_bytes)
-    sample = sample_bytes.decode(encoding)
-    try:
-        delimiter = csv.Sniffer().sniff(sample, delimiters="\t,;|").delimiter
-    except csv.Error:
-        delimiter = "\t" if spec.extension == ".tsv" else ","
+    sample = sample_bytes.decode(encoding, errors="ignore")
+    delimiter = _delimiter_from_text(sample, spec.media_type)
+    if delimiter is None:
+        raise catalog_service.CatalogError("CSV/TSV 文件缺少可识别的表头")
     header: list[Any] | None = None
     rows: list[list[Any]] = []
-    truncated = False
+    record_count = 0
     try:
         with path.open("r", encoding=encoding, newline="") as handle:
             for row in csv.reader(handle, delimiter=delimiter):
@@ -718,10 +899,9 @@ def _csv_profile_path(path: Path, spec: FormatSpec) -> dict[str, Any]:
                 if header is None:
                     header = list(row)
                     continue
-                if len(rows) >= MAX_PROFILE_ROWS:
-                    truncated = True
-                    break
-                rows.append(list(row))
+                record_count += 1
+                if len(rows) < MAX_PROFILE_ROWS:
+                    rows.append(list(row))
     except UnicodeDecodeError as exc:
         raise catalog_service.CatalogError("CSV/TSV 文件编码无效") from exc
     if header is None:
@@ -731,7 +911,19 @@ def _csv_profile_path(path: Path, spec: FormatSpec) -> dict[str, Any]:
         "category": "table",
         "extension": spec.extension,
         "media_type": spec.media_type,
-        "tables": [{**_table_contract("data", header, rows, truncated=truncated), "header_row_index": 0}],
+        "tables": [
+            {
+                **_table_contract(
+                    "data",
+                    header,
+                    rows,
+                    truncated=record_count > len(rows),
+                    record_count=record_count,
+                ),
+                "header_row_index": 0,
+                "delimiter": delimiter,
+            }
+        ],
     }
 
 
@@ -739,29 +931,36 @@ def _xlsx_profile_path(path: Path, spec: FormatSpec) -> dict[str, Any]:
     from openpyxl import load_workbook
 
     try:
-        workbook = load_workbook(
-            path,
-            read_only=True,
-            data_only=True,
-            keep_links=False,
-            keep_vba=False,
-        )
+        with path.open("rb") as source:
+            workbook = load_workbook(
+                source,
+                read_only=True,
+                data_only=True,
+                keep_links=False,
+                keep_vba=False,
+            )
+            tables: list[dict[str, Any]] = []
+            try:
+                for sheet in workbook.worksheets:
+                    detected = _sheet_profile_rows(sheet.iter_rows(values_only=True))
+                    if detected is not None:
+                        header_index, header, rows, truncated, record_count = detected
+                        tables.append(
+                            {
+                                **_table_contract(
+                                    sheet.title,
+                                    header,
+                                    rows,
+                                    truncated=truncated,
+                                    record_count=record_count,
+                                ),
+                                "header_row_index": header_index,
+                            }
+                        )
+            finally:
+                workbook.close()
     except Exception as exc:  # noqa: BLE001
         raise catalog_service.CatalogError("Excel 文件解析失败") from exc
-    tables: list[dict[str, Any]] = []
-    try:
-        for sheet in workbook.worksheets:
-            detected = _sheet_profile_rows(sheet.iter_rows(values_only=True))
-            if detected is not None:
-                header_index, header, rows, truncated = detected
-                tables.append(
-                    {
-                        **_table_contract(sheet.title, header, rows, truncated=truncated),
-                        "header_row_index": header_index,
-                    }
-                )
-    finally:
-        workbook.close()
     if not tables:
         raise catalog_service.CatalogError("Excel 文件没有可识别的工作表")
     return {
@@ -788,6 +987,45 @@ def _validate_signature_path(path: Path, spec: FormatSpec) -> None:
     _validate_signature(prefix, spec)
 
 
+def _detect_format_spec_path(
+    path: Path, client_media_type: str | None
+) -> FormatSpec:
+    with path.open("rb") as handle:
+        prefix = handle.read(65536)
+    _reject_known_unsupported_binary(prefix)
+    if prefix.startswith(b"PK"):
+        try:
+            with ZipFile(path) as archive:
+                spec = _zip_format_spec(archive)
+        except BadZipFile as exc:
+            raise catalog_service.CatalogError("压缩文件容器无效") from exc
+        if spec is None:
+            raise catalog_service.CatalogError("不支持的压缩文件内容类型")
+    else:
+        spec = _binary_signature_spec(prefix)
+        if spec is None:
+            encoding = _text_encoding_from_sample(prefix)
+            sample = prefix.decode(encoding, errors="ignore")
+            supplied = _media_base(client_media_type)
+            if supplied in {"application/json", "text/json"}:
+                if not sample.lstrip().startswith(("{", "[")):
+                    raise catalog_service.CatalogError("文件 MIME 与实际内容不一致")
+                spec = _FORMAT_SPECS[".json"]
+            elif supplied in {"application/xml", "text/xml"}:
+                if not sample.lstrip().startswith(("<?xml", "<")):
+                    raise catalog_service.CatalogError("文件 MIME 与实际内容不一致")
+                spec = _FORMAT_SPECS[".xml"]
+            elif (
+                supplied in _GENERIC_MEDIA_TYPES | _GENERIC_TEXT_MEDIA_TYPES
+                and sample.lstrip().startswith(("{", "["))
+            ):
+                spec = _FORMAT_SPECS[".json"]
+            else:
+                spec = _text_format_spec(sample, client_media_type)
+    _validate_detected_media_type(spec, client_media_type)
+    return spec
+
+
 def build_profile_path(
     source_path: str | Path,
     filename: str,
@@ -798,7 +1036,10 @@ def build_profile_path(
     if not path.is_file() or path.stat().st_size <= 0:
         raise catalog_service.CatalogError("上传文件不能为空")
     safe_name = datasource_service.validate_bucket_filename(filename)
-    spec = _format_spec(safe_name, client_media_type)
+    in_memory_limit = int(get_settings().catalog_in_memory_upload_bytes)
+    if path.stat().st_size <= in_memory_limit:
+        return build_profile(path.read_bytes(), safe_name, client_media_type)
+    spec = _detect_format_spec_path(path, client_media_type)
     _validate_signature_path(path, spec)
     if spec.extension in {".csv", ".tsv"}:
         profile = _csv_profile_path(path, spec)
@@ -826,6 +1067,7 @@ def build_profile_path(
                             header,
                             rows,
                             truncated=sheet.nrows - 1 > MAX_PROFILE_ROWS,
+                            record_count=max(0, sheet.nrows - 1),
                         )
                     )
             finally:
@@ -844,23 +1086,35 @@ def build_profile_path(
             "tables": tables,
         }
     else:
-        in_memory_limit = int(get_settings().catalog_in_memory_upload_bytes)
-        if path.stat().st_size <= in_memory_limit:
-            _media, profile = build_profile(path.read_bytes(), safe_name, client_media_type)
-        else:
-            profile = {
-                "format": PROFILE_FORMAT,
-                "category": "document",
-                "extension": spec.extension,
-                "media_type": spec.media_type,
-                "parser": {"name": "platform-document-parser", "status": "deferred"},
-                "text": {"character_count": 0, "line_count": 0},
-            }
+        profile = {
+            "format": PROFILE_FORMAT,
+            "category": "document",
+            "extension": spec.extension,
+            "media_type": spec.media_type,
+            "parser": {"name": "platform-document-parser", "status": "deferred"},
+            "text": {"character_count": 0, "line_count": 0},
+        }
     profile = _with_runtime_relation_names(profile, safe_name)
     profile = catalog_service.safe_catalog_document(
         profile, label="文件结构 profile", maximum=128_000
     )
     return spec.media_type, profile
+
+
+def build_tabular_profile_path(
+    source_path: str | Path,
+    filename: str,
+    client_media_type: str | None = None,
+) -> tuple[str, dict[str, Any]] | None:
+    """Profile a table by content while leaving non-tabular parsing asynchronous."""
+
+    path = Path(source_path).resolve(strict=True)
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise catalog_service.CatalogError("上传文件不能为空")
+    spec = _detect_format_spec_path(path, client_media_type)
+    if spec.category != "table":
+        return None
+    return build_profile_path(path, filename, client_media_type)
 
 
 def profile_summary_text(profile: dict[str, Any], filename: str) -> str:
@@ -1085,7 +1339,11 @@ def require_managed_file_bucket(db: Session, file_bucket_id: str) -> DataSource:
     return source
 
 
-def require_external_upload_bucket(db: Session) -> DataSource:
+def require_external_upload_bucket(
+    db: Session,
+    *,
+    ensure_storage: bool = True,
+) -> DataSource:
     """Resolve the tenant-owned upload bucket without exposing physical identity."""
     permission_service.require_tenant_permission(db, "write")
     tenant_id = tenant_service.current_tenant_id(db)
@@ -1139,7 +1397,8 @@ def require_external_upload_bucket(db: Session) -> DataSource:
         raise catalog_service.CatalogError("外部附件托管存储不可用")
     try:
         datasource_service.managed_minio_location(source)
-        datasource_service.ensure_file_bucket_storage(source)
+        if ensure_storage:
+            datasource_service.ensure_file_bucket_storage(source)
     except Exception as exc:  # noqa: BLE001 - physical configuration stays private.
         raise catalog_service.CatalogError("外部附件托管存储不可用") from exc
     return source
@@ -1149,6 +1408,11 @@ def find_or_create_asset(
     db: Session, prepared: PreparedCatalogUpload | PreparedCatalogPathUpload
 ) -> tuple[DataAsset, DataAssetVersion | None, bool, bool]:
     """Resolve content-hash idempotency before any object is uploaded."""
+    usage_plane = (
+        "modeling_material"
+        if prepared.metadata.purpose == "managed_asset"
+        else "invocation_input"
+    )
     reactivated = False
     existing = db.scalar(
         select(DataAsset).where(
@@ -1166,6 +1430,7 @@ def find_or_create_asset(
                 description=prepared.metadata.description,
                 kind="file",
                 media_type=prepared.media_type,
+                usage_plane=usage_plane,
                 labels=prepared.labels,
             ),
         )
@@ -1182,6 +1447,8 @@ def find_or_create_asset(
             raise catalog_service.CatalogError("临时附件与长期资产不能原地互相晋级")
         if not existing_purpose:
             raise catalog_service.CatalogError("既有资产未声明上传生命周期，不能由上传接口覆盖")
+        if existing.usage_plane != usage_plane:
+            raise catalog_service.CatalogError("既有资产的数据用途与上传入口不一致")
         if existing.kind != "file" or existing.media_type != prepared.media_type:
             raise catalog_service.CatalogError("既有资产的文件类型与本次上传不一致")
     duplicate = db.scalar(

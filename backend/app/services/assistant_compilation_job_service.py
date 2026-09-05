@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models import AssistantCompilationJob
+from . import content_retrieval_service
 
 
 ERROR_COMPILATION_FAILED = "compilation_failed"
@@ -201,8 +202,8 @@ def _attachment_parts(attachments: Iterable[Any]) -> list[dict[str, str]]:
             "mime": str(_field(attachment, "mime", "") or "").lower(),
             "status": str(_field(attachment, "status", "") or ""),
             "error_hash": _sha256(str(_field(attachment, "error", "") or "")),
-            # Kept out of fingerprint descriptors. A caller may persist the
-            # exact text separately in the owner-private execution_input.
+            # Kept out of fingerprint descriptors and used only as a transient
+            # indexing source for bounded retrieval below.
             "_parsed_text": parsed_text,
             "_error": str(_field(attachment, "error", "") or ""),
         })
@@ -218,9 +219,8 @@ def attachment_content_fingerprint(attachments: Iterable[Any]) -> str:
     """Hash exact compiler attachment inputs without persisting their text.
 
     Fresh uploads provide a hash of the original bytes.  The parsed-text hash
-    remains part of the identity because parser output is what the compiler
-    actually consumes.  Legacy rows without a byte hash safely fall back to
-    their parsed-text hash.
+    remains part of the identity because parser output is the retrieval source.
+    Legacy rows without a byte hash safely fall back to their parsed-text hash.
     """
     persisted_parts = [
         {key: value for key, value in item.items() if not key.startswith("_")}
@@ -229,16 +229,23 @@ def attachment_content_fingerprint(attachments: Iterable[Any]) -> str:
     return _canonical_hash(persisted_parts)
 
 
-def canonical_compiler_documents(attachments: Iterable[Any]) -> list[dict[str, str]]:
-    """Build stable content-addressed provenance inputs for the compiler.
+def canonical_compiler_documents(
+    attachments: Iterable[Any],
+    *,
+    query: str = "",
+    top_k: int = content_retrieval_service.COMPILER_TOP_K,
+    max_chars: int = content_retrieval_service.COMPILER_MAX_CHARS,
+) -> list[dict[str, Any]]:
+    """Build stable content-addressed, bounded inputs for the compiler.
 
     Assistant attachment row IDs and ORM query order are request-local.  Using
     them as evidence IDs would make content-level replay point at an older
     upload.  These IDs derive from the exact content descriptor instead and
     remain stable across threads; duplicate identical inputs receive a stable
-    ordinal.
+    ordinal. Raw parsed text is used only inside the retrieval service and is
+    never returned or persisted in the compiler execution input.
     """
-    documents: list[dict[str, str]] = []
+    retrieval_inputs: list[dict[str, Any]] = []
     ordinals: dict[str, int] = {}
     for part in _attachment_parts(attachments):
         persisted = {
@@ -246,14 +253,23 @@ def canonical_compiler_documents(attachments: Iterable[Any]) -> list[dict[str, s
         }
         descriptor_hash = _canonical_hash(persisted)
         ordinals[descriptor_hash] = ordinals.get(descriptor_hash, 0) + 1
-        documents.append({
+        retrieval_inputs.append({
             "id": f"content-{descriptor_hash[:52]}-{ordinals[descriptor_hash]:02d}",
             "filename": part["filename"],
             "status": part["status"],
-            "error": part["_error"],
-            "text": part["_parsed_text"],
+            "content_hash": part["content_hash"],
+            "parsed_text_hash": part["parsed_text_hash"],
+            "parsed_text": part["_parsed_text"],
+            # Assistant and managed uploads are invocation inputs. Their name
+            # or parsed content must never upgrade them to modeling material.
+            "usage_plane": "invocation_input",
         })
-    return documents
+    return content_retrieval_service.bounded_documents(
+        retrieval_inputs,
+        query=query,
+        top_k=top_k,
+        max_chars=max_chars,
+    )
 
 
 def llm_config_fingerprint(llm: Any) -> str:
@@ -963,6 +979,7 @@ def enqueue_guidance(
     guidance_id: str,
     message: str,
     attachment_text: str = "",
+    attachment_documents: list[dict[str, Any]] | None = None,
     sources: list[dict[str, Any]] | None = None,
     as_of: datetime | None = None,
 ) -> tuple[AssistantCompilationJob, bool]:
@@ -1005,12 +1022,33 @@ def enqueue_guidance(
         return job, False
     if len(queue) >= MAX_COMPILATION_GUIDANCE_ITEMS:
         raise ValueError("当前任务等待处理的补充指导过多，请等待现有指导被采纳")
+    bounded_documents = content_retrieval_service.bounded_documents(
+        attachment_documents
+        if attachment_documents is not None
+        else ([{
+            "id": f"legacy-guidance-{_sha256(str(attachment_text or ''))[:40]}",
+            "filename": "运行中补充资料",
+            "status": "parsed",
+            "text": str(attachment_text or ""),
+        }] if str(attachment_text or "").strip() else []),
+        query=normalized_message,
+        top_k=content_retrieval_service.COMPILER_TOP_K,
+        max_chars=content_retrieval_service.COMPILER_MAX_CHARS,
+    )
     queued_chars = sum(
         len(str(item.get("message") or ""))
-        + len(str(item.get("attachment_text") or ""))
+        + len(json.dumps(
+            item.get("attachment_documents") or [],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ))
         for item in queue
     )
-    incoming_chars = len(normalized_message) + len(str(attachment_text or ""))
+    incoming_chars = len(normalized_message) + len(json.dumps(
+        bounded_documents,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ))
     if queued_chars + incoming_chars > MAX_COMPILATION_GUIDANCE_CHARS:
         raise ValueError(
             "当前任务等待处理的补充内容过多，请等待现有指导被采纳后再继续"
@@ -1022,7 +1060,7 @@ def enqueue_guidance(
     queue.append({
         "id": normalized_id,
         "message": normalized_message,
-        "attachment_text": str(attachment_text or ""),
+        "attachment_documents": bounded_documents,
         "sources": private_sources,
         "created_at": now.isoformat(),
     })

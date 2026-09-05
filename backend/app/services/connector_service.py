@@ -18,12 +18,14 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..models import BusinessScenario, ConnectorBinding, DataSource, LLMConfig, MCPConfig
-from . import datasource_service, llm_service, mcp_service
+from . import datasource_service, input_contract_validator, llm_service, mcp_service
 
 
 ENVIRONMENTS = frozenset({"dev", "staging", "prod"})
 CONNECTOR_KINDS = frozenset({"data_source", "mcp", "llm"})
 HEALTH_STATUSES = frozenset({"unknown", "healthy", "unhealthy"})
+MAX_PROFILE_RELATIONS = 64
+MAX_PROFILE_FIELDS = 512
 RUNTIME_BINDING_FIELDS = {
     "data_source": ("data_source_binding_key", "data_source_binding_ref"),
     "mcp": ("mcp_binding_key", "mcp_binding_ref"),
@@ -281,6 +283,78 @@ def _capabilities(kind: str, connector: Any) -> list[str]:
         return ["tool"]
     values = getattr(connector, "capabilities", []) or []
     return sorted({str(item).strip().lower() for item in values if str(item).strip()})
+
+
+def _logical_column_type(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if "timestamp" in normalized or "datetime" in normalized:
+        return "datetime"
+    if normalized == "date" or normalized.startswith("date("):
+        return "date"
+    if "bool" in normalized:
+        return "boolean"
+    if any(
+        marker in normalized
+        for marker in ("bigint", "smallint", "integer", "serial", "int2", "int4", "int8")
+    ):
+        return "integer"
+    if any(
+        marker in normalized
+        for marker in ("numeric", "decimal", "double", "float", "real", "money")
+    ):
+        return "number"
+    if any(
+        marker in normalized
+        for marker in ("json", "array", "hstore", "map", "struct", "record")
+    ):
+        return "object"
+    return "string"
+
+
+def connector_structure_profile(connector: Any) -> dict[str, Any]:
+    """Capture bounded, credential-free structure facts from a data connector."""
+
+    if str(getattr(connector, "type", "") or "") == "file_bucket":
+        return {}
+    raw_tables = datasource_service.list_tables(connector)
+    if not isinstance(raw_tables, list) or len(raw_tables) > MAX_PROFILE_RELATIONS:
+        raise ConnectorBindingConflictError("连接器结构超过平台可校验上限")
+    tables: list[dict[str, Any]] = []
+    for raw_table in raw_tables:
+        if not isinstance(raw_table, Mapping):
+            raise ConnectorBindingConflictError("连接器返回的结构信息无效")
+        raw_columns = raw_table.get("columns")
+        if (
+            not isinstance(raw_columns, list)
+            or not raw_columns
+            or len(raw_columns) > MAX_PROFILE_FIELDS
+        ):
+            raise ConnectorBindingConflictError("连接器字段结构为空或超过平台可校验上限")
+        columns: list[dict[str, str]] = []
+        for raw_column in raw_columns:
+            if not isinstance(raw_column, Mapping):
+                raise ConnectorBindingConflictError("连接器返回的字段结构无效")
+            name = str(raw_column.get("name") or "").strip()
+            if not name or len(name) > 300:
+                raise ConnectorBindingConflictError("连接器返回的字段名称无效")
+            columns.append(
+                {
+                    "name": name,
+                    "logical_type": _logical_column_type(raw_column.get("type")),
+                }
+            )
+        raw_count = raw_table.get("row_count", 0)
+        row_count = raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool) else 0
+        tables.append(
+            {
+                "name": str(raw_table.get("name") or "")[:300],
+                "record_count": max(0, row_count),
+                "columns": columns,
+            }
+        )
+    profile = {"category": "table", "tables": tables}
+    input_contract_validator.structural_fingerprint(profile)
+    return profile
 
 
 def connector_revision(connector: Any) -> int:
@@ -574,6 +648,8 @@ def upsert_binding(
             binding.health_status = "unknown"
             binding.health_message = "连接器目标已变更，请重新执行健康检查"
             binding.connector_signature = ""
+            binding.structure_profile = {}
+            binding.structure_fingerprint = ""
             binding.checked_at = None
     if check:
         check_binding(db, binding, scenario)
@@ -583,12 +659,15 @@ def upsert_binding(
 def check_binding(db: Session, binding: ConnectorBinding, scenario: BusinessScenario) -> ConnectorBinding:
     """Run an explicit health check and persist only a sanitized result."""
     connector = _resolve_connector(db, binding.connector_kind, binding.connector_id, scenario)
+    structure_profile: dict[str, Any] = {}
     try:
         if binding.connector_kind == "data_source":
             if connector.type == "file_bucket":
                 ok, message = True, "文件桶就绪"
             else:
                 ok, message = datasource_service.test_connection(connector)
+                if ok:
+                    structure_profile = connector_structure_profile(connector)
             connector.status = "ok" if ok else "error"
             connector.last_error = "" if ok else sanitize_message(message)
         elif binding.connector_kind == "mcp":
@@ -601,6 +680,12 @@ def check_binding(db: Session, binding: ConnectorBinding, scenario: BusinessScen
     binding.health_message = "" if ok else sanitize_message(message)
     binding.checked_at = _now()
     binding.connector_signature = connector_signature(binding.connector_kind, connector)
+    binding.structure_profile = structure_profile if ok else {}
+    binding.structure_fingerprint = (
+        input_contract_validator.structural_fingerprint(structure_profile)
+        if structure_profile
+        else ""
+    )
     return binding
 
 

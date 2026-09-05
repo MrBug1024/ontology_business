@@ -31,3 +31,4 @@ __pycache__
 .pytest-basetemp-audit
 .pytest_cache
 .codex-sheet-inspect
+.runtime

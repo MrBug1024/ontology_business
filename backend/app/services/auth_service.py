@@ -218,6 +218,7 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已失效，请重新登录")
     request.state.user_id = session.user.id
     request.state.tenant_id = session.user.tenant_id
+    request.state.auth_session_id = session.id
     db.info["user_id"] = session.user.id
     db.info["tenant_id"] = session.user.tenant_id
     # 仅初始化尚不存在的组织及其历史成员；绝不因一次登录把已被管理员移除的

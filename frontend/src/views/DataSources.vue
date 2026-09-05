@@ -145,6 +145,15 @@
                 </el-button>
                 <el-button @click="loadFiles" :loading="loadingFiles"><el-icon><Refresh /></el-icon> 刷新</el-button>
               </div>
+              <el-alert
+                v-if="uploadFailures.length"
+                class="upload-partial-alert"
+                type="warning"
+                :closable="false"
+                show-icon
+                title="部分文件未完成上传"
+                :description="uploadFailureSummary"
+              />
               <section class="retrieval-panel" aria-labelledby="retrieval-title">
                 <div class="retrieval-head">
                   <div>
@@ -201,10 +210,16 @@
                     <small v-if="row.index_error" class="index-error" :title="row.index_error">{{ row.index_error }}</small>
                   </template>
                 </el-table-column>
+                <el-table-column label="能力契约" width="110" align="center">
+                  <template #default="{ row }">
+                    <el-tag v-if="row.modeling_contract_schema_id" size="small" type="success" effect="plain">可选来源</el-tag>
+                    <span v-else class="muted">—</span>
+                  </template>
+                </el-table-column>
                 <el-table-column label="" width="170" align="center">
                   <template #default="{ row }">
                     <el-button size="small" text type="primary" @click="viewText(row)">查看文本</el-button>
-                    <el-button v-if="selected?.can_write" size="small" text @click="reparse(row)" :loading="row._loading">重解析</el-button>
+                    <el-button v-if="selected?.can_write && !row.modeling_contract_schema_id" size="small" text @click="reparse(row)" :loading="row._loading">重解析</el-button>
                     <el-button v-if="selected?.can_write" size="small" text type="danger" @click="removeFile(row)">删除</el-button>
                   </template>
                 </el-table-column>
@@ -331,6 +346,7 @@ const files = ref<(BucketFile & { _loading?: boolean })[]>([])
 const loadingFiles = ref(false)
 const uploadList = ref<UploadFile[]>([])
 const uploading = ref(false)
+const uploadFailures = ref<Array<{ name: string; message: string }>>([])
 const reindexing = ref(false)
 const textDlg = ref(false)
 const textFile = ref('')
@@ -353,6 +369,13 @@ let textRequest = 0
 const TYPE_LABELS: Record<string, string> = {
   postgres: 'PostgreSQL', dataset: '数据集', file_bucket: '文件桶',
 }
+const uploadFailureSummary = computed(() => {
+  const visibleFailures = uploadFailures.value.slice(0, 3)
+  const remaining = uploadFailures.value.length - visibleFailures.length
+  const details = visibleFailures.map((item) => `${item.name}：${item.message}`).join('；')
+  const remainingSummary = remaining > 0 ? `；另有 ${remaining} 个文件未完成` : ''
+  return `${details}${remainingSummary}。失败文件仍保留在上传列表，可直接重试。`
+})
 function typeLabel(t: string) { return TYPE_LABELS[t] || t }
 const writableScenarios = computed(() => scenarios.value.filter((scenario) => scenario.can_write !== false))
 function modelingScopeLabel(source: Pick<DataSource, 'scenario_id'>) {
@@ -483,6 +506,7 @@ async function testConn() {
 
 // ── 文件桶 ──
 function onFilePick(f: UploadFile) {
+  uploadFailures.value = []
   if (!f.raw) {
     uploadList.value = uploadList.value.filter((x) => x.uid !== f.uid)
     return
@@ -492,16 +516,35 @@ function onFilePick(f: UploadFile) {
   }
 }
 async function doUpload() {
-  const raws = uploadList.value.filter((f) => f.raw).map((f) => f.raw!)
-  if (!raws.length) return
+  const pending = uploadList.value.filter((item) => item.raw)
+  if (!pending.length) return
   uploading.value = true
+  uploadFailures.value = []
+  const completed = new Set<string | number>()
+  let contractSourceCount = 0
   try {
-    await api.uploadFiles(selected.value!.id!, raws)
-    ElMessage.success('资料已提交，正在后台解析并建立检索索引')
-    uploadList.value = []
+    for (const item of pending) {
+      try {
+        const uploaded = await api.uploadFiles(selected.value!.id!, [item.raw!])
+        completed.add(item.uid)
+        contractSourceCount += uploaded.filter((file) => file.modeling_contract_schema_id).length
+      } catch (reason: unknown) {
+        uploadFailures.value.push({
+          name: item.name,
+          message: reason instanceof Error ? reason.message : '上传失败',
+        })
+      }
+    }
+    uploadList.value = uploadList.value.filter((item) => !completed.has(item.uid))
     await loadFiles()
-  } catch (e: any) {
-    ElMessage.error(e.message)
+    if (uploadFailures.value.length) {
+      const succeeded = completed.size
+      ElMessage.warning(`已完成 ${succeeded} 个，${uploadFailures.value.length} 个未完成；失败文件可直接重试`)
+    } else if (contractSourceCount) {
+      ElMessage.success(`上传完成，已生成 ${contractSourceCount} 个可选的能力契约来源`)
+    } else {
+      ElMessage.success('资料已提交，正在后台解析并建立检索索引')
+    }
   } finally {
     uploading.value = false
   }
@@ -546,8 +589,12 @@ async function viewText(f: BucketFile) {
 async function reparse(f: BucketFile & { _loading?: boolean }) {
   f._loading = true
   try {
-    await api.reparseFile(f.id)
-    ElMessage.success('已提交重新解析，正在后台更新检索索引')
+    const updated = await api.reparseFile(f.id)
+    ElMessage.success(
+      updated.modeling_contract_schema_id
+        ? '已按表格内容生成能力契约来源'
+        : '已提交重新解析，正在后台更新检索索引',
+    )
     await loadFiles()
   } catch (e: any) {
     ElMessage.error(e.message)
@@ -846,6 +893,7 @@ onBeforeUnmount(() => {
   border-radius: 14px;
   background: linear-gradient(135deg, color-mix(in srgb, var(--primary-soft) 72%, var(--surface)), var(--surface));
 }
+.upload-partial-alert { margin-bottom: 12px; }
 .retrieval-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .eyebrow { display: block; color: var(--primary-600); font-size: 10px; font-weight: 750; letter-spacing: .1em; }
 .retrieval-head h3 { margin: 3px 0; color: var(--text); font-size: 16px; }

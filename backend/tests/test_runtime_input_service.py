@@ -17,7 +17,9 @@ from app.models import (
     DataAsset,
     DataAssetVersion,
     DataSource,
+    DatasetField,
     DatasetHead,
+    DatasetRelation,
     DatasetSchema,
     DatasetVersion,
     LogicalDataset,
@@ -29,6 +31,7 @@ from app.services.runtime_input_service import (
     RuntimeInputResolutionError,
     resolve_runtime_inputs,
 )
+from app.services import connector_service, input_contract_validator
 from app.services.capability_contracts import (
     Actor,
     BindingOverride,
@@ -138,6 +141,7 @@ def _dataset_port(
     role: str = "invocation_input",
     binding_policy: str = "per_invocation",
     required: bool = True,
+    cardinality: str = "one",
     config: dict | None = None,
 ) -> ScenarioCapabilityPort:
     port = ScenarioCapabilityPort(
@@ -155,7 +159,7 @@ def _dataset_port(
         dataset_schema_id=world.schema.id,
         schema_document={"type": "array"},
         is_required=required,
-        cardinality="one",
+        cardinality=cardinality,
         binding_policy=binding_policy,
         status="active",
         config=config or {},
@@ -295,6 +299,245 @@ def test_each_invocation_can_pin_version_a_or_b_without_mutating_the_port(
     assert second.bindings[0].source_dataset_version_id == world.version_b.id
     assert port.dataset_id == world.dataset.id
     assert port.dataset_schema_id == world.schema.id
+
+
+def test_many_port_resolves_and_audits_each_immutable_input(db: Session) -> None:
+    world = _world(db, "many")
+    _dataset_port(db, world, cardinality="many")
+
+    result = _invoke(
+        db,
+        world,
+        request_id="many-inputs",
+        request_overrides=(
+            BindingOverride(
+                port_key="records",
+                binding_kind="dataset_version",
+                reference_id=world.version_a.id,
+                signature=world.version_a.content_hash,
+            ),
+            BindingOverride(
+                port_key="records",
+                binding_kind="dataset_version",
+                reference_id=world.version_b.id,
+                signature=world.version_b.content_hash,
+            ),
+        ),
+    )
+
+    assert [item.version_id for item in result.context.get_all("records")] == [
+        world.version_a.id,
+        world.version_b.id,
+    ]
+    assert [item.ordinal for item in result.bindings] == [0, 1]
+    assert [item.source_dataset_version_id for item in result.bindings] == [
+        world.version_a.id,
+        world.version_b.id,
+    ]
+
+
+def test_content_contract_accepts_renamed_dataset_with_matching_structure(
+    db: Session,
+) -> None:
+    world = _world(db, "content-match")
+    port = _dataset_port(db, world)
+    port.schema_document = {
+        input_contract_validator.CONTENT_CONTRACT_KEY: {
+            "version": input_contract_validator.CONTENT_CONTRACT_VERSION,
+            "relations": [
+                {
+                    "fields": [
+                        {
+                            "name": "record_id",
+                            "logical_types": ["string"],
+                            "required": True,
+                        },
+                        {
+                            "name": "amount",
+                            "logical_types": ["number"],
+                            "required": True,
+                        },
+                    ],
+                    "minimum_data_rows": 1,
+                    "allow_additional_fields": True,
+                }
+            ],
+            "allow_additional_relations": True,
+        }
+    }
+    renamed_dataset = LogicalDataset(
+        id="renamed-content-dataset",
+        tenant_id=world.tenant.id,
+        key="renamed-content",
+        name="Renamed content",
+    )
+    renamed_schema = DatasetSchema(
+        id="renamed-content-schema",
+        tenant_id=world.tenant.id,
+        dataset_id=renamed_dataset.id,
+        schema_version=1,
+        schema_hash="e" * 64,
+        compatibility="none",
+        schema_document={},
+    )
+    renamed_relation = DatasetRelation(
+        id="renamed-content-relation",
+        tenant_id=world.tenant.id,
+        dataset_id=renamed_dataset.id,
+        schema_id=renamed_schema.id,
+        relation_key="unrelated_uploaded_name",
+        display_name="Completely renamed table",
+        kind="table",
+        ordinal=0,
+    )
+    fields = [
+        DatasetField(
+            id=f"renamed-content-field-{index}",
+            tenant_id=world.tenant.id,
+            dataset_id=renamed_dataset.id,
+            schema_id=renamed_schema.id,
+            dataset_relation_id=renamed_relation.id,
+            field_key=name,
+            source_name=name,
+            logical_type=logical_type,
+            ordinal=index,
+        )
+        for index, (name, logical_type) in enumerate(
+            (("record_id", "string"), ("amount", "integer"))
+        )
+    ]
+    renamed_version = DatasetVersion(
+        id="renamed-content-version",
+        tenant_id=world.tenant.id,
+        dataset_id=renamed_dataset.id,
+        schema_id=renamed_schema.id,
+        version_number=1,
+        status="ready",
+        content_hash="9" * 64,
+        record_count=2,
+        manifest={
+            "relations": {
+                "unrelated_uploaded_name": {"row_count": 2},
+            }
+        },
+    )
+    db.add(renamed_dataset)
+    db.flush()
+    db.add(renamed_schema)
+    db.flush()
+    db.add(renamed_relation)
+    db.flush()
+    db.add_all([*fields, renamed_version])
+    db.flush()
+
+    result = _invoke(
+        db,
+        world,
+        request_id="renamed-content",
+        request_overrides=(
+            BindingOverride(
+                port_key="records",
+                binding_kind="dataset_version",
+                reference_id=renamed_version.id,
+            ),
+        ),
+    )
+
+    assert result.context.get("records").version_id == renamed_version.id
+
+
+def test_many_port_accepts_repeated_single_relation_dataset_bundle(
+    db: Session,
+) -> None:
+    world = _world(db, "many-bundle")
+    port = _dataset_port(db, world, cardinality="many")
+    port.schema_document = {
+        input_contract_validator.CONTENT_CONTRACT_KEY: {
+            "version": input_contract_validator.CONTENT_CONTRACT_VERSION,
+            "relations": [
+                {
+                    "fields": [
+                        {
+                            "name": "record_id",
+                            "logical_types": ["string"],
+                            "required": True,
+                        }
+                    ],
+                    "minimum_data_rows": 1,
+                    "allow_additional_fields": True,
+                }
+            ],
+            "allow_additional_relations": True,
+        }
+    }
+    relations: list[DatasetRelation] = []
+    for ordinal in range(2):
+        relation = DatasetRelation(
+            id=f"many-bundle-relation-{ordinal}",
+            tenant_id=world.tenant.id,
+            dataset_id=world.dataset.id,
+            schema_id=world.schema.id,
+            relation_key=f"renamed_{ordinal}",
+            display_name=f"Renamed {ordinal}",
+            kind="table",
+            ordinal=ordinal,
+        )
+        db.add(relation)
+        db.flush()
+        db.add(
+            DatasetField(
+                id=f"many-bundle-field-{ordinal}",
+                tenant_id=world.tenant.id,
+                dataset_id=world.dataset.id,
+                schema_id=world.schema.id,
+                dataset_relation_id=relation.id,
+                field_key="record_id",
+                source_name="record_id",
+                logical_type="string",
+                ordinal=0,
+            )
+        )
+        relations.append(relation)
+    world.version_a.record_count = 4
+    world.version_a.manifest = {
+        "relations": {
+            relation.relation_key: {"row_count": 2}
+            for relation in relations
+        }
+    }
+    db.flush()
+
+    result = _invoke(
+        db,
+        world,
+        request_id="many-relation-bundle",
+        request_overrides=(
+            BindingOverride(
+                port_key="records",
+                binding_kind="dataset_version",
+                reference_id=world.version_a.id,
+            ),
+        ),
+    )
+
+    assert result.context.get("records").version_id == world.version_a.id
+
+    port.cardinality = "one"
+    db.flush()
+    with pytest.raises(RuntimeInputResolutionError) as captured:
+        _invoke(
+            db,
+            world,
+            request_id="one-relation-bundle",
+            request_overrides=(
+                BindingOverride(
+                    port_key="records",
+                    binding_kind="dataset_version",
+                    reference_id=world.version_a.id,
+                ),
+            ),
+        )
+    assert captured.value.code == "content_contract_ambiguous"
 
 
 def test_released_port_contract_does_not_drift_with_live_port_edits(
@@ -664,6 +907,196 @@ def test_typed_connector_binding_key_is_resolved_server_side(db: Session) -> Non
     assert result.bindings[0].connector_binding_id == connector.id
 
 
+def test_connector_content_contract_validates_checked_structure_profile(db: Session) -> None:
+    world = _world(db, "connector-contract")
+    schema_document = {
+        input_contract_validator.CONTENT_CONTRACT_KEY: {
+            "version": input_contract_validator.CONTENT_CONTRACT_VERSION,
+            "relations": [
+                {
+                    "fields": [
+                        {
+                            "name": "record_id",
+                            "logical_types": ["integer"],
+                            "required": True,
+                        }
+                    ],
+                    "minimum_data_rows": 0,
+                    "allow_additional_fields": True,
+                }
+            ],
+            "allow_additional_relations": True,
+        }
+    }
+    port = ScenarioCapabilityPort(
+        id="port-connector-contract",
+        tenant_id=world.tenant.id,
+        scenario_id=world.scenario.id,
+        capability_kind="function",
+        capability_key=f"capability-{world.scenario.id}",
+        port_key="live_records",
+        name="Live records",
+        direction="input",
+        role="invocation_input",
+        media_kind="connector",
+        schema_document=schema_document,
+        is_required=True,
+        cardinality="one",
+        binding_policy="per_invocation",
+        status="active",
+    )
+    profile = {
+        "category": "table",
+        "tables": [
+            {
+                "name": "renamed_table",
+                "record_count": 3,
+                "columns": [
+                    {"name": "record_id", "logical_type": "integer"},
+                    {"name": "note", "logical_type": "string"},
+                ],
+            }
+        ],
+    }
+    connector = ConnectorBinding(
+        id="connector-contract",
+        tenant_id=world.tenant.id,
+        scenario_id=world.scenario.id,
+        environment="dev",
+        binding_key="live-records",
+        connector_kind="data_source",
+        connector_id="opaque-target",
+        health_status="healthy",
+        connector_signature="7" * 64,
+        structure_profile=profile,
+        structure_fingerprint=input_contract_validator.structural_fingerprint(profile),
+    )
+    db.add_all([port, connector])
+    db.flush()
+
+    result = _invoke(
+        db,
+        world,
+        request_id="connector-contract-valid",
+        request_overrides=(
+            BindingOverride(
+                port_key="live_records",
+                binding_kind="connector_binding",
+                binding_key="live-records",
+            ),
+        ),
+    )
+
+    handle = result.context.get("live_records")
+    assert handle.signature != connector.connector_signature
+    assert len(handle.signature) == 64
+
+    repeated_profile = {
+        "category": "table",
+        "tables": [
+            profile["tables"][0],
+            {**profile["tables"][0], "name": "another_renamed_table"},
+        ],
+    }
+    port.cardinality = "many"
+    connector.structure_profile = repeated_profile
+    connector.structure_fingerprint = input_contract_validator.structural_fingerprint(
+        repeated_profile
+    )
+    db.flush()
+
+    repeated = _invoke(
+        db,
+        world,
+        request_id="connector-contract-many-relations",
+        request_overrides=(
+            BindingOverride(
+                port_key="live_records",
+                binding_kind="connector_binding",
+                binding_key="live-records",
+            ),
+        ),
+    )
+    assert len(repeated.context.get("live_records").signature) == 64
+
+    port.cardinality = "one"
+    db.flush()
+    with pytest.raises(RuntimeInputResolutionError) as captured:
+        _invoke(
+            db,
+            world,
+            request_id="connector-contract-one-relation",
+            request_overrides=(
+                BindingOverride(
+                    port_key="live_records",
+                    binding_kind="connector_binding",
+                    binding_key="live-records",
+                ),
+            ),
+        )
+    assert captured.value.code == "content_contract_ambiguous"
+
+    incompatible_profile = {
+        "category": "table",
+        "tables": [
+            {
+                "name": "another_name",
+                "record_count": 3,
+                "columns": [{"name": "other_id", "logical_type": "integer"}],
+            }
+        ],
+    }
+    connector.structure_profile = incompatible_profile
+    connector.structure_fingerprint = input_contract_validator.structural_fingerprint(
+        incompatible_profile
+    )
+    db.flush()
+
+    with pytest.raises(RuntimeInputResolutionError) as captured:
+        _invoke(
+            db,
+            world,
+            request_id="connector-contract-invalid",
+            request_overrides=(
+                BindingOverride(
+                    port_key="live_records",
+                    binding_kind="connector_binding",
+                    binding_key="live-records",
+                ),
+            ),
+        )
+
+    assert captured.value.code == "content_contract_missing"
+
+
+def test_connector_structure_profile_is_bounded_and_type_normalized(monkeypatch) -> None:
+    monkeypatch.setattr(
+        connector_service.datasource_service,
+        "list_tables",
+        lambda _connector: [
+            {
+                "name": "runtime_records",
+                "row_count": 2,
+                "columns": [
+                    {"name": "record_id", "type": "BIGINT"},
+                    {"name": "observed_at", "type": "TIMESTAMP WITH TIME ZONE"},
+                    {"name": "amount", "type": "NUMERIC(12, 2)"},
+                    {"name": "payload", "type": "JSONB"},
+                ],
+            }
+        ],
+    )
+
+    profile = connector_service.connector_structure_profile(
+        SimpleNamespace(type="postgres")
+    )
+
+    assert [
+        column["logical_type"] for column in profile["tables"][0]["columns"]
+    ] == ["integer", "datetime", "number", "object"]
+    assert profile["tables"][0]["record_count"] == 2
+
+
 def test_expected_signature_is_server_checked(db: Session) -> None:
     world = _world(db, "signature")
     _dataset_port(db, world)
@@ -776,4 +1209,27 @@ def test_expired_temporary_attachment_is_rejected_before_audit(db: Session) -> N
         )
 
     assert captured.value.code == "managed_reference_expired"
+    assert db.scalar(select(func.count(CapabilityInvocation.id))) == 0
+
+
+def test_modeling_material_dataset_is_rejected_as_runtime_input(db: Session) -> None:
+    world = _world(db, "modeling-plane")
+    world.dataset.usage_plane = "modeling_material"
+    _dataset_port(db, world)
+    db.flush()
+
+    with pytest.raises(RuntimeInputResolutionError) as captured:
+        _invoke(
+            db,
+            world,
+            request_id="modeling-plane-runtime",
+            overrides=[
+                {
+                    "port_key": "records",
+                    "dataset_version_id": world.version_a.id,
+                }
+            ],
+        )
+
+    assert captured.value.code == "managed_reference_not_runtime_input"
     assert db.scalar(select(func.count(CapabilityInvocation.id))) == 0

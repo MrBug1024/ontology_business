@@ -9,6 +9,8 @@ import type {
   AssistantCompilationJobStatus,
   AssistantCompilationGuidanceResult,
   AssistantMessage,
+  AssistantRequestRun,
+  AssistantSelectionContext,
   AssistantProposalApplyResult,
   AssistantThread,
   AuthMessage,
@@ -18,10 +20,14 @@ import type {
   CatalogAsset,
   CatalogAssetVersion,
   CatalogManagedUpload,
+  ManagedUploadRun,
+  CatalogUsagePlane,
   ValidationDataset,
   ValidationDatasetJob,
   ConnectorBindingOption,
   AgentChatRequest,
+  AgentTurnEvent,
+  AgentTurnRun,
   AgentRuntimeCapability,
   ChatMessage,
   Conversation,
@@ -36,6 +42,7 @@ import type {
   DatasetVersion,
   EventEnvelope,
   FunctionDefinition,
+  FunctionProviderManifest,
   LLMConfig,
   LLMEvaluation,
   LLMEvaluationSummary,
@@ -198,6 +205,17 @@ export const api = {
       page: context.page || undefined,
       path: context.path || undefined,
     } }),
+  getAssistantRequestRun: (runId: string, signal?: AbortSignal) =>
+    http.get<AssistantRequestRun>(`/assistant/request-runs/${runId}`, { signal }),
+  retryAssistantRequestRun: (runId: string, expectedRevision: number) =>
+    http.post<AssistantRequestRun>(`/assistant/request-runs/${runId}/retry`, {
+      expected_revision: expectedRevision,
+      idempotency_key: `assistant-request-retry:${runId}`,
+    }),
+  cancelAssistantRequestRun: (runId: string, expectedRevision: number) =>
+    http.post<AssistantRequestRun>(`/assistant/request-runs/${runId}/cancel`, {
+      expected_revision: expectedRevision,
+    }),
   uploadAssistantAttachment: (file: File) => {
     const fd = new FormData()
     fd.append('file', file)
@@ -217,7 +235,7 @@ export const api = {
     http.get<AssistantCompilationJobStatus>(`/assistant/compilation-jobs/${jobId}`),
   getAssistantCompilationJobResult: (jobId: string) =>
     http.get<AssistantCompilationJobResult>(`/assistant/compilation-jobs/${jobId}/result`),
-  submitAssistantCompilationGuidance: (jobId: string, d: { request_id: string; message: string; attachment_ids: string[] }) =>
+  submitAssistantCompilationGuidance: (jobId: string, d: { request_id: string; message: string; attachment_ids: string[]; upload_run_ids?: string[] }) =>
     http.post<AssistantCompilationGuidanceResult>(`/assistant/compilation-jobs/${jobId}/guidance`, d),
   continueAssistantModelTask: (d: { scenario_id: string; thread_id: string; proposal_id: string; task_id: string }) =>
     http.post<AssistantCompilationJobStatus>('/assistant/proposals/continue-model-task', d),
@@ -301,6 +319,8 @@ export const api = {
     http.put<RelationDataMapping>(`/scenarios/relation-mappings/${id}`, d),
   deleteRelationMapping: (id: string) => http.delete(`/scenarios/relation-mappings/${id}`),
   // 受治理函数：声明式契约 + 服务端 allowlist 内置算子
+  listFunctionProviderManifests: (sid: string) =>
+    http.get<FunctionProviderManifest[]>(`/scenarios/${sid}/function-providers`),
   createFunction: (sid: string, d: FunctionDefinition) => http.post<FunctionDefinition>(`/scenarios/${sid}/functions`, d),
   updateFunction: (id: string, d: FunctionDefinition) => http.put<FunctionDefinition>(`/scenarios/functions/${id}`, d),
   deleteFunction: (id: string) => http.delete(`/scenarios/functions/${id}`),
@@ -361,7 +381,9 @@ export const api = {
   cancelTask: (id: string) => http.post<WorkflowRun>(`/operations/runs/${id}/cancel`),
 
   // 资源目录：LogicalDataset 与场景用途绑定不包含物理连接配置。
-  listCatalogAssets: () => http.get<CatalogAsset[]>('/catalog/assets'),
+  listCatalogAssets: (usagePlane?: CatalogUsagePlane) => http.get<CatalogAsset[]>('/catalog/assets', {
+    params: { usage_plane: usagePlane },
+  }),
   listCatalogAssetVersions: (assetId: string) =>
     http.get<CatalogAssetVersion[]>(`/catalog/assets/${assetId}/versions`),
   uploadCatalogAttachment: (d: {
@@ -383,6 +405,45 @@ export const api = {
       },
     })
   },
+  createManagedUploadRun: (d: {
+    filename: string
+    byte_size: number
+    media_type?: string
+    purpose: 'validation_asset' | 'invocation_attachment'
+    idempotency_key: string
+    expires_in_seconds?: number
+  }) => http.post<ManagedUploadRun>('/catalog/upload-runs', d),
+  uploadManagedRunContent: (d: {
+    runId: string
+    expectedRevision: number
+    file: File
+    signal?: AbortSignal
+    onProgress?: (percent: number) => void
+  }) => {
+    const fd = new FormData()
+    fd.append('upload_run_id', d.runId)
+    fd.append('expected_revision', String(d.expectedRevision))
+    fd.append('file', d.file)
+    return http.post<ManagedUploadRun>('/catalog/upload-runs/content', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60 * 60 * 1000,
+      signal: d.signal,
+      onUploadProgress: (event: { loaded: number; total?: number }) => {
+        if (event.total && d.onProgress) d.onProgress(Math.round((event.loaded * 100) / event.total))
+      },
+    })
+  },
+  getManagedUploadRun: (runId: string, signal?: AbortSignal) =>
+    http.get<ManagedUploadRun>(`/catalog/upload-runs/${runId}`, { signal }),
+  retryManagedUploadRun: (runId: string, expectedRevision: number) =>
+    http.post<ManagedUploadRun>(`/catalog/upload-runs/${runId}/retry`, {
+      expected_revision: expectedRevision,
+      idempotency_key: `managed-upload-retry:${runId}`,
+    }),
+  cancelManagedUploadRun: (runId: string, expectedRevision: number) =>
+    http.post<ManagedUploadRun>(`/catalog/upload-runs/${runId}/cancel`, {
+      expected_revision: expectedRevision,
+    }),
   deleteCatalogAsset: (assetId: string) => http.delete(`/catalog/assets/${assetId}`),
   createValidationDatasetJob: (assetVersionIds: string[], name = '验证数据包') =>
     http.post<ValidationDatasetJob>('/catalog/validation-dataset-jobs', {
@@ -407,7 +468,9 @@ export const api = {
     }
     return waitForValidationDatasetJob(job.id, options)
   },
-  listLogicalDatasets: () => http.get<LogicalDataset[]>('/catalog/datasets'),
+  listLogicalDatasets: (usagePlane?: CatalogUsagePlane, scenarioId?: string) => http.get<LogicalDataset[]>('/catalog/datasets', {
+    params: { usage_plane: usagePlane, scenario_id: scenarioId },
+  }),
   listDatasetSchemas: (datasetId: string) =>
     http.get<DatasetSchema[]>(`/catalog/datasets/${datasetId}/schemas`),
   listDatasetHeads: (datasetId: string) => http.get<DatasetHead[]>(`/catalog/datasets/${datasetId}/heads`),
@@ -447,7 +510,7 @@ export const api = {
       timeout: 60 * 60 * 1000,
     })
   },
-  reparseFile: (fid: string) => http.post(`/data-sources/files/${fid}/reparse`),
+  reparseFile: (fid: string) => http.post<BucketFile>(`/data-sources/files/${fid}/reparse`),
   fileText: (fid: string) => http.get<{ filename: string; text: string }>(`/data-sources/files/${fid}/text`),
   deleteFile: (fid: string) => http.delete(`/data-sources/files/${fid}`),
 
@@ -562,6 +625,27 @@ export const api = {
   listConversations: (agentId: string) => http.get<Conversation[]>(`/agents/${agentId}/conversations`),
   deleteConversation: (cid: string) => http.delete(`/agents/conversations/${cid}`),
   listMessages: (cid: string) => http.get<ChatMessage[]>(`/agents/conversations/${cid}/messages`),
+  createAgentTurn: (agentId: string, request: AgentChatRequest) =>
+    http.post<AgentTurnRun>(`/agents/${agentId}/turns`, request),
+  getAgentTurn: (runId: string) =>
+    http.get<AgentTurnRun>(`/agent-turns/${runId}`),
+  listAgentTurns: (
+    agentId: string,
+    options: { conversationId?: string; activeOnly?: boolean; limit?: number } = {},
+  ) => http.get<AgentTurnRun[]>(`/agents/${agentId}/turns`, { params: {
+    conversation_id: options.conversationId || undefined,
+    active_only: options.activeOnly || undefined,
+    limit: options.limit,
+  } }),
+  cancelAgentTurn: (runId: string, expectedRevision: number) =>
+    http.post<AgentTurnRun>(`/agent-turns/${runId}/cancel`, {
+      expected_revision: expectedRevision,
+    }),
+  retryAgentTurn: (runId: string, expectedRevision: number, idempotencyKey: string) =>
+    http.post<AgentTurnRun>(`/agent-turns/${runId}/retry`, {
+      expected_revision: expectedRevision,
+      idempotency_key: idempotencyKey,
+    }),
   confirmAgentToolPreview: (agentId: string, previewLogId: string, d: {
     conversation_id: string
     correlation_id: string
@@ -572,66 +656,117 @@ export const api = {
   }) => http.post(`/agents/${agentId}/confirmations/${previewLogId}`, d),
 }
 
-// SSE 流式对话
-export function streamChat(
-  agentId: string,
-  payload: AgentChatRequest,
-  onEvent: (ev: { type: string; data: any }) => void,
+/** Subscribe to durable turn events and resume from the last observed revision. */
+export function streamAgentTurn(
+  runId: string,
+  onEvent: (event: AgentTurnEvent) => void,
   onDone: () => void,
-  onError: (e: Error) => void,
+  onError: (error: Error) => void,
+  onConnectionState?: (state: 'connected' | 'reconnecting') => void,
+  afterRevision = 0,
 ) {
   const ctrl = new AbortController()
-  fetch(`/api/agents/${agentId}/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify(payload),
-    signal: ctrl.signal,
-  })
-    .then(async (res) => {
-      if (!res.ok) {
-        let message = `HTTP ${res.status}`
-        try {
-          const body = await res.json()
-          const detail = body?.detail
-          message = typeof detail === 'string'
-            ? detail
-            : typeof detail?.message === 'string' ? detail.message : message
-        } catch {
-          // Keep the status-only fallback when the server did not return JSON.
+  let revision = Math.max(0, afterRevision)
+  let retryDelay = 1000
+  let retryTimer: number | undefined
+  let finished = false
+
+  const finish = () => {
+    if (finished || ctrl.signal.aborted) return
+    finished = true
+    onDone()
+  }
+
+  const reconnect = () => {
+    if (finished || ctrl.signal.aborted) return
+    onConnectionState?.('reconnecting')
+    retryTimer = window.setTimeout(() => {
+      retryTimer = undefined
+      void connect()
+    }, retryDelay)
+    retryDelay = Math.min(5000, retryDelay * 2)
+  }
+
+  const connect = async () => {
+    try {
+      const headers: Record<string, string> = { Accept: 'text/event-stream' }
+      if (revision > 0) headers['Last-Event-ID'] = String(revision)
+      const response = await fetch(`/api/agent-turns/${encodeURIComponent(runId)}/events`, {
+        method: 'GET',
+        headers,
+        credentials: 'include',
+        cache: 'no-store',
+        signal: ctrl.signal,
+      })
+      if (!response.ok || !response.body) {
+        if (response.status >= 500) {
+          reconnect()
+          return
         }
-        throw new Error(message)
+        throw new Error(`HTTP ${response.status}`)
       }
-      if (!res.body) throw new Error('服务端未返回事件流')
-      const reader = res.body.getReader()
+      onConnectionState?.('connected')
+      retryDelay = 1000
+      const reader = response.body.getReader()
       const decoder = new TextDecoder()
-      let buf = ''
-      while (true) {
+      let buffer = ''
+      let eventId = 0
+      let eventName = ''
+      while (!ctrl.signal.aborted) {
         const { done, value } = await reader.read()
         if (done) break
-        buf += decoder.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() || ''
-        for (const line of lines) {
-          const t = line.trim()
-          if (!t.startsWith('data:')) continue
-          const data = t.slice(5).trim()
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        for (const rawLine of lines) {
+          const line = rawLine.trim()
+          if (line.startsWith('id:')) {
+            eventId = Number(line.slice(3).trim()) || 0
+            continue
+          }
+          if (line.startsWith('event:')) {
+            eventName = line.slice(6).trim()
+            continue
+          }
+          if (!line.startsWith('data:')) continue
+          const data = line.slice(5).trim()
+          if (eventName === 'error') {
+            finished = true
+            onError(new Error('Agent Turn 已不可用或访问权限已变化'))
+            return
+          }
+          eventName = ''
           if (data === '[DONE]') {
-            onDone()
+            finish()
             return
           }
           try {
-            onEvent(JSON.parse(data))
+            const event = JSON.parse(data) as AgentTurnEvent
+            const nextRevision = Number(event.revision || eventId)
+            if (!Number.isInteger(nextRevision) || nextRevision <= revision) continue
+            revision = nextRevision
+            onEvent(event)
           } catch {
-            /* ignore */
+            // Ignore an incomplete event and let Last-Event-ID recover it.
           }
         }
       }
-      onDone()
-    })
-    .catch((e) => {
-      if (e.name !== 'AbortError') onError(e)
-    })
+      if (!ctrl.signal.aborted && !finished) reconnect()
+    } catch (error: unknown) {
+      if (ctrl.signal.aborted || finished) return
+      const failure = error instanceof Error ? error : new Error('Agent Turn 事件流中断')
+      if (/^HTTP 4\d\d$/.test(failure.message)) {
+        onError(failure)
+        return
+      }
+      reconnect()
+    }
+  }
+
+  ctrl.signal.addEventListener('abort', () => {
+    if (retryTimer !== undefined) window.clearTimeout(retryTimer)
+  }, { once: true })
+  void connect()
   return ctrl
 }
 
@@ -699,8 +834,9 @@ export function streamAssistantChat(
     scenario_id?: string
     page?: string
     path?: string
-    selection?: Record<string, any>
+    selection?: AssistantSelectionContext
     attachment_ids?: string[]
+    upload_run_ids?: string[]
     llm_config_id?: string
     skill_ids?: string[]
     mcp_ids?: string[]

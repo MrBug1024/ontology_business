@@ -1,6 +1,7 @@
 """Security and compatibility contract for Agent business-capability scopes."""
 from __future__ import annotations
 
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,7 +31,7 @@ from app.routers import agents as agents_router
 from app.schemas import AgentCapabilityScope, AgentIn
 from app.services import (
     agent_capability_service,
-    agent_engine,
+    agent_runtime_adapter,
     permission_service,
     release_service,
     runtime_definition_service,
@@ -213,10 +214,14 @@ class AgentCapabilityScopeTests(unittest.TestCase):
         self.db.close()
         self.engine.dispose()
 
-    def _context(self, agent: Agent) -> agent_engine.AgentContext:
-        return agent_engine.AgentContext(self.db, agent, LLMConfig(name="工具模型"))
+    def _runtime(self, agent: Agent) -> agent_runtime_adapter.CapabilityAgentRuntime:
+        return agent_runtime_adapter.build_runtime_context(
+            self.db,
+            agent,
+            LLMConfig(name="工具模型"),
+        )
 
-    def test_new_agents_are_opt_in_but_legacy_agents_keep_their_previous_runtime(self) -> None:
+    def test_new_agents_use_empty_capability_runtime_but_legacy_rows_remain_readable(self) -> None:
         created_out = agents_router.create_agent(
             AgentIn(name="新 Agent", scenario_id=self.scenario.id),
             self.db,
@@ -225,13 +230,9 @@ class AgentCapabilityScopeTests(unittest.TestCase):
         self.assertEqual(created.capability_scope, agent_capability_service.explicit_empty_scope())
         self.assertEqual(created.runtime_binding_mode, "capability_only")
         self.assertFalse(created_out.capability_scope_legacy)
-        created_context = self._context(created)
-        self.assertEqual(created_context.functions, [])
-        created_tool_names = {
-            tool["function"]["name"] for tool in created_context.build_tools()
-        }
-        self.assertIn("list_ontology_model", created_tool_names)
-        self.assertNotIn("list_functions", created_tool_names)
+        created_runtime = self._runtime(created)
+        self.assertEqual(created_runtime.public_catalog(), [])
+        self.assertEqual(created_runtime.build_tools(), [])
 
         legacy_out = agents_router._out(self.legacy_agent, self.db)
         self.assertTrue(legacy_out.capability_scope_legacy)
@@ -241,13 +242,6 @@ class AgentCapabilityScopeTests(unittest.TestCase):
         ))
         self.assertEqual(
             set(legacy_out.capability_scope.functions.selected_ids),
-            {self.function_a.id, self.function_b.id},
-        )
-        # NULL is the legacy representation from before capability scopes were
-        # introduced.  It must keep the previous scenario-visible behaviour so
-        # upgrading the platform does not silently disable existing Agents.
-        self.assertEqual(
-            {item.id for item in self._context(self.legacy_agent).functions},
             {self.function_a.id, self.function_b.id},
         )
 
@@ -291,10 +285,6 @@ class AgentCapabilityScopeTests(unittest.TestCase):
             set(stored.capability_scope["functions"]["selected_ids"]),
             {self.function_a.id, self.function_b.id},
         )
-        self.assertEqual(
-            {item.id for item in self._context(stored).functions},
-            {self.function_a.id, self.function_b.id},
-        )
 
     def test_select_current_all_is_frozen_to_explicit_ids(self) -> None:
         created_out = agents_router.create_agent(
@@ -327,11 +317,15 @@ class AgentCapabilityScopeTests(unittest.TestCase):
         self.db.add(future)
         self.db.commit()
         self.assertEqual(
-            {item.id for item in self._context(stored).functions},
+            {
+                item["key"]
+                for item in self._runtime(stored).public_catalog()
+                if item["kind"] == "function"
+            },
             {self.function_a.id, self.function_b.id},
         )
 
-    def test_scope_filters_prompt_tools_and_forced_direct_calls(self) -> None:
+    def test_scope_filters_capability_catalog_tools_and_forced_calls(self) -> None:
         agent = Agent(
             id="agent-scope-explicit",
             tenant_id=self.tenant.id,
@@ -341,15 +335,24 @@ class AgentCapabilityScopeTests(unittest.TestCase):
         )
         self.db.add(agent)
         self.db.commit()
-        context = self._context(agent)
-        self.assertEqual([item.id for item in context.functions], [self.function_a.id])
-        prompt = agent_engine.build_system_prompt(context, self.scenario.name, "")
-        self.assertIn(self.function_a.name, prompt)
-        self.assertNotIn(self.function_b.name, prompt)
-        self.assertIn("未找到函数", context.execute_tool(
-            "run_function",
-            {"function_id": self.function_b.id, "params": {"amount": 1}},
+        runtime = self._runtime(agent)
+        self.assertEqual(
+            [(item["kind"], item["key"]) for item in runtime.public_catalog()],
+            [("function", self.function_a.id)],
+        )
+        self.assertEqual(
+            {tool["function"]["name"] for tool in runtime.build_tools()},
+            {"list_available_capabilities", "invoke_capability"},
+        )
+        denied = json.loads(runtime.execute_tool(
+            "invoke_capability",
+            {
+                "kind": "function",
+                "key": self.function_b.id,
+                "inputs": {"amount": 1},
+            },
         ))
+        self.assertEqual(denied["error"]["code"], "CAPABILITY_NOT_AVAILABLE")
 
     def test_all_mode_requires_a_resolvable_runtime_definition(self) -> None:
         all_scope = agent_capability_service.explicit_empty_scope()
@@ -488,8 +491,15 @@ class AgentCapabilityScopeTests(unittest.TestCase):
             "app.services.runtime_connector_service.get_settings",
             return_value=settings,
         ):
-            context = self._context(agent)
-            self.assertEqual([item.name for item in context.functions], [frozen_name])
+            runtime = self._runtime(agent)
+            self.assertEqual(
+                [
+                    item["name"]
+                    for item in runtime.public_catalog()
+                    if item["kind"] == "function"
+                ],
+                [frozen_name],
+            )
             catalog = agents_router.get_agent_capability_catalog(self.scenario.id, self.db)
             catalog_ids = {item["id"] for item in catalog["categories"]["functions"]}
             self.assertIn(self.function_a.id, catalog_ids)

@@ -310,9 +310,25 @@ class ExternalCapabilityInvocationIn(BaseModel):
             raise ValueError("confirm 模式必须提供服务端签发的确认票据")
         if self.mode != "confirm" and self.confirmation is not None:
             raise ValueError("只有 confirm 模式可以提交确认票据")
-        keys = [item.port_key.casefold() for item in self.managed_inputs]
+        keys = [
+            (
+                item.port_key.casefold(),
+                next(
+                    (field, value)
+                    for field in (
+                        "dataset_version_id",
+                        "dataset_head_id",
+                        "asset_version_id",
+                        "artifact_id",
+                        "binding_key",
+                    )
+                    if (value := getattr(item, field)) is not None
+                ),
+            )
+            for item in self.managed_inputs
+        ]
         if len(keys) != len(set(keys)):
-            raise ValueError("同一端口不能重复提交受管输入")
+            raise ValueError("同一端口不能重复提交相同受管输入")
         return self
 
 

@@ -14,7 +14,6 @@ export const AGENT_INVOCATION_FILE_ACCEPT = [
 ].join(',')
 
 const SUPPORTED_EXTENSIONS = new Set(AGENT_INVOCATION_FILE_ACCEPT.split(','))
-const TABULAR_EXTENSIONS = new Set(['.csv', '.tsv', '.xls', '.xlsx', '.xlsm'])
 const PORT_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
 const SIGNATURE_PATTERN = /^[a-f0-9]{64}$/i
 const MANAGED_BINDING_KINDS = new Set<AgentManagedBindingKind>([
@@ -105,14 +104,11 @@ export function isSupportedInvocationFile(filename: string) {
   return dot >= 0 && SUPPORTED_EXTENSIONS.has(normalized.slice(dot))
 }
 
-export function isTabularInvocationAsset(category: unknown, filename: string) {
+export function isTabularInvocationAsset(category: unknown) {
   const normalizedCategory = typeof category === 'string'
     ? category.trim().toLowerCase()
     : ''
-  if (normalizedCategory) return normalizedCategory === 'table'
-  const normalizedFilename = String(filename || '').trim().toLowerCase()
-  const dot = normalizedFilename.lastIndexOf('.')
-  return dot >= 0 && TABULAR_EXTENSIONS.has(normalizedFilename.slice(dot))
+  return normalizedCategory === 'table'
 }
 
 export function parseStructuredInputs(source: string): {

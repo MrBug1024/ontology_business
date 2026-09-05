@@ -437,6 +437,201 @@ def test_historical_sample_builds_model_and_explicit_fixture_without_contract_lo
     assert "data_source_id" not in encoded_contract
 
 
+@pytest.mark.parametrize("usage_plane", ["invocation_input", "generated_output"])
+def test_non_modeling_attachment_cannot_promote_contract_port_or_mapping(
+    governed_scenario,
+    usage_plane: str,
+) -> None:
+    db, tenant, user, scenario = governed_scenario
+    source = DataSource(
+        id=f"non-modeling-source-{usage_plane}",
+        tenant_id=tenant.id,
+        scenario_id=scenario.id,
+        name="Modeling catalog source",
+        type="postgres",
+        config={},
+        resource_scope="modeling",
+        status="ok",
+    )
+    db.add(source)
+    db.commit()
+
+    bundle = scenario_model_compiler.build_source_bundle(
+        "Compile the supplied material.",
+        [{
+            "id": f"non-modeling-{usage_plane}",
+            "filename": "looks-like-approved-modeling-material.xlsx",
+            "text": "Records have a stable identifier and title.",
+            "usage_plane": usage_plane,
+        }],
+    )
+    attachment_ref = next(
+        paragraph["ref"]
+        for paragraph in bundle["paragraphs"]
+        if paragraph["source_kind"] == "attachment"
+    )
+    raw = _raw_model(attachment_ref)
+    raw["entities"] = [{
+        "key": "entity.non_modeling_record",
+        "name": "Non-modeling record",
+        "properties": [
+            {
+                "name": "Identifier",
+                "data_type": "string",
+                "is_key": True,
+                "is_title": True,
+                "is_required": True,
+            },
+            {"name": "Title", "data_type": "string"},
+        ],
+        "evidence_refs": [attachment_ref],
+        "confidence": 0.99,
+    }]
+    raw["functions"] = [{
+        "key": "function.non_modeling_contract",
+        "name": "Non-modeling contract",
+        "input_schema": _object_schema({"records": {"type": "array"}}),
+        "output_schema": _object_schema({"summary": {"type": "object"}}),
+        "managed_data_ports": [{
+            "port_key": "records.non_modeling_input",
+            "name": "Non-modeling records",
+            "direction": "input",
+            "role": "invocation_input",
+            "media_kind": "dataset",
+            "schema_document": {
+                "type": "array",
+                "items": {"type": "object"},
+            },
+            "binding_policy": "per_invocation",
+            "binding_kinds": ["dataset_version"],
+            "evidence_kind": "versioned_data",
+            "evidence_refs": [attachment_ref],
+            "confidence": 0.99,
+        }],
+        "evidence_refs": [attachment_ref],
+        "confidence": 0.99,
+    }]
+    raw["mappings"] = [{
+        "key": "mapping.non_modeling_record",
+        "entity_ref": "entity.non_modeling_record",
+        "data_source_ref": source.id,
+        "table_name": "records",
+        "column_map": {"Identifier": "id", "Title": "title"},
+        "evidence_refs": [attachment_ref],
+        "confidence": 0.99,
+    }]
+    raw["coverage"][0]["change_keys"] = [
+        "entity.non_modeling_record",
+        "function.non_modeling_contract",
+        "mapping.non_modeling_record",
+    ]
+    payload = scenario_model_compiler.normalize_scenario_model(
+        db,
+        scenario,
+        raw,
+        source_bundle=bundle,
+        mapping_catalog=[{
+            "data_source_id": source.id,
+            "data_source_name": source.name,
+            "type": source.type,
+            "tables": [{
+                "name": "records",
+                "columns": [
+                    {"name": "id", "type": "varchar", "pk": True},
+                    {"name": "title", "type": "varchar", "pk": False},
+                ],
+            }],
+        }],
+        columns_by_table={(source.id, "records"): {"id", "title"}},
+    )
+
+    assert next(
+        document for document in bundle["documents"]
+        if document["source_kind"] == "attachment"
+    )["usage_plane"] == usage_plane
+    assert any(
+        issue["code"]
+        == assistant_capability_modeling_service.NON_MODELING_METADATA_ISSUE_CODE
+        for issue in payload["unresolved"]
+    )
+    governed_candidates = [
+        candidate
+        for candidate in payload["draft_candidates"]
+        if candidate["resource_kind"] in {
+            "function", "mapping", "capability_port",
+        }
+    ]
+    assert {candidate["resource_kind"] for candidate in governed_candidates} == {
+        "function", "mapping", "capability_port",
+    }
+    assert all(
+        candidate["promotion_eligible"] is False
+        and candidate["materialization_source"]
+        == assistant_capability_modeling_service
+        .NON_MODELING_METADATA_MATERIALIZATION_SOURCE
+        for candidate in governed_candidates
+    )
+    assert not any(
+        role.get("source_kind") == "attachment"
+        for role in payload["capability_modeling"]["data_roles"]
+    )
+
+    scenario_model_draft_service.materialize_draft_resources(
+        db,
+        scenario,
+        {
+            "kind": "scenario_model",
+            "proposal_id": f"proposal-source-isolation-{usage_plane}",
+            "payload": payload,
+        },
+        created_by_user_id=user.id,
+    )
+    db.commit()
+    rows = list(db.scalars(select(ScenarioModelDraftResource).where(
+        ScenarioModelDraftResource.scenario_id == scenario.id,
+        ScenarioModelDraftResource.resource_kind.in_({
+            "function", "mapping", "capability_port",
+        }),
+    )).all())
+    assert len(rows) == 3
+    assert {
+        row.materialization_source for row in rows
+    } == {
+        assistant_capability_modeling_service
+        .NON_MODELING_METADATA_MATERIALIZATION_SOURCE
+    }
+
+    rows, result = candidate_governance_service.revalidate_candidates(
+        db,
+        scenario,
+        tenant_id=tenant.id,
+        created_by_user_id=user.id,
+        expected_revisions={row.id: 0 for row in rows},
+    )
+    db.commit()
+    assert result["blocked_count"] == len(rows)
+    assert all(
+        any(
+            issue["code"]
+            == assistant_capability_modeling_service.NON_MODELING_METADATA_ISSUE_CODE
+            for issue in row.validation_issues
+        )
+        for row in rows
+    )
+
+    with pytest.raises(candidate_governance_service.CandidatePromotionBlocked):
+        candidate_governance_service.promote_candidates(
+            db,
+            scenario,
+            tenant_id=tenant.id,
+            created_by_user_id=user.id,
+            expected_revisions={row.id: row.revision for row in rows},
+        )
+    assert db.scalars(select(FunctionDefinition)).all() == []
+    assert db.scalars(select(DataMapping)).all() == []
+    assert db.scalars(select(ScenarioCapabilityPort)).all() == []
+
+
 def test_text_only_function_remains_typed_input_without_managed_ports(
     governed_scenario,
 ) -> None:

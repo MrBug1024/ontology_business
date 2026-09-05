@@ -296,23 +296,11 @@ class CapabilityProviderRegistry:
     ) -> CapabilityProvider:
         key = normalize_provider_key(provider_key)
         with self._lock:
-            if provider_version is None:
-                candidates = sorted(
-                    identity
-                    for identity in (set(self._instances) | set(self._factories))
-                    if identity[0] == key
+            if provider_version is None or not str(provider_version).strip():
+                raise CapabilityRegistryError(
+                    f"provider version is required for exact resolution: {key}"
                 )
-                if not candidates:
-                    raise CapabilityRegistryError(
-                        f"provider is not registered: {key}"
-                    )
-                if len(candidates) != 1:
-                    raise CapabilityRegistryError(
-                        f"provider version is ambiguous: {key}"
-                    )
-                identity = candidates[0]
-            else:
-                identity = (key, normalize_provider_version(provider_version))
+            identity = (key, normalize_provider_version(provider_version))
             existing = self._instances.get(identity)
             if existing is not None:
                 return existing

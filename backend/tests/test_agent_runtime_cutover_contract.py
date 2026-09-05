@@ -24,23 +24,19 @@ def test_public_agent_loop_requires_capability_runtime_without_legacy_constructi
     agent = SimpleNamespace(id="agent-capability-only", scenario_id="scenario-generic")
     llm = SimpleNamespace(id="llm-generic", model="test-model")
 
-    with patch.object(
-        agent_engine,
-        "AgentContext",
-        side_effect=AssertionError("legacy AgentContext must not be constructed"),
-    ):
-        events = agent_engine.run_agent(
-            db,
-            agent,
-            llm,
-            [],
-            "evaluate the current request",
-            "Generic scenario",
-            "",
-            runtime_context=None,
-        )
-        with pytest.raises(agent_engine.AgentRuntimeContextError) as blocked:
-            next(events)
+    assert not hasattr(agent_engine, "AgentContext")
+    events = agent_engine.run_agent(
+        db,
+        agent,
+        llm,
+        [],
+        "evaluate the current request",
+        "Generic scenario",
+        "",
+        runtime_context=None,
+    )
+    with pytest.raises(agent_engine.AgentRuntimeContextError) as blocked:
+        next(events)
 
     assert blocked.value.code == "capability_runtime_required"
 

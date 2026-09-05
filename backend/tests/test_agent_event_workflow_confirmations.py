@@ -15,7 +15,6 @@ from app.models import (
     BusinessScenario,
     Conversation,
     EventEnvelope,
-    LLMConfig,
     Message,
     OntologyEvent,
     OntologyWorkflow,
@@ -27,7 +26,6 @@ from app.routers import agents
 from app.schemas import AgentToolConfirmationRequest
 from app.services import (
     agent_confirmation_service,
-    agent_engine,
     permission_service,
     runtime_definition_service,
     workflow_payload_service,
@@ -200,41 +198,6 @@ class AgentEventWorkflowConfirmationTests(unittest.TestCase):
             self._payload(preview, **overrides),
             self.db,
         )
-
-    def test_agent_tools_create_durable_previews_without_side_effects(self) -> None:
-        self.db.info["llm_trace_context"] = {
-            "assistant_message_id": self.message.id,
-            "correlation_id": "correlation-agent-tools",
-        }
-        self.db.info["action_audit_context"] = {
-            "agent_id": self.agent.id,
-            "llm_config_id": None,
-            "model_name": "test-tool-model",
-        }
-        context = agent_engine.AgentContext(
-            self.db,
-            self.agent,
-            LLMConfig(name="工具测试模型"),
-        )
-
-        event_preview = json.loads(context.execute_tool(
-            "prepare_event_publish",
-            {"event_id": self.event.id, "payload": {"project_id": "P-001"}},
-        ))
-        workflow_preview = json.loads(context.execute_tool(
-            "execute_workflow",
-            {"workflow_id": self.workflow.id, "params": {"project_id": "P-001"}},
-        ))
-
-        self.assertEqual(event_preview["status"], "confirmation_required")
-        self.assertEqual(workflow_preview["status"], "confirmation_required")
-        self.assertEqual(self.db.query(ActionExecutionLog).count(), 2)
-        self.assertEqual(self.db.query(EventEnvelope).count(), 0)
-        self.assertEqual(self.db.query(WorkflowRun).count(), 0)
-        for preview in (event_preview, workflow_preview):
-            log = self.db.get(ActionExecutionLog, preview["log_id"])
-            self.assertEqual(log.agent_id, self.agent.id)
-            self.assertEqual(log.agent_message_id, self.message.id)
 
     def test_event_confirmation_publishes_and_queues_once_then_replays(self) -> None:
         preview = self._preview("event")

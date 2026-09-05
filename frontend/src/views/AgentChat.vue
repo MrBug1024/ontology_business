@@ -10,15 +10,24 @@
         </div>
       </div>
       <div class="conv-list">
-        <el-button class="new-conv-button" type="primary" :disabled="!agentValidationReady" @click="newConv">
+        <el-button class="new-conv-button" type="primary" :disabled="!agentValidationReady || conversationNavigationLocked" @click="newConv">
           <el-icon aria-hidden="true"><Plus /></el-icon> 新建验证会话
         </el-button>
         <div v-for="c in conversations" :key="c.id" class="conv-item" :class="{ active: curConv?.id === c.id }">
-          <button class="conv-open" type="button" :aria-current="curConv?.id === c.id ? 'page' : undefined" :aria-label="`打开对话：${c.title || '新对话'}`" @click="openConv(c)">
+          <button class="conv-open" type="button" :disabled="conversationNavigationLocked" :aria-current="curConv?.id === c.id ? 'page' : undefined" :aria-label="`打开对话：${c.title || '新对话'}`" @click="openConv(c)">
             <el-icon aria-hidden="true"><ChatLineRound /></el-icon>
             <span class="conv-title">{{ c.title || '新对话' }}</span>
           </button>
-          <button class="conv-del" type="button" :aria-label="`删除对话：${c.title || '新对话'}`" title="删除对话" @click.stop="delConv(c)"><el-icon aria-hidden="true"><Delete /></el-icon></button>
+          <span
+            v-if="activeTurnCount(c.id)"
+            class="conv-running"
+            :aria-label="`${activeTurnCount(c.id)} 个任务处理中`"
+            :title="`${activeTurnCount(c.id)} 个任务处理中`"
+          >
+            <el-icon class="is-loading" aria-hidden="true"><Loading /></el-icon>
+            {{ activeTurnCount(c.id) }}
+          </span>
+          <button class="conv-del" type="button" :disabled="conversationNavigationLocked" :aria-label="`删除对话：${c.title || '新对话'}`" title="删除对话" @click.stop="delConv(c)"><el-icon aria-hidden="true"><Delete /></el-icon></button>
         </div>
         <el-empty v-if="!conversations.length" description="暂无对话" :image-size="50" />
       </div>
@@ -42,7 +51,11 @@
           : validationMissingText"
       />
       <div class="chat-messages" ref="msgRef">
-        <div v-if="!messages.length" class="empty-chat">
+        <div v-if="conversationLoading && !messages.length" class="empty-chat" role="status" aria-live="polite">
+          <div class="empty-icon"><el-icon class="is-loading" :size="40" aria-hidden="true"><Loading /></el-icon></div>
+          <div class="empty-title">正在加载对话</div>
+        </div>
+        <div v-else-if="!messages.length" class="empty-chat">
           <div class="empty-icon"><el-icon :size="40"><ChatDotRound /></el-icon></div>
           <div class="empty-title">{{ agentValidationReady ? `${agent?.name || 'Agent'} 可开始验证` : '等待验证配置' }}</div>
           <div class="muted">{{ agentValidationReady
@@ -53,7 +66,7 @@
           </div>
         </div>
 
-        <div v-for="(m, i) in messages" :key="i" class="msg-row" :class="m.role">
+        <div v-for="(m, i) in messages" :key="m.id || i" class="msg-row" :class="m.role">
           <div class="msg-avatar">
             <el-icon><component :is="m.role === 'user' ? 'User' : 'Cpu'" /></el-icon>
           </div>
@@ -113,9 +126,20 @@
               </div>
             </template>
             <!-- 状态提示 -->
-            <div v-if="m.status" class="status-line"><el-icon class="is-loading"><Loading /></el-icon> {{ m.status }}</div>
+            <div v-if="m.status" class="status-line" role="status" aria-live="polite" aria-atomic="true">
+              <el-icon v-if="m.streaming" class="is-loading" aria-hidden="true"><Loading /></el-icon>
+              {{ m.status }}
+            </div>
             <!-- 正文（Markdown token 结构渲染；模型输出不会作为 HTML 注入） -->
             <SafeMarkdown v-if="m.content" :content="m.content" />
+            <div v-if="canRetryTurn(m) || canCancelTurn(m)" class="turn-actions">
+              <el-button v-if="canRetryTurn(m)" size="small" :loading="m.retrying" @click="retryTurn(m)">
+                <el-icon aria-hidden="true"><RefreshRight /></el-icon>重试
+              </el-button>
+              <el-button v-if="canCancelTurn(m)" size="small" type="danger" plain :loading="m.cancelling" @click="stopTurn(m)">
+                <el-icon aria-hidden="true"><CircleClose /></el-icon>取消
+              </el-button>
+            </div>
             <!-- 检索资料来源：由服务端按当前租户和 Agent 已绑定资料库过滤后返回。 -->
             <section v-if="m.citations?.length" class="citation-sources" :aria-labelledby="`citation-title-${i}`">
               <div class="citation-sources-head">
@@ -189,8 +213,8 @@
           ref="composerRef"
           :agent-id="agent?.id || ''"
           :conversation-id="curConv?.id || ''"
-          :disabled="!agentValidationReady"
-          :busy="streaming"
+          :disabled="!agentValidationReady || conversationLoading || currentTurnPending"
+          :busy="currentTurnActive && !conversationLoading"
           :placeholder="agentValidationReady ? '描述业务需求，或上传本次处理所需的文件' : validationMissingText"
           :accepted-attachment-kinds="acceptedAttachmentKinds"
           @submit="send"
@@ -205,8 +229,14 @@
 import { computed, ref, onBeforeUnmount, onMounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api, streamChat } from '@/api'
-import type { Agent, AgentChatRequest, AgentRuntimeCapability, ChatMessage, Conversation, RagCitation } from '@/types'
+import { api } from '@/api'
+import type {
+  Agent,
+  AgentRuntimeCapability,
+  ChatMessage,
+  Conversation,
+  RagCitation,
+} from '@/types'
 import AgentInvocationComposer from '@/components/AgentInvocationComposer.vue'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
@@ -214,6 +244,10 @@ import { actionArtifactAttachment } from '@/utils/artifactAttachments'
 import type { ArtifactAttachment } from '@/utils/artifactAttachments'
 import { actionConfirmationParams } from '@/utils/actionConfirmation'
 import { normalizeAgentReadiness } from '@/utils/agentReadiness'
+import {
+  useAgentDurableTurns,
+  type AgentTurnViewMessage,
+} from '@/composables/useAgentDurableTurns'
 
 const route = useRoute()
 const router = useRouter()
@@ -221,7 +255,6 @@ const agent = ref<Agent | null>(null)
 const runtimeCapabilities = ref<AgentRuntimeCapability[]>([])
 const conversations = ref<Conversation[]>([])
 const curConv = ref<Conversation | null>(null)
-type ChatViewMessage = ChatMessage & { streaming?: boolean; status?: string }
 type CitationPreview = {
   charStart: number
   charEnd: number
@@ -231,15 +264,13 @@ type CitationPreview = {
   source: 'snapshot' | 'current'
 }
 
-const messages = ref<ChatViewMessage[]>([])
-const streaming = ref(false)
+const messages = ref<AgentTurnViewMessage[]>([])
+const conversationLoading = ref(false)
 const composerRef = ref<InstanceType<typeof AgentInvocationComposer>>()
 const msgRef = ref<HTMLElement>()
-let ctrl: AbortController | null = null
-let activeStreamFailed = false
-let activeRequestId = ''
 let viewDisposed = false
 let agentLoadRequest = 0
+let conversationListRequest = 0
 let conversationLoadRequest = 0
 
 const suggestions = [
@@ -319,7 +350,7 @@ function parsedToolResult(value: unknown): any {
   try { return JSON.parse(value) } catch { return value }
 }
 
-function extractMessageAttachments(message: ChatViewMessage): ArtifactAttachment[] {
+function extractMessageAttachments(message: AgentTurnViewMessage): ArtifactAttachment[] {
   const structured = (message.tool_calls || [])
     .map((tool: any) => actionArtifactAttachment(tool))
     .filter((item): item is ArtifactAttachment => Boolean(item))
@@ -659,6 +690,37 @@ function scrollBottom() {
   })
 }
 
+const {
+  conversationNavigationLocked,
+  currentTurnPending,
+  currentTurnActive,
+  streaming,
+  activeTurnCount,
+  recoverActiveTurns,
+  recoverConversationTurns,
+  resetTurnScope,
+  send,
+  canRetryTurn,
+  retryTurn,
+  canCancelTurn,
+  stopTurn,
+  stop,
+} = useAgentDurableTurns({
+  agentId: () => agent.value?.id || '',
+  currentConversation: curConv,
+  messages,
+  conversationLoading,
+  validationReady: agentValidationReady,
+  validationMissingText,
+  invalidateConversationLoad: () => { conversationLoadRequest += 1 },
+  invalidateConversationList: () => { conversationListRequest += 1 },
+  refreshConversations: loadConvs,
+  openConversation: openConv,
+  clearComposerAfterAccepted: () => composerRef.value?.clearAfterAccepted(),
+  normalizeCitations: citationsOf,
+  scrollBottom,
+})
+
 async function loadAgent() {
   const requestedId = String(route.params.id || '')
   const requestId = ++agentLoadRequest
@@ -678,36 +740,87 @@ async function loadAgent() {
   }
   agent.value = loadedAgent
   runtimeCapabilities.value = loadedCapabilities
-  void loadConvs()
+  void loadConvs(true)
 }
 
-function streamErrorContent(content: string, error: unknown) {
-  const separator = content ? '\n\n' : ''
-  return `${content}${separator}[错误] ${String(error)}`
+function requestErrorMessage(error: any, fallback: string) {
+  const detail = error?.detail ?? error?.response?.data?.detail
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (detail && typeof detail.message === 'string' && detail.message.trim()) return detail.message
+  return typeof error?.message === 'string' && error.message.trim() ? error.message : fallback
 }
-async function loadConvs() {
+
+async function loadConvs(recoverActive = false): Promise<Conversation[]> {
   const currentAgentId = agent.value?.id
   const requestId = agentLoadRequest
-  if (!currentAgentId) return
+  const listRequest = ++conversationListRequest
+  const selectionRequest = conversationLoadRequest
+  const selectedConversationId = curConv.value?.id || ''
+  if (!currentAgentId) return []
   const loaded = await api.listConversations(currentAgentId)
   if (
     viewDisposed
     || requestId !== agentLoadRequest
     || agent.value?.id !== currentAgentId
-  ) return
-  conversations.value = loaded
+  ) return loaded
+  if (listRequest === conversationListRequest) conversations.value = loaded
+  if (!recoverActive) return loaded
+  try {
+    const [activeRuns, recentRuns] = await Promise.all([
+      api.listAgentTurns(currentAgentId, { activeOnly: true, limit: 100 }),
+      api.listAgentTurns(currentAgentId, { limit: 100 }),
+    ])
+    if (
+      viewDisposed
+      || requestId !== agentLoadRequest
+      || agent.value?.id !== currentAgentId
+    ) return loaded
+    recoverActiveTurns(activeRuns)
+    if (
+      selectionRequest !== conversationLoadRequest
+      || (curConv.value?.id || '') !== selectedConversationId
+    ) return loaded
+    const recoveredRun = activeRuns[0] || recentRuns[0]
+    const conversation = conversations.value.find((item) => item.id === recoveredRun?.conversation_id)
+    if (conversation) void openConv(conversation)
+  } catch {
+    // Conversation history remains usable when turn recovery is unavailable.
+  }
+  return loaded
 }
+
 async function newConv() {
+  if (conversationNavigationLocked.value) return
   conversationLoadRequest += 1
+  conversationLoading.value = false
   curConv.value = null
   messages.value = []
 }
-async function openConv(c: Conversation) {
+
+function messageFromHistory(message: ChatMessage): AgentTurnViewMessage {
+  const resultById = new Map((message.tool_results || []).map((result: any) => [result.id, result]))
+  return {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    citations: citationsOf(message.citations),
+    tool_calls: (message.tool_calls || []).map((toolCall: any) => ({
+      ...toolCall,
+      args: toolCall.args ?? toolCall.arguments ?? {},
+      result: resultById.get(toolCall.id)?.result,
+      _open: false,
+      status: 'done',
+    })),
+  }
+}
+
+async function openConv(c: Conversation, clearMessages = true) {
   const request = ++conversationLoadRequest
   const requestedConversationId = c.id
   const requestedAgentId = agent.value?.id
   curConv.value = c
-  messages.value = []
+  if (clearMessages) messages.value = []
+  conversationLoading.value = true
   try {
     const loadedMessages = await api.listMessages(requestedConversationId)
     if (
@@ -716,30 +829,53 @@ async function openConv(c: Conversation) {
       || curConv.value?.id !== requestedConversationId
       || agent.value?.id !== requestedAgentId
     ) return
-    messages.value = loadedMessages.map((message) => {
-      const resultById = new Map((message.tool_results || []).map((result: any) => [result.id, result]))
-      return {
-        id: message.id,
-        role: message.role,
-        content: message.content,
-        citations: citationsOf(message.citations),
-        tool_calls: (message.tool_calls || []).map((toolCall: any) => ({
-          ...toolCall,
-          args: toolCall.args ?? toolCall.arguments ?? {},
-          result: resultById.get(toolCall.id)?.result,
-          _open: false,
-          status: 'done',
-        })),
-      }
-    })
+    messages.value = loadedMessages.map(messageFromHistory)
     scrollBottom()
-  } catch (error: any) {
+
+    try {
+      const [recentConversationRuns, activeConversationRuns] = requestedAgentId
+        ? await Promise.all([
+          api.listAgentTurns(requestedAgentId, {
+            conversationId: requestedConversationId,
+            limit: 100,
+          }),
+          api.listAgentTurns(requestedAgentId, {
+            conversationId: requestedConversationId,
+            activeOnly: true,
+            limit: 100,
+          }),
+        ])
+        : [[], []]
+      if (
+        viewDisposed
+        || request !== conversationLoadRequest
+        || curConv.value?.id !== requestedConversationId
+        || agent.value?.id !== requestedAgentId
+      ) return
+      recoverConversationTurns([...recentConversationRuns, ...activeConversationRuns])
+      scrollBottom()
+    } catch (error: unknown) {
+      if (
+        !viewDisposed
+        && request === conversationLoadRequest
+        && curConv.value?.id === requestedConversationId
+        && agent.value?.id === requestedAgentId
+      ) ElMessage.warning(requestErrorMessage(error, '对话已加载，但任务状态恢复失败'))
+    }
+  } catch (error: unknown) {
     if (
       !viewDisposed
       && request === conversationLoadRequest
       && curConv.value?.id === requestedConversationId
       && agent.value?.id === requestedAgentId
-    ) ElMessage.error(error?.message || '对话记录加载失败')
+    ) ElMessage.error(requestErrorMessage(error, '对话记录加载失败'))
+  } finally {
+    if (
+      !viewDisposed
+      && request === conversationLoadRequest
+      && curConv.value?.id === requestedConversationId
+      && agent.value?.id === requestedAgentId
+    ) conversationLoading.value = false
   }
 }
 async function delConv(c: Conversation) {
@@ -753,128 +889,8 @@ async function delConv(c: Conversation) {
   }
 }
 
-function invocationMessage(payload: AgentChatRequest) {
-  if (payload.message.trim()) return payload.message.trim()
-  if (payload.attachments?.length) return `已上传 ${payload.attachments.length} 个文件，请根据文件内容完成业务需求。`
-  return ''
-}
-
 function useSuggestion(text: string) {
   composerRef.value?.submitMessage(text)
-}
-
-function send(payload: AgentChatRequest) {
-  if (!agentValidationReady.value) {
-    ElMessage.warning(validationMissingText.value)
-    return
-  }
-  if (streaming.value) return
-  conversationLoadRequest += 1
-  const msg = invocationMessage(payload)
-  messages.value.push({ role: 'user', content: msg })
-  messages.value.push({ role: 'assistant', content: '', tool_calls: [], streaming: true, status: '正在思考…' })
-  const ai = messages.value[messages.value.length - 1]!
-  streaming.value = true
-  activeStreamFailed = false
-  activeRequestId = payload.idempotency_key || ''
-  const hasPinnedConversation = Object.prototype.hasOwnProperty.call(payload, 'conversation_id')
-  const targetConversationId = hasPinnedConversation
-    ? payload.conversation_id || undefined
-    : curConv.value?.id
-  const isNewConv = !targetConversationId
-  scrollBottom()
-
-  ctrl = streamChat(
-    agent.value!.id!,
-    { ...payload, conversation_id: targetConversationId },
-    (ev) => handleEvent(ev, ai),
-    () => finish(ai, isNewConv),
-    (e) => {
-      activeStreamFailed = true
-      ai.status = ''
-      ai.streaming = false
-      ai.content = streamErrorContent(ai.content, e.message)
-      streaming.value = false
-      ctrl = null
-      ElMessage.error('对话出错：' + e.message)
-    },
-  )
-}
-
-function handleEvent(ev: { type: string; data: any }, ai: ChatViewMessage) {
-  if (activeRequestId) {
-    composerRef.value?.acknowledgeQueued(activeRequestId)
-    activeRequestId = ''
-  }
-  switch (ev.type) {
-    case 'status':
-      ai.status = ev.data
-      break
-    case 'tool_call':
-      ai.status = ''
-      ai.tool_calls = ai.tool_calls || []
-      ai.tool_calls.push({ id: ev.data.id, name: ev.data.name, args: ev.data.arguments, status: 'running', _open: true })
-      break
-    case 'tool_result': {
-      const tc = (ai.tool_calls || []).find((t: any) => t.id === ev.data.id)
-        || [...(ai.tool_calls || [])].reverse().find((t: any) => t.status === 'running')
-      if (tc) {
-        tc.status = 'done'
-        tc.result = ev.data.result
-      }
-      break
-    }
-    case 'citations':
-      ai.citations = citationsOf(ev.data)
-      break
-    case 'token':
-      ai.status = ''
-      ai.content += ev.data
-      break
-    case 'done':
-      break
-    case 'error':
-      activeStreamFailed = true
-      ai.status = ''
-      ai.content = streamErrorContent(ai.content, ev.data)
-      break
-  }
-  scrollBottom()
-}
-
-async function finish(ai: ChatViewMessage, isNewConv = false) {
-  const succeeded = !activeStreamFailed
-  ai.streaming = false
-  ai.status = ''
-  streaming.value = false
-  ctrl = null
-  activeRequestId = ''
-  if (succeeded) composerRef.value?.clearAfterSuccess()
-  try {
-    await loadConvs()
-  } catch {
-    ElMessage.warning('调用已完成，但会话列表刷新失败')
-  }
-  if (isNewConv && conversations.value.length) {
-    curConv.value = conversations.value[0]
-  }
-  scrollBottom()
-}
-
-function cancelActiveStream() {
-  activeStreamFailed = true
-  for (const message of messages.value) {
-    if (!message.streaming) continue
-    message.streaming = false
-    message.status = ''
-  }
-  ctrl?.abort()
-  ctrl = null
-  streaming.value = false
-}
-
-function stop() {
-  cancelActiveStream()
 }
 
 onMounted(() => {
@@ -883,7 +899,7 @@ onMounted(() => {
 })
 watch(() => route.params.id, (nextId, previousId) => {
   if (!previousId || nextId === previousId) return
-  cancelActiveStream()
+  resetTurnScope()
   conversationLoadRequest += 1
   agent.value = null
   runtimeCapabilities.value = []
@@ -896,7 +912,6 @@ onBeforeUnmount(() => {
   viewDisposed = true
   agentLoadRequest += 1
   conversationLoadRequest += 1
-  cancelActiveStream()
   document.getElementById('main-content')?.classList.remove('agent-chat-active')
 })
 </script>
@@ -918,6 +933,7 @@ onBeforeUnmount(() => {
 .validation-notice { flex: 0 0 auto; margin: 12px 34px 0; }
 .chat-layout button, .chat-layout :deep(.el-button) { touch-action: manipulation; }
 .chat-layout :deep(.el-button) { min-height: 44px; }
+.turn-actions { display: flex; margin-top: 10px; }
 .side-head :deep(.el-button) { min-width: 44px; }
 .agent-title { flex: 1; min-width: 0; }
 .agent-name {
@@ -950,6 +966,7 @@ onBeforeUnmount(() => {
 .conv-open { display: flex; min-width: 0; min-height: 44px; flex: 1; align-items: center; gap: 8px; padding: 0; border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; text-align: left; }
 .conv-open:focus-visible, .conv-del:focus-visible, .sug:focus-visible, .attach-name:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: 2px; }
 .conv-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-running { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 3px; color: var(--warning); font-size: 12px; font-weight: 600; }
 .conv-del { opacity: .72; transition: opacity var(--dur), color var(--dur), background var(--dur); width: 44px; height: 44px; border: 0; border-radius: 9px; background: transparent; color: var(--text-3); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .conv-item:hover .conv-del { opacity: 1; }
 .conv-del:hover, .conv-del:focus-visible { opacity: 1; color: var(--danger); background: var(--danger-soft); }

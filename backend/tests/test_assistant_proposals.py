@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine, event, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.database import Base
@@ -20,10 +21,13 @@ from app.models import (
     ActionExecutionLog,
     Agent,
     AssistantAttachment,
+    AssistantAuditLog,
     AssistantCompilationJob,
     AssistantMessage,
+    AssistantRequestRun,
     AssistantRouteDecision,
     AssistantThread,
+    AuthorizationGrant,
     BusinessScenario,
     Conversation,
     LLMConfig,
@@ -42,7 +46,9 @@ from app.models import (
 from app.routers import agents, assistant, scenarios
 from app.schemas import ActionExecuteRequest, AssistantChatRequest, AssistantProposalApplyRequest, ChatRequest
 from app.services import (
+    agent_turn_service,
     assistant_orchestrator,
+    assistant_request_run_service,
     datasource_service,
     operations_service,
     permission_service,
@@ -76,7 +82,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         )
         self.db.add_all([self.tenant, self.user])
         self.db.commit()
-        permission_service.ensure_organization(
+        self.organization = permission_service.ensure_organization(
             self.db,
             self.tenant.id,
             owner_user_id=self.user.id,
@@ -116,6 +122,15 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         )
         self.db.add(thread)
         self.db.flush()
+        source_message = None
+        if kind in assistant._LEGACY_MODELING_PROPOSAL_KINDS:
+            source_message = AssistantMessage(
+                thread_id=thread.id,
+                role="user",
+                content="测试中的已认证纯文本建模说明",
+            )
+            self.db.add(source_message)
+            self.db.flush()
         message = AssistantMessage(
             thread_id=thread.id,
             role="assistant",
@@ -123,6 +138,21 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             proposal=proposal,
         )
         self.db.add(message)
+        self.db.flush()
+        if source_message is not None:
+            message.context = {
+                assistant._LEGACY_MODELING_SOURCE_EVIDENCE_KEY: (
+                    assistant._legacy_modeling_source_evidence(
+                        kind=kind,
+                        thread_id=thread.id,
+                        assistant_message_id=message.id,
+                        proposal=proposal,
+                        user_message_id=source_message.id,
+                        user_message=source_message.content,
+                        modeling_material_sources=[],
+                    )
+                )
+            }
         self.db.commit()
         return thread, message
 
@@ -175,6 +205,297 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 await response.body_iterator.aclose()
                 break
         return "".join(chunks)
+
+    def _durable_assistant_request(
+        self,
+        suffix: str,
+        *,
+        status: str = "queued",
+        committed_status: str = "",
+        committed_run_id: str | None = None,
+        payload_document: dict | None = None,
+        lease_generation: int = 0,
+        lease_token: str = "",
+        lease_expires_at: datetime | None = None,
+    ) -> tuple[str, str, str, str]:
+        request_id = f"durable-{suffix}"
+        run_id = f"request-run-{suffix}"
+        thread_id = assistant._assistant_request_message_id(
+            "thread",
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+            request_id=request_id,
+        )
+        user_message_id = assistant._assistant_request_message_id(
+            "user",
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+            request_id=request_id,
+        )
+        assistant_message_id = assistant._assistant_request_message_id(
+            "assistant",
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+            request_id=request_id,
+        )
+        path = f"/durable/{suffix}"
+        payload = payload_document or {
+            "message": "请继续处理本次请求",
+            "request_id": request_id,
+            "thread_id": thread_id,
+            "path": path,
+            "mode": "ask",
+        }
+        scenario_id = str(payload.get("scenario_id") or "") or None
+        thread = AssistantThread(
+            id=thread_id,
+            tenant_id=self.tenant.id,
+            created_by_user_id=self.user.id,
+            scenario_id=scenario_id,
+            scope_key=assistant._context_scope(
+                scenario_id,
+                str(payload.get("path") or ""),
+            ),
+            title="持久助手请求",
+        )
+        user_message = AssistantMessage(
+            id=user_message_id,
+            thread_id=thread_id,
+            role="user",
+            content=str(payload.get("message") or "本次请求"),
+            context={"request_id": request_id},
+        )
+        assistant_context = {
+            "assistant_request_run_id": (
+                committed_run_id if committed_run_id is not None else run_id
+            ),
+            "assistant_request_status": committed_status or status,
+            "assistant_request_revision": 1,
+        }
+        if committed_status == "failure_committed":
+            assistant_context["assistant_request_error_code"] = "provider_unavailable"
+        assistant_message = AssistantMessage(
+            id=assistant_message_id,
+            thread_id=thread_id,
+            role="assistant",
+            content=(
+                "模型服务暂时不可用，请显式重试。"
+                if committed_status == "failure_committed"
+                else "已形成可恢复结果。"
+                if committed_status == "result_committed"
+                else "正在等待后台处理。"
+            ),
+            context=assistant_context,
+        )
+        now = datetime.now(timezone.utc)
+        run = AssistantRequestRun(
+            id=run_id,
+            tenant_id=self.tenant.id,
+            requested_by_user_id=self.user.id,
+            request_id=request_id,
+            request_fingerprint="a" * 64,
+            thread_id=thread_id,
+            user_message_id=user_message_id,
+            assistant_message_id=assistant_message_id,
+            payload_document=payload,
+            upload_run_ids=list(payload.get("upload_run_ids") or []),
+            status=status,
+            revision=2 if status == "running" else 1,
+            lease_token=lease_token,
+            lease_generation=lease_generation,
+            lease_expires_at=lease_expires_at,
+            available_at=now - timedelta(seconds=1),
+            created_at=now,
+            updated_at=now,
+        )
+        self.db.add(thread)
+        self.db.flush()
+        self.db.add_all([user_message, assistant_message])
+        self.db.flush()
+        self.db.add(run)
+        self.db.commit()
+        return run_id, thread_id, user_message_id, assistant_message_id
+
+    def test_assistant_route_fingerprint_rejects_non_finite_json(self) -> None:
+        payload = AssistantChatRequest.model_construct(
+            message="invalid numeric selection",
+            selection={"params": {"threshold": float("nan")}},
+        )
+
+        with self.assertRaises(HTTPException) as exc_info:
+            assistant._assistant_route_fingerprint(
+                payload,
+                scope_key="scenario:global|path:/",
+            )
+
+        self.assertEqual(exc_info.exception.status_code, 422)
+        self.assertEqual(
+            exc_info.exception.detail["code"],
+            "invalid_assistant_request",
+        )
+
+    def test_manual_request_retry_creates_immutable_child_and_stable_replay(self) -> None:
+        run_id, _thread_id, _user_message_id, assistant_message_id = (
+            self._durable_assistant_request("immutable-retry", status="failed")
+        )
+        parent = self.db.get(AssistantRequestRun, run_id)
+        parent.error_code = "provider_unavailable"
+        parent.error_message = "test failure"
+        parent.finished_at = datetime.now(timezone.utc)
+        self.db.commit()
+        parent_revision = parent.revision
+
+        retried = assistant_request_run_service.retry_request(
+            self.db,
+            parent.id,
+            expected_revision=parent_revision,
+            idempotency_key="assistant-immutable-retry-1",
+        )
+
+        self.db.refresh(parent)
+        self.assertNotEqual(retried["id"], parent.id)
+        self.assertEqual(retried["parent_run_id"], parent.id)
+        self.assertEqual(retried["status"], "waiting_upload")
+        self.assertEqual(parent.status, "failed")
+        self.assertEqual(parent.revision, parent_revision)
+        self.assertEqual(parent.error_code, "provider_unavailable")
+        replay = assistant_request_run_service.retry_request(
+            self.db,
+            parent.id,
+            expected_revision=parent_revision + 100,
+            idempotency_key="assistant-immutable-retry-1",
+        )
+        self.assertEqual(replay["id"], retried["id"])
+        with self.assertRaises(assistant_request_run_service.AssistantRequestConflict):
+            assistant_request_run_service.retry_request(
+                self.db,
+                parent.id,
+                expected_revision=parent_revision,
+                idempotency_key="assistant-immutable-retry-2",
+            )
+
+        child = self.db.get(AssistantRequestRun, retried["id"])
+        child.status = "failed"
+        child.revision += 1
+        child.error_code = "retry_failed"
+        child.error_message = "test retry failure"
+        child.finished_at = datetime.now(timezone.utc)
+        self.db.commit()
+        grandchild = assistant_request_run_service.retry_request(
+            self.db,
+            child.id,
+            expected_revision=child.revision,
+            idempotency_key="assistant-immutable-retry-3",
+        )
+        self.assertEqual(grandchild["parent_run_id"], child.id)
+        parent_message = self.db.get(AssistantMessage, assistant_message_id)
+        self.assertEqual(parent_message.context["assistant_request_run_id"], parent.id)
+        self.assertEqual(parent_message.context["assistant_request_status"], "failed")
+        grandchild_run = self.db.get(AssistantRequestRun, grandchild["id"])
+        self.assertNotEqual(grandchild_run.assistant_message_id, assistant_message_id)
+        grandchild_message = self.db.get(
+            AssistantMessage, grandchild_run.assistant_message_id
+        )
+        self.assertEqual(
+            grandchild_message.context["assistant_request_run_id"], grandchild["id"]
+        )
+
+    def test_retry_child_worker_reconciles_canonical_message(self) -> None:
+        run_id, _thread_id, _user_message_id, parent_assistant_message_id = (
+            self._durable_assistant_request("retry-worker", status="failed")
+        )
+        parent = self.db.get(AssistantRequestRun, run_id)
+        parent.error_code = "provider_unavailable"
+        parent.error_message = "test failure"
+        parent.finished_at = datetime.now(timezone.utc)
+        self.db.commit()
+        retried = assistant_request_run_service.retry_request(
+            self.db,
+            parent.id,
+            expected_revision=parent.revision,
+            idempotency_key="assistant-retry-worker-child",
+        )
+        child_id = retried["id"]
+        factory = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
+
+        def commit_child_result(
+            payload,
+            tenant_id,
+            user_id,
+            claimed_run_id,
+            _lease_token,
+            _lease_generation,
+        ) -> None:
+            expected_message_id = assistant_request_run_service.request_message_id(
+                "assistant",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                request_id=str(payload["request_id"]),
+            )
+            with factory() as executor_db:
+                child = executor_db.get(AssistantRequestRun, claimed_run_id)
+                self.assertEqual(child.assistant_message_id, expected_message_id)
+                message = executor_db.get(AssistantMessage, expected_message_id)
+                self.assertIsNotNone(message)
+                message.content = "已形成可恢复结果。"
+                message.context = {
+                    **dict(message.context or {}),
+                    "assistant_request_run_id": claimed_run_id,
+                    "assistant_request_status": "result_committed",
+                }
+                executor_db.commit()
+
+        with patch.object(assistant_request_run_service, "SessionLocal", factory):
+            self.assertTrue(
+                assistant_request_run_service.process_request(
+                    child_id,
+                    commit_child_result,
+                )
+            )
+
+        self.db.expire_all()
+        child = self.db.get(AssistantRequestRun, child_id)
+        parent = self.db.get(AssistantRequestRun, run_id)
+        parent_message = self.db.get(
+            AssistantMessage, parent_assistant_message_id
+        )
+        child_message = self.db.get(AssistantMessage, child.assistant_message_id)
+        self.assertEqual(child.status, "succeeded")
+        self.assertEqual(child_message.context["assistant_request_status"], "succeeded")
+        self.assertEqual(parent.status, "failed")
+        self.assertEqual(
+            parent_message.context["assistant_request_run_id"], parent.id
+        )
+
+    def test_request_retry_recovers_child_after_commit_integrity_signal(self) -> None:
+        run_id, _thread_id, _user_message_id, _assistant_message_id = (
+            self._durable_assistant_request("retry-uncertain", status="failed")
+        )
+        parent = self.db.get(AssistantRequestRun, run_id)
+        parent.error_code = "provider_unavailable"
+        parent.finished_at = datetime.now(timezone.utc)
+        self.db.commit()
+        committed = self.db.commit
+
+        def commit_then_signal_integrity() -> None:
+            committed()
+            raise IntegrityError("simulated concurrent insert", {}, RuntimeError())
+
+        with patch.object(
+            self.db,
+            "commit",
+            side_effect=commit_then_signal_integrity,
+        ):
+            replay = assistant_request_run_service.retry_request(
+                self.db,
+                parent.id,
+                expected_revision=parent.revision,
+                idempotency_key="assistant-retry-uncertain-child",
+            )
+
+        persisted = self.db.get(AssistantRequestRun, replay["id"])
+        self.assertEqual(persisted.parent_run_id, parent.id)
+        self.assertEqual(persisted.request_id, "assistant-retry-uncertain-child")
 
     def test_global_scenario_proposal_requires_confirmation_and_keeps_attachment_temporary(self) -> None:
         attachment = AssistantAttachment(
@@ -246,7 +567,174 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             1,
         )
 
-    def test_mapping_proposal_revalidates_schema_and_saves_definition_without_import(self) -> None:
+    def test_legacy_modeling_ignores_invocation_attachment_and_seals_allowed_sources(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="来源隔离场景",
+            status="active",
+        )
+        attachment = AssistantAttachment(
+            tenant_id=self.tenant.id,
+            created_by_user_id=self.user.id,
+            filename="runtime-input.csv",
+            status="parsed",
+            parsed_text="INVOCATION_ONLY_SECRET_COLUMN",
+        )
+        self.db.add_all([scenario, attachment])
+        self.db.commit()
+        modeling_source = {
+            "id": "rag:modeling-source:modeling-chunk",
+            "kind": "rag",
+            "citation_id": "M1",
+            "filename": "建模资料.md",
+            "status": "cited",
+            "data_source_id": "modeling-source",
+            "file_id": "modeling-file",
+            "chunk_id": "modeling-chunk",
+            "content_hash": "a" * 64,
+            "file_content_hash": "b" * 64,
+            "index_version": "rag-v1",
+            "char_start": 0,
+            "char_end": 32,
+        }
+        route_plan = assistant_orchestrator.AssistantRoutePlan(
+            intent="ontology",
+            decision=assistant_orchestrator.AssistantSemanticDecision(
+                goal="create",
+                scope="ontology",
+                confidence="high",
+                reason="用户明确要求创建本体",
+            ),
+            source="model",
+        )
+        observed: dict[str, str] = {}
+
+        def generate(_db, _scenario, description):
+            observed["description"] = description
+            return {"entities": [], "relations": []}
+
+        with (
+            patch.object(assistant, "_request_route_plan", return_value=route_plan),
+            patch.object(
+                assistant,
+                "_authorized_rag_context",
+                return_value=("MODELING_MATERIAL_FACT", [modeling_source]),
+            ),
+            patch.object(
+                assistant.ontology_service,
+                "generate_ontology",
+                side_effect=generate,
+            ),
+        ):
+            reply = assistant.chat(
+                AssistantChatRequest(
+                    message="请建立对象类型",
+                    scenario_id=scenario.id,
+                    path=f"/scenarios/{scenario.id}",
+                    mode="draft",
+                    draft_kind="ontology",
+                    attachment_ids=[attachment.id],
+                ),
+                self.db,
+            )
+
+        self.assertIn("MODELING_MATERIAL_FACT", observed["description"])
+        self.assertNotIn("INVOCATION_ONLY_SECRET_COLUMN", observed["description"])
+        saved = self.db.execute(
+            select(AssistantMessage)
+            .where(
+                AssistantMessage.thread_id == reply.thread_id,
+                AssistantMessage.role == "assistant",
+            )
+            .order_by(AssistantMessage.created_at.desc())
+        ).scalars().first()
+        evidence = saved.context[assistant._LEGACY_MODELING_SOURCE_EVIDENCE_KEY]
+        self.assertEqual(evidence["kind"], "ontology")
+        self.assertEqual(
+            evidence["modeling_material_sources"][0]["data_source_id"],
+            "modeling-source",
+        )
+        self.assertEqual(
+            {item.get("kind") for item in saved.attachments},
+            {"assistant_attachment", "rag"},
+        )
+
+    def test_legacy_modeling_apply_rejects_missing_persisted_source_evidence(self) -> None:
+        proposal = assistant._build_proposal(
+            "scenario",
+            {
+                "name": "不可验证场景",
+                "description": "不应写入",
+                "industry": "",
+                "status": "draft",
+            },
+        )
+        thread, message = self._proposal_message(kind="scenario", proposal=proposal)
+        message.context = {}
+        self.db.commit()
+
+        with self.assertRaises(HTTPException) as rejected:
+            assistant.apply_proposal(
+                AssistantProposalApplyRequest(
+                    kind="scenario",
+                    thread_id=thread.id,
+                    proposal_id=proposal["proposal_id"],
+                    confirm=True,
+                ),
+                self.db,
+            )
+
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertIn("建模来源证明", str(rejected.exception.detail))
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(BusinessScenario)),
+            0,
+        )
+
+    def test_legacy_ontology_proposal_is_read_only_and_cannot_apply(self) -> None:
+        scenario = BusinessScenario(
+            tenant_id=self.tenant.id,
+            name="只读本体建议",
+            status="draft",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        proposal = assistant._build_proposal(
+            "ontology",
+            {
+                "entities": [{"name": "订单", "properties": []}],
+                "relations": [],
+            },
+            scenario,
+        )
+        self.assertEqual(proposal["status"], "read_only")
+        self.assertFalse(proposal["requires_confirmation"])
+        thread, _message = self._proposal_message(
+            kind="ontology",
+            proposal=proposal,
+            scenario=scenario,
+        )
+
+        with self.assertRaises(HTTPException) as rejected:
+            assistant.apply_proposal(
+                AssistantProposalApplyRequest(
+                    kind="ontology",
+                    scenario_id=scenario.id,
+                    thread_id=thread.id,
+                    proposal_id=proposal["proposal_id"],
+                    confirm=True,
+                ),
+                self.db,
+            )
+
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertIn("完整场景建模", str(rejected.exception.detail))
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyEntity)),
+            0,
+        )
+
+    def test_legacy_mapping_proposal_is_read_only_and_never_saves_definition(self) -> None:
         scenario = BusinessScenario(
             tenant_id=self.tenant.id,
             name="采购映射",
@@ -295,6 +783,8 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             "column_map": {"申请编号": "request_no", "金额": "amount"},
         }
         proposal = assistant._build_proposal("mapping", data, scenario)
+        self.assertEqual(proposal["status"], "read_only")
+        self.assertFalse(proposal["requires_confirmation"])
         thread, _message = self._proposal_message(
             kind="mapping",
             proposal=proposal,
@@ -311,8 +801,8 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                     {"name": "amount", "type": "NUMERIC", "pk": False},
                 ],
             }],
-        ):
-            result = assistant.apply_proposal(
+        ) as list_tables, self.assertRaises(HTTPException) as rejected:
+            assistant.apply_proposal(
                 AssistantProposalApplyRequest(
                     kind="mapping",
                     scenario_id=scenario.id,
@@ -322,9 +812,13 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 ),
                 self.db,
             )
-        mapping = self.db.get(DataMapping, result["data"]["mapping_id"])
-        self.assertEqual(mapping.column_map, data["column_map"])
-        self.assertTrue(result["data"]["refresh_required"])
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertIn("完整场景建模", str(rejected.exception.detail))
+        list_tables.assert_not_called()
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(DataMapping)),
+            0,
+        )
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(OntologyInstance)),
             0,
@@ -1627,7 +2121,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.assertEqual(replay["execution_summary"]["current_task_id"], "mapping")
         self.assertEqual(replay["next_action"]["task_id"], "mapping")
 
-    def test_mapping_apply_rejects_stale_or_invented_columns(self) -> None:
+    def test_legacy_mapping_apply_stays_read_only_before_schema_access(self) -> None:
         scenario = BusinessScenario(
             tenant_id=self.tenant.id,
             name="失效映射",
@@ -1672,19 +2166,16 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             proposal=proposal,
             scenario=scenario,
         )
-        with (
-            patch.object(
-                assistant.datasource_service,
-                "list_tables",
-                return_value=[{
-                    "name": "orders",
-                    "columns": [{
-                        "name": "order_no", "type": "TEXT", "pk": True,
-                    }],
+        with patch.object(
+            assistant.datasource_service,
+            "list_tables",
+            return_value=[{
+                "name": "orders",
+                "columns": [{
+                    "name": "order_no", "type": "TEXT", "pk": True,
                 }],
-            ),
-            self.assertRaisesRegex(ValueError, "不存在的源字段"),
-        ):
+            }],
+        ) as list_tables, self.assertRaises(HTTPException) as rejected:
             assistant.apply_proposal(
                 AssistantProposalApplyRequest(
                     kind="mapping",
@@ -1695,6 +2186,9 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 ),
                 self.db,
             )
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertIn("完整场景建模", str(rejected.exception.detail))
+        list_tables.assert_not_called()
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(DataMapping)),
             0,
@@ -1798,7 +2292,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             before_scenarios,
         )
 
-    def test_legacy_name_only_proposal_is_rejected_as_unverifiable(self) -> None:
+    def test_legacy_workflow_apply_is_read_only_even_with_legacy_snapshot(self) -> None:
         scenario = BusinessScenario(
             tenant_id=self.tenant.id,
             name="旧提案",
@@ -1819,7 +2313,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         thread, _message = self._proposal_message(
             kind="workflow", proposal=proposal, scenario=scenario
         )
-        with self.assertRaisesRegex(Exception, "重新生成"):
+        with self.assertRaises(HTTPException) as rejected:
             assistant.apply_proposal(
                 AssistantProposalApplyRequest(
                     kind="workflow",
@@ -1830,8 +2324,14 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 ),
                 self.db,
             )
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertIn("完整场景建模", str(rejected.exception.detail))
+        self.assertEqual(
+            self.db.scalar(select(func.count()).select_from(OntologyWorkflow)),
+            0,
+        )
 
-    def test_invalid_workflow_reference_returns_422_and_writes_nothing(self) -> None:
+    def test_legacy_workflow_reference_proposal_never_reaches_formal_validation(self) -> None:
         scenario = BusinessScenario(
             tenant_id=self.tenant.id,
             name="无正式操作场景",
@@ -1878,8 +2378,8 @@ class AssistantGovernedProposalTests(unittest.TestCase):
                 self.db,
             )
 
-        self.assertEqual(rejected.exception.status_code, 422)
-        self.assertIn("没有可引用的正式操作", str(rejected.exception.detail))
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertIn("完整场景建模", str(rejected.exception.detail))
         self.assertEqual(
             self.db.scalar(select(func.count()).select_from(OntologyWorkflow)),
             0,
@@ -2542,7 +3042,7 @@ class AssistantGovernedProposalTests(unittest.TestCase):
             0,
         )
 
-    def test_agent_stream_action_preview_has_a_durable_parent_before_tool_result(self) -> None:
+    def test_agent_turn_action_preview_has_a_durable_parent_before_tool_result(self) -> None:
         scenario = BusinessScenario(
             tenant_id=self.tenant.id,
             name="Agent FK 预演",
@@ -2627,12 +3127,21 @@ class AssistantGovernedProposalTests(unittest.TestCase):
 
         with (
             patch.object(agents, "SessionLocal", factory),
+            patch.object(agent_turn_service, "SessionLocal", factory),
             patch.object(agents.agent_engine, "run_agent", fake_run_agent),
         ):
-            response = agents.chat(agent.id, ChatRequest(message="请预演 Action"), self.db)
-            body = asyncio.run(self._consume_until(response, '"type": "tool_result"'))
+            queued = agent_turn_service.enqueue_turn(
+                self.db,
+                agent.id,
+                ChatRequest(
+                    message="请预演 Action",
+                    idempotency_key="agent-preview-durable-parent",
+                ),
+            )
+            self.assertTrue(
+                agent_turn_service.process_turn(queued["id"], agents.invoke_agent_once)
+            )
 
-        self.assertIn('"type": "tool_result"', body)
         self.db.expire_all()
         log = self.db.execute(
             select(ActionExecutionLog).where(ActionExecutionLog.target_id == action.id)
@@ -2641,6 +3150,456 @@ class AssistantGovernedProposalTests(unittest.TestCase):
         self.assertIsNotNone(parent)
         self.assertEqual(parent.tool_results[0]["name"], "execute_action")
         self.assertTrue(parent.stream_finalized)
+
+    def test_durable_request_post_commit_outcome_survives_executor_error(self) -> None:
+        factory = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
+        cases = (
+            ("success", "result_committed", "succeeded", True),
+            ("failure", "failure_committed", "failed", False),
+        )
+
+        for suffix, committed_status, expected_status, expected_processed in cases:
+            with self.subTest(committed_status=committed_status):
+                run_id, _thread_id, _user_message_id, assistant_message_id = (
+                    self._durable_assistant_request(suffix)
+                )
+
+                def commit_then_raise(
+                    _payload,
+                    _tenant_id,
+                    _user_id,
+                    claimed_run_id,
+                    _lease_token,
+                    _lease_generation,
+                ):
+                    with factory() as executor_db:
+                        message = executor_db.get(AssistantMessage, assistant_message_id)
+                        self.assertIsNotNone(message)
+                        message.content = (
+                            "已形成可恢复结果。"
+                            if committed_status == "result_committed"
+                            else "模型服务暂时不可用，请显式重试。"
+                        )
+                        message.context = {
+                            **dict(message.context or {}),
+                            "assistant_request_run_id": claimed_run_id,
+                            "assistant_request_status": committed_status,
+                            "assistant_request_error_code": (
+                                "provider_unavailable"
+                                if committed_status == "failure_committed"
+                                else ""
+                            ),
+                        }
+                        executor_db.commit()
+                    raise RuntimeError("simulated crash after committed message")
+
+                with (
+                    patch.object(assistant_request_run_service, "SessionLocal", factory),
+                    patch.object(
+                        assistant_request_run_service,
+                        "_upload_state",
+                        return_value=("ready", "", ""),
+                    ),
+                ):
+                    processed = assistant_request_run_service.process_request(
+                        run_id, commit_then_raise
+                    )
+
+                self.assertEqual(processed, expected_processed)
+                with factory() as check_db:
+                    run = check_db.get(AssistantRequestRun, run_id)
+                    message = check_db.get(AssistantMessage, assistant_message_id)
+                    self.assertEqual(run.status, expected_status)
+                    self.assertEqual(
+                        message.context["assistant_request_status"], expected_status
+                    )
+                    if expected_status == "failed":
+                        self.assertEqual(run.error_code, "provider_unavailable")
+                        self.assertEqual(
+                            message.content, "模型服务暂时不可用，请显式重试。"
+                        )
+
+    def test_expired_durable_request_reconciles_checkpoint_without_executor(self) -> None:
+        factory = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
+        expired_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        calls: list[str] = []
+
+        def must_not_execute(*_args) -> None:
+            calls.append("executed")
+            raise AssertionError("a committed outcome must not execute again")
+
+        for suffix, committed_status, expected_status in (
+            ("reclaim-success", "result_committed", "succeeded"),
+            ("reclaim-failure", "failure_committed", "failed"),
+        ):
+            with self.subTest(committed_status=committed_status):
+                run_id, _thread_id, _user_message_id, assistant_message_id = (
+                    self._durable_assistant_request(
+                        suffix,
+                        status="running",
+                        committed_status=committed_status,
+                        lease_generation=1,
+                        lease_token="expired-lease",
+                        lease_expires_at=expired_at,
+                    )
+                )
+                with patch.object(
+                    assistant_request_run_service, "SessionLocal", factory
+                ):
+                    self.assertFalse(
+                        assistant_request_run_service.process_request(
+                            run_id, must_not_execute
+                        )
+                    )
+                with factory() as check_db:
+                    run = check_db.get(AssistantRequestRun, run_id)
+                    message = check_db.get(AssistantMessage, assistant_message_id)
+                    self.assertEqual(run.status, expected_status)
+                    self.assertEqual(
+                        message.context["assistant_request_status"], expected_status
+                    )
+
+        self.assertEqual(calls, [])
+
+    def test_mismatched_committed_run_id_is_not_accepted_as_success(self) -> None:
+        factory = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
+        run_id, _thread_id, _user_message_id, assistant_message_id = (
+            self._durable_assistant_request(
+                "mismatched-checkpoint",
+                status="running",
+                committed_status="result_committed",
+                committed_run_id="another-request-run",
+                lease_generation=1,
+                lease_token="expired-lease",
+                lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+            )
+        )
+        calls: list[str] = []
+
+        def incomplete_retry(*_args) -> None:
+            calls.append("executed")
+
+        with patch.object(assistant_request_run_service, "SessionLocal", factory):
+            self.assertFalse(
+                assistant_request_run_service.process_request(run_id, incomplete_retry)
+            )
+
+        self.assertEqual(calls, ["executed"])
+        with factory() as check_db:
+            run = check_db.get(AssistantRequestRun, run_id)
+            message = check_db.get(AssistantMessage, assistant_message_id)
+            self.assertEqual(run.status, "failed")
+            self.assertEqual(run.error_code, "assistant_result_not_committed")
+            self.assertEqual(message.context["assistant_request_status"], "failed")
+
+    def test_stale_durable_worker_is_fenced_before_message_write(self) -> None:
+        factory = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
+        request_id = "durable-stale-generation"
+        path = "/durable/stale-generation"
+        thread_id = assistant._assistant_request_message_id(
+            "thread",
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+            request_id=request_id,
+        )
+        payload_document = {
+            "message": "不得由旧执行代覆盖",
+            "request_id": request_id,
+            "thread_id": thread_id,
+            "path": path,
+            "mode": "ask",
+            "upload_run_ids": ["synthetic-upload"],
+        }
+        run_id, _thread_id, _user_message_id, assistant_message_id = (
+            self._durable_assistant_request(
+                "stale-generation",
+                status="running",
+                payload_document=payload_document,
+                lease_generation=2,
+                lease_token="current-lease",
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=2),
+            )
+        )
+        route_plan = assistant_orchestrator.AssistantRoutePlan(
+            intent="chat",
+            decision=assistant_orchestrator.AssistantSemanticDecision(
+                goal="answer",
+                scope="general",
+                confidence="high",
+                reason="普通只读回答",
+            ),
+            source="no_model",
+        )
+        worker_db = factory()
+        worker_db.info.update({
+            "tenant_id": self.tenant.id,
+            "user_id": self.user.id,
+            "assistant_request_worker": True,
+            "assistant_request_run_id": run_id,
+            "assistant_request_lease_token": "stale-lease",
+            "assistant_request_lease_generation": 1,
+        })
+        try:
+            with (
+                patch.object(
+                    assistant,
+                    "_claimed_request_route_plan",
+                    return_value=(route_plan, thread_id, []),
+                ),
+                patch.object(
+                    assistant.managed_upload_run_service,
+                    "invocation_attachment_documents",
+                    return_value=[],
+                ),
+                patch.object(
+                    assistant, "_save_message", wraps=assistant._save_message
+                ) as save_message,
+                self.assertRaises(
+                    assistant_request_run_service.AssistantRequestConflict
+                ),
+            ):
+                assistant.chat(
+                    AssistantChatRequest.model_validate(payload_document), worker_db
+                )
+            save_message.assert_not_called()
+        finally:
+            worker_db.rollback()
+            worker_db.close()
+
+        with factory() as check_db:
+            run = check_db.get(AssistantRequestRun, run_id)
+            message = check_db.get(AssistantMessage, assistant_message_id)
+            self.assertEqual(run.status, "running")
+            self.assertEqual(run.lease_generation, 2)
+            self.assertEqual(message.content, "正在等待后台处理。")
+
+    def test_durable_request_operations_honor_current_scenario_acl(self) -> None:
+        scenario = BusinessScenario(
+            id="assistant-request-acl-scenario",
+            tenant_id=self.tenant.id,
+            name="Assistant request ACL scenario",
+            status="active",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        run_id, thread_id, user_message_id, assistant_message_id = (
+            self._durable_assistant_request(
+                "scenario-acl",
+                status="failed",
+                payload_document={
+                    "message": "不得越过场景 ACL",
+                    "request_id": "durable-scenario-acl",
+                    "scenario_id": scenario.id,
+                    "path": f"/scenarios/{scenario.id}",
+                    "mode": "ask",
+                },
+            )
+        )
+        self.db.add(
+            AuthorizationGrant(
+                organization_id=self.organization.id,
+                user_id=self.user.id,
+                resource_type="scenario",
+                resource_id=scenario.id,
+                verb="read",
+                effect="deny",
+                created_by_user_id=self.user.id,
+            )
+        )
+        self.db.commit()
+        permission_service.refresh_request_authorization(self.db)
+
+        for operation in (
+            lambda: assistant_request_run_service.get_request(self.db, run_id),
+            lambda: assistant_request_run_service.enqueue_request(
+                self.db,
+                run_id=run_id,
+                request_id="durable-scenario-acl",
+                request_fingerprint="a" * 64,
+                thread_id=thread_id,
+                user_message_id=user_message_id,
+                assistant_message_id=assistant_message_id,
+                payload_document={},
+                upload_run_ids=[],
+            ),
+            lambda: assistant_request_run_service.retry_request(
+                self.db,
+                run_id,
+                expected_revision=1,
+                idempotency_key="scenario-acl-retry",
+            ),
+            lambda: assistant_request_run_service.cancel_request(
+                self.db,
+                run_id,
+                expected_revision=1,
+            ),
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaises(HTTPException) as exc_info:
+                    operation()
+                self.assertEqual(exc_info.exception.status_code, 403)
+
+    def test_terminal_fence_rebuilds_authorization_after_acl_revocation(self) -> None:
+        scenario = BusinessScenario(
+            id="assistant-terminal-acl-scenario",
+            tenant_id=self.tenant.id,
+            name="Assistant terminal ACL scenario",
+            status="active",
+        )
+        self.db.add(scenario)
+        self.db.commit()
+        run_id, _thread_id, _user_message_id, _assistant_message_id = (
+            self._durable_assistant_request(
+                "terminal-acl",
+                status="running",
+                payload_document={
+                    "message": "权限撤销后不得落最终结果",
+                    "request_id": "durable-terminal-acl",
+                    "scenario_id": scenario.id,
+                    "path": f"/scenarios/{scenario.id}",
+                    "mode": "ask",
+                },
+                lease_generation=1,
+                lease_token="terminal-acl-lease",
+                lease_expires_at=datetime.now(timezone.utc)
+                + timedelta(minutes=2),
+            )
+        )
+        factory = sessionmaker(
+            bind=self.engine,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        worker_db = factory()
+        worker_db.info.update({
+            "tenant_id": self.tenant.id,
+            "user_id": self.user.id,
+            "assistant_request_worker": True,
+            "assistant_request_run_id": run_id,
+            "assistant_request_lease_token": "terminal-acl-lease",
+            "assistant_request_lease_generation": 1,
+        })
+        try:
+            assistant_request_run_service.assert_execution_lease(
+                worker_db,
+                run_id,
+                lease_token="terminal-acl-lease",
+                lease_generation=1,
+            )
+            worker_db.rollback()
+            with factory() as revocation_db:
+                revocation_db.add(
+                    AuthorizationGrant(
+                        organization_id=self.organization.id,
+                        user_id=self.user.id,
+                        resource_type="scenario",
+                        resource_id=scenario.id,
+                        verb="read",
+                        effect="deny",
+                        created_by_user_id=self.user.id,
+                    )
+                )
+                revocation_db.commit()
+
+            with (
+                patch.object(assistant, "SessionLocal", factory),
+                self.assertRaises(HTTPException) as exc_info,
+            ):
+                assistant._assert_assistant_request_worker_lease(
+                    worker_db,
+                    for_update=True,
+                    refresh_authorization=True,
+                )
+            self.assertEqual(exc_info.exception.status_code, 403)
+        finally:
+            worker_db.rollback()
+            worker_db.close()
+
+    def test_durable_needs_input_succeeds_and_history_keeps_choices(self) -> None:
+        factory = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
+        request_id = "durable-needs-input"
+        path = "/durable/needs-input"
+        thread_id = assistant._assistant_request_message_id(
+            "thread",
+            tenant_id=self.tenant.id,
+            user_id=self.user.id,
+            request_id=request_id,
+        )
+        payload_document = {
+            "message": "请生成本体草稿",
+            "request_id": request_id,
+            "thread_id": thread_id,
+            "path": path,
+            "mode": "draft",
+            "draft_kind": "ontology",
+            "upload_run_ids": ["synthetic-upload"],
+        }
+        run_id, _thread_id, _user_message_id, assistant_message_id = (
+            self._durable_assistant_request(
+                "needs-input",
+                payload_document=payload_document,
+            )
+        )
+        route_plan = assistant_orchestrator.AssistantRoutePlan(
+            intent="ontology",
+            decision=assistant_orchestrator.AssistantSemanticDecision(
+                goal="create",
+                scope="ontology",
+                confidence="high",
+                reason="需要本体草稿",
+            ),
+            source="model",
+        )
+        managed_attachment = assistant.managed_upload_run_service.ManagedInvocationAttachment(
+            id="synthetic-upload",
+            filename="renamed.csv",
+            mime="text/csv",
+            size=32,
+            status="parsed",
+            content_hash="a" * 64,
+            parsed_text="record_id,value\nR1,3",
+            error="",
+        )
+        with (
+            patch.object(assistant_request_run_service, "SessionLocal", factory),
+            patch.object(assistant, "SessionLocal", factory),
+            patch.object(
+                assistant_request_run_service,
+                "_upload_state",
+                return_value=("ready", "", ""),
+            ),
+            patch.object(
+                assistant,
+                "_claimed_request_route_plan",
+                return_value=(route_plan, thread_id, []),
+            ),
+            patch.object(
+                assistant.managed_upload_run_service,
+                "invocation_attachment_documents",
+                return_value=[managed_attachment],
+            ),
+        ):
+            self.assertTrue(
+                assistant_request_run_service.process_request(
+                    run_id, assistant.execute_assistant_request_run
+                )
+            )
+
+        self.db.expire_all()
+        run = self.db.get(AssistantRequestRun, run_id)
+        self.assertEqual(run.status, "succeeded")
+        audit = self.db.execute(
+            select(AssistantAuditLog).where(AssistantAuditLog.thread_id == thread_id)
+        ).scalar_one()
+        self.assertEqual(audit.status, "needs_input")
+        history = assistant.list_thread_messages(
+            thread_id,
+            path=path,
+            db=self.db,
+        )
+        restored = next(item for item in history if item.id == assistant_message_id)
+        self.assertEqual(restored.questions[0].id, "scenario")
+        self.assertIn("创建业务场景草稿", restored.suggestions)
 
 
 class ActionDecisionChainTests(unittest.TestCase):

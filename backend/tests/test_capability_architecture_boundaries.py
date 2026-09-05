@@ -7,13 +7,13 @@ import unittest
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 SERVICES_ROOT = BACKEND_ROOT / "app" / "services"
+PROVIDERS_ROOT = BACKEND_ROOT / "app" / "providers"
 
 CORE_MODULES = (
     "agent_engine.py",
     "agent_runtime_adapter.py",
     "builtin_capability_providers.py",
     "business_query_service.py",
-    "capability_agent_extensions.py",
     "capability_application_service.py",
     "capability_contracts.py",
     "capability_mcp_service.py",
@@ -39,6 +39,10 @@ FORBIDDEN_CORE_PROMPT_FRAGMENTS = (
     "未发现违规",
     "财务报表",
     "涉及审计、排查或核验",
+    "candidate_detected",
+    "manual_review_required",
+    "additional_evidence_required",
+    "违规已成立",
 )
 
 FORBIDDEN_BUSINESS_TERMS = (
@@ -156,13 +160,20 @@ class CapabilityArchitectureBoundaryTests(unittest.TestCase):
                 )
 
     def test_agent_shell_contains_no_provider_owned_business_prompt_policy(self) -> None:
+        prompt_modules = (
+            SERVICES_ROOT / "agent_engine.py",
+            SERVICES_ROOT / "agent_prompt_policy.py",
+            SERVICES_ROOT / "agent_runtime_adapter.py",
+        )
+        for path in prompt_modules:
+            source = path.read_text(encoding="utf-8")
+            for fragment in FORBIDDEN_CORE_PROMPT_FRAGMENTS:
+                self.assertNotIn(
+                    fragment,
+                    source,
+                    f"Agent 通用壳不得内置 Provider 结论语义 {fragment!r}",
+                )
         source = (SERVICES_ROOT / "agent_engine.py").read_text(encoding="utf-8")
-        for fragment in FORBIDDEN_CORE_PROMPT_FRAGMENTS:
-            self.assertNotIn(
-                fragment,
-                source,
-                f"Agent 通用壳不得内置业务提示策略 {fragment!r}",
-            )
         tree = ast.parse(source)
         imported_modules = {
             str(node.module or "")
@@ -179,6 +190,77 @@ class CapabilityArchitectureBoundaryTests(unittest.TestCase):
             any("providers.medical_audit" in module for module in imported_modules),
             "Agent 通用壳不得导入医保 Provider 实现",
         )
+
+    def test_agent_function_execution_has_no_legacy_runtime_path(self) -> None:
+        for legacy_module in (
+            "function_runtime_service.py",
+            "legacy_function_run_service.py",
+        ):
+            self.assertFalse(
+                (SERVICES_ROOT / legacy_module).exists(),
+                "Legacy FunctionRun execution modules must not remain callable",
+            )
+        engine_source = (SERVICES_ROOT / "agent_engine.py").read_text(
+            encoding="utf-8"
+        )
+        adapter_source = (SERVICES_ROOT / "agent_runtime_adapter.py").read_text(
+            encoding="utf-8"
+        )
+
+        for legacy_fragment in (
+            "function_runtime_service",
+            "create_function_run",
+            "FunctionRun",
+        ):
+            self.assertNotIn(
+                legacy_fragment,
+                engine_source,
+                "Agent function execution must use CapabilityAgentRuntime and its Receipt",
+            )
+        legacy_tool_literals = [
+            node.lineno
+            for node in ast.walk(ast.parse(engine_source))
+            if isinstance(node, ast.Constant) and node.value == "run_function"
+        ]
+        self.assertFalse(
+            legacy_tool_literals,
+            "agent_engine must not expose the legacy run_function tool",
+        )
+        self.assertNotIn("class AgentContext", engine_source)
+        self.assertNotIn("def _run_agent", engine_source)
+        self.assertFalse(
+            (SERVICES_ROOT / "capability_agent_extensions.py").exists(),
+            "Provider-specific Agent tool extensions are a retired second kernel",
+        )
+        self.assertIn("capability_application_service.invoke(", adapter_source)
+        self.assertNotIn("function_runtime_service", adapter_source)
+
+    def test_provider_owned_rule_contract_is_not_a_generic_service(self) -> None:
+        self.assertFalse(
+            (SERVICES_ROOT / "semantic_audit_rule_service.py").exists(),
+            "场景规则字段、状态与解释必须由版本化 Provider 包拥有",
+        )
+        self.assertTrue(
+            (PROVIDERS_ROOT / "semantic_audit.py").exists(),
+            "缺少版本化语义判定 Provider",
+        )
+        generic_query_source = (
+            PROVIDERS_ROOT / "semantic_dataset_query.py"
+        ).read_text(encoding="utf-8")
+        for provider_owned_term in (
+            "semantic_audit",
+            "audit_rule",
+            "decision_state",
+            "candidate_detected",
+            "manual_review_required",
+            "additional_evidence_required",
+            "rule_query",
+        ):
+            self.assertNotIn(
+                provider_owned_term,
+                generic_query_source,
+                "通用对象集查询实现不得拥有语义判定字段、状态或解释",
+            )
 
     def test_public_invocation_contract_does_not_accept_physical_data_details(self) -> None:
         contract_path = SERVICES_ROOT / "capability_contracts.py"

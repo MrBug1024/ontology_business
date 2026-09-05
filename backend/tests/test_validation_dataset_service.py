@@ -6,6 +6,7 @@ from io import BytesIO
 import hashlib
 from pathlib import Path
 import re
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -104,6 +105,7 @@ class ValidationDatasetServiceTests(unittest.TestCase):
                 key="validation.claims",
                 name="claims.csv",
                 media_type="text/csv",
+                usage_plane="invocation_input",
                 labels={"catalog_purpose": "validation_asset"},
                 created_by_user_id=user.id,
             )
@@ -120,6 +122,8 @@ class ValidationDatasetServiceTests(unittest.TestCase):
                 version_document={
                     "profile": {
                         "category": "table",
+                        "extension": ".csv",
+                        "media_type": "text/csv",
                         "tables": [
                             {
                                 "name": "claims",
@@ -155,6 +159,21 @@ class ValidationDatasetServiceTests(unittest.TestCase):
         db.info["tenant_id"] = "tenant-validation-data"
         db.info["user_id"] = "user-validation-data"
         return db
+
+    def test_modeling_asset_cannot_be_promoted_to_validation_input(self) -> None:
+        with self._database() as db:
+            asset = db.get(DataAsset, "validation-csv-asset")
+            asset.usage_plane = "modeling_material"
+            db.commit()
+
+            with self.assertRaises(validation_dataset_service.ValidationDatasetError):
+                validation_dataset_service.enqueue_validation_dataset_job(
+                    db,
+                    ValidationDatasetBuildIn(
+                        asset_version_ids=[self.asset_version_id],
+                        name="Must stay modeling-only",
+                    ),
+                )
 
     def _download(
         self,
@@ -237,6 +256,33 @@ class ValidationDatasetServiceTests(unittest.TestCase):
             patch.object(object_deletion_service, "begin_upload_put"),
             patch.object(object_deletion_service, "assert_upload_active"),
             patch.object(object_deletion_service, "retain_bucket_file_upload"),
+        )
+
+    def test_materialization_uses_profile_format_for_renamed_csv(self) -> None:
+        content = b"record_id;amount\nA-1;12.5\n"
+        _media_type, profile = catalog_ingestion_service.build_profile(
+            content,
+            "renamed.payload",
+            "application/octet-stream",
+        )
+
+        with tempfile.TemporaryDirectory(prefix="validation-profile-") as temp_dir:
+            work = Path(temp_dir)
+            raw_path = work / "raw.payload"
+            raw_path.write_bytes(content)
+            relations = validation_dataset_service._materialize_raw_file(
+                raw_path,
+                "renamed.payload",
+                profile,
+                work,
+                set(),
+            )
+
+        self.assertEqual(len(relations), 1)
+        self.assertEqual(relations[0]["row_count"], 1)
+        self.assertEqual(
+            [field["name"] for field in relations[0]["fields"]],
+            ["record_id", "amount"],
         )
 
     def test_materializes_queryable_minio_parquet_without_postgresql_rows(self) -> None:
@@ -462,6 +508,7 @@ class ValidationDatasetServiceTests(unittest.TestCase):
                 key="validation.workbook",
                 name="validation.xlsx",
                 media_type=bucket_file.mime,
+                usage_plane="invocation_input",
                 labels={"catalog_purpose": "validation_asset"},
                 created_by_user_id="user-validation-data",
             )
@@ -478,6 +525,8 @@ class ValidationDatasetServiceTests(unittest.TestCase):
                 version_document={
                     "profile": {
                         "category": "table",
+                        "extension": ".xlsx",
+                        "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         "tables": [
                             {
                                 "name": "charge",
@@ -559,6 +608,7 @@ class ValidationDatasetServiceTests(unittest.TestCase):
                 key="validation.output-template",
                 name="result-template.xlsx",
                 media_type=bucket_file.mime,
+                usage_plane="invocation_input",
                 labels={"catalog_purpose": "validation_asset"},
                 created_by_user_id="user-validation-data",
             )
@@ -575,6 +625,8 @@ class ValidationDatasetServiceTests(unittest.TestCase):
                 version_document={
                     "profile": {
                         "category": "table",
+                        "extension": ".xlsx",
+                        "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         "tables": [
                             {
                                 "name": "result",

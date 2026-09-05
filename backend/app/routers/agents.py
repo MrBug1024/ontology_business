@@ -3,17 +3,17 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..database import SessionLocal
 from ..models import (
     Agent,
+    AgentTurnRun,
     BucketFile,
     BusinessScenario,
     ConnectorBinding,
@@ -59,10 +59,41 @@ router = APIRouter(prefix="/agents", tags=["agents"])
 _HISTORIC_MODEL_REPLAY_PLACEHOLDER = (
     "此前回答保留在会话记录中，但其数据快照未参与本轮推理。"
 )
+_MODEL_HISTORY_MAX_RECORDS = 24
+_MODEL_HISTORY_MAX_CHARACTERS = 48_000
 
 _RUNTIME_CONNECTION_SECRET_KEYS = {
     "password", "api_key", "token", "secret", "access_token"
 }
+
+
+def _bounded_model_history(
+    groups: list[list[dict[str, Any]]],
+    *,
+    maximum_characters: int = _MODEL_HISTORY_MAX_CHARACTERS,
+) -> list[dict[str, Any]]:
+    """Keep newest complete persisted-message groups within the model budget."""
+
+    selected_groups: list[list[dict[str, Any]]] = []
+    used_characters = 0
+    for group in reversed(groups):
+        group_characters = len(
+            json.dumps(
+                group,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+        if group_characters > maximum_characters - used_characters:
+            continue
+        selected_groups.append(group)
+        used_characters += group_characters
+    return [
+        item
+        for group in reversed(selected_groups)
+        for item in group
+    ]
 
 
 def _public_runtime_connection_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -338,7 +369,7 @@ def _agent_requires_tool_capability(
     data_source_ids: list[str] | None,
     capability_scope: object,
 ) -> bool:
-    """Mirror AgentContext.build_tools before selecting a compatible LLM."""
+    """Detect whether the governed capability catalog requires tool calling."""
     # Direct Skill/MCP side-effect tools are intentionally not part of the
     # Agent surface.  They therefore do not require a tool-capable model here.
     if data_source_ids:
@@ -359,7 +390,7 @@ def _agent_readiness_missing(
     db: Session,
     agent: Agent,
     *,
-    runtime_context: agent_engine.AgentContext | None = None,
+    runtime_context: agent_runtime_adapter.CapabilityAgentRuntime | None = None,
 ) -> list[str]:
     """Return business-facing prerequisites that still block Agent chat.
 
@@ -519,7 +550,7 @@ def _agent_turn_input(payload: ChatRequest) -> agent_runtime_adapter.AgentTurnIn
 
 def _historic_tool_results_authorized(
     message: Message,
-    context: agent_engine.AgentContext | None,
+    context: agent_runtime_adapter.CapabilityAgentRuntime | None,
 ) -> bool:
     calls = [call for call in (message.tool_calls or []) if isinstance(call, dict)]
     results = [result for result in (message.tool_results or []) if isinstance(result, dict)]
@@ -580,7 +611,7 @@ def _message_out_for_model_replay(
     message: Message,
     agent: Agent,
     *,
-    context: agent_engine.AgentContext | None = None,
+    context: agent_runtime_adapter.CapabilityAgentRuntime | None = None,
 ) -> MessageOut:
     citations = message.citations if isinstance(message.citations, list) else []
     authorization_context = (
@@ -623,7 +654,7 @@ def _model_history(
     db: Session,
     conversation_id: str,
     agent: Agent,
-    context: agent_engine.AgentContext,
+    context: agent_runtime_adapter.CapabilityAgentRuntime,
     *,
     excluded_message_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
@@ -632,13 +663,16 @@ def _model_history(
     excluded = {str(item) for item in (excluded_message_ids or set()) if str(item)}
     if excluded:
         statement = statement.where(Message.id.notin_(excluded))
-    history_msgs = db.execute(
-        statement.order_by(Message.created_at, Message.id)
+    newest_messages = db.execute(
+        statement.order_by(Message.created_at.desc(), Message.id.desc()).limit(
+            _MODEL_HISTORY_MAX_RECORDS
+        )
     ).scalars().all()
-    history: list[dict[str, Any]] = []
+    history_groups: list[list[dict[str, Any]]] = []
+    history_msgs = list(reversed(newest_messages))
     for message in history_msgs:
         if message.role == "user":
-            history.append({"role": "user", "content": message.content})
+            history_groups.append([{"role": "user", "content": message.content}])
             continue
         if message.role != "assistant":
             continue
@@ -674,25 +708,53 @@ def _model_history(
                 if result.get("id")
             }
             if calls and all(call["id"] in result_map for call in calls):
-                history.append({
-                    "role": "assistant",
-                    "content": safe_message.content,
-                    "tool_calls": calls,
-                })
+                projected_results: list[dict[str, Any]] = []
                 for call in calls:
                     result = result_map[call["id"]]
-                    history.append(
+                    model_result = result.get("result", "")
+                    projector = getattr(
+                        context,
+                        "model_historic_tool_result",
+                        None,
+                    )
+                    if callable(projector):
+                        model_result = projector(
+                            call["function"]["name"],
+                            _tool_call_name_args(call)[1],
+                            model_result,
+                        )
+                        if model_result is None:
+                            break
+                    projected_results.append(
                         {
                             "role": "tool",
                             "tool_call_id": result["id"],
                             "name": result.get("name", ""),
-                            "content": result.get("result", ""),
+                            "content": model_result,
                         }
                     )
+                else:
+                    history_groups.append([
+                        {
+                            "role": "assistant",
+                            "content": safe_message.content,
+                            "tool_calls": calls,
+                        },
+                        *projected_results,
+                    ])
+                    continue
+                history_groups.append(
+                    [{
+                        "role": "assistant",
+                        "content": _HISTORIC_MODEL_REPLAY_PLACEHOLDER,
+                    }]
+                )
                 continue
         if safe_message.content:
-            history.append({"role": "assistant", "content": safe_message.content})
-    return history
+            history_groups.append(
+                [{"role": "assistant", "content": safe_message.content}]
+            )
+    return _bounded_model_history(history_groups)
 
 
 def _out(a: Agent, db: Session) -> AgentOut:
@@ -1069,6 +1131,27 @@ def delete_conversation(conv_id: str, db: Session = Depends(get_tenant_db)):
     # definition.  Read access to the Agent is enough to erase one's own
     # private context; scenario write permission is not required.
     c = _conversation(db, conv_id)
+    db.refresh(c, with_for_update=True)
+    active_turn = db.scalar(
+        select(AgentTurnRun.id)
+        .where(
+            AgentTurnRun.conversation_id == c.id,
+            AgentTurnRun.status.in_(
+                {
+                    "accepted",
+                    "preparing_inputs",
+                    "validating_contracts",
+                    "planning",
+                    "invoking_tools",
+                    "responding",
+                    "cancel_requested",
+                }
+            ),
+        )
+        .limit(1)
+    )
+    if active_turn is not None:
+        raise HTTPException(status_code=409, detail="对话仍有后台任务运行，请先取消并等待任务结束")
     db.delete(c)
     db.commit()
     return Msg(message="已删除")
@@ -1114,336 +1197,6 @@ def confirm_agent_tool_preview(
         raise HTTPException(409, f"确认失败：{exc}") from exc
 
 
-@router.post("/{agent_id}/chat")
-def chat(agent_id: str, payload: ChatRequest, db: Session = Depends(get_tenant_db)):
-    a = _agent(db, agent_id, active_runtime=True)
-    turn_input = _agent_turn_input(payload)
-    # Resolve a supplied transcript before model routing so an inaccessible
-    # conversation is never masked by (or able to influence) LLM fallback.
-    conv = None
-    if payload.conversation_id:
-        conv = _conversation(db, payload.conversation_id)
-        if conv.agent_id != agent_id:
-            raise HTTPException(400, "对话不属于当前 Agent")
-    # Resolve exactly one definition before inspecting readiness or selecting a
-    # model.  In staging/prod those decisions must use the active release and
-    # environment-resolved connectors, never mutable live authoring rows.
-    history_context = _authorization_context(
-        db,
-        a,
-        turn_input=turn_input,
-        environment=payload.environment,
-    )
-    if history_context is None:
-        raise HTTPException(
-            409,
-            "Agent 当前运行定义、发布快照或环境连接器不完整，已阻止对话",
-        )
-    missing = _agent_readiness_missing(db, a, runtime_context=history_context)
-    if missing:
-        raise HTTPException(
-            409,
-            "Agent 尚未就绪，请先完成：" + "、".join(missing),
-        )
-    requires_tools = bool(history_context.build_tools())
-    if a.llm_config_id:
-        llm = tenant_service.get_visible(db, LLMConfig, a.llm_config_id)
-        if not llm or not llm_service.supports_capability(llm, "chat"):
-            raise HTTPException(409, "Agent 绑定的 LLM 不可用或未启用聊天能力，请重新配置")
-        if requires_tools and not llm_service.supports_capability(llm, "tool"):
-            raise HTTPException(409, "Agent 需要工具调用，但绑定的 LLM 未启用工具能力")
-    else:
-        candidates = llm_service.routable_configs(db, "tool" if requires_tools else "chat")
-        llm = candidates[0] if candidates else None
-    if not llm:
-        raise HTTPException(400, "请先为 Agent 配置 LLM（或设置默认 LLM）")
-    history_context.llm = llm
-
-    if not conv:
-        _lock_active_agent_scenario(
-            db,
-            scenario_id=a.scenario_id,
-            tenant_id=a.tenant_id,
-        )
-        conv = Conversation(
-            agent_id=agent_id,
-            created_by_user_id=_current_user_id(db),
-            title=payload.message[:50] or "新对话",
-        )
-        db.add(conv)
-        db.commit()
-        db.refresh(conv)
-
-    # 场景 & 本体
-    scenario = tenant_service.get_visible(db, BusinessScenario, a.scenario_id) if a.scenario_id else None
-    scenario_name = scenario.name if scenario else ""
-    ontology_summary = agent_engine.ontology_summary_for(scenario, db=db)
-
-    # 保存用户消息
-    current_user_message = Message(
-        conversation_id=conv.id,
-        role="user",
-        content=payload.message,
-        input_snapshot=agent_runtime_adapter.input_snapshot(history_context),
-        evidence_refs=agent_runtime_adapter.evidence_snapshot(history_context),
-    )
-    db.add(current_user_message)
-    _lock_active_agent_scenario(
-        db,
-        scenario_id=a.scenario_id,
-        tenant_id=a.tenant_id,
-    )
-    db.commit()
-    current_user_message_id = str(current_user_message.id)
-
-    conv_id = conv.id
-    trace_context = {
-        "correlation_id": uuid.uuid4().hex,
-        # Preallocate the answer id so Action dry-runs emitted during the tool
-        # loop can durably point at the AI answer before SSE persistence ends.
-        "assistant_message_id": uuid.uuid4().hex,
-        "agent_id": a.id,
-        "conversation_id": conv_id,
-        "scenario_id": a.scenario_id or "",
-        "user_id": str(db.info.get("user_id") or "") or None,
-    }
-    stream_tenant_id = str(db.info.get("tenant_id") or "")
-    stream_user_id = str(db.info.get("user_id") or "")
-    stream_llm_id = str(llm.id)
-    stream_scenario_id = str(a.scenario_id or "") or None
-    stream_agent_tenant_id = str(a.tenant_id)
-    # Action tools may commit their dry-run audit row before the streaming turn
-    # finishes.  Persist its parent answer first so PostgreSQL FK checks and
-    # lineage never depend on a not-yet-created message id.
-    db.add(
-        Message(
-            id=trace_context["assistant_message_id"],
-            conversation_id=conv_id,
-            role="assistant",
-            content="正在准备受控工具调用。",
-            stream_finalized=False,
-            input_snapshot=agent_runtime_adapter.input_snapshot(history_context),
-            evidence_refs=agent_runtime_adapter.evidence_snapshot(history_context),
-        )
-    )
-    _lock_active_agent_scenario(
-        db,
-        scenario_id=a.scenario_id,
-        tenant_id=a.tenant_id,
-    )
-    db.commit()
-
-    def persist_answer(
-        content: str,
-        tool_calls: list[dict[str, Any]],
-        tool_results: list[dict[str, Any]],
-        citations: list[dict[str, Any]],
-        input_snapshot: dict[str, Any],
-        evidence_refs: list[dict[str, Any]],
-        *,
-        finalized: bool = False,
-    ) -> None:
-        save_db = SessionLocal()
-        try:
-            _lock_active_agent_scenario(
-                save_db,
-                scenario_id=stream_scenario_id,
-                tenant_id=stream_agent_tenant_id,
-            )
-            message = save_db.get(Message, trace_context["assistant_message_id"])
-            if (
-                not message
-                or message.conversation_id != conv_id
-                or message.role != "assistant"
-            ):
-                raise RuntimeError("Agent 回答占位消息不存在或上下文不匹配")
-            message.content = content
-            message.tool_calls = tool_calls
-            message.tool_results = tool_results
-            message.citations = citations
-            message.input_snapshot = input_snapshot
-            message.evidence_refs = evidence_refs
-            user_message = save_db.get(Message, current_user_message_id)
-            if (
-                user_message is not None
-                and user_message.conversation_id == conv_id
-                and user_message.role == "user"
-            ):
-                user_message.input_snapshot = input_snapshot
-                user_message.evidence_refs = evidence_refs
-            if finalized:
-                message.stream_finalized = True
-            save_db.commit()
-        finally:
-            save_db.close()
-
-    def event_stream():
-        cancelled = False
-        assistant_content = ""
-        tool_calls_log: list[dict[str, Any]] = []
-        tool_results_log: list[dict[str, Any]] = []
-        citations_log: list[dict[str, Any]] = []
-        stream_db: Session | None = None
-        stream_context: Any | None = None
-        try:
-            # FastAPI may close yield-based request dependencies before a
-            # StreamingResponse body is consumed. Never carry request-bound ORM
-            # objects into the SSE generator: commits above also expire them,
-            # which otherwise makes relation/property lazy loads fail as
-            # detached instances. Re-authorize and resolve the runtime using a
-            # session owned for the entire stream instead.
-            stream_db = SessionLocal()
-            stream_db.info["tenant_id"] = stream_tenant_id
-            stream_db.info["user_id"] = stream_user_id
-            stream_agent = _agent(stream_db, agent_id, active_runtime=True)
-            stream_context = _authorization_context(
-                stream_db,
-                stream_agent,
-                turn_input=turn_input,
-            )
-            if stream_context is None:
-                raise RuntimeError("Agent 当前运行定义、发布快照或环境连接器不完整，已阻止对话")
-            stream_missing = _agent_readiness_missing(
-                stream_db,
-                stream_agent,
-                runtime_context=stream_context,
-            )
-            if stream_missing:
-                raise RuntimeError("Agent 尚未就绪，请先完成：" + "、".join(stream_missing))
-            stream_llm = tenant_service.get_visible(stream_db, LLMConfig, stream_llm_id)
-            if not stream_llm or not llm_service.supports_capability(stream_llm, "chat"):
-                raise RuntimeError("Agent 绑定的 LLM 不可用或未启用聊天能力，请重新配置")
-            if (
-                stream_context.build_tools()
-                and not llm_service.supports_capability(stream_llm, "tool")
-            ):
-                raise RuntimeError("Agent 需要工具调用，但绑定的 LLM 未启用工具能力")
-            stream_context.llm = stream_llm
-            stream_conversation = _conversation(stream_db, conv_id)
-            if stream_conversation.agent_id != stream_agent.id:
-                raise RuntimeError("对话不属于当前 Agent")
-            history = _model_history(
-                stream_db,
-                conv_id,
-                stream_agent,
-                stream_context,
-                excluded_message_ids={
-                    current_user_message_id,
-                    str(trace_context["assistant_message_id"]),
-                },
-            )
-            runtime_snapshot = agent_runtime_adapter.input_snapshot(stream_context)
-            runtime_decision = runtime_snapshot.get("runtime")
-            if isinstance(runtime_decision, dict) and runtime_decision:
-                yield f"data: {json.dumps({'type': 'runtime_decision', 'data': runtime_decision}, ensure_ascii=False)}\n\n"
-            for ev in agent_engine.run_agent(
-                stream_db,
-                stream_agent,
-                stream_llm,
-                history,
-                payload.message,
-                scenario_name,
-                ontology_summary,
-                trace_context=trace_context,
-                runtime_context=stream_context,
-            ):
-                etype = ev["type"]
-                if etype == "token":
-                    assistant_content += ev["data"]
-                elif etype == "tool_call":
-                    tool_calls_log.append(ev["data"])
-                elif etype == "tool_result":
-                    tool_results_log.append(ev["data"])
-                elif etype == "citations":
-                    # 引用由 AgentContext 在当前租户、绑定数据源范围内生成；作为
-                    # 独立字段持久化，历史消息无需再从工具文本中反向解析。
-                    citations_log = ev["data"] if isinstance(ev["data"], list) else []
-                elif etype == "evidence_refs":
-                    # Capability evidence is read from the runtime context
-                    # below; the event simply makes the transport observable.
-                    pass
-                if etype in {"tool_result", "citations", "evidence_refs"}:
-                    # A tool result can contain a durable Action dry-run id.  Save
-                    # it into the already-existing answer before the SSE event is
-                    # visible so early client cancellation cannot break lineage.
-                    stream_db.commit()
-                    persist_answer(
-                        assistant_content or "已完成受控工具预演，正在整理最终说明。",
-                        tool_calls_log,
-                        tool_results_log,
-                        citations_log,
-                        agent_runtime_adapter.input_snapshot(stream_context),
-                        agent_runtime_adapter.evidence_snapshot(stream_context),
-                    )
-                yield f"data: {json.dumps({'type': etype, 'data': ev['data']}, ensure_ascii=False)}\n\n"
-            # Complete the pre-persisted answer using an independent session;
-            # the request-scoped session may be closed while SSE is streaming.
-            persist_answer(
-                assistant_content,
-                tool_calls_log,
-                tool_results_log,
-                citations_log,
-                agent_runtime_adapter.input_snapshot(stream_context),
-                agent_runtime_adapter.evidence_snapshot(stream_context),
-                finalized=True,
-            )
-        except GeneratorExit:
-            cancelled = True
-            # A cancelled browser stream still has a durable partial answer.
-            # Mark it final before releasing any preview for confirmation.
-            try:
-                persist_answer(
-                    assistant_content or "对话已停止。",
-                    tool_calls_log,
-                    tool_results_log,
-                    citations_log,
-                    (
-                        agent_runtime_adapter.input_snapshot(stream_context)
-                        if stream_context is not None
-                        else {}
-                    ),
-                    (
-                        agent_runtime_adapter.evidence_snapshot(stream_context)
-                        if stream_context is not None
-                        else []
-                    ),
-                    finalized=True,
-                )
-            except Exception:  # noqa: BLE001 - preserve cancellation semantics.
-                pass
-            raise
-        except Exception as exc:  # noqa: BLE001
-            error_data = str(exc)
-            try:
-                persist_answer(
-                    _stream_error_content(assistant_content, error_data),
-                    tool_calls_log,
-                    tool_results_log,
-                    citations_log,
-                    (
-                        agent_runtime_adapter.input_snapshot(stream_context)
-                        if stream_context is not None
-                        else {}
-                    ),
-                    (
-                        agent_runtime_adapter.evidence_snapshot(stream_context)
-                        if stream_context is not None
-                        else []
-                    ),
-                    finalized=True,
-                )
-            except Exception:  # noqa: BLE001 - preserve the original SSE error.
-                pass
-            yield f"data: {json.dumps({'type': 'error', 'data': error_data}, ensure_ascii=False)}\n\n"
-        finally:
-            if stream_db is not None:
-                stream_db.close()
-            if not cancelled:
-                yield "data: [DONE]\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
 def invoke_agent_once(
     agent_id: str,
     *,
@@ -1452,9 +1205,16 @@ def invoke_agent_once(
     db: Session,
     inputs: dict[str, Any] | None = None,
     managed_inputs: list[Any] | None = None,
+    attachments: list[Any] | None = None,
     capability: dict[str, Any] | None = None,
     idempotency_key: str | None = None,
     environment: str = "dev",
+    user_message_id: str | None = None,
+    assistant_message_id: str | None = None,
+    turn_run_id: str | None = None,
+    turn_lease_token: str | None = None,
+    turn_lease_generation: int | None = None,
+    defer_terminal_commit: bool | None = None,
 ) -> dict[str, Any]:
     """Run one durable Agent turn for a non-browser transport.
 
@@ -1469,11 +1229,17 @@ def invoke_agent_once(
             "conversation_id": conversation_id,
             "inputs": inputs or {},
             "managed_inputs": managed_inputs or [],
+            "attachments": attachments or [],
             "capability": capability,
             "idempotency_key": idempotency_key,
             "environment": environment,
         }
     )
+    durable_turn = bool(turn_run_id)
+    if defer_terminal_commit is None:
+        defer_terminal_commit = durable_turn
+    if bool(defer_terminal_commit) != durable_turn:
+        raise HTTPException(409, "Agent Turn 终态事务模式与执行上下文不一致")
     turn_input = _agent_turn_input(payload)
     a = _agent(db, agent_id, active_runtime=True)
     conv = None
@@ -1490,6 +1256,7 @@ def invoke_agent_once(
     )
     if runtime_context is None:
         raise HTTPException(409, "Agent 当前运行定义、发布快照或环境连接器不完整，已阻止对话")
+    agent_runtime_adapter.require_complete_runtime_context(runtime_context)
     missing = _agent_readiness_missing(db, a, runtime_context=runtime_context)
     if missing:
         raise HTTPException(409, "Agent 尚未就绪，请先完成：" + "、".join(missing))
@@ -1525,33 +1292,113 @@ def invoke_agent_once(
     scenario = tenant_service.get_visible(db, BusinessScenario, a.scenario_id) if a.scenario_id else None
     scenario_name = scenario.name if scenario else ""
     ontology_summary = agent_engine.ontology_summary_for(scenario, db=db)
-    user_message = Message(
-        conversation_id=conv.id,
-        role="user",
-        content=message,
-        input_snapshot=agent_runtime_adapter.input_snapshot(runtime_context),
-        evidence_refs=agent_runtime_adapter.evidence_snapshot(runtime_context),
-    )
-    db.add(user_message)
-    db.flush()
-    assistant_message_id = uuid.uuid4().hex
-    assistant_message = Message(
-        id=assistant_message_id,
-        conversation_id=conv.id,
-        role="assistant",
-        content="正在准备受控工具调用。",
-        stream_finalized=False,
-        created_at=user_message.created_at + timedelta(microseconds=1),
-        input_snapshot=agent_runtime_adapter.input_snapshot(runtime_context),
-        evidence_refs=agent_runtime_adapter.evidence_snapshot(runtime_context),
-    )
-    db.add(assistant_message)
+    if user_message_id or assistant_message_id:
+        if not user_message_id or not assistant_message_id:
+            raise HTTPException(409, "持久 Agent Turn 的消息引用不完整")
+        user_message = db.get(Message, user_message_id)
+        assistant_message = db.get(Message, assistant_message_id)
+        if (
+            user_message is None
+            or assistant_message is None
+            or user_message.conversation_id != conv.id
+            or assistant_message.conversation_id != conv.id
+            or user_message.role != "user"
+            or assistant_message.role != "assistant"
+            or user_message.content != message
+            or assistant_message.stream_finalized
+        ):
+            raise HTTPException(409, "持久 Agent Turn 的消息上下文已变化")
+        user_message.input_snapshot = agent_runtime_adapter.input_snapshot(runtime_context)
+        user_message.evidence_refs = agent_runtime_adapter.evidence_snapshot(runtime_context)
+        assistant_message.content = "正在准备受控工具调用。"
+        assistant_message.input_snapshot = agent_runtime_adapter.input_snapshot(runtime_context)
+        assistant_message.evidence_refs = agent_runtime_adapter.evidence_snapshot(runtime_context)
+    else:
+        user_message = Message(
+            conversation_id=conv.id,
+            role="user",
+            content=message,
+            input_snapshot=agent_runtime_adapter.input_snapshot(runtime_context),
+            evidence_refs=agent_runtime_adapter.evidence_snapshot(runtime_context),
+        )
+        db.add(user_message)
+        db.flush()
+        assistant_message_id = uuid.uuid4().hex
+        assistant_message = Message(
+            id=assistant_message_id,
+            conversation_id=conv.id,
+            role="assistant",
+            content="正在准备受控工具调用。",
+            stream_finalized=False,
+            created_at=user_message.created_at + timedelta(microseconds=1),
+            input_snapshot=agent_runtime_adapter.input_snapshot(runtime_context),
+            evidence_refs=agent_runtime_adapter.evidence_snapshot(runtime_context),
+        )
+        db.add(assistant_message)
     _lock_active_agent_scenario(
         db,
         scenario_id=a.scenario_id,
         tenant_id=a.tenant_id,
     )
     db.commit()
+
+    execution_tenant_id = str(a.tenant_id)
+    execution_user_id = _current_user_id(db)
+
+    def assert_turn_fence() -> None:
+        if not turn_run_id:
+            return
+        if not turn_lease_token or turn_lease_generation is None:
+            raise RuntimeError("Agent Turn 执行租约不完整")
+        fence_db = SessionLocal()
+        try:
+            # A durable worker must rebuild the authenticated principal and ACL
+            # view at every external/tool boundary.  A new session deliberately
+            # avoids carrying request-scoped permission_cache entries across a
+            # long-running turn.
+            fence_db.info["tenant_id"] = execution_tenant_id
+            fence_db.info["user_id"] = execution_user_id
+            principal = permission_service.require_principal(fence_db)
+            if (
+                principal.tenant_id != execution_tenant_id
+                or principal.user_id != execution_user_id
+            ):
+                raise RuntimeError("Agent Turn 执行主体已失效")
+            fenced_agent = _agent(fence_db, agent_id, active_runtime=True)
+            if fenced_agent.tenant_id != execution_tenant_id:
+                raise RuntimeError("Agent Turn 执行 Agent 已失效")
+            fenced = fence_db.scalar(
+                select(AgentTurnRun.id)
+                .where(
+                    AgentTurnRun.id == turn_run_id,
+                    AgentTurnRun.tenant_id == execution_tenant_id,
+                    AgentTurnRun.agent_id == agent_id,
+                    AgentTurnRun.requested_by_user_id == execution_user_id,
+                    AgentTurnRun.lease_token == turn_lease_token,
+                    AgentTurnRun.lease_generation == turn_lease_generation,
+                    AgentTurnRun.status.in_(
+                        {"planning", "invoking_tools", "responding"}
+                    ),
+                    AgentTurnRun.lease_expires_at.is_not(None),
+                    AgentTurnRun.lease_expires_at > datetime.now(timezone.utc),
+                )
+            )
+            if fenced is None:
+                raise RuntimeError("Agent Turn 执行租约已失效")
+        except HTTPException as exc:
+            raise RuntimeError("Agent Turn 执行授权已失效") from exc
+        finally:
+            fence_db.close()
+
+    def prepare_execution_boundary() -> None:
+        if not turn_run_id:
+            return
+        # History/readiness and the previous tool round may have autobegun a
+        # transaction. Commit intended audit/state writes before external I/O,
+        # then discard request-local decisions and reauthorize independently.
+        db.commit()
+        db.info.pop("permission_cache", None)
+        assert_turn_fence()
 
     trace_id = uuid.uuid4().hex
     trace_context = {
@@ -1585,20 +1432,23 @@ def invoke_agent_once(
             ontology_summary,
             trace_context=trace_context,
             runtime_context=runtime_context,
+            before_llm_call=prepare_execution_boundary if turn_run_id else None,
         ):
             event_type = event["type"]
             data = event.get("data")
             if event_type == "token":
                 content += str(data or "")
             elif event_type == "tool_call" and isinstance(data, dict):
+                prepare_execution_boundary()
                 tool_calls.append(data)
             elif event_type == "tool_result" and isinstance(data, dict):
                 tool_results.append(data)
-                db.commit()
+                prepare_execution_boundary()
             elif event_type == "citations" and isinstance(data, list):
                 citations = data
             elif event_type == "evidence_refs" and isinstance(data, list):
                 evidence_refs = data
+        prepare_execution_boundary()
         assistant_message.content = content
         assistant_message.tool_calls = tool_calls
         assistant_message.tool_results = tool_results
@@ -1616,9 +1466,21 @@ def invoke_agent_once(
             scenario_id=a.scenario_id,
             tenant_id=a.tenant_id,
         )
-        db.commit()
+        if not defer_terminal_commit:
+            db.commit()
     except Exception as exc:
-        assistant_message.content = _stream_error_content(content, str(exc))
+        if turn_run_id:
+            db.rollback()
+            db.info.pop("permission_cache", None)
+            try:
+                assert_turn_fence()
+            except RuntimeError:
+                db.rollback()
+                raise
+        assistant_message.content = _stream_error_content(
+            content,
+            "Agent Turn 处理失败，请稍后重试",
+        )
         assistant_message.tool_calls = tool_calls
         assistant_message.tool_results = tool_results
         assistant_message.citations = citations
@@ -1635,7 +1497,8 @@ def invoke_agent_once(
             scenario_id=a.scenario_id,
             tenant_id=a.tenant_id,
         )
-        db.commit()
+        if not defer_terminal_commit:
+            db.commit()
         raise
 
     definition = runtime_context.runtime_definition
@@ -1654,5 +1517,7 @@ def invoke_agent_once(
             "definition_snapshot_id": definition.snapshot_id if definition else None,
             "release_id": definition.release_id if definition else None,
             "definition_hash": definition.definition_hash if definition else "",
+            "deployment_fingerprint": runtime_context.deployment.fingerprint,
+            "data_context_fingerprint": runtime_context.runtime_data_context.fingerprint,
         },
     }

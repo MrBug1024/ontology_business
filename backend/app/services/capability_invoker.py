@@ -39,6 +39,7 @@ from .capability_registry import (
     builtin_provider_key,
     default_provider_registry,
 )
+from .capability_provider_keys import BUILTIN_PROVIDER_VERSION
 from .deployment_service import (
     DeploymentResolutionError,
     require_request_matches_deployment,
@@ -762,9 +763,10 @@ def _provider_version_for_resolution(
         and static_builtin_key is not None
         and provider_key == static_builtin_key
     ):
-        # Legacy built-in definitions predate version metadata. This exception
-        # applies only to the platform's static kind-to-provider binding.
-        return None
+        # Historic built-in definitions predate version metadata. Their
+        # interpretation is frozen to the original platform-owned v1 identity;
+        # installed Provider cardinality must never change that choice.
+        return BUILTIN_PROVIDER_VERSION
     raise CapabilityInvocationError(
         "provider_version_missing",
         "resolved capability Provider version is missing",
@@ -826,7 +828,7 @@ def resolve_capability_contract(
     try:
         provider = trusted_registry.resolve(
             provider_key,
-            expected_version or None,
+            expected_version,
         )
     except CapabilityRegistryError:
         _raise_provider_resolution_error(
@@ -1279,6 +1281,7 @@ def _runtime_context_from_audit(
                 reference_id=reference_id,
                 signature=row.content_hash,
                 version_id=version_id,
+                ordinal=int(row.ordinal or 0),
             )
         )
     return RuntimeDataContext(tuple(handles))
@@ -1359,7 +1362,7 @@ class CapabilityInvoker:
         try:
             provider = self._registry.resolve(
                 provider_key,
-                expected_version or None,
+                expected_version,
             )
         except CapabilityRegistryError:
             _raise_provider_resolution_error(

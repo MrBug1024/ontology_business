@@ -14,6 +14,7 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base
 from app.models import (
     BusinessScenario,
+    DataMapping,
     DataSource,
     FunctionDefinition,
     OntologyAction,
@@ -1590,6 +1591,80 @@ class ScenarioModelCompilerTests(unittest.TestCase):
             {item["data_source_id"] for item in context["mapping_catalog"]},
         )
 
+    def test_mapping_catalog_never_reads_agent_runtime_sources(self) -> None:
+        modeling = DataSource(
+            id="source-modeling-only",
+            tenant_id="tenant-scenario-compiler",
+            scenario_id=self.scenario.id,
+            name="Modeling structure",
+            type="postgres",
+            resource_scope="modeling",
+            config={},
+            status="ok",
+        )
+        runtime = DataSource(
+            id="source-agent-runtime",
+            tenant_id="tenant-scenario-compiler",
+            scenario_id=self.scenario.id,
+            name="Invocation connection",
+            type="postgres",
+            resource_scope="agent_runtime",
+            config={},
+            status="ok",
+        )
+        self.db.add_all([modeling, runtime])
+        self.db.commit()
+
+        with patch.object(
+            scenario_model_compiler.datasource_service,
+            "list_tables",
+            return_value=[{
+                "name": "records",
+                "columns": [{"name": "id", "type": "text", "pk": True}],
+            }],
+        ) as list_tables:
+            context = scenario_model_compiler.prepare_compilation_context(
+                self.db,
+                self.scenario,
+            )
+
+        self.assertEqual(list_tables.call_count, 1)
+        self.assertEqual(
+            [item["data_source_id"] for item in context["mapping_catalog"]],
+            [modeling.id],
+        )
+
+    def test_existing_catalog_hides_agent_runtime_mappings(self) -> None:
+        entity = OntologyEntity(
+            id="entity-runtime-mapping",
+            scenario_id=self.scenario.id,
+            name="Runtime record",
+        )
+        source = DataSource(
+            id="source-runtime-mapping",
+            tenant_id="tenant-scenario-compiler",
+            scenario_id=self.scenario.id,
+            name="Runtime only",
+            type="postgres",
+            resource_scope="agent_runtime",
+            config={},
+            status="ok",
+        )
+        mapping = DataMapping(
+            id="runtime-mapping",
+            scenario_id=self.scenario.id,
+            entity_id=entity.id,
+            data_source_id=source.id,
+            table_name="runtime_records",
+            column_map={},
+        )
+        self.db.add_all([entity, source, mapping])
+        self.db.commit()
+
+        catalog = scenario_model_compiler._existing_catalog(self.scenario, self.db)
+
+        self.assertEqual(catalog["mappings"], [])
+
     def test_chunk_timeout_becomes_source_bound_placeholders_without_retry_loop(self) -> None:
         document = {
             "id": "timeout-source",
@@ -2154,23 +2229,22 @@ class ScenarioModelCompilerTests(unittest.TestCase):
             },
         )
 
-    def test_large_source_skips_full_call_and_starts_with_bounded_chunks(self) -> None:
+    def test_large_source_uses_one_bounded_retrieval_projection(self) -> None:
+        raw_tail = "RAW-LARGE-SOURCE-TAIL-MUST-NOT-ENTER-PROMPT"
         document = {
             "id": "large-source",
             "filename": "大型业务文档.md",
-            "text": "大型文档背景段。" * 5_000,
+            "text": ("大型文档背景段。" * 5_000) + raw_tail,
         }
         source_bundle = scenario_model_compiler.build_source_bundle(
             "请编译附件", [document]
         )
-        expected_chunks = scenario_model_compiler._source_chunks(
-            source_bundle["paragraphs"]
-        )
         all_refs = [item["ref"] for item in source_bundle["paragraphs"]]
-        self.assertGreater(
+        self.assertLessEqual(
             source_bundle["total_characters"],
-            scenario_model_compiler.DIRECT_CHUNK_SOURCE_CHARS,
+            scenario_model_compiler.content_retrieval_service.COMPILER_MAX_CHARS,
         )
+        self.assertFalse(source_bundle["documents"][0]["retrieval_complete"])
 
         def fake_chat(*args, **kwargs):  # noqa: ANN002, ANN003
             prompt = args[1][1]["content"]
@@ -2215,18 +2289,21 @@ class ScenarioModelCompilerTests(unittest.TestCase):
                 llm=object(),
             )
 
-        self.assertEqual(chat.call_count, len(expected_chunks))
+        self.assertEqual(chat.call_count, 1)
         self.assertTrue(chat.call_args_list)
         self.assertTrue(all(
             call.kwargs["max_tokens"]
-            == scenario_model_compiler.FALLBACK_MAX_OUTPUT_TOKENS
+            == scenario_model_compiler.MAX_OUTPUT_TOKENS
             for call in chat.call_args_list
         ))
-        self.assertTrue(all(
-            "这是整份文档的超时降级分块" in call.args[1][1]["content"]
-            for call in chat.call_args_list
-        ))
+        prompt = chat.call_args_list[0].args[1][1]["content"]
+        self.assertNotIn(raw_tail, prompt)
+        self.assertNotIn(document["text"], prompt)
         self.assertEqual(payload["coverage_summary"]["total"], len(all_refs))
+        self.assertIn(
+            "source_retrieval_bounded",
+            {item["code"] for item in payload["unresolved"]},
+        )
         self.assertNotIn(
             "missing_source_coverage",
             {item["code"] for item in payload["unresolved"]},
@@ -2385,6 +2462,46 @@ class ScenarioModelCompilerTests(unittest.TestCase):
         self.db.rollback()
         self.assertEqual(self.db.scalar(select(func.count()).select_from(OntologyEntity)), 0)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(OntologyAction)), 0)
+
+    def test_edited_provider_candidate_fails_closed_in_preflight_and_apply(self) -> None:
+        normalized = scenario_model_compiler.normalize_scenario_model(
+            self.db,
+            self.scenario,
+            self._raw(),
+            source_bundle=self._bundle(),
+        )
+        invalid_identities = (
+            ("tenant.dynamic-provider", "1.0.0"),
+            ("builtin.semantic-dataset-query", "9.9.9"),
+        )
+        for provider_key, provider_version in invalid_identities:
+            with self.subTest(
+                provider_key=provider_key,
+                provider_version=provider_version,
+            ):
+                payload = json.loads(json.dumps(normalized))
+                payload["functions"][0]["runtime_kind"] = "provider"
+                payload["functions"][0]["runtime_config"] = {
+                    "provider_key": provider_key,
+                    "provider_version": provider_version,
+                    "provider_config": {},
+                }
+                with self.assertRaisesRegex(ValueError, "Provider 未注册|版本不匹配"):
+                    scenario_model_compiler.preflight_scenario_model(
+                        self.db,
+                        self.scenario,
+                        payload,
+                    )
+                with self.assertRaisesRegex(ValueError, "Provider 未注册|版本不匹配"):
+                    scenario_model_compiler.apply_scenario_model(
+                        self.db,
+                        self.scenario,
+                        payload,
+                    )
+                self.assertEqual(
+                    self.db.scalar(select(func.count()).select_from(FunctionDefinition)),
+                    0,
+                )
 
     def test_missing_source_coverage_blocks_every_write(self) -> None:
         raw = self._raw()

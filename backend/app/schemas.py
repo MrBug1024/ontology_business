@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime
 import ipaddress
+import json
+import math
 import re
 import unicodedata
 from typing import Any, Literal, Optional
@@ -542,6 +544,25 @@ class FunctionDefinitionOut(FunctionDefinitionIn):
     model_config = {"from_attributes": True}
 
 
+class FunctionProviderManifestOut(BaseModel):
+    provider_key: str = Field(min_length=1, max_length=128)
+    provider_version: str = Field(min_length=1, max_length=80)
+    capability_kind: Literal["function"] = "function"
+    display_name: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=2_000)
+    config_schema: dict[str, Any]
+    default_config: dict[str, Any] = Field(default_factory=dict)
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    input_schema_mode: Literal["fixed", "editable"] = "fixed"
+    output_schema_mode: Literal["fixed", "editable"] = "fixed"
+    ui_schema: dict[str, dict[str, str]] = Field(default_factory=dict)
+    deprecated: bool = False
+    migration_message: str = Field(default="", max_length=1_000)
+
+    model_config = {"extra": "forbid"}
+
+
 class FunctionRunIn(BaseModel):
     params: dict = Field(default_factory=dict)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=180)
@@ -639,6 +660,8 @@ class BucketFileOut(BaseModel):
     index_version: str = ""
     indexed_at: datetime | None = None
     chunk_count: int = 0
+    modeling_contract_dataset_id: str | None = None
+    modeling_contract_schema_id: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -1523,6 +1546,7 @@ class AgentManagedInputIn(BaseModel):
 class AgentChatAttachmentIn(BaseModel):
     """One immutable file uploaded by the conversation user for this turn."""
 
+    upload_run_id: str | None = Field(default=None, min_length=1, max_length=32)
     asset_version_id: str | None = Field(default=None, min_length=1, max_length=32)
     dataset_version_id: str | None = Field(default=None, min_length=1, max_length=32)
     expected_signature: str | None = Field(
@@ -1535,14 +1559,19 @@ class AgentChatAttachmentIn(BaseModel):
 
     @model_validator(mode="after")
     def exactly_one_reference(self) -> "AgentChatAttachmentIn":
-        if (self.asset_version_id is None) == (self.dataset_version_id is None):
-            raise ValueError("附件必须且只能引用一个资产版本或数据集版本")
+        references = (
+            self.upload_run_id,
+            self.asset_version_id,
+            self.dataset_version_id,
+        )
+        if sum(value is not None for value in references) != 1:
+            raise ValueError("附件必须且只能引用一个上传任务、资产版本或数据集版本")
         return self
 
 
 class ChatRequest(BaseModel):
-    message: str
-    conversation_id: Optional[str] = None
+    message: str = Field(default="", max_length=50_000)
+    conversation_id: Optional[str] = Field(default=None, min_length=1, max_length=32)
     environment: Literal["dev", "staging", "prod"] = "dev"
     inputs: dict[str, Any] = Field(default_factory=dict)
     managed_inputs: list[AgentManagedInputIn] = Field(default_factory=list, max_length=100)
@@ -1554,15 +1583,111 @@ class ChatRequest(BaseModel):
 
     @model_validator(mode="after")
     def unique_managed_ports(self) -> "ChatRequest":
-        keys = [item.port_key.casefold() for item in self.managed_inputs]
+        keys = [
+            (
+                item.port_key.casefold(),
+                next(
+                    (field, value)
+                    for field in (
+                        "dataset_version_id",
+                        "dataset_head_id",
+                        "asset_version_id",
+                        "artifact_id",
+                        "binding_key",
+                    )
+                    if (value := getattr(item, field)) is not None
+                ),
+            )
+            for item in self.managed_inputs
+        ]
         if len(keys) != len(set(keys)):
-            raise ValueError("同一端口不能重复提交受管输入")
+            raise ValueError("同一端口不能重复提交相同受管输入")
+        if (
+            not self.message.strip()
+            and not self.inputs
+            and not self.managed_inputs
+            and not self.attachments
+        ):
+            raise ValueError("消息、结构化输入或受管附件至少提供一项")
+        try:
+            encoded = json.dumps(
+                self.model_dump(mode="json", exclude_none=True),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Agent 输入必须是有限 JSON 值") from exc
+        if len(encoded) > 1_048_576:
+            raise ValueError("Agent 输入请求不能超过 1 MB")
         return self
 
 
 class ChatEvent(BaseModel):
     type: str  # status / tool_call / tool_result / token / done / error
     data: Any = None
+
+
+class AgentTurnErrorOut(BaseModel):
+    code: str
+    message: str
+
+
+class AgentTurnRunOut(BaseModel):
+    id: str
+    agent_id: str | None = None
+    conversation_id: str | None = None
+    user_message_id: str | None = None
+    assistant_message_id: str | None = None
+    parent_run_id: str | None = None
+    status: Literal[
+        "accepted",
+        "preparing_inputs",
+        "validating_contracts",
+        "planning",
+        "invoking_tools",
+        "responding",
+        "cancel_requested",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "indeterminate",
+    ]
+    revision: int = Field(ge=1)
+    environment: Literal["dev", "staging", "prod"]
+    definition_hash: str = ""
+    deployment_fingerprint: str = ""
+    data_context_fingerprint: str = ""
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: AgentTurnErrorOut | None = None
+    created_at: datetime
+    updated_at: datetime
+    finished_at: datetime | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentTurnEventOut(BaseModel):
+    revision: int = Field(ge=1)
+    type: str = Field(min_length=1, max_length=50)
+    data: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentTurnCancelIn(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentTurnRetryIn(BaseModel):
+    expected_revision: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=1, max_length=180)
+
+    model_config = {"extra": "forbid"}
 
 
 # ──────────────────────────────────────────────
@@ -1626,6 +1751,20 @@ class DocumentReindexOut(BaseModel):
     items: list[dict] = Field(default_factory=list)
 
 
+class AssistantQuestionOptionOut(BaseModel):
+    label: str = Field(min_length=1, max_length=160)
+    value: str = Field(min_length=1, max_length=128)
+    impact: str = Field(default="", max_length=500)
+    recommended: bool = False
+
+
+class AssistantQuestionOut(BaseModel):
+    id: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=160)
+    message: str = Field(min_length=1, max_length=2000)
+    options: list[AssistantQuestionOptionOut] = Field(default_factory=list, max_length=8)
+
+
 class AssistantMessageOut(BaseModel):
     id: str
     thread_id: str
@@ -1637,6 +1776,8 @@ class AssistantMessageOut(BaseModel):
     thinking: list = Field(default_factory=list)
     evidence: dict = Field(default_factory=dict)
     action_preview: dict = Field(default_factory=dict)
+    questions: list[AssistantQuestionOut] = Field(default_factory=list, max_length=8)
+    suggestions: list[str] = Field(default_factory=list, max_length=8)
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -1660,22 +1801,76 @@ class AssistantAttachmentOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+_ASSISTANT_SELECTION_KEYS = frozenset({
+    "label",
+    "kind",
+    "id",
+    "type",
+    "action_id",
+    "action_name",
+    "entity_id",
+    "data_source_id",
+    "table_name",
+    "params",
+})
+_ASSISTANT_SELECTION_MAX_BYTES = 8 * 1024
+_ASSISTANT_SELECTION_MAX_DEPTH = 8
+_ASSISTANT_SELECTION_MAX_NODES = 512
+
+
+def _validate_assistant_selection_json(value: Any) -> None:
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > _ASSISTANT_SELECTION_MAX_NODES:
+            raise ValueError("selection 结构过大")
+        if depth > _ASSISTANT_SELECTION_MAX_DEPTH:
+            raise ValueError("selection 嵌套层级过深")
+        if item is None or isinstance(item, (bool, int)):
+            continue
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError("selection 数值必须为有限值")
+            continue
+        if isinstance(item, str):
+            if len(item) > 2_000:
+                raise ValueError("selection 单个文本值过长")
+            continue
+        if isinstance(item, list):
+            if len(item) > 100:
+                raise ValueError("selection 数组元素过多")
+            stack.extend((child, depth + 1) for child in item)
+            continue
+        if isinstance(item, dict):
+            if len(item) > 100:
+                raise ValueError("selection 对象字段过多")
+            for key, child in item.items():
+                if not isinstance(key, str) or not key or len(key) > 128:
+                    raise ValueError("selection 字段名无效")
+                stack.append((child, depth + 1))
+            continue
+        raise ValueError("selection 只允许 JSON 值")
+
+
 class AssistantChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=12000)
     # Every explicit send is a new compilation intent.  Keeping this separate
     # from the message/attachment content prevents a historical terminal job
     # from swallowing a later user request with identical wording.
     request_id: str | None = Field(default=None, min_length=1, max_length=128)
-    thread_id: str | None = None
-    scenario_id: str | None = None
-    page: str = ""
-    path: str = ""
+    thread_id: str | None = Field(default=None, min_length=1, max_length=64)
+    scenario_id: str | None = Field(default=None, min_length=1, max_length=64)
+    page: str = Field(default="", max_length=200)
+    path: str = Field(default="", max_length=2048)
     selection: dict = Field(default_factory=dict)
-    attachment_ids: list[str] = Field(default_factory=list)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=20)
+    upload_run_ids: list[str] = Field(default_factory=list, max_length=20)
     # Per-request routing is optional; an empty value keeps the platform's
     # configured default.  Skills/MCPs are selected by stable IDs and are
     # re-checked against the current tenant before being added to context.
-    llm_config_id: str | None = None
+    llm_config_id: str | None = Field(default=None, min_length=1, max_length=64)
     skill_ids: list[str] = Field(default_factory=list, max_length=50)
     mcp_ids: list[str] = Field(default_factory=list, max_length=50)
     # The assistant may answer or prepare a reviewed change set. Effects are
@@ -1690,6 +1885,79 @@ class AssistantChatRequest(BaseModel):
     draft_kind: Literal[
         "auto", "scenario", "ontology", "mapping", "workflow", "scenario_model"
     ] = "auto"
+
+    @field_validator("attachment_ids", "upload_run_ids", "skill_ids", "mcp_ids")
+    @classmethod
+    def validate_reference_ids(cls, value: list[str]) -> list[str]:
+        if any(not str(item).strip() or len(str(item)) > 64 for item in value):
+            raise ValueError("引用 ID 必须为 1-64 个字符")
+        if len(set(value)) != len(value):
+            raise ValueError("引用 ID 不得重复")
+        return value
+
+    @field_validator("selection")
+    @classmethod
+    def validate_selection(cls, value: dict) -> dict:
+        unknown = set(value) - _ASSISTANT_SELECTION_KEYS
+        if unknown:
+            raise ValueError("selection 包含不支持的字段")
+        for key, item in value.items():
+            if key == "params":
+                if not isinstance(item, dict):
+                    raise ValueError("selection.params 必须是对象")
+                continue
+            if not isinstance(item, str):
+                raise ValueError(f"selection.{key} 必须是字符串")
+            maximum = 300 if key in {"label", "action_name", "table_name"} else 128
+            if len(item) > maximum:
+                raise ValueError(f"selection.{key} 过长")
+        _validate_assistant_selection_json(value)
+        try:
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("selection 不是有效 JSON") from exc
+        if len(encoded) > _ASSISTANT_SELECTION_MAX_BYTES:
+            raise ValueError("selection 超过 8KiB 限制")
+        return value
+
+    model_config = {"extra": "forbid"}
+
+
+class AssistantRequestRunOut(BaseModel):
+    id: str
+    parent_run_id: str | None = None
+    request_id: str
+    thread_id: str
+    user_message_id: str
+    assistant_message_id: str
+    status: Literal[
+        "waiting_upload", "queued", "running", "succeeded", "failed", "cancelled"
+    ]
+    revision: int = Field(ge=1)
+    upload_run_ids: list[str] = Field(default_factory=list)
+    error: dict[str, str] | None = None
+    created_at: datetime
+    updated_at: datetime
+    finished_at: datetime | None = None
+
+
+class AssistantRequestRetryIn(BaseModel):
+    expected_revision: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+    model_config = {"extra": "forbid"}
+
+
+class AssistantRequestCancelIn(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+    model_config = {"extra": "forbid"}
 
 
 class AssistantProposalApplyRequest(BaseModel):
@@ -1731,20 +1999,7 @@ class AssistantCompilationGuidanceRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=12000)
     attachment_ids: list[str] = Field(default_factory=list, max_length=20)
-
-
-class AssistantQuestionOptionOut(BaseModel):
-    label: str
-    value: str
-    impact: str
-    recommended: bool = False
-
-
-class AssistantQuestionOut(BaseModel):
-    id: str
-    title: str
-    message: str
-    options: list[AssistantQuestionOptionOut] = Field(default_factory=list)
+    upload_run_ids: list[str] = Field(default_factory=list, max_length=20)
 
 
 class AssistantEvidenceOut(BaseModel):

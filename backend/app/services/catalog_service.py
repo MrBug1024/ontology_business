@@ -44,7 +44,12 @@ from ..models import (
     SemanticFieldMapping,
     SemanticMapping,
 )
-from . import datasource_service, permission_service, tenant_service
+from . import (
+    datasource_service,
+    input_contract_validator,
+    permission_service,
+    tenant_service,
+)
 
 
 class CatalogError(ValueError):
@@ -80,6 +85,12 @@ _PORT_PHYSICAL_REFERENCE_KEYS = {
     "sql",
     "table_name",
 }
+_USAGE_PLANES = {
+    "modeling_material",
+    "invocation_input",
+    "generated_output",
+}
+_MODELING_CONTRACT_SOURCE_PURPOSE = "modeling_contract_source"
 
 
 def _now() -> datetime:
@@ -210,7 +221,86 @@ def require_dataset(db: Session, dataset_id: str) -> LogicalDataset:
     ).scalar_one_or_none()
     if dataset is None:
         raise CatalogError("逻辑数据集不存在")
+    _require_modeling_contract_source_access(db, dataset)
     return dataset
+
+
+def _modeling_contract_source_row(
+    db: Session,
+    dataset: LogicalDataset,
+) -> tuple[BucketFile, DataSource] | None:
+    labels = dict(dataset.labels or {})
+    if labels.get("catalog_purpose") != _MODELING_CONTRACT_SOURCE_PURPOSE:
+        return None
+    source_id = str(labels.get("modeling_source_data_source_id") or "")
+    file_id = str(labels.get("modeling_source_bucket_file_id") or "")
+    digest = str(labels.get("source_content_sha256") or "").lower()
+    scope = str(labels.get("modeling_source_scope") or "")
+    scenario_id = str(labels.get("modeling_source_scenario_id") or "")
+    if (
+        not source_id
+        or not file_id
+        or _SHA256_RE.fullmatch(digest) is None
+        or dataset.key != f"modeling.contract.{source_id}.{digest}"
+        or dataset.usage_plane != "modeling_material"
+        or scope not in {"tenant", "scenario"}
+        or (scope == "scenario") != bool(scenario_id)
+    ):
+        raise CatalogError("建模契约来源元数据无效")
+    row = db.execute(
+        select(BucketFile, DataSource)
+        .join(DataSource, DataSource.id == BucketFile.data_source_id)
+        .where(
+            BucketFile.id == file_id,
+            BucketFile.data_source_id == source_id,
+            BucketFile.content_sha256 == digest,
+            DataSource.tenant_id == _tenant(db),
+            DataSource.resource_scope == "modeling",
+            DataSource.type == "file_bucket",
+        )
+    ).first()
+    if row is None:
+        raise CatalogError("建模契约来源已不可用")
+    bucket_file, source = row
+    if (source.scenario_id or "") != scenario_id:
+        raise CatalogError("建模契约来源归属无效")
+    return bucket_file, source
+
+
+def _require_modeling_contract_source_access(
+    db: Session,
+    dataset: LogicalDataset,
+    *,
+    scenario_id: str | None = None,
+    writable: bool = False,
+) -> None:
+    row = _modeling_contract_source_row(db, dataset)
+    if row is None:
+        return
+    if dataset.lifecycle_status != "active":
+        raise CatalogError("建模契约来源已退役")
+    _bucket_file, source = row
+    if scenario_id is not None and source.scenario_id not in {None, scenario_id}:
+        raise CatalogError("建模契约来源不属于当前业务场景")
+    if source.scenario_id:
+        scenario = tenant_service.require_scenario(
+            db, source.scenario_id, writable=writable
+        )
+        permission_service.require_scenario_permission(
+            db,
+            scenario,
+            "write" if writable else "read",
+            message="没有建模契约来源所属业务场景的权限",
+        )
+    else:
+        permission_service.require_tenant_permission(
+            db, "write" if writable else "read"
+        )
+
+
+def _require_modeling_dataset(dataset: LogicalDataset, *, label: str) -> None:
+    if str(getattr(dataset, "usage_plane", "") or "") != "modeling_material":
+        raise CatalogError(f"{label}只能引用建模资料数据集")
 
 
 def require_schema(db: Session, schema_id: str, *, dataset_id: str | None = None) -> DatasetSchema:
@@ -223,6 +313,7 @@ def require_schema(db: Session, schema_id: str, *, dataset_id: str | None = None
     schema = db.execute(statement).scalar_one_or_none()
     if schema is None:
         raise CatalogError("数据集 Schema 不存在")
+    require_dataset(db, schema.dataset_id)
     return schema
 
 
@@ -247,11 +338,21 @@ def require_dataset_version(
     return version
 
 
-def list_assets(db: Session) -> list[DataAsset]:
+def list_assets(
+    db: Session,
+    *,
+    usage_plane: str | None = None,
+) -> list[DataAsset]:
     permission_service.require_tenant_permission(db, "read")
+    statement = select(DataAsset)
+    if usage_plane is not None:
+        normalized_plane = str(usage_plane or "").strip().lower()
+        if normalized_plane not in _USAGE_PLANES:
+            raise CatalogError("数据资产 usage_plane 无效")
+        statement = statement.where(DataAsset.usage_plane == normalized_plane)
     return list(
         db.scalars(
-            select(DataAsset)
+            statement
             .options(selectinload(DataAsset.versions))
             .where(DataAsset.tenant_id == _tenant(db))
             .order_by(DataAsset.created_at.desc(), DataAsset.id.desc())
@@ -268,6 +369,7 @@ def create_asset(db: Session, payload: DataAssetCreate) -> DataAsset:
         description=payload.description,
         kind=payload.kind,
         media_type=payload.media_type,
+        usage_plane=payload.usage_plane,
         labels=_safe_document(payload.labels, label="资产标签", maximum=32_000),
         lifecycle_status="active",
         created_by_user_id=_actor(db),
@@ -364,11 +466,25 @@ def register_asset_version(
     return version
 
 
-def list_datasets(db: Session) -> list[LogicalDataset]:
+def list_datasets(
+    db: Session,
+    *,
+    usage_plane: str | None = None,
+    scenario_id: str | None = None,
+) -> list[LogicalDataset]:
     permission_service.require_tenant_permission(db, "read")
-    return list(
+    if scenario_id:
+        scenario = tenant_service.require_scenario(db, scenario_id)
+        permission_service.require_scenario_permission(db, scenario, "read")
+    statement = select(LogicalDataset)
+    if usage_plane is not None:
+        normalized_plane = str(usage_plane or "").strip().lower()
+        if normalized_plane not in _USAGE_PLANES:
+            raise CatalogError("数据集 usage_plane 无效")
+        statement = statement.where(LogicalDataset.usage_plane == normalized_plane)
+    rows = list(
         db.scalars(
-            select(LogicalDataset)
+            statement
             .options(
                 selectinload(LogicalDataset.schemas),
                 selectinload(LogicalDataset.versions),
@@ -378,6 +494,23 @@ def list_datasets(db: Session) -> list[LogicalDataset]:
             .order_by(LogicalDataset.created_at.desc(), LogicalDataset.id.desc())
         ).all()
     )
+    visible: list[LogicalDataset] = []
+    for dataset in rows:
+        labels = dict(dataset.labels or {})
+        if labels.get("catalog_purpose") != _MODELING_CONTRACT_SOURCE_PURPOSE:
+            visible.append(dataset)
+            continue
+        if dataset.lifecycle_status != "active":
+            continue
+        source_scenario_id = str(labels.get("modeling_source_scenario_id") or "")
+        if source_scenario_id and source_scenario_id != str(scenario_id or ""):
+            continue
+        try:
+            if _modeling_contract_source_row(db, dataset) is not None:
+                visible.append(dataset)
+        except CatalogError:
+            continue
+    return visible
 
 
 def create_dataset(db: Session, payload: LogicalDatasetCreate) -> LogicalDataset:
@@ -387,6 +520,7 @@ def create_dataset(db: Session, payload: LogicalDatasetCreate) -> LogicalDataset
         key=_key(payload.key, "数据集 key"),
         name=payload.name.strip(),
         description=payload.description,
+        usage_plane=payload.usage_plane,
         lifecycle_status="active",
         labels=_safe_document(payload.labels, label="数据集标签", maximum=32_000),
         created_by_user_id=_actor(db),
@@ -491,6 +625,7 @@ def load_schema(db: Session, schema_id: str, *, dataset_id: str | None = None) -
     schema = db.execute(statement).scalar_one_or_none()
     if schema is None:
         raise CatalogError("数据集 Schema 不存在")
+    require_dataset(db, schema.dataset_id)
     return schema
 
 
@@ -661,6 +796,8 @@ def create_scenario_binding(
     permission_service.require_scenario_permission(db, scenario, "write")
     dataset = require_dataset(db, payload.dataset_id)
     role = "invocation_input" if payload.role == "input" else payload.role
+    if role == "modeling_evidence":
+        _require_modeling_dataset(dataset, label="建模资料绑定")
     config = _safe_document(payload.config, label="场景数据绑定配置", maximum=64_000)
     if payload.binding_mode == "head":
         head = db.execute(
@@ -793,6 +930,13 @@ def _apply_capability_port(
         schema = require_schema(
             db, payload.dataset_schema_id, dataset_id=payload.dataset_id
         )
+        _require_modeling_dataset(schema.dataset, label="能力端口契约")
+        _require_modeling_contract_source_access(
+            db,
+            schema.dataset,
+            scenario_id=port.scenario_id,
+            writable=True,
+        )
     port.capability_kind = payload.capability_kind
     port.capability_key = payload.capability_key.strip()
     port.port_key = _key(payload.port_key, "能力端口 key")
@@ -803,10 +947,35 @@ def _apply_capability_port(
     port.media_kind = payload.media_kind
     port.dataset_id = schema.dataset_id if schema else None
     port.dataset_schema_id = schema.id if schema else None
-    port.schema_document = _safe_document(
+    schema_document = _safe_document(
         payload.schema_document,
         label="能力端口 JSON Schema",
     )
+    try:
+        input_contract_validator.validate_content_contract(schema_document)
+    except input_contract_validator.InputContractError as exc:
+        raise CatalogError(f"能力端口内容契约无效：{exc.message}") from exc
+    if schema is not None:
+        try:
+            content_contract = input_contract_validator.build_tabular_content_contract(
+                schema.relations
+            )
+        except input_contract_validator.InputContractError as exc:
+            raise CatalogError(exc.message) from exc
+        if input_contract_validator.CONTENT_CONTRACT_KEY in schema_document:
+            if (
+                schema_document[input_contract_validator.CONTENT_CONTRACT_KEY]
+                != content_contract
+            ):
+                raise CatalogError(
+                    "能力端口内容契约必须与所选建模资料 Schema 的规范契约完全一致"
+                )
+        else:
+            schema_document = {
+                **schema_document,
+                input_contract_validator.CONTENT_CONTRACT_KEY: content_contract,
+            }
+    port.schema_document = schema_document
     port.is_required = payload.is_required
     port.cardinality = payload.cardinality
     port.binding_policy = payload.binding_policy
@@ -883,15 +1052,23 @@ def create_semantic_mapping(
 ) -> SemanticMapping:
     scenario = tenant_service.require_scenario(db, scenario_id, writable=True)
     permission_service.require_scenario_permission(db, scenario, "write")
-    binding = db.execute(
-        select(ScenarioDatasetBinding).where(
-            ScenarioDatasetBinding.id == payload.scenario_dataset_binding_id,
-            ScenarioDatasetBinding.scenario_id == scenario.id,
-            ScenarioDatasetBinding.tenant_id == _tenant(db),
-        )
-    ).scalar_one_or_none()
-    if binding is None:
-        raise CatalogError("场景数据绑定不存在")
+    # A semantic mapping is Definition-plane metadata.  Its authority is the
+    # immutable modeling DatasetSchema, never a runtime DatasetVersion.  Keep
+    # accepting the old binding id only as a scoped compatibility assertion;
+    # new callers do not create or persist a deployment-plane dependency.
+    binding = None
+    if payload.scenario_dataset_binding_id:
+        binding = db.execute(
+            select(ScenarioDatasetBinding).where(
+                ScenarioDatasetBinding.id == payload.scenario_dataset_binding_id,
+                ScenarioDatasetBinding.scenario_id == scenario.id,
+                ScenarioDatasetBinding.tenant_id == _tenant(db),
+            )
+        ).scalar_one_or_none()
+        if binding is None:
+            raise CatalogError("场景数据绑定不存在")
+        if binding.role != "modeling_evidence":
+            raise CatalogError("语义映射只能兼容引用建模资料绑定")
     entity = db.execute(
         select(OntologyEntity).where(
             OntologyEntity.id == payload.entity_id,
@@ -900,12 +1077,21 @@ def create_semantic_mapping(
     ).scalar_one_or_none()
     if entity is None:
         raise CatalogError("对象类型不属于当前场景")
-    schema = require_schema(db, payload.dataset_schema_id, dataset_id=binding.dataset_id)
+    schema = require_schema(db, payload.dataset_schema_id)
+    _require_modeling_dataset(schema.dataset, label="语义映射")
+    _require_modeling_contract_source_access(
+        db,
+        schema.dataset,
+        scenario_id=scenario.id,
+        writable=True,
+    )
+    if binding is not None and binding.dataset_id != schema.dataset_id:
+        raise CatalogError("兼容建模资料绑定与 Dataset Schema 不一致")
     relation = db.execute(
         select(DatasetRelation).where(
             DatasetRelation.id == payload.dataset_relation_id,
             DatasetRelation.schema_id == schema.id,
-            DatasetRelation.dataset_id == binding.dataset_id,
+            DatasetRelation.dataset_id == schema.dataset_id,
             DatasetRelation.tenant_id == _tenant(db),
         )
     ).scalar_one_or_none()
@@ -929,7 +1115,7 @@ def create_semantic_mapping(
                 DatasetField.id.in_(field_ids),
                 DatasetField.dataset_relation_id == relation.id,
                 DatasetField.schema_id == schema.id,
-                DatasetField.dataset_id == binding.dataset_id,
+                DatasetField.dataset_id == schema.dataset_id,
                 DatasetField.tenant_id == _tenant(db),
             )
         ).all()
@@ -942,10 +1128,10 @@ def create_semantic_mapping(
         raise CatalogError("同一对象属性不能重复映射")
     mapping = SemanticMapping(
         tenant_id=_tenant(db),
-        dataset_id=binding.dataset_id,
+        dataset_id=schema.dataset_id,
         scenario_id=scenario.id,
         entity_id=entity.id,
-        scenario_dataset_binding_id=binding.id,
+        scenario_dataset_binding_id=binding.id if binding is not None else None,
         dataset_schema_id=schema.id,
         dataset_relation_id=relation.id,
         mapping_key=_key(payload.mapping_key, "语义映射 key"),
@@ -968,7 +1154,7 @@ def create_semantic_mapping(
             SemanticFieldMapping(
                 tenant_id=_tenant(db),
                 scenario_id=scenario.id,
-                dataset_id=binding.dataset_id,
+                dataset_id=schema.dataset_id,
                 dataset_schema_id=schema.id,
                 dataset_relation_id=relation.id,
                 ontology_entity_id=entity.id,
@@ -995,10 +1181,17 @@ def list_semantic_mappings(db: Session, scenario_id: str) -> list[SemanticMappin
     return list(
         db.scalars(
             select(SemanticMapping)
+            .join(
+                LogicalDataset,
+                (LogicalDataset.id == SemanticMapping.dataset_id)
+                & (LogicalDataset.tenant_id == SemanticMapping.tenant_id),
+            )
             .options(selectinload(SemanticMapping.field_mappings))
             .where(
                 SemanticMapping.scenario_id == scenario.id,
                 SemanticMapping.tenant_id == _tenant(db),
+                LogicalDataset.usage_plane == "modeling_material",
+                LogicalDataset.lifecycle_status == "active",
             )
             .order_by(SemanticMapping.created_at, SemanticMapping.id)
         ).all()

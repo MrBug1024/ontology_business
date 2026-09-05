@@ -33,6 +33,14 @@ import {
 } from '../src/utils/relationMappings.ts'
 import { cloneAgentCapabilityScope, emptyAgentCapabilityScope } from '../src/utils/agentCapabilities.ts'
 import { buildSchemaFromFields, flattenSchemaFields } from '../src/utils/schemaBuilder.ts'
+import { migrateManagedUploadRunEntry } from '../src/utils/managedUploadIdentity.ts'
+import {
+  INPUT_CONTRACT_KEY,
+  buildInputContractSubmission,
+  createInputContractDraft,
+  createInputContractField,
+  createInputContractRelation,
+} from '../src/utils/inputContracts.ts'
 import {
   editableRuleCondition,
   parseRuleCondition,
@@ -54,6 +62,101 @@ function memoryStorage() {
     removeItem: (key) => values.delete(key),
   }
 }
+
+test('capability input contracts are optional and clear stale dataset selectors', () => {
+  const draft = createInputContractDraft('dataset_schema')
+  draft.datasetId = 'modeling-dataset'
+  draft.datasetSchemaId = 'schema-v1'
+
+  assert.deepEqual(buildInputContractSubmission(draft), {
+    dataset_id: null,
+    dataset_schema_id: null,
+    schema_document: {},
+  })
+  assert.equal(INPUT_CONTRACT_KEY in buildInputContractSubmission(draft).schema_document, false)
+
+  draft.enabled = true
+  assert.deepEqual(buildInputContractSubmission(draft), {
+    dataset_id: 'modeling-dataset',
+    dataset_schema_id: 'schema-v1',
+    schema_document: {},
+  })
+})
+
+test('manual capability input contract emits the bounded tabular contract payload', () => {
+  const firstRelation = createInputContractRelation()
+  firstRelation.minimumDataRows = 2
+  firstRelation.allowAdditionalFields = false
+  firstRelation.fields[0].name = 'record_id'
+  firstRelation.fields[0].logicalType = 'string'
+  const amount = createInputContractField()
+  amount.name = 'amount'
+  amount.logicalType = 'number'
+  amount.required = false
+  firstRelation.fields.push(amount)
+  const draft = createInputContractDraft('manual')
+  draft.enabled = true
+  draft.allowAdditionalRelations = false
+  draft.relations = [firstRelation]
+
+  assert.deepEqual(buildInputContractSubmission(draft), {
+    dataset_id: null,
+    dataset_schema_id: null,
+    schema_document: {
+      [INPUT_CONTRACT_KEY]: {
+        version: 'tabular-content/v1',
+        relations: [{
+          fields: [
+            { name: 'record_id', logical_types: ['string'], required: true },
+            { name: 'amount', logical_types: ['number'], required: false },
+          ],
+          minimum_data_rows: 2,
+          allow_additional_fields: false,
+        }],
+        allow_additional_relations: false,
+      },
+    },
+  })
+})
+
+test('capability port editor filters contract datasets to active modeling material', () => {
+  const panel = readFileSync(
+    new URL('../src/components/CapabilityPortsPanel.vue', import.meta.url),
+    'utf8',
+  )
+  const editor = readFileSync(
+    new URL('../src/components/InputContractEditor.vue', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(panel, /api\.listLogicalDatasets\('modeling_material', props\.scenarioId\)/)
+  assert.match(panel, /item\.usage_plane === 'modeling_material'/)
+  assert.match(panel, /item\.lifecycle_status === 'active'/)
+  assert.match(panel, /v-model="inputContract"/)
+  assert.doesNotMatch(panel, /结构化数据集端口必须绑定逻辑数据集/)
+  assert.match(editor, /aria-label="启用结构校验"/)
+  assert.match(editor, /MAX_INPUT_CONTRACT_RELATIONS/)
+  assert.match(editor, /MAX_INPUT_CONTRACT_FIELDS/)
+})
+
+test('semantic mapping editor authors directly from scenario-scoped modeling schemas', () => {
+  const panel = readFileSync(
+    new URL('../src/components/SemanticMappingsPanel.vue', import.meta.url),
+    'utf8',
+  )
+  const scenarioDetail = readFileSync(
+    new URL('../src/views/ScenarioDetail.vue', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(panel, /api\.listLogicalDatasets\('modeling_material', props\.scenarioId\)/)
+  assert.match(panel, /api\.listDatasetSchemas\(datasetId\)/)
+  assert.match(panel, /dataset_schema_id: schema\.id/)
+  assert.doesNotMatch(panel, /api\.listDatasetVersions/)
+  assert.doesNotMatch(panel, /api\.createScenarioDatasetBinding/)
+  assert.doesNotMatch(panel, /scenario_dataset_binding_id:/)
+  assert.match(scenarioDetail, /<SemanticMappingsPanel\s+:scenario-id="sid"/)
+})
 
 test('data source labels report the configured storage authority', () => {
   assert.equal(
@@ -207,6 +310,63 @@ test('global assistant shows safe references and keeps capability changes govern
   assert.doesNotMatch(source, /assistant-task-preset|本条消息/)
   assert.match(source, /拆解任务并受控建设模型/)
   assert.doesNotMatch(source, /return '场景已有定义'/)
+})
+
+test('global assistant submits durable upload runs without waiting for parsing', () => {
+  const viewSource = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  const uploadSource = readFileSync(
+    new URL('../src/composables/useAssistantManagedUploads.ts', import.meta.url),
+    'utf8',
+  )
+  const requestRunSource = readFileSync(
+    new URL('../src/composables/useAssistantRequestRuns.ts', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(viewSource, /useAssistantManagedUploads\(\{ attachments \}\)/)
+  assert.match(viewSource, /useAssistantRequestRuns\(/)
+  assert.match(uploadSource, /api\.createManagedUploadRun\(/)
+  assert.match(uploadSource, /purpose: 'invocation_attachment'/)
+  assert.match(uploadSource, /void uploadManagedContent\(item, file, scope\)/)
+  assert.match(viewSource, /upload_run_ids: currentAttachments\.flatMap/)
+  assert.match(uploadSource, /function attachmentIsSendable\(item: AssistantAttachment\)/)
+  assert.match(uploadSource, /item\.status !== 'awaiting_upload' \|\| !item\.error/)
+  assert.match(uploadSource, /item\.error = errorMessage\(error, '上传未到达服务端，请重试'\)/)
+  assert.match(uploadSource, /migrateManagedUploadRunEntry\(uploadSourceFiles, previousRunId, run\.id\)/)
+  assert.match(uploadSource, /migrateManagedUploadRunEntry\(uploadControllers, previousRunId, run\.id\)/)
+  assert.match(uploadSource, /if \(!scopeIsCurrent\(scope\)\) return[\s\S]*options\.attachments\.value\.push\(item\)/)
+  assert.match(uploadSource, /uploadControllers\.forEach\(\(controller\) => controller\.abort\(\)\)/)
+  assert.match(uploadSource, /onBeforeUnmount\(\(\) => \{[\s\S]*resetManagedUploads\(\)/)
+  assert.match(requestRunSource, /api\.getAssistantRequestRun\(runId, controller\.signal\)[\s\S]*if \(!pollIsCurrent\(runId, controller, scope\)\) break/)
+  assert.match(requestRunSource, /api\.retryAssistantRequestRun\(runId, revision\)[\s\S]*messageIsCurrent\(message, scope\)/)
+  assert.match(requestRunSource, /api\.cancelAssistantRequestRun\(runId, revision\)[\s\S]*messageIsCurrent\(message, scope\)/)
+  assert.match(requestRunSource, /assistantRequestPolls\.forEach\(\(controller\) => controller\.abort\(\)\)/)
+  assert.doesNotMatch(`${viewSource}\n${uploadSource}`, /await api\.uploadAssistantAttachment\(file\)/)
+})
+
+test('assistant managed upload retry migrates and cleans multi-generation run keys', () => {
+  const file = { name: 'source.csv' }
+  const controller = { abort() {} }
+  const files = new Map([['root-run', file]])
+  const controllers = new Map([['root-run', controller]])
+
+  migrateManagedUploadRunEntry(files, 'root-run', 'child-run')
+  migrateManagedUploadRunEntry(controllers, 'root-run', 'child-run')
+  migrateManagedUploadRunEntry(files, 'child-run', 'grandchild-run')
+  migrateManagedUploadRunEntry(controllers, 'child-run', 'grandchild-run')
+
+  assert.deepEqual([...files.keys()], ['grandchild-run'])
+  assert.deepEqual([...controllers.keys()], ['grandchild-run'])
+  assert.equal(files.get('grandchild-run'), file)
+  assert.equal(controllers.get('grandchild-run'), controller)
+
+  files.delete('grandchild-run')
+  controllers.delete('grandchild-run')
+  assert.equal(files.size, 0)
+  assert.equal(controllers.size, 0)
 })
 
 test('global assistant launcher and drawer header stay clear on narrow screens', () => {

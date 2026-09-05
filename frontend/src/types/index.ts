@@ -403,7 +403,7 @@ export interface FunctionDefinition {
   output_schema?: Record<string, unknown>
   tags?: string[]
   visibility?: 'scenario' | 'tenant'
-  runtime_kind?: 'contract' | 'weighted_score' | 'threshold' | 'geo_distance' | 'timeseries_aggregate' | string
+  runtime_kind?: 'contract' | 'weighted_score' | 'threshold' | 'geo_distance' | 'timeseries_aggregate' | 'provider' | string
   runtime_config?: Record<string, any>
   created_at?: string
   updated_at?: string
@@ -789,6 +789,7 @@ export interface CatalogAsset {
   description?: string
   kind: 'file' | 'stream' | 'api' | 'database' | 'generated' | 'other'
   media_type?: string
+  usage_plane: CatalogUsagePlane
   labels: Record<string, unknown>
   lifecycle_status: 'active' | 'retired'
   created_by_user_id?: string | null
@@ -832,6 +833,35 @@ export interface CatalogManagedUpload {
   }
 }
 
+export type ManagedUploadStatus =
+  | 'awaiting_upload'
+  | 'uploading'
+  | 'stored'
+  | 'processing'
+  | 'ready'
+  | 'failed'
+  | 'cancelled'
+
+export interface ManagedUploadRun {
+  id: string
+  parent_run_id?: string | null
+  purpose: 'validation_asset' | 'invocation_attachment'
+  filename: string
+  declared_byte_size: number
+  byte_size: number
+  status: ManagedUploadStatus
+  revision: number
+  asset_id?: string | null
+  asset_version_id?: string | null
+  content_sha256: string
+  error?: { code: string; message: string } | null
+  result?: CatalogManagedUpload | null
+  expires_at: string
+  created_at: string
+  updated_at: string
+  finished_at?: string | null
+}
+
 export interface ValidationDataset {
   dataset_id: string
   dataset_version_id: string
@@ -853,12 +883,15 @@ export interface ValidationDatasetJob {
   result?: ValidationDataset | null
 }
 
+export type CatalogUsagePlane = 'modeling_material' | 'invocation_input' | 'generated_output'
+
 export interface LogicalDataset {
   id: string
   tenant_id: string
   key: string
   name: string
   description?: string
+  usage_plane: CatalogUsagePlane
   labels: Record<string, unknown>
   lifecycle_status: 'active' | 'retired'
   created_by_user_id?: string | null
@@ -977,7 +1010,7 @@ export interface SemanticFieldMappingCreate {
 }
 
 export interface SemanticMappingCreate {
-  scenario_dataset_binding_id: string
+  scenario_dataset_binding_id?: string | null
   entity_id: string
   dataset_schema_id: string
   dataset_relation_id: string
@@ -1031,6 +1064,8 @@ export interface BucketFile {
   index_version?: string
   indexed_at?: string | null
   chunk_count?: number
+  modeling_contract_dataset_id?: string | null
+  modeling_contract_schema_id?: string | null
   created_at?: string
 }
 
@@ -1443,6 +1478,7 @@ export interface AgentCapabilityTarget {
 }
 
 export interface AgentChatAttachment {
+  upload_run_id?: string
   asset_version_id?: string
   dataset_version_id?: string
   expected_signature?: string
@@ -1458,6 +1494,82 @@ export interface AgentChatRequest {
   capability?: AgentCapabilityTarget
   idempotency_key?: string
   attachments?: AgentChatAttachment[]
+}
+
+export type ProviderUiControl =
+  | 'checkbox'
+  | 'number'
+  | 'select'
+  | 'semantic_mapping_multiselect'
+  | 'text'
+
+export interface ProviderUiFieldDescriptor {
+  control: ProviderUiControl
+  label?: string
+  help?: string
+  placeholder?: string
+}
+
+export interface FunctionProviderManifest {
+  provider_key: string
+  provider_version: string
+  capability_kind: 'function'
+  display_name: string
+  description: string
+  config_schema: Record<string, unknown>
+  default_config: Record<string, unknown>
+  input_schema: Record<string, unknown>
+  output_schema: Record<string, unknown>
+  input_schema_mode: 'fixed' | 'editable'
+  output_schema_mode: 'fixed' | 'editable'
+  ui_schema: Record<string, ProviderUiFieldDescriptor>
+  deprecated: boolean
+  migration_message: string
+}
+
+export type AgentTurnStatus =
+  | 'accepted'
+  | 'preparing_inputs'
+  | 'validating_contracts'
+  | 'planning'
+  | 'invoking_tools'
+  | 'responding'
+  | 'cancel_requested'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'indeterminate'
+
+export interface AgentTurnRun {
+  id: string
+  agent_id?: string | null
+  conversation_id?: string | null
+  user_message_id?: string | null
+  assistant_message_id?: string | null
+  parent_run_id?: string | null
+  status: AgentTurnStatus
+  revision: number
+  environment: 'dev' | 'staging' | 'prod'
+  definition_hash: string
+  deployment_fingerprint: string
+  data_context_fingerprint: string
+  result: Record<string, unknown>
+  error?: { code: string; message: string } | null
+  created_at: string
+  updated_at: string
+  finished_at?: string | null
+}
+
+export interface AgentTurnEvent {
+  revision: number
+  type: AgentTurnStatus
+  data: {
+    status?: AgentTurnStatus
+    label?: string
+    result?: Record<string, unknown>
+    error?: { code: string; message: string }
+  }
+  created_at: string
 }
 
 /** P1 运行时任务状态：由队列、重试、超时与审批共同驱动。 */
@@ -1635,12 +1747,44 @@ export interface AssistantCompilationJobResult {
 
 export interface AssistantAttachment {
   id: string
+  upload_run_id?: string
   filename: string
   mime?: string
   size: number
-  status: string
+  status: ManagedUploadStatus | 'pending' | 'parsed' | 'error'
+  revision?: number
+  progress?: number
   error?: string
   created_at?: string
+}
+
+export interface AssistantSelectionContext {
+  label?: string
+  kind?: string
+  id?: string
+  type?: string
+  action_id?: string
+  action_name?: string
+  entity_id?: string
+  data_source_id?: string
+  table_name?: string
+  params?: Record<string, unknown>
+}
+
+export interface AssistantRequestRun {
+  id: string
+  parent_run_id?: string | null
+  request_id: string
+  thread_id: string
+  user_message_id: string
+  assistant_message_id: string
+  status: 'waiting_upload' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  revision: number
+  upload_run_ids: string[]
+  error?: { code: string; message: string } | null
+  created_at: string
+  updated_at: string
+  finished_at?: string | null
 }
 
 export interface AssistantQuestion {

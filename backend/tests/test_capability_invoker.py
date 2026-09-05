@@ -699,7 +699,7 @@ def test_explicit_provider_runtime_selects_exact_version_from_multi_version_regi
     assert len(second.calls) == 1
 
 
-def test_static_builtin_provider_binding_keeps_legacy_versionless_discovery(
+def test_static_builtin_provider_binding_freezes_legacy_versionless_definition_to_v1(
     db: Session,
 ) -> None:
     world = _world(db, "builtin-version-compatibility")
@@ -710,8 +710,12 @@ def test_static_builtin_provider_binding_keeps_legacy_versionless_discovery(
     resource["runtime_config"] = {}
     provider = RecordingProvider(_object_contract())
     provider.provider_key = BUILTIN_PROVIDER_KEYS["function"]
+    newer_provider = RecordingProvider(_object_contract(required_roles=["new-v2-role"]))
+    newer_provider.provider_key = BUILTIN_PROVIDER_KEYS["function"]
+    newer_provider.provider_version = "2.0.0"
     registry = CapabilityProviderRegistry()
     registry.register_instance(provider)
+    registry.register_instance(newer_provider)
     registry.seal()
     request = _request(world, correlation_id="builtin-version-compatibility")
     capability = replace(
@@ -727,6 +731,7 @@ def test_static_builtin_provider_binding_keeps_legacy_versionless_discovery(
     )
 
     assert contract["side_effect"] is False
+    assert contract["required_roles"] == []
 
     resource["runtime_kind"] = "provider"
     resource["runtime_config"] = {

@@ -16,7 +16,7 @@ import copy
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Iterable
 
@@ -39,7 +39,7 @@ from ..models import (
     ScenarioCapabilityPort,
     WorkflowRun,
 )
-from . import connector_service, release_service
+from . import connector_service, release_service, semantic_mapping_contract_service
 
 
 class RuntimeDefinitionError(ValueError):
@@ -260,6 +260,8 @@ class RuntimeDefinition:
     events: dict[str, Any]
     workflows: dict[str, Any]
     capability_ports: dict[str, Any]
+    semantic_mapping_contracts: dict[str, Any] = field(default_factory=dict)
+    semantic_relation_mapping_contracts: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_frozen(self) -> bool:
@@ -334,6 +336,16 @@ def _materialize_runtime_graph(
     events = resources("events")
     workflows = resources("workflows")
     capability_ports = resources("capability_ports")
+    semantic_mapping_contracts = {
+        str(resource_id): copy.deepcopy(dict(raw))
+        for resource_id, raw in groups.get("semantic_mapping_contracts", {}).items()
+    }
+    semantic_relation_mapping_contracts = {
+        str(resource_id): copy.deepcopy(dict(raw))
+        for resource_id, raw in groups.get(
+            "semantic_relation_mapping_contracts", {}
+        ).items()
+    }
 
     for relation in relations.values():
         relation.source_entity = entities.get(str(relation.source_entity_id))
@@ -373,6 +385,8 @@ def _materialize_runtime_graph(
         "events": events,
         "workflows": workflows,
         "capability_ports": capability_ports,
+        "semantic_mapping_contracts": semantic_mapping_contracts,
+        "semantic_relation_mapping_contracts": semantic_relation_mapping_contracts,
     }
     memo: dict[int, Any] = {}
     frozen_groups = {
@@ -477,6 +491,26 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
             )
         ).scalars().all()
     }
+    try:
+        semantic_mapping_contracts = (
+            semantic_mapping_contract_service.load_live_contracts(
+                db,
+                scenario_id=scenario.id,
+                tenant_id=str(scenario.tenant_id),
+            )
+        )
+        semantic_relation_mapping_contracts = (
+            semantic_mapping_contract_service.load_live_relation_contracts(
+                db,
+                scenario_id=scenario.id,
+                tenant_id=str(scenario.tenant_id),
+                semantic_mapping_contracts=semantic_mapping_contracts,
+            )
+        )
+    except semantic_mapping_contract_service.SemanticMappingContractError as exc:
+        raise RuntimeDefinitionError(
+            f"活动语义映射无法解析为运行契约：{exc}"
+        ) from exc
     capability_ids = {
         "function": set(functions),
         "action": set(actions),
@@ -504,6 +538,8 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
         "events": events,
         "workflows": workflows,
         "capability_ports": capability_ports,
+        "semantic_mapping_contracts": semantic_mapping_contracts,
+        "semantic_relation_mapping_contracts": semantic_relation_mapping_contracts,
     }
     scenario_view, definition_groups = _materialize_runtime_graph(
         scenario,
@@ -519,6 +555,10 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
     events = definition_groups["events"]
     workflows = definition_groups["workflows"]
     capability_ports = definition_groups["capability_ports"]
+    semantic_mapping_contracts = definition_groups["semantic_mapping_contracts"]
+    semantic_relation_mapping_contracts = definition_groups[
+        "semantic_relation_mapping_contracts"
+    ]
 
     # Dev authoring remains mutable between resolves, but each resolve/deployment
     # gets a reproducible optimistic pin and a detached object graph. Hash only
@@ -559,7 +599,18 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
             for _resource_id, item in sorted(resources.items())
         ]
         for group, resources in definition_groups.items()
+        if group in definition_fields
     }
+    digest_payload["semantic_mapping_contracts"] = [
+        copy.deepcopy(dict(contract))
+        for _mapping_id, contract in sorted(semantic_mapping_contracts.items())
+    ]
+    digest_payload["semantic_relation_mapping_contracts"] = [
+        copy.deepcopy(dict(contract))
+        for _mapping_id, contract in sorted(
+            semantic_relation_mapping_contracts.items()
+        )
+    ]
     # Properties are nested ORM resources and therefore need an explicit,
     # deterministic projection in the live definition hash.  Without this, a
     # property edit would leave an Agent/Action optimistic pin unchanged.
@@ -619,6 +670,8 @@ def _live_definition(scenario: BusinessScenario, environment: str, db: Session) 
         events=events,
         workflows=workflows,
         capability_ports=capability_ports,
+        semantic_mapping_contracts=semantic_mapping_contracts,
+        semantic_relation_mapping_contracts=semantic_relation_mapping_contracts,
     )
 
 
@@ -659,6 +712,30 @@ def _from_snapshot(
     ):
         raise RuntimeDefinitionError("发布快照能力端口缺少明确归属，已阻止运行")
     runtime_content = release_service.active_snapshot_content(content)
+    referenced_semantic_mapping_ids: set[str] = set()
+    for function in runtime_content.get("functions", []):
+        runtime_config = function.get("runtime_config") if isinstance(function, Mapping) else None
+        provider_config = (
+            runtime_config.get("provider_config")
+            if isinstance(runtime_config, Mapping)
+            else None
+        )
+        mapping_ids = (
+            provider_config.get("semantic_mapping_ids")
+            if isinstance(provider_config, Mapping)
+            else None
+        )
+        if isinstance(mapping_ids, list):
+            referenced_semantic_mapping_ids.update(str(item) for item in mapping_ids)
+    frozen_semantic_mapping_ids = {
+        str(item.get("id") or "")
+        for item in runtime_content.get("semantic_mapping_contracts", [])
+        if isinstance(item, Mapping)
+    }
+    if referenced_semantic_mapping_ids - frozen_semantic_mapping_ids:
+        raise RuntimeDefinitionError(
+            "发布快照的语义映射缺少冻结运行契约，已阻止运行"
+        )
 
     def historic_resource(group: str, item: Mapping[str, Any]) -> dict[str, Any]:
         values = dict(item)
@@ -688,7 +765,14 @@ def _from_snapshot(
         scenario,
         {
             group: {
-                str(item["id"]): historic_resource(group, item)
+                str(item["id"]): (
+                    dict(item)
+                    if group in {
+                        "semantic_mapping_contracts",
+                        "semantic_relation_mapping_contracts",
+                    }
+                    else historic_resource(group, item)
+                )
                 for item in runtime_content.get(group, [])
             }
             for group in (
@@ -702,6 +786,8 @@ def _from_snapshot(
                 "events",
                 "workflows",
                 "capability_ports",
+                "semantic_mapping_contracts",
+                "semantic_relation_mapping_contracts",
             )
         },
     )
@@ -724,6 +810,10 @@ def _from_snapshot(
         events=frozen_groups["events"],
         workflows=frozen_groups["workflows"],
         capability_ports=frozen_groups["capability_ports"],
+        semantic_mapping_contracts=frozen_groups["semantic_mapping_contracts"],
+        semantic_relation_mapping_contracts=frozen_groups[
+            "semantic_relation_mapping_contracts"
+        ],
     )
 
 

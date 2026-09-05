@@ -238,6 +238,7 @@ class DataPort:
     schema: Mapping[str, Any] = field(default_factory=dict)
     schema_hash: str = ""
     required: bool = True
+    cardinality: str = "one"
     binding_kinds: tuple[str, ...] = ()
     override_policy: str = "forbidden"
     description: str = ""
@@ -252,6 +253,9 @@ class DataPort:
             else canonical_hash(frozen_schema, domain="data-port-schema-v1")
         )
         kinds = _tokens(self.binding_kinds, "binding kind")
+        cardinality = _token(self.cardinality, "data port cardinality")
+        if cardinality not in {"one", "many"}:
+            raise CapabilityContractError("data port cardinality must be one or many")
         policy = _token(self.override_policy, "override policy")
         if policy not in {"forbidden", "managed-reference"}:
             raise CapabilityContractError(
@@ -262,6 +266,7 @@ class DataPort:
         object.__setattr__(self, "schema", frozen_schema)
         object.__setattr__(self, "schema_hash", schema_hash)
         object.__setattr__(self, "binding_kinds", kinds)
+        object.__setattr__(self, "cardinality", cardinality)
         object.__setattr__(self, "override_policy", policy)
         object.__setattr__(
             self,
@@ -397,15 +402,35 @@ class CapabilityInvocationRequest:
             raise CapabilityContractError(
                 "request binding overrides must be BindingOverride values"
             )
-        port_keys = [item.port_key for item in overrides]
-        if len(port_keys) != len(set(port_keys)):
+        identities = [
+            (
+                item.port_key,
+                item.binding_kind,
+                item.selector,
+                item.selector_value,
+                item.version_id,
+            )
+            for item in overrides
+        ]
+        if len(identities) != len(set(identities)):
             raise CapabilityContractError("request contains duplicate data-port overrides")
         object.__setattr__(self, "inputs", frozen_inputs)
         object.__setattr__(self, "confirmation", frozen_confirmation)
         object.__setattr__(
             self,
             "binding_overrides",
-            tuple(sorted(overrides, key=lambda item: item.port_key)),
+            tuple(
+                sorted(
+                    overrides,
+                    key=lambda item: (
+                        item.port_key,
+                        item.binding_kind,
+                        item.selector,
+                        item.selector_value,
+                        item.version_id or "",
+                    ),
+                )
+            ),
         )
         object.__setattr__(self, "mode", _token(self.mode, "invocation mode"))
         object.__setattr__(
@@ -458,6 +483,7 @@ class ResolvedDataHandle:
     reference_id: str
     signature: str
     version_id: str | None = None
+    ordinal: int = 0
 
     def __post_init__(self) -> None:
         normalized = DataBindingOverride(
@@ -479,19 +505,26 @@ class ResolvedDataHandle:
             "version_id",
         ):
             object.__setattr__(self, name, getattr(normalized, name))
+        if isinstance(self.ordinal, bool) or not isinstance(self.ordinal, int) or self.ordinal < 0:
+            raise CapabilityContractError(
+                "resolved data handle ordinal must be a non-negative integer"
+            )
 
-    def signature_fact(self) -> Mapping[str, str]:
+    def signature_fact(self) -> Mapping[str, str | int]:
         """Return the only binding facts admitted to deployment hashes."""
 
-        return MappingProxyType(
-            {
-                "binding_kind": self.binding_kind,
-                "port_key": self.port_key,
-                "signature": self.signature,
-            }
-        )
+        document: dict[str, str | int] = {
+            "binding_kind": self.binding_kind,
+            "port_key": self.port_key,
+            "signature": self.signature,
+        }
+        # Preserve the established one-value fingerprint while making each
+        # additional value in a cardinality=many port order-explicit.
+        if self.ordinal:
+            document["ordinal"] = self.ordinal
+        return MappingProxyType(document)
 
-    def audit_fact(self) -> Mapping[str, str | None]:
+    def audit_fact(self) -> Mapping[str, str | int | None]:
         return MappingProxyType(
             {
                 "binding_kind": self.binding_kind,
@@ -499,6 +532,7 @@ class ResolvedDataHandle:
                 "reference_id": self.reference_id,
                 "signature": self.signature,
                 "version_id": self.version_id,
+                "ordinal": self.ordinal,
             }
         )
 
@@ -516,10 +550,22 @@ class RuntimeDataContext:
             raise CapabilityContractError(
                 "runtime data context handles must be ResolvedDataHandle values"
             )
-        port_keys = [item.port_key for item in handles]
-        if len(port_keys) != len(set(port_keys)):
-            raise CapabilityContractError("runtime data context contains duplicate ports")
-        ordered = tuple(sorted(handles, key=lambda item: item.port_key))
+        identities = [(item.port_key, item.ordinal) for item in handles]
+        if len(identities) != len(set(identities)):
+            raise CapabilityContractError(
+                "runtime data context contains duplicate port ordinals"
+            )
+        ordered = tuple(
+            sorted(
+                handles,
+                key=lambda item: (
+                    item.port_key,
+                    item.ordinal,
+                    item.binding_kind,
+                    item.reference_id,
+                ),
+            )
+        )
         object.__setattr__(self, "handles", ordered)
         object.__setattr__(
             self,
@@ -532,7 +578,16 @@ class RuntimeDataContext:
 
     def get(self, port_key: str) -> ResolvedDataHandle | None:
         normalized = _token(port_key, "data port key")
-        return next((item for item in self.handles if item.port_key == normalized), None)
+        matches = self.get_all(normalized)
+        if len(matches) > 1:
+            raise CapabilityContractError(
+                "runtime data port has multiple handles; use get_all"
+            )
+        return matches[0] if matches else None
+
+    def get_all(self, port_key: str) -> tuple[ResolvedDataHandle, ...]:
+        normalized = _token(port_key, "data port key")
+        return tuple(item for item in self.handles if item.port_key == normalized)
 
     def signature_facts(self) -> tuple[Mapping[str, str], ...]:
         return tuple(item.signature_fact() for item in self.handles)

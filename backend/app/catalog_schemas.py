@@ -8,6 +8,9 @@ from pydantic import BaseModel, Field, model_validator
 
 
 CatalogAssetKind = Literal["file", "stream", "api", "database", "generated", "other"]
+CatalogUsagePlane = Literal[
+    "modeling_material", "invocation_input", "generated_output"
+]
 CatalogBindingRole = Literal[
     "modeling_evidence",
     "test_fixture",
@@ -44,6 +47,7 @@ class DataAssetCreate(BaseModel):
     description: str = Field(default="", max_length=8_000)
     kind: CatalogAssetKind = "file"
     media_type: str = Field(default="", max_length=200)
+    usage_plane: CatalogUsagePlane
     labels: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"extra": "forbid"}
@@ -188,6 +192,7 @@ class LogicalDatasetCreate(BaseModel):
     key: str = Field(min_length=1, max_length=180)
     name: str = Field(min_length=1, max_length=300)
     description: str = Field(default="", max_length=8_000)
+    usage_plane: CatalogUsagePlane
     labels: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"extra": "forbid"}
@@ -430,7 +435,9 @@ class SemanticFieldMappingCreate(BaseModel):
 
 
 class SemanticMappingCreate(BaseModel):
-    scenario_dataset_binding_id: str = Field(min_length=1, max_length=32)
+    # Optional only for the bounded legacy API compatibility path. New
+    # mappings are authored directly from the modeling DatasetSchema.
+    scenario_dataset_binding_id: str | None = Field(default=None, min_length=1, max_length=32)
     entity_id: str = Field(min_length=1, max_length=32)
     dataset_schema_id: str = Field(min_length=1, max_length=32)
     dataset_relation_id: str = Field(min_length=1, max_length=32)
@@ -456,7 +463,7 @@ class SemanticMappingOut(BaseModel):
     dataset_id: str
     scenario_id: str
     entity_id: str
-    scenario_dataset_binding_id: str
+    scenario_dataset_binding_id: str | None = None
     dataset_schema_id: str
     dataset_relation_id: str
     mapping_key: str

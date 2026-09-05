@@ -19,6 +19,7 @@ BUILTIN_PROVIDER_KEYS = MappingProxyType(
         "workflow": "builtin.ontology-workflow",
     }
 )
+BUILTIN_PROVIDER_VERSION = "1.0.0"
 
 
 def builtin_provider_key(capability_kind: str) -> str | None:
@@ -65,6 +66,7 @@ def derive_provider_execution_key(
 
 __all__ = [
     "BUILTIN_PROVIDER_KEYS",
+    "BUILTIN_PROVIDER_VERSION",
     "builtin_provider_key",
     "derive_provider_execution_key",
 ]

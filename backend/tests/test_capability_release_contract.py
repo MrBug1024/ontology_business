@@ -60,6 +60,7 @@ def _seed(db):
         tenant_id=tenant.id,
         key="generic.records",
         name="Generic records",
+        usage_plane="modeling_material",
     )
     schema = DatasetSchema(
         id="schema-release-port",
@@ -109,6 +110,12 @@ def test_release_captures_port_contract_without_runtime_data(db) -> None:
     tenant, scenario, dataset, schema, port = _seed(db)
     before = release_service.capture_snapshot_content(db, scenario)
     assert before["capability_contract_version"] == 2
+    assert before["modeling_source_attestation"] == {
+        "version": 1,
+        "source_plane": "modeling_material",
+        "subjects_hash": before["modeling_source_attestation"]["subjects_hash"],
+    }
+    assert len(before["modeling_source_attestation"]["subjects_hash"]) == 64
     assert before["capability_ports"] == [
         {
             "id": port.id,
@@ -169,6 +176,162 @@ def test_release_captures_port_contract_without_runtime_data(db) -> None:
     db.commit()
     after_contract_change = release_service.capture_snapshot_content(db, scenario)
     assert release_service.snapshot_hash(after_contract_change) != release_service.snapshot_hash(before)
+
+
+def test_release_rejects_orm_bypassed_non_modeling_port(db) -> None:
+    _tenant, scenario, dataset, _schema, _port = _seed(db)
+    dataset.usage_plane = "invocation_input"
+    db.commit()
+
+    with pytest.raises(
+        release_service.ReleaseValidationError,
+        match="非建模资料",
+    ):
+        release_service.capture_snapshot_content(db, scenario)
+
+
+def test_publish_rejects_unattested_catalog_dependency_but_allows_manual_contract(
+    db,
+) -> None:
+    _tenant, scenario, _dataset, _schema, _port = _seed(db)
+    branch = release_service.create_branch(
+        db,
+        scenario.id,
+        name="source-attestation",
+    )
+    snapshot = db.get(OntologySnapshot, branch.head_snapshot_id)
+    legacy_content = dict(snapshot.content)
+    original_attestation = legacy_content.pop("modeling_source_attestation")
+    snapshot.content = legacy_content
+    snapshot.content_hash = release_service.snapshot_hash(legacy_content)
+    db.commit()
+
+    with pytest.raises(
+        release_service.ReleaseValidationError,
+        match="无法证明来自建模资料",
+    ):
+        release_service.publish_snapshot(
+            db,
+            scenario.id,
+            environment="staging",
+            confirmed=True,
+            branch_id=branch.id,
+        )
+
+    snapshot = db.get(OntologySnapshot, branch.head_snapshot_id)
+    stale_content = dict(snapshot.content)
+    stale_ports = [dict(item) for item in stale_content["capability_ports"]]
+    stale_ports[0]["dataset_schema_hash"] = "b" * 64
+    stale_content["capability_ports"] = stale_ports
+    stale_content["modeling_source_attestation"] = original_attestation
+    snapshot.content = stale_content
+    snapshot.content_hash = release_service.snapshot_hash(stale_content)
+    db.commit()
+
+    with pytest.raises(
+        release_service.ReleaseValidationError,
+        match="无法证明来自建模资料",
+    ):
+        release_service.publish_snapshot(
+            db,
+            scenario.id,
+            environment="staging",
+            confirmed=True,
+            branch_id=branch.id,
+        )
+
+    snapshot = db.get(OntologySnapshot, branch.head_snapshot_id)
+    manual_content = dict(snapshot.content)
+    manual_content.pop("modeling_source_attestation")
+    manual_ports = [dict(item) for item in manual_content["capability_ports"]]
+    manual_ports[0]["dataset_schema_hash"] = ""
+    manual_ports[0]["schema_document"] = {
+        "x-platform-input-contract": {
+            "version": "tabular-content/v1",
+            "relations": [
+                {
+                    "fields": [
+                        {
+                            "name": "record_id",
+                            "logical_types": ["string"],
+                            "required": True,
+                        }
+                    ],
+                    "minimum_data_rows": 1,
+                    "allow_additional_fields": True,
+                }
+            ],
+            "allow_additional_relations": True,
+        }
+    }
+    manual_content["capability_ports"] = manual_ports
+    snapshot.content = manual_content
+    snapshot.content_hash = release_service.snapshot_hash(manual_content)
+    db.commit()
+
+    release = release_service.publish_snapshot(
+        db,
+        scenario.id,
+        environment="staging",
+        confirmed=True,
+        branch_id=branch.id,
+    )
+    assert release.status == "released"
+
+
+def test_environment_rollback_rejects_unattested_catalog_dependency(db) -> None:
+    _tenant, scenario, _dataset, _schema, _port = _seed(db)
+    branch = release_service.create_branch(
+        db,
+        scenario.id,
+        name="unattested-rollback",
+    )
+    snapshot = db.get(OntologySnapshot, branch.head_snapshot_id)
+    legacy_content = dict(snapshot.content)
+    legacy_content.pop("modeling_source_attestation")
+    snapshot.content = legacy_content
+    snapshot.content_hash = release_service.snapshot_hash(legacy_content)
+    db.commit()
+
+    with pytest.raises(
+        release_service.ReleaseValidationError,
+        match="无法证明来自建模资料",
+    ):
+        release_service.rollback_snapshot(
+            db,
+            scenario.id,
+            target_snapshot_id=snapshot.id,
+            confirmed=True,
+            branch_id=branch.id,
+            environment="prod",
+            reason="test legacy source gate",
+        )
+
+
+def test_proposal_cannot_supply_modeling_source_attestation(db) -> None:
+    _tenant, scenario, _dataset, _schema, _port = _seed(db)
+    branch = release_service.create_branch(
+        db,
+        scenario.id,
+        name="proposal-attestation",
+    )
+    content = release_service.capture_snapshot_content(db, scenario)
+    content["modeling_source_attestation"] = {
+        "version": 1,
+        "source_plane": "modeling_material",
+        "subjects_hash": "0" * 64,
+    }
+
+    proposal = release_service.create_proposal(
+        db,
+        branch.id,
+        title="Untrusted provenance",
+        description="",
+        content=content,
+        submit=False,
+    )
+    proposed_snapshot = db.get(OntologySnapshot, proposal.proposed_snapshot_id)
+    assert "modeling_source_attestation" not in proposed_snapshot.content
 
 
 def test_runtime_definition_reads_v2_ports_and_legacy_v1_as_empty(db) -> None:
@@ -328,6 +491,42 @@ def test_port_contract_rejects_case_insensitive_duplicate_keys() -> None:
     }
 
     with pytest.raises(release_service.ReleaseValidationError, match="能力端口 key 不能重复"):
+        release_service.normalize_snapshot_content(content)
+
+
+def test_release_rejects_malformed_optional_content_contract() -> None:
+    content = {
+        "scenario": {"name": "Generic", "namespace": "default"},
+        "entities": [],
+        "relations": [],
+        "mappings": [],
+        "functions": [],
+        "actions": [],
+        "rules": [],
+        "events": [],
+        "workflows": [],
+        "capability_contract_version": 1,
+        "capability_ports": [
+            {
+                "id": "port-invalid-content-contract",
+                "port_key": "records.input",
+                "name": "Records",
+                "direction": "input",
+                "role": "invocation_input",
+                "media_kind": "structured",
+                "is_required": False,
+                "binding_policy": "none",
+                "schema_document": {
+                    "x-platform-input-contract": {
+                        "version": "unsupported/v9",
+                        "relations": [],
+                    }
+                },
+            }
+        ],
+    }
+
+    with pytest.raises(release_service.ReleaseValidationError, match="内容契约无效"):
         release_service.normalize_snapshot_content(content)
 
 

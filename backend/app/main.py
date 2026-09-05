@@ -17,8 +17,10 @@ from .request_body_limit import RequestBodyLimitMiddleware
 from . import agent_mcp_server
 from .routers import (
     agent_mcp,
+    agent_turns,
     agents,
     assistant,
+    assistant_request_runs,
     capability_access,
     auth,
     catalog,
@@ -27,6 +29,7 @@ from .routers import (
     external_capabilities,
     functions,
     llm_configs,
+    managed_uploads,
     mcp,
     operations,
     platform_migrations,
@@ -35,7 +38,10 @@ from .routers import (
     templates,
 )
 from .services import (
+    agent_turn_service,
+    assistant_request_run_service,
     cache_service,
+    managed_upload_run_service,
     object_storage_service,
     operations_service,
     permission_service,
@@ -45,6 +51,7 @@ from .services import (
 
 
 logger = logging.getLogger(__name__)
+ASSISTANT_CHAT_MAX_BODY_BYTES = 128 * 1024
 
 
 async def _operations_worker() -> None:
@@ -80,6 +87,47 @@ async def _validation_dataset_worker() -> None:
         await asyncio.sleep(0.2 if worked else 2)
 
 
+async def _agent_turn_worker() -> None:
+    """Execute durable Agent turns independently from browser connections."""
+    while True:
+        try:
+            worked = await asyncio.to_thread(
+                agent_turn_service.process_next_turn,
+                agents.invoke_agent_once,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Agent Turn worker 轮询失败")
+            worked = False
+        await asyncio.sleep(0.2 if worked else 1)
+
+
+async def _managed_upload_worker() -> None:
+    """Profile durable raw uploads without keeping browser requests open."""
+    while True:
+        try:
+            worked = await asyncio.to_thread(
+                managed_upload_run_service.process_next_upload_run
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("受管上传 worker 轮询失败")
+            worked = False
+        await asyncio.sleep(0.2 if worked else 1)
+
+
+async def _assistant_request_worker() -> None:
+    """Resume attachment-backed Assistant sends independently of HTTP/SSE."""
+    while True:
+        try:
+            worked = await asyncio.to_thread(
+                assistant_request_run_service.process_next_request,
+                assistant.execute_assistant_request_run,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("助手请求 worker 轮询失败")
+            worked = False
+        await asyncio.sleep(0.2 if worked else 1)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
@@ -113,6 +161,10 @@ async def lifespan(_: FastAPI):
         )
     except Exception:  # noqa: BLE001
         logger.exception("验证数据集任务启动恢复失败")
+    try:
+        await asyncio.to_thread(managed_upload_run_service.recover_upload_runs)
+    except Exception:  # noqa: BLE001
+        logger.exception("受管上传任务启动恢复失败")
     async with agent_mcp_server.mcp_server.session_manager.run():
         operations_worker = asyncio.create_task(
             _operations_worker(),
@@ -126,18 +178,39 @@ async def lifespan(_: FastAPI):
             _validation_dataset_worker(),
             name="validation-dataset-worker",
         )
+        agent_turn_worker = asyncio.create_task(
+            _agent_turn_worker(),
+            name="agent-turn-worker",
+        )
+        managed_upload_worker = asyncio.create_task(
+            _managed_upload_worker(),
+            name="managed-upload-worker",
+        )
+        assistant_request_worker = asyncio.create_task(
+            _assistant_request_worker(),
+            name="assistant-request-worker",
+        )
         try:
             yield
         finally:
             operations_worker.cancel()
             compilation_worker.cancel()
             validation_dataset_worker.cancel()
+            agent_turn_worker.cancel()
+            managed_upload_worker.cancel()
+            assistant_request_worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await operations_worker
             with contextlib.suppress(asyncio.CancelledError):
                 await compilation_worker
             with contextlib.suppress(asyncio.CancelledError):
                 await validation_dataset_worker
+            with contextlib.suppress(asyncio.CancelledError):
+                await agent_turn_worker
+            with contextlib.suppress(asyncio.CancelledError):
+                await managed_upload_worker
+            with contextlib.suppress(asyncio.CancelledError):
+                await assistant_request_worker
 
 
 settings = get_settings()
@@ -145,9 +218,18 @@ app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=li
 
 app.add_middleware(
     RequestBodyLimitMiddleware,
+    max_body_bytes=ASSISTANT_CHAT_MAX_BODY_BYTES,
+    paths={
+        f"{settings.api_prefix}/assistant/chat",
+        f"{settings.api_prefix}/assistant/chat/stream",
+    },
+)
+app.add_middleware(
+    RequestBodyLimitMiddleware,
     max_body_bytes=settings.catalog_max_upload_bytes + 1024 * 1024,
     paths={
         f"{settings.api_prefix}/catalog/uploads",
+        f"{settings.api_prefix}/catalog/upload-runs/content",
         f"{settings.api_prefix}/external/v2/assets/upload",
         f"{settings.api_prefix}/assistant/attachments",
     },
@@ -165,6 +247,7 @@ app.include_router(auth.router, prefix=settings.api_prefix)
 app.include_router(data_sources.router, prefix=settings.api_prefix)
 app.include_router(catalog.router, prefix=settings.api_prefix)
 app.include_router(catalog.scenario_router, prefix=settings.api_prefix)
+app.include_router(managed_uploads.router, prefix=settings.api_prefix)
 app.include_router(llm_configs.router, prefix=settings.api_prefix)
 app.include_router(skills.router, prefix=settings.api_prefix)
 app.include_router(templates.router, prefix=settings.api_prefix)
@@ -172,6 +255,7 @@ app.include_router(mcp.router, prefix=settings.api_prefix)
 app.include_router(agents.router, prefix=settings.api_prefix)
 app.include_router(platform_migrations.router, prefix=settings.api_prefix)
 app.include_router(assistant.router, prefix=settings.api_prefix)
+app.include_router(assistant_request_runs.router, prefix=settings.api_prefix)
 app.include_router(operations.router, prefix=settings.api_prefix)
 app.include_router(operations.operations_router, prefix=settings.api_prefix)
 app.include_router(functions.router, prefix=settings.api_prefix)
@@ -180,6 +264,7 @@ app.include_router(external_api.router, prefix=settings.api_prefix)
 app.include_router(external_capabilities.router, prefix=settings.api_prefix)
 app.include_router(capability_access.router, prefix=settings.api_prefix)
 app.include_router(agent_mcp.router, prefix=settings.api_prefix)
+app.include_router(agent_turns.router, prefix=settings.api_prefix)
 
 
 @app.get("/")

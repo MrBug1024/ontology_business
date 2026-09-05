@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,7 +27,6 @@ from app.models import (
 from app.routers import scenarios
 from app.schemas import InstanceIn, RelationDataMappingIn, RelationInstanceIn
 from app.services import (
-    agent_engine,
     datasource_service,
     mapping_refresh_service,
     ontology_service,
@@ -428,7 +426,6 @@ def test_fk_refresh_order_converges_and_applies_endpoint_key_transforms(
     finally:
         _close_world(world)
 
-
 def test_no_explicit_relation_mapping_means_zero_generated_links(tmp_path) -> None:
     world = _world(tmp_path, mode=None)
     try:
@@ -716,25 +713,6 @@ def test_frozen_import_requires_snapshot_entity_and_keeps_environments_isolated(
         assert len(links) == 1
         assert links[0].source_metadata["runtime_environment"] == "staging"
 
-        context = agent_engine.AgentContext.__new__(agent_engine.AgentContext)
-        context.agent = SimpleNamespace(scenario_id=world.scenario.id)
-        context.entities = [world.source_entity, world.target_entity]
-        context.data_sources = [world.data_source]
-        context.runtime_definition = SimpleNamespace(
-            scenario=world.scenario,
-            environment="staging",
-            source="release",
-            snapshot_id="snapshot-1",
-            release_id="release-1",
-            definition_hash="definition-hash-1",
-            mappings={
-                source_frozen.id: source_frozen,
-                target_frozen.id: target_frozen,
-            },
-            relation_mappings={relation_frozen.id: relation_frozen},
-        )
-        assert context._object_in_data_context(staging_objects[0]) is True
-        assert context._object_in_data_context(dev_objects[0]) is False
     finally:
         _close_world(world)
 
@@ -934,7 +912,7 @@ def test_postgresql_mapping_identifiers_are_dialect_safe() -> None:
         ontology_service._quoted_mapping_table("orders; DROP TABLE users", "postgres")
 
 
-def test_agent_and_scenario_reads_hide_retired_mapping_and_release_facts(tmp_path) -> None:
+def test_scenario_reads_hide_retired_mapping_and_release_facts(tmp_path) -> None:
     world = _world(tmp_path, mode="source_fk")
     try:
         provenance = {
@@ -1062,32 +1040,6 @@ def test_agent_and_scenario_reads_hide_retired_mapping_and_release_facts(tmp_pat
         )
         allowed = SimpleNamespace(allowed=True)
 
-        context = agent_engine.AgentContext.__new__(agent_engine.AgentContext)
-        context.db = world.db
-        context.agent = SimpleNamespace(scenario_id=world.scenario.id)
-        context.scenario = world.scenario
-        context.entities = [world.source_entity, world.target_entity]
-        context.relations = [world.relation]
-        context.data_sources = [world.data_source]
-        context.runtime_definition = definition
-        with (
-            patch.object(
-                agent_engine.permission_service, "check_object", return_value=allowed
-            ),
-            patch.object(
-                agent_engine.permission_service,
-                "filter_instance_attributes",
-                side_effect=lambda _db, item: item.attributes or {},
-            ),
-        ):
-            assert context._ontology_object(retired_mapping_object.id)["error"]
-            assert context._ontology_object(retired_release_object.id)["error"]
-            agent_detail = context._ontology_object(current_source.id)
-        assert {item["id"] for item in agent_detail["relations"]} == {
-            current_link.id,
-            manual_link.id,
-        }
-
         with (
             patch.object(scenarios, "_scenario_for_request", return_value=world.scenario),
             patch.object(
@@ -1118,62 +1070,5 @@ def test_agent_and_scenario_reads_hide_retired_mapping_and_release_facts(tmp_pat
             current_link.id,
             manual_link.id,
         }
-    finally:
-        _close_world(world)
-
-
-def test_mixed_mapping_catalog_only_exposes_object_tables_to_sql_tools(tmp_path) -> None:
-    world = _world(tmp_path, mode="join_table")
-    try:
-        context = agent_engine.AgentContext.__new__(agent_engine.AgentContext)
-        context.db = world.db
-        context.agent = SimpleNamespace(scenario_id=world.scenario.id)
-        context.entities = [world.source_entity, world.target_entity]
-        context.relations = [world.relation]
-        context.mappings = [world.source_mapping, world.target_mapping]
-        context.relation_mappings = [world.relation_mapping]
-        context.data_sources = [world.data_source]
-        table_rows = [
-            {
-                "name": "source_rows",
-                "columns": [{"name": "source_code"}, {"name": "target_fk"}],
-            },
-            {
-                "name": "target_rows",
-                "columns": [{"name": "target_id"}, {"name": "target_name"}],
-            },
-            {
-                "name": "join_links",
-                "columns": [{"name": "source_key"}, {"name": "target_key"}],
-            },
-        ]
-        with (
-            patch.object(
-                agent_engine.permission_service, "can_read_property", return_value=True
-            ),
-            patch.object(
-                agent_engine.datasource_service, "list_tables", return_value=table_rows
-            ),
-        ):
-            catalog = context._mapping_catalog()
-            assert {item["kind"] for item in catalog} == {"object", "relation"}
-            visible_tables = json.loads(
-                context.execute_tool(
-                    "list_tables", {"data_source_id": world.data_source.id}
-                )
-            )
-            assert {item["name"] for item in visible_tables} == {
-                "source_rows",
-                "target_rows",
-            }
-            assert context.validate_sql_query(
-                world.data_source.id,
-                "SELECT source_code FROM source_rows",
-            ) == "SELECT source_code FROM source_rows"
-            assert context.authorize_historic_tool_result(
-                "list_tables",
-                {"data_source_id": world.data_source.id},
-                json.dumps(visible_tables, ensure_ascii=False),
-            ) is True
     finally:
         _close_world(world)

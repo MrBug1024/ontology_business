@@ -470,6 +470,11 @@ def _asset_payload(db: Session, tenant_id: str, item: _BackfillItem) -> tuple[di
                 description="Reconstructed from a verified managed legacy file.",
                 kind="file",
                 media_type=str(bucket_file.mime or "")[:200],
+                usage_plane=(
+                    "modeling_material"
+                    if source.resource_scope == "modeling"
+                    else "generated_output"
+                ),
                 labels={
                     "migration": {
                         "contract": MIGRATION_CONTRACT,

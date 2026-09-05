@@ -14,7 +14,11 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from ..models import BusinessScenario, DataSource, ScenarioModelDraftResource
-from . import datasource_service, release_service
+from . import (
+    assistant_capability_modeling_service,
+    datasource_service,
+    release_service,
+)
 
 
 MAX_DRAFT_PAYLOAD_CHARS = 1_000_000
@@ -270,6 +274,11 @@ def _candidate_issues(
     for issue in _issue_list(model_payload.get("unresolved")):
         affected = set(issue.get("affected_change_keys") or [])
         issue_refs = set(issue.get("source_refs") or [])
+        source_applies = bool(
+            issue.get("code")
+            != assistant_capability_modeling_service.NON_MODELING_METADATA_ISSUE_CODE
+            and issue_refs.intersection(source_refs)
+        )
         applies = bool(
             any(
                 value == resource_key
@@ -277,7 +286,7 @@ def _candidate_issues(
                 or resource_key.startswith(f"{value}:")
                 for value in affected
             )
-            or (issue_refs and issue_refs.intersection(source_refs))
+            or source_applies
             or (not affected and not issue_refs)
         )
         if applies:
@@ -294,8 +303,16 @@ def _compiler_candidates(model_payload: dict[str, Any]) -> list[dict[str, Any]]:
         for raw in sidecar:
             if isinstance(raw, dict) and normalize_resource_kind(raw.get("resource_kind")):
                 item = _json_copy(raw, {})
-                item["materialization_source"] = (
-                    "live_checkpoint" if live_checkpoint else "compiler_sidecar"
+                declared_source = str(item.get("materialization_source") or "")
+                item["materialization_source"] = "live_checkpoint" if live_checkpoint else (
+                    declared_source
+                    if declared_source in {
+                        assistant_capability_modeling_service
+                        .VERIFIED_METADATA_MATERIALIZATION_SOURCE,
+                        assistant_capability_modeling_service
+                        .NON_MODELING_METADATA_MATERIALIZATION_SOURCE,
+                    }
+                    else "compiler_sidecar"
                 )
                 item["_sidecar_candidate"] = True
                 result.append(item)
@@ -1422,6 +1439,7 @@ def active_working_draft_context(
             "source_message_id": row.source_message_id,
             "predecessor_draft_id": row.predecessor_draft_id,
             "predecessor_revision": row.predecessor_revision,
+            "materialization_source": row.materialization_source,
         }
         item = release_service.safe_snapshot_content(item)
         canonical = json.dumps(

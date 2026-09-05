@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -12,11 +13,20 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
-from app.models import Agent, BusinessScenario, FunctionDefinition, FunctionRun, LLMConfig, Tenant, User
+from app.models import (
+    Agent,
+    BusinessScenario,
+    CapabilityInvocation,
+    FunctionDefinition,
+    FunctionRun,
+    LLMConfig,
+    Tenant,
+    User,
+)
 from app.routers import functions as functions_router
 from app.routers import scenarios as scenarios_router
 from app.services import (
-    agent_engine,
+    agent_runtime_adapter,
     function_definition_service,
     policies,
     permission_service,
@@ -222,6 +232,57 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
         columns = {column["name"] for column in inspect(self.engine).get_columns("function_definitions")}
         self.assertFalse({"code", "script", "executor", "executor_config", "handler"} & columns)
 
+    def test_function_provider_authoring_uses_server_manifest_and_exact_validation(self) -> None:
+        listed = self.client.get(
+            f"/api/scenarios/{self.scenario.id}/function-providers"
+        )
+        self.assertEqual(listed.status_code, 200, listed.text)
+        manifests = listed.json()
+        query_manifest = next(
+            item
+            for item in manifests
+            if item["provider_key"] == "builtin.semantic-dataset-query"
+        )
+        self.assertEqual(query_manifest["provider_version"], "1.0.0")
+        self.assertFalse(query_manifest["config_schema"]["additionalProperties"])
+
+        payload = self._payload(name="受管对象查询")
+        payload.update(
+            {
+                "runtime_kind": "provider",
+                "runtime_config": {
+                    "provider_key": query_manifest["provider_key"],
+                    "provider_version": query_manifest["provider_version"],
+                    "provider_config": {"semantic_mapping_ids": ["mapping-test"]},
+                },
+                "input_schema": query_manifest["input_schema"],
+                "output_schema": query_manifest["output_schema"],
+            }
+        )
+        created = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/functions",
+            json=payload,
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+
+        wrong_version = json.loads(json.dumps(payload))
+        wrong_version["runtime_config"]["provider_version"] = "9.9.9"
+        rejected_version = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/functions",
+            json=wrong_version,
+        )
+        self.assertEqual(rejected_version.status_code, 400, rejected_version.text)
+        self.assertIn("版本不匹配", rejected_version.json()["detail"])
+
+        invalid_config = json.loads(json.dumps(payload))
+        invalid_config["runtime_config"]["provider_config"]["unknown"] = True
+        rejected_config = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/functions",
+            json=invalid_config,
+        )
+        self.assertEqual(rejected_config.status_code, 400, rejected_config.text)
+        self.assertIn("unsupported", rejected_config.json()["detail"])
+
     def test_release_freezes_function_contract_and_blocks_direct_delete(self) -> None:
         created = self._create_function()
         snapshot_id, release_id = self._publish_staging()
@@ -263,10 +324,14 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
         finally:
             verify.close()
 
-    def test_agent_can_discover_and_run_side_effect_free_function(self) -> None:
+    def test_agent_executes_function_through_capability_receipt(self) -> None:
         payload = self._payload(name="订单加权评分")
         payload.update({
             "input_schema": _contract_schema({"amount": {"type": "number"}}, ["amount"]),
+            "output_schema": _contract_schema(
+                {"score": {"type": "number"}},
+                ["score"],
+            ),
             "runtime_kind": "weighted_score",
             "runtime_config": {"weights": {"amount": 0.5}, "bias": 2},
         })
@@ -282,6 +347,7 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
                 name="订单助手",
                 scenario_id=self.scenario.id,
                 data_source_ids=[],
+                runtime_binding_mode="capability_only",
                 capability_scope={
                     "functions": {"mode": "explicit", "selected_ids": [created.json()["id"]]},
                     "actions": {"mode": "explicit", "selected_ids": []},
@@ -291,26 +357,55 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
                 },
             )
             db.add(agent)
-            db.flush()
-            context = agent_engine.AgentContext(db, agent, LLMConfig(name="工具模型"))
-            tool_names = {tool["function"]["name"] for tool in context.build_tools()}
-            self.assertTrue({"list_functions", "run_function"}.issubset(tool_names))
-            result = context.execute_tool(
-                "run_function",
-                {"function_id": created.json()["id"], "params": {"amount": 10}},
+            db.commit()
+            runtime = agent_runtime_adapter.build_runtime_context(
+                db,
+                agent,
+                LLMConfig(name="工具模型"),
             )
-            self.assertEqual(json.loads(result)["score"], 7)
-            self.assertEqual(db.query(FunctionRun).count(), 1)
+            tool_names = {
+                tool["function"]["name"] for tool in runtime.build_tools()
+            }
+            self.assertEqual(
+                tool_names,
+                {"list_available_capabilities", "invoke_capability"},
+            )
+            db.info["action_audit_context"] = {"agent_id": agent.id}
+            try:
+                receipt = json.loads(
+                    runtime.execute_tool(
+                        "invoke_capability",
+                        {
+                            "kind": "function",
+                            "key": created.json()["id"],
+                            "inputs": {"amount": 10},
+                        },
+                    )
+                )
+            finally:
+                db.info.pop("action_audit_context", None)
+            self.assertEqual(receipt["status"], "succeeded")
+            self.assertEqual(receipt["output"]["score"], 7)
+            invocation = db.get(CapabilityInvocation, receipt["invocation_id"])
+            self.assertIsNotNone(invocation)
+            self.assertEqual(invocation.capability_kind, "function")
+            self.assertEqual(invocation.capability_key, created.json()["id"])
+            self.assertEqual(invocation.invocation_source, "agent")
+            self.assertEqual(db.query(FunctionRun).count(), 0)
         finally:
             db.rollback()
             db.close()
 
-    def test_function_runtime_is_independent_and_uses_a_function_only_table(self) -> None:
+    def test_function_browser_route_uses_unified_invocation_and_strict_replay(self) -> None:
         payload = self._payload(name="订单加权评分")
         payload.update({
             "input_schema": _contract_schema(
                 {"amount": {"type": "number"}},
                 ["amount"],
+            ),
+            "output_schema": _contract_schema(
+                {"score": {"type": "number"}},
+                ["score"],
             ),
             "runtime_kind": "weighted_score",
             "runtime_config": {"weights": {"amount": 0.2}, "bias": 1},
@@ -333,22 +428,30 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
 
         replay = self.client.post(
             f"/api/functions/{function_id}/run",
-            json={"params": {"amount": 999}, "idempotency_key": "score-order-1"},
+            json={"params": {"amount": 10}, "idempotency_key": "score-order-1"},
         )
         self.assertEqual(replay.status_code, 201, replay.text)
         self.assertEqual(replay.json()["id"], first.json()["id"])
+
+        conflict = self.client.post(
+            f"/api/functions/{function_id}/run",
+            json={"params": {"amount": 999}, "idempotency_key": "score-order-1"},
+        )
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertEqual(conflict.json()["detail"]["code"], "idempotency_conflict")
 
         missing = self.client.post(
             f"/api/functions/{function_id}/run",
             json={"params": {}},
         )
-        self.assertEqual(missing.status_code, 201, missing.text)
-        self.assertEqual(missing.json()["status"], "failed")
-        self.assertIn("缺少必填参数", missing.json()["error"])
+        self.assertEqual(missing.status_code, 422, missing.text)
+        self.assertEqual(missing.json()["detail"]["code"], "input_schema_invalid")
 
         listed = self.client.get(f"/api/functions/{function_id}/runs")
         self.assertEqual(listed.status_code, 200, listed.text)
-        self.assertEqual(len(listed.json()), 2)
+        self.assertEqual(len(listed.json()), 1)
+        self.assertNotEqual(listed.json()[0]["input_payload"], {"amount": 10})
+        self.assertIn("hash", listed.json()[0]["input_payload"])
 
         db_inspector = inspect(self.engine)
         self.assertIn("function_runs", db_inspector.get_table_names())
@@ -356,11 +459,76 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
         self.assertNotIn("asset_id", columns)
         verify = self.Session()
         try:
-            run = verify.get(FunctionRun, first.json()["id"])
+            run = verify.get(CapabilityInvocation, first.json()["id"])
             self.assertIsNotNone(run)
-            self.assertEqual(run.function_id, function_id)
+            self.assertEqual(run.capability_kind, "function")
+            self.assertEqual(run.capability_key, function_id)
+            self.assertEqual(verify.query(FunctionRun).count(), 0)
         finally:
             verify.close()
+
+    def test_function_history_filters_legacy_rows_by_tenant(self) -> None:
+        created = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/functions",
+            json=self._payload(),
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        function_id = created.json()["id"]
+        db = self.Session()
+        try:
+            other_tenant = Tenant(id="tenant-functions-other", name="其他租户")
+            other_scenario = BusinessScenario(
+                id="scenario-functions-other",
+                tenant_id=other_tenant.id,
+                name="其他场景",
+            )
+            other_function = FunctionDefinition(
+                id="function-cross-tenant",
+                scenario_id=other_scenario.id,
+                name="不可见函数",
+            )
+            db.add_all([other_tenant, other_scenario, other_function])
+            db.flush()
+            created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            db.add_all(
+                [
+                    FunctionRun(
+                        id="legacy-owned-run",
+                        tenant_id=self.tenant.id,
+                        scenario_id=self.scenario.id,
+                        function_id=function_id,
+                        run_type="function",
+                        status="succeeded",
+                        output_payload={"risk_level": "low"},
+                        created_at=created_at,
+                    ),
+                    FunctionRun(
+                        id="legacy-cross-tenant-run",
+                        tenant_id=other_tenant.id,
+                        scenario_id=self.scenario.id,
+                        function_id=function_id,
+                        run_type="function",
+                        status="succeeded",
+                        output_payload={"risk_level": "secret"},
+                        created_at=created_at,
+                    ),
+                ]
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        listed = self.client.get(f"/api/functions/{function_id}/runs")
+
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(
+            [item["id"] for item in listed.json()],
+            ["legacy-owned-run"],
+        )
+        cross_tenant = self.client.get("/api/functions/function-cross-tenant/runs")
+        missing = self.client.get("/api/functions/function-missing/runs")
+        self.assertEqual(cross_tenant.status_code, 404, cross_tenant.text)
+        self.assertEqual(cross_tenant.json(), missing.json())
 
 
 if __name__ == "__main__":

@@ -26,9 +26,11 @@ from ..models import (
     DataMapping,
     DataSource,
     DatasetHead,
+    DatasetSchema,
     DatasetVersion,
     EventEnvelope,
     FunctionDefinition,
+    LogicalDataset,
     OntologyAction,
     OntologyBranch,
     OntologyEntity,
@@ -47,13 +49,16 @@ from ..models import (
     RelationDataMapping,
     ScenarioCapabilityPort,
     ScenarioDatasetBinding,
+    SemanticMapping,
     WorkflowRun,
 )
 from . import (
     connector_service,
     function_definition_service,
+    input_contract_validator,
     ontology_service,
     permission_service,
+    semantic_mapping_contract_service,
     template_catalog_service,
 )
 from .policies import validate_workflow_graph
@@ -68,6 +73,10 @@ ROLLBACKABLE_SNAPSHOT_KINDS = {"baseline", "merge", "rollback", "pre_merge", "pr
 NONTERMINAL_WORKFLOW_RUN_STATUSES = {"queued", "running", "awaiting_approval", "retry_waiting"}
 _SECRET_MARKER_KEY = "__release_secret__"
 _SECRET_MARKER = {_SECRET_MARKER_KEY: "preserve"}
+_MODELING_SOURCE_ATTESTATION_KEY = "modeling_source_attestation"
+_MODELING_SOURCE_ATTESTATION_VERSION = 1
+_MODELING_SOURCE_PLANE = "modeling_material"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _SECRET_KEY_PARTS = {
     "password",
     "passwd",
@@ -574,11 +583,22 @@ def _normalize_function(raw: Any) -> dict:
     """Normalize a typed function plus its safe built-in runtime descriptor."""
     if not isinstance(raw, dict):
         raise ReleaseValidationError("函数定义必须是对象")
+    # Lazy import avoids initializing the sealed Provider registry while its
+    # trusted Provider modules are still importing release dependencies.
+    from . import provider_definition_service
+
     try:
         declaration = function_definition_service.normalize_definition(
             {key: value for key, value in raw.items() if key != "id"}
         )
-    except function_definition_service.FunctionDefinitionError as exc:
+        declaration = provider_definition_service.validate_function_definition(
+            declaration,
+            compatibility_mode=True,
+        )
+    except (
+        function_definition_service.FunctionDefinitionError,
+        provider_definition_service.ProviderDefinitionError,
+    ) as exc:
         raise ReleaseValidationError(f"函数定义无效：{exc}") from exc
     return {
         "id": _required_id(raw.get("id"), "函数定义 id"),
@@ -798,6 +818,12 @@ def _normalize_capability_port(raw: Any, *, contract_version: int) -> dict:
     schema_document = _sanitize_secret_values(
         _dict(raw.get("schema_document"), "能力端口 JSON Schema")
     )
+    try:
+        input_contract_validator.validate_content_contract(schema_document)
+    except input_contract_validator.InputContractError as exc:
+        raise ReleaseValidationError(
+            f"能力端口内容契约无效：{exc.message}"
+        ) from exc
     config = _sanitize_secret_values(_dict(raw.get("config"), "能力端口配置"))
     if _contains_marker(schema_document) or _contains_marker(config):
         raise ReleaseValidationError("能力端口契约不能包含凭据或敏感配置")
@@ -897,6 +923,174 @@ def _runtime_binding_requirements(
     return requirements
 
 
+def _normalize_modeling_source_attestation(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) != {
+        "version",
+        "source_plane",
+        "subjects_hash",
+    }:
+        raise ReleaseValidationError("建模来源证明格式无效")
+    version = raw.get("version")
+    source_plane = raw.get("source_plane")
+    subjects_hash = raw.get("subjects_hash")
+    if (
+        isinstance(version, bool)
+        or version != _MODELING_SOURCE_ATTESTATION_VERSION
+        or source_plane != _MODELING_SOURCE_PLANE
+        or not isinstance(subjects_hash, str)
+        or _SHA256_RE.fullmatch(subjects_hash) is None
+    ):
+        raise ReleaseValidationError("建模来源证明格式无效")
+    return {
+        "version": _MODELING_SOURCE_ATTESTATION_VERSION,
+        "source_plane": _MODELING_SOURCE_PLANE,
+        "subjects_hash": subjects_hash,
+    }
+
+
+def _snapshot_modeling_source_subjects(
+    content: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Return catalog-derived subjects whose source plane needs attestation."""
+
+    subjects: list[dict[str, str]] = []
+    raw_ports = content.get("capability_ports", [])
+    if not isinstance(raw_ports, list):
+        raise ReleaseValidationError("能力端口列表无效，无法验证建模来源")
+    for port in raw_ports:
+        if not isinstance(port, Mapping):
+            raise ReleaseValidationError("能力端口定义无效，无法验证建模来源")
+        schema_hash = port.get("dataset_schema_hash", "")
+        if schema_hash is None or schema_hash == "":
+            continue
+        if not isinstance(schema_hash, str) or _SHA256_RE.fullmatch(schema_hash) is None:
+            raise ReleaseValidationError("能力端口 Dataset Schema hash 无效")
+        port_id = port.get("id")
+        if not isinstance(port_id, str) or not port_id.strip():
+            raise ReleaseValidationError("能力端口缺少稳定标识，无法验证建模来源")
+        subjects.append(
+            {
+                "kind": "capability_port_dataset_schema",
+                "owner_id": port_id,
+                "subject_id": schema_hash,
+            }
+        )
+
+    raw_functions = content.get("functions", [])
+    if not isinstance(raw_functions, list):
+        raise ReleaseValidationError("函数列表无效，无法验证建模来源")
+    for function in raw_functions:
+        if not isinstance(function, Mapping):
+            raise ReleaseValidationError("函数定义无效，无法验证建模来源")
+        runtime_config = function.get("runtime_config")
+        if not isinstance(runtime_config, Mapping):
+            continue
+        provider_config = runtime_config.get("provider_config")
+        if not isinstance(provider_config, Mapping) or "semantic_mapping_ids" not in provider_config:
+            continue
+        mapping_ids = provider_config.get("semantic_mapping_ids")
+        if not isinstance(mapping_ids, list):
+            raise ReleaseValidationError("函数语义映射依赖无效，无法验证建模来源")
+        function_id = function.get("id")
+        if not isinstance(function_id, str) or not function_id.strip():
+            raise ReleaseValidationError("函数缺少稳定标识，无法验证建模来源")
+        for mapping_id in mapping_ids:
+            if not isinstance(mapping_id, str) or not mapping_id.strip():
+                raise ReleaseValidationError("函数语义映射依赖无效，无法验证建模来源")
+            subjects.append(
+                {
+                    "kind": "semantic_mapping",
+                    "owner_id": function_id,
+                    "subject_id": mapping_id,
+                }
+            )
+    return sorted(
+        subjects,
+        key=lambda item: (item["kind"], item["owner_id"], item["subject_id"]),
+    )
+
+
+def _modeling_source_attestation(
+    content: Mapping[str, Any],
+) -> dict[str, Any]:
+    subjects = _snapshot_modeling_source_subjects(content)
+    digest = hashlib.sha256(
+        b"modeling-source-attestation-subjects-v1\0"
+        + _canonical(subjects).encode("utf-8")
+    ).hexdigest()
+    return {
+        "version": _MODELING_SOURCE_ATTESTATION_VERSION,
+        "source_plane": _MODELING_SOURCE_PLANE,
+        "subjects_hash": digest,
+    }
+
+
+def _require_snapshot_modeling_provenance(content: Mapping[str, Any]) -> None:
+    normalized = normalize_snapshot_content(dict(content))
+    subjects = _snapshot_modeling_source_subjects(normalized)
+    referenced_mapping_ids = {
+        item["subject_id"]
+        for item in subjects
+        if item["kind"] == "semantic_mapping"
+    }
+    contract_ids = {
+        str(item.get("id") or "")
+        for item in normalized.get("semantic_mapping_contracts", [])
+        if isinstance(item, Mapping)
+    }
+    if referenced_mapping_ids - contract_ids:
+        raise ReleaseValidationError(
+            "发布快照的语义映射依赖缺少可移植契约；请基于当前定义创建新快照"
+        )
+    if not subjects:
+        return
+    expected = _modeling_source_attestation(normalized)
+    if normalized.get(_MODELING_SOURCE_ATTESTATION_KEY) != expected:
+        raise ReleaseValidationError(
+            "发布快照包含无法证明来自建模资料的目录依赖；请基于当前定义创建新快照"
+        )
+
+
+def _attest_current_modeling_sources(
+    db: Session,
+    scenario: BusinessScenario,
+    content: dict[str, Any],
+) -> dict[str, Any]:
+    subjects = _snapshot_modeling_source_subjects(content)
+    mapping_ids = {
+        item["subject_id"]
+        for item in subjects
+        if item["kind"] == "semantic_mapping"
+    }
+    if mapping_ids:
+        verified_mapping_ids = set(
+            db.execute(
+                select(SemanticMapping.id)
+                .join(
+                    LogicalDataset,
+                    (LogicalDataset.id == SemanticMapping.dataset_id)
+                    & (LogicalDataset.tenant_id == SemanticMapping.tenant_id),
+                )
+                .where(
+                    SemanticMapping.id.in_(mapping_ids),
+                    SemanticMapping.scenario_id == scenario.id,
+                    SemanticMapping.tenant_id == scenario.tenant_id,
+                    SemanticMapping.status == "active",
+                    LogicalDataset.usage_plane == _MODELING_SOURCE_PLANE,
+                )
+            ).scalars()
+        )
+        if verified_mapping_ids != mapping_ids:
+            raise ReleaseValidationError(
+                "函数语义映射依赖无法证明来自建模资料，必须重新治理后才能发布"
+            )
+    attested = copy.deepcopy(content)
+    attested[_MODELING_SOURCE_ATTESTATION_KEY] = _modeling_source_attestation(
+        attested
+    )
+    return attested
+
+
 def normalize_snapshot_content(content: Any) -> dict:
     """验证并规范化完整本体定义，同时在持久化前剥离所有敏感值。"""
     if not isinstance(content, dict):
@@ -951,6 +1145,30 @@ def normalize_snapshot_content(content: Any) -> dict:
             "能力端口列表",
         )
     ]
+    # Portable semantic mappings are server-derived from modeling schemas.
+    # Omission stays meaningful for proposal and historic snapshot compatibility.
+    semantic_mapping_contracts_present = "semantic_mapping_contracts" in content
+    semantic_mapping_contracts = [
+        _normalize_semantic_mapping_contract(item)
+        for item in _list(
+            content.get("semantic_mapping_contracts")
+            if semantic_mapping_contracts_present
+            else [],
+            "语义映射契约列表",
+        )
+    ]
+    semantic_relation_mapping_contracts_present = (
+        "semantic_relation_mapping_contracts" in content
+    )
+    semantic_relation_mapping_contracts = [
+        _normalize_semantic_relation_mapping_contract(item)
+        for item in _list(
+            content.get("semantic_relation_mapping_contracts")
+            if semantic_relation_mapping_contracts_present
+            else [],
+            "语义关系映射契约列表",
+        )
+    ]
     actions = [_normalize_action(item) for item in _list(content.get("actions"), "Action 列表")]
     rules = [_normalize_rule(item) for item in _list(content.get("rules"), "规则列表")]
     events = [_normalize_event(item) for item in _list(content.get("events"), "事件列表")]
@@ -959,6 +1177,14 @@ def normalize_snapshot_content(content: Any) -> dict:
         mappings, relation_mappings, actions, workflows
     )
     connector_bindings_present = "connector_bindings" in content or bool(runtime_requirements)
+    modeling_attestation_present = _MODELING_SOURCE_ATTESTATION_KEY in content
+    modeling_attestation = (
+        _normalize_modeling_source_attestation(
+            content.get(_MODELING_SOURCE_ATTESTATION_KEY)
+        )
+        if modeling_attestation_present
+        else None
+    )
     raw_requirements = content.get("connector_bindings") if "connector_bindings" in content else []
     if raw_requirements is None:
         raw_requirements = []
@@ -1004,6 +1230,8 @@ def normalize_snapshot_content(content: Any) -> dict:
         "关系数据映射": relation_mappings,
         "函数": functions,
         "能力端口": capability_ports,
+        "语义映射契约": semantic_mapping_contracts,
+        "语义关系映射契约": semantic_relation_mapping_contracts,
         "关系": relations,
         "Action": actions,
         "规则": rules,
@@ -1040,10 +1268,73 @@ def normalize_snapshot_content(content: Any) -> dict:
         "action": action_id_set,
         "workflow": workflow_id_set,
     }
+    semantic_contract_by_id = {
+        item["id"]: item for item in semantic_mapping_contracts
+    }
     if capability_contract_version >= 2:
         for port in capability_ports:
             if port["capability_key"] not in capability_ids[port["capability_kind"]]:
                 raise ReleaseValidationError("能力端口引用了不存在的所属能力")
+    properties_by_entity = {
+        item["id"]: {prop["id"] for prop in item["properties"]}
+        for item in entities
+    }
+    for contract in semantic_mapping_contracts:
+        entity_property_ids = properties_by_entity.get(contract["entity_id"])
+        if entity_property_ids is None:
+            raise ReleaseValidationError("语义映射契约引用了不存在的实体")
+        if any(
+            field["ontology_property_id"] not in entity_property_ids
+            for field in contract["fields"]
+        ):
+            raise ReleaseValidationError("语义映射契约引用了不存在的实体属性")
+    relations_by_id = {item["id"]: item for item in relations}
+    for contract in semantic_relation_mapping_contracts:
+        relation = relations_by_id.get(contract["ontology_relation_id"])
+        source_mapping = semantic_contract_by_id.get(
+            contract["source_semantic_mapping_id"]
+        )
+        target_mapping = semantic_contract_by_id.get(
+            contract["target_semantic_mapping_id"]
+        )
+        if relation is None or source_mapping is None or target_mapping is None:
+            raise ReleaseValidationError(
+                "语义关系映射契约引用了不存在的关系或对象映射"
+            )
+        if (
+            source_mapping["entity_id"] != relation["source_entity_id"]
+            or target_mapping["entity_id"] != relation["target_entity_id"]
+        ):
+            raise ReleaseValidationError("语义关系映射契约端点与本体关系不一致")
+        for endpoint, field_key in (
+            (source_mapping, "source_contract_field_index"),
+            (target_mapping, "target_contract_field_index"),
+        ):
+            raw_contract = endpoint["schema_document"][
+                input_contract_validator.CONTENT_CONTRACT_KEY
+            ]
+            endpoint_fields = raw_contract["relations"][0]["fields"]
+            if contract[field_key] >= len(endpoint_fields):
+                raise ReleaseValidationError("语义关系映射契约字段索引超出端点 Schema")
+    if semantic_mapping_contracts_present:
+        referenced_semantic_mapping_ids = {
+            item["subject_id"]
+            for item in _snapshot_modeling_source_subjects(
+                {
+                    "functions": functions,
+                    "capability_ports": capability_ports,
+                }
+            )
+            if item["kind"] == "semantic_mapping"
+        }
+        missing_semantic_contracts = sorted(
+            referenced_semantic_mapping_ids - set(semantic_contract_by_id)
+        )
+        if missing_semantic_contracts:
+            raise ReleaseValidationError(
+                "函数引用的语义映射缺少可移植契约："
+                + "、".join(missing_semantic_contracts[:20])
+            )
     for relation in relations:
         if relation["source_entity_id"] not in entity_id_set or relation["target_entity_id"] not in entity_id_set:
             raise ReleaseValidationError("关系引用了不存在的实体")
@@ -1074,7 +1365,6 @@ def normalize_snapshot_content(content: Any) -> dict:
         except ValueError as exc:
             raise ReleaseValidationError(str(exc)) from exc
     mapped_relations: set[str] = set()
-    relations_by_id = {item["id"]: item for item in relations}
     entities_by_id = {item["id"]: item for item in entities}
     for relation_mapping in relation_mappings:
         relation = relations_by_id.get(relation_mapping["relation_id"])
@@ -1168,9 +1458,43 @@ def normalize_snapshot_content(content: Any) -> dict:
     if capability_ports_present:
         normalized["capability_contract_version"] = capability_contract_version
         normalized["capability_ports"] = capability_ports
+    if semantic_mapping_contracts_present:
+        normalized["semantic_mapping_contracts"] = semantic_mapping_contracts
+    if semantic_relation_mapping_contracts_present:
+        normalized["semantic_relation_mapping_contracts"] = (
+            semantic_relation_mapping_contracts
+        )
     if connector_bindings_present:
         normalized["connector_bindings"] = connector_bindings
+    if modeling_attestation_present:
+        normalized[_MODELING_SOURCE_ATTESTATION_KEY] = modeling_attestation
     return normalized
+
+
+def _normalize_semantic_mapping_contract(raw: Any) -> dict[str, Any]:
+    """Normalize a derived mapping definition without admitting data identity."""
+
+    sanitized = _sanitize_secret_values(copy.deepcopy(raw))
+    if _contains_marker(sanitized):
+        raise ReleaseValidationError("语义映射契约不能包含凭据或敏感配置")
+    try:
+        return semantic_mapping_contract_service.normalize_contract(sanitized)
+    except semantic_mapping_contract_service.SemanticMappingContractError as exc:
+        raise ReleaseValidationError(f"语义映射契约无效：{exc}") from exc
+
+
+def _normalize_semantic_relation_mapping_contract(raw: Any) -> dict[str, Any]:
+    """Normalize a derived semantic relation without Catalog references."""
+
+    sanitized = _sanitize_secret_values(copy.deepcopy(raw))
+    if _contains_marker(sanitized):
+        raise ReleaseValidationError("语义关系映射契约不能包含凭据或敏感配置")
+    try:
+        return semantic_mapping_contract_service.normalize_relation_contract(
+            sanitized
+        )
+    except semantic_mapping_contract_service.SemanticMappingContractError as exc:
+        raise ReleaseValidationError(f"语义关系映射契约无效：{exc}") from exc
 
 
 def _validate_workflow_references(
@@ -1225,6 +1549,23 @@ def active_snapshot_content(content: Mapping[str, Any]) -> dict:
         for item in projected.get("mappings", [])
         if str(item.get("entity_id") or "") in entity_ids
     ]
+    semantic_mapping_contracts = [
+        item
+        for item in projected.get("semantic_mapping_contracts", [])
+        if str(item.get("entity_id") or "") in entity_ids
+    ]
+    semantic_mapping_contract_ids = {
+        str(item.get("id") or "") for item in semantic_mapping_contracts
+    }
+    semantic_relation_mapping_contracts = [
+        item
+        for item in projected.get("semantic_relation_mapping_contracts", [])
+        if str(item.get("ontology_relation_id") or "") in relation_ids
+        and str(item.get("source_semantic_mapping_id") or "")
+        in semantic_mapping_contract_ids
+        and str(item.get("target_semantic_mapping_id") or "")
+        in semantic_mapping_contract_ids
+    ]
     mapping_ids = {str(item["id"]) for item in mappings}
     relation_mappings = [
         item
@@ -1270,6 +1611,12 @@ def active_snapshot_content(content: Mapping[str, Any]) -> dict:
     projected["relations"] = relations
     if "mappings" in projected:
         projected["mappings"] = mappings
+    if "semantic_mapping_contracts" in projected:
+        projected["semantic_mapping_contracts"] = semantic_mapping_contracts
+    if "semantic_relation_mapping_contracts" in projected:
+        projected["semantic_relation_mapping_contracts"] = (
+            semantic_relation_mapping_contracts
+        )
     if "relation_mappings" in projected:
         projected["relation_mappings"] = relation_mappings
     projected["actions"] = actions
@@ -1302,6 +1649,88 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
         .where(OntologyEntity.scenario_id == scenario.id)
         .order_by(OntologyEntity.id.asc())
     ).scalars().unique().all()
+    contaminated_mapping_id = db.scalar(
+        select(SemanticMapping.id)
+        .join(
+            LogicalDataset,
+            (LogicalDataset.id == SemanticMapping.dataset_id)
+            & (LogicalDataset.tenant_id == SemanticMapping.tenant_id),
+        )
+        .where(
+            SemanticMapping.scenario_id == scenario.id,
+            SemanticMapping.tenant_id == scenario.tenant_id,
+            SemanticMapping.status == "active",
+            LogicalDataset.usage_plane != "modeling_material",
+        )
+        .limit(1)
+    )
+    if contaminated_mapping_id is not None:
+        raise ReleaseValidationError(
+            "语义映射引用了非建模资料，必须重新治理后才能发布"
+        )
+    try:
+        semantic_mapping_contracts = list(
+            semantic_mapping_contract_service.load_live_contracts(
+                db,
+                scenario_id=scenario.id,
+                tenant_id=str(scenario.tenant_id),
+            ).values()
+        )
+        semantic_relation_mapping_contracts = list(
+            semantic_mapping_contract_service.load_live_relation_contracts(
+                db,
+                scenario_id=scenario.id,
+                tenant_id=str(scenario.tenant_id),
+                semantic_mapping_contracts={
+                    item["id"]: item for item in semantic_mapping_contracts
+                },
+            ).values()
+        )
+    except semantic_mapping_contract_service.SemanticMappingContractError as exc:
+        raise ReleaseValidationError(f"语义映射无法生成可移植契约：{exc}") from exc
+    capability_ports = list(
+        db.execute(
+            select(ScenarioCapabilityPort)
+            .options(
+                joinedload(ScenarioCapabilityPort.dataset_schema).joinedload(
+                    DatasetSchema.dataset
+                )
+            )
+            .where(
+                ScenarioCapabilityPort.scenario_id == scenario.id,
+                ScenarioCapabilityPort.status == "active",
+            )
+            .order_by(
+                ScenarioCapabilityPort.capability_kind.asc(),
+                ScenarioCapabilityPort.capability_key.asc(),
+                ScenarioCapabilityPort.port_key.asc(),
+            )
+        ).scalars().unique().all()
+    )
+    for port in capability_ports:
+        dataset = port.dataset_schema.dataset if port.dataset_schema else None
+        if port.dataset_id is not None and (
+            dataset is None or dataset.usage_plane != "modeling_material"
+        ):
+            raise ReleaseValidationError(
+                "能力端口契约引用了非建模资料，必须重新治理后才能发布"
+            )
+        if port.dataset_schema is not None and input_contract_validator.has_content_contract(
+            port.schema_document or {}
+        ):
+            try:
+                expected_contract = input_contract_validator.build_tabular_content_contract(
+                    port.dataset_schema.relations
+                )
+            except input_contract_validator.InputContractError as exc:
+                raise ReleaseValidationError(exc.message) from exc
+            actual_contract = (port.schema_document or {}).get(
+                input_contract_validator.CONTENT_CONTRACT_KEY
+            )
+            if actual_contract != expected_contract:
+                raise ReleaseValidationError(
+                    "能力端口内容契约与建模资料 Schema 不一致，必须重新生成后才能发布"
+                )
     content = {
         "scenario": {
             "name": scenario.name,
@@ -1454,20 +1883,15 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
                 "binding_policy": port.binding_policy or "per_invocation",
                 "config": _sanitize_secret_values(port.config or {}),
             }
-            for port in db.execute(
-                select(ScenarioCapabilityPort)
-                .options(joinedload(ScenarioCapabilityPort.dataset_schema))
-                .where(
-                    ScenarioCapabilityPort.scenario_id == scenario.id,
-                    ScenarioCapabilityPort.status == "active",
-                )
-                .order_by(
-                    ScenarioCapabilityPort.capability_kind.asc(),
-                    ScenarioCapabilityPort.capability_key.asc(),
-                    ScenarioCapabilityPort.port_key.asc(),
-                )
-            ).scalars().unique().all()
+            for port in capability_ports
         ],
+        # These descriptors carry only ontology identities and structural
+        # content requirements. Catalog datasets remain authoring evidence and
+        # are intentionally absent from the release definition.
+        "semantic_mapping_contracts": semantic_mapping_contracts,
+        "semantic_relation_mapping_contracts": (
+            semantic_relation_mapping_contracts
+        ),
         "actions": [
             {
                 "id": action.id,
@@ -1549,7 +1973,10 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
     # modeling contract.  Remove their entire dependency closure before schema
     # validation so deprecation is a viable migration path, not a release
     # blocker; the rows themselves remain untouched in the database.
-    return normalize_snapshot_content(active_snapshot_content(content))
+    active_content = active_snapshot_content(content)
+    return normalize_snapshot_content(
+        _attest_current_modeling_sources(db, scenario, active_content)
+    )
 
 
 def _scenario_for_read(db: Session, scenario_id: str) -> tuple[BusinessScenario, permission_service.Principal]:
@@ -2975,6 +3402,12 @@ def create_proposal(
     if expected_base_snapshot_id and branch.head_snapshot_id != expected_base_snapshot_id:
         raise ReleaseConflictError("发布分支基线已变化，请刷新后重新创建提案")
     normalized = normalize_snapshot_content(content)
+    # Provenance is issued only from a fresh server-side capture after merge;
+    # callers cannot carry an attestation or a Catalog-derived semantic
+    # contract through a proposal payload.
+    normalized.pop(_MODELING_SOURCE_ATTESTATION_KEY, None)
+    normalized.pop("semantic_mapping_contracts", None)
+    normalized.pop("semantic_relation_mapping_contracts", None)
     _validate_mapping_sources(db, scenario, normalized)
     base_snapshot = _snapshot_for_scenario(db, scenario, branch.head_snapshot_id)
     _validate_snapshot_template_actions(
@@ -3240,6 +3673,7 @@ def publish_snapshot(
         snapshot_id=snapshot_id,
     )
     try:
+        _require_snapshot_modeling_provenance(snapshot.content or {})
         _validate_snapshot_template_actions(db, scenario, snapshot.content or {})
         _require_snapshot_managed_dependencies(
             db,
@@ -3419,6 +3853,8 @@ def rollback_snapshot(
             raise ReleaseValidationError("回滚目标必须属于当前分支")
         if not branch.head_snapshot_id:
             raise ReleaseConflictError("分支没有当前快照")
+        if environment:
+            _require_snapshot_modeling_provenance(target.content or {})
         _validate_snapshot_template_actions(db, scenario, target.content or {})
         # A staging/prod rollback is an environment deployment transition, not
         # a mutation of the shared dev authoring definition.  In particular it

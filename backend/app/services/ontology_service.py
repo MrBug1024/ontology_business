@@ -1962,6 +1962,8 @@ def _visible_relation_mapping_source(
         if not visible:
             raise ValueError("关系映射的数据源不可访问")
         source = visible
+    if source.resource_scope != "modeling":
+        raise ValueError("关系映射只能引用建模资料数据源")
     if source.type == "file_bucket":
         raise ValueError("关系映射只能使用数据库数据源")
     return source

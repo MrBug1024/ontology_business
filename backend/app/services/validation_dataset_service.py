@@ -57,7 +57,6 @@ class NoMaterializableTableError(ValidationDatasetError):
     pass
 
 
-_TABLE_EXTENSIONS = {".csv", ".tsv", ".xls", ".xlsx", ".xlsm"}
 _IDENTIFIER_MARKERS = (
     "id", "code", "number", "编号", "编码", "代码", "证件", "卡号", "单号", "序号"
 )
@@ -287,6 +286,13 @@ def _profile(version: DataAssetVersion) -> dict[str, Any]:
     return profile
 
 
+def _profile_extension(profile: dict[str, Any]) -> str:
+    extension = str(profile.get("extension") or "").strip().lower()
+    if extension not in {".csv", ".tsv", ".xls", ".xlsx", ".xlsm"}:
+        raise ValidationDatasetError("表格结构 profile 缺少受支持的内容格式")
+    return extension
+
+
 def _csv_rows(path: Path, delimiter: str) -> Iterator[Sequence[Any]]:
     with path.open("rb") as handle:
         sample = handle.read(65536)
@@ -322,7 +328,7 @@ def _materialize_raw_file(
     output_dir: Path,
     used_relation_keys: set[str],
 ) -> list[dict[str, Any]]:
-    extension = Path(filename).suffix.lower()
+    extension = _profile_extension(profile)
     stem = Path(filename).stem
     tables = list(profile.get("tables") or [])
     results: list[dict[str, Any]] = []
@@ -330,11 +336,16 @@ def _materialize_raw_file(
         if not tables:
             raise ValidationDatasetError("表格结构 profile 缺失")
         relation_name = str(tables[0].get("relation_name") or "").strip()
+        delimiter = str(tables[0].get("delimiter") or "")
+        if not delimiter:
+            delimiter = "\t" if extension == ".tsv" else ","
+        if delimiter not in {"\t", ",", ";", "|"}:
+            raise ValidationDatasetError("表格结构 profile 的分隔符无效")
         candidates = [(
             relation_name
             or catalog_ingestion_service.runtime_relation_name(filename, "data", 1),
             tables[0],
-            _csv_rows(raw_path, "\t" if extension == ".tsv" else ","),
+            _csv_rows(raw_path, delimiter),
         )]
         workbook = None
     elif extension in {".xlsx", ".xlsm"}:
@@ -545,11 +556,16 @@ def enqueue_validation_dataset_job(
     tenant_id = tenant_service.current_tenant_id(db)
     versions = list(
         db.scalars(
-            select(DataAssetVersion).where(
+            select(DataAssetVersion)
+            .join(DataAsset, DataAsset.id == DataAssetVersion.asset_id)
+            .where(
                 DataAssetVersion.id.in_(payload.asset_version_ids),
                 DataAssetVersion.tenant_id == tenant_id,
                 DataAssetVersion.status == "ready",
                 DataAssetVersion.bucket_file_id.is_not(None),
+                DataAsset.tenant_id == tenant_id,
+                DataAsset.lifecycle_status == "active",
+                DataAsset.usage_plane == "invocation_input",
             )
         ).all()
     )
@@ -573,6 +589,7 @@ def enqueue_validation_dataset_job(
             name=payload.name.strip(),
             description="验证中心按内容哈希生成的可复用数据包",
             lifecycle_status="active",
+            usage_plane="invocation_input",
             labels={
                 "catalog_purpose": "validation_dataset",
                 "input_hash": identity_hash,
@@ -917,15 +934,13 @@ def build_validation_dataset(
                 DataAsset.id.in_([version.asset_id for version in versions]),
                 DataAsset.tenant_id == tenant_id,
                 DataAsset.lifecycle_status == "active",
+                DataAsset.usage_plane == "invocation_input",
             )
         ).all()
     }
     if len(assets) != len({item.asset_id for item in versions}):
         raise ValidationDatasetError("部分验证资料已删除")
     for version in versions:
-        asset = assets[version.asset_id]
-        if Path(asset.name).suffix.lower() not in _TABLE_EXTENSIONS:
-            raise ValidationDatasetError(f"{asset.name} 不是可查询表格")
         _profile(version)
 
     identity, identity_hash, dataset_key = _input_identity(versions)
@@ -977,7 +992,9 @@ def build_validation_dataset(
             used_relation_keys: set[str] = set()
             for index, version in enumerate(versions):
                 bucket_file = bucket_files[str(version.bucket_file_id)]
-                raw_path = work / f"raw-{index:03d}{Path(assets[version.asset_id].name).suffix.lower()}"
+                profile = _profile(version)
+                extension = _profile_extension(profile)
+                raw_path = work / f"raw-{index:03d}{extension}"
                 object_storage_service.download_object_to_file(
                     bucket_file.bucket_name,
                     bucket_file.object_key,
@@ -991,7 +1008,7 @@ def build_validation_dataset(
                     relations = _materialize_raw_file(
                         raw_path,
                         assets[version.asset_id].name,
-                        _profile(version),
+                        profile,
                         work,
                         used_relation_keys,
                     )
@@ -1028,6 +1045,7 @@ def build_validation_dataset(
                     name=payload.name.strip(),
                     description="验证中心按内容哈希生成的可复用数据包",
                     lifecycle_status="active",
+                    usage_plane="invocation_input",
                     labels={"catalog_purpose": "validation_dataset", "input_hash": identity_hash},
                     created_by_user_id=str(db.info.get("user_id") or "") or None,
                 )

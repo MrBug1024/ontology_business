@@ -29,8 +29,17 @@ from app.models import (
     User,
 )
 from app.routers import catalog
-from app.services import business_query_service, connector_service, permission_service
-from app.providers.semantic_dataset_query import SemanticDatasetQueryProvider
+from app.services import (
+    business_query_service,
+    connector_service,
+    permission_service,
+    release_service,
+)
+from app.providers.semantic_audit import SemanticAuditProvider
+from app.providers.semantic_dataset_query import (
+    SemanticDatasetQueryProvider,
+    SemanticDatasetQueryProviderError,
+)
 from app.services import runtime_definition_service
 from app.services.capability_contracts import (
     Actor,
@@ -151,13 +160,18 @@ class CatalogApiTests(unittest.TestCase):
         self.client.close()
         self.engine.dispose()
 
-    def _create_dataset_contract(self) -> tuple[dict, dict, dict, dict]:
+    def _create_dataset_contract(
+        self,
+        *,
+        usage_plane: str = "modeling_material",
+    ) -> tuple[dict, dict, dict, dict]:
         dataset = self.client.post(
             "/api/catalog/datasets",
             json={
                 "key": "generic.records",
                 "name": "Generic records",
                 "description": "Reusable tenant data product",
+                "usage_plane": usage_plane,
             },
         )
         self.assertEqual(dataset.status_code, 201, dataset.text)
@@ -214,6 +228,7 @@ class CatalogApiTests(unittest.TestCase):
                 "name": "Modeling evidence",
                 "kind": "file",
                 "media_type": "text/csv",
+                "usage_plane": "modeling_material",
             },
         )
         self.assertEqual(asset.status_code, 201, asset.text)
@@ -278,39 +293,72 @@ class CatalogApiTests(unittest.TestCase):
             self.assertIsNotNone(db.get(LogicalDataset, dataset["id"]))
             self.assertIsNone(db.get(ScenarioDatasetBinding, binding_json["id"]))
 
-    def test_semantic_dataset_provider_uses_pinned_mapping_with_same_schema_runtime_data(self) -> None:
-        dataset, schema, version, head = self._create_dataset_contract()
-        binding = self.client.post(
-            f"/api/scenarios/{self.scenario.id}/dataset-bindings",
+    def test_semantic_dataset_provider_uses_schema_only_mapping_with_structurally_compatible_runtime_data(self) -> None:
+        modeling_dataset = self.client.post(
+            "/api/catalog/datasets",
             json={
-                "dataset_id": dataset["id"],
-                "binding_key": "records.authoring",
-                "environment": "dev",
-                "role": "modeling_evidence",
-                "binding_mode": "head",
-                "dataset_head_id": head["id"],
-                "is_required": False,
+                "key": "generic.modeling-records",
+                "name": "Generic modeling records",
+                "description": "Schema-only modeling material",
+                "usage_plane": "modeling_material",
             },
-        ).json()
+        )
+        self.assertEqual(modeling_dataset.status_code, 201, modeling_dataset.text)
+        self.assertEqual(modeling_dataset.json()["version_count"], 0)
+        modeling_dataset = modeling_dataset.json()
+        modeling_schema = self.client.post(
+            f"/api/catalog/datasets/{modeling_dataset['id']}/schemas",
+            json={
+                "compatibility": "backward",
+                "schema_document": {"purpose": "schema-only modeling contract"},
+                "relations": [
+                    {
+                        "relation_key": "authored_sheet_name",
+                        "display_name": "Authored sheet name",
+                        "kind": "table",
+                        "fields": [
+                            {
+                                "field_key": "record_id",
+                                "source_name": "record_id",
+                                "logical_type": "string",
+                                "nullable": False,
+                                "key_ordinal": 0,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        self.assertEqual(modeling_schema.status_code, 201, modeling_schema.text)
+        modeling_schema = modeling_schema.json()
+        runtime_dataset, runtime_schema, version, runtime_head = self._create_dataset_contract(
+            usage_plane="invocation_input"
+        )
+        self.assertNotEqual(
+            modeling_schema["schema_hash"], runtime_schema["schema_hash"]
+        )
         mapping = self.client.post(
             f"/api/scenarios/{self.scenario.id}/semantic-mappings",
             json={
-                "scenario_dataset_binding_id": binding["id"],
                 "entity_id": self.entity.id,
-                "dataset_schema_id": schema["id"],
-                "dataset_relation_id": schema["relations"][0]["id"],
+                "dataset_schema_id": modeling_schema["id"],
+                "dataset_relation_id": modeling_schema["relations"][0]["id"],
                 "mapping_key": "records.business-record",
                 "status": "active",
                 "fields": [
                     {
                         "ontology_property_id": self.property.id,
-                        "dataset_field_id": schema["relations"][0]["fields"][0]["id"],
+                        "dataset_field_id": modeling_schema["relations"][0]["fields"][0]["id"],
                         "direction": "input",
                         "is_required": True,
                     }
                 ],
             },
-        ).json()
+        )
+        self.assertEqual(mapping.status_code, 201, mapping.text)
+        mapping = mapping.json()
+        self.assertIsNone(mapping["scenario_dataset_binding_id"])
+        self.assertEqual(mapping["dataset_id"], modeling_dataset["id"])
 
         with self.Session() as db:
             db.info["tenant_id"] = self.tenant.id
@@ -347,7 +395,7 @@ class CatalogApiTests(unittest.TestCase):
                         key="records",
                         modality="dataset",
                         schema={},
-                        schema_hash=schema["schema_hash"],
+                        schema_hash=runtime_schema["schema_hash"],
                         binding_kinds=("dataset_version",),
                         override_policy="managed-reference",
                     ),
@@ -438,6 +486,33 @@ class CatalogApiTests(unittest.TestCase):
             self.assertEqual(call["data_sources"][0].config["dataset_version_id"], version["id"])
             self.assertEqual(call["mappings"][0].table_name, "records")
             self.assertEqual(call["mappings"][0].column_map, {"Record ID": "record_id"})
+            self.assertEqual(
+                call["data_sources"][0].config["dataset_id"], runtime_dataset["id"]
+            )
+
+            head_context = RuntimeDataContext(
+                handles=(
+                    ResolvedDataHandle(
+                        port_key="records",
+                        binding_kind="dataset_head",
+                        reference_id=runtime_head["id"],
+                        version_id=version["id"],
+                        signature=version["content_hash"],
+                    ),
+                )
+            )
+            with patch(
+                "app.providers.semantic_dataset_query.business_query_service.query_business_data",
+                side_effect=compile_query,
+            ) as head_query:
+                head_result = provider.invoke(request, actor, deployment, head_context)
+            self.assertEqual(head_result["records"], [{"Record ID": "R-1"}])
+            self.assertEqual(
+                head_query.call_args.kwargs["data_sources"][0].config[
+                    "dataset_version_id"
+                ],
+                version["id"],
+            )
 
             function.input_schema = {
                 "type": "object",
@@ -561,14 +636,12 @@ class CatalogApiTests(unittest.TestCase):
                 "additionalProperties": False,
             }
             function.runtime_config = {
-                "provider_key": SemanticDatasetQueryProvider.provider_key,
-                "provider_version": SemanticDatasetQueryProvider.provider_version,
+                "provider_key": SemanticAuditProvider.provider_key,
+                "provider_version": SemanticAuditProvider.provider_version,
                 "provider_config": {
                     "semantic_mapping_ids": [mapping["id"]],
-                    "rule_query": {
-                        "selector_input": "rule_selector",
-                        "spec_version": "semantic-audit/v1",
-                    },
+                    "selector_input": "rule_selector",
+                    "spec_version": "semantic-audit/v1",
                 },
             }
             db.commit()
@@ -586,7 +659,16 @@ class CatalogApiTests(unittest.TestCase):
                 data_ports=deployment.data_ports,
                 data_context=data_context,
             )
-            audit_contract = provider.contract(request.capability, audit_deployment)
+            audit_provider = SemanticAuditProvider().bind_invocation(db)
+            audit_capability = CapabilityRef(
+                kind="function",
+                resource_id=self.function.id,
+                provider_key=SemanticAuditProvider.provider_key,
+            )
+            audit_contract = audit_provider.contract(
+                audit_capability,
+                audit_deployment,
+            )
             self.assertEqual(
                 audit_contract["input_schema"]["properties"],
                 function.input_schema["properties"],
@@ -600,9 +682,9 @@ class CatalogApiTests(unittest.TestCase):
                 "app.providers.semantic_dataset_query.business_query_service.query_business_data",
                 side_effect=compile_audit,
             ):
-                audit_result = provider.invoke(
+                audit_result = audit_provider.invoke(
                     Request(
-                        capability=request.capability,
+                        capability=audit_capability,
                         inputs={
                             "rule_selector": "duplicate-record",
                             "record_id": "R-1",
@@ -618,6 +700,117 @@ class CatalogApiTests(unittest.TestCase):
             )
             self.assertEqual(audit_result["audit_rule"]["code"], "duplicate-record")
             self.assertEqual(audit_result["records"], [{"Record ID": "R-1"}])
+
+            # Frozen releases created before the dedicated Provider keep their
+            # exact v1 interpreter, but new authoring no longer emits this shape.
+            function.runtime_config = {
+                "provider_key": SemanticDatasetQueryProvider.provider_key,
+                "provider_version": SemanticDatasetQueryProvider.provider_version,
+                "provider_config": {
+                    "semantic_mapping_ids": [mapping["id"]],
+                    "rule_query": {
+                        "selector_input": "rule_selector",
+                        "spec_version": "semantic-audit/v1",
+                    },
+                },
+            }
+            db.commit()
+            legacy_definition = runtime_definition_service.resolve_active(
+                db,
+                db.get(BusinessScenario, self.scenario.id),
+                environment="dev",
+            )
+            legacy_deployment = ResolvedDeployment(
+                scenario_id=self.scenario.id,
+                tenant_id=self.tenant.id,
+                environment="dev",
+                definition_hash=legacy_definition.definition_hash,
+                definition=legacy_definition,
+                data_ports=deployment.data_ports,
+                data_context=data_context,
+            )
+            with patch(
+                "app.providers.semantic_dataset_query.business_query_service.query_business_data",
+                side_effect=compile_audit,
+            ):
+                legacy_result = provider.invoke(
+                    Request(
+                        capability=request.capability,
+                        inputs={
+                            "rule_selector": "duplicate-record",
+                            "record_id": "R-1",
+                        },
+                    ),
+                    actor,
+                    legacy_deployment,
+                    data_context,
+                )
+            self.assertEqual(
+                legacy_result["decision_state"],
+                "candidate_detected_pending_review",
+            )
+
+            frozen_content = release_service.capture_snapshot_content(
+                db,
+                db.get(BusinessScenario, self.scenario.id),
+            )
+            portable_contract = next(
+                item
+                for item in frozen_content["semantic_mapping_contracts"]
+                if item["id"] == mapping["id"]
+            )
+            portable_text = repr(portable_contract)
+            self.assertNotIn(modeling_dataset["id"], portable_text)
+            self.assertNotIn(modeling_schema["id"], portable_text)
+            self.assertNotIn("authored_sheet_name", portable_text)
+            frozen_snapshot = OntologySnapshot(
+                id="snapshot-semantic-contract",
+                tenant_id=self.tenant.id,
+                scenario_id=self.scenario.id,
+                kind="merge",
+                content=frozen_content,
+                content_hash=release_service.snapshot_hash(frozen_content),
+                created_by_user_id=self.user.id,
+            )
+            db.add(frozen_snapshot)
+            db.flush()
+            frozen_definition = runtime_definition_service._from_snapshot(
+                db.get(BusinessScenario, self.scenario.id),
+                "prod",
+                frozen_snapshot,
+                release=None,
+            )
+            db.get(SemanticMapping, mapping["id"]).status = "retired"
+            db.commit()
+            frozen_deployment = ResolvedDeployment(
+                scenario_id=self.scenario.id,
+                tenant_id=self.tenant.id,
+                environment="prod",
+                definition_hash=frozen_definition.definition_hash,
+                definition=frozen_definition,
+                data_ports=deployment.data_ports,
+                data_context=data_context,
+            )
+            with patch(
+                "app.providers.semantic_dataset_query.business_query_service.query_business_data",
+                side_effect=compile_audit,
+            ):
+                frozen_result = provider.invoke(
+                    Request(
+                        capability=request.capability,
+                        inputs={
+                            "rule_selector": "duplicate-record",
+                            "record_id": "R-1",
+                        },
+                    ),
+                    actor,
+                    frozen_deployment,
+                    data_context,
+                )
+            self.assertEqual(
+                frozen_result["decision_state"],
+                "candidate_detected_pending_review",
+            )
 
     def test_dataset_head_compare_and_set_rejects_a_stale_writer(self) -> None:
         dataset, schema, version_a, _head = self._create_dataset_contract()
@@ -689,6 +882,7 @@ class CatalogApiTests(unittest.TestCase):
             json={
                 "key": "unsafe.dataset",
                 "name": "Unsafe dataset",
+                "usage_plane": "generated_output",
                 "labels": {"database_password": "must-not-persist"},
             },
         )
@@ -784,6 +978,10 @@ class CatalogApiTests(unittest.TestCase):
         self.assertEqual(created.status_code, 201, created.text)
         port = created.json()
         self.assertEqual(port["dataset_schema_hash"], schema["schema_hash"])
+        self.assertEqual(
+            port["schema_document"]["x-platform-input-contract"]["version"],
+            "tabular-content/v1",
+        )
         self.assertNotIn("dataset_version_id", port)
         self.assertNotIn("data_source_id", port)
 
@@ -845,6 +1043,292 @@ class CatalogApiTests(unittest.TestCase):
         )
         self.assertEqual(zero_data.status_code, 201, zero_data.text)
         self.assertIsNone(zero_data.json()["dataset_id"])
+
+        invalid_contract = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/capability-ports",
+            json={
+                "capability_kind": "function",
+                "capability_key": self.function.id,
+                "port_key": "invalid.contract",
+                "name": "Invalid contract",
+                "direction": "input",
+                "role": "invocation_input",
+                "media_kind": "structured",
+                "schema_document": {
+                    "x-platform-input-contract": {
+                        "version": "unsupported/v9",
+                        "relations": [],
+                    }
+                },
+                "is_required": False,
+                "binding_policy": "none",
+                "status": "draft",
+            },
+        )
+        self.assertEqual(invalid_contract.status_code, 400, invalid_contract.text)
+        self.assertIn("内容契约无效", invalid_contract.json()["detail"])
+
+    def test_schema_backed_port_contract_is_canonical_without_blocking_manual_contracts(
+        self,
+    ) -> None:
+        dataset, schema, _version, _head = self._create_dataset_contract()
+        base_payload = {
+            "capability_kind": "function",
+            "capability_key": self.function.id,
+            "name": "Canonical records",
+            "direction": "input",
+            "role": "invocation_input",
+            "media_kind": "dataset",
+            "dataset_id": dataset["id"],
+            "dataset_schema_id": schema["id"],
+            "is_required": True,
+            "cardinality": "one",
+            "binding_policy": "per_invocation",
+            "status": "active",
+        }
+        generated = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/capability-ports",
+            json={**base_payload, "port_key": "canonical.generated"},
+        )
+        self.assertEqual(generated.status_code, 201, generated.text)
+        canonical_contract = generated.json()["schema_document"][
+            "x-platform-input-contract"
+        ]
+
+        exact = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/capability-ports",
+            json={
+                **base_payload,
+                "port_key": "canonical.exact",
+                "schema_document": {
+                    "type": "array",
+                    "x-platform-input-contract": canonical_contract,
+                },
+            },
+        )
+        self.assertEqual(exact.status_code, 201, exact.text)
+        self.assertEqual(
+            exact.json()["schema_document"]["x-platform-input-contract"],
+            canonical_contract,
+        )
+
+        mismatched_contract = {
+            **canonical_contract,
+            "relations": [
+                {
+                    **canonical_contract["relations"][0],
+                    "minimum_data_rows": 2,
+                }
+            ],
+        }
+        mismatched = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/capability-ports",
+            json={
+                **base_payload,
+                "port_key": "canonical.mismatched",
+                "schema_document": {
+                    "x-platform-input-contract": mismatched_contract,
+                },
+            },
+        )
+        self.assertEqual(mismatched.status_code, 400, mismatched.text)
+        self.assertIn("规范契约完全一致", mismatched.json()["detail"])
+
+        manual = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/capability-ports",
+            json={
+                "capability_kind": "function",
+                "capability_key": self.function.id,
+                "port_key": "manual.contract",
+                "name": "Manual contract",
+                "direction": "input",
+                "role": "invocation_input",
+                "media_kind": "structured",
+                "schema_document": {
+                    "x-platform-input-contract": mismatched_contract,
+                },
+                "is_required": False,
+                "binding_policy": "none",
+                "status": "active",
+            },
+        )
+        self.assertEqual(manual.status_code, 201, manual.text)
+        self.assertIsNone(manual.json()["dataset_schema_id"])
+        self.assertEqual(
+            manual.json()["schema_document"]["x-platform-input-contract"],
+            mismatched_contract,
+        )
+
+    def test_modeling_catalog_rejects_invocation_dataset_at_every_write_boundary(self) -> None:
+        dataset, schema, _version, head = self._create_dataset_contract(
+            usage_plane="invocation_input"
+        )
+
+        listed = self.client.get(
+            "/api/catalog/datasets",
+            params={"usage_plane": "modeling_material"},
+        )
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json(), [])
+
+        binding = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/dataset-bindings",
+            json={
+                "dataset_id": dataset["id"],
+                "binding_key": "invalid.modeling",
+                "environment": "dev",
+                "role": "modeling_evidence",
+                "binding_mode": "head",
+                "dataset_head_id": head["id"],
+                "is_required": False,
+            },
+        )
+        self.assertEqual(binding.status_code, 400, binding.text)
+
+        port = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/capability-ports",
+            json={
+                "capability_kind": "function",
+                "capability_key": self.function.id,
+                "port_key": "invalid.records",
+                "name": "Invalid records",
+                "direction": "input",
+                "role": "invocation_input",
+                "media_kind": "dataset",
+                "dataset_id": dataset["id"],
+                "dataset_schema_id": schema["id"],
+                "is_required": True,
+                "cardinality": "one",
+                "binding_policy": "per_invocation",
+            },
+        )
+        self.assertEqual(port.status_code, 400, port.text)
+
+        with self.Session() as db:
+            invalid_binding = ScenarioDatasetBinding(
+                id="binding-invalid-modeling-plane",
+                tenant_id=self.tenant.id,
+                scenario_id=self.scenario.id,
+                dataset_id=dataset["id"],
+                binding_key="bypassed.invalid.modeling",
+                environment="dev",
+                role="modeling_evidence",
+                binding_mode="head",
+                dataset_head_id=head["id"],
+                is_required=False,
+                status="active",
+                config={},
+            )
+            invalid_mapping = SemanticMapping(
+                id="mapping-invalid-modeling-plane",
+                tenant_id=self.tenant.id,
+                dataset_id=dataset["id"],
+                scenario_id=self.scenario.id,
+                entity_id=self.entity.id,
+                scenario_dataset_binding_id=invalid_binding.id,
+                dataset_schema_id=schema["id"],
+                dataset_relation_id=schema["relations"][0]["id"],
+                mapping_key="bypassed.invalid.mapping",
+                status="active",
+                identifier_strategy={},
+                filter_expression={},
+            )
+            invalid_port = ScenarioCapabilityPort(
+                id="port-invalid-modeling-plane",
+                tenant_id=self.tenant.id,
+                scenario_id=self.scenario.id,
+                capability_kind="function",
+                capability_key=self.function.id,
+                port_key="bypassed.invalid.records",
+                name="Bypassed invalid records",
+                direction="input",
+                role="invocation_input",
+                media_kind="dataset",
+                dataset_id=dataset["id"],
+                dataset_schema_id=schema["id"],
+                schema_document={"type": "array"},
+                is_required=True,
+                cardinality="one",
+                binding_policy="per_invocation",
+                status="active",
+                config={},
+            )
+            db.add_all([invalid_binding, invalid_mapping, invalid_port])
+            db.commit()
+
+            provider = SemanticDatasetQueryProvider().bind_invocation(db)
+            deployment = ResolvedDeployment(
+                scenario_id=self.scenario.id,
+                tenant_id=self.tenant.id,
+                environment="dev",
+                definition_hash="f" * 64,
+                definition=SimpleNamespace(entities={}),
+            )
+            with self.assertRaisesRegex(
+                SemanticDatasetQueryProviderError,
+                "unavailable",
+            ):
+                provider._semantic_catalog(
+                    definition=deployment.definition,
+                    deployment=deployment,
+                    mapping_ids=(invalid_mapping.id,),
+                )
+            with self.assertRaisesRegex(
+                release_service.ReleaseValidationError,
+                "非建模资料",
+            ):
+                release_service.capture_snapshot_content(
+                    db,
+                    db.get(BusinessScenario, self.scenario.id),
+                )
+
+        listed_mappings = self.client.get(
+            f"/api/scenarios/{self.scenario.id}/semantic-mappings"
+        )
+        self.assertEqual(listed_mappings.status_code, 200, listed_mappings.text)
+        self.assertEqual(listed_mappings.json(), [])
+
+        mapping = self.client.post(
+            f"/api/scenarios/{self.scenario.id}/semantic-mappings",
+            json={
+                "scenario_dataset_binding_id": "binding-invalid-modeling-plane",
+                "entity_id": self.entity.id,
+                "dataset_schema_id": schema["id"],
+                "dataset_relation_id": schema["relations"][0]["id"],
+                "mapping_key": "invalid.mapping",
+                "status": "active",
+                "fields": [],
+            },
+        )
+        self.assertEqual(mapping.status_code, 400, mapping.text)
+
+    def test_asset_catalog_can_be_filtered_by_authoritative_usage_plane(self) -> None:
+        modeling = self.client.post(
+            "/api/catalog/assets",
+            json={
+                "key": "modeling.asset",
+                "name": "Modeling asset",
+                "usage_plane": "modeling_material",
+            },
+        )
+        invocation = self.client.post(
+            "/api/catalog/assets",
+            json={
+                "key": "invocation.asset",
+                "name": "Invocation asset",
+                "usage_plane": "invocation_input",
+            },
+        )
+        self.assertEqual(modeling.status_code, 201, modeling.text)
+        self.assertEqual(invocation.status_code, 201, invocation.text)
+
+        listed = self.client.get(
+            "/api/catalog/assets",
+            params={"usage_plane": "modeling_material"},
+        )
+
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual([item["id"] for item in listed.json()], [modeling.json()["id"]])
 
     def test_connector_binding_options_expose_only_portable_references(self) -> None:
         with self.Session() as db:

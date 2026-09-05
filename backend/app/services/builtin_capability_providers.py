@@ -9,9 +9,9 @@ from typing import Any, ClassVar
 from sqlalchemy.orm import Session
 
 from ..models import ActionExecutionLog, CapabilityInvocation
+from ..providers import builtin_function_evaluator
 from . import (
     capability_readiness_service,
-    function_runtime_service,
     operations_service,
     permission_service,
     runtime_definition_service,
@@ -401,7 +401,7 @@ class FunctionDefinitionProvider(_BuiltinProvider):
             "write",
             message="function execution is not permitted",
         )
-        return function_runtime_service.execute_function(function, request.inputs)
+        return builtin_function_evaluator.evaluate_function(function, request.inputs)
 
 
 @dataclass(frozen=True, slots=True)

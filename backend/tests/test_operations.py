@@ -16,9 +16,7 @@ from app.database import Base
 from app.config import get_settings
 from app.models import (
     ActionExecutionLog,
-    Agent,
     BusinessScenario,
-    LLMConfig,
     OntologyAction,
     OntologyEntity,
     OntologyEvent,
@@ -32,7 +30,6 @@ from app.models import (
 )
 from app.routers import scenarios as scenarios_router
 from app.schemas import ActionIn
-from app.services.agent_engine import AgentContext
 from app.services import (
     capability_readiness_service,
     operations_service,
@@ -275,32 +272,6 @@ class OperationsRuntimeTests(unittest.TestCase):
         self.db.refresh(run)
         self.assertEqual(run.status, "awaiting_approval")
         self.assertEqual(run.attempt, 1)
-
-    def test_agent_workflow_tool_requires_user_confirmation_instead_of_enqueuing(self) -> None:
-        workflow = self._workflow(name="agent-approval", node_types=("approval",))
-        agent = Agent(
-            id="agent-operations",
-            tenant_id=self.tenant.id,
-            scenario_id=self.scenario.id,
-            name="运营助手",
-            capability_scope={
-                "functions": {"mode": "explicit", "selected_ids": []},
-                "actions": {"mode": "explicit", "selected_ids": []},
-                "rules": {"mode": "explicit", "selected_ids": []},
-                "events": {"mode": "explicit", "selected_ids": []},
-                "workflows": {"mode": "explicit", "selected_ids": [workflow.id]},
-            },
-        )
-        context = AgentContext(self.db, agent, LLMConfig(name="测试模型"))
-
-        raw_result = context.execute_tool(
-            "execute_workflow",
-            {"workflow_id": workflow.id, "params": {"case": "agent"}},
-        )
-        result = json.loads(raw_result)
-        self.assertEqual(result["status"], "confirmation_required")
-        self.assertEqual(result["workflow_id"], workflow.id)
-        self.assertEqual(self.db.query(WorkflowRun).count(), 0)
 
     def test_event_envelope_enqueues_subscriber_once(self) -> None:
         event = OntologyEvent(id="event-1", scenario_id=self.scenario.id, name="对象已更新")

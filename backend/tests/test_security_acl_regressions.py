@@ -17,6 +17,7 @@ from app.config import get_settings
 from app.database import Base, get_db
 from app.models import (
     Agent,
+    AgentTurnRun,
     AssistantAttachment,
     AssistantMessage,
     AssistantThread,
@@ -38,8 +39,17 @@ from app.models import (
     Tenant,
     User,
 )
-from app.routers import agents, assistant, data_sources, llm_configs, mcp, scenarios, skills
-from app.services import datasource_service, permission_service
+from app.routers import (
+    agent_turns,
+    agents,
+    assistant,
+    data_sources,
+    llm_configs,
+    mcp,
+    scenarios,
+    skills,
+)
+from app.services import agent_turn_service, datasource_service, permission_service
 from app.services import auth_service
 from app.services.auth_service import get_current_user, get_tenant_db
 
@@ -316,6 +326,7 @@ class SecurityAclRegressionTests(unittest.TestCase):
         self.app.include_router(scenarios.router, prefix="/api")
         self.app.include_router(data_sources.router, prefix="/api")
         self.app.include_router(agents.router, prefix="/api")
+        self.app.include_router(agent_turns.router, prefix="/api")
         self.app.include_router(assistant.router, prefix="/api")
         self.app.include_router(skills.router, prefix="/api")
         self.app.include_router(mcp.router, prefix="/api")
@@ -345,6 +356,36 @@ class SecurityAclRegressionTests(unittest.TestCase):
     def _as_viewer(self) -> None:
         self.current_user_id = self.viewer.id
         self.current_tenant_id = self.tenant.id
+
+    def _process_legacy_turn_events(self, run_id: str, **_kwargs):
+        """Test adapter: let the durable worker finish after SSE acceptance."""
+
+        yield ": durable-agent-turn-accepted\n\n"
+        with patch.object(agent_turn_service, "SessionLocal", self.Session):
+            self.assertTrue(
+                agent_turn_service.process_turn(run_id, agents.invoke_agent_once)
+            )
+        db = self.Session()
+        db.info["tenant_id"] = self.current_tenant_id
+        db.info["user_id"] = self.current_user_id
+        try:
+            run = agent_turn_service.get_turn(db, run_id)
+            message = db.get(Message, run["assistant_message_id"])
+            assistant = (
+                {
+                    "content": message.content,
+                    "tool_calls": list(message.tool_calls or []),
+                    "tool_results": list(message.tool_results or []),
+                    "citations": list(message.citations or []),
+                    "evidence_refs": list(message.evidence_refs or []),
+                }
+                if message is not None
+                else None
+            )
+        finally:
+            db.close()
+        yield from agent_turns._legacy_terminal_frames(run, assistant)
+        yield "data: [DONE]\n\n"
 
     def _deny_viewer_scenario_read(self) -> None:
         db = self.Session()
@@ -540,10 +581,9 @@ class SecurityAclRegressionTests(unittest.TestCase):
         self.assertEqual(first_message["tool_calls"], message.tool_calls)
         self.assertEqual(first_message["tool_results"], message.tool_results)
 
-    def test_stream_exception_persists_exactly_what_the_browser_rendered(self) -> None:
+    def test_legacy_stream_reports_only_durable_sanitized_worker_failure(self) -> None:
         partial_content = "已完成年度审计数据汇总。"
         error_data = "生成审计附件时失败"
-        expected_content = agents._stream_error_content(partial_content, error_data)
         db = self.Session()
         try:
             llm = LLMConfig(
@@ -567,6 +607,11 @@ class SecurityAclRegressionTests(unittest.TestCase):
 
         with (
             patch.object(agents, "SessionLocal", self.Session),
+            patch.object(
+                agent_turns,
+                "_legacy_chat_events",
+                self._process_legacy_turn_events,
+            ),
             patch.object(agents.agent_engine, "run_agent", failing_run_agent),
         ):
             streamed = self.client.post(
@@ -578,8 +623,9 @@ class SecurityAclRegressionTests(unittest.TestCase):
             )
 
         self.assertEqual(streamed.status_code, 200, streamed.text)
-        self.assertIn(partial_content, streamed.text)
-        self.assertIn(error_data, streamed.text)
+        self.assertNotIn(partial_content, streamed.text)
+        self.assertNotIn(error_data, streamed.text)
+        self.assertIn("执行结果无法确认", streamed.text)
 
         first = self.client.get(
             f"/api/agents/conversations/{self.conversation.id}/messages"
@@ -589,15 +635,20 @@ class SecurityAclRegressionTests(unittest.TestCase):
         )
         self.assertEqual(first.status_code, 200, first.text)
         self.assertEqual(second.status_code, 200, second.text)
-        persisted = [
-            item for item in first.json()
-            if item["role"] == "assistant" and item["content"] == expected_content
-        ]
+        run_id = streamed.headers["x-agent-turn-id"]
+        db = self.Session()
+        try:
+            run = db.get(AgentTurnRun, run_id)
+            self.assertEqual(run.status, "indeterminate")
+            assistant_message_id = run.assistant_message_id
+        finally:
+            db.close()
+        persisted = [item for item in first.json() if item["id"] == assistant_message_id]
         self.assertEqual(len(persisted), 1)
         refreshed = next(item for item in second.json() if item["id"] == persisted[0]["id"])
-        self.assertEqual(refreshed["content"], expected_content)
+        self.assertIn("执行结果无法确认", refreshed["content"])
+        self.assertNotIn(error_data, refreshed["content"])
         self.assertEqual(refreshed, persisted[0])
-        self.assertEqual(agents._stream_error_content("", error_data), f"[错误] {error_data}")
 
     def test_agent_stream_reloads_runtime_in_stream_owned_session(self) -> None:
         db = self.Session()
@@ -634,6 +685,11 @@ class SecurityAclRegressionTests(unittest.TestCase):
 
         with (
             patch.object(agents, "SessionLocal", self.Session),
+            patch.object(
+                agent_turns,
+                "_legacy_chat_events",
+                self._process_legacy_turn_events,
+            ),
             patch.object(agents.agent_engine, "run_agent", inspect_runtime),
         ):
             response = self.client.post(
@@ -776,6 +832,11 @@ class SecurityAclRegressionTests(unittest.TestCase):
 
         with (
             patch.object(agents, "SessionLocal", self.Session),
+            patch.object(
+                agent_turns,
+                "_legacy_chat_events",
+                self._process_legacy_turn_events,
+            ),
             patch.object(agents, "_authorization_context", capture_authorization_context),
             patch.object(agents.agent_engine, "run_agent", fake_run_agent),
         ):
@@ -794,7 +855,7 @@ class SecurityAclRegressionTests(unittest.TestCase):
         self.assertNotIn("AP001年度审计报告.docx", replayed)
         self.assertIn(agents._HISTORIC_MODEL_REPLAY_PLACEHOLDER, replayed)
         self.assertEqual(len(captured_runtime_context), 1)
-        self.assertEqual(len(authorization_contexts), 2)
+        self.assertEqual(len(authorization_contexts), 1)
         self.assertIs(captured_runtime_context[0], authorization_contexts[-1])
         self.assertEqual(captured_runtime_context[0].runtime_connections, [])
 

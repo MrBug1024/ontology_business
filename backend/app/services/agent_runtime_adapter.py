@@ -14,13 +14,13 @@ from __future__ import annotations
 import copy
 import json
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 from uuid import uuid4
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from ..config import get_settings
 from ..models import (
@@ -28,12 +28,17 @@ from ..models import (
     BusinessScenario,
     CapabilityInvocation,
     ConnectorBinding,
+    DataAssetVersion,
     DataSource,
+    DatasetRelation,
+    DatasetSchema,
+    DatasetVersion,
     LLMConfig,
 )
 from . import (
     agent_capability_service,
     capability_application_service,
+    input_contract_validator,
     llm_service,
     permission_service,
     runtime_connector_service,
@@ -66,6 +71,8 @@ _HISTORICAL_MODES = {
 }
 _CAPABILITY_TOOL_LIST = "list_available_capabilities"
 _CAPABILITY_TOOL_INVOKE = "invoke_capability"
+_MAX_MODEL_RECEIPT_BYTES = 8_192
+_MODEL_RECEIPT_CONTRACT = "agent-capability-receipt-model-view/v1"
 
 
 class AgentRuntimeAdapterError(RuntimeError):
@@ -149,11 +156,14 @@ class AgentTurnInput:
                 "invalid_managed_inputs",
                 "Agent managed inputs must use governed binding overrides",
             )
-        keys = [item.port_key for item in overrides]
-        if len(keys) != len(set(keys)):
+        identities = [
+            (item.port_key, item.binding_kind, item.selector, item.selector_value)
+            for item in overrides
+        ]
+        if len(identities) != len(set(identities)):
             raise AgentRuntimeAdapterError(
                 "duplicate_managed_input",
-                "A managed input port can be supplied only once per turn",
+                "The same managed input cannot be supplied twice per turn",
             )
         kind = str(self.target_kind or "").strip().lower() or None
         key = str(self.target_key or "").strip() or None
@@ -229,6 +239,59 @@ def _outline(value: Any, *, depth: int = 0) -> dict[str, Any]:
     else:
         kind = "string"
     return {"type": kind}
+
+
+def _prompt_outline(value: Any) -> dict[str, Any]:
+    """Build a small value-free manifest for model-side capability planning."""
+
+    remaining_nodes = [200]
+
+    def visit(item: Any, *, depth: int = 0) -> dict[str, Any]:
+        if remaining_nodes[0] <= 0 or depth >= 6:
+            return {"type": "truncated"}
+        remaining_nodes[0] -= 1
+        if isinstance(item, Mapping):
+            pairs = sorted(item.items(), key=lambda pair: str(pair[0]))
+            visible = pairs[:50]
+            result: dict[str, Any] = {
+                "type": "object",
+                "field_count": len(pairs),
+                "fields": {
+                    str(key)[:160]: visit(child, depth=depth + 1)
+                    for key, child in visible
+                    if remaining_nodes[0] > 0
+                },
+            }
+            if len(pairs) > len(visible) or remaining_nodes[0] <= 0:
+                result["truncated"] = True
+            return result
+        if isinstance(item, Sequence) and not isinstance(
+            item, (str, bytes, bytearray)
+        ):
+            samples = [
+                visit(child, depth=depth + 1)
+                for child in list(item)[:3]
+                if remaining_nodes[0] > 0
+            ]
+            return {
+                "type": "array",
+                "length": len(item),
+                "sample_shapes": samples,
+                "truncated": len(item) > len(samples),
+            }
+        if item is None:
+            kind = "null"
+        elif isinstance(item, bool):
+            kind = "boolean"
+        elif isinstance(item, int):
+            kind = "integer"
+        elif isinstance(item, float):
+            kind = "number"
+        else:
+            kind = "string"
+        return {"type": kind}
+
+    return visit(value)
 
 
 def _safe_turn_input(turn_input: AgentTurnInput) -> dict[str, Any]:
@@ -331,6 +394,120 @@ def _safe_error(code: str, message: str, *, retryable: bool = False) -> str:
         ensure_ascii=False,
         sort_keys=True,
     )
+
+
+def _json_value_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        return "array"
+    return "unknown"
+
+
+def _model_output_outline(value: Any) -> dict[str, Any]:
+    """Summarize result shape without retaining keys, values, or row samples."""
+
+    type_counts: defaultdict[str, int] = defaultdict(int)
+    object_field_count = 0
+    array_item_count = 0
+    max_depth = 0
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        max_depth = max(max_depth, depth)
+        kind = _json_value_type(item)
+        type_counts[kind] += 1
+        if isinstance(item, Mapping):
+            object_field_count += len(item)
+            pending.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, Sequence) and not isinstance(
+            item,
+            (str, bytes, bytearray),
+        ):
+            array_item_count += len(item)
+            pending.extend((child, depth + 1) for child in item)
+    return {
+        "root_type": _json_value_type(value),
+        "node_type_counts": dict(sorted(type_counts.items())),
+        "object_field_count": object_field_count,
+        "array_item_count": array_item_count,
+        "max_depth": max_depth,
+    }
+
+
+def _model_receipt_projection(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the bounded receipt view allowed in model and chat history."""
+
+    plain = json.loads(canonical_json(document))
+    serialized = canonical_json(plain)
+    if len(serialized.encode("utf-8")) <= _MAX_MODEL_RECEIPT_BYTES:
+        return plain
+
+    output = plain.get("output")
+    capability = plain.get("capability")
+    error = plain.get("error")
+    projected = {
+        "contract": _MODEL_RECEIPT_CONTRACT,
+        "invocation_id": str(plain.get("invocation_id") or "")[:64],
+        "status": str(plain.get("status") or "")[:40],
+        "capability": {
+            "kind": str(
+                capability.get("kind") if isinstance(capability, Mapping) else ""
+            )[:40],
+            "key": str(
+                capability.get("key") if isinstance(capability, Mapping) else ""
+            )[:160],
+        },
+        "definition_hash": str(plain.get("definition_hash") or "")[:128],
+        "deployment_fingerprint": str(
+            plain.get("deployment_fingerprint") or ""
+        )[:128],
+        "data_context_fingerprint": str(
+            plain.get("data_context_fingerprint") or ""
+        )[:128],
+        "receipt_hash": canonical_hash(
+            plain,
+            domain="agent-capability-receipt-v1",
+        ),
+        "result_hash": canonical_hash(
+            output,
+            domain="agent-capability-result-v1",
+        ),
+        "result_outline": _model_output_outline(output),
+        "result_bytes": len(canonical_json(output).encode("utf-8")),
+        "result_omitted": True,
+        "next_step": (
+            "完整结果保留在服务端受治理回执中；请缩小输入或过滤条件后重试，"
+            "或按 invocation_id 通过授权接口继续查询。"
+        ),
+        "error": (
+            {
+                "code": str(error.get("code") or "")[:80],
+                "message": str(error.get("message") or "")[:500],
+            }
+            if isinstance(error, Mapping)
+            else None
+        ),
+    }
+    if len(canonical_json(projected).encode("utf-8")) > _MAX_MODEL_RECEIPT_BYTES:
+        raise AgentRuntimeAdapterError(
+            "model_receipt_projection_too_large",
+            "Capability receipt projection exceeds the model boundary",
+        )
+    return projected
 
 
 def _public_capability(document: Mapping[str, Any]) -> dict[str, Any]:
@@ -529,6 +706,9 @@ class CapabilityAgentRuntime:
         self._capability_by_ref = {
             (str(item["kind"]), str(item["key"])): item for item in self.capabilities
         }
+        self._attachment_observations_cache: tuple[
+            input_contract_validator.ObservedInput, ...
+        ] | None = None
         self.context_issues = self._context_issues(raw_catalog)
         self.complete = not self.context_issues
         self.citations: list[dict[str, Any]] = []
@@ -632,6 +812,10 @@ class CapabilityAgentRuntime:
         self,
         capability: Mapping[str, Any],
     ) -> bool:
+        occupied = {item.port_key for item in self.turn_input.binding_overrides}
+        attachment_kinds = {
+            item.binding_kind for item in self.turn_input.attachments
+        }
         eligible = [
             item
             for item in (capability.get("data_ports") or [])
@@ -639,28 +823,104 @@ class CapabilityAgentRuntime:
             and str(item.get("direction") or "input").strip().lower() != "output"
             and bool(item.get("allow_override", False))
             and str(item.get("key") or item.get("port_key") or "").strip()
+            not in occupied
+            and (
+                not item.get("binding_kinds")
+                or bool(
+                    attachment_kinds.intersection(
+                        str(kind).strip().lower()
+                        for kind in (item.get("binding_kinds") or [])
+                    )
+                )
+            )
         ]
-        attachments = self.turn_input.attachments
-        if len(eligible) < len(attachments):
+        if not eligible:
+            return True
+        try:
+            input_contract_validator.match_inputs(
+                eligible,
+                self._attachment_observations(),
+            )
+        except input_contract_validator.InputContractError:
             return False
+        return True
 
-        def assign(index: int, used: frozenset[str]) -> bool:
-            if index >= len(attachments):
-                return True
-            attachment = attachments[index]
-            for port in eligible:
-                key = str(port.get("key") or port.get("port_key") or "").strip()
-                if key in used:
-                    continue
-                kinds = {
-                    str(kind).strip().lower()
-                    for kind in (port.get("binding_kinds") or [])
-                }
-                if attachment.binding_kind in kinds and assign(index + 1, used | {key}):
-                    return True
-            return False
-
-        return assign(0, frozenset())
+    def _attachment_observations(
+        self,
+    ) -> tuple[input_contract_validator.ObservedInput, ...]:
+        cached = self._attachment_observations_cache
+        if cached is not None:
+            return cached
+        observations: list[input_contract_validator.ObservedInput] = []
+        for index, attachment in enumerate(self.turn_input.attachments):
+            profile: Mapping[str, Any] = {}
+            if attachment.asset_version_id:
+                version = self.db.scalar(
+                    select(DataAssetVersion).where(
+                        DataAssetVersion.id == attachment.asset_version_id,
+                        DataAssetVersion.tenant_id == self.tenant_id,
+                    )
+                )
+                document = (
+                    version.version_document
+                    if version is not None
+                    and isinstance(version.version_document, Mapping)
+                    else {}
+                )
+                raw_profile = document.get("profile")
+                if isinstance(raw_profile, Mapping):
+                    profile = raw_profile
+            else:
+                version = self.db.scalar(
+                    select(DatasetVersion).where(
+                        DatasetVersion.id == attachment.dataset_version_id,
+                        DatasetVersion.tenant_id == self.tenant_id,
+                    )
+                )
+                schema = (
+                    self.db.scalar(
+                        select(DatasetSchema).where(
+                            DatasetSchema.id == version.schema_id,
+                            DatasetSchema.dataset_id == version.dataset_id,
+                            DatasetSchema.tenant_id == self.tenant_id,
+                        )
+                    )
+                    if version is not None
+                    else None
+                )
+                if schema is not None:
+                    relations = tuple(
+                        self.db.scalars(
+                            select(DatasetRelation)
+                            .options(selectinload(DatasetRelation.fields))
+                            .where(
+                                DatasetRelation.schema_id == schema.id,
+                                DatasetRelation.dataset_id == schema.dataset_id,
+                                DatasetRelation.tenant_id == self.tenant_id,
+                            )
+                            .order_by(DatasetRelation.ordinal, DatasetRelation.id)
+                        ).all()
+                    )
+                    profile = input_contract_validator.build_observed_tabular_profile(
+                        relations,
+                        record_count=int(version.record_count or 0),
+                        relation_row_counts=(
+                            version.manifest.get("relations")
+                            if isinstance(version.manifest, Mapping)
+                            and isinstance(version.manifest.get("relations"), Mapping)
+                            else None
+                        ),
+                    )
+            observations.append(
+                input_contract_validator.ObservedInput(
+                    index=index,
+                    binding_kind=attachment.binding_kind,
+                    reference_id=attachment.reference_id,
+                    profile=profile,
+                )
+            )
+        self._attachment_observations_cache = tuple(observations)
+        return self._attachment_observations_cache
 
     def set_runtime_decision(self, document: Mapping[str, Any]) -> None:
         self.runtime_decision = copy.deepcopy(dict(document))
@@ -708,9 +968,8 @@ class CapabilityAgentRuntime:
             invoke_properties["attachment_bindings"] = {
                 "type": "array",
                 "description": (
-                    "Map each user attachment index to one compatible managed-data "
-                    "input port from the selected capability. Omit only when the order "
-                    "of attachments and eligible ports is unambiguous."
+                    "Map only attachments that satisfy a governed managed-data input "
+                    "port. Unmapped supplementary attachments remain available to the turn."
                 ),
                 "items": {
                     "type": "object",
@@ -781,6 +1040,7 @@ class CapabilityAgentRuntime:
         if not attachments:
             return ()
         occupied = {item.port_key for item in self.turn_input.binding_overrides}
+        attachment_kinds = {item.binding_kind for item in attachments}
         eligible = [
             item
             for item in (capability.get("data_ports") or [])
@@ -789,54 +1049,48 @@ class CapabilityAgentRuntime:
             and bool(item.get("allow_override", False))
             and str(item.get("key") or item.get("port_key") or "").strip()
             not in occupied
+            and (
+                not item.get("binding_kinds")
+                or bool(
+                    attachment_kinds.intersection(
+                        str(kind).strip().lower()
+                        for kind in (item.get("binding_kinds") or [])
+                    )
+                )
+            )
         ]
         eligible_by_key = {
-            str(item.get("key") or item.get("port_key") or "").strip(): item
+            str(item.get("key") or item.get("port_key") or "").strip().lower(): item
             for item in eligible
         }
+
         def compatible(index: int, key: str) -> bool:
-            port = eligible_by_key.get(key)
+            port = eligible_by_key.get(key.lower())
             if port is None or index < 0 or index >= len(attachments):
                 return False
-            return attachments[index].binding_kind in {
+            configured_kinds = {
                 str(kind).strip().lower()
                 for kind in (port.get("binding_kinds") or [])
             }
-
-        if not eligible_by_key or any(
-            not any(
-                attachment.binding_kind in {
-                    str(kind).strip().lower()
-                    for kind in (port.get("binding_kinds") or [])
-                }
-                for port in eligible
-            )
-            for attachment in attachments
-        ):
-            raise AgentRuntimeAdapterError(
-                "capability_does_not_accept_attachments",
-                "The selected capability has no compatible dataset or file input port for the user's attachments",
+            return (
+                not configured_kinds
+                or attachments[index].binding_kind in configured_kinds
             )
 
         pairs: list[tuple[int, str]] = []
         if raw_bindings is None:
-            used: set[str] = set()
-            for index, _attachment in enumerate(attachments):
-                key = next(
-                    (
-                        candidate
-                        for candidate in eligible_by_key
-                        if candidate not in used and compatible(index, candidate)
-                    ),
-                    "",
+            try:
+                matched = input_contract_validator.match_inputs(
+                    eligible,
+                    self._attachment_observations(),
                 )
-                if not key:
-                    raise AgentRuntimeAdapterError(
-                        "attachment_port_mapping_required",
-                        "There are more attachments than compatible input ports",
-                    )
-                used.add(key)
-                pairs.append((index, key))
+            except input_contract_validator.InputContractError as exc:
+                raise AgentRuntimeAdapterError(exc.code, exc.message) from None
+            pairs = [
+                (index, assignment.port_key)
+                for assignment in matched.assignments
+                for index in assignment.input_indices
+            ]
         else:
             if not isinstance(raw_bindings, Sequence) or isinstance(
                 raw_bindings, (str, bytes, bytearray)
@@ -858,23 +1112,56 @@ class CapabilityAgentRuntime:
                         "invalid_attachment_index",
                         "Attachment index is invalid",
                     ) from exc
-                key = str(item.get("port_key") or "").strip()
+                key = str(item.get("port_key") or "").strip().lower()
                 pairs.append((index, key))
 
         indices = [index for index, _key in pairs]
         port_keys = [key for _index, key in pairs]
-        if sorted(indices) != list(range(len(attachments))):
-            raise AgentRuntimeAdapterError(
-                "incomplete_attachment_bindings",
-                "Every uploaded attachment must be mapped exactly once",
-            )
-        if len(port_keys) != len(set(port_keys)) or any(
-            not compatible(index, key) for index, key in pairs
+        if len(indices) != len(set(indices)) or any(
+            index < 0 or index >= len(attachments) for index in indices
         ):
             raise AgentRuntimeAdapterError(
-                "invalid_attachment_port",
-                "Attachment mapping contains a duplicate or incompatible input port",
+                "invalid_attachment_bindings",
+                "An attachment may be mapped at most once",
             )
+        if any(not compatible(index, key) for index, key in pairs):
+            raise AgentRuntimeAdapterError(
+                "invalid_attachment_port",
+                "Attachment mapping contains an incompatible input port",
+            )
+        for key in set(port_keys):
+            port = eligible_by_key[key]
+            if (
+                str(port.get("cardinality") or "one").lower() == "one"
+                and port_keys.count(key) > 1
+            ):
+                raise AgentRuntimeAdapterError(
+                    "invalid_attachment_port",
+                    "Multiple attachments target a single-value input port",
+                )
+        paired_by_port = set(port_keys)
+        if any(
+            bool(port.get("required", True)) and key not in paired_by_port
+            for key, port in eligible_by_key.items()
+        ):
+            raise AgentRuntimeAdapterError(
+                "content_contract_missing",
+                "Required attachment input contracts are not satisfied",
+            )
+        observations = self._attachment_observations()
+        for index, key in pairs:
+            schema_document = eligible_by_key[key].get("schema_document") or {}
+            if input_contract_validator.has_content_contract(schema_document):
+                try:
+                    input_contract_validator.validate_profile_for_cardinality(
+                        schema_document,
+                        observations[index].profile,
+                        cardinality=str(
+                            eligible_by_key[key].get("cardinality") or "one"
+                        ),
+                    )
+                except input_contract_validator.InputContractError as exc:
+                    raise AgentRuntimeAdapterError(exc.code, exc.message) from None
         return tuple(
             DataBindingOverride(
                 port_key=port_key,
@@ -1163,7 +1450,11 @@ class CapabilityAgentRuntime:
             )
             document = capability_application_service.receipt_document(receipt)
             self._record_receipt(document)
-            return json.dumps(document, ensure_ascii=False, sort_keys=True)
+            return json.dumps(
+                _model_receipt_projection(document),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         except capability_application_service.CapabilityApplicationError as exc:
             self.db.rollback()
             return _safe_error(exc.code.upper(), exc.message)
@@ -1200,7 +1491,46 @@ class CapabilityAgentRuntime:
             )
         except capability_application_service.CapabilityApplicationError:
             return False
-        return json.loads(canonical_json(parsed)) == json.loads(canonical_json(current))
+        normalized = json.loads(canonical_json(parsed))
+        canonical_current = json.loads(canonical_json(current))
+        projected_current = _model_receipt_projection(current)
+        # Legacy rows may contain the canonical receipt. They remain eligible
+        # only so replay can replace them with the same bounded projection used
+        # for new turns; the full document is never returned to the model.
+        return normalized in (canonical_current, projected_current)
+
+    def model_historic_tool_result(
+        self,
+        name: str,
+        args: Mapping[str, Any],
+        raw_result: Any,
+    ) -> str | None:
+        """Re-authorize and project one persisted result for model replay."""
+
+        parsed = _parse_result(raw_result)
+        if name == _CAPABILITY_TOOL_LIST:
+            if parsed != self.public_catalog():
+                return None
+            return json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+        if name != _CAPABILITY_TOOL_INVOKE or not isinstance(parsed, Mapping):
+            return None
+        invocation_id = str(parsed.get("invocation_id") or "")
+        if not invocation_id:
+            return None
+        try:
+            current = capability_application_service.get_receipt(
+                self.db,
+                self._actor(),
+                invocation_id,
+            )
+        except capability_application_service.CapabilityApplicationError:
+            return None
+        normalized = json.loads(canonical_json(parsed))
+        canonical_current = json.loads(canonical_json(current))
+        projection = _model_receipt_projection(current)
+        if normalized not in (canonical_current, projection):
+            return None
+        return json.dumps(projection, ensure_ascii=False, sort_keys=True)
 
     def _system_prompt(self) -> str:
         base = self.agent.system_prompt or "你是一名专业的业务智能助手。"
@@ -1231,7 +1561,8 @@ class CapabilityAgentRuntime:
                 + json.dumps(catalog, ensure_ascii=False, sort_keys=True),
                 (
                     "【本轮用户附件】模型必须根据用户需求和能力数据端口自主选择能力，"
-                    "并在 invoke_capability 时完成附件到端口的映射；不得要求用户填写端口或 JSON。\n"
+                    "并在 invoke_capability 时只映射满足端口契约的附件；未定义契约的补充附件保持未映射，"
+                    "不得要求用户填写端口或 JSON。\n"
                     + json.dumps(
                         [
                             {"attachment_index": index, "filename": item.filename}
@@ -1269,9 +1600,19 @@ class CapabilityAgentRuntime:
         parts = [str(message or "")]
         if self.turn_input.structured_inputs:
             parts.append(
-                "【客户端提供的结构化输入（其显式字段优先于模型补全）】\n"
+                "【客户端结构化输入清单】以下内容只描述字段形状，不包含原始值；"
+                "服务端会把完整 typed input 直接交给最终选中的能力，模型不得猜测、"
+                "复述或要求展开大批量原始数据。\n"
                 + json.dumps(
-                    self.turn_input.structured_inputs,
+                    {
+                        "content_hash": canonical_hash(
+                            self.turn_input.structured_inputs,
+                            domain="agent-structured-input-v1",
+                        ),
+                        "outline": _prompt_outline(
+                            self.turn_input.structured_inputs
+                        ),
+                    },
                     ensure_ascii=False,
                     sort_keys=True,
                 )
@@ -1297,6 +1638,8 @@ class CapabilityAgentRuntime:
         self,
         history: list[dict[str, Any]],
         user_message: str,
+        *,
+        before_llm_call: Callable[[], None] | None = None,
     ) -> Iterator[dict[str, Any]]:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self._system_prompt()},
@@ -1309,6 +1652,8 @@ class CapabilityAgentRuntime:
         for _round in range(max_rounds):
             content_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
+            if before_llm_call is not None:
+                before_llm_call()
             for event in llm_service.chat_stream(
                 self.llm,
                 messages,
@@ -1470,6 +1815,38 @@ def build_runtime_context(
     return capability_runtime
 
 
+def require_complete_runtime_context(context: Any) -> None:
+    """Reject an incomplete per-turn context before any model interaction."""
+
+    if getattr(context, "complete", True) is not False:
+        return
+    raw_issues = getattr(context, "context_issues", ())
+    issue_codes = {
+        str(item.get("code") or "").strip().lower()
+        for item in raw_issues
+        if isinstance(item, Mapping)
+    }
+    if "attachments_not_supported" in issue_codes:
+        raise AgentRuntimeAdapterError(
+            "runtime_input_contract_unsatisfied",
+            "上传内容未满足所选能力的基础输入契约",
+        )
+    if "requested_capability_unavailable" in issue_codes:
+        raise AgentRuntimeAdapterError(
+            "requested_capability_unavailable",
+            "请求的能力当前不可用",
+        )
+    if "selected_capability_not_ready" in issue_codes:
+        raise AgentRuntimeAdapterError(
+            "selected_capability_not_ready",
+            "所选能力尚未满足运行条件",
+        )
+    raise AgentRuntimeAdapterError(
+        "runtime_context_incomplete",
+        "Agent 当前运行上下文不完整，已在模型调用前阻止处理",
+    )
+
+
 def input_snapshot(context: Any) -> dict[str, Any]:
     method = getattr(context, "input_snapshot", None)
     return method() if callable(method) else {}
@@ -1485,6 +1862,7 @@ __all__ = [
     "AgentTurnInput",
     "CapabilityAgentRuntime",
     "build_runtime_context",
+    "require_complete_runtime_context",
     "evidence_snapshot",
     "input_snapshot",
 ]

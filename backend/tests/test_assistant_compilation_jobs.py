@@ -872,6 +872,7 @@ class AssistantCompilationJobTests(unittest.TestCase):
         first_docs = job_service.canonical_compiler_documents([first])
         second_docs = job_service.canonical_compiler_documents([second])
         self.assertEqual(first_docs, second_docs)
+        self.assertEqual(first_docs[0]["usage_plane"], "invocation_input")
         self.assertNotIn("upload-one", first_docs[0]["id"])
         self.assertNotIn("upload-two", second_docs[0]["id"])
 
@@ -1403,14 +1404,15 @@ class AssistantCompilationJobTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             created_by_user_id=self.user.id,
         )
-        self.assertEqual(private_input["version"], 1)
+        self.assertEqual(private_input["version"], 2)
         self.assertEqual(
             private_input["compiler_message"],
             "从冻结附件恢复完整场景建模",
         )
+        frozen_document = private_input["compiler_documents"][0]
+        self.assertNotIn("text", frozen_document)
         self.assertEqual(
-            private_input["compiler_documents"][0]["text"],
-            frozen_attachment_text,
+            frozen_document["passages"][0]["text"], frozen_attachment_text
         )
 
         public_status = assistant.get_compilation_job(
@@ -1500,14 +1502,12 @@ class AssistantCompilationJobTests(unittest.TestCase):
             captured["documents"],
             private_input["compiler_documents"],
         )
-        self.assertEqual(
-            captured["documents"][0]["text"],
-            frozen_attachment_text,
+        self.assertNotIn("text", captured["documents"][0])
+        captured_passages = json.dumps(
+            captured["documents"][0]["passages"], ensure_ascii=False
         )
-        self.assertNotEqual(
-            captured["documents"][0]["text"],
-            changed_attachment_text,
-        )
+        self.assertIn(frozen_attachment_text, captured_passages)
+        self.assertNotIn(changed_attachment_text, captured_passages)
         self.assertEqual(captured["llm_id"], self.llm.id)
         self.assertGreater(float(captured["request_timeout"]), 0)
         self.assertTrue(captured["has_progress"])

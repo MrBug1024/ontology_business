@@ -8,7 +8,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from fastapi import HTTPException
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from starlette.datastructures import Headers, UploadFile
@@ -26,7 +25,7 @@ from app.services import ontology_service, workflow_service
 
 
 class AssistantOntologyIngestionTests(unittest.TestCase):
-    def test_attachment_context_preserves_tail_beyond_legacy_twelve_thousand_chars(self) -> None:
+    def test_attachment_context_retrieves_bounded_passages_without_copying_tail(self) -> None:
         marker = "TAIL-MARKER-AFTER-LEGACY-LIMIT"
         body = "建筑业务正文" * 3_000 + marker
         attachment = SimpleNamespace(
@@ -37,13 +36,28 @@ class AssistantOntologyIngestionTests(unittest.TestCase):
             error="",
         )
 
-        context, sources = assistant._attachment_context([attachment])
+        with patch.object(
+            assistant.content_retrieval_service,
+            "authorized_attachments",
+            return_value=[attachment],
+        ):
+            context, sources = assistant._attachment_context(
+                [attachment],
+                query="建筑业务正文",
+                db=SimpleNamespace(),
+                tenant_id="tenant-test",
+                user_id="user-test",
+                thread_id="thread-test",
+            )
 
-        self.assertIn(marker, context)
+        self.assertIn("附件内容清单", context)
+        self.assertIn("【A1】", context)
+        self.assertNotIn(marker, context)
+        self.assertNotIn(body, context)
         self.assertEqual(sources[0]["characters"], len(body))
-        self.assertFalse(sources[0]["truncated"])
+        self.assertTrue(sources[0]["truncated"])
 
-    def test_attachment_context_rejects_over_limit_instead_of_truncating(self) -> None:
+    def test_attachment_context_bounds_oversized_legacy_text_instead_of_rejecting(self) -> None:
         attachment = SimpleNamespace(
             id="attachment-too-long",
             filename="超长建筑资料.md",
@@ -52,8 +66,24 @@ class AssistantOntologyIngestionTests(unittest.TestCase):
             error="",
         )
 
-        with self.assertRaisesRegex(HTTPException, "不会静默截断"):
-            assistant._attachment_context([attachment])
+        with patch.object(
+            assistant.content_retrieval_service,
+            "authorized_attachments",
+            return_value=[attachment],
+        ):
+            context, sources = assistant._attachment_context(
+                [attachment],
+                query="文",
+                max_chars=1_000,
+                db=SimpleNamespace(),
+                tenant_id="tenant-test",
+                user_id="user-test",
+                thread_id="thread-test",
+            )
+
+        self.assertLessEqual(sources[0]["retrieved_characters"], 1_000)
+        self.assertTrue(sources[0]["truncated"])
+        self.assertNotIn(attachment.parsed_text, context)
 
     def test_attachment_upload_keeps_text_beyond_legacy_twenty_four_thousand_chars(self) -> None:
         marker = "TAIL-MARKER-AFTER-LEGACY-UPLOAD-LIMIT"
@@ -114,6 +144,58 @@ class AssistantOntologyIngestionTests(unittest.TestCase):
         self.assertIn(marker, result.parsed_text)
         self.assertEqual(result.parsed_text, parsed_text)
         self.assertIs(captured["attachment"], result)
+
+    def test_renamed_tabular_attachment_is_dispatched_from_content_profile(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeDb:
+            def add(self, item) -> None:
+                captured["attachment"] = item
+
+            def flush(self) -> None:
+                return None
+
+            def commit(self) -> None:
+                return None
+
+            def refresh(self, _item) -> None:
+                return None
+
+        upload = UploadFile(
+            BytesIO(b"record_id,amount\nA-1,12.5\n"),
+            filename="renamed.payload",
+            headers=Headers({"content-type": "application/octet-stream"}),
+        )
+        with (
+            patch.object(assistant, "_purge_expired_attachments"),
+            patch.object(assistant, "_tenant", return_value="tenant-ingestion"),
+            patch.object(assistant, "_current_user_id", return_value="user-ingestion"),
+            patch.object(assistant.datasource_service, "save_assistant_attachment_object"),
+            patch.object(
+                assistant.object_deletion_service,
+                "prepare_assistant_attachment_upload",
+                return_value=SimpleNamespace(object_key="managed-upload-key"),
+            ),
+            patch.object(
+                assistant.object_deletion_service,
+                "heartbeat_upload_intent",
+                return_value=nullcontext(SimpleNamespace(assert_active=lambda: None)),
+            ),
+            patch.object(assistant.object_deletion_service, "begin_upload_put"),
+            patch.object(assistant.object_deletion_service, "assert_upload_active"),
+            patch.object(assistant.object_deletion_service, "retain_assistant_attachment_upload"),
+            patch.object(
+                assistant.doc_parser,
+                "parse_bytes",
+                side_effect=AssertionError("tabular content must not use the document parser"),
+            ),
+        ):
+            result = asyncio.run(assistant.upload_attachment(upload, FakeDb()))
+
+        self.assertEqual(result.status, "parsed")
+        self.assertEqual(result.mime, "text/csv")
+        self.assertIn("record_id", result.parsed_text)
+        self.assertNotIn("A-1", result.parsed_text)
 
     def test_generate_ontology_passes_long_context_and_keeps_more_than_eight_entities(self) -> None:
         marker = "TAIL-MARKER-AFTER-LEGACY-THREE-THOUSAND"

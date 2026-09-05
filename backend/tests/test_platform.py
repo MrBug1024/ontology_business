@@ -323,7 +323,9 @@ class AssistantIntentTests(unittest.TestCase):
             scenario,
         )
         self.assertEqual(len(proposal["proposal_id"]), 32)
-        self.assertEqual(proposal["status"], "pending")
+        self.assertEqual(proposal["status"], "read_only")
+        self.assertFalse(proposal["requires_confirmation"])
+        self.assertIn("完整场景建模", proposal["summary"])
         self.assertEqual(proposal["base_snapshot"]["entity_names"], ["客户"])
         self.assertEqual(
             [item["operation"] for item in proposal["changes"]],
@@ -364,54 +366,20 @@ class AssistantIntentTests(unittest.TestCase):
             apply_proposal(request, None)
         self.assertEqual(error.exception.status_code, 409)
 
-    def test_apply_proposal_uses_saved_payload_and_marks_message_applied(self) -> None:
-        scenario = SimpleNamespace(id="scenario-1", entities=[], relations=[], workflows=[])
+    def test_apply_legacy_workflow_proposal_is_read_only_and_never_claimed(self) -> None:
         thread = SimpleNamespace(id="thread-1", scenario_id="scenario-1")
         proposal_message = SimpleNamespace(id="message-1", proposal={})
         saved_proposal = {
             "proposal_id": "proposal-1",
             "kind": "workflow",
             "status": "pending",
-            "base_snapshot": _scenario_snapshot(scenario),
             "payload": {
                 "name": "审批草稿",
                 "nodes": [{"id": "start", "type": "start"}, {"id": "end", "type": "end"}],
                 "edges": [{"source": "start", "target": "end"}],
             },
         }
-
-        class FakeDb:
-            info = {"tenant_id": "tenant-1", "user_id": "user-1"}
-
-            def __init__(self) -> None:
-                self.added = []
-                self.committed = False
-
-            def add(self, value) -> None:
-                self.added.append(value)
-
-            def commit(self) -> None:
-                self.committed = True
-
-            def flush(self) -> None:
-                return None
-
-            def rollback(self) -> None:
-                return None
-
-            def execute(self, _statement):
-                return self
-
-            def scalars(self):
-                return self
-
-            def first(self):
-                return scenario
-
-            def expire(self, _value, _attributes) -> None:
-                return None
-
-        db = FakeDb()
+        db = SimpleNamespace(info={"tenant_id": "tenant-1", "user_id": "user-1"})
         request = AssistantProposalApplyRequest(
             kind="workflow",
             scenario_id="scenario-1",
@@ -420,22 +388,21 @@ class AssistantIntentTests(unittest.TestCase):
             confirm=True,
             payload={"name": "客户端篡改的工作流", "nodes": [], "edges": []},
         )
-        fake_workflow = SimpleNamespace(id="workflow-1")
-        claim = SimpleNamespace(status="applying", result={}, applied_at=None)
-        with patch("app.routers.assistant._scenario", return_value=scenario), patch(
+        with patch(
             "app.routers.assistant._find_saved_proposal",
             return_value=(thread, proposal_message, saved_proposal),
         ), patch(
+            "app.routers.assistant._require_legacy_modeling_source_evidence",
+        ), patch(
             "app.routers.assistant._claim_proposal_application",
-            return_value=(claim, True),
-        ), patch("app.routers.assistant.OntologyWorkflow", return_value=fake_workflow):
-            result = apply_proposal(request, db)
+        ) as claim_application:
+            with self.assertRaises(HTTPException) as rejected:
+                apply_proposal(request, db)
 
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["data"]["workflow_id"], "workflow-1")
-        self.assertEqual(proposal_message.proposal["status"], "applied")
-        self.assertEqual(proposal_message.proposal["payload"]["name"], "审批草稿")
-        self.assertTrue(db.committed)
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertIn("仅供审阅", str(rejected.exception.detail))
+        claim_application.assert_not_called()
+        self.assertEqual(proposal_message.proposal, {})
 
 
 class ObjectRuntimeTests(unittest.TestCase):

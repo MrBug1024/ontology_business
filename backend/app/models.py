@@ -96,6 +96,9 @@ class Tenant(Base):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_users_id_tenant"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
@@ -1399,6 +1402,7 @@ class Agent(Base):
             "'capability_only')",
             name="ck_agents_runtime_binding_mode",
         ),
+        UniqueConstraint("id", "tenant_id", name="uq_agents_id_tenant"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -1442,6 +1446,11 @@ class Agent(Base):
 
 class Conversation(Base):
     __tablename__ = "conversations"
+    __table_args__ = (
+        UniqueConstraint(
+            "id", "agent_id", name="uq_conversations_id_agent"
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     agent_id: Mapped[str] = mapped_column(
@@ -1464,6 +1473,11 @@ class Conversation(Base):
 
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "id", "conversation_id", name="uq_messages_id_conversation"
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     conversation_id: Mapped[str] = mapped_column(
@@ -1492,6 +1506,199 @@ class Message(Base):
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
 
 
+class AgentTurnRun(Base):
+    """Durable ownership and execution state for one Agent conversation turn."""
+
+    __tablename__ = "agent_turn_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "requested_by_user_id",
+            "idempotency_key",
+            name="uq_agent_turn_runs_principal_request",
+        ),
+        UniqueConstraint("id", "tenant_id", name="uq_agent_turn_runs_id_tenant"),
+        UniqueConstraint(
+            "tenant_id",
+            "parent_run_id",
+            name="uq_agent_turn_runs_parent_retry",
+        ),
+        ForeignKeyConstraint(
+            ["requested_by_user_id", "tenant_id"],
+            ["users.id", "users.tenant_id"],
+            name="fk_agent_turn_runs_user_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["agent_id", "tenant_id"],
+            ["agents.id", "agents.tenant_id"],
+            name="fk_agent_turn_runs_agent_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["preparation_run_id", "tenant_id"],
+            ["ingestion_runs.id", "ingestion_runs.tenant_id"],
+            name="fk_agent_turn_runs_preparation_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["parent_run_id", "tenant_id"],
+            ["agent_turn_runs.id", "agent_turn_runs.tenant_id"],
+            name="fk_agent_turn_runs_parent_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["conversation_id", "agent_id"],
+            ["conversations.id", "conversations.agent_id"],
+            name="fk_agent_turn_runs_conversation_agent",
+        ),
+        ForeignKeyConstraint(
+            ["user_message_id", "conversation_id"],
+            ["messages.id", "messages.conversation_id"],
+            name="fk_agent_turn_runs_user_message_conversation",
+        ),
+        ForeignKeyConstraint(
+            ["assistant_message_id", "conversation_id"],
+            ["messages.id", "messages.conversation_id"],
+            name="fk_agent_turn_runs_assistant_message_conversation",
+        ),
+        CheckConstraint(
+            "status IN ('accepted', 'preparing_inputs', 'validating_contracts', "
+            "'planning', 'invoking_tools', 'responding', 'cancel_requested', "
+            "'succeeded', 'failed', 'cancelled', 'indeterminate')",
+            name="ck_agent_turn_runs_status",
+        ),
+        CheckConstraint(
+            "environment IN ('dev', 'staging', 'prod')",
+            name="ck_agent_turn_runs_environment",
+        ),
+        CheckConstraint("revision > 0", name="ck_agent_turn_runs_revision"),
+        CheckConstraint(
+            "lease_generation >= 0", name="ck_agent_turn_runs_lease_generation"
+        ),
+        CheckConstraint(
+            _sha256_check("request_fingerprint"),
+            name="ck_agent_turn_runs_request_fingerprint",
+        ),
+        CheckConstraint(
+            _sha256_check("request_digest"),
+            name="ck_agent_turn_runs_request_digest",
+        ),
+        Index(
+            "ix_agent_turn_runs_dispatch",
+            "status",
+            "available_at",
+            "lease_expires_at",
+        ),
+        Index(
+            "ix_agent_turn_runs_owner_created",
+            "tenant_id",
+            "requested_by_user_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    requested_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    agent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    user_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    assistant_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    preparation_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ingestion_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    parent_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_turn_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Only a versioned authenticated envelope is stored here. Message content
+    # has its existing transcript lifecycle; typed inputs never remain in
+    # plaintext turn state.
+    request_payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    request_summary: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    environment: Mapped[str] = mapped_column(
+        String(20), default=_runtime_environment_default, nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(30), default="accepted", nullable=False, index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    lease_token: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    lease_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    definition_hash: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    deployment_fingerprint: Mapped[str] = mapped_column(
+        String(64), default="", nullable=False
+    )
+    data_context_fingerprint: Mapped[str] = mapped_column(
+        String(64), default="", nullable=False
+    )
+    result_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    error_code: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class AgentTurnEvent(Base):
+    """Monotonic public progress event for one durable Agent turn."""
+
+    __tablename__ = "agent_turn_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "revision", name="uq_agent_turn_events_revision"),
+        ForeignKeyConstraint(
+            ["run_id", "tenant_id"],
+            ["agent_turn_runs.id", "agent_turn_runs.tenant_id"],
+            name="fk_agent_turn_events_run_tenant",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("revision > 0", name="ck_agent_turn_events_revision"),
+        Index("ix_agent_turn_events_run_revision", "run_id", "revision"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    data: Mapped[dict] = mapped_column(_json_document_type(), default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
 # ──────────────────────────────────────────────
 # 全局 AI 助手：上下文会话、临时附件与变更审计
 # ──────────────────────────────────────────────
@@ -1499,6 +1706,15 @@ class AssistantThread(Base):
     """带业务上下文范围的助手会话。助手只在当前租户和上下文范围内可见。"""
 
     __tablename__ = "assistant_threads"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_assistant_threads_id_tenant"),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            "created_by_user_id",
+            name="uq_assistant_threads_id_tenant_user",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
@@ -1570,6 +1786,9 @@ class AssistantMessage(Base):
     """助手会话消息，同时保存上下文和 AI 生成的待确认变更。"""
 
     __tablename__ = "assistant_messages"
+    __table_args__ = (
+        UniqueConstraint("id", "thread_id", name="uq_assistant_messages_id_thread"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     thread_id: Mapped[str] = mapped_column(
@@ -1584,6 +1803,136 @@ class AssistantMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     thread: Mapped[AssistantThread] = relationship(back_populates="messages")
+
+
+class AssistantRequestRun(Base):
+    """Durable execution ownership for one attachment-backed Assistant send."""
+
+    __tablename__ = "assistant_request_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "parent_run_id",
+            name="uq_assistant_request_runs_parent_retry",
+        ),
+        UniqueConstraint(
+            "id", "tenant_id", name="uq_assistant_request_runs_id_tenant"
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "requested_by_user_id",
+            "request_id",
+            name="uq_assistant_request_runs_principal_request",
+        ),
+        ForeignKeyConstraint(
+            ["requested_by_user_id", "tenant_id"],
+            ["users.id", "users.tenant_id"],
+            name="fk_assistant_request_runs_user_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["parent_run_id", "tenant_id"],
+            ["assistant_request_runs.id", "assistant_request_runs.tenant_id"],
+            name="fk_assistant_request_runs_parent_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["thread_id", "tenant_id", "requested_by_user_id"],
+            [
+                "assistant_threads.id",
+                "assistant_threads.tenant_id",
+                "assistant_threads.created_by_user_id",
+            ],
+            name="fk_assistant_request_runs_thread_principal",
+        ),
+        ForeignKeyConstraint(
+            ["user_message_id", "thread_id"],
+            ["assistant_messages.id", "assistant_messages.thread_id"],
+            name="fk_assistant_request_runs_user_message_thread",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["assistant_message_id", "thread_id"],
+            ["assistant_messages.id", "assistant_messages.thread_id"],
+            name="fk_assistant_request_runs_assistant_message_thread",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "status IN ('waiting_upload', 'queued', 'running', 'succeeded', 'failed', 'cancelled')",
+            name="ck_assistant_request_runs_status",
+        ),
+        CheckConstraint("revision > 0", name="ck_assistant_request_runs_revision"),
+        CheckConstraint(
+            "lease_generation >= 0",
+            name="ck_assistant_request_runs_lease_generation",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND lease_token <> '' AND lease_generation > 0 "
+            "AND lease_expires_at IS NOT NULL) OR "
+            "(status <> 'running' AND lease_token = '' AND lease_expires_at IS NULL)",
+            name="ck_assistant_request_runs_lease_state",
+        ),
+        CheckConstraint(
+            _sha256_check("request_fingerprint"),
+            name="ck_assistant_request_runs_fingerprint",
+        ),
+        Index(
+            "ix_assistant_request_runs_dispatch",
+            "status",
+            "available_at",
+            "lease_expires_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    requested_by_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True
+    )
+    parent_run_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    thread_id: Mapped[str] = mapped_column(
+        ForeignKey("assistant_threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_message_id: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    assistant_message_id: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    payload_document: Mapped[dict] = mapped_column(
+        _json_document_type(), nullable=False, default=dict
+    )
+    upload_run_ids: Mapped[list] = mapped_column(
+        _json_document_type(), nullable=False, default=list
+    )
+    status: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="waiting_upload", index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    lease_token: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+    error_code: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, onupdate=_now
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class AssistantProposalApplication(Base):
@@ -2402,6 +2751,12 @@ class ConnectorBinding(Base):
             "id", "tenant_id", "scenario_id",
             name="uq_connector_bindings_id_scope",
         ),
+        CheckConstraint(
+            "structure_fingerprint = '' OR ("
+            + _sha256_check("structure_fingerprint")
+            + ")",
+            name="ck_connector_bindings_structure_fingerprint",
+        ),
         Index("ix_connector_bindings_connector", "connector_kind", "connector_id"),
         Index("ix_connector_bindings_scenario_environment", "scenario_id", "environment"),
     )
@@ -2426,6 +2781,14 @@ class ConnectorBinding(Base):
     health_status: Mapped[str] = mapped_column(String(20), default="unknown")
     health_message: Mapped[str] = mapped_column(Text, default="")
     connector_signature: Mapped[str] = mapped_column(String(64), default="")
+    # Credential-free, bounded schema facts captured by an explicit connector
+    # health check. Physical locations and credentials never enter this profile.
+    structure_profile: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    structure_fingerprint: Mapped[str] = mapped_column(
+        String(64), default="", nullable=False
+    )
     checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
@@ -2831,6 +3194,11 @@ class DataAsset(Base):
             "lifecycle_status IN ('active', 'retired')",
             name="ck_data_assets_lifecycle",
         ),
+        CheckConstraint(
+            "usage_plane IN ('modeling_material', 'invocation_input', "
+            "'generated_output')",
+            name="ck_data_assets_usage_plane",
+        ),
         Index("ix_data_assets_tenant_lifecycle", "tenant_id", "lifecycle_status"),
     )
 
@@ -2845,6 +3213,9 @@ class DataAsset(Base):
     media_type: Mapped[str] = mapped_column(String(200), default="", nullable=False)
     lifecycle_status: Mapped[str] = mapped_column(
         String(20), default="active", nullable=False
+    )
+    usage_plane: Mapped[str] = mapped_column(
+        String(30), default="generated_output", nullable=False
     )
     labels: Mapped[dict] = mapped_column(_json_document_type(), default=dict, nullable=False)
     created_by_user_id: Mapped[str | None] = mapped_column(
@@ -2874,6 +3245,12 @@ class DataAssetVersion(Base):
     __table_args__ = (
         UniqueConstraint("asset_id", "version_number", name="uq_asset_versions_number"),
         UniqueConstraint("id", "tenant_id", name="uq_asset_versions_id_tenant"),
+        UniqueConstraint(
+            "id",
+            "asset_id",
+            "tenant_id",
+            name="uq_asset_versions_id_asset_tenant",
+        ),
         ForeignKeyConstraint(
             ["asset_id", "tenant_id"],
             ["data_assets.id", "data_assets.tenant_id"],
@@ -2952,6 +3329,169 @@ class DataAssetVersion(Base):
     bucket_file: Mapped[BucketFile | None] = relationship(foreign_keys=[bucket_file_id])
 
 
+class ManagedUploadRun(Base):
+    """Durable control-plane state for one asynchronously profiled upload."""
+
+    __tablename__ = "managed_upload_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "parent_run_id",
+            name="uq_managed_upload_runs_parent_retry",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "requested_by_user_id",
+            "idempotency_key",
+            name="uq_managed_upload_runs_principal_request",
+        ),
+        UniqueConstraint("id", "tenant_id", name="uq_managed_upload_runs_id_tenant"),
+        ForeignKeyConstraint(
+            ["requested_by_user_id", "tenant_id"],
+            ["users.id", "users.tenant_id"],
+            name="fk_managed_upload_runs_user_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["parent_run_id", "tenant_id"],
+            ["managed_upload_runs.id", "managed_upload_runs.tenant_id"],
+            name="fk_managed_upload_runs_parent_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["data_source_id", "tenant_id"],
+            ["data_sources.id", "data_sources.tenant_id"],
+            name="fk_managed_upload_runs_source_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["bucket_file_id", "data_source_id"],
+            ["bucket_files.id", "bucket_files.data_source_id"],
+            name="fk_managed_upload_runs_file_source",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["asset_id", "tenant_id"],
+            ["data_assets.id", "data_assets.tenant_id"],
+            name="fk_managed_upload_runs_asset_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["asset_version_id", "tenant_id"],
+            ["data_asset_versions.id", "data_asset_versions.tenant_id"],
+            name="fk_managed_upload_runs_version_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["asset_version_id", "asset_id", "tenant_id"],
+            [
+                "data_asset_versions.id",
+                "data_asset_versions.asset_id",
+                "data_asset_versions.tenant_id",
+            ],
+            name="fk_managed_upload_runs_version_asset_tenant",
+        ),
+        CheckConstraint(
+            "purpose IN ('validation_asset', 'invocation_attachment')",
+            name="ck_managed_upload_runs_purpose",
+        ),
+        CheckConstraint(
+            "status IN ('awaiting_upload', 'uploading', 'stored', 'processing', "
+            "'ready', 'failed', 'cancelled')",
+            name="ck_managed_upload_runs_status",
+        ),
+        CheckConstraint("declared_byte_size > 0", name="ck_managed_upload_runs_declared_size"),
+        CheckConstraint("byte_size >= 0", name="ck_managed_upload_runs_size"),
+        CheckConstraint("revision > 0", name="ck_managed_upload_runs_revision"),
+        CheckConstraint(
+            "lease_generation >= 0", name="ck_managed_upload_runs_lease_generation"
+        ),
+        CheckConstraint(
+            _sha256_check("request_fingerprint"),
+            name="ck_managed_upload_runs_request_fingerprint",
+        ),
+        CheckConstraint(
+            "content_sha256 = '' OR (" + _sha256_check("content_sha256") + ")",
+            name="ck_managed_upload_runs_content_sha256",
+        ),
+        CheckConstraint(
+            "(asset_id IS NULL) = (asset_version_id IS NULL)",
+            name="ck_managed_upload_runs_asset_pair",
+        ),
+        Index(
+            "ix_managed_upload_runs_dispatch",
+            "status",
+            "available_at",
+            "lease_expires_at",
+        ),
+        Index(
+            "ix_managed_upload_runs_owner_created",
+            "tenant_id",
+            "requested_by_user_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    requested_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    parent_run_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    data_source_id: Mapped[str] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    bucket_file_id: Mapped[str | None] = mapped_column(
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("data_assets.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    asset_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("data_asset_versions.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(30), nullable=False)
+    filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    client_media_type: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    declared_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    metadata_document: Mapped[dict] = mapped_column(
+        _json_document_type(), default=dict, nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(30), default="awaiting_upload", nullable=False
+    )
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    lease_token: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    lease_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    error_code: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class LogicalDataset(Base):
     """Tenant-owned logical data product independent of any business scene."""
 
@@ -2962,6 +3502,11 @@ class LogicalDataset(Base):
         CheckConstraint(
             "lifecycle_status IN ('active', 'retired')",
             name="ck_logical_datasets_lifecycle",
+        ),
+        CheckConstraint(
+            "usage_plane IN ('modeling_material', 'invocation_input', "
+            "'generated_output')",
+            name="ck_logical_datasets_usage_plane",
         ),
         Index("ix_logical_datasets_tenant_lifecycle", "tenant_id", "lifecycle_status"),
     )
@@ -2975,6 +3520,9 @@ class LogicalDataset(Base):
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     lifecycle_status: Mapped[str] = mapped_column(
         String(20), default="active", nullable=False
+    )
+    usage_plane: Mapped[str] = mapped_column(
+        String(30), default="generated_output", nullable=False
     )
     labels: Mapped[dict] = mapped_column(_json_document_type(), default=dict, nullable=False)
     created_by_user_id: Mapped[str | None] = mapped_column(
@@ -4536,8 +5084,8 @@ class SemanticMapping(Base):
     __table_args__ = (
         UniqueConstraint("scenario_id", "mapping_key", name="uq_semantic_mappings_key"),
         UniqueConstraint(
-            "scenario_id", "entity_id", "scenario_dataset_binding_id",
-            name="uq_semantic_mappings_entity_binding",
+            "scenario_id", "entity_id", "dataset_schema_id",
+            name="uq_semantic_mappings_entity_schema",
         ),
         UniqueConstraint(
             "id",
@@ -4627,9 +5175,12 @@ class SemanticMapping(Base):
     entity_id: Mapped[str] = mapped_column(
         ForeignKey("ontology_entities.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    scenario_dataset_binding_id: Mapped[str] = mapped_column(
+    # Compatibility anchor for mappings authored before schema-first modeling.
+    # New mappings are governed directly by dataset_schema_id and leave this
+    # deployment-plane reference empty.
+    scenario_dataset_binding_id: Mapped[str | None] = mapped_column(
         ForeignKey("scenario_dataset_bindings.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     dataset_schema_id: Mapped[str] = mapped_column(
@@ -4657,7 +5208,7 @@ class SemanticMapping(Base):
 
     scenario: Mapped[BusinessScenario] = relationship(foreign_keys=[scenario_id])
     entity: Mapped[OntologyEntity] = relationship(foreign_keys=[entity_id])
-    scenario_dataset_binding: Mapped[ScenarioDatasetBinding] = relationship(
+    scenario_dataset_binding: Mapped[ScenarioDatasetBinding | None] = relationship(
         foreign_keys=[scenario_dataset_binding_id]
     )
     dataset_schema: Mapped[DatasetSchema] = relationship(
@@ -4848,7 +5399,6 @@ class SemanticRelationMapping(Base):
                 "dataset_schema_id",
                 "source_dataset_relation_id",
                 "source_entity_id",
-                "scenario_dataset_binding_id",
             ],
             [
                 "semantic_mappings.id",
@@ -4858,7 +5408,6 @@ class SemanticRelationMapping(Base):
                 "semantic_mappings.dataset_schema_id",
                 "semantic_mappings.dataset_relation_id",
                 "semantic_mappings.entity_id",
-                "semantic_mappings.scenario_dataset_binding_id",
             ],
             name="fk_semantic_relations_source_mapping",
             ondelete="RESTRICT",
@@ -4872,7 +5421,6 @@ class SemanticRelationMapping(Base):
                 "dataset_schema_id",
                 "target_dataset_relation_id",
                 "target_entity_id",
-                "scenario_dataset_binding_id",
             ],
             [
                 "semantic_mappings.id",
@@ -4882,7 +5430,6 @@ class SemanticRelationMapping(Base):
                 "semantic_mappings.dataset_schema_id",
                 "semantic_mappings.dataset_relation_id",
                 "semantic_mappings.entity_id",
-                "semantic_mappings.scenario_dataset_binding_id",
             ],
             name="fk_semantic_relations_target_mapping",
             ondelete="RESTRICT",
@@ -4959,9 +5506,11 @@ class SemanticRelationMapping(Base):
     ontology_relation_id: Mapped[str] = mapped_column(
         ForeignKey("ontology_relations.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    scenario_dataset_binding_id: Mapped[str] = mapped_column(
+    # Optional compatibility anchor for relation mappings created before
+    # schema-first authoring. Endpoint scope is enforced independently below.
+    scenario_dataset_binding_id: Mapped[str | None] = mapped_column(
         ForeignKey("scenario_dataset_bindings.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     dataset_relation_id: Mapped[str] = mapped_column(
@@ -4997,7 +5546,7 @@ class SemanticRelationMapping(Base):
     ontology_relation: Mapped[OntologyRelation] = relationship(
         foreign_keys=[ontology_relation_id]
     )
-    scenario_dataset_binding: Mapped[ScenarioDatasetBinding] = relationship(
+    scenario_dataset_binding: Mapped[ScenarioDatasetBinding | None] = relationship(
         foreign_keys=[scenario_dataset_binding_id]
     )
     dataset_relation: Mapped[DatasetRelation] = relationship(

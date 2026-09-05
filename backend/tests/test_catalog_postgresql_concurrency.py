@@ -11,21 +11,28 @@ import os
 import queue
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, delete, select, text
+from sqlalchemy import create_engine, delete, select, text, update
 
 from app.config import get_settings
 from app.database import SessionLocal, engine
 from app.models import (
+    AgentTurnEvent,
+    AgentTurnRun,
+    AssistantMessage,
+    AssistantRequestRun,
+    AssistantThread,
     BusinessScenario,
     CapabilityInvocation,
     DatasetHead,
     DatasetSchema,
     DatasetVersion,
+    DataSource,
     LogicalDataset,
+    ManagedUploadRun,
     Organization,
     OrganizationMember,
     OrganizationRole,
@@ -33,7 +40,12 @@ from app.models import (
     User,
 )
 from app.routers import scenarios
-from app.services import catalog_service
+from app.services import (
+    agent_turn_worker_service,
+    assistant_request_worker_service,
+    catalog_service,
+    managed_upload_processing_service,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -44,6 +56,141 @@ pytestmark = pytest.mark.skipif(
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+@pytest.fixture()
+def durable_postgresql_runs():
+    """Isolated control-plane rows; no worker executor, LLM or object I/O."""
+    settings = get_settings()
+    assert settings.postgresql_admin_user and settings.postgresql_admin_password
+    cleanup_engine = create_engine(engine.url.set(
+        username=settings.postgresql_admin_user,
+        password=settings.postgresql_admin_password,
+    ))
+    tenant_id, user_id, source_id, thread_id = [uuid4().hex for _ in range(4)]
+    user_message_id, assistant_message_id = [uuid4().hex for _ in range(2)]
+    run_ids = {kind: uuid4().hex for kind in ("agent", "upload", "assistant")}
+    available_at = datetime.now(timezone.utc) + timedelta(days=1)
+    try:
+        with SessionLocal() as db:
+            db.add(Tenant(id=tenant_id, name="Durable claim acceptance"))
+            db.flush()
+            db.add(User(id=user_id, tenant_id=tenant_id, email=f"{user_id}@example.test",
+                        password_hash="synthetic-only", status="active"))
+            db.add(DataSource(id=source_id, tenant_id=tenant_id,
+                              name="Claim fixture", type="file_bucket"))
+            db.flush()
+            db.add(AssistantThread(id=thread_id, tenant_id=tenant_id,
+                                   created_by_user_id=user_id))
+            db.flush()
+            db.add_all([
+                AssistantMessage(id=user_message_id, thread_id=thread_id, role="user"),
+                AssistantMessage(id=assistant_message_id, thread_id=thread_id, role="assistant"),
+            ])
+            db.flush()
+            db.add(AgentTurnRun(
+                id=run_ids["agent"], tenant_id=tenant_id,
+                idempotency_key=uuid4().hex, request_fingerprint="a" * 64,
+                request_digest="b" * 64, available_at=available_at,
+            ))
+            db.add(ManagedUploadRun(
+                id=run_ids["upload"], tenant_id=tenant_id, data_source_id=source_id,
+                requested_by_user_id=user_id, idempotency_key=uuid4().hex,
+                request_fingerprint="c" * 64, purpose="invocation_attachment",
+                filename="claim.csv", declared_byte_size=1, status="stored",
+                available_at=available_at, expires_at=available_at,
+            ))
+            db.add(AssistantRequestRun(
+                id=run_ids["assistant"], tenant_id=tenant_id,
+                requested_by_user_id=user_id, request_id=uuid4().hex,
+                request_fingerprint="d" * 64, thread_id=thread_id,
+                user_message_id=user_message_id, assistant_message_id=assistant_message_id,
+                status="queued", available_at=available_at,
+            ))
+            db.commit()
+        yield run_ids
+    finally:
+        # Runtime roles cannot delete audit ledgers. Cleanup is limited to this
+        # fixture's exact UUID tenant using the separate integration owner.
+        with cleanup_engine.begin() as connection:
+            for model in (AgentTurnEvent, AgentTurnRun, ManagedUploadRun, AssistantRequestRun):
+                connection.execute(delete(model).where(model.tenant_id == tenant_id))
+            connection.execute(delete(AssistantMessage).where(AssistantMessage.thread_id == thread_id))
+            for model in (AssistantThread, DataSource, User):
+                connection.execute(delete(model).where(model.tenant_id == tenant_id))
+            connection.execute(delete(Tenant).where(Tenant.id == tenant_id))
+        cleanup_engine.dispose()
+
+
+@pytest.mark.parametrize("kind", ["agent", "upload", "assistant"])
+def test_durable_worker_claims_refresh_locked_rows_and_fence_expired_leases(
+    durable_postgresql_runs, kind,
+) -> None:
+    run_id = durable_postgresql_runs[kind]
+    model = {"agent": AgentTurnRun, "upload": ManagedUploadRun,
+             "assistant": AssistantRequestRun}[kind]
+
+    def claim(db):
+        if kind == "agent":
+            return agent_turn_worker_service.claim_turn(db, run_id)
+        if kind == "upload":
+            return managed_upload_processing_service.claim_processing_run(db, run_id)
+        return assistant_request_worker_service._claim(
+            db, run_id, lease_seconds=120,
+            upload_state_reader=lambda _db, _run: ("ready", "", ""),
+        )
+
+    start = threading.Barrier(2)
+    outcomes = queue.Queue()
+
+    def worker():
+        try:
+            with SessionLocal() as db:
+                db.execute(text("SET LOCAL lock_timeout = '5s'"))
+                cached_run = db.get(model, run_id)
+                assert cached_run is not None
+                start.wait(timeout=10)
+                outcomes.put(claim(db))
+        except Exception as exc:
+            outcomes.put(exc)
+
+    workers = [threading.Thread(target=worker) for _ in range(2)]
+    for worker_thread in workers:
+        worker_thread.start()
+    for worker_thread in workers:
+        worker_thread.join(timeout=15)
+    assert all(not worker_thread.is_alive() for worker_thread in workers)
+    results = [outcomes.get(timeout=1) for _ in workers]
+    assert not any(isinstance(result, Exception) for result in results), results
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1, "two cached sessions must not both own the same run"
+    old_lease = winners[0]
+    with SessionLocal() as db:
+        db.execute(update(model).where(model.id == run_id).values(
+            lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        ))
+        db.commit()
+        new_lease = claim(db)
+        assert new_lease is not None
+        assert new_lease.generation == old_lease.generation + 1
+        assert new_lease.token != old_lease.token
+        if kind == "agent":
+            assert not agent_turn_worker_service.finalize_turn(
+                db, run_id, lease=old_lease, status="succeeded",
+                result={"answer": "stale result must be rejected"},
+            )
+        elif kind == "upload":
+            assert managed_upload_processing_service.load_processing_snapshot(
+                run_id, old_lease, session_factory=SessionLocal,
+                metadata_loader=lambda _run: None,
+            ) is None
+        else:
+            assert not assistant_request_worker_service._renew(
+                run_id, old_lease, lease_seconds=120, session_factory=SessionLocal,
+            )
+        persisted = db.get(model, run_id)
+        db.refresh(persisted)
+        assert persisted.lease_token == new_lease.token
 
 
 def test_scenario_retirement_preserves_restricted_invocation_audit() -> None:

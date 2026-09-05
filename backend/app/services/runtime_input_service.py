@@ -14,14 +14,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime
 from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from ..models import (
     BusinessScenario,
@@ -30,6 +30,7 @@ from ..models import (
     DataAsset,
     DataAssetVersion,
     DatasetHead,
+    DatasetRelation,
     DatasetSchema,
     DatasetVersion,
     LogicalDataset,
@@ -37,6 +38,8 @@ from ..models import (
     ScenarioCapabilityPort,
 )
 from . import connector_service
+from . import input_contract_validator
+from . import managed_asset_lifecycle
 from .capability_contracts import (
     Actor,
     BindingOverride,
@@ -251,6 +254,7 @@ class _ResolvedInput:
     content_hash: str = ""
     schema_hash: str = ""
     default_binding_id: str | None = None
+    ordinal: int = 0
 
     def safe_document(self) -> dict[str, Any]:
         document: dict[str, Any] = {
@@ -259,6 +263,7 @@ class _ResolvedInput:
             "resolved_kind": self.handle.binding_kind,
             "resolution_source": self.resolution_source,
             "signature": self.handle.signature,
+            "ordinal": self.ordinal,
         }
         if self.handle.version_id is not None:
             document["resolved_version_id"] = self.handle.version_id
@@ -513,18 +518,21 @@ def _parse_override(value: Any) -> _ManagedReference:
     )
 
 
-def _normalize_overrides(overrides: Any) -> dict[str, _ManagedReference]:
-    result: dict[str, _ManagedReference] = {}
+def _normalize_overrides(overrides: Any) -> dict[str, tuple[_ManagedReference, ...]]:
+    grouped: dict[str, list[_ManagedReference]] = {}
+    identities: set[tuple[str, str, str]] = set()
     for raw in _override_items(overrides):
         item = _parse_override(raw)
-        if item.port_key in result:
+        identity = (item.port_key, item.kind, item.reference_id)
+        if identity in identities:
             raise RuntimeInputResolutionError(
                 "duplicate_runtime_input",
-                "multiple runtime input overrides target the same port",
+                "the same runtime input override was supplied more than once",
                 port_key=item.port_key,
             )
-        result[item.port_key] = item
-    return result
+        identities.add(identity)
+        grouped.setdefault(item.port_key, []).append(item)
+    return {key: tuple(values) for key, values in grouped.items()}
 
 
 def _safe_port_config(port: Any) -> Mapping[str, Any]:
@@ -593,6 +601,7 @@ def _data_port(port: Any) -> DataPort:
         schema=port.schema_document or {},
         schema_hash=released_schema_hash,
         required=bool(port.is_required),
+        cardinality=str(getattr(port, "cardinality", "one") or "one"),
         binding_kinds=_allowed_kinds(port),
         override_policy="managed-reference" if _allows_override(port) else "forbidden",
         description=port.description or "",
@@ -923,14 +932,72 @@ def _load_dataset_version(
     released_schema_hash = str(
         getattr(port, "dataset_schema_hash", "") or ""
     ).strip().lower()
-    # Per-invocation selection may switch logical datasets, but it must still
-    # satisfy the immutable schema contract captured by the release.
-    if released_schema_hash and released_schema_hash != schema_hash:
+    schema_document = getattr(port, "schema_document", {}) or {}
+    has_content_contract = input_contract_validator.has_content_contract(
+        schema_document
+    )
+    # Historical releases without a portable content contract retain exact
+    # schema-hash behavior. New contracts compare structural content so file
+    # and relation renames cannot decide acceptance.
+    if released_schema_hash and released_schema_hash != schema_hash and not has_content_contract:
         raise RuntimeInputResolutionError(
             "dataset_contract_mismatch",
             "dataset version schema does not satisfy the released port contract",
             port_key=reference.port_key,
         )
+    dataset = _one(
+        db,
+        select(LogicalDataset).where(
+            LogicalDataset.id == version.dataset_id,
+            LogicalDataset.tenant_id == tenant_id,
+        ),
+    )
+    if dataset is None or str(dataset.lifecycle_status or "").lower() != "active":
+        raise RuntimeInputResolutionError(
+            "managed_reference_not_ready",
+            "managed dataset is not active",
+            port_key=reference.port_key,
+        )
+    if str(dataset.usage_plane or "").lower() == "modeling_material":
+        raise RuntimeInputResolutionError(
+            "managed_reference_not_runtime_input",
+            "modeling materials cannot be used as invocation data",
+            port_key=reference.port_key,
+        )
+    if has_content_contract:
+        relations = tuple(
+            db.scalars(
+                select(DatasetRelation)
+                .options(selectinload(DatasetRelation.fields))
+                .where(
+                    DatasetRelation.schema_id == schema.id,
+                    DatasetRelation.dataset_id == schema.dataset_id,
+                    DatasetRelation.tenant_id == tenant_id,
+                )
+                .order_by(DatasetRelation.ordinal, DatasetRelation.id)
+            ).all()
+        )
+        manifest = version.manifest if isinstance(version.manifest, Mapping) else {}
+        relation_row_counts = manifest.get("relations")
+        if not isinstance(relation_row_counts, Mapping):
+            relation_row_counts = None
+        try:
+            input_contract_validator.validate_profile_for_cardinality(
+                schema_document,
+                input_contract_validator.build_observed_tabular_profile(
+                    relations,
+                    record_count=int(version.record_count or 0),
+                    relation_row_counts=relation_row_counts,
+                ),
+                cardinality=str(getattr(port, "cardinality", "one") or "one"),
+            )
+        except input_contract_validator.InputContractError as exc:
+            raise RuntimeInputResolutionError(
+                exc.code,
+                exc.message,
+                port_key=reference.port_key,
+                details=exc.details,
+            ) from None
     _require_expected_signature(reference, content_hash)
     return version, content_hash, schema_hash
 
@@ -1092,31 +1159,24 @@ def _resolve_asset_version(
             "managed asset is not active",
             port_key=reference.port_key,
         )
-    lifecycle = (
-        (version.version_document or {}).get("lifecycle", {})
-        if isinstance(version.version_document, Mapping)
-        else {}
-    )
-    if isinstance(lifecycle, Mapping) and bool(lifecycle.get("temporary")):
-        raw_expiry = lifecycle.get("expires_at")
-        try:
-            expires_at = datetime.fromisoformat(
-                str(raw_expiry or "").replace("Z", "+00:00")
-            )
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            raise RuntimeInputResolutionError(
-                "managed_reference_not_ready",
-                "temporary managed attachment has no valid expiry",
-                port_key=reference.port_key,
-            ) from None
-        if expires_at <= datetime.now(timezone.utc):
-            raise RuntimeInputResolutionError(
-                "managed_reference_expired",
-                "temporary managed attachment has expired",
-                port_key=reference.port_key,
-            )
+    if str(asset.usage_plane or "").lower() == "modeling_material":
+        raise RuntimeInputResolutionError(
+            "managed_reference_not_runtime_input",
+            "modeling materials cannot be used as invocation data",
+            port_key=reference.port_key,
+        )
+    try:
+        managed_asset_lifecycle.require_current_asset_version(
+            version.version_document
+            if isinstance(version.version_document, Mapping)
+            else {}
+        )
+    except managed_asset_lifecycle.ManagedAssetLifecycleError as exc:
+        raise RuntimeInputResolutionError(
+            exc.code,
+            exc.message,
+            port_key=reference.port_key,
+        ) from None
     content_hash = _signature(
         version.content_sha256,
         code="invalid_managed_signature",
@@ -1124,6 +1184,33 @@ def _resolve_asset_version(
         port_key=reference.port_key,
     )
     _require_expected_signature(reference, content_hash)
+    schema_document = getattr(port, "schema_document", {}) or {}
+    if input_contract_validator.has_content_contract(schema_document):
+        version_document = (
+            version.version_document
+            if isinstance(version.version_document, Mapping)
+            else {}
+        )
+        profile = version_document.get("profile")
+        if not isinstance(profile, Mapping):
+            raise RuntimeInputResolutionError(
+                "content_contract_missing",
+                "managed asset has no structural profile for the port contract",
+                port_key=reference.port_key,
+            )
+        try:
+            input_contract_validator.validate_profile_for_cardinality(
+                schema_document,
+                profile,
+                cardinality=str(getattr(port, "cardinality", "one") or "one"),
+            )
+        except input_contract_validator.InputContractError as exc:
+            raise RuntimeInputResolutionError(
+                exc.code,
+                exc.message,
+                port_key=reference.port_key,
+                details=exc.details,
+            ) from None
     handle = ResolvedDataHandle(
         port_key=reference.port_key,
         binding_kind="asset_version",
@@ -1193,7 +1280,6 @@ def _load_connector(
         message="connector binding has no valid checked signature",
         port_key=reference.port_key,
     )
-    _require_expected_signature(reference, actual)
     return binding
 
 
@@ -1217,6 +1303,48 @@ def _resolve_connector(
         lock_reference=lock_reference,
     )
     actual = str(binding.connector_signature).lower()
+    schema_document = getattr(port, "schema_document", {}) or {}
+    if input_contract_validator.has_content_contract(schema_document):
+        profile = binding.structure_profile
+        stored_fingerprint = str(binding.structure_fingerprint or "").strip().lower()
+        if (
+            binding.connector_kind != "data_source"
+            or not isinstance(profile, Mapping)
+            or not profile
+            or not _SHA256_RE.fullmatch(stored_fingerprint)
+        ):
+            raise RuntimeInputResolutionError(
+                "connector_structure_unverified",
+                "connector structure has not passed a bounded schema check",
+                port_key=reference.port_key,
+            )
+        try:
+            validation = input_contract_validator.validate_profile_for_cardinality(
+                schema_document,
+                profile,
+                cardinality=str(getattr(port, "cardinality", "one") or "one"),
+            )
+        except input_contract_validator.InputContractError as exc:
+            raise RuntimeInputResolutionError(
+                exc.code,
+                exc.message,
+                port_key=reference.port_key,
+                details=exc.details,
+            ) from None
+        if validation.structural_fingerprint != stored_fingerprint:
+            raise RuntimeInputResolutionError(
+                "connector_structure_unverified",
+                "connector structure signature is stale or invalid",
+                port_key=reference.port_key,
+            )
+        actual = canonical_hash(
+            {
+                "connector_signature": actual,
+                "structure_fingerprint": stored_fingerprint,
+            },
+            domain="connector-runtime-input-v1",
+        )
+    _require_expected_signature(reference, actual)
     handle = ResolvedDataHandle(
         port_key=reference.port_key,
         binding_kind="connector_binding",
@@ -1344,7 +1472,11 @@ def list_managed_input_options(
         "managed_reference_expired",
         "managed_reference_not_found",
         "managed_reference_not_ready",
+        "managed_reference_not_runtime_input",
         "managed_reference_scope_mismatch",
+        "connector_structure_unverified",
+        "content_contract_ambiguous",
+        "content_contract_missing",
     }
 
     def resolve(reference: _ManagedReference) -> _ResolvedInput | None:
@@ -1378,6 +1510,7 @@ def list_managed_input_options(
                 DatasetVersion.status == "ready",
                 LogicalDataset.tenant_id == normalized_tenant,
                 LogicalDataset.lifecycle_status == "active",
+                LogicalDataset.usage_plane != "modeling_material",
             )
             .order_by(
                 LogicalDataset.name,
@@ -1421,6 +1554,7 @@ def list_managed_input_options(
                 DatasetHead.environment == normalized_environment,
                 LogicalDataset.tenant_id == normalized_tenant,
                 LogicalDataset.lifecycle_status == "active",
+                LogicalDataset.usage_plane != "modeling_material",
                 DatasetVersion.tenant_id == normalized_tenant,
                 DatasetVersion.status == "ready",
             )
@@ -1463,6 +1597,7 @@ def list_managed_input_options(
                 DataAssetVersion.status == "ready",
                 DataAsset.tenant_id == normalized_tenant,
                 DataAsset.lifecycle_status == "active",
+                DataAsset.usage_plane != "modeling_material",
             )
             .order_by(
                 DataAsset.name,
@@ -1619,7 +1754,7 @@ def _audit_binding(
         scenario_id=invocation.scenario_id,
         invocation_id=invocation.id,
         capability_port_id=item.port.id,
-        ordinal=0,
+        ordinal=item.ordinal,
         source_kind=item.source_kind,
         inline_document=None,
         asset_version_id=item.asset_version_id,
@@ -1795,36 +1930,54 @@ def resolve_runtime_inputs(
     resolved: list[_ResolvedInput] = []
     missing: list[str] = []
     for port_key, port in port_by_key.items():
-        override = override_by_key.get(port_key)
-        if override is not None:
+        port_overrides = override_by_key.get(port_key, ())
+        cardinality = str(getattr(port, "cardinality", "one") or "one").lower()
+        if cardinality == "one" and len(port_overrides) > 1:
+            raise RuntimeInputResolutionError(
+                "duplicate_runtime_input",
+                "multiple runtime inputs target a single-value port",
+                port_key=port_key,
+            )
+        if port_overrides:
             if not _allows_override(port):
                 raise RuntimeInputResolutionError(
                     "runtime_input_override_forbidden",
                     "port policy does not allow invocation-time override",
                     port_key=port_key,
                 )
-            item = _resolve_reference(
-                db,
-                reference=override,
-                tenant_id=normalized_tenant,
-                scenario_id=normalized_scenario,
-                environment=normalized_environment,
-                port=port,
-                resolution_source="invocation_override",
+            items = tuple(
+                _resolve_reference(
+                    db,
+                    reference=override,
+                    tenant_id=normalized_tenant,
+                    scenario_id=normalized_scenario,
+                    environment=normalized_environment,
+                    port=port,
+                    resolution_source="invocation_override",
+                )
+                for override in port_overrides
             )
         else:
-            item = _scenario_default(
+            default_item = _scenario_default(
                 db,
                 tenant_id=normalized_tenant,
                 scenario_id=normalized_scenario,
                 environment=normalized_environment,
                 port=port,
             )
-        if item is None:
+            items = (default_item,) if default_item is not None else ()
+        if not items:
             if bool(port.is_required):
                 missing.append(port_key)
             continue
-        resolved.append(item)
+        for ordinal, item in enumerate(items):
+            resolved.append(
+                replace(
+                    item,
+                    ordinal=ordinal,
+                    handle=replace(item.handle, ordinal=ordinal),
+                )
+            )
 
     if missing:
         raise RuntimeInputResolutionError(

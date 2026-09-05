@@ -69,6 +69,7 @@ def _coerce_port(value: Any) -> DataPort:
             schema=_read(value, "schema", "contract", default={}) or {},
             schema_hash=_read(value, "schema_hash", default="") or "",
             required=bool(_read(value, "required", "is_required", default=True)),
+            cardinality=str(_read(value, "cardinality", default="one") or "one"),
             binding_kinds=tuple(binding_kinds),
             override_policy=str(override_policy),
             description=str(_read(value, "description", default="") or ""),
@@ -108,6 +109,7 @@ def _coerce_handle(value: Any) -> ResolvedDataHandle:
                 "dataset_version_id",
                 default=None,
             ),
+            ordinal=int(_read(value, "ordinal", default=0) or 0),
         )
     except CapabilityContractError as exc:
         raise DeploymentResolutionError(str(exc)) from exc
@@ -154,7 +156,15 @@ def resolve_runtime_data_context(
 
     ports = normalize_data_ports(data_ports)
     by_port = {item.key: item for item in ports}
-    resolved: dict[str, ResolvedDataHandle] = {}
+    resolved: dict[str, list[ResolvedDataHandle]] = {}
+
+    def append_handle(port: DataPort, handle: ResolvedDataHandle) -> None:
+        items = resolved.setdefault(port.key, [])
+        if port.cardinality == "one" and items:
+            raise DeploymentResolutionError(
+                f"multiple bindings target single-value data port: {port.key}"
+            )
+        items.append(handle)
 
     for raw_binding in bindings:
         handle = _coerce_handle(raw_binding)
@@ -163,24 +173,32 @@ def resolve_runtime_data_context(
             raise DeploymentResolutionError(
                 f"binding targets undeclared data port: {handle.port_key}"
             )
-        if handle.port_key in resolved:
-            raise DeploymentResolutionError(
-                f"multiple bindings target data port: {handle.port_key}"
-            )
         if port.binding_kinds and handle.binding_kind not in port.binding_kinds:
             raise DeploymentResolutionError(
                 f"binding kind {handle.binding_kind} is not allowed for port {port.key}"
             )
-        resolved[handle.port_key] = handle
+        append_handle(
+            port,
+            ResolvedDataHandle(
+                port_key=handle.port_key,
+                binding_kind=handle.binding_kind,
+                reference_id=handle.reference_id,
+                signature=handle.signature,
+                version_id=handle.version_id,
+                ordinal=len(resolved.get(handle.port_key, ())),
+            ),
+        )
 
-    seen_overrides: set[str] = set()
+    seen_overrides: set[tuple[str, str, str]] = set()
+    overridden_ports: set[str] = set()
     for raw_override in overrides:
         handle = _override_handle(raw_override)
-        if handle.port_key in seen_overrides:
+        identity = (handle.port_key, handle.binding_kind, handle.reference_id)
+        if identity in seen_overrides:
             raise DeploymentResolutionError(
-                f"multiple overrides target data port: {handle.port_key}"
+                f"duplicate override targets data port: {handle.port_key}"
             )
-        seen_overrides.add(handle.port_key)
+        seen_overrides.add(identity)
         port = by_port.get(handle.port_key)
         if port is None:
             raise DeploymentResolutionError(
@@ -194,16 +212,31 @@ def resolve_runtime_data_context(
             raise DeploymentResolutionError(
                 f"override kind {handle.binding_kind} is not allowed for port {port.key}"
             )
-        resolved[handle.port_key] = handle
+        if handle.port_key not in overridden_ports:
+            resolved[handle.port_key] = []
+            overridden_ports.add(handle.port_key)
+        append_handle(
+            port,
+            ResolvedDataHandle(
+                port_key=handle.port_key,
+                binding_kind=handle.binding_kind,
+                reference_id=handle.reference_id,
+                signature=handle.signature,
+                version_id=handle.version_id,
+                ordinal=len(resolved[handle.port_key]),
+            ),
+        )
 
     missing = [
-        item.key for item in ports if item.required and item.key not in resolved
+        item.key for item in ports if item.required and not resolved.get(item.key)
     ]
     if missing:
         raise DeploymentResolutionError(
             "required data ports are not bound: " + ", ".join(sorted(missing))
         )
-    return RuntimeDataContext(tuple(resolved.values()))
+    return RuntimeDataContext(
+        tuple(handle for port in ports for handle in resolved.get(port.key, ()))
+    )
 
 
 def _definition_scenario(definition: Any) -> Any | None:

@@ -1,10 +1,12 @@
 """Verify the full Alembic head/downgrade/head path in an isolated database."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
 import sys
+from typing import Any
 from uuid import uuid4
 
 from alembic import command
@@ -156,12 +158,333 @@ def _verify_revision_09_contract(database_url: URL) -> None:
         engine.dispose()
 
 
+def _constraint_names(connection: Any, table_names: tuple[str, ...]) -> set[str]:
+    return {
+        str(name)
+        for name in connection.execute(
+            text(
+                """
+                SELECT constraint_row.conname
+                  FROM pg_constraint AS constraint_row
+                  JOIN pg_class AS table_row
+                    ON table_row.oid = constraint_row.conrelid
+                  JOIN pg_namespace AS namespace_row
+                    ON namespace_row.oid = table_row.relnamespace
+                 WHERE namespace_row.nspname = 'public'
+                   AND table_row.relname = ANY(:table_names)
+                """
+            ),
+            {"table_names": list(table_names)},
+        ).scalars()
+    }
+
+
+def _verify_revision_19_contract(database_url: URL) -> None:
+    expected_revision = "20260904_19"
+    if _revision(database_url) != expected_revision:
+        raise RuntimeError("isolated migration database did not reach revision 19")
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with engine.connect() as connection:
+            tables = {
+                str(name)
+                for name in connection.execute(
+                    text(
+                        """
+                        SELECT table_name
+                          FROM information_schema.tables
+                         WHERE table_schema = 'public'
+                           AND table_name IN (
+                               'agent_turn_runs',
+                               'agent_turn_events',
+                               'managed_upload_runs'
+                           )
+                        """
+                    )
+                ).scalars()
+            }
+            if tables != {
+                "agent_turn_runs",
+                "agent_turn_events",
+                "managed_upload_runs",
+            }:
+                raise RuntimeError("revision 19 durable run tables are incomplete")
+            constraints = _constraint_names(
+                connection,
+                ("agent_turn_runs", "agent_turn_events", "managed_upload_runs"),
+            )
+            required = {
+                "fk_agent_turn_runs_agent_tenant",
+                "fk_agent_turn_runs_preparation_tenant",
+                "fk_agent_turn_runs_parent_tenant",
+                "fk_agent_turn_events_run_tenant",
+                "fk_managed_upload_runs_source_tenant",
+                "fk_managed_upload_runs_file_source",
+                "fk_managed_upload_runs_asset_tenant",
+                "fk_managed_upload_runs_version_tenant",
+                "uq_agent_turn_runs_parent_retry",
+            }
+            if not required <= constraints:
+                raise RuntimeError("revision 19 durable run constraints are incomplete")
+    finally:
+        engine.dispose()
+
+
+def _verify_revision_20_contract(database_url: URL) -> None:
+    expected_revision = "20260904_20"
+    if _revision(database_url) != expected_revision:
+        raise RuntimeError("isolated migration database did not reach revision 20")
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with engine.connect() as connection:
+            connector_columns = set(
+                connection.execute(
+                    text(
+                        """
+                        SELECT column_name
+                          FROM information_schema.columns
+                         WHERE table_schema = 'public'
+                           AND table_name = 'connector_bindings'
+                           AND column_name IN (
+                               'structure_profile', 'structure_fingerprint'
+                           )
+                        """
+                    )
+                ).scalars()
+            )
+            if connector_columns:
+                raise RuntimeError("revision 21 connector columns survived downgrade")
+            constraints = _constraint_names(
+                connection,
+                (
+                    "conversations",
+                    "messages",
+                    "data_asset_versions",
+                    "agent_turn_runs",
+                    "assistant_threads",
+                    "assistant_messages",
+                    "assistant_request_runs",
+                    "managed_upload_runs",
+                ),
+            )
+            revision_21_constraints = {
+                "uq_conversations_id_agent",
+                "uq_messages_id_conversation",
+                "uq_asset_versions_id_asset_tenant",
+                "fk_agent_turn_runs_conversation_agent",
+                "fk_agent_turn_runs_user_message_conversation",
+                "fk_agent_turn_runs_assistant_message_conversation",
+                "uq_assistant_threads_id_tenant_user",
+                "uq_assistant_messages_id_thread",
+                "fk_assistant_request_runs_thread_principal",
+                "fk_assistant_request_runs_user_message_thread",
+                "fk_assistant_request_runs_assistant_message_thread",
+                "ck_assistant_request_runs_lease_state",
+                "fk_managed_upload_runs_version_asset_tenant",
+            }
+            if constraints & revision_21_constraints:
+                raise RuntimeError("revision 21 ownership constraints survived downgrade")
+            expected_release_statuses = {
+                "r20release_dataset_dependency": "rolled_back",
+                "r20release_semantic_dependency": "rolled_back",
+                "r20release_malformed_dependency": "rolled_back",
+                "r20release_zero_data": "released",
+                "r20release_manual_contract": "released",
+                "r20release_empty_mapping_list": "released",
+            }
+            release_rows = {
+                str(row.id): row
+                for row in connection.execute(
+                    text(
+                        """
+                        SELECT id, status, withdrawn_at, withdraw_reason
+                          FROM ontology_releases
+                         WHERE id = ANY(:release_ids)
+                        """
+                    ),
+                    {"release_ids": list(expected_release_statuses)},
+                )
+            }
+            if set(release_rows) != set(expected_release_statuses):
+                raise RuntimeError("revision 20 release isolation fixtures are incomplete")
+            for release_id, expected_status in expected_release_statuses.items():
+                row = release_rows[release_id]
+                if str(row.status) != expected_status:
+                    raise RuntimeError(
+                        f"revision 20 source isolation failed for {release_id}"
+                    )
+                if expected_status == "rolled_back":
+                    if row.withdrawn_at is None or not str(row.withdraw_reason).startswith(
+                        "system_source_isolation_v1:"
+                    ):
+                        raise RuntimeError(
+                            f"revision 20 withdrawal audit is incomplete for {release_id}"
+                        )
+                elif row.withdrawn_at is not None or str(row.withdraw_reason or ""):
+                    raise RuntimeError(
+                        f"revision 20 changed a source-independent release: {release_id}"
+                    )
+    finally:
+        engine.dispose()
+
+
+def _seed_revision_20_release_isolation_cases(database_url: URL) -> None:
+    """Create immutable rev19 snapshots without relying on mutable authoring rows."""
+
+    cases = {
+        "dataset_dependency": {
+            "capability_ports": [
+                {"id": "deleted-port", "dataset_schema_hash": "a" * 64}
+            ]
+        },
+        "semantic_dependency": {
+            "functions": [
+                {
+                    "id": "function-with-deleted-mapping",
+                    "runtime_config": {
+                        "provider_config": {
+                            "semantic_mapping_ids": ["deleted-mapping"]
+                        }
+                    },
+                }
+            ]
+        },
+        "malformed_dependency": {
+            "functions": [
+                {
+                    "id": "function-with-malformed-mapping",
+                    "runtime_config": {
+                        "provider_config": {"semantic_mapping_ids": "invalid"}
+                    },
+                }
+            ]
+        },
+        "zero_data": {"functions": [], "capability_ports": []},
+        "manual_contract": {
+            "capability_ports": [
+                {
+                    "id": "manual-contract-port",
+                    "dataset_schema_hash": "",
+                    "schema_document": {
+                        "x-platform-input-contract": {
+                            "version": "tabular-content/v1",
+                            "relations": [
+                                {"fields": [{"name": "record_id"}]}
+                            ],
+                        }
+                    },
+                }
+            ]
+        },
+        "empty_mapping_list": {
+            "functions": [
+                {
+                    "id": "function-without-mapping",
+                    "runtime_config": {
+                        "provider_config": {"semantic_mapping_ids": []}
+                    },
+                }
+            ]
+        },
+    }
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO tenants (id, name, created_at)
+                    VALUES ('r20tenant', 'Revision 20 tenant', CURRENT_TIMESTAMP)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO business_scenarios (
+                        id, tenant_id, is_public, name, description, industry,
+                        namespace, status, created_at, updated_at
+                    ) VALUES (
+                        'r20scenario', 'r20tenant', FALSE, 'Revision 20 scenario',
+                        '', '', 'default', 'active', CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO ontology_branches (
+                        id, tenant_id, scenario_id, name, description, status,
+                        base_snapshot_id, head_snapshot_id, created_by_user_id,
+                        created_at, updated_at
+                    ) VALUES (
+                        'r20branch', 'r20tenant', 'r20scenario', 'main', '',
+                        'active', NULL, NULL, NULL, CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+            for index, (case_name, content) in enumerate(cases.items(), start=1):
+                snapshot_id = f"r20snapshot_{case_name}"
+                release_id = f"r20release_{case_name}"
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO ontology_snapshots (
+                            id, tenant_id, scenario_id, branch_id,
+                            parent_snapshot_id, kind, content, content_hash,
+                            created_by_user_id, created_at
+                        ) VALUES (
+                            :snapshot_id, 'r20tenant', 'r20scenario', 'r20branch',
+                            NULL, 'merge', CAST(:content AS json), :content_hash,
+                            NULL, CURRENT_TIMESTAMP
+                        )
+                        """
+                    ),
+                    {
+                        "snapshot_id": snapshot_id,
+                        "content": json.dumps(content, sort_keys=True),
+                        "content_hash": f"{index:064x}",
+                    },
+                )
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO ontology_releases (
+                            id, tenant_id, scenario_id, branch_id, snapshot_id,
+                            proposal_id, environment, status, notes,
+                            connector_audit, created_by_user_id, withdrawn_at,
+                            withdrawn_by_user_id, withdraw_reason, created_at
+                        ) VALUES (
+                            :release_id, 'r20tenant', 'r20scenario', 'r20branch',
+                            :snapshot_id, NULL, 'staging', 'released', '',
+                            '[]'::json, NULL, NULL, NULL, '', CURRENT_TIMESTAMP
+                        )
+                        """
+                    ),
+                    {"release_id": release_id, "snapshot_id": snapshot_id},
+                )
+    finally:
+        engine.dispose()
+
+
 def _verify_head_contract(database_url: URL, *, runtime_role: str, head: str) -> None:
     if _revision(database_url) != head:
         raise RuntimeError("isolated migration database did not reach the expected head")
     engine = create_engine(database_url, pool_pre_ping=True)
     try:
         with engine.connect() as connection:
+            assistant_request_owner = connection.execute(
+                text(
+                    "SELECT tableowner FROM pg_tables "
+                    "WHERE schemaname = 'public' AND tablename = 'assistant_request_runs'"
+                )
+            ).scalar_one()
+            if str(assistant_request_owner) == runtime_role:
+                raise RuntimeError("runtime role must not own assistant_request_runs")
             function = connection.execute(
                 text(
                     """
@@ -240,6 +563,122 @@ def _verify_head_contract(database_url: URL, *, runtime_role: str, head: str) ->
                 "withdraw_reason",
             }:
                 raise RuntimeError("release withdrawal audit columns are incomplete")
+            connector_columns = {
+                str(row.column_name): (str(row.data_type), str(row.is_nullable))
+                for row in connection.execute(
+                    text(
+                        """
+                        SELECT column_name, data_type, is_nullable
+                          FROM information_schema.columns
+                         WHERE table_schema = 'public'
+                           AND table_name = 'connector_bindings'
+                           AND column_name IN (
+                               'structure_profile', 'structure_fingerprint'
+                           )
+                        """
+                    )
+                )
+            }
+            if connector_columns != {
+                "structure_profile": ("jsonb", "NO"),
+                "structure_fingerprint": ("character varying", "NO"),
+            }:
+                raise RuntimeError("connector structure profile columns are incomplete")
+            constraints = _constraint_names(
+                connection,
+                (
+                    "connector_bindings",
+                    "conversations",
+                    "messages",
+                    "data_asset_versions",
+                    "agent_turn_runs",
+                    "managed_upload_runs",
+                ),
+            )
+            required_constraints = {
+                "ck_connector_bindings_structure_fingerprint",
+                "uq_conversations_id_agent",
+                "uq_messages_id_conversation",
+                "uq_asset_versions_id_asset_tenant",
+                "fk_agent_turn_runs_conversation_agent",
+                "fk_agent_turn_runs_user_message_conversation",
+                "fk_agent_turn_runs_assistant_message_conversation",
+                "fk_managed_upload_runs_version_asset_tenant",
+            }
+            if not required_constraints <= constraints:
+                raise RuntimeError("durable ownership constraints are incomplete")
+            privilege_rows = {
+                table_name: {
+                    privilege: bool(
+                        connection.execute(
+                            text(
+                                "SELECT has_table_privilege("
+                                ":runtime_role, :table_name, :privilege)"
+                            ),
+                            {
+                                "runtime_role": runtime_role,
+                                "table_name": f"public.{table_name}",
+                                "privilege": privilege.upper(),
+                            },
+                        ).scalar_one()
+                    )
+                    for privilege in (
+                        "select",
+                        "insert",
+                        "update",
+                        "delete",
+                        "truncate",
+                        "references",
+                        "trigger",
+                    )
+                }
+                for table_name in (
+                    "agent_turn_runs",
+                    "agent_turn_events",
+                    "assistant_request_runs",
+                    "managed_upload_runs",
+                )
+            }
+            expected_privileges = {
+                "agent_turn_runs": {
+                    "select": True,
+                    "insert": True,
+                    "update": True,
+                    "delete": False,
+                    "truncate": False,
+                    "references": False,
+                    "trigger": False,
+                },
+                "agent_turn_events": {
+                    "select": True,
+                    "insert": True,
+                    "update": False,
+                    "delete": False,
+                    "truncate": False,
+                    "references": False,
+                    "trigger": False,
+                },
+                "assistant_request_runs": {
+                    "select": True,
+                    "insert": True,
+                    "update": True,
+                    "delete": False,
+                    "truncate": False,
+                    "references": False,
+                    "trigger": False,
+                },
+                "managed_upload_runs": {
+                    "select": True,
+                    "insert": True,
+                    "update": True,
+                    "delete": False,
+                    "truncate": False,
+                    "references": False,
+                    "trigger": False,
+                },
+            }
+            if privilege_rows != expected_privileges:
+                raise RuntimeError("durable run runtime privileges are not least-privilege")
     finally:
         engine.dispose()
 
@@ -282,12 +721,22 @@ def main() -> int:
         os.environ.pop("ALEMBIC_ROLE", None)
         os.environ.pop("ALEMBIC_USE_ADMIN", None)
 
-        command.upgrade(config, head)
-        _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
+        # Exercise the reversible 18/19 chain before crossing irreversible
+        # revision 20, then verify the current head and revision 21 downgrade
+        # independently without attempting to reconstruct retired metadata.
+        command.upgrade(config, "20260904_19")
+        _verify_revision_19_contract(target_url)
         command.downgrade(config, "20260831_16")
         _verify_revision_16_contract(target_url, runtime_role=runtime_role)
         command.downgrade(config, "20260829_09")
         _verify_revision_09_contract(target_url)
+        command.upgrade(config, "20260904_19")
+        _verify_revision_19_contract(target_url)
+        _seed_revision_20_release_isolation_cases(target_url)
+        command.upgrade(config, head)
+        _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
+        command.downgrade(config, "20260904_20")
+        _verify_revision_20_contract(target_url)
         command.upgrade(config, head)
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
         print(f"Alembic isolated round-trip passed at {head}")

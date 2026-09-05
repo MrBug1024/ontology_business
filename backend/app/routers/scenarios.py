@@ -84,6 +84,7 @@ from ..schemas import (
     EventOut,
     FunctionDefinitionIn,
     FunctionDefinitionOut,
+    FunctionProviderManifestOut,
     InstanceIn,
     InstanceOut,
     Msg,
@@ -141,6 +142,7 @@ from ..services import (
     object_storage_service,
     operations_service,
     permission_service,
+    provider_definition_service,
     release_service,
     runtime_connector_service,
     runtime_definition_service,
@@ -186,6 +188,17 @@ def _source_in_scenario(db: Session, scenario_id: str, source_id: str) -> DataSo
     return source
 
 
+def _modeling_source_in_scenario(
+    db: Session,
+    scenario_id: str,
+    source_id: str,
+) -> DataSource:
+    source = _source_in_scenario(db, scenario_id, source_id)
+    if source.resource_scope != "modeling":
+        raise HTTPException(400, "建模数据映射只能引用建模资料数据源")
+    return source
+
+
 def _lock_template_data_sources(
     db: Session, source_ids: list[str]
 ) -> dict[str, DataSource]:
@@ -227,7 +240,7 @@ def _mapping_for_request(db: Session, mapping_id: str, writable: bool = False) -
     if not mapping:
         raise HTTPException(404, "映射不存在")
     _scenario_for_request(db, mapping.scenario_id, writable=writable)
-    _source_in_scenario(db, mapping.scenario_id, mapping.data_source_id)
+    _modeling_source_in_scenario(db, mapping.scenario_id, mapping.data_source_id)
     return mapping
 
 
@@ -238,7 +251,7 @@ def _relation_mapping_for_request(
     if not mapping:
         raise HTTPException(404, "关系映射不存在")
     _scenario_for_request(db, mapping.scenario_id, writable=writable)
-    _source_in_scenario(db, mapping.scenario_id, mapping.data_source_id)
+    _modeling_source_in_scenario(db, mapping.scenario_id, mapping.data_source_id)
     return mapping
 
 
@@ -4036,7 +4049,9 @@ def create_mapping(scenario_id: str, payload: DataMappingIn, db: Session = Depen
     s = _scenario_for_request(db, scenario_id, writable=True)
     entity = _entity_in_scenario(db, scenario_id, payload.entity_id)
     assert entity is not None
-    selected_source = _source_in_scenario(db, scenario_id, payload.data_source_id)
+    selected_source = _modeling_source_in_scenario(
+        db, scenario_id, payload.data_source_id
+    )
     mapping_data = payload.model_dump()
     try:
         mapping_data["transform_rules"] = ontology_service.normalize_transform_rules(
@@ -4414,6 +4429,21 @@ def list_function_definitions(scenario_id: str, db: Session = Depends(get_db)):
     ]
 
 
+@router.get(
+    "/{scenario_id}/function-providers",
+    response_model=list[FunctionProviderManifestOut],
+)
+def list_function_provider_manifests(
+    scenario_id: str,
+    db: Session = Depends(get_db),
+):
+    _scenario_for_request(db, scenario_id)
+    try:
+        return provider_definition_service.list_function_provider_manifests()
+    except provider_definition_service.ProviderDefinitionError as exc:
+        raise HTTPException(500, "受信 Provider 清单不可用") from exc
+
+
 @router.post("/{scenario_id}/functions", response_model=FunctionDefinitionOut)
 def create_function_definition(
     scenario_id: str,
@@ -4423,7 +4453,11 @@ def create_function_definition(
     _scenario_for_request(db, scenario_id, writable=True)
     try:
         declaration = function_definition_service.normalize_definition(payload.model_dump())
-    except function_definition_service.FunctionDefinitionError as exc:
+        declaration = provider_definition_service.validate_function_definition(declaration)
+    except (
+        function_definition_service.FunctionDefinitionError,
+        provider_definition_service.ProviderDefinitionError,
+    ) as exc:
         raise HTTPException(400, f"函数定义无效: {exc}") from exc
     function = FunctionDefinition(scenario_id=scenario_id, **declaration)
     db.add(function)
@@ -4444,7 +4478,11 @@ def update_function_definition(
     _scenario_for_request(db, function.scenario_id, writable=True)
     try:
         declaration = function_definition_service.normalize_definition(payload.model_dump())
-    except function_definition_service.FunctionDefinitionError as exc:
+        declaration = provider_definition_service.validate_function_definition(declaration)
+    except (
+        function_definition_service.FunctionDefinitionError,
+        provider_definition_service.ProviderDefinitionError,
+    ) as exc:
         raise HTTPException(400, f"函数定义无效: {exc}") from exc
     for key, value in declaration.items():
         setattr(function, key, value)

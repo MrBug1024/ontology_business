@@ -24,6 +24,7 @@ from ..catalog_schemas import (
     CatalogManagedUploadMetadata,
     CatalogManagedUploadOut,
     CatalogEnvironment,
+    CatalogUsagePlane,
     ConnectorBindingOptionOut,
     DataAssetCreate,
     DataAssetOut,
@@ -115,6 +116,7 @@ def _asset_out(asset) -> DataAssetOut:
         description=asset.description or "",
         kind=asset.kind,
         media_type=asset.media_type or "",
+        usage_plane=asset.usage_plane,
         labels=asset.labels or {},
         lifecycle_status=asset.lifecycle_status,
         created_by_user_id=asset.created_by_user_id,
@@ -126,13 +128,24 @@ def _asset_out(asset) -> DataAssetOut:
 
 
 def _dataset_out(dataset: LogicalDataset) -> LogicalDatasetOut:
+    public_labels = {
+        key: value
+        for key, value in dict(dataset.labels or {}).items()
+        if key
+        not in {
+            "modeling_source_data_source_id",
+            "modeling_source_bucket_file_id",
+            "source_content_sha256",
+        }
+    }
     return LogicalDatasetOut(
         id=dataset.id,
         tenant_id=dataset.tenant_id,
         key=dataset.key,
         name=dataset.name,
         description=dataset.description or "",
-        labels=dataset.labels or {},
+        usage_plane=dataset.usage_plane,
+        labels=public_labels,
         lifecycle_status=dataset.lifecycle_status,
         created_by_user_id=dataset.created_by_user_id,
         created_at=dataset.created_at,
@@ -292,8 +305,17 @@ _CATALOG_UPLOAD_PHYSICAL_FIELDS = {
 
 
 @router.get("/assets", response_model=list[DataAssetOut])
-def list_assets(db: Session = Depends(get_tenant_db)) -> list[DataAssetOut]:
-    return [_asset_out(item) for item in catalog_service.list_assets(db)]
+def list_assets(
+    usage_plane: CatalogUsagePlane | None = None,
+    db: Session = Depends(get_tenant_db),
+) -> list[DataAssetOut]:
+    try:
+        return [
+            _asset_out(item)
+            for item in catalog_service.list_assets(db, usage_plane=usage_plane)
+        ]
+    except catalog_service.CatalogError as exc:
+        raise _catalog_error(exc) from exc
 
 
 @router.post(
@@ -671,8 +693,22 @@ def register_asset_version(
 
 
 @router.get("/datasets", response_model=list[LogicalDatasetOut])
-def list_datasets(db: Session = Depends(get_tenant_db)) -> list[LogicalDatasetOut]:
-    return [_dataset_out(item) for item in catalog_service.list_datasets(db)]
+def list_datasets(
+    usage_plane: CatalogUsagePlane | None = None,
+    scenario_id: str | None = None,
+    db: Session = Depends(get_tenant_db),
+) -> list[LogicalDatasetOut]:
+    try:
+        return [
+            _dataset_out(item)
+            for item in catalog_service.list_datasets(
+                db,
+                usage_plane=usage_plane,
+                scenario_id=scenario_id,
+            )
+        ]
+    except catalog_service.CatalogError as exc:
+        raise _catalog_error(exc) from exc
 
 
 @router.post(

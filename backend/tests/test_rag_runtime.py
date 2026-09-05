@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,19 +10,14 @@ from sqlalchemy.orm import Session
 
 from app.database import Base
 from app.models import (
-    Agent,
     BucketFile,
-    Conversation,
     DataSource,
     DocumentChunk,
     DocumentIndexJob,
     LLMConfig,
-    Message,
     Tenant,
 )
-from app.services.agent_engine import AgentContext, _run_agent
 from app.services import rag_service
-from app.schemas import MessageOut
 
 
 class RagTokenizationTests(unittest.TestCase):
@@ -118,14 +112,6 @@ class RagRuntimeTests(unittest.TestCase):
             status="parsed",
             parsed_text=text,
         )
-
-    def _bind_agent_runtime_source(self, agent: Agent, source: DataSource) -> None:
-        self.db.add(agent)
-        self.db.flush()
-        source.resource_scope = "agent_runtime"
-        source.owner_agent_id = agent.id
-        agent.runtime_data_source_ids = [source.id]
-        self.db.flush()
 
     def test_incremental_index_persists_chunks_and_offsets(self) -> None:
         first = rag_service.index_file(self.db, self.private_file)
@@ -260,177 +246,6 @@ class RagRuntimeTests(unittest.TestCase):
         self.db.info.pop("tenant_id")
         with self.assertRaises(HTTPException):
             rag_service.search(self.db, [self.foreign_source.id], "机密")
-
-    def test_agent_does_not_promote_foreign_public_modeling_bucket_to_runtime_input(self) -> None:
-        agent = Agent(
-            tenant_id=self.tenant_a.id,
-            name="公开资料阅读助手",
-            data_source_ids=[self.public_source.id],
-        )
-        context = AgentContext(self.db, agent, LLMConfig(name="测试模型"))
-        tool_names = {item["function"]["name"] for item in context.build_tools()}
-        self.assertNotIn("search_documents", tool_names)
-        self.assertNotIn("save_deliverable", tool_names)
-        self.assertIn(
-            "不直接执行",
-            context.execute_tool("save_deliverable", {"filename": "result.md", "content": "不应写入"}),
-        )
-
-    def test_agent_never_exposes_or_executes_direct_skill_or_mcp_side_effects(self) -> None:
-        agent = Agent(
-            tenant_id=self.tenant_a.id,
-            name="受控执行助手",
-        )
-        context = AgentContext(self.db, agent, LLMConfig(name="测试模型"))
-        tool_names = {item["function"]["name"] for item in context.build_tools()}
-        self.assertNotIn("execute_skill", tool_names)
-        self.assertFalse(any(name.startswith("mcp_") for name in tool_names))
-        skill_result = context.execute_tool("execute_skill", {"skill_name": "未绑定技能", "args": []})
-        mcp_result = context.execute_tool("mcp_未绑定服务_写入", {})
-        self.assertIn("不直接执行", skill_result)
-        self.assertIn("不直接执行", mcp_result)
-
-    def test_agent_search_emits_and_persists_stable_visible_citations(self) -> None:
-        rag_service.index_file(self.db, self.private_file)
-        self.db.commit()
-        agent = Agent(
-            id="agent-citation",
-            tenant_id=self.tenant_a.id,
-            name="资料引用助手",
-            data_source_ids=[self.private_source.id, self.foreign_source.id],
-        )
-        self._bind_agent_runtime_source(agent, self.private_source)
-        conversation = Conversation(id="conversation-citation", agent_id=agent.id)
-        self.db.add(conversation)
-        self.db.commit()
-
-        responses = iter(
-            [
-                iter(
-                    [
-                        {
-                            "type": "tool_calls",
-                            "tool_calls": [
-                                {
-                                    "id": "search-1",
-                                    "function": {
-                                        "name": "search_documents",
-                                        "arguments": {"query": "费用审批"},
-                                    },
-                                }
-                            ],
-                        }
-                    ]
-                ),
-                iter([{"type": "token", "content": "请在每月 5 日前完成费用复核【C1】。"}]),
-            ]
-        )
-        with patch(
-            "app.services.agent_engine.llm_service.chat_stream",
-            side_effect=lambda *args, **kwargs: next(responses),
-        ):
-            events = list(
-                _run_agent(
-                    self.db,
-                    agent,
-                    LLMConfig(name="测试模型"),
-                    [],
-                    "费用审批有什么要求？",
-                    "",
-                    "",
-                )
-            )
-
-        citations = next(event["data"] for event in events if event["type"] == "citations")
-        self.assertEqual(len(citations), 1)
-        citation = citations[0]
-        self.assertEqual(citation["citation_id"], "C1")
-        self.assertEqual(citation["file_id"], self.private_file.id)
-        self.assertEqual(citation["data_source_id"], self.private_source.id)
-        self.assertNotEqual(citation["data_source_id"], self.foreign_source.id)
-        self.assertTrue(citation["chunk_id"])
-        self.assertGreater(citation["char_end"], citation["char_start"])
-
-        stored_message = Message(
-            conversation_id=conversation.id,
-            role="assistant",
-            content="请在每月 5 日前完成费用复核【C1】。",
-            citations=citations,
-        )
-        self.db.add(stored_message)
-        self.db.commit()
-        self.db.expire_all()
-        restored = self.db.get(Message, stored_message.id)
-        self.assertIsNotNone(restored)
-        self.assertEqual(restored.citations, citations)
-        self.assertEqual(MessageOut.model_validate(restored).citations, citations)
-
-    def test_agent_hides_intermediate_tool_narration(self) -> None:
-        agent = Agent(
-            id="agent-final-answer",
-            tenant_id=self.tenant_a.id,
-            name="最终结果助手",
-        )
-        responses = iter(
-            [
-                iter(
-                    [
-                        {"type": "token", "content": "让我继续查询相关数据。"},
-                        {
-                            "type": "tool_calls",
-                            "tool_calls": [
-                                {
-                                    "id": "tables-1",
-                                    "function": {
-                                        "name": "list_tables",
-                                        "arguments": {},
-                                    },
-                                }
-                            ],
-                        },
-                    ]
-                ),
-                iter([{"type": "token", "content": "最终结论：当前没有可用数据表。"}]),
-            ]
-        )
-        with patch(
-            "app.services.agent_engine.llm_service.chat_stream",
-            side_effect=lambda *args, **kwargs: next(responses),
-        ):
-            events = list(
-                _run_agent(
-                    self.db,
-                    agent,
-                    LLMConfig(name="测试模型"),
-                    [],
-                    "请给出审计结论",
-                    "",
-                    "",
-                )
-            )
-
-        token_text = "".join(event["data"] for event in events if event["type"] == "token")
-        self.assertNotIn("让我继续查询", token_text)
-        self.assertIn("最终结论：当前没有可用数据表", token_text)
-
-    def test_read_document_emits_a_file_versioned_citation(self) -> None:
-        rag_service.index_file(self.db, self.private_file)
-        self.db.commit()
-        agent = Agent(
-            id="agent-read-document",
-            tenant_id=self.tenant_a.id,
-            name="资料阅读助手",
-            data_source_ids=[self.private_source.id],
-        )
-        self._bind_agent_runtime_source(agent, self.private_source)
-        context = AgentContext(self.db, agent, LLMConfig(name="测试模型"))
-        payload = json.loads(context.execute_tool("read_document", {"file_id": self.private_file.id}))
-        citation = payload["citation"]
-        self.assertEqual(citation["file_id"], self.private_file.id)
-        self.assertTrue(citation["citation_id"])
-        self.assertEqual(citation["file_content_hash"], self.private_file.indexed_content_hash)
-        self.assertIn("费用控制", payload["content"])
-        self.assertEqual(context.citation_snapshot()[0]["citation_id"], citation["citation_id"])
 
     def test_index_uses_configured_embedding_runtime_when_available(self) -> None:
         runtime_config = LLMConfig(

@@ -148,7 +148,7 @@ class CapabilityContractTests(unittest.TestCase):
             ("capabilities:invoke", "capabilities:read"),
         )
 
-    def test_request_rejects_duplicate_binding_overrides(self) -> None:
+    def test_request_allows_many_values_but_rejects_exact_duplicates(self) -> None:
         capability = CapabilityRef(kind="provider", resource_id="capability-a")
         first = BindingOverride(
             port_key="payload",
@@ -162,11 +162,17 @@ class CapabilityContractTests(unittest.TestCase):
             reference_id="reference-b",
             signature=BINDING_SIGNATURE_B,
         )
+        request = Request(
+            capability=capability,
+            inputs={},
+            binding_overrides=(first, second),
+        )
+        self.assertEqual(len(request.binding_overrides), 2)
         with self.assertRaises(CapabilityContractError):
             Request(
                 capability=capability,
                 inputs={},
-                binding_overrides=(first, second),
+                binding_overrides=(first, first),
             )
 
     def test_managed_override_uses_one_typed_selector_and_optional_expected_signature(self) -> None:
@@ -240,7 +246,9 @@ class CapabilityProviderRegistryTests(unittest.TestCase):
     def test_explicit_instance_and_factory_are_validated_and_cached(self) -> None:
         registry = CapabilityProviderRegistry()
         provider = registry.register_instance(_Provider())
-        self.assertIs(registry.resolve("trusted.provider"), provider)
+        self.assertIs(registry.resolve("trusted.provider", "1.0.0"), provider)
+        with self.assertRaisesRegex(CapabilityRegistryError, "version.*required"):
+            registry.resolve("trusted.provider")
 
         calls: list[int] = []
 
@@ -256,8 +264,8 @@ class CapabilityProviderRegistryTests(unittest.TestCase):
             factory,
             provider_version="1.0.0",
         )
-        first = registry.resolve("factory.provider")
-        second = registry.resolve("factory.provider")
+        first = registry.resolve("factory.provider", "1.0.0")
+        second = registry.resolve("factory.provider", "1.0.0")
         self.assertIs(first, second)
         self.assertEqual(calls, [1])
         self.assertEqual(registry.keys(), ("factory.provider", "trusted.provider"))
@@ -294,7 +302,7 @@ class CapabilityProviderRegistryTests(unittest.TestCase):
 
         registry.register_factory("declared.factory", DeclaredFactoryProvider)
         self.assertEqual(
-            registry.resolve("declared.factory").provider_version,
+            registry.resolve("declared.factory", "1.0.0").provider_version,
             "1.0.0",
         )
 

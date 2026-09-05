@@ -46,6 +46,22 @@ class MappingRefreshJobTests(unittest.TestCase):
         )
         probe.start()
         self.addCleanup(probe.stop)
+        structure_probe = patch(
+            "app.services.datasource_service.list_tables",
+            return_value=[
+                {
+                    "name": table_name,
+                    "columns": [
+                        {"name": "id", "type": "text"},
+                        {"name": "amount", "type": "numeric"},
+                    ],
+                    "row_count": 0,
+                }
+                for table_name in ("orders", "orders_archive", "orders_v2")
+            ],
+        )
+        structure_probe.start()
+        self.addCleanup(structure_probe.stop)
         self.engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(self.engine)
         self.db = Session(self.engine)
@@ -122,6 +138,25 @@ class MappingRefreshJobTests(unittest.TestCase):
         self.assertTrue(created)
         self.db.commit()
         return job
+
+    def test_mapping_authoring_rejects_agent_runtime_source(self) -> None:
+        self.source.resource_scope = "agent_runtime"
+        self.db.commit()
+
+        with self.assertRaises(HTTPException) as captured:
+            create_mapping(
+                self.scenario.id,
+                DataMappingIn(
+                    entity_id=self.entity.id,
+                    data_source_id=self.source.id,
+                    table_name="orders",
+                    column_map={"id": "id", "amount": "amount"},
+                ),
+                self.db,
+            )
+
+        self.assertEqual(captured.exception.status_code, 400)
+        self.assertIn("建模资料", str(captured.exception.detail))
 
     def _publish_mapping_to_staging(self):
         """Create the exact release/binding evidence a non-dev job requires."""

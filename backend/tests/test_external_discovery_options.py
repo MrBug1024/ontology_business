@@ -206,12 +206,30 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             key="generic.records",
             name="Generic records",
+            usage_plane="invocation_input",
             lifecycle_status="active",
         )
         self.schema = DatasetSchema(
             id="schema-discovery",
             tenant_id=self.tenant.id,
             dataset_id=self.dataset.id,
+            schema_version=1,
+            schema_hash="a" * 64,
+            compatibility="none",
+            schema_document={"type": "array"},
+        )
+        self.modeling_dataset = LogicalDataset(
+            id="dataset-discovery-modeling",
+            tenant_id=self.tenant.id,
+            key="generic.records.contract",
+            name="Generic records contract",
+            usage_plane="modeling_material",
+            lifecycle_status="active",
+        )
+        self.modeling_schema = DatasetSchema(
+            id="schema-discovery-modeling",
+            tenant_id=self.tenant.id,
+            dataset_id=self.modeling_dataset.id,
             schema_version=1,
             schema_hash="a" * 64,
             compatibility="none",
@@ -246,6 +264,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             key="incompatible.records",
             name="Incompatible records",
+            usage_plane="invocation_input",
             lifecycle_status="active",
         )
         incompatible_schema = DatasetSchema(
@@ -271,6 +290,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             tenant_id=self.tenant.id,
             key="retired.records",
             name="Retired records",
+            usage_plane="invocation_input",
             lifecycle_status="retired",
         )
         retired_schema = DatasetSchema(
@@ -296,6 +316,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             tenant_id=other_tenant_id,
             key="foreign.records",
             name="Foreign records",
+            usage_plane="invocation_input",
         )
         foreign_schema = DatasetSchema(
             id="schema-foreign",
@@ -321,6 +342,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             key="generic.document",
             name="Generic document",
             kind="file",
+            usage_plane="invocation_input",
             lifecycle_status="active",
         )
         self.asset_version = DataAssetVersion(
@@ -372,8 +394,8 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             direction="input",
             role="invocation_input",
             media_kind="dataset",
-            dataset_id=self.dataset.id,
-            dataset_schema_id=self.schema.id,
+            dataset_id=self.modeling_dataset.id,
+            dataset_schema_id=self.modeling_schema.id,
             schema_document={"type": "array"},
             is_required=False,
             binding_policy="per_invocation",
@@ -413,8 +435,6 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             direction="input",
             role="reference",
             media_kind="dataset",
-            dataset_id=self.dataset.id,
-            dataset_schema_id=self.schema.id,
             is_required=False,
             binding_policy="per_invocation",
             status="active",
@@ -472,8 +492,6 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             direction="input",
             role="invocation_input",
             media_kind="dataset",
-            dataset_id=self.dataset.id,
-            dataset_schema_id=self.schema.id,
             is_required=True,
             binding_policy="scenario_default",
             status="active",
@@ -504,6 +522,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
         db.add_all(
             [
                 self.dataset,
+                self.modeling_dataset,
                 incompatible_dataset,
                 retired_dataset,
                 foreign_dataset,
@@ -515,6 +534,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
         db.add_all(
             [
                 self.schema,
+                self.modeling_schema,
                 incompatible_schema,
                 retired_schema,
                 foreign_schema,

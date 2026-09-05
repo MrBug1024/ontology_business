@@ -32,7 +32,9 @@ from app.models import (
 from app.routers import catalog
 from app.services import (
     catalog_ingestion_service,
+    catalog_service,
     datasource_service,
+    input_contract_validator,
     object_deletion_service,
     object_storage_service,
     permission_service,
@@ -294,6 +296,8 @@ class CatalogManagedUploadTests(unittest.TestCase):
         self.assertEqual(second.json()["version"]["id"], body["version"]["id"])
         self.assertEqual(len(self.saved_calls), 1)
         with self.Session() as db:
+            stored_asset = db.scalar(select(DataAsset))
+            self.assertEqual(stored_asset.usage_plane, "modeling_material")
             self.assertEqual(db.scalar(select(func.count(DataAsset.id))), 1)
             self.assertEqual(db.scalar(select(func.count(DataAssetVersion.id))), 1)
             self.assertEqual(db.scalar(select(func.count(BucketFile.id))), 1)
@@ -301,6 +305,84 @@ class CatalogManagedUploadTests(unittest.TestCase):
             self.assertEqual(db.scalar(select(func.count(DatasetVersion.id))), 0)
             self.assertEqual(db.scalar(select(func.count(ScenarioDatasetBinding.id))), 0)
             self.assertEqual(db.scalar(select(func.count(SemanticMapping.id))), 0)
+
+    def test_renamed_csv_is_profiled_from_content_not_filename(self) -> None:
+        content = b"record_id,amount\nA-1,12.5\n"
+
+        _original_media, original = catalog_ingestion_service.build_profile(
+            content,
+            "records.csv",
+            "text/csv",
+        )
+        detected_media, renamed = catalog_ingestion_service.build_profile(
+            content,
+            "renamed.payload",
+            "application/octet-stream",
+        )
+
+        self.assertEqual(detected_media, "text/csv")
+        self.assertEqual(renamed["category"], "table")
+        self.assertEqual(renamed["extension"], ".csv")
+        self.assertEqual(renamed["tables"][0]["columns"], original["tables"][0]["columns"])
+        self.assertEqual(renamed["tables"][0]["sample_row_count"], 1)
+        self.assertEqual(renamed["tables"][0]["relation_name"], "renamed")
+
+    def test_header_only_renamed_table_has_zero_rows(self) -> None:
+        media_type, profile = catalog_ingestion_service.build_profile(
+            b"record_id,amount\n",
+            "empty.payload",
+            "application/octet-stream",
+        )
+
+        self.assertEqual(media_type, "text/csv")
+        self.assertEqual(profile["category"], "table")
+        self.assertEqual(profile["tables"][0]["sample_row_count"], 0)
+        self.assertEqual(
+            [column["name"] for column in profile["tables"][0]["columns"]],
+            ["record_id", "amount"],
+        )
+
+    def test_large_table_counts_all_rows_without_retaining_raw_rows(self) -> None:
+        row_count = catalog_ingestion_service.MAX_PROFILE_ROWS + 7
+        content = (
+            "record_id,amount\n"
+            + "".join(f"R-{index},{index}\n" for index in range(row_count))
+        ).encode()
+
+        _media_type, profile = catalog_ingestion_service.build_profile(
+            content,
+            "renamed.payload",
+            "application/octet-stream",
+        )
+        table = profile["tables"][0]
+        self.assertEqual(table["sample_row_count"], catalog_ingestion_service.MAX_PROFILE_ROWS)
+        self.assertEqual(table["record_count"], row_count)
+        self.assertTrue(table["sample_truncated"])
+        input_contract_validator.validate_profile(
+            {
+                input_contract_validator.CONTENT_CONTRACT_KEY: {
+                    "version": input_contract_validator.CONTENT_CONTRACT_VERSION,
+                    "relations": [{
+                        "fields": [
+                            {
+                                "name": "record_id",
+                                "logical_types": ["string"],
+                                "required": True,
+                            },
+                            {
+                                "name": "amount",
+                                "logical_types": ["number"],
+                                "required": True,
+                            },
+                        ],
+                        "minimum_data_rows": row_count,
+                        "allow_additional_fields": True,
+                    }],
+                    "allow_additional_relations": True,
+                }
+            },
+            profile,
+        )
 
     def test_xlsx_profile_covers_sheets_headers_and_logical_types(self) -> None:
         from openpyxl import Workbook
@@ -326,7 +408,37 @@ class CatalogManagedUploadTests(unittest.TestCase):
         self.assertTrue(table["columns"][1]["nullable"])
         self.assertEqual(table["columns"][2]["logical_type"], "boolean")
 
-    def test_stream_staging_preserves_xlsx_suffix_for_path_parser(self) -> None:
+    def test_renamed_xlsx_is_profiled_from_ooxml_content(self) -> None:
+        from openpyxl import Workbook
+
+        output = BytesIO()
+        workbook = Workbook()
+        workbook.active.append(["item", "count"])
+        workbook.active.append(["one", 2])
+        workbook.save(output)
+
+        media_type, profile = catalog_ingestion_service.build_profile(
+            output.getvalue(),
+            "workbook.payload",
+            "application/octet-stream",
+        )
+
+        self.assertEqual(
+            media_type,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertEqual(profile["category"], "table")
+        self.assertEqual(profile["extension"], ".xlsx")
+        self.assertEqual(profile["tables"][0]["relation_name"], "workbook")
+
+        with self.assertRaisesRegex(catalog_service.CatalogError, "MIME"):
+            catalog_ingestion_service.build_profile(
+                output.getvalue(),
+                "workbook.payload",
+                "image/png",
+            )
+
+    def test_stream_profile_detects_renamed_xlsx_content(self) -> None:
         from openpyxl import Workbook
 
         output = BytesIO()
@@ -336,21 +448,47 @@ class CatalogManagedUploadTests(unittest.TestCase):
         workbook.save(output)
         staged = asyncio.run(
             upload_staging_service.stage_upload(
-                UploadFile(file=BytesIO(output.getvalue()), filename="claims.xlsx"),
+                UploadFile(file=BytesIO(output.getvalue()), filename="claims.payload"),
                 max_bytes=1024 * 1024,
                 chunk_bytes=1024,
             )
         )
         try:
-            self.assertEqual(staged.path.suffix, ".xlsx")
-            _media_type, profile = catalog_ingestion_service.build_profile_path(
-                staged.path,
-                "claims.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            self.assertEqual(staged.path.suffix, ".payload")
+            with patch.object(
+                catalog_ingestion_service,
+                "get_settings",
+                return_value=SimpleNamespace(
+                    catalog_in_memory_upload_bytes=1,
+                    catalog_max_office_expanded_bytes=200 * 1024 * 1024,
+                ),
+            ):
+                _media_type, profile = catalog_ingestion_service.build_profile_path(
+                    staged.path,
+                    "claims.payload",
+                    "application/octet-stream",
+                )
+            self.assertEqual(profile["extension"], ".xlsx")
             self.assertEqual(profile["tables"][0]["relation_name"], "claims")
         finally:
             staged.remove()
+
+    def test_renamed_common_signatures_are_classified_from_content(self) -> None:
+        cases = (
+            (b"%PDF-1.4\n%%EOF", ".pdf", "application/pdf"),
+            (b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, ".png", "image/png"),
+            (b"GIF89a" + b"\x00" * 16, ".gif", "image/gif"),
+        )
+        for content, extension, media_type in cases:
+            with self.subTest(extension=extension):
+                detected_media, profile = catalog_ingestion_service.build_profile(
+                    content,
+                    "renamed.payload",
+                    "application/octet-stream",
+                )
+                self.assertEqual(detected_media, media_type)
+                self.assertEqual(profile["extension"], extension)
+                self.assertEqual(profile["category"], "document")
 
     def test_runtime_relation_names_disambiguate_multi_sheet_workbooks(self) -> None:
         self.assertEqual(
@@ -430,10 +568,27 @@ class CatalogManagedUploadTests(unittest.TestCase):
             asset = db.scalar(
                 select(DataAsset).where(DataAsset.key == "request.input.attachment")
             )
+            self.assertEqual(asset.usage_plane, "invocation_input")
             self.assertEqual(asset.labels["catalog_purpose"], "invocation_attachment")
             self.assertTrue(asset.labels["temporary"])
             self.assertEqual(db.scalar(select(func.count(LogicalDataset.id))), 0)
             self.assertEqual(db.scalar(select(func.count(ScenarioDatasetBinding.id))), 0)
+
+    def test_validation_upload_is_fixed_to_invocation_input_plane(self) -> None:
+        response = self._upload(
+            b"key,value\nA,1\n",
+            "validation.csv",
+            "text/csv",
+            purpose="validation_asset",
+            asset_key="validation.input.asset",
+        )
+
+        self.assertEqual(response.status_code, 201, response.text)
+        with self.Session() as db:
+            asset = db.scalar(
+                select(DataAsset).where(DataAsset.key == "validation.input.asset")
+            )
+            self.assertEqual(asset.usage_plane, "invocation_input")
 
     def test_cross_tenant_physical_fields_credentials_and_bad_files_are_rejected(self) -> None:
         cross_tenant = self._upload(

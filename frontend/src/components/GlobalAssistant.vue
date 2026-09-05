@@ -170,6 +170,10 @@
               <span v-if="message.role === 'assistant' && message.streaming" class="stream-cursor" aria-hidden="true">▍</span>
               <div v-else-if="message.role !== 'assistant'" class="user-content">{{ message.content }}</div>
             </div>
+            <div v-if="message.role === 'assistant' && assistantRequestRunId(message) && ['waiting_upload', 'queued', 'failed'].includes(assistantRequestStatus(message))" class="request-run-actions">
+              <el-button v-if="assistantRequestStatus(message) === 'failed'" size="small" plain type="primary" @click="retryAssistantRequest(message)">重试本次请求</el-button>
+              <el-button v-else size="small" plain type="danger" @click="cancelAssistantRequest(message)">取消后台请求</el-button>
+            </div>
             <div v-if="proposalOf(message)" class="proposal-card" :class="{ 'is-model-result': proposalOf(message)?.kind === 'scenario_model' }">
               <div class="proposal-head">
                 <div>
@@ -543,16 +547,16 @@
           <div v-for="item in attachments" :key="item.id" class="attachment-chip">
             <el-icon aria-hidden="true"><Document /></el-icon>
             <span>{{ item.filename }}</span>
-            <el-tag v-if="item.status === 'parsed'" size="small" type="success">已解析</el-tag>
-            <el-tag v-else-if="item.status === 'error'" size="small" type="danger">失败</el-tag>
+            <el-tag size="small" :type="attachmentStatusType(item)">{{ attachmentStatusLabel(item) }}</el-tag>
+            <button v-if="canRetryAttachment(item)" type="button" :aria-label="`重试附件 ${item.filename}`" title="重试" @click.stop="retryAttachment(item)">重试</button>
             <button type="button" :aria-label="`移除附件 ${item.filename}`" title="移除附件" @click="removeAttachment(item)"><el-icon aria-hidden="true"><Close /></el-icon></button>
           </div>
           <div class="temporary-context-note"><el-icon aria-hidden="true"><Lock /></el-icon>临时上下文仅随下一条消息发送，不会自动进入正式数据源或对象映射。</div>
         </div>
         <div class="composer-tools">
           <label class="tool-button" :class="{ disabled: uploadingFiles > 0 }" title="添加临时附件">
-            <el-icon v-if="uploadingFiles" class="is-loading" aria-hidden="true"><Loading /></el-icon>
-            <el-icon v-else aria-hidden="true"><Paperclip /></el-icon><span>{{ uploadingFiles ? `正在解析 ${uploadingFiles} 个文件` : '添加附件' }}</span>
+            <el-icon v-if="uploadingFiles || activeUploadCount" class="is-loading" aria-hidden="true"><Loading /></el-icon>
+            <el-icon v-else aria-hidden="true"><Paperclip /></el-icon><span>{{ uploadingFiles ? '正在登记附件' : activeUploadCount ? `后台准备 ${activeUploadCount} 个附件` : '添加附件' }}</span>
             <input ref="fileInput" type="file" multiple :disabled="uploadingFiles > 0" accept=".pdf,.docx,.xlsx,.xls,.pptx,.md,.txt,.csv,.json,.png,.jpg,.jpeg" @change="onFilesPicked" />
           </label>
         </div>
@@ -595,7 +599,7 @@ import { isNavigationFailure, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamAssistantChat, streamAssistantCompilationJob } from '@/api'
 import { useAuthStore } from '@/stores/auth'
-import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationActivity, AssistantCompilationJobStatus, AssistantCompilationLiveness, AssistantCompilationStep, AssistantMessage, AssistantModelExecutionSummary, AssistantModelNextAction, AssistantModelTask, AssistantProposal, AssistantProposalApplyResult, AssistantQuestion, AssistantSource, AssistantThread, AssistantThought, LLMConfig, MCPConfig, Skill } from '@/types'
+import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationActivity, AssistantCompilationJobStatus, AssistantCompilationLiveness, AssistantCompilationStep, AssistantMessage, AssistantModelExecutionSummary, AssistantModelNextAction, AssistantModelTask, AssistantProposal, AssistantProposalApplyResult, AssistantQuestion, AssistantRequestRun, AssistantSource, AssistantThread, AssistantThought, LLMConfig, MCPConfig, Skill } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import {
@@ -611,6 +615,8 @@ import {
 } from '@/utils/assistantCompilationRecovery'
 import { compilationRetryDraft, retryAttachmentsForMessage } from '@/utils/assistantRetry'
 import { groupScenarioModelIssues, scenarioModelIssueLabel } from '@/utils/assistantProposalGroups'
+import { useAssistantManagedUploads } from '@/composables/useAssistantManagedUploads'
+import { useAssistantRequestRuns } from '@/composables/useAssistantRequestRuns'
 
 interface AssistantContext {
   page?: string
@@ -634,7 +640,6 @@ const historyVisible = ref(false)
 const threadsLoading = ref(false)
 const messageRef = ref<HTMLElement>()
 const fileInput = ref<HTMLInputElement>()
-const uploadingFiles = ref(0)
 const guidanceSubmitting = ref(false)
 const applyingIndex = ref<number | null>(null)
 const startingModelTaskId = ref('')
@@ -670,6 +675,34 @@ let modelTaskRecoveryGeneration = 0
 let streamGeneration = 0
 let componentDisposed = false
 
+const {
+  uploadingFiles,
+  activeUploadCount,
+  attachmentIsSendable,
+  attachmentStatusLabel,
+  attachmentStatusType,
+  canRetryAttachment,
+  retryAttachment,
+  onFilesPicked,
+  removeAttachment,
+  resetManagedUploads,
+} = useAssistantManagedUploads({ attachments })
+
+const {
+  assistantRequestStates,
+  assistantRequestRunId,
+  assistantRequestStatus,
+  applyAssistantRequestRun,
+  recoverAssistantRequest,
+  retryAssistantRequest,
+  cancelAssistantRequest,
+  resetAssistantRequestRuns,
+} = useAssistantRequestRuns({
+  messages,
+  threadId,
+  reloadThread: (id) => loadThread(id, false),
+})
+
 const assistantConfigStorageKey = 'ontology-assistant-capabilities'
 
 const context = computed(() => ({
@@ -678,9 +711,8 @@ const context = computed(() => ({
   scenario_id: props.context.scenario_id || '',
 }))
 const composerPlaceholder = '描述你要完成的工作，智能业务顾问会结合当前页面和上下文自动判断下一步'
-const canSend = computed(() => Boolean(
-  input.value.trim()
-  || (attachments.value.length && attachments.value.every((item) => item.status === 'parsed'))
+const canSend = computed(() => Boolean(input.value.trim() || attachments.value.length) && (
+  attachments.value.every(attachmentIsSendable)
 ))
 const assistantScopeKey = computed(() => `${context.value.scenario_id || 'global'}|${normalizedAssistantPath(context.value.path)}`)
 const storageKey = computed(() => `ontology-assistant-thread:${encodeURIComponent(assistantScopeKey.value)}`)
@@ -701,7 +733,10 @@ const compilationAcceptingGuidance = computed(() => (
   && activeCompilationJob.value?.progress?.accepting_guidance !== false
 ))
 const advisorWorking = computed(() => Boolean(
-  compilationRunning.value || loading.value || modelTaskRecoveryBusy.value,
+  compilationRunning.value
+  || loading.value
+  || modelTaskRecoveryBusy.value
+  || Object.values(assistantRequestStates).some((status) => ['waiting_upload', 'queued', 'running'].includes(status)),
 ))
 const launcherStatus = computed(() => {
   const job = activeCompilationJob.value
@@ -896,6 +931,7 @@ function assistantMessageContent(message: AssistantMessage) {
 
 function proposalStatusType(proposal: AssistantProposal | null): 'primary' | 'success' | 'warning' | 'info' {
   if (!proposal) return 'primary'
+  if (proposal.status === 'read_only') return 'info'
   if (proposal.kind === 'scenario_model') {
     if (modelExecutionSummary(proposal)?.final) return modelRunStatusType(proposal)
     return ['completed_with_gaps', 'partially_applied'].includes(proposal.status || '') ? 'warning' : 'primary'
@@ -907,6 +943,7 @@ function proposalStatusType(proposal: AssistantProposal | null): 'primary' | 'su
 
 function proposalStatusLabel(proposal: AssistantProposal | null) {
   if (!proposal) return '待确认'
+  if (proposal.status === 'read_only') return '仅供审阅'
   if (proposal.kind === 'scenario_model') {
     if (modelRunFinishedWithoutPersistedWrites(proposal)) {
       return modelDraftOnlyTaskCount(proposal) ? '已结束，仅保留草稿' : '已结束，无正式写入'
@@ -1088,6 +1125,7 @@ async function loadAssistantCapabilities() {
 
 function proposalCanApply(proposal: AssistantProposal | null) {
   if (!proposal) return false
+  if (proposal.status === 'read_only' || proposal.requires_confirmation === false) return false
   if (proposal.kind === 'scenario_model' && !hasApplyableChanges(proposal)) return false
   return proposal.kind === 'scenario' ? !context.value.scenario_id : Boolean(context.value.scenario_id)
 }
@@ -1133,6 +1171,7 @@ function nonBlockingIssueCount(proposal: AssistantProposal | null) {
 
 function proposalApplyLabel(proposal: AssistantProposal | null) {
   if (!proposal) return '确认并应用变更'
+  if (proposal.status === 'read_only' || proposal.requires_confirmation === false) return '仅供审阅'
   if (proposal.status === 'applied') return proposal.kind === 'scenario' ? '场景已创建' : '变更已应用'
   if (proposal.status === 'partially_applied') return '已确认并写入'
   return ({ scenario: '确认并创建场景', mapping: '确认并保存映射', ontology: '确认并应用本体', workflow: '确认并保存流程', scenario_model: '确认并原子应用' } as Record<string, string>)[proposal.kind] || '确认并应用变更'
@@ -1140,6 +1179,7 @@ function proposalApplyLabel(proposal: AssistantProposal | null) {
 
 function proposalApplyHint(proposal: AssistantProposal | null) {
   if (!proposal?.proposal_id) return '此草稿缺少安全标识，请重新生成'
+  if (proposal.status === 'read_only' || proposal.requires_confirmation === false) return '请通过“完整场景建模”入口生成并治理候选'
   if (proposal.kind === 'scenario' && context.value.scenario_id) return '场景草稿只能在全局工作区创建'
   if (proposal.kind !== 'scenario' && !context.value.scenario_id) return '请先打开业务场景'
   if (proposal.kind === 'scenario_model' && blockingIssues(proposal).length) {
@@ -2112,9 +2152,13 @@ function welcomeMessage(): AssistantMessage {
 }
 
 async function loadThread(id: string, closeHistory = true) {
+  resetAssistantRequestRuns()
   detachCompilationRecovery()
   clearModelTaskRecovery()
-  if (id !== threadId.value) attachments.value = []
+  if (id !== threadId.value) {
+    resetManagedUploads()
+    attachments.value = []
+  }
   try {
     messages.value = await api.listAssistantMessages(id, apiContext())
     threadId.value = id
@@ -2124,6 +2168,14 @@ async function loadThread(id: string, closeHistory = true) {
     Object.keys(expandedIssueGroups).forEach((key) => delete expandedIssueGroups[key])
     if (closeHistory) historyVisible.value = false
     scrollBottom()
+    messages.value.forEach((message) => {
+      if (message.role !== 'assistant') return
+      const runId = assistantRequestRunId(message)
+      const status = assistantRequestStatus(message)
+      if (runId && ['waiting_upload', 'queued', 'running', 'result_committed', 'failure_committed'].includes(status)) {
+        recoverAssistantRequest(runId, id, message)
+      }
+    })
     await discoverCompilationForThread(id)
   } catch (error: any) {
     localStorage.removeItem(storageKey.value)
@@ -2180,6 +2232,7 @@ async function openAssistant() {
     await loadContext()
     return
   }
+  await loadThread(threadId.value, false)
   historyVisible.value = false
   onCompilationVisibilityChange()
   scrollBottom()
@@ -2196,6 +2249,8 @@ async function createNewThread() {
     detachCompilationRecovery()
     clearModelTaskRecovery()
     const thread = await api.createAssistantThread(apiContext())
+    resetAssistantRequestRuns()
+    resetManagedUploads()
     threads.value = [thread, ...threads.value.filter((item) => item.id !== thread.id)]
     threadId.value = thread.id
     localStorage.setItem(storageKey.value, thread.id)
@@ -2236,6 +2291,8 @@ async function deleteThread(thread: AssistantThread) {
       if (scope) clearCompilationJobBookmark(localStorage, scope)
       detachCompilationRecovery()
       clearModelTaskRecovery()
+      resetAssistantRequestRuns()
+      resetManagedUploads()
       localStorage.removeItem(storageKey.value)
       threadId.value = ''
       messages.value = threads.value[0] ? [] : [welcomeMessage()]
@@ -2246,33 +2303,6 @@ async function deleteThread(thread: AssistantThread) {
   } catch (error: any) {
     if (error !== 'cancel' && error !== 'close') ElMessage.error(error.message || '删除会话失败')
   }
-}
-
-async function uploadTemporaryFiles(files: File[]) {
-  for (const file of files) {
-    uploadingFiles.value += 1
-    try {
-      const uploaded = await api.uploadAssistantAttachment(file)
-      attachments.value.push(uploaded)
-      if (uploaded.status === 'error') ElMessage.warning(`${uploaded.filename}：${uploaded.error || '解析失败'}`)
-    } catch (error: any) {
-      ElMessage.error(`${file.name} 上传失败：${error.message || '请求失败'}`)
-    } finally {
-      uploadingFiles.value = Math.max(uploadingFiles.value - 1, 0)
-    }
-  }
-}
-
-async function onFilesPicked(event: Event) {
-  const target = event.target as HTMLInputElement
-  const files = Array.from(target.files || [])
-  await uploadTemporaryFiles(files)
-  target.value = ''
-}
-
-async function removeAttachment(item: AssistantAttachment) {
-  attachments.value = attachments.value.filter((x) => x.id !== item.id)
-  try { await api.deleteAssistantAttachment(item.id) } catch { /* 仅移除当前上下文即可 */ }
 }
 
 let streamController: AbortController | null = null
@@ -2320,6 +2350,12 @@ function optimisticCompilationJob(data: Record<string, any>): AssistantCompilati
 
 function handleAssistantEvent(event: { type: string; data: any }, ai: AssistantMessage) {
   switch (event.type) {
+    case 'assistant_request_run': {
+      const run = event.data as AssistantRequestRun
+      applyAssistantRequestRun(run, ai)
+      recoverAssistantRequest(run.id, run.thread_id, ai)
+      break
+    }
     case 'compilation_job':
       if (event.data?.job_id) {
         // Render the durable task immediately.  Recovery still re-reads the
@@ -2434,6 +2470,10 @@ async function submitCompilationGuidance(content: string) {
   const scope = compilationThreadScope(compilationRecoveryThreadId.value || threadId.value)
   if (!job || job.status !== 'running' || !scope || guidanceSubmitting.value) return
   const currentAttachments = [...attachments.value]
+  if (currentAttachments.some((item) => item.upload_run_id && item.status !== 'ready')) {
+    ElMessage.info('附件仍在后台准备，准备完成后即可补充到当前任务')
+    return
+  }
   guidanceSubmitting.value = true
   try {
     const response = await api.submitAssistantCompilationGuidance(job.id, {
@@ -2441,7 +2481,8 @@ async function submitCompilationGuidance(content: string) {
         ? crypto.randomUUID()
         : `guidance-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       message: content,
-      attachment_ids: currentAttachments.map((item) => item.id),
+      attachment_ids: currentAttachments.filter((item) => !item.upload_run_id).map((item) => item.id),
+      upload_run_ids: currentAttachments.flatMap((item) => item.upload_run_id ? [item.upload_run_id] : []),
     })
     input.value = ''
     attachments.value = []
@@ -2475,11 +2516,12 @@ function send(text?: string) {
       ? '请分析本次上传的业务资料，先整理可见任务计划；根据语义判断需要建设哪些业务模型，存在歧义时先向我确认。'
       : ''
   )).trim()
+  const hasRejectedAttachment = attachments.value.some((item) => !attachmentIsSendable(item))
   if (content && compilationRunning.value) {
     void submitCompilationGuidance(content)
     return
   }
-  if (!content || loading.value || compilationBusy.value || modelTaskRecoveryBusy.value || uploadingFiles.value > 0) return
+  if (!content || hasRejectedAttachment || loading.value || compilationBusy.value || modelTaskRecoveryBusy.value || uploadingFiles.value > 0) return
   clearModelTaskRecovery()
   if (activeCompilationJob.value?.status === 'failed') detachCompilationRecovery()
   if (messages.value.length === 1 && messages.value[0].role === 'assistant' && !messages.value[0].id) messages.value = []
@@ -2510,7 +2552,8 @@ function send(text?: string) {
       page: context.value.page,
       path: context.value.path,
       selection: selection.id ? { ...selection } : {},
-      attachment_ids: currentAttachments.map((item) => item.id),
+      attachment_ids: currentAttachments.filter((item) => !item.upload_run_id).map((item) => item.id),
+      upload_run_ids: currentAttachments.flatMap((item) => item.upload_run_id ? [item.upload_run_id] : []),
       llm_config_id: assistantConfig.llmConfigId || undefined,
       skill_ids: [...assistantConfig.skillIds],
       mcp_ids: [...assistantConfig.mcpIds],
@@ -3012,6 +3055,8 @@ watch(() => storageKey.value, async () => {
   streamController = null
   detachCompilationRecovery()
   clearModelTaskRecovery()
+  resetAssistantRequestRuns()
+  resetManagedUploads()
   loading.value = false
   messages.value = []
   threads.value = []
@@ -3406,6 +3451,7 @@ onBeforeUnmount(() => {
 .attachment-chip span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-chip button { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 5px; color: var(--text-3); background: transparent; cursor: pointer; }
 .attachment-chip button:hover, .attachment-chip button:focus-visible { color: var(--danger); background: var(--danger-soft); outline: none; }
+.request-run-actions { display: flex; gap: 8px; margin-top: 8px; }
 .temporary-context-note { display: flex; align-items: center; gap: 5px; color: var(--text-3); font-size: 10px; line-height: 1.45; }
 .composer-tools { display: flex; align-items: center; gap: 7px; min-height: 32px; margin-bottom: 6px; }
 .tool-button { display: inline-flex; align-items: center; gap: 4px; min-height: 30px; padding: 0 8px; border: 1px solid var(--border); border-radius: 7px; color: var(--text-2); background: var(--surface); cursor: pointer; font-size: 11.5px; }

@@ -37,6 +37,21 @@ RUNTIME_REQUIRED_UPDATE_TABLES = (
     "ingestion_runs",
     "derivation_runs",
 )
+RUNTIME_APPEND_ONLY_TABLES = ("agent_turn_events",)
+RUNTIME_MUTABLE_CONTROL_TABLES = (
+    "agent_turn_runs",
+    "assistant_request_runs",
+    "managed_upload_runs",
+)
+_TABLE_PRIVILEGES = (
+    "select",
+    "insert",
+    "update",
+    "delete",
+    "truncate",
+    "references",
+    "trigger",
+)
 
 _UNSAFE_RUNTIME_ROLE_FLAGS = (
     "rolsuper",
@@ -129,8 +144,16 @@ def _validate_runtime_table_privileges(
     immutable_tables: tuple[str, ...],
     ledger_tables: tuple[str, ...],
     required_update_tables: tuple[str, ...],
+    append_only_tables: tuple[str, ...] = (),
+    mutable_control_tables: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    expected = set(immutable_tables) | set(ledger_tables) | set(required_update_tables)
+    expected = (
+        set(immutable_tables)
+        | set(ledger_tables)
+        | set(required_update_tables)
+        | set(append_only_tables)
+        | set(mutable_control_tables)
+    )
     missing = sorted(expected - set(privileges))
     if missing:
         raise RuntimeError("runtime privilege snapshot missing tables: " + ", ".join(missing))
@@ -150,10 +173,38 @@ def _validate_runtime_table_privileges(
     for table_name in required_update_tables:
         if not privileges[table_name].get("update", False):
             raise RuntimeError(f"runtime role cannot UPDATE workflow state {table_name}")
+    for table_name in append_only_tables:
+        current = privileges[table_name]
+        if not current.get("select", False) or not current.get("insert", False):
+            raise RuntimeError(
+                f"runtime role lacks append-only access to {table_name}"
+            )
+        if any(
+            current.get(name, False)
+            for name in ("update", "delete", "truncate", "references", "trigger")
+        ):
+            raise RuntimeError(
+                f"runtime role can mutate append-only state {table_name}"
+            )
+    for table_name in mutable_control_tables:
+        current = privileges[table_name]
+        if not all(current.get(name, False) for name in ("select", "insert", "update")):
+            raise RuntimeError(
+                f"runtime role lacks mutable control access to {table_name}"
+            )
+        if any(
+            current.get(name, False)
+            for name in ("delete", "truncate", "references", "trigger")
+        ):
+            raise RuntimeError(
+                f"runtime role has excessive retained-control privileges on {table_name}"
+            )
     return {
         "immutable_tables": len(immutable_tables),
         "ledger_tables": len(ledger_tables),
         "required_update_tables": len(required_update_tables),
+        "append_only_tables": len(append_only_tables),
+        "mutable_control_tables": len(mutable_control_tables),
     }
 
 
@@ -163,31 +214,44 @@ def _verify_runtime_table_privileges(
     immutable_tables: tuple[str, ...],
     ledger_tables: tuple[str, ...],
     required_update_tables: tuple[str, ...],
+    append_only_tables: tuple[str, ...] = (),
+    mutable_control_tables: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     table_names = tuple(
-        dict.fromkeys((*immutable_tables, *ledger_tables, *required_update_tables))
+        dict.fromkeys(
+            (
+                *immutable_tables,
+                *ledger_tables,
+                *required_update_tables,
+                *append_only_tables,
+                *mutable_control_tables,
+            )
+        )
     )
     privileges: dict[str, dict[str, bool]] = {}
     for table_name in table_names:
         qualified = f"public.{table_name}"
         row = connection.exec_driver_sql(
-            "SELECT has_table_privilege(current_user, %s, 'SELECT'), "
-            "has_table_privilege(current_user, %s, 'INSERT'), "
-            "has_table_privilege(current_user, %s, 'UPDATE'), "
-            "has_table_privilege(current_user, %s, 'DELETE')",
-            (qualified, qualified, qualified, qualified),
+            "SELECT "
+            + ", ".join(
+                "has_table_privilege(current_user, %s, '"
+                + privilege.upper()
+                + "')"
+                for privilege in _TABLE_PRIVILEGES
+            ),
+            (qualified,) * len(_TABLE_PRIVILEGES),
         ).one()
         privileges[table_name] = {
-            "select": bool(row[0]),
-            "insert": bool(row[1]),
-            "update": bool(row[2]),
-            "delete": bool(row[3]),
+            privilege: bool(row[index])
+            for index, privilege in enumerate(_TABLE_PRIVILEGES)
         }
     return _validate_runtime_table_privileges(
         privileges,
         immutable_tables=immutable_tables,
         ledger_tables=ledger_tables,
         required_update_tables=required_update_tables,
+        append_only_tables=append_only_tables,
+        mutable_control_tables=mutable_control_tables,
     )
 
 
@@ -229,6 +293,8 @@ def main() -> int:
             immutable_tables=RUNTIME_IMMUTABLE_TABLES,
             ledger_tables=RUNTIME_MIGRATION_LEDGER_TABLES,
             required_update_tables=RUNTIME_REQUIRED_UPDATE_TABLES,
+            append_only_tables=RUNTIME_APPEND_ONLY_TABLES,
+            mutable_control_tables=RUNTIME_MUTABLE_CONTROL_TABLES,
         )
         _verify_runtime_function_privileges(connection)
 

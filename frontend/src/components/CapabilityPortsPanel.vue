@@ -59,7 +59,10 @@
       </el-table-column>
       <el-table-column label="约束" width="120">
         <template #default="{ row }">
-          <span>{{ row.is_required ? '必填' : '可选' }} · {{ row.cardinality === 'many' ? '多个' : '单个' }}</span>
+          <div class="constraint-cell">
+            <span>{{ row.is_required ? '必填' : '可选' }} · {{ row.cardinality === 'many' ? '多个' : '单个' }}</span>
+            <small>{{ hasStructuralContract(row) ? '结构校验' : '基础校验' }}</small>
+          </div>
         </template>
       </el-table-column>
       <el-table-column label="状态" width="105">
@@ -94,9 +97,9 @@
       </el-table-column>
     </el-table>
 
-    <el-dialog v-model="createDialog" title="添加能力输入契约" width="min(620px, calc(100vw - 32px))" @closed="resetCreateForm">
+    <el-dialog v-model="createDialog" title="添加能力输入契约" width="min(780px, calc(100vw - 32px))" @closed="resetCreateForm">
       <el-form label-position="top" @submit.prevent>
-        <div v-if="createError" class="form-error-summary" role="alert" tabindex="-1">{{ createError }}</div>
+        <div ref="createErrorSummary" v-if="createError" class="form-error-summary" role="alert" tabindex="-1">{{ createError }}</div>
         <div class="form-grid">
           <el-form-item label="所属能力" required>
             <el-select v-model="createForm.capability_ref" filterable style="width: 100%" placeholder="选择函数、操作或工作流">
@@ -106,26 +109,17 @@
           <el-form-item label="输入介质" required>
             <el-select v-model="createForm.media_kind" style="width: 100%" @change="onMediaKindChange">
               <el-option label="结构化数据集" value="dataset" />
+              <el-option label="表格附件" value="structured" />
               <el-option label="文档附件" value="document" />
-              <el-option label="受管连接" value="connector" />
+              <el-option label="受管数据库" value="connector" />
               <el-option label="受管产物" value="artifact" />
             </el-select>
           </el-form-item>
           <el-form-item label="端口 key" required>
-            <el-input v-model="createForm.port_key" maxlength="180" placeholder="如 audit_data" />
+            <el-input v-model="createForm.port_key" maxlength="180" placeholder="如 primary_records" />
           </el-form-item>
           <el-form-item label="显示名称" required>
-            <el-input v-model="createForm.name" maxlength="300" placeholder="如本次审计数据" />
-          </el-form-item>
-          <el-form-item v-if="createForm.media_kind === 'dataset'" label="逻辑数据集" required>
-            <el-select v-model="createForm.dataset_id" filterable style="width: 100%" placeholder="选择兼容数据集" @change="onDatasetChange">
-              <el-option v-for="dataset in datasets" :key="dataset.id" :label="dataset.name" :value="dataset.id" />
-            </el-select>
-          </el-form-item>
-          <el-form-item v-if="createForm.media_kind === 'dataset'" label="Dataset Schema" required>
-            <el-select v-model="createForm.dataset_schema_id" style="width: 100%" placeholder="选择调用数据必须满足的 Schema" :loading="schemasLoading">
-              <el-option v-for="schema in schemas" :key="schema.id" :label="`Schema v${schema.schema_version}`" :value="schema.id" />
-            </el-select>
+            <el-input v-model="createForm.name" maxlength="300" placeholder="如本次业务记录" />
           </el-form-item>
           <el-form-item label="用途" required>
             <el-select v-model="createForm.role" style="width: 100%">
@@ -145,6 +139,15 @@
           <el-input v-model="createForm.description" type="textarea" :rows="2" maxlength="8000" show-word-limit placeholder="说明该能力如何使用这份输入" />
         </el-form-item>
         <el-checkbox v-model="createForm.is_required">调用时必须提供</el-checkbox>
+        <InputContractEditor
+          v-model="inputContract"
+          :media-kind="createForm.media_kind"
+          :datasets="datasets"
+          :datasets-loading="datasetsLoading"
+          :schemas="schemas"
+          :schemas-loading="schemasLoading"
+          @dataset-change="onDatasetChange"
+        />
         <div class="form-help">新契约先保存为“待激活”，复核后再从列表中激活。正式调用只接受受管引用，不接收路径、连接串或凭据。</div>
       </el-form>
       <template #footer>
@@ -156,10 +159,16 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
+import InputContractEditor from '@/components/InputContractEditor.vue'
 import type { DatasetSchema, LogicalDataset, ScenarioCapabilityPort, ScenarioCapabilityPortWrite } from '@/types'
+import {
+  INPUT_CONTRACT_KEY,
+  buildInputContractSubmission,
+  createInputContractDraft,
+} from '@/utils/inputContracts'
 
 const props = defineProps<{
   scenarioId: string
@@ -174,22 +183,25 @@ const error = ref('')
 const createDialog = ref(false)
 const creating = ref(false)
 const createError = ref('')
+const createErrorSummary = ref<HTMLElement | null>(null)
 const datasets = ref<LogicalDataset[]>([])
+const datasetsLoading = ref(false)
 const schemas = ref<DatasetSchema[]>([])
 const schemasLoading = ref(false)
+let datasetRequest = 0
+let schemaRequest = 0
 const emptyCreateForm = () => ({
   capability_ref: '',
   media_kind: 'dataset' as ScenarioCapabilityPort['media_kind'],
   port_key: '',
   name: '',
   description: '',
-  dataset_id: '',
-  dataset_schema_id: '',
   role: 'invocation_input' as ScenarioCapabilityPort['role'],
   cardinality: 'one' as ScenarioCapabilityPort['cardinality'],
   is_required: true,
 })
 const createForm = ref(emptyCreateForm())
+const inputContract = ref(createInputContractDraft('dataset_schema'))
 const capabilityOptions = computed(() => Object.entries(props.capabilityNames || {}).map(([value, label]) => ({
   value,
   label: `${label} · ${kindLabel(value.split(':', 1)[0])}`,
@@ -231,36 +243,64 @@ async function loadPorts() {
 async function openCreateDialog() {
   resetCreateForm()
   createDialog.value = true
+  const request = ++datasetRequest
+  datasetsLoading.value = true
   try {
-    datasets.value = (await api.listLogicalDatasets()).filter((item) => item.lifecycle_status === 'active')
-  } catch (reason: any) {
-    createError.value = reason?.message || '无法读取逻辑数据集'
+    const loaded = (await api.listLogicalDatasets('modeling_material', props.scenarioId)).filter((item) => (
+      item.usage_plane === 'modeling_material' && item.lifecycle_status === 'active'
+    ))
+    if (request === datasetRequest && createDialog.value) datasets.value = loaded
+  } catch (reason: unknown) {
+    if (request === datasetRequest && createDialog.value) {
+      await showCreateError(reason instanceof Error ? reason.message : '无法读取逻辑数据集')
+    }
+  } finally {
+    if (request === datasetRequest) datasetsLoading.value = false
   }
 }
 
 function resetCreateForm() {
   createForm.value = emptyCreateForm()
+  inputContract.value = createInputContractDraft('dataset_schema')
+  datasetRequest += 1
+  datasets.value = []
+  datasetsLoading.value = false
+  schemaRequest += 1
   schemas.value = []
+  schemasLoading.value = false
   createError.value = ''
 }
 
 function onMediaKindChange() {
-  createForm.value.dataset_id = ''
-  createForm.value.dataset_schema_id = ''
+  inputContract.value = createInputContractDraft(
+    createForm.value.media_kind === 'dataset' ? 'dataset_schema' : 'manual',
+  )
+  schemaRequest += 1
   schemas.value = []
+  schemasLoading.value = false
 }
 
 async function onDatasetChange(datasetId: string) {
-  createForm.value.dataset_schema_id = ''
+  inputContract.value = {
+    ...inputContract.value,
+    datasetId,
+    datasetSchemaId: '',
+  }
   schemas.value = []
   if (!datasetId) return
+  const request = ++schemaRequest
   schemasLoading.value = true
   try {
-    schemas.value = await api.listDatasetSchemas(datasetId)
-  } catch (reason: any) {
-    createError.value = reason?.message || '无法读取 Dataset Schema'
+    const loaded = await api.listDatasetSchemas(datasetId)
+    if (request === schemaRequest && inputContract.value.datasetId === datasetId) {
+      schemas.value = loaded
+    }
+  } catch (reason: unknown) {
+    if (request === schemaRequest) {
+      await showCreateError(reason instanceof Error ? reason.message : '无法读取 Dataset Schema')
+    }
   } finally {
-    schemasLoading.value = false
+    if (request === schemaRequest) schemasLoading.value = false
   }
 }
 
@@ -270,15 +310,18 @@ async function createPort() {
   const [capabilityKind, ...keyParts] = createForm.value.capability_ref.split(':')
   const capabilityKey = keyParts.join(':')
   if (!['function', 'action', 'workflow'].includes(capabilityKind) || !capabilityKey) {
-    createError.value = '请选择所属能力。'
+    await showCreateError('请选择所属能力。')
     return
   }
   if (!/^[a-z0-9][a-z0-9._-]{0,179}$/.test(createForm.value.port_key) || !createForm.value.name.trim()) {
-    createError.value = '请填写有效的端口 key 和显示名称。'
+    await showCreateError('请填写有效的端口 key 和显示名称。')
     return
   }
-  if (createForm.value.media_kind === 'dataset' && (!createForm.value.dataset_id || !createForm.value.dataset_schema_id)) {
-    createError.value = '结构化数据集端口必须绑定逻辑数据集和 Dataset Schema。'
+  let contractSubmission: ReturnType<typeof buildInputContractSubmission>
+  try {
+    contractSubmission = buildInputContractSubmission(inputContract.value)
+  } catch (reason: unknown) {
+    await showCreateError(reason instanceof Error ? reason.message : '结构契约配置无效。')
     return
   }
   const bindingKind = createForm.value.media_kind === 'dataset'
@@ -297,9 +340,9 @@ async function createPort() {
       direction: 'input',
       role: createForm.value.role,
       media_kind: createForm.value.media_kind,
-      dataset_id: createForm.value.media_kind === 'dataset' ? createForm.value.dataset_id : null,
-      dataset_schema_id: createForm.value.media_kind === 'dataset' ? createForm.value.dataset_schema_id : null,
-      schema_document: {},
+      dataset_id: contractSubmission.dataset_id,
+      dataset_schema_id: contractSubmission.dataset_schema_id,
+      schema_document: contractSubmission.schema_document,
       is_required: createForm.value.is_required,
       cardinality: createForm.value.cardinality,
       binding_policy: 'per_invocation',
@@ -309,8 +352,8 @@ async function createPort() {
     createDialog.value = false
     ElMessage.success('能力输入契约已保存，请复核后激活')
     await loadPorts()
-  } catch (reason: any) {
-    createError.value = reason?.message || '能力输入契约保存失败'
+  } catch (reason: unknown) {
+    await showCreateError(reason instanceof Error ? reason.message : '能力输入契约保存失败')
   } finally {
     creating.value = false
   }
@@ -355,6 +398,16 @@ function bindingKinds(row: ScenarioCapabilityPort): string[] {
   return Array.isArray(raw) ? raw.map(String) : []
 }
 
+async function showCreateError(message: string) {
+  createError.value = message
+  await nextTick()
+  createErrorSummary.value?.focus()
+}
+
+function hasStructuralContract(row: ScenarioCapabilityPort) {
+  return Boolean(row.schema_document?.[INPUT_CONTRACT_KEY])
+}
+
 function kindLabel(value: string) {
   return ({ function: '函数', action: '操作', workflow: '工作流' } as Record<string, string>)[value] || value
 }
@@ -394,6 +447,8 @@ onMounted(loadPorts)
 .owner-cell strong { overflow: hidden; color: var(--text-1); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .owner-cell small { overflow: hidden; color: var(--text-3); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .binding-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.constraint-cell { display: flex; flex-direction: column; gap: 3px; }
+.constraint-cell small { color: var(--text-3); font-size: 11px; }
 .muted { color: var(--text-3); font-size: 12px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
 .form-help { margin-top: 10px; color: var(--text-3); font-size: 12px; line-height: 1.5; }
