@@ -510,7 +510,10 @@ export const api = {
       timeout: 60 * 60 * 1000,
     })
   },
-  reparseFile: (fid: string) => http.post<BucketFile>(`/data-sources/files/${fid}/reparse`),
+  reparseFile: (fid: string) => http.post<BucketFile>(`/data-sources/files/${fid}/reparse`, undefined, {
+    // Existing tabular files perform the same bounded profiling work as uploads.
+    timeout: 60 * 60 * 1000,
+  }),
   fileText: (fid: string) => http.get<{ filename: string; text: string }>(`/data-sources/files/${fid}/text`),
   deleteFile: (fid: string) => http.delete(`/data-sources/files/${fid}`),
 

@@ -62,7 +62,7 @@ STATUS_LABELS = {
     "planning": "正在规划处理步骤",
     "invoking_tools": "正在调用受治理能力",
     "responding": "正在整理结果",
-    "succeeded": "处理完成",
+    "succeeded": "对话已完成",
     "failed": "处理失败",
     "cancel_requested": "正在取消",
     "cancelled": "已取消",

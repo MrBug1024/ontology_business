@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { agentToolResultStatus } from '../src/utils/agentToolResult.ts'
 
 import {
   isAttachmentInputPort,
@@ -10,6 +11,22 @@ import {
   parseStructuredInputs,
   validateAgentInvocationDraft,
 } from '../src/utils/agentInvocation.ts'
+
+test('failed capability receipts remain failed after conversation history is restored', () => {
+  const receipt = { status: 'failed', error: { code: 'provider_execution_failed', message: 'Execution failed' } }
+  assert.equal(agentToolResultStatus(JSON.stringify(receipt)), 'error')
+  assert.equal(agentToolResultStatus(receipt), 'error')
+  assert.equal(agentToolResultStatus({ error: { code: 'REQUIRED_RUNTIME_INPUTS_MISSING' } }), 'error')
+  assert.equal(agentToolResultStatus({ status: 'timed_out' }), 'error')
+})
+
+test('successful empty results and confirmation previews are not failures', () => {
+  assert.equal(agentToolResultStatus({ status: 'succeeded', output: { records: [] }, error: null }), 'done')
+  assert.equal(agentToolResultStatus({ status: 'awaiting_confirmation', error: null }), 'done')
+  assert.equal(agentToolResultStatus([]), 'done')
+  assert.equal(agentToolResultStatus('A completed legacy text result'), 'done')
+  assert.equal(agentToolResultStatus(undefined), 'running')
+})
 
 function attachment(overrides = {}) {
   return {

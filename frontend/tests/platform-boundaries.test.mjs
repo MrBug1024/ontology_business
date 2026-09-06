@@ -1,6 +1,40 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import test from 'node:test'
+import ts from 'typescript'
+
+async function loadApi() {
+  const compile = (source) => ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  const moduleUrl = (source) => `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
+  const readinessUrl = moduleUrl(compile(readFileSync(
+    new URL('../src/utils/agentReadiness.ts', import.meta.url), 'utf8',
+  )))
+  const require = createRequire(import.meta.url)
+  const axiosUrl = pathToFileURL(require.resolve('axios')).href
+  const source = compile(readFileSync(new URL('../src/api/index.ts', import.meta.url), 'utf8'))
+    .replace(/from ['"]axios['"]/, `from '${axiosUrl}'`)
+    .replace(/from ['"]@\/utils\/agentReadiness['"]/, `from '${readinessUrl}'`)
+  return import(moduleUrl(`${source}\n//# sourceURL=modeling-file-api-test.js`))
+}
+
+test('reparsing a large modeling file can complete after the ordinary request deadline', async () => {
+  const { api, http } = await loadApi()
+  const response = { id: 'modeling-file', modeling_contract_schema_id: 'schema-version' }
+  const ordinaryTimeout = http.defaults.timeout
+  http.defaults.adapter = async (config) => {
+    const simulatedParsingDuration = 180_000
+    assert.equal(config.url, '/data-sources/files/modeling-file/reparse')
+    assert.equal(config.method, 'post')
+    assert.ok(config.timeout > simulatedParsingDuration, 'parsing was cut off by the ordinary request timeout')
+    return { data: response, status: 200, statusText: 'OK', headers: {}, config }
+  }
+  assert.deepEqual(await api.reparseFile('modeling-file'), response)
+  assert.equal(http.defaults.timeout, ordinaryTimeout)
+})
 
 test('modeling materials keep the old route and never become runtime data', () => {
   const viewSource = readFileSync(new URL('../src/views/DataSources.vue', import.meta.url), 'utf8')

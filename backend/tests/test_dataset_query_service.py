@@ -35,6 +35,29 @@ from app.services import (
 from app.services.policies import PolicyViolation, validate_read_only_sql
 
 
+def test_configured_cache_keeps_locks_leases_and_spill_out_of_the_old_location(tmp_path: Path) -> None:
+    old_cache = tmp_path / "unavailable-cache"
+    old_cache.write_text("another process owns this location", encoding="utf-8")
+    configured_cache = tmp_path / "service-cache"
+    settings = SimpleNamespace(dataset_cache_directory=str(configured_cache))
+    with patch.object(dataset_query_service, "_CACHE_ROOT", old_cache), patch.object(
+        dataset_query_service, "get_settings", return_value=settings,
+    ):
+        root, locks, leases, access = dataset_query_service._cache_layout()
+        policy = dataset_query_service._duckdb_policy()
+    assert root == configured_cache.resolve()
+    assert all(path.parent == root and path.is_dir() for path in (locks, leases, access))
+    assert policy.temp_directory == root / "duckdb-temp"
+    assert old_cache.read_text(encoding="utf-8") == "another process owns this location"
+
+
+def test_relative_cache_directory_is_rejected_without_creating_files(tmp_path: Path) -> None:
+    settings = SimpleNamespace(dataset_cache_directory="relative-cache")
+    with patch.object(dataset_query_service, "get_settings", return_value=settings):
+        with pytest.raises(dataset_query_service.DatasetQueryError, match="绝对路径"):
+            dataset_query_service._cache_layout()
+
+
 def _parquet(path: Path) -> bytes:
     parquet.write_table(
         pa.table({"name": ["alpha", "beta"], "amount": [10, 20]}), path

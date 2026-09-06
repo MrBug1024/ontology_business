@@ -949,7 +949,7 @@ def test_idempotency_reuses_same_receipt_and_rejects_changed_inputs(db: Session)
     assert len(provider.calls) == 1
 
 
-def test_provider_exception_is_safely_persisted_as_failed_receipt(db: Session) -> None:
+def test_provider_exception_is_safely_persisted_as_failed_receipt(db: Session, caplog) -> None:
     world = _world(db, "failure-invoker")
     provider = RecordingProvider(
         _object_contract(),
@@ -975,6 +975,10 @@ def test_provider_exception_is_safely_persisted_as_failed_receipt(db: Session) -
     assert replay.invocation_id == receipt.invocation_id
     assert replay.audit_ref["replayed"] is True
     assert len(provider.calls) == 1
+    assert receipt.invocation_id in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "private credential" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_preview_and_confirm_gate_side_effect_and_reuse_fixed_invocation(

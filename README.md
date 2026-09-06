@@ -269,3 +269,5 @@ npm --prefix .\frontend run build
 - **需要改后端端口**：启动前端前同步设置 `VITE_API_PROXY_TARGET`，不要依赖本机 `vite.config.ts` 中可能不同的默认代理端口。
 - **npm 11 拦截 postinstall**：执行 `npm --prefix .\frontend approve-scripts esbuild vue-demi`。
 - **LLM 调用失败**：检查 LLM 配置的 API Key 是否真实有效，可在 LLM 配置页点「测试」。
+- **能力调用报 `provider_execution_failed`**：按调用编号查看后端 `Capability Provider failed` 日志，其中只记录异常类型和代码位置。若异常链在 `dataset_query_service` 的目录初始化处出现 `PermissionError`，检查实际服务账户的目录访问权限。在 `DATASET_CACHE_DIRECTORY` 中填写新的绝对路径，由后端正常查询流程创建自己的缓存、锁和租约目录；`DATASET_DUCKDB_TEMP_DIRECTORY` 留空时溢写文件也使用该缓存目录。不要共用其他开发或测试账户创建的目录。更改本机环境配置后重启后端，再从验证中心验证实际调用。
+- **验证对话只返回大结果摘要**：超过模型上下文预算的回执仍完整保留在服务端。模型摘要仅保留匹配当前能力定义的输出契约中声明的数值、布尔值和枚举状态，并限制字段数与字节数；逐条明细通过授权回执接口查询。历史回放会重新核验服务端回执，不能用修改聊天记录的方式更改统计结果。

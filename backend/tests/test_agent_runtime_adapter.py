@@ -868,6 +868,46 @@ def test_large_capability_receipt_is_bounded_before_model_and_message_use(
     assert document["output"]["rows"][0]["physical_column"].startswith(sentinel)
 
 
+def test_large_receipt_summary_is_bound_to_the_definition_and_reauthorized_for_replay(db: Session) -> None:
+    _tenant, _user, _scenario, llm, function, agent = _world(db, "summary-replay")
+    function.output_schema = {"type": "object", "properties": {
+        "total": {"type": "integer"},
+        "state": {"type": "string", "enum": ["pending_review"]},
+        "records": {"type": "array"},
+    }}
+    db.commit()
+    runtime = agent_runtime_adapter.build_runtime_context(db, agent, llm)
+    capability = runtime.public_catalog()[0]
+    document = {
+        "invocation_id": "invocation-summary-replay", "status": "succeeded",
+        "capability": {"kind": "function", "key": function.id},
+        "definition_hash": capability["definition_hash"],
+        "deployment_fingerprint": capability["deployment_fingerprint"],
+        "data_context_fingerprint": "c" * 64,
+        "output": {"total": 107, "state": "pending_review", "records": [{"private": "x" * 20_000}]},
+        "audit_ref": {}, "confirmation": None, "error": None,
+    }
+    with patch.object(agent_runtime_adapter.capability_application_service, "invoke", return_value=object()), patch.object(
+        agent_runtime_adapter.capability_application_service, "receipt_document", return_value=document,
+    ):
+        projected = json.loads(runtime.execute_tool("invoke_capability", {
+            "kind": "function", "key": function.id, "inputs": {"amount": 8},
+        }))
+    assert projected["output_summary"] == {"state": "pending_review", "total": 107}
+    assert "private" not in json.dumps(projected)
+    assert len(json.dumps(projected).encode("utf-8")) <= agent_runtime_adapter._MAX_MODEL_RECEIPT_BYTES
+    legacy_projection = agent_runtime_adapter._model_receipt_projection(document)
+    with patch.object(agent_runtime_adapter.capability_application_service, "get_receipt", return_value=document):
+        for stored in (document, projected, legacy_projection):
+            assert runtime.authorize_historic_tool_result("invoke_capability", {}, stored)
+            replayed = runtime.model_historic_tool_result("invoke_capability", {}, stored)
+            assert json.loads(replayed) == projected
+        tampered = {**projected, "output_summary": {"total": 108}}
+        assert not runtime.authorize_historic_tool_result("invoke_capability", {}, tampered)
+        assert runtime.model_historic_tool_result("invoke_capability", {}, tampered) is None
+    assert "output_summary" not in runtime._model_receipt({**document, "definition_hash": "0" * 64})
+
+
 def test_historic_large_receipt_replay_uses_the_same_bounded_projection(
     db: Session,
 ) -> None:

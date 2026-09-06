@@ -263,8 +263,18 @@ def _ensure_private_directory(path: Path, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _cache_root() -> Path:
+    configured = str(getattr(get_settings(), "dataset_cache_directory", "") or "").strip()
+    if not configured:
+        return _CACHE_ROOT
+    root = Path(configured).expanduser()
+    if not root.is_absolute():
+        raise DatasetQueryError("数据集缓存目录必须使用绝对路径")
+    return root
+
+
 def _cache_layout() -> tuple[Path, Path, Path, Path]:
-    root = _ensure_private_directory(_CACHE_ROOT, "数据集缓存目录")
+    root = _ensure_private_directory(_cache_root(), "数据集缓存目录")
     locks = _ensure_private_directory(root / ".locks", "数据集缓存锁目录")
     leases = _ensure_private_directory(root / ".leases", "数据集缓存租约目录")
     access = _ensure_private_directory(root / ".access", "数据集缓存访问目录")
@@ -1261,7 +1271,7 @@ def _duckdb_policy() -> _DuckDBPolicy:
         if not raw_temp.is_absolute():
             raise DatasetQueryError("DuckDB 临时目录必须使用绝对路径")
     else:
-        raw_temp = _CACHE_ROOT / "duckdb-temp"
+        raw_temp = _cache_root() / "duckdb-temp"
     temp_directory = _ensure_private_directory(raw_temp, "DuckDB 临时目录")
     if (
         not 0.0 < timeout_seconds <= 600.0

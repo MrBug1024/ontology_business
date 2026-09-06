@@ -90,6 +90,7 @@ class Settings(BaseSettings):
         ge=64 * 1024 * 1024,
         le=256 * 1024 * 1024 * 1024,
     )
+    dataset_cache_directory: str = Field(default="", max_length=4096)
     dataset_cache_max_object_bytes: int = Field(
         default=1024 * 1024 * 1024,
         ge=1024 * 1024,

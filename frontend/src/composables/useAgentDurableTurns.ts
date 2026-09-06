@@ -64,7 +64,7 @@ const TURN_STATUS_LABELS: Record<AgentTurnStatus, string> = {
   invoking_tools: '正在调用受治理能力',
   responding: '正在整理结果',
   cancel_requested: '正在取消',
-  succeeded: '处理完成',
+  succeeded: '对话已完成',
   failed: '处理失败',
   cancelled: '已取消',
   indeterminate: '执行结果待核对',

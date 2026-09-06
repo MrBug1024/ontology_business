@@ -228,6 +228,7 @@
 <script setup lang="ts">
 import { computed, ref, onBeforeUnmount, onMounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { agentToolResultStatus } from '@/utils/agentToolResult'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import type {
@@ -809,7 +810,7 @@ function messageFromHistory(message: ChatMessage): AgentTurnViewMessage {
       args: toolCall.args ?? toolCall.arguments ?? {},
       result: resultById.get(toolCall.id)?.result,
       _open: false,
-      status: 'done',
+      status: agentToolResultStatus(resultById.get(toolCall.id)?.result),
     })),
   }
 }

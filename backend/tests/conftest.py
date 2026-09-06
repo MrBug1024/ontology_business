@@ -6,6 +6,8 @@ import json
 import os
 import secrets
 
+import pytest
+
 
 # Production has no default key and fails closed.  Tests that exercise the
 # durable worker receive an ephemeral key generated before application modules
@@ -16,3 +18,15 @@ os.environ.setdefault(
     "WORKFLOW_PAYLOAD_ENCRYPTION_KEYS",
     json.dumps({"pytest-ephemeral": _test_key}, separators=(",", ":")),
 )
+
+# Test processes may run as a different OS account from the API. Never create
+# cache locks or spill directories at a path taken from the developer's .env.
+os.environ["DATASET_CACHE_DIRECTORY"] = ""
+os.environ["DATASET_DUCKDB_TEMP_DIRECTORY"] = ""
+
+
+@pytest.fixture(autouse=True)
+def isolated_dataset_cache(tmp_path, monkeypatch):
+    from app.services import dataset_query_service
+
+    monkeypatch.setattr(dataset_query_service, "_CACHE_ROOT", tmp_path / "dataset-cache")

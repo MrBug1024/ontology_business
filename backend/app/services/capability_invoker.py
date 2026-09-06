@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models import CapabilityInvocation, RunInputBinding
+from .capability_failure_diagnostics import log_provider_failure
 from .capability_contracts import (
     Actor,
     CapabilityRef,
@@ -1531,7 +1532,8 @@ class CapabilityInvoker:
         except CapabilityInvocationError as exc:
             _mark_failed(db, invocation, code=exc.code, message=exc.message)
             return _receipt(invocation, request, replayed=False)
-        except Exception:  # noqa: BLE001 - return only the safe failed Receipt.
+        except Exception as exc:  # noqa: BLE001 - return only the safe failed Receipt.
+            log_provider_failure(invocation.id, exc)
             _mark_failed(db, invocation)
             return _receipt(invocation, request, replayed=False)
 
@@ -1809,7 +1811,8 @@ class CapabilityInvoker:
                 confirmation=accepted_confirmation,
             )
             return _receipt(invocation, request, replayed=False)
-        except Exception:  # noqa: BLE001 - return only the safe failed Receipt.
+        except Exception as exc:  # noqa: BLE001 - return only the safe failed Receipt.
+            log_provider_failure(invocation.id, exc)
             _mark_failed(db, invocation, confirmation=accepted_confirmation)
             return _receipt(invocation, request, replayed=False)
         confirmed_result["confirmation"] = accepted_confirmation

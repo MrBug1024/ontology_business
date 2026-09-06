@@ -56,6 +56,7 @@ from .capability_contracts import (
 )
 from .capability_invoker import CapabilityInvocationError
 from .agent_prompt_policy import AUTHORITATIVE_DECISION_PROMPT
+from .agent_receipt_summary import output_summary
 
 
 _CAPABILITY_CATEGORY_BY_KIND = {
@@ -448,7 +449,11 @@ def _model_output_outline(value: Any) -> dict[str, Any]:
     }
 
 
-def _model_receipt_projection(document: Mapping[str, Any]) -> dict[str, Any]:
+def _model_receipt_projection(
+    document: Mapping[str, Any],
+    *,
+    output_schema: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return the bounded receipt view allowed in model and chat history."""
 
     plain = json.loads(canonical_json(document))
@@ -457,6 +462,7 @@ def _model_receipt_projection(document: Mapping[str, Any]) -> dict[str, Any]:
         return plain
 
     output = plain.get("output")
+    summary = output_summary(output, output_schema)
     capability = plain.get("capability")
     error = plain.get("error")
     projected = {
@@ -489,7 +495,12 @@ def _model_receipt_projection(document: Mapping[str, Any]) -> dict[str, Any]:
         "result_outline": _model_output_outline(output),
         "result_bytes": len(canonical_json(output).encode("utf-8")),
         "result_omitted": True,
+        **({"output_summary": summary} if summary else {}),
         "next_step": (
+            "完整结果保留在服务端受治理回执中；output_summary "
+            "只包含输出契约声明的数值、布尔值和枚举状态，可用于报告摘要，不能代替明细。"
+            "明细可按 invocation_id 通过授权接口查询。"
+        ) if summary else (
             "完整结果保留在服务端受治理回执中；请缩小输入或过滤条件后重试，"
             "或按 invocation_id 通过授权接口继续查询。"
         ),
@@ -1451,7 +1462,7 @@ class CapabilityAgentRuntime:
             document = capability_application_service.receipt_document(receipt)
             self._record_receipt(document)
             return json.dumps(
-                _model_receipt_projection(document),
+                self._model_receipt(document),
                 ensure_ascii=False,
                 sort_keys=True,
             )
@@ -1468,6 +1479,20 @@ class CapabilityAgentRuntime:
                 str(exc),
                 retryable=True,
             )
+
+    def _model_receipt(self, document: Mapping[str, Any]) -> dict[str, Any]:
+        reference = document.get("capability")
+        capability = (
+            self._capability_by_ref.get((str(reference.get("kind")), str(reference.get("key"))))
+            if isinstance(reference, Mapping)
+            else None
+        )
+        schema = (
+            capability.get("output_schema")
+            if capability and capability.get("definition_hash") == document.get("definition_hash")
+            else None
+        )
+        return _model_receipt_projection(document, output_schema=schema)
 
     def authorize_historic_tool_result(
         self,
@@ -1493,11 +1518,15 @@ class CapabilityAgentRuntime:
             return False
         normalized = json.loads(canonical_json(parsed))
         canonical_current = json.loads(canonical_json(current))
-        projected_current = _model_receipt_projection(current)
+        projected_current = self._model_receipt(current)
         # Legacy rows may contain the canonical receipt. They remain eligible
         # only so replay can replace them with the same bounded projection used
         # for new turns; the full document is never returned to the model.
-        return normalized in (canonical_current, projected_current)
+        return normalized in (
+            canonical_current,
+            projected_current,
+            _model_receipt_projection(current),
+        )
 
     def model_historic_tool_result(
         self,
@@ -1527,8 +1556,8 @@ class CapabilityAgentRuntime:
             return None
         normalized = json.loads(canonical_json(parsed))
         canonical_current = json.loads(canonical_json(current))
-        projection = _model_receipt_projection(current)
-        if normalized not in (canonical_current, projection):
+        projection = self._model_receipt(current)
+        if normalized not in (canonical_current, projection, _model_receipt_projection(current)):
             return None
         return json.dumps(projection, ensure_ascii=False, sort_keys=True)
 
