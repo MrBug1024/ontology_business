@@ -38,6 +38,7 @@ export interface AgentDurableTurnOptions {
   clearComposerAfterAccepted: () => void
   normalizeCitations: (value: unknown) => RagCitation[]
   scrollBottom: () => void
+  followProgress: () => void
 }
 
 export interface AgentDurableTurns {
@@ -223,7 +224,7 @@ export function useAgentDurableTurns(options: AgentDurableTurnOptions): AgentDur
       if (typeof event.data.label === 'string' && event.data.label.trim()) {
         assistant.status = event.data.label
       }
-      options.scrollBottom()
+      options.followProgress()
     }
     if (isTerminalTurn(nextStatus)) void finishTurn(runId, subscription, scope)
   }

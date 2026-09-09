@@ -138,53 +138,15 @@ def _rule_condition_fields(condition: Any) -> list[str]:
     return sorted(fields)
 
 
-def _rule_property_schema(prop: Any) -> dict[str, Any]:
-    kind = str(getattr(prop, "data_type", "") or "").strip().lower()
-    schema: dict[str, Any]
-    if kind == "date":
-        schema = {"type": "string", "format": "date"}
-    elif kind == "datetime":
-        schema = {"type": "string", "format": "date-time"}
-    elif kind in {"float", "number"}:
-        schema = {"type": "number"}
-    elif kind == "integer":
-        schema = {"type": "integer"}
-    elif kind == "boolean":
-        schema = {"type": "boolean"}
-    elif kind in {"string", "text"}:
-        schema = {"type": "string"}
-    else:
-        schema = {}
-    enum_values = list(getattr(prop, "enum_values", None) or [])
-    if bool(getattr(prop, "is_enum", False)) and enum_values:
-        schema["enum"] = enum_values
-    return schema
-
-
 def _rule_input_schema(definition: Any, rule: Any) -> dict[str, Any]:
-    properties_by_field: dict[str, Any] = {}
+    from .ontology_rule_contract import input_schema
     entity_id = str(getattr(rule, "entity_id", "") or "")
     entity = definition.entities.get(entity_id) if entity_id else None
-    for prop in (getattr(entity, "properties", None) or []):
-        for field in {
-            str(getattr(prop, "name", "") or "").strip(),
-            str(getattr(prop, "api_name", "") or "").strip(),
-        }:
-            if field:
-                properties_by_field[field] = prop
     fields = _rule_condition_fields(getattr(rule, "condition", {}) or {})
     return {
         "type": "object",
         "properties": {
-            "record": {
-                "type": "object",
-                "properties": {
-                    field: _rule_property_schema(properties_by_field.get(field))
-                    for field in fields
-                },
-                "required": fields,
-                "additionalProperties": False,
-            }
+            "record": input_schema(rule, entity, fields)
         },
         "required": ["record"],
         "additionalProperties": False,
@@ -656,6 +618,7 @@ class OntologyWorkflowProvider(_BuiltinProvider):
             "input_schema": workflow_service.workflow_parameter_schema(
                 workflow,
                 tuple(definition.actions.values()),
+                definition=definition,
             ),
             "required_roles": [],
             "required_scopes": [],

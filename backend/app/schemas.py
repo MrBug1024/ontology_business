@@ -11,6 +11,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from .channel_interaction_schemas import EvidenceReference
+from .ontology_semantics_schemas import InstanceIntegrity, StatePolicy
 
 
 # ──────────────────────────────────────────────
@@ -130,6 +131,7 @@ class AuthMessage(Msg):
 # 本体
 # ──────────────────────────────────────────────
 class PropertyIn(BaseModel):
+    model_config = {"extra": "forbid"}
     name: str
     api_name: str = Field(default="", max_length=100)
     data_type: str = "string"
@@ -143,6 +145,13 @@ class PropertyIn(BaseModel):
     constraints: dict = Field(default_factory=dict)
     is_sensitive: bool = False
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_existing_editor_roundtrip(cls, value: Any) -> Any:
+        if cls is PropertyIn and isinstance(value, dict):
+            return {key: item for key, item in value.items() if key not in {"id", "entity_id"}}
+        return value
+
 
 class PropertyOut(PropertyIn):
     id: str
@@ -152,6 +161,7 @@ class PropertyOut(PropertyIn):
 
 
 class EntityIn(BaseModel):
+    model_config = {"extra": "forbid"}
     name: str
     api_name: str = Field(default="", max_length=100)
     lifecycle_status: Literal["active", "deprecated"] = "active"
@@ -161,7 +171,18 @@ class EntityIn(BaseModel):
     color: str = "#4f46e5"
     is_abstract: bool = False
     state_property: str = Field(default="", max_length=200)
+    state_policy: StatePolicy = Field(default_factory=StatePolicy)
     properties: list[PropertyIn] = []
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_existing_editor_roundtrip(cls, value: Any) -> Any:
+        # The existing editor submits the read DTO. Only known read metadata
+        # is ignored; unsupported business semantics still fail validation.
+        if cls is EntityIn and isinstance(value, dict):
+            readonly = {"id", "scenario_id", "created_at", "model_ready", "model_issues"}
+            return {key: item for key, item in value.items() if key not in readonly}
+        return value
 
 
 class EntityOut(EntityIn):
@@ -258,6 +279,7 @@ class InstanceIn(BaseModel):
 
 
 class InstanceOut(InstanceIn):
+    integrity: InstanceIntegrity | None = None
     id: str
     scenario_id: str
     entity_name: str = ""
@@ -311,6 +333,7 @@ class ObjectRelationOut(BaseModel):
 
 
 class ObjectSearchItemOut(BaseModel):
+    integrity: InstanceIntegrity | None = None
     id: str
     scenario_id: str
     entity_id: str
@@ -2098,6 +2121,7 @@ class RuleIn(BaseModel):
     name: str
     description: str = ""
     condition: dict = Field(default_factory=dict)
+    input_validation: Literal["object", "record"] = "object"
     action_on_match: str = ""
     trigger_action_ids: list[str] = []
     severity: Literal["info", "warning", "critical"] = "info"

@@ -42,11 +42,17 @@ def test_committed_deltas_survive_worker_loss_and_reject_stale_writer():
             event.remove(engine, "before_cursor_execute", count_query)
             assert len(queries) < 30, "每批正文的授权/写入查询必须有界"
             print(f"PG first delta: {len(queries)} queries, {elapsed * 1000:.1f} ms")
+            progress({"type": "tool_call", "data": {"id": "pg_call", "name": "list_capabilities", "arguments": {}}})
+            progress({"type": "tool_result", "data": {"id": "pg_call", "name": "list_capabilities", "result": {"ok": True}}})
             with factory() as observer:
                 observer.info.update(tenant_id=tenant.id, user_id=user.id)
                 current = agent_turn_service.get_turn(observer, queued["id"])
-                assert current["status"] == "responding"
+                assert current["status"] == "invoking_tools"
                 assert current["result"]["answer"] == "已生成😀"
+                events = agent_turn_service.list_turn_events(observer, queued["id"])
+                steps = [item["data"]["tool_step"] for item in events if "tool_step" in item["data"]]
+                assert [step["phase"] for step in steps] == ["started", "finished"]
+                assert steps[-1]["status"] == "returned"
                 assert not observer.get(Message, queued["assistant_message_id"]).stream_finalized
                 run = observer.get(AgentTurnRun, queued["id"])
                 run.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)

@@ -1562,6 +1562,7 @@ export interface AgentTurnEvent {
     error?: { code: string; message: string }
     delta?: string
     offset?: number
+    tool_step?: import('./agentExecutionTrace').AgentToolProgress
   }
   created_at: string
 }

@@ -526,6 +526,8 @@ def enqueue_workflow_run(
         decision = permission_service.check_workflow(db, workflow, "execute")
         if not decision.allowed:
             raise PolicyViolation("没有提交该工作流的权限")
+    from .workflow_ontology_contract import validate_inputs
+    validate_inputs(workflow, definition, params or {}, db=db)
     policy = runtime_policy(workflow.trigger_config or {})
     creator_id = _creator_for_enqueue(db, created_by_user_id)
     scoped_dedupe_key = _scoped_dedupe_key(dedupe_key)

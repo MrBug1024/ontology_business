@@ -168,6 +168,42 @@ def test_zero_data_capability_agent_uses_kernel_without_legacy_context(db: Sessi
     assert "candidate_detected_pending_review" not in runtime._system_prompt()
 
 
+def test_agent_presentation_preserves_markdown_stream_and_custom_prompt(db: Session, monkeypatch) -> None:
+    *_, llm, _function, agent = _world(db, "presentation")
+    agent.system_prompt = "Follow the caller's requested presentation format."
+    runtime = agent_runtime_adapter.build_runtime_context(db, agent, llm)
+    chunks = ["## Result\n\n", "**Ready**\n\n", "| Item | State |\n| --- | --- |\n| Draft | Ready |"]
+
+    def chat_stream(_llm, messages, **_kwargs):
+        prompt = messages[0]["content"]
+        assert agent.system_prompt in prompt
+        assert "不使用 Markdown" not in prompt
+        assert "output" in prompt and "delivery.text" in prompt
+        assert "调用方" in prompt and "附件" in prompt
+        assert "执行失败表示未取得有效结果，不等于没有发现业务问题" in prompt
+        assert "通用错误码不能证明故障根因已经查明" in prompt
+        for chunk in chunks:
+            yield {"type": "token", "content": chunk}
+
+    monkeypatch.setattr(agent_runtime_adapter.llm_service, "chat_stream", chat_stream)
+    events = list(runtime.run_agent([], "Show the result as Markdown."))
+    assert [event["data"] for event in events if event["type"] == "token"] == chunks
+    assert events[-1] == {"type": "done", "data": "".join(chunks)}
+
+
+@pytest.mark.parametrize("chunks", [[], ["  ", "\n"]])
+def test_empty_model_response_is_an_explicit_failure(db: Session, monkeypatch, chunks) -> None:
+    *_, llm, _function, agent = _world(db, "empty-response")
+    runtime = agent_runtime_adapter.build_runtime_context(db, agent, llm)
+    monkeypatch.setattr(agent_runtime_adapter.llm_service, "chat_stream",
+        lambda *_args, **_kwargs: iter({"type": "token", "content": chunk} for chunk in chunks))
+    with pytest.raises(agent_runtime_adapter.AgentRuntimeAdapterError) as error:
+        list(runtime.run_agent([], "Reply briefly."))
+    assert error.value.code == "empty_model_response"
+    from app.services.agent_turn_worker_service import _known_error
+    assert _known_error(error.value) == ("empty_model_response", error.value.message, True)
+
+
 def test_agent_turn_derives_stable_identity_per_capability_call(db: Session) -> None:
     _tenant, _user, _scenario, llm, function, agent = _world(
         db,

@@ -166,6 +166,14 @@ def semantic_atoms(model: dict[str, Any]) -> dict[str, set[Atom]]:
                 )
 
     for relation in model.get("relations") or []:
+        relation_identity = (
+            _resolve_ref(relation.get("source"), indexes, "entity"),
+            _text(relation.get("name")),
+            _resolve_ref(relation.get("target"), indexes, "entity"),
+        )
+        for key, value in sorted((relation.get("constraints") or {}).items()):
+            if value is not None and value is not False and value != "":
+                atoms["constraint"].add((*relation_identity, f"relation:{key}", _canonical_value(value)))
         atoms["relation"].add(
             (
                 _resolve_ref(relation.get("source"), indexes, "entity"),
@@ -243,4 +251,24 @@ def evaluate_scenario_model(
         "schema_version": SCHEMA_VERSION,
         "categories": list(CATEGORIES),
         "metrics": metrics,
+        "evaluation_scope": "structural_contract",
+        "business_meaning_verified": False,
+        "description_differences": _description_differences(predicted, gold),
     }
+
+
+def _description_differences(predicted: dict, gold: dict) -> list[dict[str, str]]:
+    differences = []
+    for group in ("entities", "relations", "rules", "actions", "functions", "workflows"):
+        expected = {_text(item.get("name")): item for item in gold.get(group) or []}
+        for item in predicted.get(group) or []:
+            name = _text(item.get("name"))
+            if name in expected and _text(item.get("description")) != _text(expected[name].get("description")):
+                differences.append({"kind": group, "name": name})
+            if group == "entities" and name in expected:
+                expected_properties = {_text(prop.get("name")): prop for prop in expected[name].get("properties") or []}
+                for prop in item.get("properties") or []:
+                    field = _text(prop.get("name"))
+                    if field in expected_properties and _text(prop.get("description")) != _text(expected_properties[field].get("description")):
+                        differences.append({"kind": "properties", "name": f"{name}.{field}"})
+    return differences

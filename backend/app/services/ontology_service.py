@@ -803,6 +803,10 @@ def validate_entity_definition(payload: Any, *, scenario_namespace: str = "defau
             raise ValueError("状态属性必须引用当前实体中的属性")
         if not candidate.is_enum:
             raise ValueError("状态属性必须配置为枚举，才能形成稳定生命周期")
+    from .ontology_instance_contract_service import normalize_state_policy
+    policy = getattr(payload, "state_policy", {})
+    normalize_state_policy(policy.model_dump() if hasattr(policy, "model_dump") else policy,
+                           state_property, properties)
 
 
 def entity_definition_issues(entity: Any) -> list[str]:

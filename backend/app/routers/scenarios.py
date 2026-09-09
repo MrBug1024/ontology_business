@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import Session, joinedload, load_only
 
 from ..database import get_db
+from ..services import ontology_instance_contract_service, workflow_ontology_contract
 from ..models import (
     ActionExecutionLog,
     Agent,
@@ -1353,6 +1354,7 @@ def _rule_out(r: OntologyRule) -> RuleOut:
         name=r.name,
         description=r.description,
         condition=r.condition or {},
+        input_validation=r.input_validation or "record",
         action_on_match=r.action_on_match,
         trigger_action_ids=r.trigger_action_ids or [],
         severity=r.severity,
@@ -1458,6 +1460,7 @@ def _entity_out(
         color=e.color,
         is_abstract=e.is_abstract,
         state_property=e.state_property or "",
+        state_policy=e.state_policy or {},
         created_at=e.created_at,
         properties=[
             PropertyOut(
@@ -1554,7 +1557,7 @@ def create_scenario(payload: ScenarioIn, db: Session = Depends(get_db)):
     return _scenario_out(s)
 
 
-def _instance_out(db: Session, i: OntologyInstance) -> InstanceOut:
+def _instance_out(db: Session, i: OntologyInstance, *, include_integrity: bool = False) -> InstanceOut:
     ent = i.entity
     can_read = permission_service.check_object(db, i, "read").allowed
     return InstanceOut(
@@ -1569,6 +1572,8 @@ def _instance_out(db: Session, i: OntologyInstance) -> InstanceOut:
         valid_from=i.valid_from,
         valid_to=i.valid_to,
         quality=i.quality or {},
+        integrity=(ontology_instance_contract_service.integrity(db, i)
+                   if can_read and include_integrity else None),
         access_scope=i.access_scope or "tenant",
         entity_name=ent.name if ent else "",
         entity_color=ent.color if ent else "",
@@ -1849,7 +1854,8 @@ def _object_detail_out(
         )
     relations.sort(key=lambda r: (r.direction, r.relation_name, r.related_object_name))
     item = _object_item_out(db, instance, relation_count=len(relations))
-    return ObjectDetailOut(**item.model_dump(), relations=relations)
+    return ObjectDetailOut(**item.model_dump(exclude={"integrity"}), relations=relations,
+                           integrity=ontology_instance_contract_service.integrity(db, instance))
 
 
 @router.get(
@@ -3259,6 +3265,9 @@ def update_entity(entity_id: str, payload: EntityIn, db: Session = Depends(get_d
         raise HTTPException(404, "实体不存在")
     scenario = _scenario_for_request(db, e.scenario_id, writable=True)
     try:
+        ontology_instance_contract_service.protect_existing_identity(db, e, payload.properties)
+        if "state_policy" not in payload.model_fields_set:
+            payload.state_policy = type(payload.state_policy).model_validate(e.state_policy or {})
         ontology_service.validate_entity_definition(
             payload, scenario_namespace=scenario.namespace or "default"
         )
@@ -3285,6 +3294,8 @@ def update_entity(entity_id: str, payload: EntityIn, db: Session = Depends(get_d
         raise HTTPException(409, str(exc)) from exc
     for k in ("name", "namespace", "description", "icon", "color", "is_abstract", "state_property"):
         setattr(e, k, getattr(payload, k))
+    if "state_policy" in payload.model_fields_set:
+        e.state_policy = payload.state_policy.model_dump()
     # Older clients do not know this field.  Treat an omitted value as "keep"
     # on PUT so editing a retired Object Type cannot accidentally reactivate it.
     if "lifecycle_status" in payload.model_fields_set:
@@ -3646,16 +3657,22 @@ def create_instance(scenario_id: str, payload: InstanceIn, db: Session = Depends
             payload.attributes,
             explicit_name=payload.name,
         )
-    i = OntologyInstance(scenario_id=scenario_id, **payload.model_dump())
-    db.add(i)
-    db.commit()
+    try:
+        if payload.source != "manual":
+            raise ontology_instance_contract_service.InstanceContractConflict("受管导入实例只能通过数据映射创建")
+        ontology_instance_contract_service.validate_manual_write(entity, payload.attributes, payload.state)
+        i = OntologyInstance(scenario_id=scenario_id, **payload.model_dump())
+        db.add(i)
+        ontology_instance_contract_service.commit_instance(db)
+    except ontology_instance_contract_service.InstanceContractConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     db.refresh(i)
-    return _instance_out(db, i)
+    return _instance_out(db, i, include_integrity=True)
 
 
 @router.put("/instances/{instance_id}", response_model=InstanceOut)
 def update_instance(instance_id: str, payload: InstanceIn, db: Session = Depends(get_db)):
-    i = db.get(OntologyInstance, instance_id)
+    i = db.execute(select(OntologyInstance).where(OntologyInstance.id == instance_id).with_for_update()).scalar_one_or_none()
     if not i or not _instance_in_current_runtime(i):
         raise HTTPException(404, "实例不存在")
     _scenario_for_request(db, i.scenario_id, writable=True)
@@ -3684,6 +3701,12 @@ def update_instance(instance_id: str, payload: InstanceIn, db: Session = Depends
             payload.attributes,
             explicit_name=payload.name,
         )
+    try:
+        if payload.source != i.source or i.source != "manual":
+            raise ontology_instance_contract_service.InstanceContractConflict("受管导入实例必须通过原数据来源更新")
+        ontology_instance_contract_service.validate_manual_write(entity, payload.attributes, payload.state, previous=i)
+    except ontology_instance_contract_service.InstanceContractConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     for k in (
         "entity_id",
         "name",
@@ -3697,9 +3720,12 @@ def update_instance(instance_id: str, payload: InstanceIn, db: Session = Depends
         "access_scope",
     ):
         setattr(i, k, getattr(payload, k))
-    db.commit()
+    try:
+        ontology_instance_contract_service.commit_instance(db)
+    except ontology_instance_contract_service.InstanceContractConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     db.refresh(i)
-    return _instance_out(db, i)
+    return _instance_out(db, i, include_integrity=True)
 
 
 @router.delete("/instances/{instance_id}", response_model=Msg)
@@ -4741,6 +4767,8 @@ def update_rule(rule_id: str, payload: RuleIn, db: Session = Depends(get_db)):
         _entity_in_scenario(db, r.scenario_id, payload.entity_id)
     _validate_trigger_actions(db, r.scenario_id, payload.trigger_action_ids)
     for k, v in payload.model_dump().items():
+        if k == "input_validation" and k not in payload.model_fields_set:
+            continue
         setattr(r, k, v)
     db.commit()
     db.refresh(r)
@@ -4889,6 +4917,10 @@ def publish_event(event_id: str, payload: EventPublishIn, db: Session = Depends(
 @router.post("/{scenario_id}/workflows", response_model=WorkflowOut)
 def create_workflow(scenario_id: str, payload: WorkflowIn, db: Session = Depends(get_db)):
     s = _scenario_for_request(db, scenario_id, writable=True)
+    try:
+        workflow_ontology_contract.validate_authoring(db, s, payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     _require_restricted_scope_management(db, payload.access_scope)
     _validate_workflow_refs(db, scenario_id, payload.steps, payload.nodes)
     _validate_workflow_trigger(
@@ -4916,7 +4948,11 @@ def update_workflow(workflow_id: str, payload: WorkflowIn, db: Session = Depends
     w = db.get(OntologyWorkflow, workflow_id)
     if not w:
         raise HTTPException(404, "工作流不存在")
-    _scenario_for_request(db, w.scenario_id, writable=True)
+    scenario = _scenario_for_request(db, w.scenario_id, writable=True)
+    try:
+        workflow_ontology_contract.validate_authoring(db, scenario, payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     try:
         operations_service.assert_workflow_mutable(db, w.id)
     except PolicyViolation as exc:

@@ -63,24 +63,16 @@
             <el-icon><component :is="m.role === 'user' ? 'User' : 'Cpu'" /></el-icon>
           </div>
           <div class="msg-bubble">
-            <PlainMessage v-if="m.content" :content="m.content" />
+            <AgentExecutionTrace
+              v-if="m.role === 'assistant' && agent?.id && m.id"
+              :agent-id="agent.id" :message-id="m.id" :run-id="m.turnId" :revision="m.turnRevision"
+              :active="m.streaming" :status-label="m.status" :tool-calls="m.tool_calls || []"
+              :receipt-owners="receiptOwners" @updating="followReceipt"
+            />
+            <SafeMarkdown v-if="m.role === 'assistant' && m.content" :content="m.content" />
+            <div v-else-if="m.content" class="user-message">{{ m.content }}</div>
             <MessageInputAttachments v-if="m.role === 'user'" :snapshot="m.input_snapshot" />
-            <!-- 工具调用卡片 -->
-            <template v-for="(tc, ti) in m.tool_calls || []" :key="'tc' + ti">
-              <AgentCapabilityReceipt
-                v-if="capabilityInvocationId(tc) && agent?.id && m.id && receiptOwners.get(capabilityInvocationId(tc)) === m.id"
-                :agent-id="agent.id" :message-id="m.id"
-                :invocation-id="capabilityInvocationId(tc)"
-                :scenario-id="agent.scenario_id || undefined" :streaming="m.streaming"
-                @updating="followReceipt"
-              />
-            </template>
             <!-- 状态提示 -->
-            <div v-if="m.status && (m.streaming || canRetryTurn(m))" class="status-line" role="status" aria-live="polite" aria-atomic="true">
-              <el-icon v-if="m.streaming" class="is-loading" aria-hidden="true"><Loading /></el-icon>
-              {{ m.status }}
-            </div>
-            <!-- 渠道消息以纯文本呈现。 -->
             <div v-if="canRetryTurn(m) || canCancelTurn(m)" class="turn-actions">
               <el-button v-if="canRetryTurn(m)" size="small" :loading="m.retrying" @click="retryTurn(m)">
                 <el-icon aria-hidden="true"><RefreshRight /></el-icon>重试
@@ -189,9 +181,8 @@ import type {
 } from '@/types'
 import AgentInvocationComposer from '@/components/AgentInvocationComposer.vue'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
-import PlainMessage from '@/components/PlainMessage.vue'
 import MessageInputAttachments from '@/components/agent/MessageInputAttachments.vue'
-import AgentCapabilityReceipt from '@/components/agent/AgentCapabilityReceipt.vue'
+import AgentExecutionTrace from '@/components/agent/AgentExecutionTrace.vue'
 import { capabilityInvocationId } from '@/utils/agentCapabilityReceipt'
 import { actionArtifactAttachment } from '@/utils/artifactAttachments'
 import type { ArtifactAttachment } from '@/utils/artifactAttachments'
@@ -498,6 +489,7 @@ const {
   clearComposerAfterAccepted: () => composerRef.value?.clearAfterAccepted(),
   normalizeCitations: citationsOf,
   scrollBottom,
+  followProgress: followReceipt,
 })
 
 async function loadAgent() {
@@ -610,7 +602,8 @@ async function openConv(c: Conversation, clearMessages = true) {
       || agent.value?.id !== requestedAgentId
     ) return
     messages.value = loadedMessages.map(messageFromHistory)
-    scrollBottom()
+    if (clearMessages) scrollBottom()
+    else followReceipt()
 
     try {
       const [recentConversationRuns, activeConversationRuns] = requestedAgentId
@@ -633,7 +626,8 @@ async function openConv(c: Conversation, clearMessages = true) {
         || agent.value?.id !== requestedAgentId
       ) return
       recoverConversationTurns([...recentConversationRuns, ...activeConversationRuns])
-      scrollBottom()
+      if (clearMessages) scrollBottom()
+      else followReceipt()
     } catch (error: unknown) {
       if (
         !viewDisposed
@@ -710,6 +704,7 @@ onBeforeUnmount(() => {
 .chat-layout { height: 100%; min-height: 0; overflow: hidden; }
 .chat-side, .chat-main { min-height: 0; overflow: hidden; }
 .chat-messages { min-height: 0; overscroll-behavior: contain; }
+.user-message { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; min-width: 0; }
 .validation-notice { flex: 0 0 auto; margin: 12px 34px 0; }
 .chat-layout button, .chat-layout :deep(.el-button) { touch-action: manipulation; }
 .chat-layout :deep(.el-button) { min-height: 44px; }

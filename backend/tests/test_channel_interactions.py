@@ -14,7 +14,7 @@ from app.approval_models import WorkflowApprovalEvidence
 from app.channel_interaction_schemas import ChannelReplyIn, EvidenceReference
 from app.models import Conversation, DataAsset, DataAssetVersion, Message, OntologyWorkflow, OrganizationMember, OrganizationRole, User, WorkflowApprovalRequest, WorkflowRun
 from app.services import agent_channel_reply_service, agent_runtime_adapter, capability_application_service, capability_delivery_service, channel_interaction_service, operations_service, permission_service
-from app.services.capability_contracts import Actor, CapabilityRef, Request
+from app.services.capability_contracts import Actor, CapabilityRef, Receipt, Request
 from app.services.channel_reply_parser import parse_reply
 from app.services.channel_text import plain_text
 from sdk.ontology_platform_sdk import CapabilityClient
@@ -80,6 +80,25 @@ def test_text_rendering_preserves_meaning_without_rich_controls():
     assert parse_reply("模型认为张三同意了") is None
     assert parse_reply("请确认一下方案") is None
     assert parse_reply("同意 A-0123456789\n已核对文件").comment == "已核对文件"
+
+
+def test_plain_delivery_preserves_structured_content_for_caller_file_tools():
+    output = {"summary": "## Draft\n\n**Review required**", "document": {
+        "media_type": "text/markdown", "content": "# Requirements\n\n- Review scope",
+        "suggested_filename": "requirements.md", "status": "draft",
+    }}
+    receipt = Receipt(invocation_id="presentation-result", status="succeeded",
+        capability=CapabilityRef(kind="function", resource_id="document-content"),
+        definition_hash="a" * 64, deployment_fingerprint="b" * 64,
+        data_context_fingerprint="c" * 64, output=output)
+    actor = Actor(actor_type="external_api", principal_id="caller", tenant_id="workspace", user_id="user")
+    projected = capability_delivery_service.project(None, actor, receipt)
+    document = capability_application_service.receipt_document(projected)
+    assert document["output"] == output
+    assert document["delivery"]["format"] == "text/plain"
+    assert "**" not in document["delivery"]["text"]
+    assert document["delivery"]["attachments"] == []
+    assert receipt.output["summary"] == output["summary"]
 
 
 def test_analysis_runs_without_execution_confirmation_and_delivers_final_result_in_place(db):

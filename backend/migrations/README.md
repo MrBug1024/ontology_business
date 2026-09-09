@@ -6,6 +6,18 @@ DDL. Run `alembic upgrade head` with the migration owner before starting the
 application, then use the runtime verification script to confirm the deployed
 revision and permissions.
 
+Revision `20260909_29` adds object lifecycle policies, the rule input-validation
+mode and manual-instance business identity uniqueness. Its backfill refuses
+ambiguous keys or duplicate identities instead of merging records. Incomplete
+legacy records retain a missing identity until explicitly corrected. Database
+triggers serialize identity-definition changes and enforce manual initial states
+and transitions; the runtime role performs no DDL. Immutable release JSON is not
+rewritten. Downgrade refuses to discard enabled lifecycle policies.
+
+Revision `20260909_30` canonicalizes numeric identity hashes so `1` and `1.0`
+cannot create distinct manual objects. Original attribute values are retained.
+Equivalent existing identities block migration and require explicit resolution.
+
 ## Business identity and manual publication
 
 Revision `20260908_27` removes deployment labels from current business columns,

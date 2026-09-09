@@ -409,6 +409,7 @@ class OntologyEntity(Base):
     color: Mapped[str] = mapped_column(String(20), default="#4f46e5")
     is_abstract: Mapped[bool] = mapped_column(Boolean, default=False)
     state_property: Mapped[str] = mapped_column(String(200), default="")
+    state_policy: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship(back_populates="entities")
@@ -527,6 +528,7 @@ class OntologyInstance(Base):
     __tablename__ = "ontology_instances"
     __table_args__ = (
         UniqueConstraint("id", "scenario_id", name="uq_instances_id_scenario"),
+        UniqueConstraint("entity_id", "business_key_hash", name="uq_instances_business_key"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -538,6 +540,7 @@ class OntologyInstance(Base):
     )
     name: Mapped[str] = mapped_column(String(300), nullable=False)  # 展示名
     attributes: Mapped[dict] = mapped_column(JSON, default=dict)  # 属性值
+    business_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source: Mapped[str] = mapped_column(String(20), default="manual")  # manual / imported
     source_ref: Mapped[str] = mapped_column(String(500), default="")  # 来源引用（表.行 等）
     # 内部血缘快照（mapping_id/data_source_id/table/key 等）；对外 DTO 保持兼容。
@@ -2360,6 +2363,7 @@ class OntologyRule(Base):
     """
 
     __tablename__ = "ontology_rules"
+    __table_args__ = (CheckConstraint("input_validation IN ('object', 'record')", name="ck_rule_input_validation"),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     scenario_id: Mapped[str] = mapped_column(
@@ -2373,6 +2377,7 @@ class OntologyRule(Base):
     # 规则条件表达式（JSON）：
     # {"op":"and","conditions":[{"field":"数量","op":">","value":2}, ...]}
     condition: Mapped[dict] = mapped_column(JSON, default=dict)
+    input_validation: Mapped[str] = mapped_column(String(20), default="object")
     # 规则命中后的动作（描述性 + 可选触发的 action_id 列表）
     action_on_match: Mapped[str] = mapped_column(Text, default="")
     trigger_action_ids: Mapped[list] = mapped_column(JSON, default=list)

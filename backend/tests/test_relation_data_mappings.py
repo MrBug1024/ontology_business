@@ -712,13 +712,16 @@ def test_title_name_is_server_synchronized_for_manual_create_and_search(tmp_path
             attributes={"编码": "M-1", "标题": 0},
         )
         allow = SimpleNamespace(allowed=True)
+        def instance_result(_db, item, *, include_integrity):
+            assert include_integrity is True
+            return item
         with (
             patch.object(scenarios, "_scenario_for_request", return_value=world.scenario),
             patch.object(
                 scenarios.permission_service,
                 "require_instance_attribute_write_permissions",
             ),
-            patch.object(scenarios, "_instance_out", side_effect=lambda _db, item: item),
+            patch.object(scenarios, "_instance_out", side_effect=instance_result),
         ):
             instance = scenarios.create_instance(world.scenario.id, payload, world.db)
         assert instance.name == "0"

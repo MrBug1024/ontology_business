@@ -54,6 +54,7 @@ from . import (
     template_catalog_service,
     tenant_service,
     workflow_payload_service,
+    workflow_ontology_contract,
 )
 from .policies import PolicyViolation, validate_action_params, validate_workflow_graph
 
@@ -216,6 +217,7 @@ def normalize_parameter_schema(schema: Any) -> dict[str, Any]:
 def workflow_parameter_schema(
     workflow: Any,
     actions: list[Any] | tuple[Any, ...],
+    *, definition: Any = None,
 ) -> dict[str, Any]:
     """Return the existing inferred workflow input contract as JSON Schema."""
 
@@ -223,7 +225,8 @@ def workflow_parameter_schema(
     if isinstance(trigger, dict):
         explicit = trigger.get("input_schema") or trigger.get("params_schema")
         if isinstance(explicit, dict):
-            return normalize_parameter_schema(explicit)
+            return workflow_ontology_contract.parameter_schema(
+                workflow, definition, normalize_parameter_schema(explicit))
 
     action_by_id = {
         str(getattr(action, "id", "")): action
@@ -279,12 +282,13 @@ def workflow_parameter_schema(
                 definition=action_properties.get(action_field),
             )
 
-    return {
+    inferred = {
         "type": "object",
         "properties": properties,
         "required": [name for name in properties if name in required],
         "additionalProperties": True,
     }
+    return workflow_ontology_contract.parameter_schema(workflow, definition, inferred)
 
 
 def validate_workflow_references(
@@ -677,6 +681,12 @@ def evaluate_rule(
         definition=runtime_definition,
         db=db,
     )
+    if getattr(rule, "input_validation", "record") == "object":
+        from .ontology_rule_contract import validate_record
+        entity = (runtime_definition.entities.get(str(rule.entity_id))
+                  if runtime_definition is not None else getattr(rule, "entity", None))
+        validate_record(rule, record, entity, sorted(
+            capability_readiness_service.condition_fields(rule.condition or {})))
     matched = evaluate_condition(rule.condition or {}, record)
     trigger_actions: list[dict[str, Any]] = []
     if matched and runtime_definition is not None:
@@ -2238,6 +2248,7 @@ def execute_workflow(
     workflow_permission = permission_service.check_workflow(db, workflow, "execute")
     if not workflow_permission.allowed:
         raise PolicyViolation("没有执行该工作流的权限")
+    workflow_ontology_contract.validate_inputs(workflow, runtime_definition, params, db=db)
     start = time.time()
     provenance = _runtime_provenance(runtime_definition)
     workflow_permission_summary = {
@@ -2314,7 +2325,11 @@ def execute_workflow(
         elif waiting:
             log.status = "awaiting_approval"
         else:
-            log.status = "success"
+            try:
+                workflow_ontology_contract.require_output_completion(workflow, step_results)
+                log.status = "success"
+            except PolicyViolation as exc:
+                log.status, log.error = "failed", str(exc)
     except Exception as exc:  # noqa: BLE001
         log.status = "failed"
         log.error = str(exc)
@@ -2410,7 +2425,7 @@ def _execute_steps(
                 step_result["error"] = f"规则已停用: {rule.name}"
             else:
                 record = step.get("record", context.get("record", {}))
-                r = evaluate_rule(rule, record)
+                r = evaluate_rule(rule, record, db=db, runtime_definition=runtime_definition)
                 step_result["status"] = "matched" if r["matched"] else "not_matched"
                 step_result["result"] = r
                 context[f"step_{step_num}"] = r
@@ -2545,8 +2560,14 @@ def _execute_dag(
             ctx[node_id] = params
 
         elif ntype == "end":
-            res["status"] = "success"
-            res["result"] = {"summary": render_template(data.get("summary", ""), ctx)}
+            try:
+                res["result"] = render_template(data["output"], ctx) if "output" in data else {
+                    "summary": render_template(data.get("summary", ""), ctx)}
+                if workflow_ontology_contract.validate_output(workflow, node_id, res["result"]):
+                    res["contract_validation"] = "passed"
+                res["status"] = "success"
+            except PolicyViolation as exc:
+                res["status"], res["error"] = "failed", str(exc)
 
         elif ntype == "action":
             action = _definition_resource(
@@ -2595,7 +2616,7 @@ def _execute_dag(
                 record = render_template(data.get("record", {}) or {}, ctx)
                 if not isinstance(record, dict):
                     record = {"value": record}
-                r = evaluate_rule(rule, record)
+                r = evaluate_rule(rule, record, db=db, runtime_definition=runtime_definition)
                 res["status"] = "matched" if r["matched"] else "not_matched"
                 res["result"] = r
                 ctx[node_id] = _wrap_out(r)
@@ -2642,16 +2663,18 @@ def _execute_dag(
                 try:
                     resp = llm_service.chat(
                         llm,
-                        [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": str(prompt)},
-                        ],
+                        workflow_ontology_contract.llm_messages(
+                            workflow, runtime_definition, system, str(prompt), db=db, node_id=node_id),
                         temperature=0.3,
                         db=db,
                     )
                     content = resp.get("content", "")
+                    parsed = _try_parse_json(content)
+                    validated = workflow_ontology_contract.validate_output(workflow, node_id, parsed)
                     res["status"] = "success"
-                    res["result"] = {"result": content, "parsed": _try_parse_json(content)}
+                    res["result"] = {"result": content, "parsed": parsed}
+                    if validated:
+                        res["contract_validation"] = "passed"
                     ctx[node_id] = res["result"]
                 except Exception as exc:  # noqa: BLE001
                     res["status"] = "failed"

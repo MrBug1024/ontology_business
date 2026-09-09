@@ -98,8 +98,16 @@ settings = get_settings()
 mcp_server = FastMCP(
     name="Ontology Platform Agent Gateway",
     instructions=(
-        "Use invoke_agent with an Agent publication token. Use the generic capability tools "
-        "with a capabilities-scoped external API key; all execution uses governed references."
+        "To add business capabilities to your own agent, use list_capabilities, "
+        "invoke_capability and get_capability_receipt with a capabilities-scoped API key. "
+        "These tools return structured receipts, not a hosted conversation. Read output "
+        "according to the discovered contract; delivery.text is only an optional plain-text "
+        "summary. Your agent controls answer formatting and authorized local file creation, "
+        "storage and delivery. Draft content does not prove a file was saved or sent. "
+        "Supply current typed inputs; managed references are required only by declared data ports. "
+        "Execution status, authorization and confirmation remain server-authoritative. "
+        "Use invoke_agent with an Agent publication token only when deliberately delegating "
+        "the conversation to the platform Agent."
     ),
     streamable_http_path="/mcp",
     stateless_http=True,
@@ -172,7 +180,7 @@ def _capability_identity() -> capability_mcp_service.AuthenticatedCapabilityMCP:
 @mcp_server.tool(
     name="list_capabilities",
     title="发现业务能力",
-    description="返回指定场景已启用发布中当前主体可见的能力契约与就绪状态。",
+    description="返回指定场景已启用发布中当前主体可见的业务输入、输出和数据端口契约与就绪状态；供调用方自己的 Agent 发现能力。",
     structured_output=True,
 )
 async def list_capabilities(
@@ -194,7 +202,10 @@ async def list_capabilities(
     name="invoke_capability",
     title="调用业务能力",
     description=(
-        "使用结构化输入和受管数据引用调用指定能力；不接受连接串、凭据、SQL 或物理表名。"
+        "直接执行指定业务能力并返回结构化回执，不调用完整平台对话 Agent。"
+        "按已发现契约提交本次 inputs，仅在数据端口要求时提供 managed_inputs。"
+        "output 是业务结果，delivery.text 是可选纯文本摘要；调用方决定回答格式和本地附件交付。"
+        "不接受连接串、凭据、SQL 或物理表名。"
     ),
     structured_output=True,
 )

@@ -11,6 +11,7 @@ from app.models import AgentTurnRun, Message
 from app.routers import agent_turns, agents
 from app.services import agent_runtime_adapter, agent_turn_service
 from app.services.agent_turn_progress_service import TurnProgress
+from app.services.agent_tool_progress import public_tool_progress
 from app.services.auth_service import get_tenant_db
 from .test_agent_runtime_adapter import _world, db
 from .test_agent_turn_service import _database, _payload, turn_database
@@ -112,6 +113,47 @@ def test_cancellation_fences_buffered_text(turn_database):
         progress.flush()
     with _database(turn_database) as session:
         assert "迟到内容" not in agent_turn_service.get_turn(session, queued["id"])["result"]["answer"]
+
+
+def test_tool_lifecycle_is_replayable_without_private_payloads(turn_database):
+    queued, lease = _claimed(turn_database)
+    progress = TurnProgress(queued["id"], lease, turn_database)
+    progress({"type": "tool_call", "data": {
+        "id": "call_a", "name": "invoke_capability", "arguments": {"secret": "private-input"},
+    }})
+    progress({"type": "tool_result", "data": {
+        "id": "call_a", "name": "invoke_capability", "result": json.dumps({
+            "status": "failed", "invocation_id": "a" * 32,
+            "error": {"code": "provider_execution_failed", "message": "private-error"},
+            "output": {"secret": "private-output"},
+        }),
+    }})
+    with _database(turn_database) as session:
+        events = agent_turn_service.list_turn_events(session, queued["id"], after_revision=queued["revision"])
+    steps = [event["data"]["tool_step"] for event in events if "tool_step" in event["data"]]
+    assert steps == [
+        {"call_id": "call_a", "name": "invoke_capability", "phase": "started", "status": "running"},
+        {"call_id": "call_a", "name": "invoke_capability", "phase": "finished", "status": "failed",
+         "invocation_id": "a" * 32, "error_code": "provider_execution_failed"},
+    ]
+    assert "private-" not in json.dumps([event["data"] for event in events])
+    with _database(turn_database) as session:
+        current = agent_turn_service.get_turn(session, queued["id"])
+        agent_turn_service.cancel_turn(session, queued["id"], expected_revision=current["revision"])
+    with pytest.raises(RuntimeError, match="租约"):
+        progress({"type": "tool_result", "data": {"id": "call_a", "name": "invoke_capability", "result": {}}})
+
+
+def test_tool_progress_projection_rejects_untrusted_metadata_and_preserves_waiting():
+    def project(result):
+        return public_tool_progress({"type": "tool_result", "data": {"id": "a", "name": "invoke_capability", "result": result}})
+
+    assert project({"status": "awaiting_approval"}).status == "awaiting_approval"
+    assert project({"status": {"untrusted": True}}).status == "returned"
+    assert project({"ok": False}).status == "failed"
+    assert project({"status": "indeterminate", "error": {"code": "unknown_result"}}).status == "indeterminate"
+    assert project({"error": {"code": "secret value"}, "invocation_id": "../private"}).error_code is None
+    assert public_tool_progress({"type": "tool_call", "data": {"id": "bad id", "name": "x"}}) is None
 
 
 def test_sse_replays_all_pages_before_terminal_marker(turn_database):

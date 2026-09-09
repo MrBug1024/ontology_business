@@ -29,11 +29,13 @@ _HAVING_OPERATORS = frozenset({"eq", "ne", "gt", "gte", "lt", "lte", "in", "not_
 def public_query_schema() -> dict[str, Any]:
     """Return the protocol-neutral semantic object-set query contract."""
 
+    from .business_query_roles import ROLE_SCHEMA
     entity_reference = {
         "type": "object",
         "properties": {
             "entity_id": {"type": "string", "minLength": 1},
             "entity_name": {"type": "string", "minLength": 1},
+            "role": ROLE_SCHEMA,
         },
         "anyOf": [
             {"required": ["entity_id"]},
@@ -57,6 +59,7 @@ def public_query_schema() -> dict[str, Any]:
     entity_selector = {
         "entity_id": {"type": "string", "minLength": 1},
         "entity_name": {"type": "string", "minLength": 1},
+        "role": ROLE_SCHEMA,
     }
     schema: dict[str, Any] = {
         "type": "object",
@@ -89,6 +92,8 @@ def public_query_schema() -> dict[str, Any]:
                     "type": "object",
                     "properties": {
                         **entity_selector,
+                        "relation_id": {"type": "string", "minLength": 1, "maxLength": 32},
+                        "direction": {"type": "string", "enum": ["outgoing", "incoming"]},
                         "properties": {
                             "type": "array",
                             "items": {"type": "string", "minLength": 1},
@@ -480,11 +485,14 @@ def _configured_relation_mapping(
     definition: Any,
     base: _SourcePlan,
     related: _SourcePlan,
+    relation_id: str = "",
 ) -> Any | None:
     """Resolve one visible, configured relation between two object mappings."""
     mapping_ids = {str(base.mapping.id), str(related.mapping.id)}
     candidates = []
     for item in (getattr(definition, "relation_mappings", {}) or {}).values():
+        if relation_id and str(getattr(item, "relation_id", "")) != relation_id:
+            continue
         endpoint_ids = {
             str(getattr(item, "source_mapping_id", "") or ""),
             str(getattr(item, "target_mapping_id", "") or ""),
@@ -546,9 +554,22 @@ def _relation_join_sql(
     base_alias: str,
     related_alias: str,
     through_alias: str,
+    relation_id: str = "",
+    direction: str = "",
 ) -> list[str]:
     """Compile one governed relationship into one or two JOIN clauses."""
     join_data = _object(join, "关联条件") if join is not None else {}
+    if relation_id:
+        relation = (getattr(definition, "relations", {}) or {}).get(relation_id)
+        endpoints = {str(base.entity.id), str(related.entity.id)}
+        if relation is None or {str(relation.source_entity_id), str(relation.target_entity_id)} != endpoints:
+            raise BusinessQueryError("查询引用的关系不连接所选对象类型")
+    if direction and direction not in {"outgoing", "incoming"}:
+        raise BusinessQueryError("关系方向必须为 outgoing 或 incoming")
+    if str(base.entity.id) == str(related.entity.id) and (not relation_id or not direction):
+        raise BusinessQueryError("同类型对象的不同角色必须指定关系与方向")
+    if relation_id and join_data:
+        raise BusinessQueryError("指定受管关系后不能覆盖其关联条件")
     if join_data:
         left, right = _join_columns(
             base,
@@ -563,7 +584,9 @@ def _relation_join_sql(
             f" {_alias(source_type, related_alias)} ON {left.expression} = {right.expression}"
         ]
 
-    configured = _configured_relation_mapping(definition, base, related)
+    configured = _configured_relation_mapping(definition, base, related, relation_id)
+    if relation_id and configured is None:
+        raise BusinessQueryError("所选关系尚未配置可查询的受管映射")
     if configured is None:
         left, right = _join_columns(
             base,
@@ -591,6 +614,11 @@ def _relation_join_sql(
     target_mapping_id = str(getattr(configured, "target_mapping_id", "") or "")
     base_is_source = str(base.mapping.id) == source_mapping_id
     base_is_target = str(base.mapping.id) == target_mapping_id
+    if base_is_source and base_is_target:
+        base_is_source = direction == "outgoing"
+        base_is_target = direction == "incoming"
+    elif direction and ((direction == "outgoing") != base_is_source):
+        raise BusinessQueryError("关系方向与所选对象端点不一致")
     if not (base_is_source or base_is_target):
         raise BusinessQueryError("关系数据映射端点不属于当前查询范围")
     if base_is_source and str(related.mapping.id) != target_mapping_id:
@@ -702,6 +730,7 @@ def prepare_query(
     data_sources: Sequence[Any],
     args: Any,
 ) -> dict[str, Any]:
+    from .business_query_roles import role_key, resolve_role
     request = _object(args, "业务查询参数")
     allowed = {
         "base_entity", "base_properties", "base_filters", "related_entities",
@@ -721,10 +750,14 @@ def prepare_query(
     )
     related_raw = _list(request.get("related_entities"), "related_entities", maximum=5)
     related: list[tuple[_SourcePlan, dict[str, Any], str]] = []
-    used_entities = {str(base.entity.id)}
+    try:
+        base_key = role_key(base_request, str(base.entity.id))
+    except ValueError as exc:
+        raise BusinessQueryError(str(exc)) from exc
+    used_roles = {base_key}
     for index, raw in enumerate(related_raw):
         item = _object(raw, f"related_entities[{index}]")
-        if set(item) - {"entity_id", "entity_name", "properties", "filters", "join"}:
+        if set(item) - {"entity_id", "entity_name", "properties", "filters", "join", "role", "relation_id", "direction"}:
             raise BusinessQueryError("关联对象包含不支持的参数")
         plan = _source_plan(
             db,
@@ -734,20 +767,32 @@ def prepare_query(
             request=item,
             label=f"related_entities[{index}]",
         )
-        if str(plan.entity.id) in used_entities:
-            raise BusinessQueryError("业务查询不能重复关联同一个对象类型")
+        try:
+            key = role_key(item, str(plan.entity.id))
+        except ValueError as exc:
+            raise BusinessQueryError(str(exc)) from exc
+        if key in used_roles:
+            raise BusinessQueryError("业务查询角色不能重复，同类型对象须指定不同 role")
         if str(plan.source.id) != str(base.source.id):
             raise BusinessQueryError("当前业务查询只支持同一数据源内的对象关联")
-        used_entities.add(str(plan.entity.id))
+        used_roles.add(key)
         related.append((plan, item, f"r{index}"))
 
     source_type = str(base.source.type)
     parameters: dict[str, Any] = {}
-    aliases: dict[str, str] = {str(base.entity.id): "b"}
-    plans: dict[str, _SourcePlan] = {str(base.entity.id): base}
-    for plan, _item, alias in related:
-        aliases[str(plan.entity.id)] = alias
-        plans[str(plan.entity.id)] = plan
+    aliases: dict[str, str] = {base_key: "b"}
+    plans: dict[str, _SourcePlan] = {base_key: base}
+    for plan, item, alias in related:
+        key = role_key(item, str(plan.entity.id))
+        aliases[key] = alias
+        plans[key] = plan
+
+    def selected_role(item: dict, label: str) -> str:
+        entity = mapped_query_service._entity_from_request(definition, _entity_request(item, label))
+        try:
+            return resolve_role(plans, str(entity.id), item)
+        except ValueError as exc:
+            raise BusinessQueryError(str(exc)) from exc
 
     raw_aggregations = _list(request.get("aggregations"), "aggregations", maximum=20)
     base_properties = _list(
@@ -768,7 +813,7 @@ def prepare_query(
             maximum=50,
         )
         for name in properties:
-            label = f"{plan.entity.name}.{str(name).strip()}"
+            label = f"{item.get('role') or plan.entity.name}.{str(name).strip()}"
             columns.append(_column(plan, name, alias, label, allow_transform=True))
 
     where = _filter_sql(
@@ -789,6 +834,8 @@ def prepare_query(
                 base_alias="b",
                 related_alias=alias,
                 through_alias=f"j{index}",
+                relation_id=str(item.get("relation_id") or ""),
+                direction=str(item.get("direction") or ""),
             )
         )
         where.extend(
@@ -814,14 +861,11 @@ def prepare_query(
     group_labels: set[str] = set()
     for index, raw in enumerate(_list(request.get("group_by"), "group_by", maximum=20)):
         item = _object(raw, f"group_by[{index}]")
-        if set(item) - {"entity_id", "entity_name", "property"}:
+        if set(item) - {"entity_id", "entity_name", "property", "role"}:
             raise BusinessQueryError("group_by 只支持对象和 property")
-        key = _entity_request(item, f"group_by[{index}]")
-        entity = mapped_query_service._entity_from_request(definition, key)
-        plan = plans.get(str(entity.id))
-        if plan is None:
-            raise BusinessQueryError("group_by 引用了未参与查询的对象类型")
-        column = _column(plan, item.get("property"), aliases[str(entity.id)], "")
+        key = selected_role(item, f"group_by[{index}]")
+        plan = plans[key]
+        column = _column(plan, item.get("property"), aliases[key], "")
         group_sql.append(column.expression)
         group_labels.add(column.property_name)
 
@@ -831,7 +875,7 @@ def prepare_query(
     for index, raw in enumerate(raw_aggregations):
         item = _object(raw, f"aggregations[{index}]")
         if set(item) - {
-            "function", "entity_id", "entity_name", "property", "alias", "filters",
+            "function", "entity_id", "entity_name", "property", "alias", "filters", "role",
         }:
             raise BusinessQueryError(
                 "聚合只支持 function、对象、property、alias 和 filters"
@@ -839,15 +883,12 @@ def prepare_query(
         function = str(item.get("function") or "").strip().lower()
         if function not in _AGGREGATIONS:
             raise BusinessQueryError("聚合函数只支持 count、sum、avg、min、max")
-        key = _entity_request(item, f"aggregations[{index}]")
-        entity = mapped_query_service._entity_from_request(definition, key)
-        plan = plans.get(str(entity.id))
-        if plan is None:
-            raise BusinessQueryError("聚合引用了未参与查询的对象类型")
+        key = selected_role(item, f"aggregations[{index}]")
+        plan = plans[key]
         property_name = item.get("property")
         column: _Column | None = None
         if property_name not in (None, ""):
-            column = _column(plan, property_name, aliases[str(entity.id)], "")
+            column = _column(plan, property_name, aliases[key], "")
         elif function != "count":
             raise BusinessQueryError(f"aggregations[{index}] 的 {function} 聚合必须提供 property")
         if function in {"sum", "avg"} and column is not None:
@@ -862,7 +903,7 @@ def prepare_query(
         aggregate_expression = column.expression if column is not None else "*"
         aggregate_filters = _filter_sql(
             source_type,
-            aliases[str(entity.id)],
+            aliases[key],
             _normalize_filters(plan, item.get("filters")),
             parameters,
             f"aggregate_{index}_filter",
@@ -982,12 +1023,9 @@ def prepare_query(
                 f"{mapped_query_service.quote_identifier(source_type, f'q_agg_{aggregate_alias_indexes[alias]}')} {direction.upper()}"
             )
             continue
-        key = _entity_request(item, f"sort[{index}]")
-        entity = mapped_query_service._entity_from_request(definition, key)
-        plan = plans.get(str(entity.id))
-        if plan is None:
-            raise BusinessQueryError("sort 引用了未参与查询的对象类型")
-        sort_column = _column(plan, item.get("property"), aliases[str(entity.id)], "")
+        key = selected_role(item, f"sort[{index}]")
+        plan = plans[key]
+        sort_column = _column(plan, item.get("property"), aliases[key], "")
         sort_sql.append(f"{sort_column.expression} {direction.upper()}")
     if sort_sql:
         sql += " ORDER BY " + ", ".join(sort_sql)

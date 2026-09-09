@@ -1,7 +1,16 @@
 <template>
   <section class="capability-receipt" aria-label="业务处理结果" :aria-busy="loading">
-    <strong v-if="receipt">{{ receipt.name }}</strong>
-    <div v-if="receipt" class="receipt-text" role="status">{{ receipt.delivery.text || receipt.message }}</div>
+    <template v-if="receipt">
+      <div v-for="interaction in pendingInteractions" :key="interaction.id" class="receipt-interaction" role="status">
+        <strong>{{ interaction.title }}</strong>
+        <p>{{ interaction.text }}</p>
+        <p v-for="reply in interaction.reply_texts" :key="reply">{{ reply }}</p>
+      </div>
+      <details class="receipt-details">
+        <summary>查看业务回执</summary>
+        <div class="receipt-text">{{ receipt.delivery.text || receipt.message }}</div>
+      </details>
+    </template>
     <span v-else-if="loading" role="status">正在读取处理结果</span>
     <p v-if="error" class="receipt-error" role="alert">{{ error }}</p>
     <div class="receipt-files">
@@ -21,11 +30,13 @@ import type { AgentCapabilityReceipt } from '@/types/agentCapabilityReceipt'
 import { receiptResourceId } from '@/utils/agentCapabilityReceipt'
 
 const props = defineProps<{ agentId: string; messageId: string; invocationId: string; scenarioId?: string; streaming?: boolean }>()
-const emit = defineEmits<{ (event: 'updating'): void }>()
+const emit = defineEmits<{ (event: 'updating'): void; (event: 'observed', state: { name: string; status: string }): void }>()
 const receipt = ref<AgentCapabilityReceipt | null>(null)
 const loading = ref(false)
 const error = ref('')
 const files = computed(() => (receipt.value?.delivery.attachments || []).filter(file => receiptResourceId(file.id)))
+const pendingInteractions = computed(() => ['awaiting_confirmation', 'awaiting_approval'].includes(receipt.value?.status || '')
+  ? receipt.value?.delivery.interactions || [] : [])
 let generation = 0
 let controller: AbortController | undefined
 let timer: ReturnType<typeof setTimeout> | undefined
@@ -49,6 +60,7 @@ async function refresh() {
     if (current !== generation || request.signal.aborted) return
     if (receipt.value?.delivery.revision !== result.delivery.revision) emit('updating')
     receipt.value = result
+    emit('observed', { name: result.name, status: result.status })
     if (['pending', 'running', 'awaiting_confirmation', 'awaiting_approval'].includes(result.status)) {
       timer = setTimeout(() => { void refresh() }, 2000)
     }
@@ -68,7 +80,10 @@ onBeforeUnmount(stop)
 </script>
 
 <style scoped>
-.capability-receipt { border-top: 1px solid var(--el-border-color); margin-top: 8px; padding: 12px 0; min-width: 0; }
+.capability-receipt { margin-top: 8px; min-width: 0; }
+.receipt-details summary { cursor: pointer; font-size: 12px; padding: 4px 0; }
+.receipt-details summary:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 3px; }
+.receipt-interaction { border-left: 2px solid var(--el-color-warning); padding-left: 10px; overflow-wrap: anywhere; }
 .capability-receipt strong { font-size: 14px; }
 .receipt-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; margin-top: 6px; }
 .receipt-files { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }

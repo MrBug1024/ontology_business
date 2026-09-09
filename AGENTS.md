@@ -193,6 +193,7 @@ Invocation plane  -> data_context_fingerprint
 ### 5.3 统一执行与 Provider
 
 - Agent、REST v2、MCP 和 SDK 只做认证、协议转换、统一调用与 Receipt 渲染；不得复制 capability/readiness、ACL、数据解析、Provider、preview/confirmation/idempotency 或 provenance。
+- 能力契约规定业务输入、输出结构、规则和状态含义；调用方 Agent 与渠道决定对话格式、文件工具、保存位置及交付方式。纯文本投递摘要不得覆盖结构化业务结果，也不得成为全平台禁止 Markdown 的约束。文档内容或拟执行事项不等于已保存/已发送附件；只有受信执行回执证明完成。在线执行仍需明确的本次输入及必要的恢复/审计记录，禁止承诺未经实现的零数据留存或离线执行。
 - 行业字段、算法、场景工具、grounding、历史 alias 和特定逻辑模型只能进入 `backend/app/providers/<provider>/`。
 - 通用内核、Agent shell、协议层与通用 prompt 禁止出现行业名、固定 namespace、业务字段、表名或工具名分支。
 - Provider 按精确 `(provider_key, provider_version)` 由受信代码静态注册；数据库不得指定 Python 路径，禁止动态 `import`、`eval` 或 `exec` 租户代码。

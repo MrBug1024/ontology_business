@@ -13,6 +13,7 @@ import json
 import math
 import re
 import threading
+from types import SimpleNamespace
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -6722,6 +6723,7 @@ def normalize_scenario_model(
                 )
             definition = entity_input.model_dump()
             definition["state_property"] = state_property
+        definition["state_policy"] = copy.deepcopy(value.get("state_policy", getattr(existing, "state_policy", {}) if existing else {}))
         raw_props = {
             _text(prop.get("name"), maximum=200): prop
             for prop in (value.get("properties") or [])
@@ -6875,6 +6877,7 @@ def normalize_scenario_model(
                 "description": definition["description"],
                 "is_abstract": definition["is_abstract"],
                 "state_property": definition["state_property"],
+                "state_policy": definition.get("state_policy", {}),
                 "properties": list(combined_properties.values()),
             })
             ontology_service.validate_entity_definition(
@@ -6906,7 +6909,7 @@ def normalize_scenario_model(
                 )
         entity_fields_changed = bool(existing) and any(
             getattr(existing, field) != definition[field]
-            for field in ("description", "is_abstract", "state_property")
+            for field in ("description", "is_abstract", "state_property", "state_policy")
         )
         property_changes = any(
             prop.get("_operation") in {"add", "update"}
@@ -7340,12 +7343,17 @@ def normalize_scenario_model(
                 source_refs=meta["evidence_refs"],
             )
             severity = "info"
+        input_validation = value.get("input_validation", "object")
+        if input_validation not in {"object", "record"}:
+            _issue(unresolved, "invalid_rule_input_validation", "规则输入校验模式必须为 object 或 record", source_refs=meta["evidence_refs"])
+            input_validation = "object"
         rules.append({
             **meta,
             "name": _text(value.get("name") or key, maximum=200),
             "description": _text(value.get("description")),
             "entity": entity_ref,
             "condition": condition,
+            "input_validation": input_validation,
             "action_on_match": _text(value.get("action_on_match")),
             "trigger_actions": [item for item in action_refs if item],
             "severity": severity,
@@ -8469,6 +8477,12 @@ def _validate_compiled_references(
             state_property not in entity_props or not entity_props[state_property].get("is_enum")
         ):
             raise PolicyViolation(f"对象类型“{item.get('name')}”的状态属性无效")
+        from .ontology_instance_contract_service import normalize_state_policy
+        try:
+            normalize_state_policy(item.get("state_policy", {}), state_property,
+                                   [SimpleNamespace(**prop) for prop in entity_props.values()])
+        except ValueError as exc:
+            raise PolicyViolation("复合模型包含无效状态迁移策略") from exc
     for item in sections["relations"]:
         _assert_reference(
             item.get("source"), generated_keys=generated["entities"],
@@ -9208,6 +9222,7 @@ def _apply_scenario_model_mutations(
                 description=item.get("description", ""),
                 is_abstract=bool(item.get("is_abstract", False)),
                 state_property=item.get("state_property", ""),
+                state_policy=item.get("state_policy", {}),
             )
             db.add(entity)
             db.flush()
@@ -9234,6 +9249,7 @@ def _apply_scenario_model_mutations(
                 entity.description = item.get("description", "")
                 entity.is_abstract = bool(item.get("is_abstract", False))
                 entity.state_property = item.get("state_property", "")
+                entity.state_policy = copy.deepcopy(item.get("state_policy", entity.state_policy or {}))
             counts["entities_extended"] += 1
         created[item["key"]] = entity.id
         existing_props = {prop.name: prop for prop in entity.properties}
@@ -9465,6 +9481,7 @@ def _apply_scenario_model_mutations(
             description=item.get("description", ""),
             condition=item.get("condition") or {},
             action_on_match=item.get("action_on_match", ""),
+            input_validation=item.get("input_validation", "object"),
             trigger_action_ids=[_resolved_id(ref, created) for ref in item.get("trigger_actions") or []],
             severity=item.get("severity", "info"),
             enabled=False,

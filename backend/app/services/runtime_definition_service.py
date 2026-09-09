@@ -551,7 +551,7 @@ def _live_definition(scenario: BusinessScenario, db: Session) -> RuntimeDefiniti
     definition_fields = {
         "entities": (
             "id", "name", "api_name", "namespace", "description", "icon", "color",
-            "lifecycle_status", "is_abstract", "state_property",
+            "lifecycle_status", "is_abstract", "state_property", "state_policy",
         ),
         "relations": (
             "id", "name", "api_name", "namespace", "source_entity_id",
@@ -567,7 +567,7 @@ def _live_definition(scenario: BusinessScenario, db: Session) -> RuntimeDefiniti
             "table_name", "foreign_key_column", "source_key_column", "target_key_column",
         ),
         "actions": ("id", "entity_id", "name", "description", "input_schema", "executor_type", "executor_config", "precondition", "postcondition", "enabled", "requires_confirmation", "idempotency_required", "permission_scope", "access_scope"),
-        "rules": ("id", "entity_id", "name", "description", "condition", "action_on_match", "trigger_action_ids", "severity", "enabled"),
+        "rules": ("id", "entity_id", "name", "description", "condition", "input_validation", "action_on_match", "trigger_action_ids", "severity", "enabled"),
         "events": ("id", "name", "description", "payload_schema", "trigger_source", "enabled"),
         "workflows": ("id", "name", "description", "trigger_type", "trigger_config", "steps", "nodes", "edges", "status", "enabled", "access_scope"),
         "capability_ports": (

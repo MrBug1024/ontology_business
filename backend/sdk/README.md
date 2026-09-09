@@ -37,10 +37,47 @@ snapshot formats are read only for authorized pinned history. No parallel
 environment-based endpoint is retained. Deployments use separate infrastructure
 configuration, never business records or permission labels.
 
-### Plain-message delivery
+### Consume capabilities from your own Agent
+
+`invoke_capability` executes the selected business contract directly. It does not
+require a platform Agent, a chat session or an Agent LLM configuration. The same
+contract is available through REST, this SDK and the generic MCP tools
+`list_capabilities`, `invoke_capability`, and `get_capability_receipt`. The separate
+`invoke_agent` MCP tool delegates a conversation to the platform Agent and is
+not required to add scene capabilities to an existing Agent.
+
+Read `receipt["output"]` as the business result and retain its structure, together
+with the authoritative status and evidence. For an asynchronous workflow, poll
+until its terminal state; its execution result is in `output.result`. The
+workflow's explicit ontology output contract, when configured, identifies its
+result node and validated output; older workflows retain their execution steps.
+`delivery.text` is an optional lossy plain-text summary for existing channel
+adapters, not the output contract or an instruction to the caller's LLM. It may
+omit nested details. A web Agent can render Markdown; a messaging adapter can
+choose plain text without changing the published capability.
+
+Pass the required current context through typed `inputs`. Ordinary structured
+inputs do not require creating a DataSource, asset or ontology instance. Managed
+uploads/connections are necessary only for contracts that declare those data
+ports. Online execution processes these inputs, and durable workflows retain
+protected execution data for recovery and audit; this is not a zero-retention or
+offline service. Data that must never leave the caller needs an appropriately
+trusted local execution package or deployment.
+
+For caller-generated documents, define the business output schema to describe
+the content, required format and evidence. The caller's Agent selects its own
+authorized renderer, destination and delivery mechanism. Content is a draft,
+not proof that a file was created or sent. Platform-generated managed files are
+an optional, explicitly selected capability and can still be downloaded through
+the authorized attachment endpoint. Do not fabricate artifact IDs or pass a
+client filesystem path as a platform data reference.
+
+### Optional plain-message delivery
 
 Poll `client.get_invocation_receipt(invocation_id)`. Deliver changes only when
-`receipt["delivery"]["revision"]` changes, to the original upstream conversation.
+`receipt["delivery"]["revision"]` changes, to the original upstream conversation,
+when using this compatibility presentation. This revision covers the delivery
+view only; consumers of full results must also track `output` and `status`.
 `delivery.text` is plain text, `interactions` identifies the pending person,
 allowed replies, expiry and revision, and `attachments` contains authorized files.
 Use `download_invocation_attachment(invocation_id, file_id)` to relay the file;
@@ -251,6 +288,11 @@ confirmed = client.invoke_capability(
 
 The client sends credentials only in `X-API-Key`; platform RBAC and ACL remain
 active on every request.
+
+Authored rule constraints, workflow ontology bindings and semantic query roles
+are evaluated on the server through the same capability contract. The SDK does
+not recreate their validation. See the [ontology business contract API](../../docs/ontology-business-contract-api.md)
+for authoring fields, legacy-release compatibility and result validation.
 
 HTTPS is required by default.  A local mock can opt in with
 `allow_insecure_http=True`, but only for `localhost` or a numeric loopback

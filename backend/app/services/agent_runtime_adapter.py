@@ -57,7 +57,7 @@ from .capability_contracts import (
     canonical_json,
 )
 from .capability_invoker import CapabilityInvocationError
-from .agent_prompt_policy import AUTHORITATIVE_DECISION_PROMPT
+from .agent_prompt_policy import AUTHORITATIVE_DECISION_PROMPT, CAPABILITY_CONSUMER_PROMPT
 from .agent_receipt_summary import output_summary
 
 
@@ -1590,9 +1590,7 @@ class CapabilityAgentRuntime:
         return "\n".join(
             [
                 base,
-                "【消息渠道】使用纯文本回答，不使用 Markdown 标记、表格、按钮或弹窗。"
-                "执行回执中的 delivery.text 可直接交付用户；排队不等于完成，等待审批不等于批准。"
-                "需要确认时引用服务端给出的回复文本，不要求用户前往平台页面。内部 ID、哈希和技术字段不进入普通回答。",
+                CAPABILITY_CONSUMER_PROMPT,
                 f"【验证 Agent 职责】{self.agent.description}" if self.agent.description else "",
                 f"【当前业务场景】{self.scenario.name}",
                 "【能力运行约束】只使用本轮提供的通用能力工具。先核对机器可读契约，再按 kind/key 调用；"
@@ -1712,6 +1710,11 @@ class CapabilityAgentRuntime:
                     tool_calls = event["tool_calls"]
             content = "".join(content_parts)
             if not tool_calls:
+                if not content.strip():
+                    raise AgentRuntimeAdapterError(
+                        "empty_model_response",
+                        "模型未返回可显示的回答。请重试；如已有能力执行记录，请先核对其结果。",
+                    )
                 if self._evidence_refs:
                     yield {"type": "evidence_refs", "data": self.evidence_snapshot()}
                 yield {"type": "done", "data": content}

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..models import AgentTurnRun
 from . import agent_turn_input_service, permission_service
+from .agent_tool_progress import AgentToolProgress, public_tool_progress
 
 if TYPE_CHECKING:
     from .agent_turn_worker_service import TurnLease
@@ -50,8 +51,8 @@ class TurnProgress:
                 self.flush()
         elif kind in {"tool_call", "tool_result", "done"}:
             self.flush()
-            if kind == "tool_call":
-                self._write("invoking_tools", "")
+            if kind in {"tool_call", "tool_result"}:
+                self._write("invoking_tools", "", tool_step=public_tool_progress(event))
 
     def flush(self) -> None:
         while self.pending:
@@ -60,7 +61,7 @@ class TurnProgress:
             self.pending = self.pending[len(chunk):]
             self.last_flush = self.clock()
 
-    def _write(self, kind: str, text: str) -> None:
+    def _write(self, kind: str, text: str, *, tool_step: AgentToolProgress | None = None) -> None:
         # Import the state machine here to keep its worker wiring acyclic.
         from . import agent_turn_worker_service as worker
 
@@ -85,6 +86,8 @@ class TurnProgress:
                 raise RuntimeError("Agent Turn 正文状态无效")
             status = "responding" if kind == "answer_delta" else "invoking_tools"
             data: dict[str, Any] = {"status": status, "label": worker.STATUS_LABELS[status]}
+            if tool_step is not None:
+                data["tool_step"] = tool_step.model_dump(exclude_none=True)
             if kind == "answer_delta":
                 if len(previous) + len(text) > MAX_RESPONSE_CHARACTERS:
                     raise agent_turn_input_service.AgentTurnError(
@@ -95,6 +98,7 @@ class TurnProgress:
                 result["answer"] = previous + text
             elif kind == "answer_reset":
                 result["answer"] = ""
+                data["label"] = "正在分析请求"
             run.result_document = result
             run.status = status
             run.revision += 1

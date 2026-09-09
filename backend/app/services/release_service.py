@@ -412,6 +412,13 @@ def _normalize_entity(raw: Any) -> dict:
         )
         if not state_definition or not state_definition["is_enum"]:
             raise ReleaseValidationError("实体状态属性必须引用当前实体的枚举属性")
+    if "state_policy" in raw:
+        from .ontology_instance_contract_service import normalize_state_policy
+        try:
+            normalize_state_policy(raw["state_policy"], state_property,
+                                   [SimpleNamespace(**prop) for prop in properties])
+        except ValueError as exc:
+            raise ReleaseValidationError("实体状态迁移策略无效") from exc
     try:
         namespace = ontology_service.validate_namespace(
             _string(raw.get("namespace"), "实体命名空间", default="default", maximum=180)
@@ -429,6 +436,7 @@ def _normalize_entity(raw: Any) -> dict:
         "color": _string(raw.get("color"), "实体颜色", default="#4f46e5", maximum=20),
         "is_abstract": is_abstract,
         "state_property": state_property,
+        **({"state_policy": copy.deepcopy(raw["state_policy"])} if "state_policy" in raw else {}),
         "properties": properties,
     }
 
@@ -643,6 +651,8 @@ def _normalize_rule(raw: Any) -> dict:
     severity = _string(raw.get("severity"), "规则严重度", default="info", maximum=20)
     if severity not in {"info", "warning", "critical"}:
         raise ReleaseValidationError("规则严重度无效")
+    if raw.get("input_validation", "record") not in {"object", "record"}:
+        raise ReleaseValidationError("规则输入校验模式无效")
     trigger_action_ids = [_required_id(item, "规则触发 Action id") for item in _list(raw.get("trigger_action_ids"), "规则触发 Actions")]
     return {
         "id": _required_id(raw.get("id"), "规则 id"),
@@ -650,6 +660,7 @@ def _normalize_rule(raw: Any) -> dict:
         "name": _string(raw.get("name"), "规则名称", maximum=200),
         "description": _string(raw.get("description"), "规则说明"),
         "condition": _sanitize_secret_values(_dict(raw.get("condition"), "规则条件")),
+        **({"input_validation": raw["input_validation"]} if "input_validation" in raw else {}),
         "action_on_match": _string(raw.get("action_on_match"), "规则命中动作"),
         "trigger_action_ids": trigger_action_ids,
         "severity": severity,
@@ -1412,6 +1423,16 @@ def normalize_snapshot_content(content: Any) -> dict:
             raise ReleaseValidationError("规则引用了不存在的 Action")
     for workflow in workflows:
         _validate_workflow_references(workflow, action_id_set, rule_id_set, event_id_set)
+        if (workflow.get("trigger_config") or {}).get("ontology_contract") is not None:
+            from .workflow_ontology_contract import validate_declaration
+            definition = SimpleNamespace(entities={entity["id"]: SimpleNamespace(**{
+                **entity, "properties": [SimpleNamespace(**prop) for prop in entity["properties"]]
+            }) for entity in entities})
+            try:
+                validate_declaration(SimpleNamespace(**workflow), definition,
+                                     complete=workflow["status"] == "active")
+            except ValueError as exc:
+                raise ReleaseValidationError(str(exc)) from exc
         if workflow["nodes"]:
             try:
                 validate_workflow_graph(workflow["nodes"], workflow["edges"])
@@ -1747,6 +1768,7 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
                 "color": entity.color or "#4f46e5",
                 "is_abstract": bool(entity.is_abstract),
                 "state_property": entity.state_property or "",
+                "state_policy": copy.deepcopy(entity.state_policy or {}),
                 "properties": [
                     {
                         "id": prop.id,
@@ -1918,6 +1940,7 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
                 "name": rule.name,
                 "description": rule.description or "",
                 "condition": _sanitize_secret_values(rule.condition or {}),
+                "input_validation": rule.input_validation or "record",
                 "action_on_match": rule.action_on_match or "",
                 "trigger_action_ids": rule.trigger_action_ids or [],
                 "severity": rule.severity or "info",
@@ -2962,6 +2985,7 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
             "state_property",
         ):
             setattr(entity, key, entity_data[key])
+        entity.state_policy = copy.deepcopy(entity_data.get("state_policy", {}))
     db.flush()
 
     for entity_data in content["entities"]:
@@ -3194,6 +3218,7 @@ def _apply_snapshot_content(db: Session, scenario: BusinessScenario, content: di
         ):
             setattr(rule, key, copy.deepcopy(rule_data[key]))
         rule.condition = _preserve_secrets(old_condition, rule_data["condition"])
+        rule.input_validation = rule_data.get("input_validation", "record")
 
     for event_data in content["events"]:
         event = _assert_id_scope(db, OntologyEvent, event_data["id"], scenario.id, "事件")

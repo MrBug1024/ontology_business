@@ -1,4 +1,8 @@
-"""Project authoritative execution state into channel-neutral delivery receipts."""
+"""Refresh execution state and add a backward-compatible plain-text delivery view.
+
+The structured output remains the business result. Consumers may ignore the
+delivery view and present that output using their own Agent and channel tools.
+"""
 from __future__ import annotations
 
 from collections.abc import Mapping

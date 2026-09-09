@@ -365,6 +365,11 @@ def _workflow_readiness(
         except Exception as exc:  # noqa: BLE001
             reasons.append(f"工作流图无效：{exc}")
     if definition is not None:
+        from .workflow_ontology_contract import validate_declaration
+        try:
+            validate_declaration(workflow, definition, db=db)
+        except (ValueError, PolicyViolation) as exc:
+            reasons.append(str(exc))
         resources = {
             "action": definition.actions,
             "rule": definition.rules,
