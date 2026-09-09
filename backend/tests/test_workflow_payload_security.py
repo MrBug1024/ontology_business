@@ -40,11 +40,10 @@ def _settings(*, active: str = "active", include_old: bool = True) -> SimpleName
 
 
 def _context() -> dict[str, str]:
-    return workflow_payload_service.payload_context(
+    return workflow_payload_service.runtime_payload_context(
         run_id="run-secure-payload",
         scenario_id="scenario-secure-payload",
         workflow_id="workflow-secure-payload",
-        environment="dev",
         definition_hash="a" * 64,
     )
 
@@ -221,7 +220,7 @@ def test_revision_data_transform_encrypts_and_reversibly_downgrades_legacy_rows(
         encrypted = connection.execute(select(runs)).mappings().one()
         assert marker not in json.dumps(dict(encrypted), sort_keys=True)
         assert encrypted["input_payload"]["contract"] == (
-            workflow_payload_service.ENVELOPE_CONTRACT
+            "workflow-run-input-envelope/v1"
         )
         assert revision._decrypt_existing_rows(connection) == 1
         restored = connection.execute(select(runs.c.input_payload)).scalar_one()

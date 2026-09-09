@@ -81,7 +81,6 @@ class MappingReleaseBindingTests(unittest.TestCase):
         binding = connector_service.upsert_binding(
             self.db,
             self.scenario,
-            environment=environment,
             binding_key_value=key,
             kind="data_source",
             connector_id=connector_id,
@@ -137,7 +136,7 @@ class MappingReleaseBindingTests(unittest.TestCase):
                 self.db,
                 self.scenario,
                 legacy_content,
-                environment="staging",
+                for_publication=True,
             )
         self.assertIn("未声明数据映射", str(error.exception))
 
@@ -166,7 +165,6 @@ class MappingReleaseBindingTests(unittest.TestCase):
             self.db,
             self.scenario,
             content,
-            environment="staging",
         )
         self.assertEqual(len(audit), 1)
         self.assertEqual(audit[0]["binding_key"], "audited-orders-binding")
@@ -200,7 +198,6 @@ class MappingReleaseBindingTests(unittest.TestCase):
                 self.db,
                 self.scenario,
                 snapshot.content,
-                environment="staging",
             )
         self.assertIn("能力不满足", str(error.exception))
 

@@ -124,7 +124,7 @@ class AgentMCPPublicationTests(unittest.TestCase):
         self.engine.dispose()
 
     def test_create_lists_only_safe_metadata_and_rotation_revokes_old_token(self) -> None:
-        def validate(db, agent_id, writable=False):
+        def validate(db, agent_id, writable=False, release_id=None):
             return db.get(Agent, agent_id), self.context, []
 
         def runtime_status(db, service):
@@ -200,7 +200,6 @@ class AgentMCPPublicationTests(unittest.TestCase):
                 enabled=True,
                 agent_config_hash=agent_mcp_service.agent_config_hash(self.agent),
                 definition_hash="d" * 64,
-                runtime_environment="prod",
             ))
             db.commit()
         finally:
@@ -228,6 +227,8 @@ class AgentMCPPublicationTests(unittest.TestCase):
                                     "invoke_agent",
                                     "invoke_capability",
                                     "list_capabilities",
+                                    "read_business_approval",
+                                    "reply_business_interaction",
                                 },
                             )
                             invoke_tool = next(
@@ -325,6 +326,9 @@ class AgentMCPPublicationTests(unittest.TestCase):
             )
             db.add_all([scenario, function])
             db.commit()
+            from tests.release_fixtures import enable_current_release
+            db.info.update(tenant_id=self.tenant.id, user_id=self.owner.id)
+            enable_current_release(db, scenario)
             _key, raw_token = external_api_service.issue_key(
                 db,
                 tenant_id=self.tenant.id,
@@ -356,7 +360,6 @@ class AgentMCPPublicationTests(unittest.TestCase):
                                 "list_capabilities",
                                 {
                                     "scenario_id": scenario.id,
-                                    "environment": "dev",
                                 },
                             )
                             self.assertFalse(listed.isError)
@@ -370,7 +373,6 @@ class AgentMCPPublicationTests(unittest.TestCase):
                                     "scenario_id": scenario.id,
                                     "capability_kind": "function",
                                     "capability_key": function.id,
-                                    "environment": "dev",
                                     "inputs": {"amount": 4},
                                 },
                             )

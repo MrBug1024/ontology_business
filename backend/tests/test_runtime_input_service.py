@@ -189,7 +189,6 @@ def _invoke(
     deployment = ResolvedDeployment(
         scenario_id=world.scenario.id,
         tenant_id=world.tenant.id,
-        environment=environment,
         definition_hash="d" * 64,
         definition=object(),
     )
@@ -569,7 +568,6 @@ def test_released_port_contract_does_not_drift_with_live_port_edits(
     deployment = ResolvedDeployment(
         scenario_id=world.scenario.id,
         tenant_id=world.tenant.id,
-        environment="dev",
         definition_hash="d" * 64,
         definition=definition,
         definition_source="release",
@@ -675,7 +673,6 @@ def test_dataset_head_is_frozen_to_ready_version_at_invocation_start(
         id="head-runtime",
         tenant_id=world.tenant.id,
         dataset_id=world.dataset.id,
-        environment="dev",
         dataset_version_id=world.version_a.id,
     )
     db.add(head)
@@ -733,7 +730,6 @@ def test_modeling_scenario_dataset_is_never_used_as_runtime_input(
         id="head-runtime-rules",
         tenant_id=world.tenant.id,
         dataset_id=world.dataset.id,
-        environment="dev",
         dataset_version_id=world.version_a.id,
     )
     db.add(head)
@@ -755,7 +751,6 @@ def test_scenario_level_defaults_are_ignored_and_explicit_runtime_input_is_allow
         id="connector-same-key",
         tenant_id=world.tenant.id,
         scenario_id=world.scenario.id,
-        environment="dev",
         binding_key="records",
         connector_kind="data_source",
         connector_id="opaque-target",
@@ -811,7 +806,6 @@ def test_scenario_connector_is_not_implicit_but_explicit_agent_input_is_checked(
         id="connector-default",
         tenant_id=world.tenant.id,
         scenario_id=world.scenario.id,
-        environment="dev",
         binding_key="live_reference",
         connector_kind="data_source",
         connector_id="opaque-target",
@@ -878,7 +872,6 @@ def test_typed_connector_binding_key_is_resolved_server_side(db: Session) -> Non
         id="connector-by-key",
         tenant_id=world.tenant.id,
         scenario_id=world.scenario.id,
-        environment="dev",
         binding_key="current-system",
         connector_kind="data_source",
         connector_id="opaque-target",
@@ -962,7 +955,6 @@ def test_connector_content_contract_validates_checked_structure_profile(db: Sess
         id="connector-contract",
         tenant_id=world.tenant.id,
         scenario_id=world.scenario.id,
-        environment="dev",
         binding_key="live-records",
         connector_kind="data_source",
         connector_id="opaque-target",

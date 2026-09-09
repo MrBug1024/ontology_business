@@ -295,7 +295,8 @@ test('action confirmation keeps original parameters when the preview is compacte
     new URL('../src/views/AgentChat.vue', import.meta.url),
     'utf8',
   )
-  assert.match(source, /const params = actionConfirmationParams\(toolCall, plan\)/)
+  assert.match(source, /<PlainMessage v-if="m.content" :content="m.content"/)
+  assert.doesNotMatch(source, /confirmActionPreview|confirmAgentPreview|openConfirmationTask/)
   assert.doesNotMatch(source, /params:\s*plan\.parameters\s*\|\|\s*\{\}/)
 })
 

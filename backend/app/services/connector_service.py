@@ -1,10 +1,10 @@
-"""Credential-free connector catalog and scenario/environment bindings.
+"""Credential-free connector catalog and scenario bindings.
 
 The platform already has three mature configuration resources (data sources,
 MCP servers and LLM deployments).  This module deliberately treats those as
 the physical targets instead of copying their credentials into another table.
 ``ConnectorBinding`` is the small governance layer that records which target a
-portable package reference may use in a particular scenario/environment.
+portable package reference may use in a particular scenario.
 """
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from ..models import BusinessScenario, ConnectorBinding, DataSource, LLMConfig, 
 from . import datasource_service, input_contract_validator, llm_service, mcp_service
 
 
-ENVIRONMENTS = frozenset({"dev", "staging", "prod"})
 CONNECTOR_KINDS = frozenset({"data_source", "mcp", "llm"})
 HEALTH_STATUSES = frozenset({"unknown", "healthy", "unhealthy"})
 MAX_PROFILE_RELATIONS = 64
@@ -65,11 +64,7 @@ def _text(value: Any, label: str, *, maximum: int) -> str:
     return result
 
 
-def normalize_environment(environment: str) -> str:
-    value = str(environment or "").strip().lower()
-    if value not in ENVIRONMENTS:
-        raise ConnectorBindingError("环境必须为 dev、staging 或 prod")
-    return value
+
 
 
 def normalize_kind(kind: str) -> str:
@@ -211,15 +206,14 @@ def normalize_snapshot_binding_requirements(raw: Any) -> list[dict[str, str]]:
     if not isinstance(raw, list):
         raise ConnectorBindingError("连接器依赖必须是列表")
     normalized: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str]] = set()
     for item in raw:
         if not isinstance(item, Mapping):
             raise ConnectorBindingError("连接器依赖必须是对象")
         kind = normalize_kind(str(item.get("kind") or ""))
         key = _text(item.get("binding_key"), "连接器绑定键", maximum=180)
-        environment = normalize_environment(str(item.get("environment") or "dev"))
         label = str(item.get("reference_label") or "").strip()[:300]
-        identity = (environment, kind, key)
+        identity = (kind, key)
         if identity in seen:
             raise ConnectorBindingError("连接器依赖不能重复")
         seen.add(identity)
@@ -227,11 +221,10 @@ def normalize_snapshot_binding_requirements(raw: Any) -> list[dict[str, str]]:
             {
                 "binding_key": key,
                 "kind": kind,
-                "environment": environment,
                 "reference_label": label,
             }
         )
-    return sorted(normalized, key=lambda item: (item["environment"], item["kind"], item["binding_key"]))
+    return sorted(normalized, key=lambda item: (item["kind"], item["binding_key"]))
 
 
 _SECRET_NAME = re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|credential)\s*([=:])\s*[^\s,;]+")
@@ -456,11 +449,10 @@ def require_connector_target(
     return _resolve_connector(db, kind, connector_id, scenario)
 
 
-def _binding_query(scenario: BusinessScenario, environment: str, key: str):
+def _binding_query(scenario: BusinessScenario, key: str):
     return select(ConnectorBinding).where(
         ConnectorBinding.scenario_id == scenario.id,
         ConnectorBinding.tenant_id == scenario.tenant_id,
-        ConnectorBinding.environment == environment,
         ConnectorBinding.binding_key == key,
     )
 
@@ -563,7 +555,6 @@ def binding_summary(db: Session, binding: ConnectorBinding, scenario: BusinessSc
             "binding_id": binding.id,
             "binding_key": binding.binding_key,
             "reference_label": binding.reference_label or "",
-            "environment": binding.environment,
             "ready": ready,
             "blocking_reason": sanitize_message(reason),
             "created_at": binding.created_at,
@@ -576,16 +567,12 @@ def binding_summary(db: Session, binding: ConnectorBinding, scenario: BusinessSc
 def list_bindings(
     db: Session,
     scenario: BusinessScenario,
-    *,
-    environment: str | None = None,
 ) -> list[dict[str, Any]]:
     stmt = select(ConnectorBinding).where(
         ConnectorBinding.scenario_id == scenario.id,
         ConnectorBinding.tenant_id == scenario.tenant_id,
     )
-    if environment:
-        stmt = stmt.where(ConnectorBinding.environment == normalize_environment(environment))
-    bindings = db.execute(stmt.order_by(ConnectorBinding.environment, ConnectorBinding.binding_key)).scalars().all()
+    bindings = db.execute(stmt.order_by(ConnectorBinding.binding_key)).scalars().all()
     return [binding_summary(db, binding, scenario) for binding in bindings]
 
 
@@ -611,7 +598,6 @@ def upsert_binding(
     db: Session,
     scenario: BusinessScenario,
     *,
-    environment: str,
     binding_key_value: str,
     kind: str,
     connector_id: str,
@@ -619,19 +605,17 @@ def upsert_binding(
     check: bool = False,
     created_by_user_id: str | None = None,
 ) -> ConnectorBinding:
-    resolved_environment = normalize_environment(environment)
     normalized_kind = normalize_kind(kind)
     key = _text(binding_key_value, "连接器绑定键", maximum=180)
     connector = _resolve_connector(db, normalized_kind, connector_id, scenario)
     label = str(reference_label or "").strip()[:300]
-    binding = db.execute(_binding_query(scenario, resolved_environment, key)).scalars().first()
+    binding = db.execute(_binding_query(scenario, key)).scalars().first()
     if binding and binding.connector_kind != normalized_kind:
-        raise ConnectorBindingConflictError("同一环境绑定键不能指向不同连接器类型")
+        raise ConnectorBindingConflictError("同一场景绑定键不能指向不同连接器类型")
     if binding is None:
         binding = ConnectorBinding(
             tenant_id=str(scenario.tenant_id),
             scenario_id=scenario.id,
-            environment=resolved_environment,
             binding_key=key,
             reference_label=label,
             connector_kind=normalized_kind,
@@ -693,22 +677,20 @@ def require_ready_binding(
     db: Session,
     scenario: BusinessScenario,
     *,
-    environment: str,
     binding_key_value: str,
     kind: str,
     reference: Mapping[str, Any] | None = None,
 ) -> tuple[ConnectorBinding, Any]:
-    resolved_environment = normalize_environment(environment)
     normalized_kind = normalize_kind(kind)
     key = _text(binding_key_value, "连接器绑定键", maximum=180)
-    binding = db.execute(_binding_query(scenario, resolved_environment, key)).scalars().first()
+    binding = db.execute(_binding_query(scenario, key)).scalars().first()
     if binding is None:
-        raise ConnectorBindingConflictError("目标环境尚未配置该连接器绑定")
+        raise ConnectorBindingConflictError("当前场景尚未配置该连接器绑定")
     if binding.connector_kind != normalized_kind:
-        raise ConnectorBindingConflictError("目标环境连接器绑定类型不匹配")
+        raise ConnectorBindingConflictError("当前场景连接器绑定类型不匹配")
     ready, reason, connector = _binding_state(db, binding, scenario)
     if not ready or connector is None:
-        raise ConnectorBindingConflictError(reason or "目标环境连接器不可用")
+        raise ConnectorBindingConflictError(reason or "当前场景连接器不可用")
     _check_compatibility(kind=normalized_kind, connector=connector, reference=reference)
     return binding, connector
 
@@ -717,7 +699,6 @@ def requirement_resolution(
     db: Session,
     scenario: BusinessScenario,
     *,
-    environment: str,
     kind: str,
     reference: Mapping[str, Any] | None,
     path: str,
@@ -733,13 +714,12 @@ def requirement_resolution(
     )
     label = binding_label(normalized_kind, reference, path)
     configured_binding = db.execute(
-        _binding_query(scenario, normalize_environment(environment), key)
+        _binding_query(scenario, key)
     ).scalars().first()
     try:
         binding, connector = require_ready_binding(
             db,
             scenario,
-            environment=environment,
             binding_key_value=key,
             kind=normalized_kind,
             reference=reference,
@@ -772,18 +752,14 @@ def validate_snapshot_bindings(
     db: Session,
     scenario: BusinessScenario,
     content: Mapping[str, Any],
-    *,
-    environment: str,
 ) -> list[dict[str, Any]]:
     """Recheck persisted requirements without triggering external I/O."""
-    resolved_environment = normalize_environment(environment)
     requirements = normalize_snapshot_binding_requirements(content.get("connector_bindings"))
     audit: list[dict[str, Any]] = []
     for requirement in requirements:
         binding, connector = require_ready_binding(
             db,
             scenario,
-            environment=resolved_environment,
             binding_key_value=requirement["binding_key"],
             kind=requirement["kind"],
         )
@@ -797,7 +773,6 @@ def validate_snapshot_bindings(
                 "adapter_type": _adapter(requirement["kind"], connector),
                 "connector_signature": connector_signature(requirement["kind"], connector),
                 "connector_revision": connector_revision(connector),
-                "environment": resolved_environment,
                 "health_status": "healthy",
                 "checked_at": binding.checked_at.isoformat() if binding.checked_at else None,
             }
@@ -809,17 +784,14 @@ def readiness(
     db: Session,
     scenario: BusinessScenario,
     content: Mapping[str, Any],
-    *,
-    environment: str,
 ) -> dict[str, Any]:
     """Return a UI-safe publish gate decision; no connection test is performed."""
     try:
-        audit = validate_snapshot_bindings(db, scenario, content, environment=environment)
-        return {"ready": True, "environment": normalize_environment(environment), "reasons": [], "audit": audit}
+        audit = validate_snapshot_bindings(db, scenario, content)
+        return {"ready": True, "reasons": [], "audit": audit}
     except ConnectorBindingError as exc:
         return {
             "ready": False,
-            "environment": normalize_environment(environment),
             "reasons": [sanitize_message(exc)],
             "audit": [],
         }

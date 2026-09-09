@@ -74,7 +74,7 @@ def build_manifest(
     db: Session,
     scenario_id: str,
     *,
-    environment: str,
+    release_id: str | None = None,
 ) -> dict[str, Any]:
     scenario = tenant_service.require_scenario(db, scenario_id)
     permission_service.require_scenario_permission(db, scenario, "read")
@@ -82,17 +82,16 @@ def build_manifest(
         capabilities = capability_application_service.list_capabilities(
             db,
             scenario,
-            environment=environment,
+            release_id=release_id,
         )
         deployment, _inputs = capability_application_service.resolve_deployment(
             db,
             scenario,
-            environment=environment,
+            release_id=release_id,
         )
         releases = release_service.list_releases(
             db,
             scenario.id,
-            environment=environment,
         )
     except (
         capability_application_service.CapabilityApplicationError,
@@ -114,7 +113,6 @@ def build_manifest(
         "manifest_version": "capability-access-manifest/v1",
         "scenario": {"id": scenario.id, "name": scenario.name},
         "deployment": {
-            "environment": deployment.environment,
             "definition_source": deployment.definition_source,
             "release_id": deployment.release_id,
             "snapshot_id": deployment.snapshot_id,
@@ -125,7 +123,7 @@ def build_manifest(
             {
                 "protocol": "rest",
                 "endpoint": f"{scenario_path}/capabilities",
-                "discovery": f"{scenario_path}/capabilities?environment={deployment.environment}",
+                "discovery": f"{scenario_path}/capabilities?release_id={deployment.release_id}",
                 "invocation": f"{scenario_path}/capabilities/{{kind}}/{{capability_key}}/invoke",
                 "receipt": f"{api_prefix}/external/v2/invocations/{{invocation_id}}",
                 "managed_input_upload": f"{api_prefix}/external/v2/assets/upload",
@@ -143,6 +141,8 @@ def build_manifest(
                     "list_capabilities",
                     "invoke_capability",
                     "get_capability_receipt",
+                    "read_business_approval",
+                    "reply_business_interaction",
                 ],
             },
         ],
@@ -150,7 +150,6 @@ def build_manifest(
             {
                 "id": release.id,
                 "snapshot_id": release.snapshot_id,
-                "environment": release.environment,
                 "status": release.status,
                 "created_at": release.created_at,
             }
@@ -160,7 +159,7 @@ def build_manifest(
             {"code": "definition_resolved", "passed": True},
             {
                 "code": "release_pinned",
-                "passed": deployment.environment == "dev" or bool(deployment.release_id),
+                "passed": bool(deployment.release_id),
             },
             {
                 "code": "capabilities_ready",

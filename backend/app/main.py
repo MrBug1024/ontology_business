@@ -12,12 +12,14 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from .config import get_settings
+from .business_query_contract import BusinessQueryContractMiddleware
 from .database import engine, init_db
 from .request_body_limit import RequestBodyLimitMiddleware
 from . import agent_mcp_server
 from .routers import (
     agent_mcp,
     agent_turns,
+    agent_capability_confirmations,
     agents,
     assistant,
     assistant_request_runs,
@@ -27,6 +29,8 @@ from .routers import (
     data_sources,
     external_api,
     external_capabilities,
+    channel_interactions,
+    external_invocation_artifacts,
     functions,
     llm_configs,
     managed_uploads,
@@ -34,8 +38,11 @@ from .routers import (
     operations,
     platform_migrations,
     scenarios,
+    scenario_releases,
     skills,
     templates,
+    workspace_access,
+    system_accounts,
 )
 from .services import (
     agent_turn_service,
@@ -47,7 +54,10 @@ from .services import (
     permission_service,
     skill_service,
     validation_dataset_service,
+    invitation_delivery_service,
+    system_account_service,
 )
+from .services.auth_request_security import CookieOriginMiddleware
 
 
 logger = logging.getLogger(__name__)
@@ -145,6 +155,7 @@ async def lifespan(_: FastAPI):
     db = SessionLocal()
     try:
         permission_service.bootstrap_authorization(db)
+        system_account_service.bootstrap_superadmin(db)
         operations_service.purge_expired_assistant_attachments(db)
         operations_service.purge_expired_catalog_attachments(db)
         db.commit()
@@ -166,6 +177,7 @@ async def lifespan(_: FastAPI):
     except Exception:  # noqa: BLE001
         logger.exception("受管上传任务启动恢复失败")
     async with agent_mcp_server.mcp_server.session_manager.run():
+        invitation_worker = asyncio.create_task(invitation_delivery_service.run_worker(), name="workspace-invitation-delivery")
         operations_worker = asyncio.create_task(
             _operations_worker(),
             name="ontology-operations-worker",
@@ -193,12 +205,15 @@ async def lifespan(_: FastAPI):
         try:
             yield
         finally:
+            invitation_worker.cancel()
             operations_worker.cancel()
             compilation_worker.cancel()
             validation_dataset_worker.cancel()
             agent_turn_worker.cancel()
             managed_upload_worker.cancel()
             assistant_request_worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await invitation_worker
             with contextlib.suppress(asyncio.CancelledError):
                 await operations_worker
             with contextlib.suppress(asyncio.CancelledError):
@@ -215,6 +230,11 @@ async def lifespan(_: FastAPI):
 
 settings = get_settings()
 app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=lifespan)
+app.add_middleware(BusinessQueryContractMiddleware, api_prefix=settings.api_prefix)
+app.add_middleware(CookieOriginMiddleware)
+app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=16384,
+    paths={f"{settings.api_prefix}/auth/{action}" for action in (
+        "login", "register", "verify-email", "resend-code", "forgot-password", "reset-password")})
 
 app.add_middleware(
     RequestBodyLimitMiddleware,
@@ -244,6 +264,8 @@ app.add_middleware(
 
 app.include_router(scenarios.router, prefix=settings.api_prefix)
 app.include_router(auth.router, prefix=settings.api_prefix)
+app.include_router(workspace_access.router, prefix=settings.api_prefix)
+app.include_router(system_accounts.router, prefix=settings.api_prefix)
 app.include_router(data_sources.router, prefix=settings.api_prefix)
 app.include_router(catalog.router, prefix=settings.api_prefix)
 app.include_router(catalog.scenario_router, prefix=settings.api_prefix)
@@ -262,9 +284,14 @@ app.include_router(functions.router, prefix=settings.api_prefix)
 app.include_router(external_api.management_router, prefix=settings.api_prefix)
 app.include_router(external_api.router, prefix=settings.api_prefix)
 app.include_router(external_capabilities.router, prefix=settings.api_prefix)
+app.include_router(channel_interactions.router, prefix=settings.api_prefix)
+app.include_router(channel_interactions.browser_router, prefix=settings.api_prefix)
+app.include_router(external_invocation_artifacts.router, prefix=settings.api_prefix)
 app.include_router(capability_access.router, prefix=settings.api_prefix)
+app.include_router(scenario_releases.router, prefix=settings.api_prefix)
 app.include_router(agent_mcp.router, prefix=settings.api_prefix)
 app.include_router(agent_turns.router, prefix=settings.api_prefix)
+app.include_router(agent_capability_confirmations.router, prefix=settings.api_prefix)
 
 
 @app.get("/")

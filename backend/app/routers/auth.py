@@ -22,19 +22,28 @@ from ..schemas import (
     VerifyEmailIn,
 )
 from ..services import auth_service, permission_service
+from ..services.auth_request_security import SensitiveAuthRoute, auth_rate_limit
+from ..services import system_account_service, workspace_service
+from ..services.access_governance_service import lock_governance
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[Depends(auth_rate_limit)], route_class=SensitiveAuthRoute)
 logger = logging.getLogger(__name__)
 
 
-def _user_out(user: User, *, can_manage: bool = False) -> UserOut:
+def _user_out(user: User, *, can_manage: bool = False, db: Session) -> UserOut:
+    tenant_id = str(db.info.get("tenant_id") or user.tenant_id)
+    member = workspace_service.membership(db, user.id, tenant_id)
+    tenant = db.get(Tenant, tenant_id)
     return UserOut(
         id=user.id,
         email=user.email,
         display_name=user.display_name,
-        tenant_id=user.tenant_id,
+        tenant_id=tenant_id,
         email_verified=bool(user.email_verified_at),
         can_manage=can_manage,
+        system_role=user.system_role,
+        workspace_role=member.role.key if member else None,
+        workspace_name=tenant.name if tenant and member else "",
     )
 
 
@@ -42,7 +51,7 @@ def _can_manage_tenant(db: Session, user: User) -> bool:
     """Evaluate the same tenant-management policy exposed by management APIs."""
     prior_tenant_id = db.info.get("tenant_id")
     prior_user_id = db.info.get("user_id")
-    db.info["tenant_id"] = user.tenant_id
+    db.info["tenant_id"] = prior_tenant_id or user.tenant_id
     db.info["user_id"] = user.id
     try:
         return permission_service.check_tenant_permission(db, "manage").allowed
@@ -76,13 +85,14 @@ def _find_code(db: Session, user: User, code: str, purpose: str) -> EmailVerific
 
 @router.post("/register", response_model=AuthMessage)
 def register(payload: RegisterIn, db: Session = Depends(get_db)):
+    lock_governance(db)
     email = auth_service.normalize_email(payload.email)
     auth_service.validate_password(payload.password)
     if payload.password != payload.password_confirm:
         raise HTTPException(400, "两次输入的密码不一致")
 
     user = db.execute(select(User).where(User.email == email)).scalars().first()
-    if user and user.status == "active":
+    if user and user.status != "pending":
         raise HTTPException(409, "该邮箱已注册，请直接登录")
 
     first_user = db.execute(select(User.id)).first() is None
@@ -108,6 +118,7 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
         user.display_name = payload.display_name.strip() or user.display_name
         user.status = "pending"
         user.email_verified_at = None
+        user.revision += 1
 
     # 新租户创建者立即成为 owner；升级前已有同租户用户由服务统一回填为 owner/admin。
     permission_service.ensure_organization(
@@ -122,21 +133,25 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
         auth_service.send_verification_email(email, code, "register")
     except Exception:  # noqa: BLE001
         db.rollback()
-        logger.exception("注册验证码邮件发送失败（邮箱域名=%s）", email.rsplit("@", 1)[-1])
+        logger.warning("注册验证码邮件发送失败")
         raise HTTPException(503, "验证码邮件发送失败，请稍后重试")
     return AuthMessage(message="验证码已发送，请查收邮件", email=email)
 
 
 @router.post("/verify-email", response_model=AuthMessage)
 def verify_email(payload: VerifyEmailIn, db: Session = Depends(get_db)):
+    lock_governance(db)
     email = auth_service.normalize_email(payload.email)
     user = db.execute(select(User).where(User.email == email)).scalars().first()
-    if not user:
+    if not user or user.status != "pending":
         raise HTTPException(400, "验证码不正确或已失效")
     record = _find_code(db, user, payload.code, "register")
     record.used_at = datetime.now(timezone.utc)
     user.status = "active"
     user.email_verified_at = datetime.now(timezone.utc)
+    user.revision += 1
+    db.flush()
+    system_account_service.bootstrap_superadmin(db)
     db.commit()
     return AuthMessage(message="邮箱验证成功，请登录", email=email)
 
@@ -145,7 +160,7 @@ def verify_email(payload: VerifyEmailIn, db: Session = Depends(get_db)):
 def resend_code(payload: ResendCodeIn, db: Session = Depends(get_db)):
     email = auth_service.normalize_email(payload.email)
     user = db.execute(select(User).where(User.email == email)).scalars().first()
-    if not user or user.status == "active":
+    if not user or user.status != "pending":
         return AuthMessage(message="如果该邮箱需要验证，新的验证码已发送", email=email)
     code = auth_service.issue_email_code(db, user, "register")
     db.commit()
@@ -153,21 +168,24 @@ def resend_code(payload: ResendCodeIn, db: Session = Depends(get_db)):
         auth_service.send_verification_email(email, code, "register")
     except Exception:  # noqa: BLE001
         db.rollback()
-        logger.exception("重发注册验证码邮件失败（邮箱域名=%s）", email.rsplit("@", 1)[-1])
+        logger.warning("重发注册验证码邮件失败")
         raise HTTPException(503, "验证码邮件发送失败，请稍后重试")
     return AuthMessage(message="新的验证码已发送", email=email)
 
 
 @router.post("/login", response_model=UserOut)
 def login(payload: LoginIn, response: Response, db: Session = Depends(get_db)):
+    lock_governance(db)
     email = auth_service.normalize_email(payload.email)
     user = db.execute(select(User).where(User.email == email)).scalars().first()
     if not user or not auth_service.verify_password(payload.password, user.password_hash):
         raise HTTPException(401, "邮箱或密码不正确")
     if user.status != "active":
-        raise HTTPException(403, "请先完成邮箱验证")
+        raise HTTPException(403, "账户已禁用，请联系平台管理员" if user.status == "disabled" else "请先完成邮箱验证")
+    system_account_service.bootstrap_superadmin(db)
+    user.last_login_at = auth_service.utc_now()
     auth_service.set_session_cookie(response, user, db)
-    return _user_out(user, can_manage=_can_manage_tenant(db, user))
+    return _user_out(user, can_manage=_can_manage_tenant(db, user), db=db)
 
 
 @router.post("/logout", response_model=Msg)
@@ -177,8 +195,8 @@ def logout(request: Request, response: Response, db: Session = Depends(get_db)):
 
 
 @router.get("/me", response_model=UserOut)
-def me(user: User = Depends(auth_service.get_current_user), db: Session = Depends(get_db)):
-    return _user_out(user, can_manage=_can_manage_tenant(db, user))
+def me(user: User = Depends(auth_service.get_current_account), db: Session = Depends(get_db)):
+    return _user_out(user, can_manage=_can_manage_tenant(db, user), db=db)
 
 
 @router.post("/forgot-password", response_model=AuthMessage)
@@ -193,13 +211,14 @@ def forgot_password(payload: ForgotPasswordIn, db: Session = Depends(get_db)):
         auth_service.send_verification_email(email, code, "password_reset")
     except Exception:  # noqa: BLE001
         db.rollback()
-        logger.exception("重置密码验证码邮件发送失败（邮箱域名=%s）", email.rsplit("@", 1)[-1])
+        logger.warning("重置密码验证码邮件发送失败")
         raise HTTPException(503, "验证码邮件发送失败，请稍后重试")
     return AuthMessage(message="重置验证码已发送", email=email)
 
 
 @router.post("/reset-password", response_model=AuthMessage)
 def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
+    lock_governance(db)
     email = auth_service.normalize_email(payload.email)
     auth_service.validate_password(payload.password)
     if payload.password != payload.password_confirm:
@@ -210,6 +229,7 @@ def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
     record = _find_code(db, user, payload.code, "password_reset")
     record.used_at = datetime.now(timezone.utc)
     user.password_hash = auth_service.hash_password(payload.password)
+    user.revision += 1
     db.execute(delete(AuthSession).where(AuthSession.user_id == user.id))
     db.commit()
     return AuthMessage(message="密码已重置，请使用新密码登录", email=email)

@@ -599,7 +599,6 @@ class ResolvedDeployment:
 
     scenario_id: str
     tenant_id: str
-    environment: str
     definition_hash: str
     definition: Any = field(repr=False, compare=False)
     data_ports: tuple[DataPort, ...] = ()
@@ -612,7 +611,6 @@ class ResolvedDeployment:
     def __post_init__(self) -> None:
         scenario_id = _text(self.scenario_id, "deployment scenario id", maximum=240)
         tenant_id = _text(self.tenant_id, "deployment tenant id", maximum=240)
-        environment = _token(self.environment, "deployment environment")
         definition_hash = _sha256(self.definition_hash, "definition hash")
         definition_source = _token(self.definition_source, "definition source")
         ports = tuple(self.data_ports)
@@ -634,7 +632,6 @@ class ResolvedDeployment:
             )
         object.__setattr__(self, "scenario_id", scenario_id)
         object.__setattr__(self, "tenant_id", tenant_id)
-        object.__setattr__(self, "environment", environment)
         object.__setattr__(self, "definition_hash", definition_hash)
         object.__setattr__(self, "definition_source", definition_source)
         object.__setattr__(self, "data_ports", ordered_ports)
@@ -654,7 +651,6 @@ class ResolvedDeployment:
         fingerprint_payload = {
             "definition_hash": definition_hash,
             "definition_source": definition_source,
-            "environment": environment,
             "release_id": self.release_id,
             "scenario_id": scenario_id,
             "snapshot_id": self.snapshot_id,
@@ -666,7 +662,7 @@ class ResolvedDeployment:
         object.__setattr__(
             self,
             "fingerprint",
-            canonical_hash(fingerprint_payload, domain="resolved-deployment-v1"),
+            canonical_hash(fingerprint_payload, domain="resolved-deployment-v2"),
         )
 
     def port(self, key: str) -> DataPort | None:
@@ -689,6 +685,7 @@ class Receipt:
     confirmation: Mapping[str, Any] = field(default_factory=dict)
     error_code: str | None = None
     error_message: str = ""
+    delivery: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -715,6 +712,7 @@ class Receipt:
         object.__setattr__(self, "output", _freeze(self.output))
         object.__setattr__(self, "audit_ref", _freeze(self.audit_ref))
         object.__setattr__(self, "confirmation", _freeze(self.confirmation))
+        object.__setattr__(self, "delivery", _freeze(self.delivery))
         object.__setattr__(
             self,
             "error_code",

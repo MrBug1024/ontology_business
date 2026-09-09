@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
+from app.config import get_settings
 from app.models import (
     ActionExecutionLog,
     BusinessScenario,
@@ -39,6 +40,7 @@ from app.services import (
     runtime_definition_service,
     workflow_service,
 )
+from app.services.policies import PolicyViolation
 
 
 class RuntimeDefinitionIsolationTests(unittest.TestCase):
@@ -144,16 +146,10 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
         self.engine.dispose()
 
     def _staging_settings(self):
-        return patch(
-            "app.services.runtime_connector_service.get_settings",
-            return_value=SimpleNamespace(runtime_environment="staging"),
-        )
+        return patch.object(get_settings(), "runtime_environment", "staging")
 
     def _dev_settings(self):
-        return patch(
-            "app.services.runtime_connector_service.get_settings",
-            return_value=SimpleNamespace(runtime_environment="dev"),
-        )
+        return patch.object(get_settings(), "runtime_environment", "dev")
 
     def _capture_snapshot(self, snapshot_id: str) -> OntologySnapshot:
         content = release_service.capture_snapshot_content(self.db, self.scenario)
@@ -182,7 +178,7 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             branch_id=self.branch.id,
             snapshot_id=snapshot.id,
-            environment="staging",
+            enabled=True,
             status=status,
             created_by_user_id=self.owner.id,
         )
@@ -216,7 +212,6 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
             definition = runtime_definition_service.resolve_active(
                 self.db,
                 self.scenario,
-                environment=runtime_connector_service.runtime_environment(),
             )
 
         frozen_workflow = runtime_definition_service.resolve_resource(
@@ -225,7 +220,7 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
         frozen_action = runtime_definition_service.resolve_resource(
             definition, "action", self.action.id
         )
-        self.assertEqual(definition.environment, "staging")
+        self.assertFalse(hasattr(definition, "environment"))
         self.assertEqual(definition.source, "release")
         self.assertEqual(definition.snapshot_id, snapshot_a.id)
         self.assertEqual(definition.release_id, release_a.id)
@@ -239,7 +234,6 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
             definition_a = runtime_definition_service.resolve_active(
                 self.db,
                 self.scenario,
-                environment=runtime_connector_service.runtime_environment(),
             )
             workflow_a = runtime_definition_service.resolve_resource(
                 definition_a, "workflow", self.workflow.id
@@ -261,6 +255,7 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
 
         snapshot_b = self._move_live_definition_to_b()
         release_a.status = "superseded"
+        release_a.enabled = False
         release_b = self._release("release-runtime-b", snapshot_b)
         self.assertEqual(release_b.status, "released")
 
@@ -279,7 +274,7 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
         self.assertEqual(called_definition.snapshot_id, snapshot_a.id)
         self.assertEqual(called_definition.release_id, release_a.id)
         self.assertEqual(called_definition.source, "release")
-        self.assertEqual(execute.call_args.kwargs["runtime_environment"], "staging")
+        self.assertNotIn("runtime_environment", execute.call_args.kwargs)
 
         self.db.refresh(run)
         self.assertEqual(run.status, "succeeded")
@@ -297,19 +292,18 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
             .order_by(ActionExecutionLog.created_at.desc())
         ).scalars().first()
         self.assertIsNotNone(log)
-        self.assertEqual(log.environment, "staging")
+        self.assertFalse(hasattr(log, "environment"))
         self.assertEqual(log.release_id, release_a.id)
         self.assertEqual(log.definition_snapshot_id, snapshot_a.id)
         self.assertEqual(log.definition_hash, called_definition.definition_hash)
         self.assertEqual(log.definition_source, "release")
 
-    def test_same_workflow_dedupe_does_not_cross_environments_and_unready_action_is_blocked(self) -> None:
+    def test_workflow_replay_is_independent_of_deployment_mode_and_pins_inputs_and_revision(self) -> None:
         snapshot_a, release_a = self._release_a()
         with self._staging_settings():
             staging_definition = runtime_definition_service.resolve_active(
                 self.db,
                 self.scenario,
-                environment=runtime_connector_service.runtime_environment(),
             )
             staging_workflow = runtime_definition_service.resolve_resource(
                 staging_definition, "workflow", self.workflow.id
@@ -340,21 +334,19 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
                     staging_action,
                     {},
                     idempotency_key="same-mutation",
-                    runtime_environment="staging",
                     runtime_definition=staging_definition,
                 )
 
         self.assertTrue(created)
         self.assertFalse(duplicate_created)
         self.assertEqual(duplicate.id, staging_run.id)
-        self.assertEqual(staging_run.dedupe_key, "staging:same-delivery")
+        self.assertEqual(staging_run.dedupe_key, "same-delivery")
         self.assertEqual(staging_run.release_id, release_a.id)
 
         with self._dev_settings():
             dev_definition = runtime_definition_service.resolve_active(
                 self.db,
                 self.scenario,
-                environment=runtime_connector_service.runtime_environment(),
             )
             live_workflow = self.db.get(OntologyWorkflow, self.workflow.id)
             live_action = self.db.get(OntologyAction, self.action.id)
@@ -375,15 +367,21 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
                     live_action,
                     {},
                     idempotency_key="same-mutation",
-                    runtime_environment="dev",
                     runtime_definition=dev_definition,
                 )
 
-        self.assertTrue(dev_created)
-        self.assertNotEqual(dev_run.id, staging_run.id)
-        self.assertEqual(dev_run.dedupe_key, "dev:same-delivery")
-        self.assertEqual(dev_run.definition_source, "live")
-        self.assertIsNone(dev_run.release_id)
+        self.assertFalse(dev_created)
+        self.assertEqual(dev_run.id, staging_run.id)
+        self.assertEqual(dev_run.dedupe_key, "same-delivery")
+        self.assertEqual(dev_run.definition_source, "release")
+        self.assertEqual(dev_run.release_id, release_a.id)
+        authored = runtime_definition_service.resolve_authoring(self.db, self.scenario)
+        with self.assertRaises(PolicyViolation):
+            operations_service.enqueue_workflow_run(self.db, self.workflow, {"ticket": "dedupe"},
+                dedupe_key="same-delivery", runtime_definition=authored)
+        with self.assertRaises(PolicyViolation):
+            operations_service.enqueue_workflow_run(self.db, self.workflow, {"ticket": "changed"},
+                dedupe_key="same-delivery", runtime_definition=staging_definition)
         self.assertEqual(
             set(
                 self.db.execute(
@@ -392,7 +390,7 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
                     )
                 ).scalars()
             ),
-            {"staging:same-delivery", "dev:same-delivery"},
+            {"same-delivery"},
         )
         action_logs = self.db.execute(
             select(ActionExecutionLog)
@@ -400,7 +398,7 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
                 ActionExecutionLog.target_type == "action",
                 ActionExecutionLog.target_id == self.action.id,
             )
-            .order_by(ActionExecutionLog.environment.asc())
+            .order_by(ActionExecutionLog.created_at.asc())
         ).scalars().all()
         self.assertEqual(action_logs, [])
 
@@ -409,7 +407,6 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
         run = WorkflowRun(
             scenario_id=self.scenario.id,
             workflow_id=self.workflow.id,
-            environment="staging",
             definition_snapshot_id=snapshot.id,
             release_id=release.id,
             definition_hash="0" * 64,
@@ -427,12 +424,10 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
         definition = runtime_definition_service.resolve_active(
             self.db,
             self.scenario,
-            environment="staging",
         )
         run = WorkflowRun(
             scenario_id=self.scenario.id,
             workflow_id=self.workflow.id,
-            environment="staging",
             definition_snapshot_id=snapshot.id,
             release_id=release.id,
             definition_hash=definition.definition_hash,
@@ -441,12 +436,12 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
 
         for allowed_status in ("released", "superseded", "rolled_back"):
             release.status = allowed_status
+            release.enabled = allowed_status == "released"
             self.db.commit()
             resolved_run = runtime_definition_service.resolve_for_run(self.db, run)
             resolved_pin = runtime_definition_service.resolve_pinned(
                 self.db,
                 self.scenario,
-                environment="staging",
                 snapshot_id=snapshot.id,
                 release_id=release.id,
                 definition_hash=definition.definition_hash,
@@ -461,7 +456,6 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
             lambda: runtime_definition_service.resolve_pinned(
                 self.db,
                 self.scenario,
-                environment="staging",
                 snapshot_id=snapshot.id,
                 release_id=release.id,
                 definition_hash=definition.definition_hash,
@@ -474,15 +468,13 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
                 resolver()
 
     def test_dev_run_definition_hash_is_an_optimistic_execution_pin(self) -> None:
-        definition = runtime_definition_service.resolve_active(
+        definition = runtime_definition_service.resolve_authoring(
             self.db,
             self.scenario,
-            environment="dev",
         )
         run = WorkflowRun(
             scenario_id=self.scenario.id,
             workflow_id=self.workflow.id,
-            environment="dev",
             definition_hash=definition.definition_hash,
             definition_source="live",
         )
@@ -492,7 +484,7 @@ class RuntimeDefinitionIsolationTests(unittest.TestCase):
         run.definition_hash = "tampered"
         with self.assertRaisesRegex(
             runtime_definition_service.RuntimeDefinitionError,
-            "完整性校验失败",
+            "运行定义已变更",
         ):
             runtime_definition_service.resolve_for_run(self.db, run)
 

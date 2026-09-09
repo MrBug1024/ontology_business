@@ -3693,7 +3693,6 @@ class ActionDecisionChainTests(unittest.TestCase):
 
         rows = scenarios.list_execution_logs(
             self.scenario.id,
-            environment=None,
             limit=50,
             db=self.db,
         )
@@ -3779,7 +3778,6 @@ class ActionDecisionChainTests(unittest.TestCase):
                     idempotency_key="agent-artifact-req-1",
                     preview_log_id=preview["log_id"],
                     correlation_id=preview["correlation_id"],
-                    expected_environment=preview["environment"],
                     expected_definition_snapshot_id=preview["definition_snapshot_id"],
                     expected_release_id=preview["release_id"],
                     expected_definition_hash=preview["definition_hash"],
@@ -3849,7 +3847,6 @@ class ActionDecisionChainTests(unittest.TestCase):
             idempotency_key="agent-race-1",
             preview_log_id=preview["log_id"],
             correlation_id=preview["correlation_id"],
-            expected_environment=preview["environment"],
             expected_definition_snapshot_id=preview["definition_snapshot_id"],
             expected_release_id=preview["release_id"],
             expected_definition_hash=preview["definition_hash"],

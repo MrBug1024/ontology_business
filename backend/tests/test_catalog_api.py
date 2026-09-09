@@ -214,7 +214,7 @@ class CatalogApiTests(unittest.TestCase):
         version_json = version.json()
 
         head = self.client.put(
-            f"/api/catalog/datasets/{dataset_json['id']}/heads/dev",
+            f"/api/catalog/datasets/{dataset_json['id']}/head",
             json={"dataset_version_id": version_json["id"]},
         )
         self.assertEqual(head.status_code, 200, head.text)
@@ -240,7 +240,6 @@ class CatalogApiTests(unittest.TestCase):
             json={
                 "dataset_id": dataset["id"],
                 "binding_key": "records.input",
-                "environment": "dev",
                 "role": "modeling_evidence",
                 "binding_mode": "head",
                 "dataset_head_id": head["id"],
@@ -371,10 +370,9 @@ class CatalogApiTests(unittest.TestCase):
                 "provider_config": {"semantic_mapping_ids": [mapping["id"]]},
             }
             db.commit()
-            definition = runtime_definition_service.resolve_active(
+            definition = runtime_definition_service.resolve_authoring(
                 db,
                 db.get(BusinessScenario, self.scenario.id),
-                environment="dev",
             )
             handle = ResolvedDataHandle(
                 port_key="records",
@@ -387,7 +385,6 @@ class CatalogApiTests(unittest.TestCase):
             deployment = ResolvedDeployment(
                 scenario_id=self.scenario.id,
                 tenant_id=self.tenant.id,
-                environment="dev",
                 definition_hash=definition.definition_hash,
                 definition=definition,
                 data_ports=(
@@ -544,15 +541,13 @@ class CatalogApiTests(unittest.TestCase):
                 },
             }
             db.commit()
-            templated_definition = runtime_definition_service.resolve_active(
+            templated_definition = runtime_definition_service.resolve_authoring(
                 db,
                 db.get(BusinessScenario, self.scenario.id),
-                environment="dev",
             )
             templated_deployment = ResolvedDeployment(
                 scenario_id=self.scenario.id,
                 tenant_id=self.tenant.id,
-                environment="dev",
                 definition_hash=templated_definition.definition_hash,
                 definition=templated_definition,
                 data_ports=deployment.data_ports,
@@ -645,15 +640,13 @@ class CatalogApiTests(unittest.TestCase):
                 },
             }
             db.commit()
-            audit_definition = runtime_definition_service.resolve_active(
+            audit_definition = runtime_definition_service.resolve_authoring(
                 db,
                 db.get(BusinessScenario, self.scenario.id),
-                environment="dev",
             )
             audit_deployment = ResolvedDeployment(
                 scenario_id=self.scenario.id,
                 tenant_id=self.tenant.id,
-                environment="dev",
                 definition_hash=audit_definition.definition_hash,
                 definition=audit_definition,
                 data_ports=deployment.data_ports,
@@ -715,15 +708,13 @@ class CatalogApiTests(unittest.TestCase):
                 },
             }
             db.commit()
-            legacy_definition = runtime_definition_service.resolve_active(
+            legacy_definition = runtime_definition_service.resolve_authoring(
                 db,
                 db.get(BusinessScenario, self.scenario.id),
-                environment="dev",
             )
             legacy_deployment = ResolvedDeployment(
                 scenario_id=self.scenario.id,
                 tenant_id=self.tenant.id,
-                environment="dev",
                 definition_hash=legacy_definition.definition_hash,
                 definition=legacy_definition,
                 data_ports=deployment.data_ports,
@@ -776,7 +767,6 @@ class CatalogApiTests(unittest.TestCase):
             db.flush()
             frozen_definition = runtime_definition_service._from_snapshot(
                 db.get(BusinessScenario, self.scenario.id),
-                "prod",
                 frozen_snapshot,
                 release=None,
             )
@@ -785,7 +775,6 @@ class CatalogApiTests(unittest.TestCase):
             frozen_deployment = ResolvedDeployment(
                 scenario_id=self.scenario.id,
                 tenant_id=self.tenant.id,
-                environment="prod",
                 definition_hash=frozen_definition.definition_hash,
                 definition=frozen_definition,
                 data_ports=deployment.data_ports,
@@ -826,7 +815,7 @@ class CatalogApiTests(unittest.TestCase):
         version_b = version_b_response.json()
 
         first_writer = self.client.put(
-            f"/api/catalog/datasets/{dataset['id']}/heads/dev",
+            f"/api/catalog/datasets/{dataset['id']}/head",
             json={
                 "dataset_version_id": version_b["id"],
                 "expected_dataset_version_id": version_a["id"],
@@ -836,7 +825,7 @@ class CatalogApiTests(unittest.TestCase):
         self.assertEqual(first_writer.json()["dataset_version_id"], version_b["id"])
 
         stale_writer = self.client.put(
-            f"/api/catalog/datasets/{dataset['id']}/heads/dev",
+            f"/api/catalog/datasets/{dataset['id']}/head",
             json={
                 "dataset_version_id": version_a["id"],
                 "expected_dataset_version_id": version_a["id"],
@@ -851,7 +840,7 @@ class CatalogApiTests(unittest.TestCase):
 
         # Existing clients remain compatible when they intentionally omit CAS.
         unconditional = self.client.put(
-            f"/api/catalog/datasets/{dataset['id']}/heads/dev",
+            f"/api/catalog/datasets/{dataset['id']}/head",
             json={"dataset_version_id": version_a["id"]},
         )
         self.assertEqual(unconditional.status_code, 200, unconditional.text)
@@ -869,7 +858,6 @@ class CatalogApiTests(unittest.TestCase):
             json={
                 "dataset_id": dataset["id"],
                 "binding_key": "cross-tenant",
-                "environment": "dev",
                 "role": "reference",
                 "binding_mode": "pinned",
                 "dataset_version_id": "unknown",
@@ -937,7 +925,7 @@ class CatalogApiTests(unittest.TestCase):
                     scenario_id=self.scenario.id,
                     branch_id=branch.id,
                     snapshot_id=snapshot.id,
-                    environment="prod",
+                    enabled=True,
                     status="released",
                     created_by_user_id=self.user.id,
                 )
@@ -1176,7 +1164,6 @@ class CatalogApiTests(unittest.TestCase):
             json={
                 "dataset_id": dataset["id"],
                 "binding_key": "invalid.modeling",
-                "environment": "dev",
                 "role": "modeling_evidence",
                 "binding_mode": "head",
                 "dataset_head_id": head["id"],
@@ -1211,7 +1198,6 @@ class CatalogApiTests(unittest.TestCase):
                 scenario_id=self.scenario.id,
                 dataset_id=dataset["id"],
                 binding_key="bypassed.invalid.modeling",
-                environment="dev",
                 role="modeling_evidence",
                 binding_mode="head",
                 dataset_head_id=head["id"],
@@ -1260,7 +1246,6 @@ class CatalogApiTests(unittest.TestCase):
             deployment = ResolvedDeployment(
                 scenario_id=self.scenario.id,
                 tenant_id=self.tenant.id,
-                environment="dev",
                 definition_hash="f" * 64,
                 definition=SimpleNamespace(entities={}),
             )
@@ -1346,7 +1331,6 @@ class CatalogApiTests(unittest.TestCase):
             binding = connector_service.upsert_binding(
                 db,
                 self.scenario,
-                environment="dev",
                 binding_key_value="warehouse.current",
                 kind="data_source",
                 connector_id=source.id,
@@ -1362,14 +1346,13 @@ class CatalogApiTests(unittest.TestCase):
 
         response = self.client.get(
             f"/api/scenarios/{self.scenario.id}/connector-bindings",
-            params={"environment": "dev"},
+            params={},
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json(), [{
             "binding_key": "warehouse.current",
             "label": "Current warehouse",
             "connector_kind": "data_source",
-            "environment": "dev",
             "ready": True,
             "blocking_reason": "",
             "capabilities": ["sql_read", "schema"],

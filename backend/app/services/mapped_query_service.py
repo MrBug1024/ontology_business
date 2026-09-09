@@ -86,7 +86,6 @@ class MappedQueryPlan:
             "table": str(self.mapping.table_name),
             "definition": {
                 "source": str(self.definition.source),
-                "environment": str(self.definition.environment),
                 "definition_hash": str(self.definition.definition_hash),
                 "snapshot_id": self.definition.snapshot_id,
                 "release_id": self.definition.release_id,
@@ -203,7 +202,7 @@ def _canonical_mapping(definition: Any, runtime_mapping: Any) -> Any:
     elif str(getattr(runtime_mapping, "data_source_id", "") or "") != str(
         getattr(canonical, "data_source_id", "") or ""
     ):
-        raise MappedQueryError("开发环境映射的数据源与当前运行定义不一致")
+        raise MappedQueryError("当前映射的数据源与运行定义不一致")
     return canonical
 
 

@@ -154,7 +154,7 @@
               <h3 id="agent-capability-heading">业务能力</h3>
               <p>新 Agent 默认拥有当前场景的全部业务能力；只有需要限制职责边界时，才改为指定能力。</p>
             </div>
-            <el-tag v-if="capabilityCatalog" size="small" effect="plain">{{ capabilityCatalog.environment }} 运行定义</el-tag>
+            <el-tag v-if="capabilityCatalog" size="small" effect="plain">当前场景能力</el-tag>
           </div>
           <el-alert
             v-if="editingLegacyScope"

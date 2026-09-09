@@ -17,16 +17,15 @@ router = APIRouter(prefix="/developer/capability-access", tags=["capability-acce
 @router.get("/{scenario_id}/manifest", response_model=CapabilityAccessManifestOut)
 def get_manifest(
     scenario_id: str,
-    environment: Literal["dev", "staging", "prod"] = Query(default="prod"),
+    release_id: str | None = Query(default=None, min_length=1, max_length=32),
     db: Session = Depends(get_tenant_db),
 ) -> CapabilityAccessManifestOut:
     try:
         document = capability_access_service.build_manifest(
             db,
             scenario_id,
-            environment=environment,
+            release_id=release_id,
         )
     except capability_access_service.CapabilityAccessError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return CapabilityAccessManifestOut.model_validate(document)
-

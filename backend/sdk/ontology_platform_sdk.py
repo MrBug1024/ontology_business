@@ -85,6 +85,7 @@ class _ExternalHttpClient:
         json_body: dict[str, Any] | None = None,
         form_data: dict[str, Any] | None = None,
         files: dict[str, Any] | None = None,
+        response_bytes: bool = False,
     ) -> Any:
         try:
             response = self._client.request(
@@ -94,7 +95,7 @@ class _ExternalHttpClient:
                 json=json_body,
                 data=form_data,
                 files=files,
-                headers={"X-API-Key": self._api_key, "Accept": "application/json"},
+                headers={"X-API-Key": self._api_key, "Accept": "application/octet-stream" if response_bytes else "application/json"},
                 # A caller may pass an httpx client configured to follow
                 # redirects.  Never permit that setting to forward a bearer
                 # credential to an arbitrary Location target.
@@ -110,6 +111,8 @@ class _ExternalHttpClient:
             raise ExternalApiError(
                 f"外部 API 返回 HTTP {response.status_code}", status_code=response.status_code
             )
+        if response_bytes:
+            return response.content
         try:
             return response.json()
         except ValueError as exc:
@@ -169,6 +172,12 @@ class OntologyPlatformClient(_ExternalHttpClient):
 class CapabilityClient(_ExternalHttpClient):
     """Synchronous client for ``/api/external/v2`` capability endpoints."""
 
+    def download_invocation_attachment(self, invocation_id: str, file_id: str) -> bytes:
+        return self._request(
+            f"invocations/{quote(invocation_id, safe='')}/attachments/{quote(file_id, safe='')}/download",
+            response_bytes=True,
+        )
+
     def list_scenarios(self) -> list[dict[str, Any]]:
         payload = self._request("scenarios")
         if not isinstance(payload, list):
@@ -179,11 +188,11 @@ class CapabilityClient(_ExternalHttpClient):
         self,
         scenario_id: str,
         *,
-        environment: str = "prod",
+        release_id: str | None = None,
     ) -> list[dict[str, Any]]:
         payload = self._request(
             f"scenarios/{quote(str(scenario_id), safe='')}/capabilities",
-            params={"environment": environment},
+            params={"release_id": release_id} if release_id else {},
         )
         if not isinstance(payload, list):
             raise ExternalApiError("外部 API 返回了无效能力列表")
@@ -230,14 +239,14 @@ class CapabilityClient(_ExternalHttpClient):
         kind: CapabilityKind,
         key: str,
         *,
-        environment: str = "prod",
+        release_id: str | None = None,
     ) -> dict[str, Any]:
         normalized_kind = _capability_kind(kind)
         payload = self._request(
             "scenarios/"
             f"{quote(str(scenario_id), safe='')}/capabilities/"
             f"{quote(normalized_kind, safe='')}/{quote(str(key), safe='')}",
-            params={"environment": environment},
+            params={"release_id": release_id} if release_id else {},
         )
         if not isinstance(payload, dict):
             raise ExternalApiError("外部 API 返回了无效能力契约")
@@ -250,7 +259,7 @@ class CapabilityClient(_ExternalHttpClient):
         key: str,
         port_key: str,
         *,
-        environment: str = "prod",
+        release_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -261,7 +270,7 @@ class CapabilityClient(_ExternalHttpClient):
             f"{quote(normalized_kind, safe='')}/{quote(str(key), safe='')}/ports/"
             f"{quote(str(port_key), safe='')}/managed-input-options",
             params={
-                "environment": environment,
+                **({"release_id": release_id} if release_id else {}),
                 "limit": limit,
                 "offset": offset,
             },
@@ -280,9 +289,9 @@ class CapabilityClient(_ExternalHttpClient):
         kind: CapabilityKind,
         key: str,
         *,
+        release_id: str | None = None,
         inputs: dict[str, Any] | None = None,
         managed_inputs: list[dict[str, Any]] | None = None,
-        environment: str = "prod",
         mode: str = "execute",
         idempotency_key: str | None = None,
         correlation_id: str | None = None,
@@ -293,12 +302,12 @@ class CapabilityClient(_ExternalHttpClient):
     ) -> dict[str, Any]:
         normalized_kind = _capability_kind(kind)
         document: dict[str, Any] = {
-            "environment": environment,
             "mode": mode,
             "inputs": dict(inputs or {}),
             "managed_inputs": list(managed_inputs or []),
         }
         optional = {
+            "release_id": release_id,
             "idempotency_key": idempotency_key,
             "correlation_id": correlation_id,
             "request_id": request_id,
@@ -325,6 +334,20 @@ class CapabilityClient(_ExternalHttpClient):
         if not isinstance(payload, dict) or payload.get("invocation_id") != invocation_id:
             raise ExternalApiError("外部 API 返回了无效能力回执")
         return payload
+
+    def get_business_approval(self, interaction_id: str) -> dict[str, Any]:
+        return self._request(f"interactions/approval/{quote(str(interaction_id), safe='')}")
+
+    def reply_business_interaction(
+        self, kind: str, interaction_id: str, *, text: str, message_id: str,
+        expected_revision: int, evidence: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if kind not in {"confirmation", "approval"}:
+            raise ValueError("不支持的业务待办类型")
+        return self._request(
+            f"interactions/{kind}/{quote(str(interaction_id), safe='')}/reply", method="POST",
+            json_body={"text": text, "message_id": message_id, "expected_revision": expected_revision, "evidence": evidence or []},
+        )
 
 
 def _is_loopback_host(hostname: str) -> bool:

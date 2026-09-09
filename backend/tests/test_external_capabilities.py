@@ -10,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
+from app.business_query_contract import BusinessQueryContractMiddleware
 from app.models import (
     BusinessScenario,
     DatasetSchema,
@@ -21,9 +22,10 @@ from app.models import (
     User,
 )
 from app.routers import external_api, external_capabilities
-from app.services import permission_service
+from app.services import permission_service, scenario_release_service
 from app.services.auth_service import get_tenant_db
 from sdk import CapabilityClient
+from .release_fixtures import enable_current_release
 
 
 class ExternalCapabilityApiTests(unittest.TestCase):
@@ -88,10 +90,13 @@ class ExternalCapabilityApiTests(unittest.TestCase):
                 owner_user_id=self.owner.id,
             )
             db.commit()
+            db.info.update(tenant_id=self.tenant.id, user_id=self.owner.id)
+            self.release = enable_current_release(db, self.scenario)
         finally:
             db.close()
 
         self.app = FastAPI()
+        self.app.add_middleware(BusinessQueryContractMiddleware, api_prefix="/api")
         self.app.include_router(external_api.management_router, prefix="/api")
         self.app.include_router(external_capabilities.router, prefix="/api")
 
@@ -112,6 +117,13 @@ class ExternalCapabilityApiTests(unittest.TestCase):
         self.client.close()
         self.engine.dispose()
 
+    def _publish_current(self):
+        with self.Session() as db:
+            db.info.update(tenant_id=self.tenant.id, user_id=self.owner.id)
+            scenario_release_service.change_release(db, self.scenario.id, self.release.id,
+                expected_revision=self.release.revision, action="retire")
+            self.release = enable_current_release(db, db.get(BusinessScenario, self.scenario.id))
+
     def _issue(self, name: str, scopes: list[str]) -> dict:
         response = self.client.post(
             "/api/developer/api-keys",
@@ -130,6 +142,18 @@ class ExternalCapabilityApiTests(unittest.TestCase):
             f"/capabilities/function/{self.function.id}"
         )
 
+    def test_retired_environment_selectors_are_rejected_instead_of_silently_ignored(self) -> None:
+        key = self._issue("retired-selector", ["capabilities:read", "capabilities:invoke"])
+        headers = {"X-API-Key": key["token"]}
+        for field in ("environment", "runtime_environment", "expected_environment"):
+            with self.subTest(field=field):
+                response = self.client.get(self._capability_url(), params={field: "prod"}, headers=headers)
+                self.assertEqual(response.status_code, 410, response.text)
+                self.assertEqual(response.json()["detail"]["code"], "business_environment_removed")
+                rejected = self.client.post(f"{self._capability_url()}/invoke",
+                    json={"inputs": {"amount": 4}, field: "prod"}, headers=headers)
+                self.assertEqual(rejected.status_code, 422, rejected.text)
+
     def test_zero_data_capability_is_discoverable_invokable_and_receipted(self) -> None:
         key = self._issue(
             "zero-data-client",
@@ -139,7 +163,7 @@ class ExternalCapabilityApiTests(unittest.TestCase):
 
         listed = self.client.get(
             f"/api/external/v2/scenarios/{self.scenario.id}/capabilities",
-            params={"environment": "dev"},
+            params={},
             headers=headers,
         )
         self.assertEqual(listed.status_code, 200, listed.text)
@@ -153,7 +177,7 @@ class ExternalCapabilityApiTests(unittest.TestCase):
 
         invoked = self.client.post(
             f"{self._capability_url()}/invoke",
-            json={"environment": "dev", "inputs": {"amount": 4}},
+            json={"inputs": {"amount": 4}},
             headers=headers,
         )
         self.assertEqual(invoked.status_code, 200, invoked.text)
@@ -233,15 +257,16 @@ class ExternalCapabilityApiTests(unittest.TestCase):
         finally:
             db.close()
 
+        self._publish_current()
         key = self._issue("scoped-discovery", ["capabilities:read"])
         headers = {"X-API-Key": key["token"]}
         primary = self.client.get(
-            self._capability_url(), params={"environment": "dev"}, headers=headers
+            self._capability_url(), params={}, headers=headers
         )
         secondary = self.client.get(
             f"/api/external/v2/scenarios/{self.scenario.id}"
             f"/capabilities/function/{other.id}",
-            params={"environment": "dev"},
+            params={},
             headers=headers,
         )
 
@@ -306,8 +331,6 @@ class ExternalCapabilityApiTests(unittest.TestCase):
                 direction="input",
                 role="invocation_input",
                 media_kind="dataset",
-                dataset_id=dataset.id,
-                dataset_schema_id=schema.id,
                 schema_document={"type": "array", "items": {"type": "object"}},
                 is_required=True,
                 cardinality="one",
@@ -323,6 +346,7 @@ class ExternalCapabilityApiTests(unittest.TestCase):
         finally:
             db.close()
 
+        self._publish_current()
         key = self._issue(
             "changing-input-client",
             ["capabilities:read", "capabilities:invoke"],
@@ -330,7 +354,7 @@ class ExternalCapabilityApiTests(unittest.TestCase):
         headers = {"X-API-Key": key["token"]}
         discovered = self.client.get(
             self._capability_url(),
-            params={"environment": "dev"},
+            params={},
             headers=headers,
         )
         self.assertEqual(discovered.status_code, 200, discovered.text)
@@ -359,7 +383,7 @@ class ExternalCapabilityApiTests(unittest.TestCase):
 
         missing = self.client.post(
             f"{self._capability_url()}/invoke",
-            json={"environment": "dev", "inputs": {"amount": 2}},
+            json={"inputs": {"amount": 2}},
             headers=headers,
         )
         self.assertEqual(missing.status_code, 409, missing.text)
@@ -373,7 +397,6 @@ class ExternalCapabilityApiTests(unittest.TestCase):
             invoked = self.client.post(
                 f"{self._capability_url()}/invoke",
                 json={
-                    "environment": "dev",
                     "inputs": {"amount": 2},
                     "managed_inputs": [
                         {"port_key": "records", "dataset_version_id": version_id}
@@ -399,7 +422,7 @@ class ExternalCapabilityApiTests(unittest.TestCase):
         headers = {"X-API-Key": read_key["token"]}
         denied = self.client.post(
             f"{self._capability_url()}/invoke",
-            json={"environment": "dev", "inputs": {"amount": 1}},
+            json={"inputs": {"amount": 1}},
             headers=headers,
         )
         self.assertEqual(denied.status_code, 403, denied.text)
@@ -410,7 +433,7 @@ class ExternalCapabilityApiTests(unittest.TestCase):
         )
         invalid = self.client.post(
             f"{self._capability_url()}/invoke",
-            json={"environment": "dev", "inputs": {"amount": "private-invalid"}},
+            json={"inputs": {"amount": "private-invalid"}},
             headers={"X-API-Key": broad_key["token"]},
         )
         self.assertEqual(invalid.status_code, 422, invalid.text)
@@ -429,33 +452,29 @@ class ExternalCapabilityApiTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(client, "identity"))
         self.assertFalse(hasattr(client, "list_objects"))
-        capabilities = client.list_capabilities(self.scenario.id, environment="dev")
+        capabilities = client.list_capabilities(self.scenario.id, )
         self.assertEqual([item["key"] for item in capabilities], [self.function.id])
         contract = client.get_capability(
             self.scenario.id,
             "function",
             self.function.id,
-            environment="dev",
         )
         with self.assertRaises(ValueError):
             client.get_capability(
                 self.scenario.id,
                 "provider",  # type: ignore[arg-type]
                 self.function.id,
-                environment="dev",
             )
         with self.assertRaises(ValueError):
             client.invoke_capability(
                 self.scenario.id,
                 "query",  # type: ignore[arg-type]
                 self.function.id,
-                environment="dev",
             )
         receipt = client.invoke_capability(
             self.scenario.id,
             "function",
             self.function.id,
-            environment="dev",
             inputs={"amount": 6},
             expected_definition_hash=contract["definition_hash"],
             expected_deployment_fingerprint=contract["deployment_fingerprint"],

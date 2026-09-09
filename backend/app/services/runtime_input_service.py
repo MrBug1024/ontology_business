@@ -3,7 +3,7 @@
 This service is the database-aware boundary between versioned capability ports
 and invocation-time data.  Capability definitions declare requirements; this
 module resolves those requirements to immutable catalog versions or a checked
-connector binding for one tenant, scenario, and environment.
+connector binding for one tenant and scenario.
 
 Only managed references are accepted.  Arbitrary inline documents and physical
 connection details are deliberately outside this API.  Dataset heads are read
@@ -59,7 +59,6 @@ from .deployment_service import (
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_ENVIRONMENTS = frozenset({"dev", "staging", "prod"})
 _INVOCATION_SOURCES = frozenset({"internal", "agent", "rest", "mcp"})
 _MANAGED_KINDS = frozenset(
     {"dataset_version", "dataset_head", "asset_version", "connector_binding"}
@@ -143,7 +142,7 @@ class RuntimeInputResolution:
 
 @dataclass(frozen=True, slots=True)
 class DeploymentInputResolution:
-    """Current environment defaults resolved without creating an invocation."""
+    """Explicit managed defaults resolved without creating an invocation."""
 
     runtime_data_context: RuntimeDataContext
     data_ports: tuple[DataPort, ...]
@@ -168,7 +167,6 @@ class ManagedInputOption:
     reference_id: str | None = None
     binding_key: str | None = None
     version_number: int | None = None
-    environment: str | None = None
     connector_kind: str | None = None
     updated_at: datetime | None = None
 
@@ -193,8 +191,6 @@ class ManagedInputOption:
         }
         if self.version_number is not None:
             document["version_number"] = self.version_number
-        if self.environment is not None:
-            document["environment"] = self.environment
         if self.connector_kind is not None:
             document["connector_kind"] = self.connector_kind
         if self.updated_at is not None:
@@ -302,16 +298,6 @@ def _text(value: Any, label: str, *, maximum: int = 240) -> str:
         raise RuntimeInputResolutionError(
             "invalid_runtime_scope",
             f"{label} must contain between 1 and {maximum} characters",
-        )
-    return normalized
-
-
-def _environment(value: Any) -> str:
-    normalized = str(value or "").strip().lower()
-    if normalized not in _ENVIRONMENTS:
-        raise RuntimeInputResolutionError(
-            "invalid_environment",
-            "environment must be dev, staging, or prod",
         )
     return normalized
 
@@ -636,7 +622,6 @@ def load_runtime_input_ports(
     *,
     tenant_id: str,
     scenario_id: str,
-    environment: str,
     capability: CapabilityRef,
     definition: Any | None = None,
 ) -> tuple[Any, ...]:
@@ -644,7 +629,6 @@ def load_runtime_input_ports(
 
     normalized_tenant = _text(tenant_id, "tenant id")
     normalized_scenario = _text(scenario_id, "scenario id")
-    _environment(environment)
     if not isinstance(capability, CapabilityRef):
         raise RuntimeInputResolutionError(
             "invalid_capability_reference",
@@ -794,17 +778,15 @@ def resolve_deployment_inputs(
     *,
     tenant_id: str,
     scenario_id: str,
-    environment: str,
     capability: CapabilityRef,
     definition: Any,
 ) -> DeploymentInputResolution:
-    """Resolve only environment defaults for deployment identity/readiness."""
+    """Resolve explicit managed defaults for deployment identity/readiness."""
 
     ports = load_runtime_input_ports(
         db,
         tenant_id=tenant_id,
         scenario_id=scenario_id,
-        environment=environment,
         capability=capability,
         definition=definition,
     )
@@ -815,7 +797,6 @@ def resolve_deployment_inputs(
             db,
             tenant_id=tenant_id,
             scenario_id=scenario_id,
-            environment=environment,
             port=port,
         )
         if item is None:
@@ -1044,7 +1025,6 @@ def _resolve_dataset_head(
     *,
     reference: _ManagedReference,
     tenant_id: str,
-    environment: str,
     port: ScenarioCapabilityPort,
     resolution_source: str,
     default_binding_id: str | None = None,
@@ -1066,12 +1046,6 @@ def _resolve_dataset_head(
         raise RuntimeInputResolutionError(
             "managed_reference_scope_mismatch",
             "managed dataset head is outside the invocation scope",
-            port_key=reference.port_key,
-        )
-    if str(head.environment or "").lower() != environment:
-        raise RuntimeInputResolutionError(
-            "managed_reference_environment_mismatch",
-            "managed dataset head belongs to another environment",
             port_key=reference.port_key,
         )
     version_reference = _ManagedReference(
@@ -1236,7 +1210,6 @@ def _load_connector(
     reference: _ManagedReference,
     tenant_id: str,
     scenario_id: str,
-    environment: str,
     lock_reference: bool = True,
 ) -> ConnectorBinding:
     statement = select(ConnectorBinding)
@@ -1245,7 +1218,6 @@ def _load_connector(
             ConnectorBinding.binding_key == reference.reference_id,
             ConnectorBinding.tenant_id == tenant_id,
             ConnectorBinding.scenario_id == scenario_id,
-            ConnectorBinding.environment == environment,
         )
     else:
         statement = statement.where(ConnectorBinding.id == reference.reference_id)
@@ -1260,12 +1232,6 @@ def _load_connector(
         raise RuntimeInputResolutionError(
             "managed_reference_scope_mismatch",
             "managed connector binding is outside the invocation scope",
-            port_key=reference.port_key,
-        )
-    if str(binding.environment or "").lower() != environment:
-        raise RuntimeInputResolutionError(
-            "managed_reference_environment_mismatch",
-            "managed connector binding belongs to another environment",
             port_key=reference.port_key,
         )
     if str(binding.health_status or "").lower() != "healthy":
@@ -1289,7 +1255,6 @@ def _resolve_connector(
     reference: _ManagedReference,
     tenant_id: str,
     scenario_id: str,
-    environment: str,
     port: ScenarioCapabilityPort,
     resolution_source: str,
     lock_reference: bool = True,
@@ -1299,7 +1264,6 @@ def _resolve_connector(
         reference=reference,
         tenant_id=tenant_id,
         scenario_id=scenario_id,
-        environment=environment,
         lock_reference=lock_reference,
     )
     actual = str(binding.connector_signature).lower()
@@ -1369,7 +1333,6 @@ def _resolve_reference(
     reference: _ManagedReference,
     tenant_id: str,
     scenario_id: str,
-    environment: str,
     port: ScenarioCapabilityPort,
     resolution_source: str,
     default_binding_id: str | None = None,
@@ -1397,7 +1360,6 @@ def _resolve_reference(
             db,
             reference=reference,
             tenant_id=tenant_id,
-            environment=environment,
             port=port,
             resolution_source=resolution_source,
             default_binding_id=default_binding_id,
@@ -1416,7 +1378,6 @@ def _resolve_reference(
         reference=reference,
         tenant_id=tenant_id,
         scenario_id=scenario_id,
-        environment=environment,
         port=port,
         resolution_source=resolution_source,
         lock_reference=lock_reference,
@@ -1428,14 +1389,13 @@ def list_managed_input_options(
     *,
     tenant_id: str,
     scenario_id: str,
-    environment: str,
     port: Any,
 ) -> tuple[ManagedInputOption, ...]:
     """List only logical references that this exact input port can resolve.
 
     Authorization is deliberately owned by the caller because catalog rows do
     not define a second, competing ACL model. This function enforces the
-    runtime contract itself: tenant/scenario/environment scope, frozen schema
+    runtime contract itself: tenant/scenario scope, frozen schema
     hash, binding kinds, active lifecycle, readiness, connector freshness and
     temporary-asset expiry. It performs no writes and does not lock mutable
     heads or connector bindings while merely displaying choices.
@@ -1443,7 +1403,6 @@ def list_managed_input_options(
 
     normalized_tenant = _text(tenant_id, "tenant id")
     normalized_scenario = _text(scenario_id, "scenario id")
-    normalized_environment = _environment(environment)
     scenario = _require_scope(
         db,
         tenant_id=normalized_tenant,
@@ -1468,7 +1427,6 @@ def list_managed_input_options(
     skippable_candidate_errors = {
         "dataset_contract_mismatch",
         "invalid_managed_signature",
-        "managed_reference_environment_mismatch",
         "managed_reference_expired",
         "managed_reference_not_found",
         "managed_reference_not_ready",
@@ -1486,7 +1444,6 @@ def list_managed_input_options(
                 reference=reference,
                 tenant_id=normalized_tenant,
                 scenario_id=normalized_scenario,
-                environment=normalized_environment,
                 port=port,
                 resolution_source="discovery",
                 lock_reference=False,
@@ -1551,7 +1508,6 @@ def list_managed_input_options(
             .join(DatasetVersion, DatasetVersion.id == DatasetHead.dataset_version_id)
             .where(
                 DatasetHead.tenant_id == normalized_tenant,
-                DatasetHead.environment == normalized_environment,
                 LogicalDataset.tenant_id == normalized_tenant,
                 LogicalDataset.lifecycle_status == "active",
                 LogicalDataset.usage_plane != "modeling_material",
@@ -1580,10 +1536,9 @@ def list_managed_input_options(
                     binding_kind="dataset_head",
                     port_key=port_key,
                     reference_id=head.id,
-                    label=f"{dataset.name} · {normalized_environment}",
+                    label=dataset.name,
                     signature=resolved.handle.signature,
                     version_number=int(version.version_number),
-                    environment=normalized_environment,
                     updated_at=head.updated_at,
                 )
             )
@@ -1633,7 +1588,6 @@ def list_managed_input_options(
             for item in connector_service.list_bindings(
                 db,
                 scenario,
-                environment=normalized_environment,
             )
             if bool(item.get("ready", False))
         }
@@ -1642,7 +1596,6 @@ def list_managed_input_options(
             .where(
                 ConnectorBinding.tenant_id == normalized_tenant,
                 ConnectorBinding.scenario_id == normalized_scenario,
-                ConnectorBinding.environment == normalized_environment,
             )
             .order_by(ConnectorBinding.binding_key, ConnectorBinding.id)
         ).scalars().all()
@@ -1672,7 +1625,6 @@ def list_managed_input_options(
                         or binding.binding_key
                     ),
                     signature=resolved.handle.signature,
-                    environment=normalized_environment,
                     connector_kind=binding.connector_kind,
                     updated_at=binding.updated_at,
                 )
@@ -1695,7 +1647,6 @@ def _scenario_default(
     *,
     tenant_id: str,
     scenario_id: str,
-    environment: str,
     port: ScenarioCapabilityPort,
 ) -> _ResolvedInput | None:
     # Scenario dataset/connector bindings are modeling and release metadata,
@@ -1778,7 +1729,6 @@ def resolve_runtime_inputs(
     deployment: ResolvedDeployment,
     actor: Actor,
     scenario_id: str | None = None,
-    environment: str | None = None,
     tenant_id: str | None = None,
     overrides: Any = None,
     invocation_id: str | None = None,
@@ -1792,9 +1742,8 @@ def resolve_runtime_inputs(
 ) -> RuntimeInputResolution:
     """Resolve all active managed ports and create invocation input audit.
 
-    Resolution priority is invocation override, scenario/environment dataset
-    binding, then scenario/environment connector binding.  No legacy physical
-    source fallback is performed here; that remains outside the new kernel.
+    Inputs come from explicit invocation references and governed runtime defaults.
+    Modeling bindings and infrastructure configuration cannot supply missing data.
     """
 
     if not isinstance(request, Request):
@@ -1822,7 +1771,6 @@ def resolve_runtime_inputs(
 
     normalized_tenant = _text(deployment.tenant_id, "tenant id")
     normalized_scenario = _text(deployment.scenario_id, "scenario id")
-    normalized_environment = _environment(deployment.environment)
     if actor.tenant_id != normalized_tenant:
         raise RuntimeInputResolutionError(
             "principal_scope_mismatch",
@@ -1838,11 +1786,6 @@ def resolve_runtime_inputs(
         raise RuntimeInputResolutionError(
             "runtime_scope_mismatch",
             "requested scenario does not match the resolved deployment",
-        )
-    if environment not in (None, "") and _environment(environment) != normalized_environment:
-        raise RuntimeInputResolutionError(
-            "runtime_scope_mismatch",
-            "requested environment does not match the resolved deployment",
         )
 
     capability_kind = str(request.capability.kind or "").strip().lower()
@@ -1913,7 +1856,6 @@ def resolve_runtime_inputs(
         db,
         tenant_id=normalized_tenant,
         scenario_id=normalized_scenario,
-        environment=normalized_environment,
         capability=request.capability,
         definition=deployment.definition,
     )
@@ -1951,7 +1893,6 @@ def resolve_runtime_inputs(
                     reference=override,
                     tenant_id=normalized_tenant,
                     scenario_id=normalized_scenario,
-                    environment=normalized_environment,
                     port=port,
                     resolution_source="invocation_override",
                 )
@@ -1962,7 +1903,6 @@ def resolve_runtime_inputs(
                 db,
                 tenant_id=normalized_tenant,
                 scenario_id=normalized_scenario,
-                environment=normalized_environment,
                 port=port,
             )
             items = (default_item,) if default_item is not None else ()
@@ -2001,7 +1941,6 @@ def resolve_runtime_inputs(
     safe_inputs = [item.safe_document() for item in resolved]
     input_hash = canonical_hash(
         {
-            "environment": normalized_environment,
             "managed_inputs": safe_inputs,
             "scenario_id": normalized_scenario,
             "tenant_id": normalized_tenant,
@@ -2016,7 +1955,6 @@ def resolve_runtime_inputs(
         requested_by_user_id=requested_by_user_id,
         release_id=deployment.release_id,
         definition_snapshot_id=deployment.snapshot_id,
-        environment=normalized_environment,
         capability_kind=capability_kind,
         capability_key=capability_key,
         definition_hash=deployment.definition_hash,

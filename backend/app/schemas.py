@@ -10,6 +10,7 @@ import unicodedata
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from .channel_interaction_schemas import EvidenceReference
 
 
 # ──────────────────────────────────────────────
@@ -30,7 +31,6 @@ class ScenarioReleaseWithdrawRequest(BaseModel):
 
 class ScenarioReleaseWithdrawOut(BaseModel):
     scenario_id: str
-    environment: Literal["staging", "prod"]
     withdrawn_release_ids: list[str] = Field(default_factory=list)
     changed: bool
     withdrawn_at: datetime | None = None
@@ -71,35 +71,41 @@ class ScenarioPurgeOut(BaseModel):
 
 
 class RegisterIn(BaseModel):
-    email: str
-    password: str = Field(min_length=8, max_length=128)
-    password_confirm: str
+    model_config = {"extra": "forbid"}
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=128, repr=False)
+    password_confirm: str = Field(min_length=8, max_length=128, repr=False)
     display_name: str = Field(default="", max_length=120)
 
 
 class LoginIn(BaseModel):
-    email: str
-    password: str
+    model_config = {"extra": "forbid"}
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=128, repr=False)
 
 
 class VerifyEmailIn(BaseModel):
-    email: str
-    code: str = Field(min_length=6, max_length=6)
+    model_config = {"extra": "forbid"}
+    email: str = Field(min_length=3, max_length=320)
+    code: str = Field(min_length=6, max_length=6, repr=False)
 
 
 class ResendCodeIn(BaseModel):
-    email: str
+    model_config = {"extra": "forbid"}
+    email: str = Field(min_length=3, max_length=320)
 
 
 class ForgotPasswordIn(BaseModel):
-    email: str
+    model_config = {"extra": "forbid"}
+    email: str = Field(min_length=3, max_length=320)
 
 
 class ResetPasswordIn(BaseModel):
-    email: str
-    code: str = Field(min_length=6, max_length=6)
-    password: str = Field(min_length=8, max_length=128)
-    password_confirm: str
+    model_config = {"extra": "forbid"}
+    email: str = Field(min_length=3, max_length=320)
+    code: str = Field(min_length=6, max_length=6, repr=False)
+    password: str = Field(min_length=8, max_length=128, repr=False)
+    password_confirm: str = Field(min_length=8, max_length=128, repr=False)
 
 
 class UserOut(BaseModel):
@@ -111,6 +117,9 @@ class UserOut(BaseModel):
     # UI hint only. Every management endpoint remains responsible for enforcing
     # its own server-side permission check.
     can_manage: bool = False
+    system_role: Literal["user", "superadmin"] = "user"
+    workspace_role: Literal["owner", "admin", "operator", "viewer"] | None = None
+    workspace_name: str = ""
 
 
 class AuthMessage(Msg):
@@ -480,7 +489,6 @@ class DataMappingRefreshJobOut(BaseModel):
     id: str
     mapping_id: str
     scenario_id: str
-    environment: str
     status: str
     limit: int = 50
     attempt: int = 0
@@ -566,7 +574,6 @@ class FunctionProviderManifestOut(BaseModel):
 class FunctionRunIn(BaseModel):
     params: dict = Field(default_factory=dict)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=180)
-    environment: Literal["dev", "staging", "prod"] = "dev"
 
 
 class FunctionRunOut(BaseModel):
@@ -673,7 +680,7 @@ class ScenarioModelDraftResourceOut(BaseModel):
     ``publishable`` remains the legacy staging-layer safety flag: a candidate
     row is never itself a runtime definition.  ``promotion_eligible`` is the
     independent quality decision that says whether the candidate may be
-    formalised into the dev definition.  Its value never depends on whether
+    formalised into the authored definition.  Its value never depends on whether
     the source was an assistant, a person, or an import.
     """
 
@@ -1570,9 +1577,9 @@ class AgentChatAttachmentIn(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    release_id: str | None = Field(default=None, min_length=1, max_length=32)
     message: str = Field(default="", max_length=50_000)
     conversation_id: Optional[str] = Field(default=None, min_length=1, max_length=32)
-    environment: Literal["dev", "staging", "prod"] = "dev"
     inputs: dict[str, Any] = Field(default_factory=dict)
     managed_inputs: list[AgentManagedInputIn] = Field(default_factory=list, max_length=100)
     attachments: list[AgentChatAttachmentIn] = Field(default_factory=list, max_length=20)
@@ -1655,7 +1662,6 @@ class AgentTurnRunOut(BaseModel):
         "indeterminate",
     ]
     revision: int = Field(ge=1)
-    environment: Literal["dev", "staging", "prod"]
     definition_hash: str = ""
     deployment_fingerprint: str = ""
     data_context_fingerprint: str = ""
@@ -2158,7 +2164,6 @@ class ActionExecutionLogOut(BaseModel):
     status: str
     mode: str = "execute"
     idempotency_key: str | None = None
-    environment: Literal["dev", "staging", "prod"] = "dev"
     definition_snapshot_id: str | None = None
     release_id: str | None = None
     definition_hash: str = ""
@@ -2188,7 +2193,6 @@ class ActionExecutionLogOut(BaseModel):
 
 class ActionExecuteRequest(BaseModel):
     params: dict = Field(default_factory=dict)
-    environment: Literal["dev", "staging", "prod"] = "dev"
     dry_run: bool = False
     confirm: bool = False
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=120)
@@ -2196,7 +2200,6 @@ class ActionExecuteRequest(BaseModel):
     # against the persisted dry-run and the current runtime definition.
     preview_log_id: str | None = Field(default=None, min_length=1, max_length=32)
     correlation_id: str | None = Field(default=None, min_length=1, max_length=64)
-    expected_environment: Literal["dev", "staging", "prod"] | None = None
     expected_definition_snapshot_id: str | None = Field(default=None, max_length=32)
     expected_release_id: str | None = Field(default=None, max_length=32)
     expected_definition_hash: str | None = Field(default=None, max_length=64)
@@ -2207,7 +2210,6 @@ class AgentToolConfirmationRequest(BaseModel):
 
     conversation_id: str = Field(min_length=1, max_length=32)
     correlation_id: str = Field(min_length=1, max_length=64)
-    expected_environment: Literal["dev", "staging", "prod"]
     expected_definition_snapshot_id: str | None = Field(default=None, max_length=32)
     expected_release_id: str | None = Field(default=None, max_length=32)
     expected_definition_hash: str = Field(min_length=1, max_length=64)
@@ -2219,14 +2221,12 @@ class AgentToolConfirmationRequest(BaseModel):
 
 class WorkflowExecuteRequest(BaseModel):
     params: dict = Field(default_factory=dict)
-    environment: Literal["dev", "staging", "prod"] = "dev"
 
 
 class WorkflowRunCreateRequest(BaseModel):
     """提交一次人工运行；可靠性策略由工作流 trigger_config 统一控制。"""
 
     params: dict = Field(default_factory=dict)
-    environment: Literal["dev", "staging", "prod"] = "dev"
 
 
 class WorkflowRunOut(BaseModel):
@@ -2235,7 +2235,6 @@ class WorkflowRunOut(BaseModel):
     workflow_id: str
     workflow_name: str = ""
     trigger_source: str
-    environment: Literal["dev", "staging", "prod"] = "dev"
     definition_snapshot_id: str | None = None
     release_id: str | None = None
     definition_hash: str = ""
@@ -2275,6 +2274,8 @@ class WorkflowApprovalOut(BaseModel):
     node_name: str = ""
     instructions: str = ""
     status: str
+    revision: int = 1
+    requires_evidence: bool = False
     requested_at: datetime
     expires_at: datetime | None = None
     resolved_at: datetime | None = None
@@ -2284,13 +2285,16 @@ class WorkflowApprovalOut(BaseModel):
 
 
 class ApprovalDecisionIn(BaseModel):
+    model_config = {"extra": "forbid"}
+    approval_id: str = Field(min_length=1, max_length=32)
+    expected_revision: int = Field(ge=1)
+    evidence: list[EvidenceReference] = Field(default_factory=list, max_length=20)
     comment: str = Field(default="", max_length=1000)
 
 
 class EventPublishIn(BaseModel):
     payload: dict = Field(default_factory=dict)
     dedupe_key: str | None = Field(default=None, min_length=1, max_length=180)
-    environment: Literal["dev", "staging", "prod"] = "dev"
 
 
 class EventEnvelopeOut(BaseModel):
@@ -2301,7 +2305,6 @@ class EventEnvelopeOut(BaseModel):
     payload: dict = Field(default_factory=dict)
     source: str = "manual"
     source_run_id: str | None = None
-    environment: Literal["dev", "staging", "prod"] = "dev"
     definition_snapshot_id: str | None = None
     release_id: str | None = None
     definition_hash: str = ""

@@ -726,14 +726,11 @@ def create_dataset_version(
 def set_head(
     db: Session,
     dataset: LogicalDataset,
-    environment: str,
     version_id: str,
     *,
     expected_version_id: str | None = None,
 ) -> DatasetHead:
     permission_service.require_tenant_permission(db, "write")
-    if environment not in {"dev", "staging", "prod"}:
-        raise CatalogError("不支持的数据集环境")
     version = require_dataset_version(
         db,
         version_id,
@@ -744,7 +741,6 @@ def set_head(
         select(DatasetHead)
         .where(
             DatasetHead.dataset_id == dataset.id,
-            DatasetHead.environment == environment,
         )
         .with_for_update()
     ).scalar_one_or_none()
@@ -756,7 +752,6 @@ def set_head(
         head = DatasetHead(
             tenant_id=dataset.tenant_id,
             dataset_id=dataset.id,
-            environment=environment,
             dataset_version_id=version.id,
             updated_by_user_id=_actor(db),
         )
@@ -780,7 +775,6 @@ def list_scenario_bindings(db: Session, scenario_id: str) -> list[ScenarioDatase
                 ScenarioDatasetBinding.tenant_id == _tenant(db),
             )
             .order_by(
-                ScenarioDatasetBinding.environment,
                 ScenarioDatasetBinding.binding_key,
             )
         ).all()
@@ -809,8 +803,6 @@ def create_scenario_binding(
         ).scalar_one_or_none()
         if head is None:
             raise CatalogError("数据集 Head 不存在")
-        if head.environment != payload.environment:
-            raise CatalogError("数据集 Head 与绑定环境不一致")
     else:
         require_dataset_version(
             db,
@@ -823,7 +815,6 @@ def create_scenario_binding(
         scenario_id=scenario.id,
         dataset_id=dataset.id,
         binding_key=_key(payload.binding_key, "绑定 key"),
-        environment=payload.environment,
         role=role,
         binding_mode=payload.binding_mode,
         dataset_head_id=payload.dataset_head_id,

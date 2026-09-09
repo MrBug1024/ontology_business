@@ -46,7 +46,6 @@ def _runtime_provenance(
     definition: runtime_definition_service.RuntimeDefinition,
 ) -> dict[str, Any]:
     return {
-        "environment": definition.environment,
         "definition_snapshot_id": definition.snapshot_id,
         "release_id": definition.release_id,
         "definition_hash": definition.definition_hash,
@@ -88,7 +87,6 @@ def _preview_response(log: ActionExecutionLog) -> dict[str, Any]:
         "confirmation_type": log.target_type,
         "requires_confirmation": True,
         "result": result,
-        "environment": log.environment,
         "definition_snapshot_id": log.definition_snapshot_id,
         "release_id": log.release_id,
         "definition_hash": log.definition_hash,
@@ -296,7 +294,6 @@ def _event_dict(envelope: Any, queued_runs: list[Any]) -> dict[str, Any]:
         "payload": envelope.payload or {},
         "source": envelope.source,
         "source_run_id": envelope.source_run_id,
-        "environment": envelope.environment,
         "definition_snapshot_id": envelope.definition_snapshot_id,
         "release_id": envelope.release_id,
         "definition_hash": envelope.definition_hash,
@@ -317,7 +314,6 @@ def _workflow_run_dict(run: Any, workflow_name: str) -> dict[str, Any]:
         "trigger_source": run.trigger_source,
         "status": run.status,
         "input_params": workflow_payload_service.public_input_summary(run),
-        "environment": run.environment,
         "definition_snapshot_id": run.definition_snapshot_id,
         "release_id": run.release_id,
         "definition_hash": run.definition_hash,
@@ -338,7 +334,6 @@ def _response_from_execution(
         "confirmation_type": execution.target_type,
         "result": execution.result or {},
         "error": execution.error or "",
-        "environment": execution.environment,
         "definition_snapshot_id": execution.definition_snapshot_id,
         "release_id": execution.release_id,
         "definition_hash": execution.definition_hash,
@@ -366,7 +361,6 @@ def _validate_preview_context(
     agent: Agent,
     conversation: Conversation,
     correlation_id: str,
-    expected_environment: str,
     expected_definition_snapshot_id: str | None,
     expected_release_id: str | None,
     expected_definition_hash: str,
@@ -387,7 +381,6 @@ def _validate_preview_context(
         raise AgentConfirmationError("预演与当前用户、Agent、对话或目标不一致，请重新预演")
     if (
         correlation_id != preview.correlation_id
-        or expected_environment != preview.environment
         or expected_definition_snapshot_id != preview.definition_snapshot_id
         or expected_release_id != preview.release_id
         or expected_definition_hash != preview.definition_hash
@@ -412,7 +405,6 @@ def confirm_preview(
     agent: Agent,
     conversation: Conversation,
     correlation_id: str,
-    expected_environment: str,
     expected_definition_snapshot_id: str | None,
     expected_release_id: str | None,
     expected_definition_hash: str,
@@ -425,7 +417,6 @@ def confirm_preview(
         agent=agent,
         conversation=conversation,
         correlation_id=correlation_id,
-        expected_environment=expected_environment,
         expected_definition_snapshot_id=expected_definition_snapshot_id,
         expected_release_id=expected_release_id,
         expected_definition_hash=expected_definition_hash,
@@ -444,10 +435,9 @@ def confirm_preview(
     if not scenario:
         raise AgentConfirmationError("预演所属业务场景已不存在")
     try:
-        definition = runtime_definition_service.resolve_active(
-            db,
-            scenario,
-            environment=preview.environment or "dev",
+        definition = (
+            runtime_definition_service.resolve_active(db, scenario, release_id=preview.release_id)
+            if preview.release_id else runtime_definition_service.resolve_authoring(db, scenario)
         )
         resource = runtime_definition_service.resolve_resource(
             definition, preview.target_type, preview.target_id
@@ -455,8 +445,7 @@ def confirm_preview(
     except runtime_definition_service.RuntimeDefinitionError as exc:
         raise AgentConfirmationError(f"当前运行定义不可执行该预演：{exc}") from exc
     if (
-        definition.environment != preview.environment
-        or definition.snapshot_id != preview.definition_snapshot_id
+        definition.snapshot_id != preview.definition_snapshot_id
         or definition.release_id != preview.release_id
         or definition.definition_hash != preview.definition_hash
     ):
@@ -513,8 +502,7 @@ def confirm_preview(
         input_params=dict(preview.input_params or {}),
         status="running",
         mode="execute",
-        idempotency_key=f"{preview.environment}:agent-confirm:{preview.id}",
-        environment=preview.environment,
+        idempotency_key=f"agent-confirm:{preview.id}",
         definition_snapshot_id=preview.definition_snapshot_id,
         release_id=preview.release_id,
         definition_hash=preview.definition_hash,

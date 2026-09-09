@@ -337,7 +337,6 @@ export const api = {
     idempotency_key?: string
     preview_log_id?: string
     correlation_id?: string
-    expected_environment?: 'dev' | 'staging' | 'prod'
     expected_definition_snapshot_id?: string
     expected_release_id?: string
     expected_definition_hash?: string
@@ -375,8 +374,8 @@ export const api = {
   getTask: (id: string) => http.get<WorkflowRun>(`/tasks/${id}`),
   listTaskApprovals: (params: { scenario_id?: string } = {}) =>
     http.get<WorkflowApproval[]>('/tasks/approvals', { params }),
-  approveTask: (id: string, comment = '') => http.post<WorkflowRun>(`/tasks/${id}/approve`, { comment }),
-  rejectTask: (id: string, comment = '') => http.post<WorkflowRun>(`/tasks/${id}/reject`, { comment }),
+  approveTask: (id: string, approval: WorkflowApproval, comment = '') => http.post<WorkflowRun>(`/tasks/${id}/approve`, { comment, approval_id: approval.id, expected_revision: approval.revision }),
+  rejectTask: (id: string, approval: WorkflowApproval, comment = '') => http.post<WorkflowRun>(`/tasks/${id}/reject`, { comment, approval_id: approval.id, expected_revision: approval.revision }),
   retryTask: (id: string) => http.post<WorkflowRun>(`/tasks/${id}/retry`),
   cancelTask: (id: string) => http.post<WorkflowRun>(`/operations/runs/${id}/cancel`),
 
@@ -477,9 +476,8 @@ export const api = {
   listDatasetVersions: (datasetId: string) => http.get<DatasetVersion[]>(`/catalog/datasets/${datasetId}/versions`),
   listScenarioDatasetBindings: (scenarioId: string) =>
     http.get<ScenarioDatasetBinding[]>(`/scenarios/${scenarioId}/dataset-bindings`),
-  listScenarioConnectorBindings: (scenarioId: string, environment: 'dev' | 'staging' | 'prod' = 'dev') =>
+  listScenarioConnectorBindings: (scenarioId: string) =>
     http.get<ConnectorBindingOption[]>(`/scenarios/${scenarioId}/connector-bindings`, {
-      params: { environment },
     }),
   createScenarioDatasetBinding: (scenarioId: string, d: ScenarioDatasetBindingCreate) =>
     http.post<ScenarioDatasetBinding>(`/scenarios/${scenarioId}/dataset-bindings`, d),
@@ -652,7 +650,6 @@ export const api = {
   confirmAgentToolPreview: (agentId: string, previewLogId: string, d: {
     conversation_id: string
     correlation_id: string
-    expected_environment: 'dev' | 'staging' | 'prod'
     expected_definition_snapshot_id?: string
     expected_release_id?: string
     expected_definition_hash: string
@@ -747,10 +744,12 @@ export function streamAgentTurn(
             const event = JSON.parse(data) as AgentTurnEvent
             const nextRevision = Number(event.revision || eventId)
             if (!Number.isInteger(nextRevision) || nextRevision <= revision) continue
-            revision = nextRevision
             onEvent(event)
+            revision = nextRevision
           } catch {
-            // Ignore an incomplete event and let Last-Event-ID recover it.
+            await reader.cancel()
+            reconnect()
+            return
           }
         }
       }

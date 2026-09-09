@@ -3034,7 +3034,6 @@ const hasPinnedActionPreview = computed(() => {
     preview?.log_id
     && preview?.status === 'dry_run'
     && preview?.correlation_id
-    && preview?.environment
     && preview?.definition_hash,
   )
 })
@@ -3330,7 +3329,6 @@ async function confirmActionExecution() {
       idempotency_key: actionIdempotencyKey.value,
       preview_log_id: String(pinnedPreview.log_id),
       correlation_id: String(pinnedPreview.correlation_id),
-      expected_environment: pinnedPreview.environment,
       expected_definition_snapshot_id: pinnedPreview.definition_snapshot_id || undefined,
       expected_release_id: pinnedPreview.release_id || undefined,
       expected_definition_hash: String(pinnedPreview.definition_hash),
@@ -4340,7 +4338,6 @@ function assistantPreviewIsPinned(preview: AssistantActionPreview | undefined, a
     && result?.log_id
     && result?.status === 'dry_run'
     && result?.correlation_id
-    && result?.environment
     && result?.definition_hash,
   )
 }

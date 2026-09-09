@@ -285,7 +285,6 @@ def test_semantic_mapping_backfills_only_from_explicit_catalog_facts() -> None:
             scenario_id=scenario.id,
             dataset_id=dataset.id,
             binding_key="records.evidence",
-            environment="dev",
             role="modeling_evidence",
             binding_mode="pinned",
             dataset_version_id=version.id,

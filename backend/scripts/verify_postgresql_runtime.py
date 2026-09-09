@@ -37,7 +37,7 @@ RUNTIME_REQUIRED_UPDATE_TABLES = (
     "ingestion_runs",
     "derivation_runs",
 )
-RUNTIME_APPEND_ONLY_TABLES = ("agent_turn_events",)
+RUNTIME_APPEND_ONLY_TABLES = ("agent_turn_events", "release_lifecycle_events", "workflow_approval_evidence")
 RUNTIME_MUTABLE_CONTROL_TABLES = (
     "agent_turn_runs",
     "assistant_request_runs",
@@ -276,6 +276,37 @@ def _verify_runtime_function_privileges(connection: Any) -> None:
             raise RuntimeError(f"runtime role cannot EXECUTE {label}")
 
 
+def _verify_access_governance_privileges(connection: Any) -> None:
+    expected = {
+        "access_audit_events": {"select", "insert"},
+        "access_governance_guard": {"select", "update"},
+        "workspace_invitations": {"select", "insert", "update", "delete"},
+        "auth_rate_limits": {"select", "insert", "update", "delete"},
+    }
+    for table, allowed in expected.items():
+        for privilege in _TABLE_PRIVILEGES:
+            granted = connection.exec_driver_sql(
+                "SELECT has_table_privilege(current_user, %s, %s)",
+                (f"public.{table}", privilege.upper()),
+            ).scalar_one()
+            if bool(granted) != (privilege in allowed):
+                raise RuntimeError(f"runtime access-governance privileges differ for {table}")
+
+
+def _verify_capability_status_storage(connection: Any) -> int:
+    from app.models import CapabilityInvocation
+
+    expected = CapabilityInvocation.__table__.c.status.type.length
+    capacity = connection.exec_driver_sql(
+        "SELECT character_maximum_length FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'capability_invocations' "
+        "AND column_name = 'status'"
+    ).scalar_one()
+    if capacity is None or capacity < expected:
+        raise RuntimeError("capability invocation status storage is too narrow")
+    return int(capacity)
+
+
 def main() -> int:
     from app.config import get_settings
     from app.database import engine, init_db
@@ -297,6 +328,8 @@ def main() -> int:
             mutable_control_tables=RUNTIME_MUTABLE_CONTROL_TABLES,
         )
         _verify_runtime_function_privileges(connection)
+        _verify_access_governance_privileges(connection)
+        status_capacity = _verify_capability_status_storage(connection)
 
     if not object_storage_service.is_configured():
         raise RuntimeError("MinIO configuration is incomplete")
@@ -314,6 +347,7 @@ def main() -> int:
             {
                 "postgresql": {
                     "schema": "current",
+                    "capability_status_capacity": status_capacity,
                     "role": role,
                     "table_privileges": table_privileges,
                     "governed_functions": "executable",

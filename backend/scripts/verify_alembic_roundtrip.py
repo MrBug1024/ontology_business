@@ -733,10 +733,33 @@ def main() -> int:
         command.upgrade(config, "20260904_19")
         _verify_revision_19_contract(target_url)
         _seed_revision_20_release_isolation_cases(target_url)
-        command.upgrade(config, head)
-        _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
+        command.upgrade(config, "20260907_26")
         command.downgrade(config, "20260904_20")
         _verify_revision_20_contract(target_url)
+        fixture_engine = create_engine(target_url)
+        try:
+            with fixture_engine.begin() as connection:
+                # The rev20 isolation fixture deliberately publishes three
+                # alternatives. Explicitly retire two before removing that
+                # old dimension; production migration never chooses for users.
+                connection.execute(text("UPDATE ontology_releases SET status = 'rolled_back', withdrawn_at = CURRENT_TIMESTAMP, withdraw_reason = 'roundtrip_fixture_explicit_retirement' WHERE id IN ('r20release_manual_contract', 'r20release_empty_mapping_list')"))
+        finally:
+            fixture_engine.dispose()
+        command.upgrade(config, head)
+        _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
+        command.downgrade(config, "20260908_27")
+        command.upgrade(config, head)
+        _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
+        try:
+            command.downgrade(config, "20260907_26")
+        except RuntimeError as exc:
+            if "backup" not in str(exc).lower():
+                raise
+        else:
+            raise RuntimeError("Business dimension retirement must reject destructive downgrade")
+        # Alembic commits completed revisions separately: revision 28 can have
+        # reached 27 before 27 refuses reconstructing retired dimensions.
+        _verify_head_contract(target_url, runtime_role=runtime_role, head="20260908_27")
         command.upgrade(config, head)
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
         print(f"Alembic isolated round-trip passed at {head}")

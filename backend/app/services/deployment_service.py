@@ -251,7 +251,6 @@ def build_resolved_deployment(
     overrides: Iterable[BindingOverride] = (),
     scenario_id: str | None = None,
     tenant_id: str | None = None,
-    environment: str | None = None,
 ) -> ResolvedDeployment:
     """Build an immutable deployment from a duck-typed runtime definition."""
 
@@ -268,9 +267,6 @@ def build_resolved_deployment(
         if scenario is not None
         else None
     )
-    resolved_environment = environment or _read(
-        definition, "environment", default=None
-    )
     ports = normalize_data_ports(data_ports)
     context = resolve_runtime_data_context(
         ports,
@@ -281,7 +277,6 @@ def build_resolved_deployment(
         return ResolvedDeployment(
             scenario_id=_text(resolved_scenario_id, "deployment scenario id"),
             tenant_id=_text(resolved_tenant_id, "deployment tenant id"),
-            environment=_text(resolved_environment, "deployment environment"),
             definition_hash=_read(definition, "definition_hash"),
             definition=definition,
             data_ports=ports,

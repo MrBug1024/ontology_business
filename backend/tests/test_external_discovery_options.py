@@ -249,14 +249,6 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             id="head-discovery",
             tenant_id=self.tenant.id,
             dataset_id=self.dataset.id,
-            environment="prod",
-            dataset_version_id=self.version.id,
-        )
-        self.dev_head = DatasetHead(
-            id="head-discovery-dev",
-            tenant_id=self.tenant.id,
-            dataset_id=self.dataset.id,
-            environment="dev",
             dataset_version_id=self.version.id,
         )
         incompatible_dataset = LogicalDataset(
@@ -376,7 +368,6 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             id="binding-discovery",
             tenant_id=self.tenant.id,
             scenario_id=self.scenario.id,
-            environment="dev",
             binding_key="generic.current-system",
             reference_label="Current governed system",
             connector_kind="data_source",
@@ -554,7 +545,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
         db.add_all(
             [
                 self.head,
-                self.dev_head,
+                self.head,
                 self.connector,
                 self.dataset_port,
                 self.asset_port,
@@ -595,7 +586,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             branch_id=branch.id,
             snapshot_id=snapshot.id,
-            environment="prod",
+            enabled=True,
             status="released",
             created_by_user_id=self.user.id,
         )
@@ -664,7 +655,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
     def test_prod_options_use_frozen_owner_schema_and_binding_kind(self) -> None:
         response = self.client.get(
             self._options_url("records"),
-            params={"environment": "prod"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(response.status_code, 200, response.text)
@@ -686,7 +677,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
 
         wrong_owner = self.client.get(
             self._options_url("records", capability_id=self.other_function.id),
-            params={"environment": "prod"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(wrong_owner.status_code, 404, wrong_owner.text)
@@ -701,7 +692,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
 
         asset_response = self.client.get(
             self._options_url("document"),
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(asset_response.status_code, 200, asset_response.text)
@@ -718,7 +709,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
 
         head_response = self.client.get(
             self._options_url("current-records"),
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(head_response.status_code, 200, head_response.text)
@@ -726,14 +717,14 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             head_response.json()["items"][0]["managed_input"],
             {
                 "port_key": "current-records",
-                "dataset_head_id": self.dev_head.id,
+                "dataset_head_id": self.head.id,
                 "expected_signature": self.version.content_hash,
             },
         )
 
         connector_response = self.client.get(
             self._options_url("system"),
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(connector_response.status_code, 200, connector_response.text)
@@ -780,7 +771,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
     def test_missing_scenario_default_is_nonblocking_when_invocation_override_is_allowed(self) -> None:
         capabilities = self.client.get(
             f"/api/external/v2/scenarios/{self.scenario.id}/capabilities",
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(capabilities.status_code, 200, capabilities.text)
@@ -798,7 +789,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
 
         response = self.client.get(
             self._options_url(self.override_default_port.port_key),
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(response.status_code, 200, response.text)
@@ -813,35 +804,35 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
     def test_retired_cross_tenant_port_owner_and_readiness_fail_closed(self) -> None:
         retired = self.client.get(
             self._options_url("records", scenario_id=self.retired_scenario.id),
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(retired.status_code, 404, retired.text)
 
         foreign = self.client.get(
             self._options_url("records", scenario_id=self.other_scenario.id),
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(foreign.status_code, 404, foreign.text)
 
         wrong_port = self.client.get(
             self._options_url("document", capability_id=self.other_function.id),
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(wrong_port.status_code, 404, wrong_port.text)
 
         acl_denied = self.client.get(
             self._options_url("records", scenario_id=self.denied_scenario.id),
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(acl_denied.status_code, 403, acl_denied.text)
 
         locked = self.client.get(
             self._options_url("fixed-records"),
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(locked.status_code, 409, locked.text)
@@ -852,7 +843,7 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
 
         unready = self.client.get(
             self._options_url("records", capability_id=self.unready_function.id),
-            params={"environment": "dev"},
+            params={},
             headers=self.headers,
         )
         self.assertEqual(unready.status_code, 409, unready.text)
@@ -873,7 +864,6 @@ class ExternalDiscoveryOptionTests(unittest.TestCase):
             "function",
             self.function.id,
             "records",
-            environment="prod",
             limit=1,
         )
         self.assertEqual(page["items"][0]["managed_input"]["dataset_version_id"], self.version.id)

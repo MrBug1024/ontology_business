@@ -132,7 +132,7 @@ class AgentEventWorkflowConfirmationTests(unittest.TestCase):
         self.engine.dispose()
 
     def _preview(self, target: str) -> dict:
-        definition = runtime_definition_service.resolve_active(self.db, self.scenario)
+        definition = runtime_definition_service.resolve_authoring(self.db, self.scenario)
         self.db.info["llm_trace_context"] = {
             "assistant_message_id": self.message.id,
             "correlation_id": f"correlation-{target}",
@@ -183,7 +183,6 @@ class AgentEventWorkflowConfirmationTests(unittest.TestCase):
         values = {
             "conversation_id": self.conversation.id,
             "correlation_id": preview["correlation_id"],
-            "expected_environment": preview["environment"],
             "expected_definition_snapshot_id": preview["definition_snapshot_id"],
             "expected_release_id": preview["release_id"],
             "expected_definition_hash": preview["definition_hash"],
@@ -289,7 +288,6 @@ class AgentEventWorkflowConfirmationTests(unittest.TestCase):
             AgentToolConfirmationRequest(
                 conversation_id=self.conversation.id,
                 correlation_id=preview["correlation_id"],
-                expected_environment=preview["environment"],
                 expected_definition_hash=preview["definition_hash"],
                 payload={"project_id": "TAMPERED"},
             )

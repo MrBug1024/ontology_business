@@ -25,7 +25,7 @@ class RedisJsonCache:
         self,
         client: Any | None,
         *,
-        namespace: str = "ontology-business:dev:cache:v1",
+        namespace: str = "ontology-business:cache:v2",
         default_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
     ) -> None:
         normalized_namespace = str(namespace or "").strip(":")
@@ -44,7 +44,7 @@ class RedisJsonCache:
         client_factory: Callable[..., Any] | None = None,
     ) -> "RedisJsonCache":
         configured = settings or get_settings()
-        namespace = f"ontology-business:{configured.runtime_environment}:cache:v1"
+        namespace = "ontology-business:cache:v2"
         if not configured.redis_configured:
             return cls(None, namespace=namespace)
         if client_factory is None:

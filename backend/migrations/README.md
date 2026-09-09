@@ -6,7 +6,69 @@ DDL. Run `alembic upgrade head` with the migration owner before starting the
 application, then use the runtime verification script to confirm the deployed
 revision and permissions.
 
+## Business identity and manual publication
+
+Revision `20260908_27` removes deployment labels from current business columns,
+constraints, invocation keys, dataset heads, connectors, queues and audit rows.
+It adds manual scenario release lifecycle state and append-only lifecycle audit.
+Legacy immutable snapshots remain byte-identical and are decoded only by the
+historical contract adapter. They never select current data or permissions.
+
+Stop all API and worker instances before upgrading. Provide the existing payload
+key ring: stored workflow and pending Agent inputs are authenticated, re-encrypted
+without the retired dimension, and retain replay identity. Duplicate logical
+bindings, heads, object identities or active releases cause a transactional
+failure. Resolve conflicts explicitly from business ownership; migration never
+chooses a deployment label, merges customer data, or publishes authored content.
+Revision 27 cannot reconstruct removed partitions on downgrade; restore a
+pre-upgrade backup. The verifier exercises reversible segments independently,
+checks that this downgrade refuses, then restores the current head.
+
+Revision `20260908_28` binds approval decisions to message identity and revision,
+retains immutable evidence references and distinguishes retry generations.
+Historical decisions without a known generation keep that absence explicit.
+Only SELECT/INSERT is granted on evidence and release audit tables. Downgrade
+refuses to discard recorded decisions, repeated execution history or evidence.
+
+## Capability confirmation status
+
+Revision `20260907_26` widens `capability_invocations.status` from 20 to 32
+characters. The existing `awaiting_confirmation` token has 21 characters, so
+PostgreSQL previously rejected successful gated previews before they could be
+confirmed. State tokens, permissions and confirmation semantics are unchanged.
+Downgrade locks the table and refuses to narrow it while a longer status remains;
+reconcile those pending invocations first. No historical migration is rewritten.
+
+## Workspace/account access cutover
+
+Revision `20260907_25` separates global account roles from workspace roles, adds
+session workspace selection, invitation delivery claims, revision checks,
+append-only access audit and persistent auth throttling. The runtime receives
+SELECT/INSERT on access audit and SELECT/UPDATE on the bootstrap guard, with no
+table ownership or DDL privileges. Schema provisioning must retain the existing
+runtime CRUD grants for the original control-plane tables.
+
+Existing accounts remain ordinary system accounts. Choose a verified account
+with `BOOTSTRAP_SUPERADMIN_EMAIL`; bootstrap runs once and records an audit.
+Set `PUBLIC_APP_URL` to the HTTPS frontend origin and enable Secure cookies.
+The migration revokes v1 browser sessions and verification codes; users log in
+again or request a fresh verification code. No production identity is inferred.
+
+Three durable-run actor references now point to the global User identity;
+their parent/resource tenant foreign keys remain unchanged. Live membership
+authorization is still required before enqueue and before worker execution.
+Downgrade refuses to discard invitation/audit history, system role assignments,
+cross-workspace memberships or cross-workspace execution attribution. Export
+and reconcile those facts explicitly before attempting rollback.
+
 ## Workflow payload key prerequisite
+
+Revision `20260908_27` preserves terminal Agent turn audit rows whose conversation
+and both message references were already deleted. Their original encrypted
+payload and fingerprint remain byte-for-byte unchanged because the deleted
+authenticated context cannot be reconstructed. The runtime refuses to retry such
+rows. All attached or nonterminal records must still authenticate and convert;
+missing keys or invalid ciphertext on those records abort the entire migration.
 
 Revision `20260829_09` replaces plaintext `workflow_runs.input_params` with an
 AES-256-GCM envelope. Before upgrading a database that already contains workflow
@@ -46,8 +108,8 @@ appropriate inside an explicitly accepted audit rollback window.
 
 Validate the reversible path against a real PostgreSQL database before release.
 The preferred command creates a uniquely named isolated
-`ontology_migration_verify_*` database, verifies head -> `09` -> head plus the
-runtime-role boundaries, and drops the fixture in a `finally` cleanup:
+`ontology_migration_verify_*` database, verifies the reversible migration segments,
+irreversible guards and runtime-role boundaries, and drops the fixture in a `finally` cleanup:
 
 ```powershell
 python scripts/verify_alembic_roundtrip.py
@@ -63,13 +125,10 @@ live, shared, or customer database was downgraded for this verification.
 The applied historical revisions have not been rewritten; repairing this path
 requires an explicit migration-governance decision under the root constitution.
 
-The equivalent manual commands below are for an already verified isolated
-database only. Resolve the current single head from Alembic and never point
-them at a live or shared database:
+Apply forward migrations with the migration owner. Use the isolated verifier
+above for downgrade rehearsals; the current head cannot be downgraded to 09:
 
 ```powershell
-python -m alembic -x use_admin=1 upgrade head
-python -m alembic -x use_admin=1 downgrade 20260829_09
 python -m alembic -x use_admin=1 upgrade head
 ```
 

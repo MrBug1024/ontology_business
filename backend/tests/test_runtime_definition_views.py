@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.database import Base
 from app.models import (
     ActionExecutionLog,
@@ -75,6 +76,11 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
             id="workflow-runtime-view",
             scenario_id=self.scenario.id,
             name="发布版工作流名称",
+            nodes=[{"id": "start", "type": "start", "data": {}},
+                   {"id": "approval-node", "type": "approval", "data": {"instructions": "核对结果"}},
+                   {"id": "end", "type": "end", "data": {}}],
+            edges=[{"id": "e1", "source": "start", "target": "approval-node", "label": ""},
+                   {"id": "e2", "source": "approval-node", "target": "end", "label": ""}],
             status="active",
             enabled=True,
         )
@@ -117,7 +123,7 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             branch_id=branch.id,
             snapshot_id=self.snapshot.id,
-            environment="staging",
+            enabled=True,
             status="released",
             created_by_user_id=self.user.id,
         )
@@ -127,7 +133,6 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
             id="run-runtime-view",
             scenario_id=self.scenario.id,
             workflow_id=self.workflow.id,
-            environment="staging",
             definition_snapshot_id=self.snapshot.id,
             release_id=self.release.id,
             definition_hash=self.snapshot.content_hash,
@@ -151,7 +156,6 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
             # This deliberately disagrees with the snapshot to make sure the
             # read path never presents saved/live labels as frozen evidence.
             target_name="不可作为冻结证据的旧名称",
-            environment="staging",
             definition_snapshot_id=self.snapshot.id,
             release_id=self.release.id,
             definition_hash=self.snapshot.content_hash,
@@ -161,7 +165,7 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
         self.db.add_all([self.run, self.approval, self.log])
         self.db.commit()
 
-        # Simulate dev authoring after staging dispatch.  The frozen task and
+        # Simulate authoring after dispatch. The frozen task and
         # graph must still read names from ``self.snapshot``.
         self.action.name = "后续实时操作名称"
         self.workflow.name = "后续实时工作流名称"
@@ -180,9 +184,8 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
         self.assertTrue(task.can_execute)
         self.assertTrue(task.can_approve)
 
-        # These operational views are served by the staging deployment.  The
-        # same tenant's dev process must not read their input/result evidence.
-        with patch.object(runtime_connector_service, "runtime_environment", return_value="staging"):
+        # Deployment configuration does not partition authenticated business reads.
+        with patch.object(get_settings(), "runtime_environment", "staging"):
             approvals = operations_router.list_approvals(
                 scenario_id=self.scenario.id,
                 status="pending",
@@ -206,7 +209,7 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
         self.assertEqual(task.workflow_name, "")
         self.assertFalse(task.can_execute)
         self.assertFalse(task.can_approve)
-        with patch.object(runtime_connector_service, "runtime_environment", return_value="staging"):
+        with patch.object(get_settings(), "runtime_environment", "staging"):
             self.assertEqual(
                 operations_router.list_tasks(
                     scenario_id=self.scenario.id,
@@ -229,38 +232,22 @@ class RuntimeDefinitionReadViewsTests(unittest.TestCase):
                 operations_router._run_for_request(self.db, self.run.id)
             self.assertEqual(error.exception.status_code, 404)
 
-    def test_operational_views_are_scoped_to_the_current_deployment(self) -> None:
-        """A dev control-plane process cannot inspect or operate staging work."""
-        with patch.object(runtime_connector_service, "runtime_environment", return_value="dev"):
-            self.assertEqual(
-                operations_router.list_tasks(
-                    scenario_id=self.scenario.id,
-                    status=None,
-                    limit=80,
-                    db=self.db,
-                ),
-                [],
-            )
-            self.assertEqual(
-                operations_router.list_approvals(
-                    scenario_id=self.scenario.id,
-                    status="pending",
-                    limit=80,
-                    db=self.db,
-                ),
-                [],
-            )
-            self.assertEqual(
-                scenarios_router.list_execution_logs(
-                    scenario_id=self.scenario.id,
-                    limit=80,
-                    db=self.db,
-                ),
-                [],
-            )
-            with self.assertRaises(HTTPException) as error:
-                operations_router._run_for_request(self.db, self.run.id)
-            self.assertEqual(error.exception.status_code, 404)
+    def test_operational_views_follow_identity_and_release_pins_in_every_deployment_mode(self) -> None:
+        for mode in ("dev", "staging", "prod"):
+            with self.subTest(mode=mode), patch.object(get_settings(), "runtime_environment", mode):
+                tasks = operations_router.list_tasks(
+                    scenario_id=self.scenario.id, status=None, limit=80, db=self.db,
+                )
+                approvals = operations_router.list_approvals(
+                    scenario_id=self.scenario.id, status="pending", limit=80, db=self.db,
+                )
+                logs = scenarios_router.list_execution_logs(
+                    scenario_id=self.scenario.id, limit=80, db=self.db,
+                )
+                self.assertEqual([item.id for item in tasks], [self.run.id])
+                self.assertEqual([item.id for item in approvals], [self.approval.id])
+                self.assertEqual([item.id for item in logs], [self.log.id])
+                self.assertEqual(operations_router._run_for_request(self.db, self.run.id).id, self.run.id)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -13,6 +13,7 @@ from pydantic import Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .config import get_settings
+from .channel_interaction_schemas import ChannelReplyIn
 from .services import agent_mcp_service, capability_mcp_service
 
 
@@ -171,23 +172,20 @@ def _capability_identity() -> capability_mcp_service.AuthenticatedCapabilityMCP:
 @mcp_server.tool(
     name="list_capabilities",
     title="发现业务能力",
-    description="返回指定场景和环境中当前主体可见的机器可读能力契约与就绪状态。",
+    description="返回指定场景已启用发布中当前主体可见的能力契约与就绪状态。",
     structured_output=True,
 )
 async def list_capabilities(
     ctx: Context,
     scenario_id: Annotated[str, Field(min_length=1, max_length=32)],
-    environment: Annotated[
-        str,
-        Field(pattern=r"^(dev|staging|prod)$"),
-    ] = "prod",
+    release_id: Annotated[str | None, Field(min_length=1, max_length=32)] = None,
 ) -> dict[str, Any]:
     await ctx.info("正在解析能力目录。")
     items = await asyncio.to_thread(
         capability_mcp_service.list_capabilities,
         _capability_identity(),
         scenario_id=scenario_id,
-        environment=environment,
+        release_id=release_id,
     )
     return {"capabilities": items}
 
@@ -208,10 +206,7 @@ async def invoke_capability(
         Field(pattern=r"^(function|action|rule|workflow)$"),
     ],
     capability_key: Annotated[str, Field(min_length=1, max_length=240)],
-    environment: Annotated[
-        str,
-        Field(pattern=r"^(dev|staging|prod)$"),
-    ] = "prod",
+    release_id: Annotated[str | None, Field(min_length=1, max_length=32)] = None,
     inputs: dict[str, Any] | None = None,
     managed_inputs: Annotated[
         list[dict[str, Any]],
@@ -242,7 +237,7 @@ async def invoke_capability(
         scenario_id=scenario_id,
         capability_kind=capability_kind,
         capability_key=capability_key,
-        environment=environment,
+        release_id=release_id,
         inputs=inputs,
         managed_inputs=managed_inputs,
         mode=mode,
@@ -273,6 +268,24 @@ async def get_capability_receipt(
         _capability_identity(),
         invocation_id=invocation_id,
     )
+
+
+@mcp_server.tool(name="read_business_approval", title="读取业务审批", structured_output=True)
+async def read_business_approval(
+    ctx: Context, interaction_id: Annotated[str, Field(min_length=1, max_length=32)],
+) -> dict[str, Any]:
+    return await asyncio.to_thread(capability_mcp_service.read_approval, _capability_identity(), interaction_id=interaction_id)
+
+
+@mcp_server.tool(
+    name="reply_business_interaction", title="转交人员回复", structured_output=True,
+    description="仅转交经接入客户端认证的真实人员原始消息。模型不能自行生成执行确认或业务审批；身份由当前人员的凭据决定。",
+)
+async def reply_business_interaction(
+    ctx: Context, kind: Literal["confirmation", "approval"],
+    interaction_id: Annotated[str, Field(min_length=1, max_length=32)], reply: ChannelReplyIn,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(capability_mcp_service.reply_interaction, _capability_identity(), kind=kind, interaction_id=interaction_id, reply=reply)
 
 
 # The parent FastAPI lifespan owns ``mcp_server.session_manager.run()``.

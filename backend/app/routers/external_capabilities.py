@@ -23,7 +23,6 @@ from ..catalog_schemas import CatalogManagedUploadMetadata, CatalogManagedUpload
 from ..config import get_settings
 from ..database import get_db
 from ..external_api_schemas import (
-    ExternalCapabilityEnvironment,
     ExternalCapabilityInvocationIn,
     ExternalCapabilityKind,
     ExternalCapabilityOut,
@@ -331,7 +330,7 @@ def list_scenarios(
 )
 def list_capabilities(
     scenario_id: str,
-    environment: ExternalCapabilityEnvironment = Query(default="prod"),
+    release_id: str | None = Query(default=None, min_length=1, max_length=32),
     context: external_api_service.ExternalApiContext = Depends(_external_context),
 ) -> list[ExternalCapabilityOut]:
     external_api_service.require_scope(context, "capabilities:read")
@@ -340,7 +339,7 @@ def list_capabilities(
         documents = capability_application_service.list_capabilities(
             context.db,
             scenario,
-            environment=environment,
+            release_id=release_id,
         )
     except capability_application_service.CapabilityApplicationError as exc:
         _application_error(exc)
@@ -357,7 +356,7 @@ def list_managed_input_options(
     kind: ExternalCapabilityKind,
     key: str,
     port_key: str,
-    environment: ExternalCapabilityEnvironment = Query(default="prod"),
+    release_id: str | None = Query(default=None, min_length=1, max_length=32),
     limit: int = Query(default=100, ge=1, le=200),
     offset: int = Query(default=0, ge=0, le=100_000),
     context: external_api_service.ExternalApiContext = Depends(_external_context),
@@ -368,10 +367,10 @@ def list_managed_input_options(
         document = capability_application_service.list_managed_input_options(
             context.db,
             scenario,
-            environment=environment,
             kind=kind,
             key=key,
             port_key=port_key,
+            release_id=release_id,
             limit=limit,
             offset=offset,
         )
@@ -388,7 +387,7 @@ def get_capability(
     scenario_id: str,
     kind: ExternalCapabilityKind,
     key: str,
-    environment: ExternalCapabilityEnvironment = Query(default="prod"),
+    release_id: str | None = Query(default=None, min_length=1, max_length=32),
     context: external_api_service.ExternalApiContext = Depends(_external_context),
 ) -> ExternalCapabilityOut:
     external_api_service.require_scope(context, "capabilities:read")
@@ -397,7 +396,7 @@ def get_capability(
         document = capability_application_service.get_capability(
             context.db,
             scenario,
-            environment=environment,
+            release_id=release_id,
             kind=kind,
             key=key,
         )
@@ -446,8 +445,8 @@ def invoke_capability(
             scenario,
             _actor(context),
             request,
-            environment=payload.environment,
             invocation_source="rest",
+            release_id=payload.release_id,
         )
         context.db.commit()
     except capability_application_service.CapabilityApplicationError as exc:

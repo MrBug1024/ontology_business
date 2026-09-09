@@ -169,7 +169,6 @@ class AgentMCPService(Base):
     definition_snapshot_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     release_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     definition_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    runtime_environment: Mapped[str] = mapped_column(String(20), nullable=False, default="dev")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now, onupdate=_now

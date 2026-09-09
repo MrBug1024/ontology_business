@@ -7,6 +7,9 @@ export interface User {
   tenant_id: string
   email_verified?: boolean
   can_manage?: boolean
+  system_role?: 'user' | 'superadmin'
+  workspace_role?: 'owner' | 'admin' | 'operator' | 'viewer' | null
+  workspace_name?: string
 }
 
 export interface AuthMessage {
@@ -342,7 +345,6 @@ export interface DataMappingRefreshJob {
   id: string
   mapping_id: string
   scenario_id: string
-  environment: 'dev' | 'staging' | 'prod' | string
   status: 'queued' | 'running' | 'retry_waiting' | 'succeeded' | 'failed' | 'timed_out' | 'cancelled' | string
   limit: number
   attempt: number
@@ -523,7 +525,6 @@ export interface ActionExecutionLog {
   status: string
   mode?: string
   idempotency_key?: string
-  environment?: 'dev' | 'staging' | 'prod' | string
   definition_snapshot_id?: string | null
   release_id?: string | null
   definition_hash?: string
@@ -531,7 +532,6 @@ export interface ActionExecutionLog {
   result?: Record<string, any>
   connector_audit?: Array<{
     kind: string
-    environment: 'dev' | 'staging' | 'prod' | string
     managed?: boolean
     binding_key?: string | null
     binding_id?: string | null
@@ -768,7 +768,6 @@ export interface ScenarioModelDraftResolve {
   resolved_resource_id: string
 }
 
-export type CatalogEnvironment = 'dev' | 'staging' | 'prod'
 
 export type CatalogBindingRole =
   | 'modeling_evidence'
@@ -900,7 +899,7 @@ export interface LogicalDataset {
   retired_at?: string | null
   schema_count: number
   version_count: number
-  heads: Record<string, string>
+  head_version_id: string | null
 }
 
 export interface DatasetVersion {
@@ -961,7 +960,6 @@ export interface DatasetHead {
   id: string
   tenant_id: string
   dataset_id: string
-  environment: CatalogEnvironment
   dataset_version_id: string
   updated_by_user_id?: string | null
   updated_at: string
@@ -971,7 +969,6 @@ export interface ConnectorBindingOption {
   binding_key: string
   label: string
   connector_kind: 'data_source' | 'mcp' | 'llm'
-  environment: CatalogEnvironment
   ready: boolean
   blocking_reason: string
   capabilities: string[]
@@ -981,7 +978,6 @@ export interface ConnectorBindingOption {
 export interface ScenarioDatasetBindingCreate {
   dataset_id: string
   binding_key: string
-  environment: CatalogEnvironment
   role: CatalogCanonicalBindingRole
   binding_mode: 'head' | 'pinned'
   dataset_head_id?: string | null
@@ -1174,7 +1170,6 @@ export interface EventEnvelope {
   payload: Record<string, any>
   source: string
   source_run_id?: string | null
-  environment?: 'dev' | 'staging' | 'prod' | string
   definition_snapshot_id?: string | null
   release_id?: string | null
   definition_hash?: string
@@ -1358,7 +1353,6 @@ export interface AgentCapabilitySummary {
 
 export interface AgentCapabilityCatalog {
   scenario_id: string
-  environment: 'dev' | 'staging' | 'prod'
   definition_hash: string
   categories: Record<AgentCapabilityCategory, AgentCapabilityReadinessItem[]>
 }
@@ -1488,7 +1482,6 @@ export interface AgentChatAttachment {
 export interface AgentChatRequest {
   message: string
   conversation_id?: string
-  environment?: 'dev' | 'staging' | 'prod'
   inputs?: Record<string, unknown>
   managed_inputs?: AgentManagedInput[]
   capability?: AgentCapabilityTarget
@@ -1549,7 +1542,6 @@ export interface AgentTurnRun {
   parent_run_id?: string | null
   status: AgentTurnStatus
   revision: number
-  environment: 'dev' | 'staging' | 'prod'
   definition_hash: string
   deployment_fingerprint: string
   data_context_fingerprint: string
@@ -1562,12 +1554,14 @@ export interface AgentTurnRun {
 
 export interface AgentTurnEvent {
   revision: number
-  type: AgentTurnStatus
+  type: AgentTurnStatus | 'answer_delta' | 'answer_reset'
   data: {
     status?: AgentTurnStatus
     label?: string
     result?: Record<string, unknown>
     error?: { code: string; message: string }
+    delta?: string
+    offset?: number
   }
   created_at: string
 }
@@ -1586,6 +1580,8 @@ export type WorkflowRunStatus =
 
 export interface WorkflowApproval {
   id: string
+  revision: number
+  requires_evidence: boolean
   workflow_run_id: string
   scenario_id: string
   workflow_id: string
@@ -1606,7 +1602,6 @@ export interface WorkflowRun {
   workflow_id: string
   workflow_name: string
   trigger_source: string
-  environment?: 'dev' | 'staging' | 'prod' | string
   definition_snapshot_id?: string | null
   release_id?: string | null
   definition_hash?: string

@@ -131,6 +131,8 @@ def run_function(
         db, live_function.scenario_id, writable=True
     )
     try:
+        from ..services import runtime_definition_service
+        definition = runtime_definition_service.resolve_authoring(db, scenario)
         receipt = capability_application_service.invoke(
             db,
             scenario,
@@ -142,8 +144,8 @@ def run_function(
                 idempotency_key=payload.idempotency_key,
                 correlation_id=f"browser:{uuid4().hex}",
             ),
-            environment=payload.environment,
             invocation_source="internal",
+            definition=definition,
         )
         db.commit()
     except capability_application_service.CapabilityApplicationError as exc:

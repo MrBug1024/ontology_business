@@ -26,6 +26,9 @@ const router = createRouter({
   routes: [
     { path: '/', redirect: '/scenarios' },
     { path: '/login', name: 'login', component: () => import('@/views/Login.vue'), meta: { title: '登录', public: true } },
+    { path: '/members', name: 'members', component: () => import('@/views/OrganizationMembers.vue'), meta: { title: '成员与权限' } },
+    { path: '/invitations', name: 'invitations', component: () => import('@/views/WorkspaceInvitations.vue'), meta: { title: '工作区邀请' } },
+    { path: '/accounts', name: 'accounts', component: () => import('@/views/SystemAccounts.vue'), meta: { title: '账户管理' } },
     { path: '/scenarios', name: 'scenarios', component: () => import('@/views/Scenarios.vue'), meta: { title: '场景能力' } },
     { path: '/scenarios/:id', name: 'scenario-detail', component: () => import('@/views/ScenarioDetail.vue'), meta: { title: '场景能力' } },
     { path: '/data-sources', name: 'data-sources', component: () => import('@/views/DataSources.vue'), meta: { title: '建模资料' } },

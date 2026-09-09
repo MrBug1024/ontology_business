@@ -3,7 +3,6 @@
     <header class="page-header">
       <div>
         <h1>发布与接入</h1>
-        <p class="sub">按场景定义发布能力，并为外部 Agent 配置受控调用入口</p>
       </div>
       <el-button v-if="manifest" plain @click="downloadManifest">
         <el-icon><Download /></el-icon>导出清单
@@ -13,22 +12,14 @@
     <section class="access-context" aria-label="发布上下文">
       <label>
         <span>业务场景</span>
-        <el-select v-model="scenarioId" filterable placeholder="选择场景" :loading="loadingScenarios">
+        <el-select v-model="scenarioId" filterable clearable placeholder="全部场景" :loading="loadingScenarios">
           <el-option v-for="scenario in scenarios" :key="scenario.id" :label="scenario.name" :value="scenario.id" />
         </el-select>
-      </label>
-      <label>
-        <span>环境</span>
-        <el-radio-group v-model="environment" aria-label="发布环境">
-          <el-radio-button value="dev">开发</el-radio-button>
-          <el-radio-button value="staging">预发布</el-radio-button>
-          <el-radio-button value="prod">生产</el-radio-button>
-        </el-radio-group>
       </label>
     </section>
 
     <el-alert
-      v-if="manifestError"
+      v-if="manifestError && activeTab !== 'releases'"
       ref="manifestErrorRef"
       class="manifest-error"
       type="warning"
@@ -38,7 +29,7 @@
       tabindex="-1"
     />
 
-    <section v-if="manifest" class="deployment-band" aria-label="当前发布定义">
+    <section v-if="manifest && activeTab !== 'releases'" class="deployment-band" aria-label="当前发布定义">
       <div>
         <span>定义来源</span>
         <strong>{{ manifest.deployment.definition_source === 'release' ? '已发布快照' : '开发中定义' }}</strong>
@@ -57,29 +48,23 @@
       </div>
       <div class="deployment-actions">
         <el-tag :type="manifestReady ? 'success' : 'warning'" effect="light">
-          {{ manifestReady ? '清单检查通过' : '存在发布阻塞' }}
+          {{ manifestReady ? '接入检查通过' : '接入配置需检查' }}
         </el-tag>
-        <el-button
-          v-if="canWithdrawRelease"
-          plain
-          type="danger"
-          :loading="withdrawingRelease"
-          @click="withdrawCurrentRelease"
-        >
-          <el-icon><CircleClose /></el-icon>撤下发布
-        </el-button>
       </div>
     </section>
 
     <el-tabs v-model="activeTab" class="access-tabs">
-      <el-tab-pane label="协议适配器" name="adapters">
+      <el-tab-pane label="场景发布" name="releases">
+        <ScenarioReleaseList :scenario-id="scenarioId" :scenarios="scenarios" :can-manage="canManage" @select="selectRelease" @changed="releaseChanged" />
+      </el-tab-pane>
+      <el-tab-pane label="接入配置" name="adapters">
         <div v-loading="loadingManifest" class="adapter-grid">
           <article v-for="adapter in manifest?.adapters || []" :key="adapter.protocol" class="adapter-panel">
             <header>
               <span class="adapter-icon"><el-icon><component :is="adapter.protocol === 'rest' ? 'Link' : 'Connection'" /></el-icon></span>
               <div>
                 <h2>{{ adapter.protocol === 'rest' ? 'REST API v2' : 'Capability MCP' }}</h2>
-                <span>{{ manifest?.deployment.environment.toUpperCase() }} · {{ manifest?.deployment.definition_source === 'release' ? 'Release 固定' : 'Live definition' }}</span>
+                <span>已发布场景能力</span>
               </div>
               <el-tag size="small" :type="manifestReady ? 'success' : 'warning'">{{ manifestReady ? '可接入' : '需检查' }}</el-tag>
             </header>
@@ -101,7 +86,7 @@
               <el-icon><DocumentCopy /></el-icon>复制配置
             </el-button>
           </article>
-          <el-empty v-if="!loadingManifest && !manifest" description="请选择可解析的场景与环境" />
+          <el-empty v-if="!loadingManifest && !manifest" description="尚未选择已启用的发布" />
         </div>
       </el-tab-pane>
 
@@ -178,7 +163,7 @@
           </el-table>
           <div class="manifest-id"><span>Manifest ID</span><code>{{ manifest.manifest_id }}</code></div>
           </section>
-          <el-empty v-else-if="!loadingManifest" description="当前环境尚无可检查的发布清单" />
+          <el-empty v-else-if="!loadingManifest" description="尚未选择已启用的发布" />
         </div>
       </el-tab-pane>
 
@@ -221,7 +206,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import ScenarioReleaseList from '@/components/ScenarioReleaseList.vue'
+import type { ScenarioRelease } from '@/types/scenarioRelease'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
@@ -239,14 +226,17 @@ const router = useRouter()
 const auth = useAuthStore()
 const canManage = computed(() => auth.user?.can_manage === true)
 const scenarios = ref<Scenario[]>([])
-const scenarioId = ref('')
-const environment = ref<'dev' | 'staging' | 'prod'>('dev')
+const scenarioId = computed({
+  get: () => queryText(route.query.scenario_id),
+  set: (value: string) => { void router.replace({ query: { scenario_id: value || undefined } }) },
+})
+const releaseId = computed(() => queryText(route.query.release_id))
 const manifest = ref<CapabilityAccessManifest | null>(null)
 const manifestError = ref('')
 const manifestErrorRef = ref()
 const loadingScenarios = ref(false)
 const loadingManifest = ref(false)
-const activeTab = ref('adapters')
+const activeTab = ref('releases')
 const keys = ref<IntegrationKey[]>([])
 const loadingKeys = ref(false)
 const createKeyVisible = ref(false)
@@ -255,8 +245,9 @@ const keyFormError = ref('')
 const keyErrorRef = ref<HTMLElement>()
 const secretVisible = ref(false)
 const createdSecret = ref('')
-const withdrawingRelease = ref(false)
 let manifestRequest = 0
+let manifestController: AbortController | undefined
+let disposed = false
 
 const keyForm = reactive<{
   name: string
@@ -270,15 +261,6 @@ const keyForm = reactive<{
 
 const readyCount = computed(() => manifest.value?.capabilities.filter((item) => item.ready).length || 0)
 const manifestReady = computed(() => Boolean(manifest.value?.checks.every((check) => check.passed)))
-const canWithdrawRelease = computed(() => Boolean(
-  canManage.value
-  && manifest.value
-  && environment.value !== 'dev'
-  && manifest.value.deployment.definition_source === 'release'
-  && manifest.value.release_history.some((item) => (
-    item.environment === environment.value && item.status === 'released'
-  )),
-))
 const secretMcpConfig = computed(() => {
   const adapter = manifest.value?.adapters.find((item) => item.protocol === 'mcp')
   if (!adapter) return ''
@@ -300,14 +282,6 @@ async function loadScenarios() {
   loadingScenarios.value = true
   try {
     scenarios.value = await api.listScenarios()
-    const requested = queryText(route.query.scenario_id)
-    scenarioId.value = scenarios.value.some((item) => item.id === requested)
-      ? requested
-      : scenarios.value[0]?.id || ''
-    const requestedEnvironment = queryText(route.query.environment)
-    if (requestedEnvironment === 'dev' || requestedEnvironment === 'staging' || requestedEnvironment === 'prod') {
-      environment.value = requestedEnvironment
-    }
   } finally {
     loadingScenarios.value = false
   }
@@ -315,16 +289,18 @@ async function loadScenarios() {
 
 async function loadManifest() {
   const requestId = ++manifestRequest
+  manifestController?.abort()
+  manifestController = new AbortController()
   manifest.value = null
   manifestError.value = ''
-  if (!scenarioId.value) return
+  if (!scenarioId.value || !releaseId.value) { loadingManifest.value = false; return }
   loadingManifest.value = true
   try {
-    const loaded = await capabilityAccessApi.getManifest(scenarioId.value, environment.value)
-    if (requestId === manifestRequest) manifest.value = loaded
-  } catch (error: any) {
-    if (requestId !== manifestRequest) return
-    manifestError.value = error?.message || '接入清单解析失败'
+    const loaded = await capabilityAccessApi.getManifest(scenarioId.value, releaseId.value, manifestController.signal)
+    if (!disposed && requestId === manifestRequest) manifest.value = loaded
+  } catch (error: unknown) {
+    if (disposed || requestId !== manifestRequest || manifestController.signal.aborted) return
+    manifestError.value = error instanceof Error ? error.message : '接入清单解析失败'
     void nextTick(() => manifestErrorRef.value?.$el?.focus?.())
   } finally {
     if (requestId === manifestRequest) loadingManifest.value = false
@@ -336,8 +312,8 @@ async function loadKeys() {
   loadingKeys.value = true
   try {
     keys.value = await capabilityAccessApi.listKeys()
-  } catch (error: any) {
-    ElMessage.error(error?.message || '集成密钥加载失败')
+  } catch (error: unknown) {
+    ElMessage.error(error instanceof Error ? error.message : '集成密钥加载失败')
   } finally {
     loadingKeys.value = false
   }
@@ -374,8 +350,8 @@ async function createKey() {
     createKeyVisible.value = false
     secretVisible.value = true
     await loadKeys()
-  } catch (error: any) {
-    keyFormError.value = error?.message || '密钥创建失败'
+  } catch (error: unknown) {
+    keyFormError.value = error instanceof Error ? error.message : '密钥创建失败'
     void nextTick(() => keyErrorRef.value?.focus())
   } finally {
     creatingKey.value = false
@@ -391,41 +367,18 @@ async function revokeKey(key: IntegrationKey) {
     await capabilityAccessApi.revokeKey(key.id)
     await loadKeys()
     ElMessage.success('密钥已撤销')
-  } catch (error: any) {
-    if (error !== 'cancel' && error !== 'close') ElMessage.error(error?.message || '撤销失败')
+  } catch (error: unknown) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error instanceof Error ? error.message : '撤销失败')
   }
 }
 
-async function withdrawCurrentRelease() {
-  if (!scenarioId.value || environment.value === 'dev' || !canWithdrawRelease.value) return
-  const selectedEnvironment = environment.value
-  try {
-    const prompt = await ElMessageBox.prompt(
-      `撤下 ${selectedEnvironment.toUpperCase()} 发布后，该环境将拒绝新的能力调用；Release、快照和历史回执仍会保留。`,
-      '撤下当前环境发布',
-      {
-        type: 'warning',
-        confirmButtonText: '确认撤下',
-        cancelButtonText: '取消',
-        inputPlaceholder: '填写撤下原因',
-        inputValidator: (value: string) => value.trim() ? true : '撤下原因不能为空',
-      },
-    )
-    withdrawingRelease.value = true
-    const result = await capabilityAccessApi.withdrawRelease(
-      scenarioId.value,
-      selectedEnvironment,
-      prompt.value.trim(),
-    )
-    ElMessage.success(result.changed ? '当前环境发布已撤下' : '当前环境发布此前已撤下')
-    await loadManifest()
-  } catch (error: any) {
-    if (error !== 'cancel' && error !== 'close') {
-      ElMessage.error(error?.message || '撤下发布失败')
-    }
-  } finally {
-    withdrawingRelease.value = false
-  }
+async function selectRelease(release: ScenarioRelease) {
+  await router.push({ query: { scenario_id: release.scenario_id, release_id: release.id } })
+  activeTab.value = 'adapters'
+}
+
+function releaseChanged(release: ScenarioRelease) {
+  if (release.id === releaseId.value) void loadManifest()
 }
 
 function clearSecret() {
@@ -468,7 +421,7 @@ function downloadManifest() {
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = `capability-manifest-${manifest.value.scenario.id}-${manifest.value.deployment.environment}.json`
+  link.download = `capability-manifest-${manifest.value.scenario.id}-${manifest.value.deployment.release_id}.json`
   document.body.appendChild(link)
   link.click()
   link.remove()
@@ -478,7 +431,7 @@ function downloadManifest() {
 function checkLabel(code: string) {
   return ({
     definition_resolved: '运行定义可解析',
-    release_pinned: '非开发环境已固定 Release',
+    release_pinned: '已固定发布版本',
     capabilities_ready: '能力就绪检查',
     runtime_bindings_excluded: '未包含运行数据绑定',
     credentials_excluded: '未包含凭据',
@@ -495,15 +448,16 @@ function formatDate(value?: string | null) {
   return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—'
 }
 
-watch([scenarioId, environment], async () => {
-  await router.replace({
-    query: {
-      ...route.query,
-      scenario_id: scenarioId.value || undefined,
-      environment: environment.value,
-    },
-  })
+watch([scenarioId, releaseId], () => {
+  if (releaseId.value) activeTab.value = 'adapters'
   void loadManifest()
+})
+
+onBeforeUnmount(() => {
+  disposed = true
+  manifestRequest += 1
+  manifestController?.abort()
+  clearSecret()
 })
 
 onMounted(async () => {

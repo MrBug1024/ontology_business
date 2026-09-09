@@ -83,6 +83,8 @@
             <el-menu-item index="/mcp">外部工具</el-menu-item>
             <el-menu-item index="/skills">本地技能</el-menu-item>
           </el-sub-menu>
+          <el-menu-item index="/members"><el-icon aria-hidden="true"><User /></el-icon><span>成员与权限</span></el-menu-item>
+          <el-menu-item v-if="auth.user?.system_role === 'superadmin'" index="/accounts"><el-icon aria-hidden="true"><Setting /></el-icon><span>账户管理</span></el-menu-item>
         </el-menu>
       </nav>
 
@@ -101,9 +103,10 @@
       <header class="topbar" role="banner">
         <div class="topbar-leading">
           <el-button class="menu-button" text circle aria-label="打开导航" @click="sidebarOpen = true"><el-icon><Menu /></el-icon></el-button>
-          <div class="crumb" aria-label="当前位置"><span>业务工作区</span><el-icon aria-hidden="true"><ArrowRight /></el-icon><strong>{{ pageTitle }}</strong></div>
+          <div class="crumb" aria-label="当前位置"><WorkspaceMenu /><el-icon aria-hidden="true"><ArrowRight /></el-icon><strong>{{ pageTitle }}</strong></div>
         </div>
         <div class="top-actions">
+          <el-button class="workspace-invitations-button" text circle aria-label="查看工作区邀请" title="工作区邀请" @click="router.push('/invitations')"><el-icon><Message /></el-icon></el-button>
           <el-button
             class="theme-button"
             text
@@ -141,6 +144,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import GlobalAssistant from '@/components/GlobalAssistant.vue'
+import WorkspaceMenu from '@/components/access/WorkspaceMenu.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -228,6 +232,7 @@ onBeforeUnmount(() => window.removeEventListener('ontology-theme-change', syncTh
 .topbar-leading, .crumb, .top-actions, .user-trigger { display: flex; align-items: center; }
 .topbar-leading { min-width: 0; gap: 8px; }
 .crumb { min-width: 0; gap: 7px; color: var(--text-3); font-size: 12px; }
+.crumb :deep(.el-dropdown) { min-width: 0; }
 .crumb strong { overflow: hidden; color: var(--text); font-size: 12.5px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .crumb .el-icon { flex: 0 0 auto; font-size: 11px; }
 .top-actions { gap: 10px; }
@@ -245,6 +250,10 @@ onBeforeUnmount(() => window.removeEventListener('ontology-theme-change', syncTh
   .sidebar-close, .menu-button { display: inline-flex; }
   .topbar { height: 60px; padding: 0 12px; }
   .crumb > span, .crumb > .el-icon, .user-name { display: none; }
+}
+@media (max-width: 560px) {
+  .workspace-invitations-button, .crumb strong { display: none; }
+  .top-actions { flex-shrink: 0; padding-left: 54px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .sidebar, .skip-link, .side-menu :deep(.el-menu-item), .side-menu :deep(.el-sub-menu__title) { transition-duration: .01ms !important; }

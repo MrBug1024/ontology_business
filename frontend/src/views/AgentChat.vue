@@ -31,24 +31,18 @@
         </div>
         <el-empty v-if="!conversations.length" description="暂无对话" :image-size="50" />
       </div>
-      <div class="side-foot" v-if="agent">
-        <div class="muted side-foot-label">本轮业务数据</div>
-        <span class="muted">来自对话附件与 Agent 已配置的业务数据库</span>
-      </div>
     </div>
 
     <!-- 右侧：对话区 -->
     <div class="chat-main">
       <el-alert
-        v-if="agent"
+        v-if="agent && !agentValidationReady"
         class="validation-notice"
-        :type="agentValidationReady ? 'info' : 'warning'"
+        type="warning"
         :closable="false"
         show-icon
-        :title="agentValidationReady ? '第三方调用模拟器' : '尚不可开始验证'"
-        :description="agentValidationReady
-          ? '直接描述业务需求并按需上传本次处理的文件。Agent 会在创建时授权的业务能力中自主选择；建模资料不会作为本次正式业务数据。'
-          : validationMissingText"
+        title="尚不可开始验证"
+        :description="validationMissingText"
       />
       <div class="chat-messages" ref="msgRef">
         <div v-if="conversationLoading && !messages.length" class="empty-chat" role="status" aria-live="polite">
@@ -58,9 +52,7 @@
         <div v-else-if="!messages.length" class="empty-chat">
           <div class="empty-icon"><el-icon :size="40"><ChatDotRound /></el-icon></div>
           <div class="empty-title">{{ agentValidationReady ? `${agent?.name || 'Agent'} 可开始验证` : '等待验证配置' }}</div>
-          <div class="muted">{{ agentValidationReady
-            ? `基于「${agent?.scenario_name || '通用'}」场景语义与已授权能力，验证理解、分析、生成和受控操作。`
-            : validationMissingText }}</div>
+          <div v-if="!agentValidationReady" class="muted">{{ validationMissingText }}</div>
           <div v-if="agentValidationReady" class="suggestions">
             <button class="sug" type="button" v-for="q in suggestions" :key="q" @click="useSuggestion(q)">{{ q }}</button>
           </div>
@@ -71,67 +63,24 @@
             <el-icon><component :is="m.role === 'user' ? 'User' : 'Cpu'" /></el-icon>
           </div>
           <div class="msg-bubble">
+            <PlainMessage v-if="m.content" :content="m.content" />
+            <MessageInputAttachments v-if="m.role === 'user'" :snapshot="m.input_snapshot" />
             <!-- 工具调用卡片 -->
             <template v-for="(tc, ti) in m.tool_calls || []" :key="'tc' + ti">
-              <div class="tool-card" :class="{ open: tc._open }">
-                <button class="head" type="button" :aria-expanded="tc._open" @click="tc._open = !tc._open">
-                  <el-icon aria-hidden="true"><component :is="tc.status === 'error' ? 'CircleClose' : tc.status === 'done' ? 'CircleCheck' : 'Loading'" /></el-icon>
-                  <span>{{ tc.name }}</span>
-                  <el-tag v-if="tc.status === 'done'" size="small" type="success">完成</el-tag>
-                  <el-tag v-else-if="tc.status === 'error'" size="small" type="danger">失败</el-tag>
-                  <el-tag v-else size="small" type="warning">执行中</el-tag>
-                  <el-icon style="margin-left:auto" aria-hidden="true"><component :is="tc._open ? 'ArrowUp' : 'ArrowDown'" /></el-icon>
-                </button>
-                <div class="body">
-                  <div class="muted" style="margin-bottom:4px">参数</div>
-                  <StructuredValueViewer :value="tc.args" empty-text="无需参数" class="tool-structured-value" />
-                  <div v-if="tc.result !== undefined" class="muted" style="margin:8px 0 4px">结果</div>
-                  <StructuredValueViewer v-if="tc.result !== undefined" :value="tc.result" empty-text="暂无返回结果" class="tool-structured-value" />
-                  <section v-if="actionPreviewOf(tc)" class="agent-action-confirm" aria-label="操作预演确认">
-                    <div>
-                      <strong>{{ actionPreviewOf(tc)?.result?.plan?.action_name || '业务操作' }}</strong>
-                      <span v-if="actionPreviewOf(tc)?.result?.plan?.artifact">将生成 {{ actionPreviewOf(tc)?.result?.plan?.artifact?.filename }}</span>
-                      <span v-else>预演已固定操作定义和参数，确认前没有产生副作用。</span>
-                    </div>
-                    <el-button type="primary" size="small" :loading="tc._confirming" :disabled="m.streaming" @click="confirmActionPreview(tc)">确认执行</el-button>
-                  </section>
-                  <section v-else-if="confirmationPreviewOf(tc)" class="agent-action-confirm" :aria-label="`${confirmationLabel(confirmationPreviewOf(tc))}预演确认`">
-                    <div>
-                      <strong>{{ confirmationTitle(confirmationPreviewOf(tc)) }}</strong>
-                      <span>{{ confirmationDescription(confirmationPreviewOf(tc)) }}</span>
-                    </div>
-                    <el-button
-                      type="primary"
-                      size="small"
-                      :loading="tc._confirming"
-                      :disabled="m.streaming || !curConv?.id"
-                      :aria-busy="tc._confirming ? 'true' : 'false'"
-                      @click="confirmAgentPreview(tc)"
-                    >确认{{ confirmationLabel(confirmationPreviewOf(tc)) }}</el-button>
-                  </section>
-                  <section v-if="confirmationOutcomeOf(tc)" class="agent-confirm-outcome" aria-live="polite">
-                    <div>
-                      <strong>{{ confirmationOutcomeTitle(confirmationOutcomeOf(tc)) }}</strong>
-                      <span>{{ confirmationOutcomeDescription(confirmationOutcomeOf(tc)) }}</span>
-                    </div>
-                    <el-button
-                      v-if="confirmationTaskId(confirmationOutcomeOf(tc))"
-                      type="primary"
-                      plain
-                      size="small"
-                      @click="openConfirmationTask(confirmationOutcomeOf(tc))"
-                    >查看任务</el-button>
-                  </section>
-                </div>
-              </div>
+              <AgentCapabilityReceipt
+                v-if="capabilityInvocationId(tc) && agent?.id && m.id && receiptOwners.get(capabilityInvocationId(tc)) === m.id"
+                :agent-id="agent.id" :message-id="m.id"
+                :invocation-id="capabilityInvocationId(tc)"
+                :scenario-id="agent.scenario_id || undefined" :streaming="m.streaming"
+                @updating="followReceipt"
+              />
             </template>
             <!-- 状态提示 -->
-            <div v-if="m.status" class="status-line" role="status" aria-live="polite" aria-atomic="true">
+            <div v-if="m.status && (m.streaming || canRetryTurn(m))" class="status-line" role="status" aria-live="polite" aria-atomic="true">
               <el-icon v-if="m.streaming" class="is-loading" aria-hidden="true"><Loading /></el-icon>
               {{ m.status }}
             </div>
-            <!-- 正文（Markdown token 结构渲染；模型输出不会作为 HTML 注入） -->
-            <SafeMarkdown v-if="m.content" :content="m.content" />
+            <!-- 渠道消息以纯文本呈现。 -->
             <div v-if="canRetryTurn(m) || canCancelTurn(m)" class="turn-actions">
               <el-button v-if="canRetryTurn(m)" size="small" :loading="m.retrying" @click="retryTurn(m)">
                 <el-icon aria-hidden="true"><RefreshRight /></el-icon>重试
@@ -240,10 +189,12 @@ import type {
 } from '@/types'
 import AgentInvocationComposer from '@/components/AgentInvocationComposer.vue'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
-import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
+import PlainMessage from '@/components/PlainMessage.vue'
+import MessageInputAttachments from '@/components/agent/MessageInputAttachments.vue'
+import AgentCapabilityReceipt from '@/components/agent/AgentCapabilityReceipt.vue'
+import { capabilityInvocationId } from '@/utils/agentCapabilityReceipt'
 import { actionArtifactAttachment } from '@/utils/artifactAttachments'
 import type { ArtifactAttachment } from '@/utils/artifactAttachments'
-import { actionConfirmationParams } from '@/utils/actionConfirmation'
 import { normalizeAgentReadiness } from '@/utils/agentReadiness'
 import {
   useAgentDurableTurns,
@@ -266,6 +217,17 @@ type CitationPreview = {
 }
 
 const messages = ref<AgentTurnViewMessage[]>([])
+const receiptOwners = computed(() => {
+  const owners = new Map<string, string>()
+  for (const message of messages.value) {
+    if (!message.id) continue
+    for (const tool of message.tool_calls || []) {
+      const invocationId = capabilityInvocationId(tool)
+      if (invocationId) owners.set(invocationId, message.id)
+    }
+  }
+  return owners
+})
 const conversationLoading = ref(false)
 const composerRef = ref<InstanceType<typeof AgentInvocationComposer>>()
 const msgRef = ref<HTMLElement>()
@@ -361,97 +323,6 @@ function extractMessageAttachments(message: AgentTurnViewMessage): ArtifactAttac
   return [...unique.values()]
 }
 
-function actionPreviewOf(toolCall: any): any | null {
-  const result = parsedToolResult(toolCall?.result)
-  if (
-    result && typeof result === 'object'
-    && result.status === 'dry_run'
-    && result.log_id
-    && result.correlation_id
-    && result.definition_hash
-    && result.result?.plan?.action_id
-  ) return result
-  return null
-}
-
-function confirmationPreviewOf(toolCall: any): any | null {
-  const result = parsedToolResult(toolCall?.result)
-  if (
-    result && typeof result === 'object'
-    && result.status === 'confirmation_required'
-    && ['event', 'workflow'].includes(result.confirmation_type)
-    && result.log_id
-    && result.correlation_id
-    && result.environment
-    && result.definition_hash
-    && result.result?.plan?.confirmation_type === result.confirmation_type
-  ) return result
-  return null
-}
-
-function confirmationOutcomeOf(toolCall: any): any | null {
-  const result = parsedToolResult(toolCall?.result)
-  const succeeded = result?.status === 'success'
-    || (result?.status === 'idempotent_replay' && result?.original_status === 'success')
-  if (
-    succeeded
-    && ['event', 'workflow'].includes(result?.confirmation_type)
-    && result?.log_id
-    && result?.parent_preview_log_id
-  ) return result
-  return null
-}
-
-function confirmationLabel(preview: any) {
-  return preview?.confirmation_type === 'event' ? '发布事件' : '提交工作流'
-}
-
-function confirmationTitle(preview: any) {
-  const plan = preview?.result?.plan || {}
-  return preview?.confirmation_type === 'event'
-    ? plan.event_name || '业务事件'
-    : plan.workflow_name || '业务工作流'
-}
-
-function confirmationDescription(preview: any) {
-  return preview?.confirmation_type === 'event'
-    ? '定义与载荷已固定；确认后将发布事件，并可能触发订阅工作流。'
-    : '定义与参数已固定；确认后将提交到任务队列，由任务中心跟踪。'
-}
-
-function confirmationTaskId(outcome: any) {
-  return outcome?.result?.workflow_run?.id
-    || outcome?.result?.queued_workflow_run_ids?.[0]
-    || ''
-}
-
-function confirmationOutcomeTitle(outcome: any) {
-  return outcome?.confirmation_type === 'event' ? '事件已发布' : '工作流任务已提交'
-}
-
-function confirmationOutcomeDescription(outcome: any) {
-  if (outcome?.confirmation_type === 'workflow') {
-    const run = outcome?.result?.workflow_run || {}
-    return `${run.workflow_name || '工作流'} · ${run.status === 'queued' ? '已进入队列' : run.status || '已提交'}`
-  }
-  const envelope = outcome?.result?.event_envelope || {}
-  const queued = outcome?.result?.queued_workflow_run_ids || []
-  return `${envelope.name || '业务事件'} · ${queued.length ? `已排队 ${queued.length} 个订阅工作流任务` : '没有命中需排队的订阅工作流'}`
-}
-
-function openConfirmationTask(outcome: any) {
-  const taskId = confirmationTaskId(outcome)
-  if (!taskId) return
-  void router.push({
-    name: 'tasks',
-    query: {
-      task: taskId,
-      scenario_id: agent.value?.scenario_id || undefined,
-      return_to: route.fullPath,
-    },
-  })
-}
-
 function artifactFormatLabel(format?: string) {
   return ({ docx: 'Word 文档', xlsx: 'Excel 工作簿', markdown: 'Markdown', md: 'Markdown' } as Record<string, string>)[String(format || '').toLowerCase()] || '业务附件'
 }
@@ -460,104 +331,6 @@ function formatFileSize(size = 0) {
   if (size < 1024) return `${size} B`
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
   return `${(size / 1024 / 1024).toFixed(1)} MB`
-}
-
-function actionIdempotencyKey() {
-  return globalThis.crypto?.randomUUID?.() || `agent-action-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
-}
-
-async function confirmActionPreview(toolCall: any) {
-  const previewResult = actionPreviewOf(toolCall)
-  if (!previewResult || toolCall._confirming) return
-  const plan = previewResult.result.plan
-  const params = actionConfirmationParams(toolCall, plan)
-  if (!params) {
-    ElMessage.error('操作预演参数不完整，请重新发起业务需求')
-    return
-  }
-  const artifactName = plan.artifact?.filename
-  try {
-    await ElMessageBox.confirm(
-      artifactName
-        ? `确认执行“${plan.action_name}”并生成附件“${artifactName}”？文件会保存到已配置的业务资料库。`
-        : `确认执行“${plan.action_name}”？系统将严格使用预演时固定的定义和参数。`,
-      '确认执行业务操作',
-      { type: 'warning', confirmButtonText: '确认执行', cancelButtonText: '取消' },
-    )
-  } catch { return }
-  toolCall._confirming = true
-  try {
-    const result: any = await api.executeAction(plan.action_id, {
-      params,
-      dry_run: false,
-      confirm: true,
-      idempotency_key: actionIdempotencyKey(),
-      preview_log_id: previewResult.log_id,
-      correlation_id: previewResult.correlation_id,
-      expected_environment: previewResult.environment,
-      expected_definition_snapshot_id: previewResult.definition_snapshot_id || undefined,
-      expected_release_id: previewResult.release_id || undefined,
-      expected_definition_hash: previewResult.definition_hash,
-    })
-    toolCall.result = result
-    toolCall._open = true
-    if (result.status === 'success' || (result.status === 'idempotent_replay' && result.original_status === 'success')) {
-      ElMessage.success(result.result?.artifact ? '附件已按源模板格式生成' : '业务操作已完成')
-    } else {
-      ElMessage.error(result.error || '业务操作未成功完成')
-    }
-  } catch (error: any) {
-    ElMessage.error(error?.message || '确认执行失败，请重新预演')
-  } finally {
-    toolCall._confirming = false
-  }
-}
-
-async function confirmAgentPreview(toolCall: any) {
-  const preview = confirmationPreviewOf(toolCall)
-  const currentAgent = agent.value
-  const conversation = curConv.value
-  if (!preview || toolCall._confirming) return
-  if (!currentAgent?.id || !conversation?.id) {
-    ElMessage.warning('请等待对话保存完成后再确认')
-    return
-  }
-  try {
-    await ElMessageBox.confirm(
-      preview.confirmation_type === 'event'
-        ? `确认发布事件“${confirmationTitle(preview)}”？系统将使用预演时固定的事件定义和载荷，并可能触发订阅工作流。`
-        : `确认提交工作流“${confirmationTitle(preview)}”？系统将使用预演时固定的定义和参数创建任务。`,
-      preview.confirmation_type === 'event' ? '确认发布业务事件' : '确认提交工作流任务',
-      {
-        type: 'warning',
-        confirmButtonText: confirmationLabel(preview),
-        cancelButtonText: '取消',
-      },
-    )
-  } catch { return }
-
-  toolCall._confirming = true
-  try {
-    const result: any = await api.confirmAgentToolPreview(currentAgent.id, preview.log_id, {
-      conversation_id: conversation.id,
-      correlation_id: preview.correlation_id,
-      expected_environment: preview.environment as 'dev' | 'staging' | 'prod',
-      expected_definition_snapshot_id: preview.definition_snapshot_id || undefined,
-      expected_release_id: preview.release_id || undefined,
-      expected_definition_hash: preview.definition_hash,
-    })
-    toolCall.result = result
-    toolCall._open = true
-    if (confirmationOutcomeOf(toolCall)) {
-      ElMessage.success(result.confirmation_type === 'event' ? '事件已发布' : '工作流任务已提交')
-    } else {
-      ElMessage.error(result.error || '确认未成功完成')
-    }
-  } catch (error: any) {
-    ElMessage.error(error?.message || '确认失败，请重新预演')
-  } finally {
-    toolCall._confirming = false
-  }
 }
 
 const previewVisible = ref(false)
@@ -691,6 +464,11 @@ function scrollBottom() {
   })
 }
 
+function followReceipt() {
+  const pane = msgRef.value
+  if (pane && pane.scrollHeight - pane.scrollTop - pane.clientHeight < 160) scrollBottom()
+}
+
 const {
   conversationNavigationLocked,
   currentTurnPending,
@@ -804,6 +582,7 @@ function messageFromHistory(message: ChatMessage): AgentTurnViewMessage {
     id: message.id,
     role: message.role,
     content: message.content,
+    input_snapshot: message.input_snapshot,
     citations: citationsOf(message.citations),
     tool_calls: (message.tool_calls || []).map((toolCall: any) => ({
       ...toolCall,

@@ -12,7 +12,78 @@ logic. Create a credential with `capabilities:read` and
 integration must upload new invocation documents. Copy its token immediately
 because it is returned only once.
 
+Each credential remains bound to the workspace in which it was issued. Switching
+the browser's active workspace does not change SDK authorization. The server
+checks the subject's active membership and scenario ACL on every request; a
+system superadmin role does not grant workspace access. Removing a member or
+changing their workspace role revokes that workspace's credentials. Disabling
+the account revokes all of its credentials, and restoring the account does not
+restore old tokens.
+
 ## Zero-data capability
+
+The `release_id` in the examples is the id of a manually created and enabled
+scenario release. Omit it to select the scenario's one enabled release. The
+server never falls back to authored definitions for external calls.
+
+### Contract transition (2026-09-08)
+
+Upgrade the SDK and server together. Current `/external/v2` requests no longer
+accept `environment`, `runtime_environment` or `expected_environment`: retired
+query fields return 410 and closed request bodies reject them with 422. Replace
+them with an optional explicit `release_id`. They are not silently ignored.
+The immutable definition format is v3 and channel delivery is v1; historical
+snapshot formats are read only for authorized pinned history. No parallel
+environment-based endpoint is retained. Deployments use separate infrastructure
+configuration, never business records or permission labels.
+
+### Plain-message delivery
+
+Poll `client.get_invocation_receipt(invocation_id)`. Deliver changes only when
+`receipt["delivery"]["revision"]` changes, to the original upstream conversation.
+`delivery.text` is plain text, `interactions` identifies the pending person,
+allowed replies, expiry and revision, and `attachments` contains authorized files.
+Use `download_invocation_attachment(invocation_id, file_id)` to relay the file;
+credentials stay in headers. A queued workflow remains running until its actual
+execution finishes. Human retries preserve the original invocation's final result.
+
+An adapter must authenticate the actual sender using that person's authorized
+credential or a trusted identity mapping. A shared bot credential does not grant
+permission to impersonate named group members. The model may explain a pending
+decision; only the human's actual message is submitted to the reply interface.
+
+```python
+interaction = receipt["delivery"]["interactions"][0]
+kind = "approval" if interaction["kind"] == "workflow_approval" else "confirmation"
+result = client.reply_business_interaction(
+    kind, interaction["id"], text=human_message,
+    message_id=upstream_message_id, expected_revision=interaction["revision"],
+    evidence=[{"asset_version_id": uploaded["version"]["id"]}],
+)
+```
+
+Supply evidence only for business approval; adding inputs to execution confirmation
+requires a new preview. A different authorized approver can use
+`get_business_approval(approval_id)` with their own credential. MCP exposes
+`read_business_approval` and `reply_business_interaction` over the same service.
+REST equivalents are GET `/interactions/approval/{id}` and POST
+`/interactions/{approval|confirmation}/{id}/reply` beneath `/api/external/v2`.
+
+The validation Agent accepts the human's ordinary confirmation message in the
+same conversation. Its session-authenticated adapter restores the exact preview
+inputs and delegates to CapabilityInvoker. The existing typed browser endpoint
+remains available to compatible clients:
+`GET /api/agents/{agent_id}/capability-invocations/{invocation_id}?message_id=...`
+reads the current receipt, and `POST` to the same path plus `/confirm` accepts
+`{"message_id": "...", "confirmed": true}`. The server verifies conversation
+ownership and current capability permissions, restores encrypted preview inputs,
+and delegates to the same CapabilityInvoker. The model-visible projection omits
+confirmation tokens. This browser adapter does not change the SDK/API-key
+confirmation contract or authorize a model to confirm an operation.
+
+After a workflow approval, preceding successful node outputs are restored from
+the durable reviewed result. LLM nodes before that approval are not regenerated.
+Restart all API/worker instances when deploying this execution change.
 
 ```python
 from sdk import CapabilityClient
@@ -21,13 +92,13 @@ with CapabilityClient(
     "https://platform.example.com/api/external/v2",
     "ont_sk_...",
 ) as client:
-    capabilities = client.list_capabilities("scenario-id", environment="prod")
+    capabilities = client.list_capabilities("scenario-id", release_id="release-id")
     contract = capabilities[0]
     receipt = client.invoke_capability(
         "scenario-id",
         contract["kind"],
         contract["key"],
-        environment="prod",
+        release_id="release-id",
         inputs={"request": "Summarize the supplied requirements"},
         expected_definition_hash=contract["definition_hash"],
         expected_deployment_fingerprint=contract["deployment_fingerprint"],
@@ -42,19 +113,19 @@ published contract has no managed data ports.
 A capability client can bootstrap without a first-party UI. Scenario discovery
 uses the API key subject's live scenario ACL and excludes retired scenarios.
 For a selectable managed input port, ask the server for options tied to the
-exact scenario, capability, port, environment, frozen definition hash and
+exact scenario, capability, port, release, frozen definition hash and
 deployment fingerprint:
 
 ```python
 scenario = client.list_scenarios()[0]
-contract = client.list_capabilities(scenario["id"], environment="prod")[0]
+contract = client.list_capabilities(scenario["id"], release_id="release-id")[0]
 port = next(item for item in contract["data_ports"] if item["allow_override"])
 page = client.list_managed_input_options(
     scenario["id"],
     contract["kind"],
     contract["key"],
     port["key"],
-    environment="prod",
+    release_id="release-id",
 )
 
 choice = page["items"][0]
@@ -62,7 +133,7 @@ receipt = client.invoke_capability(
     scenario["id"],
     contract["kind"],
     contract["key"],
-    environment="prod",
+    release_id="release-id",
     inputs={"threshold": 0.8},
     managed_inputs=[choice["managed_input"]],
     expected_definition_hash=page["definition_hash"],
@@ -86,7 +157,7 @@ credential.
 
 ```python
 contract = client.get_capability(
-    "scenario-id", "function", "capability-key", environment="prod"
+    "scenario-id", "function", "capability-key", release_id="release-id"
 )
 uploaded = client.upload_invocation_attachment(
     "requirements.docx",
@@ -102,7 +173,7 @@ receipt = client.invoke_capability(
     "scenario-id",
     "function",
     "capability-key",
-    environment="prod",
+    release_id="release-id",
     inputs={"request": "Produce an implementation-ready specification"},
     managed_inputs=[{
         "port_key": "requirements",
@@ -126,7 +197,7 @@ overrides.
 
 ```python
 options = client.list_managed_input_options(
-    "scenario-id", "function", "capability-key", "records", environment="prod"
+    "scenario-id", "function", "capability-key", "records", release_id="release-id"
 )
 version_a, version_b = options["items"][:2]
 
@@ -134,7 +205,7 @@ first = client.invoke_capability(
     "scenario-id",
     "function",
     "capability-key",
-    environment="prod",
+    release_id="release-id",
     inputs={"threshold": 0.8},
     managed_inputs=[version_a["managed_input"]],
     expected_definition_hash=options["definition_hash"],
@@ -145,7 +216,7 @@ second = client.invoke_capability(
     "scenario-id",
     "function",
     "capability-key",
-    environment="prod",
+    release_id="release-id",
     inputs={"threshold": 0.8},
     managed_inputs=[version_b["managed_input"]],
     expected_definition_hash=options["definition_hash"],
@@ -160,17 +231,17 @@ Side-effecting capabilities require an explicit preview/confirm exchange:
 
 ```python
 action_contract = client.get_capability(
-    "scenario-id", "action", "capability-key", environment="prod"
+    "scenario-id", "action", "capability-key", release_id="release-id"
 )
 preview = client.invoke_capability(
     "scenario-id", "action", "capability-key",
-    environment="prod", mode="preview", inputs={"request_id": "R-1001"},
+    release_id="release-id", mode="preview", inputs={"request_id": "R-1001"},
     expected_definition_hash=action_contract["definition_hash"],
     expected_deployment_fingerprint=action_contract["deployment_fingerprint"],
 )
 confirmed = client.invoke_capability(
     "scenario-id", "action", "capability-key",
-    environment="prod", mode="confirm", inputs={"request_id": "R-1001"},
+    release_id="release-id", mode="confirm", inputs={"request_id": "R-1001"},
     confirmation=preview["confirmation"],
     idempotency_key="enterprise-agent:R-1001",
     expected_definition_hash=action_contract["definition_hash"],

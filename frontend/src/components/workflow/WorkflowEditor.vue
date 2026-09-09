@@ -10,6 +10,7 @@ import type { Node, Edge, Connection } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import WFNode from './WFNode.vue'
+import WorkflowApprovalPolicyFields from './WorkflowApprovalPolicyFields.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import { api } from '@/api'
 import type { WorkflowRun } from '@/types'
@@ -651,6 +652,7 @@ const wf = computed({
           </template>
 
           <template v-if="selNode.type === 'approval'">
+            <WorkflowApprovalPolicyFields :key="selNode.id" v-model="selNode.data" />
             <div class="wfe-field">
               <label>审批说明</label>
               <el-input v-model="selNode.data.instructions" type="textarea" :rows="4" placeholder="说明审批人需要核对的影响、条件和执行范围" />
@@ -666,7 +668,6 @@ const wf = computed({
                 <el-option label="标记超时" value="timeout" />
               </el-select>
             </div>
-            <div class="wfe-hint">流程将在此节点暂停；审批人从任务中心批准或驳回后，系统才会继续。</div>
           </template>
 
           <template v-if="selNode.type === 'http'">

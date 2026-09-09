@@ -8,7 +8,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 from sqlalchemy.engine import URL
 
-from app import external_api_models, models  # noqa: F401
+from app import access_models, approval_models, external_api_models, models, release_models  # noqa: F401
 from app.config import get_settings
 from app.database import Base
 

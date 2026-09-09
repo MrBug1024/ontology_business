@@ -17,7 +17,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.config import get_settings
 from app.database import Base, get_db
+from app.release_models import ReleaseLifecycleEvent
+from app.routers import scenario_releases as scenario_releases_router
+from app.services import scenario_release_service
 from app.models import (
     ActionExecutionLog,
     BusinessScenario,
@@ -46,7 +50,7 @@ from app.services import (
     release_service,
     runtime_definition_service,
 )
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, get_tenant_db
 
 
 class RuntimeDefinitionRouteTests(unittest.TestCase):
@@ -199,7 +203,6 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
             binding = connector_service.upsert_binding(
                 db,
                 self.scenario,
-                environment="staging",
                 binding_key_value="runtime-orders",
                 kind="data_source",
                 connector_id=self.source.id,
@@ -220,6 +223,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
 
         self.app = FastAPI()
         self.app.include_router(scenarios_router.router, prefix="/api")
+        self.app.include_router(scenario_releases_router.router, prefix="/api")
 
         def override_current_user():
             return SimpleNamespace(id=self.user.id, tenant_id=self.tenant.id)
@@ -235,6 +239,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
 
         self.app.dependency_overrides[get_current_user] = override_current_user
         self.app.dependency_overrides[get_db] = override_db
+        self.app.dependency_overrides[get_tenant_db] = override_db
         self.client = TestClient(self.app)
 
     def tearDown(self) -> None:
@@ -242,10 +247,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
         self.engine.dispose()
 
     def _staging_settings(self):
-        return patch(
-            "app.services.runtime_connector_service.get_settings",
-            return_value=SimpleNamespace(runtime_environment="staging"),
-        )
+        return patch.object(get_settings(), "runtime_environment", "staging")
 
     def _create_staging_release(self) -> tuple[str, str]:
         """Capture release A, then turn its mutable live rows into version B."""
@@ -267,7 +269,6 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 db,
                 scenario,
                 content,
-                environment="staging",
             )
             snapshot = OntologySnapshot(
                 id="snapshot-runtime-a",
@@ -288,7 +289,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 scenario_id=self.scenario.id,
                 branch_id=branch.id,
                 snapshot_id=snapshot.id,
-                environment="staging",
+                enabled=True,
                 status="released",
                 connector_audit=connector_audit,
                 created_by_user_id=self.user.id,
@@ -322,7 +323,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
 
         with self._staging_settings():
             action_response = self.client.post(
-                f"/api/scenarios/actions/{self.action.id}/execute",
+                f"/api/scenarios/actions/{self.action.id}/execute?release_id=release-runtime-a",
                 json={"params": {}, "dry_run": True},
             )
             self.assertEqual(action_response.status_code, 200, action_response.text)
@@ -335,7 +336,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
             self.assertEqual(action_response.json()["release_id"], release_id)
 
             workflow_response = self.client.post(
-                f"/api/scenarios/workflows/{self.workflow.id}/runs",
+                f"/api/scenarios/workflows/{self.workflow.id}/runs?release_id=release-runtime-a",
                 json={"params": {"source": "route-test"}},
             )
             self.assertEqual(workflow_response.status_code, 202, workflow_response.text)
@@ -345,7 +346,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
             self.assertEqual(workflow_response.json()["release_id"], release_id)
 
             event_response = self.client.post(
-                f"/api/scenarios/events/{self.event.id}/publish",
+                f"/api/scenarios/events/{self.event.id}/publish?release_id=release-runtime-a",
                 json={"payload": {"source": "route-test"}},
             )
             self.assertEqual(event_response.status_code, 200, event_response.text)
@@ -359,20 +360,20 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
         try:
             action_log = db.query(ActionExecutionLog).one()
             self.assertEqual(action_log.target_name, "发布版操作 A")
-            self.assertEqual(action_log.environment, "staging")
+            self.assertFalse(hasattr(action_log, "environment"))
             self.assertEqual(action_log.definition_source, "release")
             self.assertEqual(action_log.definition_snapshot_id, snapshot_id)
             self.assertEqual(action_log.release_id, release_id)
 
             manual_run = db.query(WorkflowRun).filter_by(workflow_id=self.workflow.id).one()
-            self.assertEqual(manual_run.environment, "staging")
+            self.assertFalse(hasattr(manual_run, "environment"))
             self.assertEqual(manual_run.definition_source, "release")
             self.assertEqual(manual_run.definition_snapshot_id, snapshot_id)
             self.assertEqual(manual_run.release_id, release_id)
 
             envelope = db.query(EventEnvelope).one()
             self.assertEqual(envelope.name, "发布版事件 A")
-            self.assertEqual(envelope.environment, "staging")
+            self.assertFalse(hasattr(envelope, "environment"))
             self.assertEqual(envelope.definition_source, "release")
             self.assertEqual(envelope.definition_snapshot_id, snapshot_id)
             self.assertEqual(envelope.release_id, release_id)
@@ -391,15 +392,15 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
     def test_staging_routes_fail_closed_when_the_scenario_has_no_release(self) -> None:
         with self._staging_settings():
             action_response = self.client.post(
-                f"/api/scenarios/actions/{self.action.id}/execute",
+                f"/api/scenarios/actions/{self.action.id}/execute?release_id=release-runtime-a",
                 json={"params": {}, "dry_run": True},
             )
             workflow_response = self.client.post(
-                f"/api/scenarios/workflows/{self.workflow.id}/runs",
+                f"/api/scenarios/workflows/{self.workflow.id}/runs?release_id=release-runtime-a",
                 json={"params": {}},
             )
             event_response = self.client.post(
-                f"/api/scenarios/events/{self.event.id}/publish",
+                f"/api/scenarios/events/{self.event.id}/publish?release_id=release-runtime-a",
                 json={"payload": {}},
             )
 
@@ -410,7 +411,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
         self.assertEqual(workflow_response.status_code, 409, workflow_response.text)
         self.assertEqual(event_response.status_code, 400, event_response.text)
         for response in (action_response, workflow_response, event_response):
-            self.assertIn("尚未发布", response.text)
+            self.assertIn("发布", response.text)
 
         db = self.Session()
         try:
@@ -435,12 +436,12 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
         ):
             response = self.client.delete(f"/api/scenarios/{path}/{resource_id}")
             self.assertEqual(response.status_code, 409, response.text)
-            self.assertIn("活动环境发布引用", response.json()["detail"])
+            self.assertIn("有效发布引用", response.json()["detail"])
             self.assertIn(label, response.json()["detail"])
 
         scenario_response = self.client.delete(f"/api/scenarios/{self.scenario.id}")
         self.assertEqual(scenario_response.status_code, 409, scenario_response.text)
-        self.assertIn("活动环境发布引用", scenario_response.json()["detail"])
+        self.assertIn("有效发布引用", scenario_response.json()["detail"])
 
         db = self.Session()
         try:
@@ -462,8 +463,10 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
         try:
             release = db.get(OntologyRelease, "release-runtime-a")
             self.assertIsNotNone(release)
-            release.environment = "dev"
-            db.commit()
+            db.info.update(tenant_id=self.tenant.id, user_id=self.user.id)
+            scenario_release_service.change_release(
+                db, self.scenario.id, release.id, expected_revision=release.revision, action="retire",
+            )
         finally:
             db.close()
 
@@ -482,36 +485,33 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 runtime_definition_service.RuntimeDefinitionError,
                 "已退役",
             ):
-                runtime_definition_service.resolve_active(db, scenario, environment="dev")
+                runtime_definition_service.resolve_authoring(db, scenario, )
         finally:
             db.close()
 
     def test_withdraw_and_retire_keep_staging_snapshot_read_only(self) -> None:
         snapshot_id, release_id = self._create_staging_release()
 
-        withdrawn = self.client.post(
-            f"/api/scenarios/{self.scenario.id}/releases/staging/withdraw",
-            json={"confirmed": True, "reason": "场景正式退役前撤下部署"},
+        withdrawn = self.client.patch(
+            f"/api/scenario-releases/{release_id}",
+            json={"action": "retire", "expected_revision": 1},
         )
         self.assertEqual(withdrawn.status_code, 200, withdrawn.text)
-        self.assertTrue(withdrawn.json()["changed"])
-        self.assertEqual(withdrawn.json()["withdrawn_release_ids"], [release_id])
-        self.assertEqual(withdrawn.json()["withdrawn_by_user_id"], self.user.id)
+        self.assertEqual(withdrawn.json()["status"], "retired")
+        self.assertEqual(withdrawn.json()["revision"], 2)
 
-        replay = self.client.post(
-            f"/api/scenarios/{self.scenario.id}/releases/staging/withdraw",
-            json={"confirmed": True, "reason": "重复请求不得重写第一次审计"},
+        replay = self.client.patch(
+            f"/api/scenario-releases/{release_id}",
+            json={"action": "retire", "expected_revision": 1},
         )
-        self.assertEqual(replay.status_code, 200, replay.text)
-        self.assertFalse(replay.json()["changed"])
-        self.assertEqual(replay.json()["reason"], "场景正式退役前撤下部署")
+        self.assertEqual(replay.status_code, 409, replay.text)
 
         retired = self.client.delete(f"/api/scenarios/{self.scenario.id}")
         self.assertEqual(retired.status_code, 200, retired.text)
 
         with self._staging_settings():
             detail = self.client.get(
-                f"/api/scenarios/{self.scenario.id}?include_runtime_facts=false"
+                f"/api/scenarios/{self.scenario.id}?include_runtime_facts=false&release_id={release_id}"
             )
             self.assertEqual(detail.status_code, 200, detail.text)
             self.assertEqual(detail.json()["status"], "retired")
@@ -530,7 +530,7 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
             )
 
             blocked_execution = self.client.post(
-                f"/api/scenarios/actions/{self.action.id}/execute",
+                f"/api/scenarios/actions/{self.action.id}/execute?release_id=release-runtime-a",
                 json={"params": {}, "dry_run": True},
             )
             self.assertEqual(
@@ -546,10 +546,11 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
             db.info["user_id"] = self.user.id
             scenario = db.get(BusinessScenario, self.scenario.id)
             release = db.get(OntologyRelease, release_id)
-            self.assertEqual(release.status, "rolled_back")
-            self.assertIsNotNone(release.withdrawn_at)
-            self.assertEqual(release.withdrawn_by_user_id, self.user.id)
-            self.assertEqual(release.withdraw_reason, "场景正式退役前撤下部署")
+            self.assertEqual(release.status, "retired")
+            self.assertIsNotNone(release.retired_at)
+            event = db.query(ReleaseLifecycleEvent).filter_by(release_id=release_id, action="retire").one()
+            self.assertEqual(event.actor_id, self.user.id)
+            self.assertEqual(event.revision, 2)
             with self.assertRaisesRegex(
                 runtime_definition_service.RuntimeDefinitionError,
                 "已退役",
@@ -557,12 +558,9 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 runtime_definition_service.resolve_active(
                     db,
                     scenario,
-                    environment="staging",
                 )
             history = runtime_definition_service.resolve_retired_history(
-                db,
-                scenario,
-                environment="staging",
+                db, scenario, release_id=release_id,
             )
             self.assertEqual(history.snapshot_id, snapshot_id)
             self.assertEqual(history.release_id, release_id)
@@ -573,9 +571,9 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
 
     def test_every_governance_write_rejects_a_retired_scenario(self) -> None:
         snapshot_id, _release_id = self._create_staging_release()
-        withdrawn = self.client.post(
-            f"/api/scenarios/{self.scenario.id}/releases/staging/withdraw",
-            json={"confirmed": True, "reason": "为退役治理边界测试撤下"},
+        withdrawn = self.client.patch(
+            f"/api/scenario-releases/{_release_id}",
+            json={"action": "retire", "expected_revision": 1},
         )
         self.assertEqual(withdrawn.status_code, 200, withdrawn.text)
 
@@ -635,7 +633,6 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                 lambda: release_service.publish_snapshot(
                     db,
                     self.scenario.id,
-                    environment="staging",
                     confirmed=True,
                     snapshot_id=snapshot_id,
                 ),
@@ -644,14 +641,9 @@ class RuntimeDefinitionRouteTests(unittest.TestCase):
                     self.scenario.id,
                     target_snapshot_id=snapshot_id,
                     confirmed=True,
-                    environment="staging",
                 ),
-                lambda: release_service.withdraw_environment(
-                    db,
-                    self.scenario.id,
-                    environment="staging",
-                    confirmed=True,
-                    reason="不得改写退役发布",
+                lambda: scenario_release_service.change_release(
+                    db, self.scenario.id, _release_id, expected_revision=2, action="enable",
                 ),
             )
             for write in blocked_writes:

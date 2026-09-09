@@ -88,7 +88,6 @@ def _database(session_factory):
 def _payload(*, message: str = "请分析本次资料") -> ChatRequest:
     return ChatRequest(
         message=message,
-        environment="dev",
         inputs={"sensitive_field": "must-not-be-plaintext"},
         idempotency_key="turn-request-1",
     )
@@ -310,7 +309,8 @@ def test_durable_final_message_rolls_back_if_run_finalization_crashes(
     with _database(turn_database) as db:
         run = db.get(AgentTurnRun, queued["id"])
         assistant = db.get(Message, queued["assistant_message_id"])
-        assert run.status == "invoking_tools"
+        assert run.status == "responding"
+        assert run.result_document["answer"] == "原子完成"
         assert assistant.stream_finalized is False
         assert assistant.tool_results == []
         assert assistant.content == "正在准备受控工具调用。"
@@ -730,7 +730,6 @@ def test_http_accepts_immediately_and_sse_resumes_from_persistent_revision(
             "/api/agents/turn-agent/turns",
             json={
                 "message": "立即受理",
-                "environment": "dev",
                 "idempotency_key": "http-turn-1",
             },
         )
@@ -792,7 +791,7 @@ def test_legacy_chat_is_a_durable_sse_observer_without_inline_llm(
     ):
         response = client.post(
             "/api/agents/turn-agent/chat",
-            json={"message": "兼容入口立即落库", "environment": "dev"},
+            json={"message": "兼容入口立即落库"},
         )
 
     assert response.status_code == 200

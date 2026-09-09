@@ -102,6 +102,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { useAuthStore } from '@/stores/auth'
+import { safeInternalReturnPath } from '@/utils/navigation'
 
 type AuthMode = 'login' | 'register' | 'verify' | 'forgot' | 'reset'
 const route = useRoute()
@@ -137,7 +138,7 @@ async function submit() {
   try {
     if (mode.value === 'login') {
       await auth.login(email.value, password.value)
-      await router.replace(String(route.query.redirect || '/scenarios'))
+      await router.replace(safeInternalReturnPath(route.query.redirect))
     } else if (mode.value === 'register') {
       await api.register({ email: email.value, password: password.value, password_confirm: passwordConfirm.value, display_name: displayName.value })
       mode.value = 'verify'

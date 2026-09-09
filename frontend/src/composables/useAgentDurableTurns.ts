@@ -1,6 +1,7 @@
 import { computed, onBeforeUnmount, reactive, ref, type ComputedRef, type Ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamAgentTurn } from '@/api'
+import { applyAgentTurnEvent } from '@/utils/agentTurnProgress'
 import type {
   AgentChatRequest,
   AgentTurnEvent,
@@ -176,6 +177,11 @@ export function useAgentDurableTurns(options: AgentDurableTurnOptions): AgentDur
     assistant.streaming = !isTerminalTurn(run.status)
     assistant.status = TURN_STATUS_LABELS[run.status]
     applyTurnResult(run.result || {}, assistant)
+    const inputSnapshot = run.result?.input_snapshot
+    if (inputSnapshot && typeof inputSnapshot === 'object' && !Array.isArray(inputSnapshot)) {
+      const userMessage = options.messages.value.find(message => message.id === run.user_message_id)
+      if (userMessage) userMessage.input_snapshot = inputSnapshot as Record<string, unknown>
+    }
     if (run.status === 'failed' && !assistant.content) {
       assistant.content = streamErrorContent('', run.error?.message || '后台处理失败')
     } else if (run.status === 'cancelled') {
@@ -207,14 +213,8 @@ export function useAgentDurableTurns(options: AgentDurableTurnOptions): AgentDur
     if (!isTurnSubscriptionCurrent(runId, subscription, scope)) return
     const currentTurn = activeTurns.value.get(runId)
     if (!currentTurn || event.revision <= currentTurn.revision) return
-    const nextStatus = event.data.status || event.type
-    const nextRun: AgentTurnRun = {
-      ...currentTurn,
-      status: nextStatus,
-      revision: event.revision,
-      result: event.data.result || currentTurn.result,
-      error: event.data.error || currentTurn.error,
-    }
+    const nextRun = applyAgentTurnEvent(currentTurn, event)
+    const nextStatus = nextRun.status
     if (isTerminalTurn(nextStatus)) activeTurns.value.delete(runId)
     else activeTurns.value.set(runId, nextRun)
     const assistant = findTurnMessage(runId, nextRun.assistant_message_id)

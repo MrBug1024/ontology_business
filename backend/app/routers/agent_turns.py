@@ -227,7 +227,6 @@ def legacy_chat(
             db,
             agent_id,
             conversation_id=payload.conversation_id,
-            environment=payload.environment,
         )
         accepted_payload = payload
         if not payload.idempotency_key:
@@ -455,9 +454,12 @@ def stream_agent_turn_events(
                     separators=(",", ":"),
                 )
                 yield f"id: {revision}\ndata: {payload}\n\n"
-            if current["status"] in agent_turn_service.TERMINAL_STATUSES:
+            if (current["status"] in agent_turn_service.TERMINAL_STATUSES
+                and revision >= int(current["revision"])):
                 yield "data: [DONE]\n\n"
                 return
+            if events and revision < int(current["revision"]):
+                continue
             if time.monotonic() - keepalive_at >= 15:
                 keepalive_at = time.monotonic()
                 yield ": keepalive\n\n"

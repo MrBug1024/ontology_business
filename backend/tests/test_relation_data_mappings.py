@@ -362,14 +362,12 @@ def _refresh(
     mapping: DataMapping,
     *,
     relation_mappings=None,
-    environment: str = "dev",
 ) -> dict:
     return ontology_service.import_instances_from_mapping(
         world.db,
         world.scenario,
         mapping,
         data_source=world.data_source,
-        environment=environment,
         relation_mappings=relation_mappings,
         mapping_connector_audits=_connector_audits(world),
         relation_connector_audits=(
@@ -383,10 +381,8 @@ def _refresh(
             else {}
         ),
         definition_provenance={
-            "snapshot_id": "snapshot-1",
-            "release_id": "release-1",
             "definition_hash": "definition-hash-1",
-            "source": "release" if environment != "dev" else "live",
+            "source": "live",
         },
     )
 
@@ -416,7 +412,8 @@ def test_fk_refresh_order_converges_and_applies_endpoint_key_transforms(
         assert target.source_metadata["record_key"] == "7"
         assert source.name == "0"
         assert target.name == "目标七"
-        assert links[0].source_metadata["definition_snapshot_id"] == "snapshot-1"
+        assert links[0].source_metadata["definition_snapshot_id"] is None
+        assert links[0].source_metadata["definition_source"] == "live"
         assert links[0].source_metadata["definition_hash"] == "definition-hash-1"
         assert links[0].source_metadata["connector_ref"]["connector_id"] == world.data_source.id
 
@@ -533,7 +530,6 @@ def test_relation_mapping_crud_materializes_healthy_join_binding(tmp_path) -> No
         binding = world.db.scalar(
             select(ConnectorBinding).where(
                 ConnectorBinding.scenario_id == world.scenario.id,
-                ConnectorBinding.environment == "dev",
                 ConnectorBinding.binding_key
                 == stored_mapping.data_source_binding_key,
             )
@@ -614,7 +610,7 @@ def _frozen_mapping(mapping: DataMapping, entity: OntologyEntity | None) -> Simp
     return frozen
 
 
-def test_frozen_import_requires_snapshot_entity_and_keeps_environments_isolated(tmp_path) -> None:
+def test_frozen_import_requires_snapshot_entity_and_preserves_logical_object_identity(tmp_path) -> None:
     world = _world(tmp_path, mode="source_fk")
     try:
         missing_entity = _frozen_mapping(world.source_mapping, None)
@@ -624,7 +620,6 @@ def test_frozen_import_requires_snapshot_entity_and_keeps_environments_isolated(
                 world.scenario,
                 missing_entity,
                 data_source=world.data_source,
-                environment="staging",
                 relation_mappings=[],
             )
 
@@ -643,18 +638,18 @@ def test_frozen_import_requires_snapshot_entity_and_keeps_environments_isolated(
             world.scenario,
             source_frozen,
             data_source=world.data_source,
-            environment="staging",
             relation_mappings=[],
             definition_provenance=staging_provenance,
+            runtime_mappings={source_frozen.id: source_frozen, target_frozen.id: target_frozen},
         )
         ontology_service.import_instances_from_mapping(
             world.db,
             world.scenario,
             target_frozen,
             data_source=world.data_source,
-            environment="staging",
             relation_mappings=[],
             definition_provenance=staging_provenance,
+            runtime_mappings={source_frozen.id: source_frozen, target_frozen.id: target_frozen},
         )
         relation_frozen = SimpleNamespace(
             **{
@@ -680,7 +675,6 @@ def test_frozen_import_requires_snapshot_entity_and_keeps_environments_isolated(
             world.scenario,
             source_frozen,
             data_source=world.data_source,
-            environment="staging",
             relation_mappings=[relation_frozen],
             mapping_data_sources={
                 source_frozen.id: world.data_source,
@@ -697,21 +691,13 @@ def test_frozen_import_requires_snapshot_entity_and_keeps_environments_isolated(
         imported = world.db.scalars(
             select(OntologyInstance).where(OntologyInstance.source == "imported")
         ).all()
-        assert len(imported) == 4
-        dev_objects = [
-            item
-            for item in imported
-            if ontology_service.instance_in_runtime_environment(item, "dev")
-        ]
-        staging_objects = [
-            item
-            for item in imported
-            if ontology_service.instance_in_runtime_environment(item, "staging")
-        ]
-        assert len(dev_objects) == len(staging_objects) == 2
+        assert len(imported) == 2
+        assert all("runtime_environment" not in item.source_metadata for item in imported)
+        assert all(item.source_metadata["release_id"] == "release-1" for item in imported)
         links = world.db.scalars(select(RelationInstance)).all()
         assert len(links) == 1
-        assert links[0].source_metadata["runtime_environment"] == "staging"
+        assert "runtime_environment" not in links[0].source_metadata
+        assert links[0].source_metadata["release_id"] == "release-1"
 
     finally:
         _close_world(world)
@@ -885,16 +871,16 @@ def test_release_title_normalization_fk_binding_and_runtime_hash(tmp_path) -> No
         with pytest.raises(release_service.ReleaseValidationError, match="承载侧"):
             release_service.normalize_snapshot_content(bad)
 
-        definition_before = runtime_definition_service.resolve_active(
-            world.db, world.scenario, environment="dev"
+        definition_before = runtime_definition_service.resolve_authoring(
+            world.db, world.scenario,
         )
         relation_fingerprint_before = mapping_refresh_service.relation_mapping_fingerprint(
             definition_before, world.source_mapping.id
         )
         world.relation_mapping.data_source_binding_key = "updated-binding"
         world.db.commit()
-        definition_after = runtime_definition_service.resolve_active(
-            world.db, world.scenario, environment="dev"
+        definition_after = runtime_definition_service.resolve_authoring(
+            world.db, world.scenario,
         )
         assert definition_before.definition_hash != definition_after.definition_hash
         assert relation_fingerprint_before != mapping_refresh_service.relation_mapping_fingerprint(
@@ -1027,7 +1013,7 @@ def test_scenario_reads_hide_retired_mapping_and_release_facts(tmp_path) -> None
         world.db.commit()
         definition = SimpleNamespace(
             scenario=world.scenario,
-            environment="staging",
+            is_frozen=True,
             source="release",
             snapshot_id="snapshot-current",
             release_id="release-current",

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -38,6 +39,7 @@ from ..schemas import (
 )
 from ..services import (
     agent_capability_service,
+    agent_channel_reply_service,
     agent_confirmation_service,
     agent_engine,
     agent_migration_service,
@@ -210,7 +212,6 @@ def _sync_runtime_connections(
             binding = connector_service.upsert_binding(
                 db,
                 scenario,
-                environment="dev",
                 binding_key_value=f"agent:{agent.id}:database:{source.id}",
                 kind="data_source",
                 connector_id=source.id,
@@ -490,7 +491,7 @@ def _authorization_context(
     llm: LLMConfig | None = None,
     *,
     turn_input: agent_runtime_adapter.AgentTurnInput | None = None,
-    environment: str = "dev",
+    release_id: str | None = None,
 ) -> Any | None:
     """Build the exact current runtime/ACL view used for historic replay."""
     try:
@@ -499,7 +500,7 @@ def _authorization_context(
             agent,
             llm or LLMConfig(name="历史权限校验"),
             turn_input=turn_input,
-            environment=environment,
+            release_id=release_id,
         )
     except Exception:  # noqa: BLE001 - missing release/binding must fail closed.
         return None
@@ -766,10 +767,9 @@ def _out(a: Agent, db: Session) -> AgentOut:
         definition_error = "尚未绑定业务场景"
     else:
         try:
-            definition = runtime_definition_service.resolve_active(
+            definition = runtime_definition_service.resolve_authoring(
                 db,
                 scenario,
-                environment=runtime_connector_service.runtime_environment(),
             )
         except (runtime_definition_service.RuntimeDefinitionError, ValueError) as exc:
             definition_error = str(exc) or "当前环境运行定义不可用"
@@ -872,10 +872,9 @@ def _validate_bindings(
                 definition=None,
             )
         elif needs_capability_definition:
-            definition = runtime_definition_service.resolve_active(
+            definition = runtime_definition_service.resolve_authoring(
                 db,
                 scenario,
-                environment=runtime_connector_service.runtime_environment(),
             )
             capability_scope = agent_capability_service.validate_scope(
                 db,
@@ -896,6 +895,7 @@ def _validate_bindings(
 def get_agent_capability_catalog(
     scenario_id: str,
     db: Session = Depends(get_tenant_db),
+    release_id: str | None = None,
 ):
     """Return only capabilities readable by the current principal.
 
@@ -905,16 +905,15 @@ def get_agent_capability_catalog(
     scenario = tenant_service.require_scenario(db, scenario_id)
     permission_service.require_scenario_permission(db, scenario, "read")
     try:
-        definition = runtime_definition_service.resolve_active(
+        definition = runtime_definition_service.resolve_requested(
             db,
             scenario,
-            environment=runtime_connector_service.runtime_environment(),
+            release_id=release_id,
         )
     except (runtime_definition_service.RuntimeDefinitionError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from exc
     return {
         "scenario_id": scenario.id,
-        "environment": definition.environment,
         "definition_hash": definition.definition_hash,
         "categories": agent_capability_service.catalog_summary(db, definition),
     }
@@ -933,7 +932,6 @@ def get_agent_runtime_capabilities(
             db,
             agent,
             LLMConfig(name="能力契约发现"),
-            environment=runtime_connector_service.runtime_environment(),
         )
     except agent_runtime_adapter.AgentRuntimeAdapterError as exc:
         raise HTTPException(
@@ -1181,7 +1179,6 @@ def confirm_agent_tool_preview(
             agent=agent,
             conversation=conversation,
             correlation_id=payload.correlation_id,
-            expected_environment=payload.expected_environment,
             expected_definition_snapshot_id=payload.expected_definition_snapshot_id,
             expected_release_id=payload.expected_release_id,
             expected_definition_hash=payload.expected_definition_hash,
@@ -1208,13 +1205,14 @@ def invoke_agent_once(
     attachments: list[Any] | None = None,
     capability: dict[str, Any] | None = None,
     idempotency_key: str | None = None,
-    environment: str = "dev",
+    release_id: str | None = None,
     user_message_id: str | None = None,
     assistant_message_id: str | None = None,
     turn_run_id: str | None = None,
     turn_lease_token: str | None = None,
     turn_lease_generation: int | None = None,
     defer_terminal_commit: bool | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run one durable Agent turn for a non-browser transport.
 
@@ -1232,7 +1230,7 @@ def invoke_agent_once(
             "attachments": attachments or [],
             "capability": capability,
             "idempotency_key": idempotency_key,
-            "environment": environment,
+            "release_id": release_id,
         }
     )
     durable_turn = bool(turn_run_id)
@@ -1252,7 +1250,7 @@ def invoke_agent_once(
         db,
         a,
         turn_input=turn_input,
-        environment=payload.environment,
+        release_id=payload.release_id,
     )
     if runtime_context is None:
         raise HTTPException(409, "Agent 当前运行定义、发布快照或环境连接器不完整，已阻止对话")
@@ -1422,7 +1420,11 @@ def invoke_agent_once(
     citations: list[dict[str, Any]] = []
     evidence_refs: list[dict[str, Any]] = []
     try:
-        for event in agent_engine.run_agent(
+        interaction = agent_channel_reply_service.handle_message(
+            db, a, conv.id, message, str(user_message.id), payload.attachments, runtime_context,
+            before_apply=prepare_execution_boundary,
+        )
+        events = agent_channel_reply_service.reply_events(interaction, str(user_message.id)) if interaction is not None else agent_engine.run_agent(
             db,
             a,
             llm,
@@ -1433,10 +1435,13 @@ def invoke_agent_once(
             trace_context=trace_context,
             runtime_context=runtime_context,
             before_llm_call=prepare_execution_boundary if turn_run_id else None,
-        ):
+        )
+        for event in events:
             event_type = event["type"]
             data = event.get("data")
-            if event_type == "token":
+            if event_type == "response_start":
+                content = ""
+            elif event_type == "token":
                 content += str(data or "")
             elif event_type == "tool_call" and isinstance(data, dict):
                 prepare_execution_boundary()
@@ -1448,6 +1453,8 @@ def invoke_agent_once(
                 citations = data
             elif event_type == "evidence_refs" and isinstance(data, list):
                 evidence_refs = data
+            if on_event is not None:
+                on_event(event)
         prepare_execution_boundary()
         assistant_message.content = content
         assistant_message.tool_calls = tool_calls
@@ -1513,7 +1520,6 @@ def invoke_agent_once(
         "tool_calls": tool_calls,
         "tool_results": tool_results,
         "runtime": {
-            "environment": definition.environment if definition else "",
             "definition_snapshot_id": definition.snapshot_id if definition else None,
             "release_id": definition.release_id if definition else None,
             "definition_hash": definition.definition_hash if definition else "",

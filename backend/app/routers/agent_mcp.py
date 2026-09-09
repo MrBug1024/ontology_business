@@ -76,7 +76,6 @@ def _out(db: Session, service: AgentMCPService, endpoint_url: str) -> AgentMCPSe
         token_hint=service.token_hint,
         expires_at=service.expires_at,
         last_used_at=service.last_used_at,
-        runtime_environment=service.runtime_environment,
         definition_hash=service.definition_hash,
         created_at=service.created_at,
         updated_at=service.updated_at,
@@ -144,7 +143,7 @@ def create_service(
 ) -> AgentMCPServiceCreatedOut:
     principal = _principal(db)
     agent, context, missing = agent_mcp_service.validate_agent_runtime(
-        db, payload.agent_id, writable=True
+        db, payload.agent_id, writable=True, release_id=payload.release_id,
     )
     if context is None or missing:
         raise HTTPException(409, "Agent 尚未就绪，请先完成：" + "、".join(missing))
@@ -168,7 +167,6 @@ def create_service(
         definition_snapshot_id=definition.snapshot_id,
         release_id=definition.release_id,
         definition_hash=definition.definition_hash,
-        runtime_environment=definition.environment,
     )
     db.add(service)
     try:
@@ -211,7 +209,7 @@ def rotate_token(
     _principal(db)
     service = _owned_service(db, service_id)
     agent, context, missing = agent_mcp_service.validate_agent_runtime(
-        db, service.agent_id, writable=True
+        db, service.agent_id, writable=True, release_id=service.release_id,
     )
     if context is None or missing:
         raise HTTPException(409, "Agent 尚未就绪，请先完成：" + "、".join(missing))
@@ -227,7 +225,6 @@ def rotate_token(
     service.definition_snapshot_id = definition.snapshot_id
     service.release_id = definition.release_id
     service.definition_hash = definition.definition_hash
-    service.runtime_environment = definition.environment
     service.enabled = True
     db.commit()
     db.refresh(service)
@@ -250,7 +247,6 @@ def test_service(
         ok=True,
         message="发布配置有效，第三方可以通过 invoke_agent 调用完整 Agent 能力",
         agent_name=agent.name,
-        runtime_environment=service.runtime_environment,
         definition_hash=service.definition_hash,
     )
 

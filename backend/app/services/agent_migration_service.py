@@ -31,14 +31,12 @@ from .capability_contracts import canonical_hash, canonical_json
 MIGRATION_CONTRACT = "agent-capability-migration/v2"
 _MODES = ("legacy", "shadow", "prefer_capability", "capability_only")
 _TARGET_MODE = "capability_only"
-_TARGET_ENVIRONMENT = "dev"
 _READINESS_AXES = ("definition", "validation", "release", "runtime")
 _PLAN_DIGEST = canonical_hash(
     {
         "contract": MIGRATION_CONTRACT,
         "source_modes": list(_MODES[:-1]),
         "target_mode": _TARGET_MODE,
-        "environment": _TARGET_ENVIRONMENT,
         "required_readiness_axes": list(_READINESS_AXES),
     },
     domain="agent-capability-migration-plan-v2",
@@ -121,7 +119,6 @@ def _new_run(tenant_id: str, name: str) -> PlatformMigrationRun:
             "tenant_id": tenant_id,
             "cutover": {
                 "target_mode": _TARGET_MODE,
-                "environment": _TARGET_ENVIRONMENT,
                 "required_readiness_axes": list(_READINESS_AXES),
             },
         },
@@ -300,7 +297,6 @@ def evaluate_migration_gate(
         agent_readiness_service.compute_agent_readiness(
             db,
             agent,
-            environment=_TARGET_ENVIRONMENT,
             runtime_binding_mode=_TARGET_MODE,
         )
     )
@@ -325,14 +321,13 @@ def evaluate_migration_gate(
                 }
             )
     fingerprint = canonical_hash(
-        {"environment": _TARGET_ENVIRONMENT, "readiness": readiness},
+        { "readiness": readiness},
         domain="agent-capability-cutover-readiness-v1",
     )
     return {
         "contract": "agent-capability-cutover-gate/v1",
         "passed": not reasons,
         "target_mode": _TARGET_MODE,
-        "environment": _TARGET_ENVIRONMENT,
         "required_axes": list(_READINESS_AXES),
         "readiness": readiness,
         "readiness_fingerprint": fingerprint,
@@ -482,7 +477,6 @@ def change_agent_mode(
         "outcome": outcome,
         "reason": normalized_reason,
         "actor_id": str(db.info.get("user_id") or ""),
-        "environment": gate["environment"],
         "readiness": gate["readiness"],
         "readiness_fingerprint": gate["readiness_fingerprint"],
         "request_hash": request_hash,

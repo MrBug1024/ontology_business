@@ -138,10 +138,7 @@
             <div><dt>审批节点</dt><dd>{{ activeApproval.node_name || activeApproval.node_id }}</dd></div>
             <div><dt>发起时间</dt><dd>{{ formatDate(activeApproval.requested_at) }}</dd></div>
           </dl>
-          <div v-if="canApprove(selectedTask)" class="approval-actions">
-            <el-button type="danger" plain :loading="approvalSubmitting" @click="requestApproval('reject')">驳回</el-button>
-            <el-button type="primary" :loading="approvalSubmitting" @click="requestApproval('approve')">批准并继续</el-button>
-          </div>
+          <WorkflowApprovalReply v-if="canApprove(selectedTask) && activeApproval" :key="activeApproval.id" :approval="activeApproval" @completed="approvalCompleted" />
           <p v-else class="approval-readonly-hint" role="status">当前账号仅可查看审批上下文，没有审批权限。</p>
         </section>
 
@@ -160,6 +157,7 @@
           <StructuredValueViewer :value="selectedTask.input_params" empty-text="无需输入参数" />
         </section>
         <section v-if="selectedTask.result && Object.keys(selectedTask.result).length" class="detail-section">
+          <WorkflowArtifactDownloads :result="selectedTask.result" />
           <h4>执行结果</h4>
           <StructuredValueViewer :value="selectedTask.result" empty-text="暂无执行结果" />
         </section>
@@ -180,6 +178,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import type { Scenario, WorkflowApproval, WorkflowRun } from '@/types'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
+import WorkflowArtifactDownloads from '@/components/WorkflowArtifactDownloads.vue'
+import WorkflowApprovalReply from '@/components/workflow/WorkflowApprovalReply.vue'
 
 type StatusTagType = 'success' | 'warning' | 'danger' | 'info' | 'primary' | ''
 type StatusMeta = { label: string; type: StatusTagType; description: string }
@@ -191,7 +191,6 @@ const approvals = ref<WorkflowApproval[]>([])
 const scenarios = ref<Scenario[]>([])
 const loading = ref(false)
 const detailLoading = ref(false)
-const approvalSubmitting = ref(false)
 const retrySubmitting = ref(false)
 const cancellingTaskId = ref<string | null>(null)
 const taskDrawer = ref(false)
@@ -369,38 +368,9 @@ async function showTask(id: string, syncRoute = true) {
     detailLoading.value = false
   }
 }
-async function requestApproval(decision: 'approve' | 'reject') {
-  const task = selectedTask.value
-  if (!task || !canApprove(task)) {
-    ElMessage.warning('当前账号没有审批此任务的权限')
-    return
-  }
-  const isApprove = decision === 'approve'
-  try {
-    const { value } = await ElMessageBox.prompt(
-      isApprove ? '可选：记录本次批准意见。' : '请说明驳回原因，方便发起人修正后重新提交。',
-      isApprove ? '批准任务' : '驳回任务',
-      {
-        inputType: 'textarea',
-        inputPlaceholder: isApprove ? '审批意见（可选）' : '请输入驳回原因',
-        inputValidator: isApprove ? undefined : (input: string) => input.trim() ? true : '请输入驳回原因',
-        confirmButtonText: isApprove ? '批准并继续' : '确认驳回',
-        cancelButtonText: '取消',
-        type: isApprove ? 'warning' : 'error',
-      },
-    )
-    approvalSubmitting.value = true
-    const updatedTask = isApprove
-      ? await api.approveTask(task.id, value || '')
-      : await api.rejectTask(task.id, value || '')
-    updateTask(updatedTask)
-    await loadApprovals()
-    ElMessage.success(isApprove ? '任务已批准，正在继续执行' : '任务已驳回')
-  } catch (error: any) {
-    if (!isCancelled(error)) ElMessage.error(error?.message || '审批操作失败')
-  } finally {
-    approvalSubmitting.value = false
-  }
+async function approvalCompleted(runId: string) {
+  await loadApprovals()
+  if (selectedTask.value?.id === runId) await showTask(runId, false)
 }
 async function retryTask(task: WorkflowRun) {
   if (!canRetry(task)) {

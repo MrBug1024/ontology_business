@@ -214,11 +214,12 @@ class AgentCapabilityScopeTests(unittest.TestCase):
         self.db.close()
         self.engine.dispose()
 
-    def _runtime(self, agent: Agent) -> agent_runtime_adapter.CapabilityAgentRuntime:
+    def _runtime(self, agent: Agent, release_id: str | None = None) -> agent_runtime_adapter.CapabilityAgentRuntime:
         return agent_runtime_adapter.build_runtime_context(
             self.db,
             agent,
             LLMConfig(name="工具模型"),
+            release_id=release_id,
         )
 
     def test_new_agents_use_empty_capability_runtime_but_legacy_rows_remain_readable(self) -> None:
@@ -359,8 +360,8 @@ class AgentCapabilityScopeTests(unittest.TestCase):
         all_scope["functions"] = {"mode": "all", "selected_ids": []}
         with patch.object(
             agents_router.runtime_definition_service,
-            "resolve_active",
-            side_effect=runtime_definition_service.RuntimeDefinitionError("staging 尚未发布"),
+            "resolve_authoring",
+            side_effect=runtime_definition_service.RuntimeDefinitionError("场景定义不可解析"),
         ):
             with self.assertRaises(HTTPException) as error:
                 agents_router.create_agent(
@@ -372,7 +373,7 @@ class AgentCapabilityScopeTests(unittest.TestCase):
                     self.db,
                 )
         self.assertEqual(error.exception.status_code, 409)
-        self.assertIn("尚未发布", str(error.exception.detail))
+        self.assertIn("场景定义不可解析", str(error.exception.detail))
 
     def test_cross_scenario_and_hidden_ids_are_rejected_without_leaking_identity(self) -> None:
         with self.assertRaises(HTTPException) as cross_error:
@@ -458,7 +459,7 @@ class AgentCapabilityScopeTests(unittest.TestCase):
             scenario_id=self.scenario.id,
             branch_id=branch.id,
             snapshot_id=snapshot.id,
-            environment="staging",
+            enabled=True,
             status="released",
             created_by_user_id=self.owner.id,
         )
@@ -486,12 +487,9 @@ class AgentCapabilityScopeTests(unittest.TestCase):
         self.db.add_all([live_only, agent])
         self.db.commit()
 
-        settings = SimpleNamespace(runtime_environment="staging")
-        with patch(
-            "app.services.runtime_connector_service.get_settings",
-            return_value=settings,
-        ):
-            runtime = self._runtime(agent)
+        from app.config import get_settings
+        with patch.object(get_settings(), "runtime_environment", "staging"):
+            runtime = self._runtime(agent, release_id=release.id)
             self.assertEqual(
                 [
                     item["name"]
@@ -500,17 +498,16 @@ class AgentCapabilityScopeTests(unittest.TestCase):
                 ],
                 [frozen_name],
             )
-            catalog = agents_router.get_agent_capability_catalog(self.scenario.id, self.db)
+            catalog = agents_router.get_agent_capability_catalog(self.scenario.id, self.db, release_id=release.id)
             catalog_ids = {item["id"] for item in catalog["categories"]["functions"]}
             self.assertIn(self.function_a.id, catalog_ids)
             self.assertNotIn(live_only.id, catalog_ids)
-            with self.assertRaises(HTTPException) as live_only_error:
-                agents_router.create_agent(
-                    AgentIn(
-                        name="不可越过发布边界",
-                        scenario_id=self.scenario.id,
-                        capability_scope=_scope("functions", live_only.id),
-                    ),
-                    self.db,
-                )
-            self.assertEqual(live_only_error.exception.status_code, 400)
+            created = agents_router.create_agent(
+                AgentIn(
+                    name="当前定义验证",
+                    scenario_id=self.scenario.id,
+                    capability_scope=_scope("functions", live_only.id),
+                ),
+                self.db,
+            )
+            self.assertEqual(created.capability_scope.functions.selected_ids, [live_only.id])

@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import select, text, update
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -35,6 +35,8 @@ from . import (
     runtime_connector_service,
     runtime_definition_service,
     workflow_payload_service,
+    workflow_approval_resume,
+    workflow_approval_policy,
 )
 from .policies import PolicyViolation, validate_action_params
 
@@ -129,6 +131,7 @@ def validate_approval_nodes(
         if step.get("type") == "approval":
             definitions.append(step)
     for definition in definitions:
+        workflow_approval_policy.audience(definition)
         _bounded_int(
             definition.get("timeout_seconds"),
             default=APPROVAL_TIMEOUT_DEFAULT_SECONDS,
@@ -257,18 +260,14 @@ def _is_active(workflow: OntologyWorkflow) -> bool:
     return bool(workflow.enabled) and (workflow.status or "draft") == "active"
 
 
-def _scoped_dedupe_key(key: str | None, environment: str) -> str | None:
-    """Keep durable event/workflow dedupe isolated per deployment environment."""
+def _scoped_dedupe_key(key: str | None) -> str | None:
+    """Bound a caller key; tenant and resource scope are enforced by storage."""
     if not key:
         return None
-    scoped = f"{environment}:{key}"
-    if len(scoped) <= 180:
-        return scoped
-    # Input schemas cap external keys at 180; this fallback preserves a stable
-    # scope for internal/legacy callers without relying on a lossy truncation.
+    if len(key) <= 180:
+        return key
     import hashlib
-
-    return f"{environment}:sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+    return f"sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
 
 
 def _definition_for_workflow(
@@ -283,12 +282,11 @@ def _definition_for_workflow(
     )
     if not scenario:
         raise PolicyViolation("工作流所属场景不存在")
-    resolved = definition or runtime_definition_service.resolve_active(
+    resolved = definition or runtime_definition_service.resolve_authoring(
         db,
         scenario,
-        environment="dev",
     )
-    if resolved.scenario.id != scenario.id:
+    if resolved.scenario.id != scenario.id or resolved.scenario.tenant_id != scenario.tenant_id:
         raise PolicyViolation("运行定义不属于工作流业务场景")
     try:
         frozen_workflow = runtime_definition_service.resolve_resource(
@@ -392,8 +390,6 @@ def _eligible_workflow_creator(
 def _automation_creator_for_workflow(
     db: Session,
     workflow: Any,
-    *,
-    environment: str | None = None,
 ) -> str | None:
     """Find an explicitly attributable actor for schedule/event automation.
 
@@ -414,11 +410,6 @@ def _automation_creator_for_workflow(
         .where(
             WorkflowRun.workflow_id == workflow.id,
             WorkflowRun.created_by_user_id.is_not(None),
-            *(
-                [WorkflowRun.environment == environment]
-                if environment
-                else []
-            ),
         )
         .order_by(WorkflowRun.created_at.desc())
     ).scalars().all()
@@ -491,8 +482,6 @@ def _run_principal_error(
 def _has_unresolved_automation_principal_block(
     db: Session,
     workflow: Any,
-    *,
-    environment: str | None = None,
 ) -> bool:
     """Avoid creating one failed audit row per scheduling interval.
 
@@ -507,11 +496,6 @@ def _has_unresolved_automation_principal_block(
                 WorkflowRun.workflow_id == workflow.id,
                 WorkflowRun.status == "failed",
                 WorkflowRun.error.like(f"{AUTOMATION_PRINCIPAL_BLOCK_MARKER}%"),
-                *(
-                    [WorkflowRun.environment == environment]
-                    if environment
-                    else []
-                ),
             )
             .limit(1)
         ).scalar_one_or_none()
@@ -543,7 +527,8 @@ def enqueue_workflow_run(
         if not decision.allowed:
             raise PolicyViolation("没有提交该工作流的权限")
     policy = runtime_policy(workflow.trigger_config or {})
-    scoped_dedupe_key = _scoped_dedupe_key(dedupe_key, definition.environment)
+    creator_id = _creator_for_enqueue(db, created_by_user_id)
+    scoped_dedupe_key = _scoped_dedupe_key(dedupe_key)
     if scoped_dedupe_key:
         existing = db.execute(
             select(WorkflowRun)
@@ -554,9 +539,9 @@ def enqueue_workflow_run(
             .order_by(WorkflowRun.created_at.desc())
         ).scalars().first()
         if existing:
+            _assert_workflow_replay(existing, definition, creator_id, params)
             return existing, False
 
-    creator_id = _creator_for_enqueue(db, created_by_user_id)
     now = utc_now()
     run = WorkflowRun(
         id=uuid4().hex,
@@ -568,7 +553,6 @@ def enqueue_workflow_run(
         input_payload={},
         input_summary={},
         input_digest="",
-        environment=definition.environment,
         definition_snapshot_id=definition.snapshot_id,
         release_id=definition.release_id,
         definition_hash=definition.definition_hash,
@@ -592,6 +576,17 @@ def enqueue_workflow_run(
     return run, True
 
 
+def _assert_workflow_replay(run, definition, creator_id: str | None, params: dict[str, Any] | None) -> None:
+    if (
+        run.created_by_user_id != creator_id
+        or run.definition_hash != definition.definition_hash
+        or run.release_id != definition.release_id
+        or run.definition_snapshot_id != definition.snapshot_id
+        or workflow_payload_service.open_workflow_run_input(run) != dict(params or {})
+    ):
+        raise PolicyViolation("同一工作流请求键已绑定其他主体、版本或输入，请查询原任务")
+
+
 def publish_event(
     db: Session,
     event: Any,
@@ -607,12 +602,11 @@ def publish_event(
     scenario = getattr(event, "scenario", None) or db.get(BusinessScenario, event.scenario_id)
     if not scenario:
         raise PolicyViolation("事件所属业务场景不存在")
-    definition = runtime_definition or runtime_definition_service.resolve_active(
+    definition = runtime_definition or runtime_definition_service.resolve_authoring(
         db,
         scenario,
-        environment="dev",
     )
-    if definition.scenario.id != scenario.id:
+    if definition.scenario.id != scenario.id or definition.scenario.tenant_id != scenario.tenant_id:
         raise PolicyViolation("运行定义不属于事件业务场景")
     try:
         event = runtime_definition_service.resolve_resource(definition, "event", event.id)
@@ -630,7 +624,7 @@ def publish_event(
     raw_payload = dict(payload or {})
     if event.payload_schema:
         raw_payload = validate_action_params(event.payload_schema, raw_payload)
-    scoped_dedupe_key = _scoped_dedupe_key(dedupe_key, definition.environment)
+    scoped_dedupe_key = _scoped_dedupe_key(dedupe_key)
     if scoped_dedupe_key:
         existing = db.execute(
             select(EventEnvelope)
@@ -641,6 +635,13 @@ def publish_event(
             .order_by(EventEnvelope.created_at.desc())
         ).scalars().first()
         if existing:
+            if (
+                existing.created_by_user_id != creator_id
+                or existing.definition_hash != definition.definition_hash
+                or existing.release_id != definition.release_id
+                or existing.payload != raw_payload
+            ):
+                raise PolicyViolation("同一事件请求键已绑定其他主体、版本或输入，请查询原事件")
             existing_runs = db.execute(
                 select(WorkflowRun).where(WorkflowRun.event_envelope_id == existing.id)
             ).scalars().all()
@@ -658,9 +659,9 @@ def publish_event(
             name=event.name,
             payload=raw_payload,
             source="workflow_cycle_suppressed",
+            created_by_user_id=creator_id,
             source_run_id=source_run_id,
             dedupe_key=scoped_dedupe_key,
-            environment=definition.environment,
             definition_snapshot_id=definition.snapshot_id,
             release_id=definition.release_id,
             definition_hash=definition.definition_hash,
@@ -676,9 +677,9 @@ def publish_event(
         name=event.name,
         payload=raw_payload,
         source=source,
+        created_by_user_id=creator_id,
         source_run_id=source_run_id,
         dedupe_key=scoped_dedupe_key,
-        environment=definition.environment,
         definition_snapshot_id=definition.snapshot_id,
         release_id=definition.release_id,
         definition_hash=definition.definition_hash,
@@ -711,10 +712,10 @@ def publish_event(
         # blocked run and will fail closed before dispatch instead of invoking
         # permission_service's owner fallback.
         workflow_creator = creator_id or _automation_creator_for_workflow(
-            db, workflow, environment=definition.environment
+            db, workflow
         )
         if not workflow_creator and _has_unresolved_automation_principal_block(
-            db, workflow, environment=definition.environment
+            db, workflow
         ):
             continue
         run, created = enqueue_workflow_run(
@@ -754,7 +755,7 @@ def enqueue_due_schedules(db: Session, *, now: datetime | None = None) -> list[W
     """扫描启用的 interval 定时工作流，并将到期运行写入持久化队列。"""
     now = now or utc_now()
     definitions = runtime_definition_service.active_definitions(
-        db, environment="dev"
+        db
     )
     queued: list[WorkflowRun] = []
     for definition in definitions:
@@ -780,7 +781,6 @@ def enqueue_due_schedules(db: Session, *, now: datetime | None = None) -> list[W
                 select(WorkflowRun.scheduled_for)
                 .where(
                     WorkflowRun.workflow_id == workflow.id,
-                    WorkflowRun.environment == definition.environment,
                     WorkflowRun.scheduled_for.is_not(None),
                 )
                 .order_by(WorkflowRun.scheduled_for.desc())
@@ -796,7 +796,6 @@ def enqueue_due_schedules(db: Session, *, now: datetime | None = None) -> list[W
                 select(WorkflowRun.id)
                 .where(
                     WorkflowRun.workflow_id == workflow.id,
-                    WorkflowRun.environment == definition.environment,
                     WorkflowRun.status.in_(ACTIVE_RUN_STATUSES),
                 )
                 .limit(1)
@@ -808,10 +807,10 @@ def enqueue_due_schedules(db: Session, *, now: datetime | None = None) -> list[W
             # previously attributable executor rather than letting the execution
             # permission helper choose the tenant owner implicitly.
             creator_id = _automation_creator_for_workflow(
-                db, workflow, environment=definition.environment
+                db, workflow
             )
             if not creator_id and _has_unresolved_automation_principal_block(
-                db, workflow, environment=definition.environment
+                db, workflow
             ):
                 continue
             run, created = enqueue_workflow_run(
@@ -876,6 +875,8 @@ def _ensure_approval_request(db: Session, run: WorkflowRun, waiting_step: dict[s
         select(WorkflowApprovalRequest).where(
             WorkflowApprovalRequest.workflow_run_id == run.id,
             WorkflowApprovalRequest.node_id == node_id,
+            or_(WorkflowApprovalRequest.execution_key == run.execution_key,
+                and_(WorkflowApprovalRequest.execution_key == "", WorkflowApprovalRequest.status == "pending")),
         )
     ).scalars().first()
     if approval:
@@ -895,6 +896,7 @@ def _ensure_approval_request(db: Session, run: WorkflowRun, waiting_step: dict[s
         timeout_seconds = APPROVAL_TIMEOUT_DEFAULT_SECONDS
     approval = WorkflowApprovalRequest(
         workflow_run_id=run.id,
+        execution_key=run.execution_key,
         scenario_id=run.scenario_id,
         node_id=node_id,
         node_name=str(waiting_step.get("name") or "人工审批"),
@@ -909,13 +911,11 @@ def _ensure_approval_request(db: Session, run: WorkflowRun, waiting_step: dict[s
 def process_available_runs(db: Session, *, now: datetime | None = None, limit: int = 8) -> list[WorkflowRun]:
     """同步处理少量已到期队列项；由 lifespan 中的后台循环调用。"""
     now = now or utc_now()
-    worker_environment = runtime_connector_service.runtime_environment()
     run_ids = db.execute(
         select(WorkflowRun.id)
         .where(
             WorkflowRun.status.in_(DISPATCHABLE_RUN_STATUSES),
             WorkflowRun.available_at <= now,
-            WorkflowRun.environment == worker_environment,
         )
         .order_by(WorkflowRun.available_at.asc(), WorkflowRun.created_at.asc())
         .limit(max(1, min(limit, 32)))
@@ -1033,9 +1033,11 @@ def process_available_runs(db: Session, *, now: datetime | None = None, limit: i
                     # Assert again inside the execution path.  The resolver
                     # rejects any mismatch instead of treating the persisted
                     # value as a request-controlled environment selector.
-                    runtime_environment=runtime_connector_service.runtime_environment(run.environment),
                     runtime_definition=definition,
                     audit_input_params=workflow_payload_service.public_input_summary(run),
+                    resumed_results=workflow_approval_resume.approved_results(
+                        run.result or {}, set(run.approved_node_ids or []),
+                    ),
                 )
         except Exception as exc:  # noqa: BLE001
             result = {"status": "failed", "steps": [], "error": str(exc), "duration_ms": 0}
@@ -1142,7 +1144,7 @@ def _expire_approval(
             WorkflowApprovalRequest.id == approval.id,
             WorkflowApprovalRequest.status == "pending",
         )
-        .values(status="expired", resolved_at=now, comment="审批超时")
+        .values(status="expired", resolved_at=now, comment="审批超时", revision=WorkflowApprovalRequest.revision + 1)
     ).rowcount
     if claimed != 1:
         return
@@ -1166,6 +1168,11 @@ def decide_approval(
     comment: str = "",
     user_id: str | None = None,
     now: datetime | None = None,
+    approval_id: str | None = None,
+    expected_revision: int | None = None,
+    decision_message_id: str | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+    reply_hash: str | None = None,
 ) -> WorkflowRun:
     principal = permission_service.require_principal(db)
     if user_id and user_id != principal.user_id:
@@ -1186,6 +1193,12 @@ def decide_approval(
     ).scalars().first()
     if not approval or run.status != "awaiting_approval":
         raise PolicyViolation("当前任务没有待处理的审批")
+    if approval_id is not None and approval.id != approval_id:
+        raise PolicyViolation("审批待办已变化，请读取当前待办后重新回复")
+    if expected_revision is not None and approval.revision != expected_revision:
+        raise PolicyViolation("审批版本已变化，请读取当前待办后重新回复")
+    approval_config = workflow_approval_policy.node_config(workflow, approval.node_id)
+    workflow_approval_policy.require_audience(db, approval_config)
     if approval.expires_at and _aware(approval.expires_at) <= now:
         # Conditional claims make an approval decision race safe: a concurrent
         # approver or expiry worker cannot both resolve the same request.
@@ -1194,8 +1207,9 @@ def decide_approval(
             .where(
                 WorkflowApprovalRequest.id == approval.id,
                 WorkflowApprovalRequest.status == "pending",
+            WorkflowApprovalRequest.revision == approval.revision,
             )
-            .values(status="expired", resolved_at=now, comment="审批超时")
+            .values(status="expired", resolved_at=now, comment="审批超时", revision=WorkflowApprovalRequest.revision + 1)
         ).rowcount
         if claimed != 1:
             db.rollback()
@@ -1219,23 +1233,30 @@ def decide_approval(
         raise PolicyViolation("审批已超时")
 
     resolved_status = "approved" if approved else "rejected"
+    evidence = workflow_approval_policy.prepare_evidence(db, approval_config, evidence_refs or [], approved=approved)
     approver_user_id = user_id or principal.user_id
     claimed = db.execute(
         update(WorkflowApprovalRequest)
         .where(
             WorkflowApprovalRequest.id == approval.id,
             WorkflowApprovalRequest.status == "pending",
+            WorkflowApprovalRequest.revision == approval.revision,
         )
         .values(
             status=resolved_status,
             resolved_at=now,
             resolved_by_user_id=approver_user_id,
             comment=comment,
+            revision=WorkflowApprovalRequest.revision + 1,
+            decision_message_id=decision_message_id,
+            decision_digest=reply_hash,
+            evidence_refs=evidence,
         )
     ).rowcount
     if claimed != 1:
         db.rollback()
         raise PolicyViolation("审批已被其他操作处理")
+    workflow_approval_policy.retain_evidence(db, approval, evidence)
     if approved:
         approved_nodes = set(run.approved_node_ids or [])
         approved_nodes.add(approval.node_id)
@@ -1270,6 +1291,10 @@ def decide_approval(
 
 def retry_run(db: Session, run: WorkflowRun, *, now: datetime | None = None) -> WorkflowRun:
     principal = permission_service.require_principal(db)
+    run = db.scalar(select(WorkflowRun).where(WorkflowRun.id == run.id)
+                    .with_for_update().execution_options(populate_existing=True))
+    if run is None:
+        raise PolicyViolation("任务不存在或已变化")
     try:
         _, workflow = _definition_for_run(db, run)
     except PolicyViolation as exc:
@@ -1279,6 +1304,13 @@ def retry_run(db: Session, run: WorkflowRun, *, now: datetime | None = None) -> 
     if run.status not in {"failed", "timed_out", "cancelled"}:
         raise PolicyViolation("只有失败、超时或取消的任务可以重新执行")
     now = now or utc_now()
+    from .workflow_execution_history import freeze_before_retry
+    freeze_before_retry(db, run)
+    db.execute(update(WorkflowApprovalRequest).where(
+        WorkflowApprovalRequest.workflow_run_id == run.id,
+        WorkflowApprovalRequest.status == "pending",
+    ).values(status="cancelled", resolved_at=now, comment="任务已由人工重新执行",
+             revision=WorkflowApprovalRequest.revision + 1))
     run.status = "queued"
     run.trigger_source = "retry"
     # An operator retry is a new, explicitly requested business execution.  It
@@ -1342,15 +1374,14 @@ def cancel_run(
     if updated != 1:
         db.rollback()
         raise PolicyViolation("任务状态已变化，请刷新后重试")
-    if run.status == "awaiting_approval":
-        db.execute(
-            update(WorkflowApprovalRequest)
-            .where(
-                WorkflowApprovalRequest.workflow_run_id == run.id,
-                WorkflowApprovalRequest.status == "pending",
-            )
-            .values(status="cancelled", resolved_at=now, comment=comment or "任务已取消")
+    db.execute(
+        update(WorkflowApprovalRequest)
+        .where(
+            WorkflowApprovalRequest.workflow_run_id == run.id,
+            WorkflowApprovalRequest.status == "pending",
         )
+        .values(status="cancelled", resolved_at=now, comment=comment or "任务已取消", revision=WorkflowApprovalRequest.revision + 1)
+    )
     db.commit()
     db.refresh(run)
     return run
@@ -1412,6 +1443,7 @@ def purge_expired_catalog_attachments(
     limit: int = 200,
 ) -> int:
     """Detach expired temporary payloads while retaining logical audit ids."""
+    from ..approval_models import WorkflowApprovalEvidence
     cutoff = now or utc_now()
     if cutoff.tzinfo is None:
         cutoff = cutoff.replace(tzinfo=timezone.utc)
@@ -1424,6 +1456,9 @@ def purge_expired_catalog_attachments(
             .where(
                 DataAssetVersion.status == "ready",
                 DataAssetVersion.bucket_file_id.is_not(None),
+                ~select(WorkflowApprovalEvidence.id).where(
+                    WorkflowApprovalEvidence.asset_version_id == DataAssetVersion.id,
+                ).exists(),
                 lifecycle["purpose"].as_string() == "invocation_attachment",
                 lifecycle["temporary"].as_boolean().is_(True),
                 lifecycle["expires_at"].as_string() <= cutoff.isoformat(),

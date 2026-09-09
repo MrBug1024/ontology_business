@@ -6574,7 +6574,6 @@ def _assistant_action_preview(
             db,
             runtime_action,
             params,
-            runtime_environment=definition.environment,
             runtime_definition=definition,
         )
     finally:

@@ -28,11 +28,12 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from ..config import get_settings
+from .legacy_release_contract import workflow_payload_context as payload_context
 
 
 ENVELOPE_CONTRACT = "workflow-run-input-envelope/v1"
 SUMMARY_CONTRACT = "workflow-run-input-summary/v1"
-AAD_CONTRACT = "workflow-run-input-aad/v1"
+AAD_CONTRACT = "workflow-run-input-aad/v2"
 ALGORITHM = "A256GCM"
 _KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -180,7 +181,6 @@ def _run_context(
     run_id: str,
     scenario_id: str,
     workflow_id: str,
-    environment: str,
     definition_hash: str,
 ) -> dict[str, str]:
     values = {
@@ -188,10 +188,9 @@ def _run_context(
         "run_id": str(run_id or "").strip(),
         "scenario_id": str(scenario_id or "").strip(),
         "workflow_id": str(workflow_id or "").strip(),
-        "environment": str(environment or "").strip(),
         "definition_hash": str(definition_hash or "").strip(),
     }
-    if any(not values[key] for key in ("run_id", "scenario_id", "workflow_id", "environment")):
+    if any(not values[key] for key in ("run_id", "scenario_id", "workflow_id")):
         raise WorkflowPayloadError(
             "invalid_workflow_payload_context",
             "工作流输入载荷缺少稳定运行上下文",
@@ -199,12 +198,11 @@ def _run_context(
     return values
 
 
-def payload_context(
+def runtime_payload_context(
     *,
     run_id: str,
     scenario_id: str,
     workflow_id: str,
-    environment: str,
     definition_hash: str,
 ) -> dict[str, str]:
     """Build the stable authenticated context used by runtime and migration."""
@@ -213,7 +211,6 @@ def payload_context(
         run_id=run_id,
         scenario_id=scenario_id,
         workflow_id=workflow_id,
-        environment=environment,
         definition_hash=definition_hash,
     )
 
@@ -223,7 +220,6 @@ def _context_for_run(run: Any) -> dict[str, str]:
         run_id=str(getattr(run, "id", "") or ""),
         scenario_id=str(getattr(run, "scenario_id", "") or ""),
         workflow_id=str(getattr(run, "workflow_id", "") or ""),
-        environment=str(getattr(run, "environment", "") or ""),
         definition_hash=str(getattr(run, "definition_hash", "") or ""),
     )
 

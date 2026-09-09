@@ -868,8 +868,6 @@ def _idempotency_statement(
         CapabilityInvocation.scenario_id == deployment.scenario_id,
         CapabilityInvocation.capability_kind == request.capability.kind,
         CapabilityInvocation.capability_key == request.capability.resource_id,
-        CapabilityInvocation.definition_hash == deployment.definition_hash,
-        CapabilityInvocation.deployment_fingerprint == deployment.fingerprint,
         CapabilityInvocation.idempotency_key == request.idempotency_key,
     )
 
@@ -886,7 +884,16 @@ def _find_idempotent(
     statement = _idempotency_statement(deployment, request)
     if lock:
         statement = statement.with_for_update()
-    return db.execute(statement).scalar_one_or_none()
+    invocation = db.execute(statement).scalar_one_or_none()
+    if invocation is not None and (
+        invocation.definition_hash != deployment.definition_hash
+        or invocation.deployment_fingerprint != deployment.fingerprint
+    ):
+        raise CapabilityInvocationError(
+            "idempotency_deployment_conflict",
+            "idempotency key already belongs to a different capability revision; read its original receipt",
+        )
+    return invocation
 
 
 def _find_request_id(
@@ -1637,7 +1644,6 @@ class CapabilityInvoker:
         identity_matches = (
             invocation.tenant_id == deployment.tenant_id
             and invocation.scenario_id == deployment.scenario_id
-            and invocation.environment == deployment.environment
             and invocation.capability_kind == request.capability.kind
             and invocation.capability_key == request.capability.resource_id
             and invocation.definition_hash == deployment.definition_hash

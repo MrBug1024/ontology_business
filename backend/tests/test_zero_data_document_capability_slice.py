@@ -81,6 +81,15 @@ class _DocumentSemanticsProvider:
     provider_key = "test.document-semantics"
     provider_version = "1.0.0"
 
+    def validate_definition(self, *, input_schema, output_schema, provider_config, compatibility_mode):
+        expected_output = {"type": "object", "properties": {
+            "document": {"type": "object"}, "fragment_count": {"type": "integer"},
+            "input_semantics_hash": {"type": "string"},
+        }}
+        if input_schema != DOCUMENT_INPUT_SCHEMA or output_schema != expected_output or provider_config != {}:
+            raise ValueError("Invalid document fixture definition")
+        return {}
+
     def contract(
         self,
         capability: CapabilityRef,
@@ -154,7 +163,6 @@ def _receipt_semantics(document: dict) -> dict:
 def _invocation_provenance(invocation: CapabilityInvocation) -> dict:
     return {
         "scenario_id": invocation.scenario_id,
-        "environment": invocation.environment,
         "release_id": invocation.release_id,
         "definition_snapshot_id": invocation.definition_snapshot_id,
         "definition_hash": invocation.definition_hash,
@@ -319,15 +327,19 @@ def test_zero_data_document_capability_works_through_agent_rest_and_mcp() -> Non
                 wraps=shared_invoker.invoke,
             ) as kernel_spy,
             patch.object(capability_mcp_service, "SessionLocal", SessionLocal),
+            patch("app.services.provider_definition_service.default_provider_registry", registry),
         ):
             agent_db = SessionLocal()
             try:
                 agent_db.info["tenant_id"] = tenant.id
                 agent_db.info["user_id"] = owner.id
+                from .release_fixtures import enable_current_release
+                release = enable_current_release(agent_db, agent_db.get(BusinessScenario, scenario.id))
                 runtime = agent_runtime_adapter.build_runtime_context(
                     agent_db,
                     agent_db.get(Agent, agent.id),
                     agent_db.get(LLMConfig, llm.id),
+                    release_id=release.id,
                     turn_input=agent_runtime_adapter.AgentTurnInput(
                         structured_inputs=invocation_input,
                         target_kind="function",
@@ -357,7 +369,7 @@ def test_zero_data_document_capability_works_through_agent_rest_and_mcp() -> Non
 
             rest_catalog_response = client.get(
                 f"/api/external/v2/scenarios/{scenario.id}/capabilities",
-                params={"environment": "dev"},
+                params={"release_id": release.id},
                 headers={"X-API-Key": rest_token},
             )
             assert rest_catalog_response.status_code == 200, rest_catalog_response.text
@@ -370,7 +382,7 @@ def test_zero_data_document_capability_works_through_agent_rest_and_mcp() -> Non
                     f"function/{function.id}/invoke"
                 ),
                 headers={"X-API-Key": rest_token},
-                json={"environment": "dev", "inputs": invocation_input},
+                json={"release_id": release.id, "inputs": invocation_input},
             )
             assert rest_response.status_code == 200, rest_response.text
             rest_receipt = rest_response.json()
@@ -380,7 +392,7 @@ def test_zero_data_document_capability_works_through_agent_rest_and_mcp() -> Non
             mcp_catalog = capability_mcp_service.list_capabilities(
                 mcp_auth,
                 scenario_id=scenario.id,
-                environment="dev",
+                release_id=release.id,
             )
             assert mcp_catalog[0]["data_ports"] == []
             mcp_receipt = capability_mcp_service.invoke_capability(
@@ -388,7 +400,7 @@ def test_zero_data_document_capability_works_through_agent_rest_and_mcp() -> Non
                 scenario_id=scenario.id,
                 capability_kind="function",
                 capability_key=function.id,
-                environment="dev",
+                release_id=release.id,
                 inputs=invocation_input,
             )
 

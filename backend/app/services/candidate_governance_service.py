@@ -1,7 +1,7 @@
 """Origin-neutral quality governance for scenario definition candidates.
 
 The staging row is deliberately inert; that storage fact is independent from
-whether its payload is good enough to become a formal dev definition.  This
+whether its payload is good enough to become a formal authored definition.  This
 module owns the second decision.  It never calls an LLM and never branches on
 an industry, scenario name, or candidate origin.
 

@@ -87,15 +87,21 @@ def validate_agent_runtime(
     agent_id: str,
     *,
     writable: bool = False,
-    environment: str = "dev",
+    release_id: str | None = None,
 ) -> tuple[Agent, Any, list[str]]:
     # Import lazily to keep the MCP service independent from router import order.
     from ..routers import agents
 
     agent = agents._agent(db, agent_id, writable=writable)
-    context = agents._authorization_context(db, agent, environment=environment)
+    from . import runtime_definition_service
+    scenario = tenant_service.require_scenario(db, agent.scenario_id)
+    try:
+        definition = runtime_definition_service.resolve_active(db, scenario, release_id=release_id)
+    except runtime_definition_service.RuntimeDefinitionError:
+        return agent, None, ["人工创建并启用的场景发布"]
+    context = agents._authorization_context(db, agent, release_id=definition.release_id)
     if context is None:
-        return agent, None, ["当前环境运行定义或连接器"]
+        return agent, None, ["指定发布定义或受管连接器"]
     missing = agents._agent_readiness_missing(db, agent, runtime_context=context)
     return agent, context, missing
 
@@ -109,11 +115,13 @@ def service_runtime_status(
     try:
         db.info["tenant_id"] = service.tenant_id
         db.info["user_id"] = service.execution_user_id or ""
+        if not service.release_id:
+            return None, None, ["该接入尚未绑定人工发布，请重新创建接入"], True
         try:
             agent, context, missing = validate_agent_runtime(
                 db,
                 service.agent_id,
-                environment=service.runtime_environment,
+                release_id=service.release_id,
             )
         except HTTPException as exc:
             return None, None, [str(exc.detail)], True
@@ -124,7 +132,8 @@ def service_runtime_status(
             agent_config_hash(agent) != service.agent_config_hash
             or not definition
             or definition.definition_hash != service.definition_hash
-            or definition.environment != service.runtime_environment
+            or definition.release_id != service.release_id
+            or definition.snapshot_id != service.definition_snapshot_id
         )
         return agent, context, missing, stale
     finally:
@@ -237,13 +246,13 @@ def invoke_published_agent(
 
         result = agents.invoke_agent_once(
             service.agent_id,
+            release_id=service.release_id,
             message=message,
             conversation_id=conversation_id,
             inputs=inputs,
             managed_inputs=managed_inputs,
             capability=capability,
             idempotency_key=idempotency_key,
-            environment=service.runtime_environment,
             db=db,
         )
         result.update({

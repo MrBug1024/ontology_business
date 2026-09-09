@@ -467,6 +467,7 @@ class MappingRuntimeTests(unittest.TestCase):
         )
         mapping = SimpleNamespace(
             id="mapping-1",
+            entity=entity,
             scenario_id="scenario-1",
             data_source_id="source-1",
             entity_id="entity-1",

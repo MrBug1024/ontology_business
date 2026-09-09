@@ -220,7 +220,7 @@ def test_runtime_privilege_contract_preserves_state_updates_only() -> None:
         "ingestion_runs",
         "derivation_runs",
     }
-    assert set(runtime.RUNTIME_APPEND_ONLY_TABLES) == {"agent_turn_events"}
+    assert set(runtime.RUNTIME_APPEND_ONLY_TABLES) == {"agent_turn_events", "release_lifecycle_events", "workflow_approval_evidence"}
     assert set(runtime.RUNTIME_MUTABLE_CONTROL_TABLES) == {
         "agent_turn_runs",
         "assistant_request_runs",
@@ -235,7 +235,7 @@ def test_runtime_privilege_contract_preserves_state_updates_only() -> None:
         mutable_control_tables=runtime.RUNTIME_MUTABLE_CONTROL_TABLES,
     )
     assert result["immutable_tables"] == len(runtime.RUNTIME_IMMUTABLE_TABLES)
-    assert result["append_only_tables"] == 1
+    assert result["append_only_tables"] == 3
     assert result["mutable_control_tables"] == 3
 
 

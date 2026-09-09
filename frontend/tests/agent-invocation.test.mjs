@@ -2,6 +2,22 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { agentToolResultStatus } from '../src/utils/agentToolResult.ts'
+import { applyAgentTurnEvent } from '../src/utils/agentTurnProgress.ts'
+
+test('text deltas resume from the persisted snapshot and ignore duplicate revisions', () => {
+  const current = { status: 'responding', revision: 3, result: { answer: '你好😀' } }
+  const event = { revision: 4, type: 'answer_delta', data: { offset: 4, delta: '世界' } }
+  const next = applyAgentTurnEvent(current, event)
+  assert.equal(next.result.answer, '你好😀世界')
+  assert.equal(next.status, 'responding')
+  assert.equal(applyAgentTurnEvent(next, event), next)
+  assert.throws(() => applyAgentTurnEvent(current, { ...event, data: { offset: 2, delta: '丢字' } }))
+  const reset = applyAgentTurnEvent(next, { revision: 5, type: 'answer_reset', data: { status: 'invoking_tools' } })
+  assert.equal(reset.result.answer, '')
+  const final = applyAgentTurnEvent(reset, { revision: 6, type: 'succeeded', data: { result: { answer: '权威结果' } } })
+  assert.equal(final.result.answer, '权威结果')
+  assert.equal(final.status, 'succeeded')
+})
 
 import {
   isAttachmentInputPort,

@@ -202,7 +202,6 @@ def _world(db: Session, key: str) -> World:
     frozen_workflow = _runtime_copy(workflow, scenario)
     definition = runtime_definition_service.RuntimeDefinition(
         scenario=scenario,
-        environment="dev",
         source="live",
         snapshot_id=None,
         release_id=None,
@@ -250,7 +249,6 @@ def _with_managed_connector(db: Session, world: World, key: str) -> World:
         id=f"binding-{key}",
         tenant_id=world.scenario.tenant_id,
         scenario_id=world.scenario.id,
-        environment="dev",
         binding_key=port.port_key,
         connector_kind="data_source",
         connector_id=f"connector-{key}",
@@ -780,7 +778,7 @@ def test_action_provider_previews_without_execution_and_confirms_once(
     execute_log = db.scalar(
         select(ActionExecutionLog).where(ActionExecutionLog.mode == "execute")
     )
-    assert execute_log.idempotency_key.startswith("dev:cap:")
+    assert execute_log.idempotency_key.startswith("cap:")
     assert execute_log.idempotency_key.endswith(":action-key")
     assert execute_log.parent_action_log_id == preview.output["preview_log_id"]
     assert execute_log.input_params["contract"] == (
@@ -799,29 +797,10 @@ def test_workflow_provider_only_enqueues_durable_run_and_reuses_dedupe(
         "execute_workflow",
         lambda *_args, **_kwargs: executed.append(True),
     )
-    preview_request = _request(
-        world,
-        "workflow",
-        world.workflow.id,
-        correlation_id="workflow-confirmation",
-        inputs={"case_id": "case-1"},
-        mode="preview",
-        idempotency_key="workflow-key",
-    )
-    preview = _invoke(db, world, preview_request)
-    assert preview.status == "awaiting_confirmation"
-    assert executed == []
-    assert db.scalar(select(func.count(WorkflowRun.id))) == 0
-
     confirm_request = _request(
-        world,
-        "workflow",
-        world.workflow.id,
-        correlation_id="workflow-confirmation",
-        inputs={"case_id": "case-1"},
-        mode="confirm",
-        idempotency_key="workflow-key",
-        confirmation=dict(preview.confirmation),
+        world, "workflow", world.workflow.id,
+        correlation_id="workflow-execution", inputs={"case_id": "case-1"},
+        mode="execute", idempotency_key="workflow-key",
     )
     confirmed = _invoke(db, world, confirm_request)
     replay = _invoke(db, world, confirm_request)
@@ -830,14 +809,14 @@ def test_workflow_provider_only_enqueues_durable_run_and_reuses_dedupe(
     assert confirmed.status == "succeeded"
     assert replay.audit_ref["replayed"] is True
     assert run.status == "queued"
-    assert run.dedupe_key.startswith("dev:cap:")
+    assert run.dedupe_key.startswith("cap:")
     assert run.dedupe_key.endswith(":workflow-key")
     assert run.definition_hash == world.deployment.definition_hash
     assert executed == []
     assert db.scalar(select(func.count(WorkflowRun.id))) == 1
 
 
-def test_downstream_idempotency_is_scoped_to_deployment_and_principal(
+def test_downstream_idempotency_rejects_reusing_a_business_request_after_revision_change(
     db: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -891,17 +870,19 @@ def test_downstream_idempotency_is_scoped_to_deployment_and_principal(
         world,
         deployment=build_resolved_deployment(definition_b),
     )
-    confirmed_action(world_b, "definition-b")
+    with pytest.raises(CapabilityInvocationError) as conflict:
+        confirmed_action(world_b, "definition-b")
+    assert conflict.value.code == "idempotency_deployment_conflict"
 
     keys = db.scalars(
         select(ActionExecutionLog.idempotency_key)
         .where(ActionExecutionLog.mode == "execute")
         .order_by(ActionExecutionLog.definition_hash)
     ).all()
-    assert len(keys) == 2
-    assert len(set(keys)) == 2
+    assert len(keys) == 1
+    assert len(set(keys)) == 1
     assert all(key.endswith(":shared-caller-key") for key in keys)
-    assert dispatches == [{"value": 8}, {"value": 8}]
+    assert dispatches == [{"value": 8}]
 
 
 def test_action_provider_does_not_persist_raw_structured_inputs(
@@ -996,7 +977,6 @@ def test_provider_permissions_fail_closed_and_legacy_preview_still_commits(
             db,
             world.deployment.definition.actions[world.action.id],
             {"value": 4},
-            runtime_environment="dev",
             runtime_definition=world.deployment.definition,
         )
     commit.assert_called_once()

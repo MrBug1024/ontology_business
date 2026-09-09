@@ -24,6 +24,9 @@ os.environ.setdefault(
 os.environ["DATASET_CACHE_DIRECTORY"] = ""
 os.environ["DATASET_DUCKDB_TEMP_DIRECTORY"] = ""
 
+# Register the release audit table before unit fixtures create their schema.
+from app import approval_models, release_models  # noqa: E402, F401
+
 
 @pytest.fixture(autouse=True)
 def isolated_dataset_cache(tmp_path, monkeypatch):

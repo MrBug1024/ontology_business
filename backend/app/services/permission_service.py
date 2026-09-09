@@ -140,7 +140,7 @@ def _resolve_principal(db: Session) -> tuple[Principal | None, str, int]:
         return result
 
     user = db.get(User, user_id)
-    if not user or user.status != "active" or user.tenant_id != tenant_id:
+    if not user or user.status != "active":
         result = (None, "当前用户不属于请求租户或已失效", 403)
         cache[principal_key] = result
         return result

@@ -13,7 +13,6 @@ class CapabilityAccessScenarioOut(BaseModel):
 
 
 class CapabilityAccessDeploymentOut(BaseModel):
-    environment: Literal["dev", "staging", "prod"]
     definition_source: Literal["live", "release"]
     release_id: str | None = None
     snapshot_id: str | None = None
@@ -62,7 +61,6 @@ class CapabilityAccessAdapterOut(BaseModel):
 class CapabilityAccessReleaseOut(BaseModel):
     id: str
     snapshot_id: str
-    environment: Literal["dev", "staging", "prod"]
     status: str
     created_at: datetime
 

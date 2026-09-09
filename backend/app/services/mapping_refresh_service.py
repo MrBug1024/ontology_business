@@ -1,8 +1,8 @@
 """持久化的数据映射刷新队列。
 
 HTTP 请求只校验权限和记录刷新意图；外部数据源读取及对象/关系写入统一在
-worker 中完成。任务携带环境快照与映射定义指纹，避免一个环境的 worker 使用另一
-环境的数据源，或在映射已编辑后继续执行旧定义。
+worker 中完成。任务固定受治理定义、数据引用与映射指纹，避免 worker 使用未授权
+数据源，或在映射已编辑后继续执行旧定义。
 """
 from __future__ import annotations
 
@@ -224,21 +224,14 @@ def resolve_mapping_runtime_definition(
     scenario: BusinessScenario,
     mapping: DataMapping,
     *,
-    environment: str | None = None,
+    release_id: str | None = None,
 ) -> tuple[Any, runtime_definition_service.RuntimeDefinition]:
-    """Resolve the mapping contract authorised for this deployment.
-
-    In staging/prod the live ``DataMapping`` is used only to authorise the
-    route and locate its scenario.  The returned mapping is a detached DTO from
-    the active release snapshot, so API requests and queued work cannot read a
-    newer dev definition by accident.
-    """
-    resolved_environment = runtime_connector_service.runtime_environment(environment)
+    """Resolve the current authored mapping for an authorized validation request."""
     try:
-        definition = runtime_definition_service.resolve_active(
+        definition = runtime_definition_service.resolve_requested(
             db,
             scenario,
-            environment=resolved_environment,
+            release_id=release_id,
         )
         if not definition.is_frozen:
             return mapping, definition
@@ -279,21 +272,20 @@ def _job_runtime_mapping(
     frozen = _job_mapping_snapshot(job)
     if frozen.scenario_id != scenario.id:
         raise PolicyViolation("映射刷新快照不属于当前业务场景")
-    if job.environment == "dev":
+    if job.definition_source == "live":
         if (
             job.definition_source != "live"
             or job.definition_snapshot_id is not None
             or job.release_id is not None
         ):
-            raise PolicyViolation("开发环境映射刷新任务的定义来源无效")
+            raise PolicyViolation("当前定义映射刷新任务的定义来源无效")
         return frozen
     if job.definition_source != "release":
-        raise PolicyViolation("非开发环境映射刷新缺少发布定义来源")
+        raise PolicyViolation("固定发布映射刷新缺少发布定义来源")
     try:
         definition = runtime_definition_service.resolve_pinned(
             db,
             scenario,
-            environment=job.environment,
             snapshot_id=job.definition_snapshot_id,
             release_id=job.release_id,
             definition_hash=job.definition_hash,
@@ -318,12 +310,12 @@ def _job_runtime_definition(
 ) -> runtime_definition_service.RuntimeDefinition:
     """Resolve the complete definition pinned by a refresh job."""
     try:
-        if job.environment == "dev":
-            definition = runtime_definition_service.resolve_active(
-                db, scenario, environment="dev"
+        if job.definition_source == "live":
+            definition = runtime_definition_service.resolve_authoring(
+                db, scenario
             )
             if definition.is_frozen or job.definition_source != "live":
-                raise PolicyViolation("开发环境映射刷新任务的定义来源无效")
+                raise PolicyViolation("当前定义映射刷新任务的定义来源无效")
             if (
                 not job.definition_hash
                 or definition.definition_hash != job.definition_hash
@@ -335,11 +327,10 @@ def _job_runtime_definition(
                 raise PolicyViolation("关系映射或其端点定义已变化，请重新提交刷新")
             return definition
         if job.definition_source != "release":
-            raise PolicyViolation("非开发环境映射刷新缺少发布定义来源")
+            raise PolicyViolation("固定发布映射刷新缺少发布定义来源")
         definition = runtime_definition_service.resolve_pinned(
             db,
             scenario,
-            environment=job.environment,
             snapshot_id=job.definition_snapshot_id,
             release_id=job.release_id,
             definition_hash=job.definition_hash,
@@ -377,7 +368,6 @@ def _clear_stale_mapping_runtime_state(
     ):
         set_mapping_runtime_state(
             mapping,
-            environment=job.environment,
             status="unknown",
         )
 
@@ -390,105 +380,41 @@ def mapping_matches_snapshot(mapping: DataMapping, snapshot: Any) -> bool:
         return False
 
 
-def mapping_runtime_state(
-    mapping: DataMapping,
-    *,
-    environment: str | None = None,
-) -> dict[str, Any]:
-    """Return the refresh state visible to this fixed deployment environment.
-
-    The platform can use one metadata database for multiple deployments.  Old
-    top-level mapping status fields remain the dev compatibility view; new
-    records use ``environment_status`` so a staging/prod worker cannot make a
-    dev page look refreshed (or failed).
-    """
-    resolved_environment = runtime_connector_service.runtime_environment(environment)
-    raw_states = getattr(mapping, "environment_status", None) or {}
-    state = raw_states.get(resolved_environment) if isinstance(raw_states, dict) else None
-    if isinstance(state, dict):
-        return {
-            "status": str(state.get("status") or "unknown"),
-            "last_error": str(state.get("last_error") or ""),
-            "last_checked_at": state.get("last_checked_at"),
-            "last_refreshed_at": state.get("last_refreshed_at"),
-            "last_row_count": int(state.get("last_row_count") or 0),
-            "last_imported_count": int(state.get("last_imported_count") or 0),
-        }
-    if resolved_environment != "dev":
-        return {
-            "status": "unknown",
-            "last_error": "",
-            "last_checked_at": None,
-            "last_refreshed_at": None,
-            "last_row_count": 0,
-            "last_imported_count": 0,
-        }
+def mapping_runtime_state(mapping: DataMapping) -> dict[str, Any]:
+    """Read freshness for this explicit mapping identity."""
     return {
-        "status": str(getattr(mapping, "status", "unknown") or "unknown"),
-        "last_error": str(getattr(mapping, "last_error", "") or ""),
-        "last_checked_at": getattr(mapping, "last_checked_at", None),
-        "last_refreshed_at": getattr(mapping, "last_refreshed_at", None),
-        "last_row_count": int(getattr(mapping, "last_row_count", 0) or 0),
-        "last_imported_count": int(getattr(mapping, "last_imported_count", 0) or 0),
+        "status": str(mapping.status or "unknown"), "last_error": str(mapping.last_error or ""),
+        "last_checked_at": mapping.last_checked_at, "last_refreshed_at": mapping.last_refreshed_at,
+        "last_row_count": int(mapping.last_row_count or 0),
+        "last_imported_count": int(mapping.last_imported_count or 0),
     }
 
 
 def set_mapping_runtime_state(
-    mapping: DataMapping,
-    *,
-    environment: str | None = None,
-    status: str,
-    error: str = "",
-    checked_at: datetime | None = None,
-    refreshed_at: datetime | None = None,
-    rows_scanned: int | None = None,
-    instances_created: int | None = None,
+    mapping: DataMapping, *, status: str, error: str = "",
+    checked_at: datetime | None = None, refreshed_at: datetime | None = None,
+    rows_scanned: int | None = None, instances_created: int | None = None,
 ) -> None:
-    """Persist a status transition without allowing environment cross-talk."""
-    resolved_environment = runtime_connector_service.runtime_environment(environment)
-    existing = getattr(mapping, "environment_status", None) or {}
-    states = dict(existing) if isinstance(existing, dict) else {}
-    prior = states.get(resolved_environment)
-    state = dict(prior) if isinstance(prior, dict) else {}
-    state["status"] = str(status or "unknown")
-    state["last_error"] = str(error or "")
+    """Update freshness only after the caller verifies the mapping fingerprint."""
+    mapping.status = str(status or "unknown")
+    mapping.last_error = str(error or "")
     if checked_at is not None:
-        state["last_checked_at"] = checked_at.isoformat()
+        mapping.last_checked_at = checked_at
     if refreshed_at is not None:
-        state["last_refreshed_at"] = refreshed_at.isoformat()
+        mapping.last_refreshed_at = refreshed_at
     if rows_scanned is not None:
-        state["last_row_count"] = max(0, int(rows_scanned))
+        mapping.last_row_count = max(0, int(rows_scanned))
     if instances_created is not None:
-        state["last_imported_count"] = max(0, int(instances_created))
-    states[resolved_environment] = state
-    mapping.environment_status = states
-
-    # Keep existing API/database consumers working in dev while preventing
-    # non-dev refreshes from overwriting the compatibility fields.
-    if resolved_environment == "dev":
-        mapping.status = state["status"]
-        mapping.last_error = state["last_error"]
-        if checked_at is not None:
-            mapping.last_checked_at = checked_at
-        if refreshed_at is not None:
-            mapping.last_refreshed_at = refreshed_at
-        if rows_scanned is not None:
-            mapping.last_row_count = state["last_row_count"]
-        if instances_created is not None:
-            mapping.last_imported_count = state["last_imported_count"]
+        mapping.last_imported_count = max(0, int(instances_created))
 
 
 def invalidate_mapping_runtime_state(mapping: DataMapping) -> None:
     """Clear freshness facts after a mapping definition is edited.
 
-    A mapping definition is shared by all deployment environments.  Keeping a
-    prior ``ok`` state after its source/table/column contract changes would make
-    a different environment look safely refreshed even though it has never
-    executed the new definition.  The imported objects remain available for
-    audit and are updated on the next successful refresh; only the freshness
-    claim is invalidated here.
+    A prior successful refresh cannot establish freshness after its mapping
+    contract changes. Imported objects remain available for audit until an
+    explicitly authorized refresh updates them.
     """
-    mapping.environment_status = {}
     mapping.status = "unknown"
     mapping.last_error = ""
     mapping.last_checked_at = None
@@ -514,8 +440,8 @@ def _mapping_status_for_job(status: str) -> str:
     }.get(status, "unknown")
 
 
-def _active_key(mapping_id: str, environment: str) -> str:
-    return f"{mapping_id}:{environment}"
+def _active_key(mapping_id: str) -> str:
+    return mapping_id
 
 
 def cancel_active_mapping_refresh_jobs(
@@ -558,8 +484,9 @@ def enqueue_mapping_refresh(
     *,
     limit: int | None = None,
     requested_by_user_id: str | None = None,
+    release_id: str | None = None,
 ) -> tuple[DataMappingRefreshJob, bool]:
-    """Create or return the one active refresh job for this mapping/environment."""
+    """Create or return the one active refresh job for this mapping."""
     tenant_id = tenant_service.current_tenant_id(db)
     scenario = db.get(BusinessScenario, mapping.scenario_id)
     if not scenario or scenario.tenant_id != tenant_id:
@@ -571,14 +498,12 @@ def enqueue_mapping_refresh(
     else:
         requested_by_user_id = permission_service.require_principal(db).user_id
 
-    # The deployment selects its own definition; a request cannot make a
-    # staging/prod worker refresh mutable dev authoring rows.
-    environment = runtime_connector_service.runtime_environment()
+    # Pin the explicitly selected definition before the durable job is created.
     runtime_mapping, definition = resolve_mapping_runtime_definition(
         db,
         scenario,
         mapping,
-        environment=environment,
+        release_id=release_id,
     )
     frozen_snapshot = mapping_snapshot(runtime_mapping)
     frozen_fingerprint = _mapping_snapshot_fingerprint(frozen_snapshot)
@@ -590,7 +515,6 @@ def enqueue_mapping_refresh(
         .where(
             DataMappingRefreshJob.tenant_id == tenant_id,
             DataMappingRefreshJob.mapping_id == mapping.id,
-            DataMappingRefreshJob.environment == environment,
             DataMappingRefreshJob.status.in_(ACTIVE_STATUSES),
         )
         .order_by(DataMappingRefreshJob.created_at.desc())
@@ -600,7 +524,6 @@ def enqueue_mapping_refresh(
         if _live_mapping_matches_job(mapping, active):
             set_mapping_runtime_state(
                 mapping,
-                environment=environment,
                 status=_mapping_status_for_job(active.status),
                 error=active.error or "",
             )
@@ -613,8 +536,7 @@ def enqueue_mapping_refresh(
         scenario_id=scenario.id,
         mapping_id=mapping.id,
         requested_by_user_id=requested_by_user_id,
-        environment=environment,
-        active_key=_active_key(mapping.id, environment),
+        active_key=_active_key(mapping.id),
         mapping_snapshot=frozen_snapshot,
         mapping_fingerprint=frozen_fingerprint,
         relation_mapping_fingerprint=frozen_relation_fingerprint,
@@ -643,7 +565,7 @@ def enqueue_mapping_refresh(
             select(DataMappingRefreshJob)
             .where(
                 DataMappingRefreshJob.tenant_id == tenant_id,
-                DataMappingRefreshJob.active_key == _active_key(mapping.id, environment),
+                DataMappingRefreshJob.active_key == _active_key(mapping.id),
             )
             .order_by(DataMappingRefreshJob.created_at.desc())
             .limit(1)
@@ -653,7 +575,6 @@ def enqueue_mapping_refresh(
         if _live_mapping_matches_job(mapping, active):
             set_mapping_runtime_state(
                 mapping,
-                environment=environment,
                 status=_mapping_status_for_job(active.status),
                 error=active.error or "",
             )
@@ -662,7 +583,7 @@ def enqueue_mapping_refresh(
         return active, False
 
     if _live_mapping_matches_job(mapping, job):
-        set_mapping_runtime_state(mapping, environment=environment, status="queued")
+        set_mapping_runtime_state(mapping,  status="queued")
     return job, True
 
 
@@ -686,7 +607,6 @@ def _retry_or_finish(
         if _live_mapping_matches_job(mapping, job):
             set_mapping_runtime_state(
                 mapping,
-                environment=job.environment,
                 status="retry_waiting",
                 error=safe_error,
             )
@@ -700,7 +620,6 @@ def _retry_or_finish(
         if _live_mapping_matches_job(mapping, job):
             set_mapping_runtime_state(
                 mapping,
-                environment=job.environment,
                 status=_mapping_status_for_job(final_status),
                 error=safe_error,
                 checked_at=now,
@@ -728,7 +647,6 @@ def _cancel_job(
     if _live_mapping_matches_job(mapping, job):
         set_mapping_runtime_state(
             mapping,
-            environment=job.environment,
             status="error",
             error=job.error,
             checked_at=now,
@@ -736,7 +654,6 @@ def _cancel_job(
     elif mapping is not None and mapping.id == job.mapping_id:
         set_mapping_runtime_state(
             mapping,
-            environment=job.environment,
             status="unknown",
         )
     db.commit()
@@ -761,7 +678,7 @@ def _job_context(
 
 
 def expire_stale_mapping_refresh_jobs(db: Session, *, now: datetime | None = None) -> None:
-    """Reclaim stalled jobs using each job's persisted environment."""
+    """Reclaim stalled jobs using their persisted lease and definition pins."""
     now = now or utc_now()
     jobs = db.execute(
         select(DataMappingRefreshJob).where(
@@ -790,16 +707,14 @@ def resolve_mapping_data_source(
     scenario: BusinessScenario,
     mapping: Any,
     *,
-    environment: str | None = None,
     release_id: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    """Resolve a mapping's data source through the fixed runtime environment."""
+    """Resolve a mapping's explicitly configured data source."""
     return runtime_connector_service.resolve_connector(
         db,
         scenario,
         kind="data_source",
         config=mapping_runtime_config(mapping),
-        environment=environment,
         release_id=release_id,
     )
 
@@ -833,13 +748,11 @@ def process_mapping_refresh_jobs(
 ) -> list[DataMappingRefreshJob]:
     """Atomically claim and process a bounded number of mapping refresh jobs."""
     dispatch_now = now or utc_now()
-    worker_environment = runtime_connector_service.runtime_environment()
     job_ids = db.execute(
         select(DataMappingRefreshJob.id)
         .where(
             DataMappingRefreshJob.status.in_(DISPATCHABLE_STATUSES),
             DataMappingRefreshJob.available_at <= dispatch_now,
-            DataMappingRefreshJob.environment == worker_environment,
         )
         .order_by(DataMappingRefreshJob.available_at.asc(), DataMappingRefreshJob.created_at.asc())
         .limit(max(1, min(limit, 16)))
@@ -856,7 +769,6 @@ def process_mapping_refresh_jobs(
                 DataMappingRefreshJob.id == job_id,
                 DataMappingRefreshJob.status.in_(DISPATCHABLE_STATUSES),
                 DataMappingRefreshJob.available_at <= claim_now,
-                DataMappingRefreshJob.environment == worker_environment,
             )
             .values(
                 status="running",
@@ -906,14 +818,12 @@ def process_mapping_refresh_jobs(
                 if _live_mapping_matches_job(mapping, job):
                     set_mapping_runtime_state(
                         mapping,
-                        environment=job.environment,
                         status="refreshing",
                     )
                 source, connector_audit = resolve_mapping_data_source(
                     db,
                     scenario,
                     runtime_mapping,
-                    environment=job.environment,
                     release_id=job.release_id if job.definition_source == "release" else None,
                 )
                 relation_mappings = [
@@ -945,7 +855,6 @@ def process_mapping_refresh_jobs(
                         db,
                         scenario,
                         endpoint_mapping,
-                        environment=job.environment,
                         release_id=job.release_id if job.definition_source == "release" else None,
                     )
                     mapping_data_sources[mapping_id] = endpoint_source
@@ -960,7 +869,6 @@ def process_mapping_refresh_jobs(
                         db,
                         scenario,
                         relation_mapping,
-                        environment=job.environment,
                         release_id=job.release_id if job.definition_source == "release" else None,
                     )
                     relation_data_sources[str(relation_mapping.id)] = join_source
@@ -973,7 +881,6 @@ def process_mapping_refresh_jobs(
                     limit=job.limit,
                     data_source=source,
                     commit=False,
-                    environment=job.environment,
                     relation_mappings=relation_mappings,
                     relation_data_sources=relation_data_sources,
                     mapping_data_sources=mapping_data_sources,
@@ -1040,7 +947,6 @@ def process_mapping_refresh_jobs(
                 if _live_mapping_matches_job(mapping, job):
                     set_mapping_runtime_state(
                         mapping,
-                        environment=job.environment,
                         status="ok",
                         checked_at=finished_at,
                         refreshed_at=finished_at,

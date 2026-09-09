@@ -10,6 +10,9 @@ from sqlalchemy import select
 
 from ..database import SessionLocal
 from ..models import BusinessScenario
+from ..channel_interaction_schemas import ChannelReplyIn
+from . import channel_interaction_service, agent_turn_payload_service
+from sqlalchemy.exc import IntegrityError
 from . import capability_application_service, external_api_service, permission_service
 from .capability_contracts import Actor, CapabilityContractError, CapabilityRef, Request
 from .capability_invoker import CapabilityInvocationError
@@ -93,7 +96,7 @@ def list_capabilities(
     auth: AuthenticatedCapabilityMCP,
     *,
     scenario_id: str,
-    environment: str,
+    release_id: str | None = None,
 ) -> list[dict[str, Any]]:
     _scope(auth, "capabilities:read")
     db = SessionLocal()
@@ -102,7 +105,7 @@ def list_capabilities(
         return capability_application_service.list_capabilities(
             db,
             _scenario(db, auth, scenario_id),
-            environment=environment,
+            release_id=release_id,
         )
     except capability_application_service.CapabilityApplicationError as exc:
         raise CapabilityMCPError(f"{exc.code}: {exc.message}") from None
@@ -116,7 +119,7 @@ def invoke_capability(
     scenario_id: str,
     capability_kind: str,
     capability_key: str,
-    environment: str,
+    release_id: str | None = None,
     inputs: dict[str, Any] | None = None,
     managed_inputs: list[dict[str, Any]] | None = None,
     mode: str = "execute",
@@ -155,8 +158,8 @@ def invoke_capability(
             scenario,
             _actor(db, auth),
             request,
-            environment=environment,
             invocation_source="mcp",
+            release_id=release_id,
         )
         db.commit()
         return capability_application_service.receipt_document(receipt)
@@ -189,6 +192,39 @@ def get_receipt(
         )
     except capability_application_service.CapabilityApplicationError as exc:
         raise CapabilityMCPError(f"{exc.code}: {exc.message}") from None
+    finally:
+        db.close()
+
+
+def read_approval(auth: AuthenticatedCapabilityMCP, *, interaction_id: str) -> dict[str, Any]:
+    _scope(auth, "capabilities:read")
+    db = SessionLocal()
+    try:
+        _bind(db, auth)
+        return channel_interaction_service.read_approval(db, _actor(db, auth), interaction_id)
+    except channel_interaction_service.ChannelInteractionError as exc:
+        raise CapabilityMCPError(str(exc)) from None
+    finally:
+        db.close()
+
+
+def reply_interaction(auth: AuthenticatedCapabilityMCP, *, kind: str, interaction_id: str, reply: ChannelReplyIn) -> dict[str, Any]:
+    _scope(auth, "capabilities:invoke")
+    if kind not in {"confirmation", "approval"}:
+        raise CapabilityMCPError("不支持的消息待办类型")
+    db = SessionLocal()
+    try:
+        _bind(db, auth)
+        handler = channel_interaction_service.reply_confirmation if kind == "confirmation" else channel_interaction_service.reply_approval
+        result = handler(db, _actor(db, auth), interaction_id, reply)
+        db.commit()
+        return result
+    except (channel_interaction_service.ChannelInteractionError, capability_application_service.CapabilityApplicationError, CapabilityInvocationError) as exc:
+        db.rollback()
+        raise CapabilityMCPError(str(exc)) from None
+    except (IntegrityError, agent_turn_payload_service.AgentTurnPayloadError):
+        db.rollback()
+        raise CapabilityMCPError("回复未完成，请刷新当前待办后重试") from None
     finally:
         db.close()
 

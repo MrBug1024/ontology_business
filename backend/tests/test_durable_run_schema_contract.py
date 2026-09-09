@@ -68,6 +68,11 @@ def test_revision_21_matches_durable_orm_ownership_contract() -> None:
         assert tuple(column.name for column in item.columns) == columns
 
     for name, source, target, local_columns, remote_columns in revision.FOREIGN_KEYS:
+        # Revision 25 makes the account a global actor. Parent/resource tenant
+        # constraints from revision 21 continue to apply without alteration.
+        if target == "users" and remote_columns == ("id", "tenant_id"):
+            name = f"fk_{source}_user"
+            local_columns, remote_columns = ("requested_by_user_id",), ("id",)
         item = _constraint(source, name)
         assert isinstance(item, ForeignKeyConstraint)
         assert tuple(column.name for column in item.columns) == local_columns

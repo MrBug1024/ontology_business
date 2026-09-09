@@ -64,7 +64,6 @@ from . import (
 from .policies import validate_workflow_graph
 
 
-ENVIRONMENTS = {"dev", "staging", "prod"}
 MERGEABLE_SNAPSHOT_KINDS = {"baseline", "merge", "rollback"}
 ROLLBACKABLE_SNAPSHOT_KINDS = {"baseline", "merge", "rollback", "pre_merge", "pre_rollback"}
 # These runs resolve the live workflow definition in the worker.  Publishing a
@@ -124,15 +123,7 @@ class ReleaseConflictError(ReleaseValidationError):
     """并发/状态冲突；调用方需要重新基于最新分支创建提案。"""
 
 
-@dataclass(frozen=True)
-class ReleaseWithdrawalResult:
-    scenario_id: str
-    environment: str
-    withdrawn_release_ids: tuple[str, ...]
-    changed: bool
-    withdrawn_at: datetime | None
-    withdrawn_by_user_id: str | None
-    reason: str
+
 
 
 def _now() -> datetime:
@@ -866,7 +857,7 @@ def _runtime_binding_requirements(
 
     Package imports already add top-level ``connector_bindings``.  This scan
     closes the equivalent gap for an Action or DAG node configured manually:
-    no staging/prod runtime key can bypass the publish-time binding check.
+    no published runtime key can bypass the publish-time binding check.
     """
     requirements: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -887,10 +878,9 @@ def _runtime_binding_requirements(
                         {
                             "binding_key": identity[1],
                             "kind": identity[0],
-                            # The requested target environment is applied by
+                            # The scoped connector is resolved by
                             # publish/runtime validation; this is a logical
-                            # default retained for snapshot compatibility.
-                            "environment": "dev",
+                            # identity retained in the immutable snapshot.
                             "reference_label": f"运行时连接器：{identity[1]}",
                         }
                     )
@@ -1133,7 +1123,7 @@ def normalize_snapshot_content(content: Any) -> dict:
         if capability_ports_present
         else 1
     )
-    if capability_contract_version not in {1, 2}:
+    if capability_contract_version not in {1, 2, 3}:
         raise ReleaseValidationError("不支持的 capability contract 版本")
     capability_ports = [
         _normalize_capability_port(
@@ -1207,9 +1197,15 @@ def normalize_snapshot_content(content: Any) -> dict:
         # its usual useful validation error instead of silently discarding it.
         combined_requirements = raw_requirements
     try:
-        connector_bindings = connector_service.normalize_snapshot_binding_requirements(
-            combined_requirements if connector_bindings_present else None
-        )
+        if capability_contract_version < 3:
+            from .legacy_release_contract import binding_requirements
+            connector_bindings = binding_requirements(
+                combined_requirements if connector_bindings_present else None
+            )
+        else:
+            connector_bindings = connector_service.normalize_snapshot_binding_requirements(
+                combined_requirements if connector_bindings_present else None
+            )
     except connector_service.ConnectorBindingError as exc:
         raise ReleaseValidationError(str(exc)) from exc
 
@@ -1862,7 +1858,7 @@ def capture_snapshot_content(db: Session, scenario: BusinessScenario) -> dict:
         # Ports describe requirements only.  Dataset ids, asset versions,
         # connector ids, physical table names and credentials are deliberately
         # excluded from the immutable capability definition.
-        "capability_contract_version": 2,
+        "capability_contract_version": 3,
         "capability_ports": [
             {
                 "id": port.id,
@@ -2091,14 +2087,14 @@ def _create_snapshot(
 
 
 def _definition_hash(content: Any) -> str:
-    """Hash only live ontology definitions, not environment deployment metadata."""
+    """Hash authored ontology definitions without deployment metadata."""
     normalized = normalize_snapshot_content(content)
     normalized.pop("connector_bindings", None)
     return snapshot_hash(normalized)
 
 
 def definition_hash(content: Any) -> str:
-    """Public definition-only hash used by environment runtime validation."""
+    """Public definition-only hash used by pinned invocation validation."""
     return _definition_hash(content)
 
 
@@ -2115,18 +2111,13 @@ def _preserve_connector_requirements(captured: dict, source: Mapping[str, Any]) 
     return result
 
 
-def _assert_non_dev_runtime_bindings(content: Mapping[str, Any], *, environment: str) -> None:
-    """Reject a non-dev release that would inevitably fail at runtime.
+def _assert_publishable_runtime_bindings(content: Mapping[str, Any]) -> None:
+    """Require portable connector contracts in an immutable release.
 
-    Dev keeps the direct-ID/default-model compatibility path while users migrate
-    legacy definitions.  Staging/prod runtime resolution is intentionally
-    fail-closed, so publishing those definitions without logical binding keys
-    would create a misleading "released" state.  Check only executable
-    connector paths here; regular binding health/signature verification remains
-    in ``_require_snapshot_connectors`` below.
+    Authored validation may resolve explicitly selected local resources. A
+    release must preserve logical binding identities. Connector health and
+    signature validation remains in ``_require_snapshot_connectors`` below.
     """
-    if environment == "dev":
-        return
 
     missing: list[str] = []
     prohibited_actions: list[str] = []
@@ -2136,7 +2127,7 @@ def _assert_non_dev_runtime_bindings(content: Mapping[str, Any], *, environment:
             metadata = connector_service.runtime_binding_from_config(config, kind)
         except connector_service.ConnectorBindingError as exc:
             raise ReleaseConflictError(
-                f"{environment} 环境的 {label} 运行时绑定配置无效：{exc}"
+                f"{label} 运行时绑定配置无效：{exc}"
             ) from exc
         if metadata is None:
             key_field, _ref_field = connector_service.runtime_binding_fields(kind)
@@ -2176,11 +2167,8 @@ def _assert_non_dev_runtime_bindings(content: Mapping[str, Any], *, environment:
         action_label = str(action.get("name") or action.get("id") or "未命名 Action")[:200]
         executor_type = str(action.get("executor_type") or "")
         config = action.get("executor_config") or {}
-        # Staging/prod must be reproducible from the released definition and
-        # an auditable connector binding.  Direct HTTP, local skills and
-        # scripts depend on host/process state outside that boundary, so they
-        # are deliberately dev-only until they have an equivalent governed
-        # connector implementation.
+        # These legacy executors cannot preserve a portable frozen contract.
+        # Publication requires an equivalent governed provider or connector.
         if executor_type in {"unbound", "http", "skill", "script", "template"}:
             prohibited_actions.append(f"Action「{action_label}」使用 {executor_type}")
         elif executor_type == "sql":
@@ -2209,93 +2197,43 @@ def _assert_non_dev_runtime_bindings(content: Mapping[str, Any], *, environment:
 
     if prohibited_actions:
         raise ReleaseConflictError(
-            "非开发环境禁止待绑定、http、skill、script、template Action 执行器："
+            "正式发布不支持待绑定、http、skill、script、template Action 执行器："
             + "；".join(prohibited_actions[:12])
         )
     if missing:
         raise ReleaseConflictError(
-            "非开发环境发布必须配置运行时连接器绑定键：" + "；".join(missing[:12])
+            "正式发布必须配置运行时连接器绑定键：" + "；".join(missing[:12])
         )
 
 
 def _require_snapshot_connectors(
-    db: Session,
-    scenario: BusinessScenario,
-    content: Mapping[str, Any],
-    *,
-    environment: str | None = None,
+    db: Session, scenario: BusinessScenario, content: Mapping[str, Any],
+    *, for_publication: bool = False,
 ) -> list[dict[str, Any]]:
-    """Recheck persisted healthy bindings without making network calls.
-
-    Snapshot records created before mappings gained runtime bindings may lack
-    derived ``connector_bindings``.  Normalize an in-memory copy first so the
-    publish audit uses the same declarative requirements as the runtime.
-    """
+    """Validate explicit connector requirements without network calls."""
     try:
         normalized = normalize_snapshot_content(dict(content))
-        if environment and environment != "dev":
-            # A legacy snapshot that intentionally omitted mappings means
-            # "leave mappings untouched" during merge.  In a non-dev release
-            # that would make definition-hash verification inevitably fail if
-            # live mappings now exist, so require a fresh governed baseline.
-            if "mappings" not in content and db.scalar(
-                select(DataMapping.id)
-                .where(DataMapping.scenario_id == scenario.id)
-                .limit(1)
-            ):
-                raise ReleaseConflictError(
-                    "该历史快照未声明数据映射；请先基于当前定义创建并合并新的快照后再发布"
-                )
-            if "relation_mappings" not in content and db.scalar(
-                select(RelationDataMapping.id)
-                .where(RelationDataMapping.scenario_id == scenario.id)
-                .limit(1)
-            ):
-                raise ReleaseConflictError(
-                    "该历史快照未声明关系数据映射；请先基于当前定义创建并合并新的快照后再发布"
-                )
-            _assert_non_dev_runtime_bindings(normalized, environment=environment)
-        requirements = connector_service.normalize_snapshot_binding_requirements(
-            normalized.get("connector_bindings")
-        )
-        audit: list[dict[str, Any]] = []
-        if environment:
-            if requirements:
-                audit = connector_service.validate_snapshot_bindings(
-                    db, scenario, normalized, environment=environment
-                )
-            _require_mapping_sql_bindings(
-                db,
-                scenario,
-                normalized,
-                environment=environment,
-            )
-            return audit
-        for requirement_environment in sorted({item["environment"] for item in requirements}):
-            scoped = {
-                "connector_bindings": [
-                    item for item in requirements if item["environment"] == requirement_environment
-                ]
-            }
-            audit.extend(
-                connector_service.validate_snapshot_bindings(
-                    db, scenario, scoped, environment=requirement_environment
-                )
-            )
-        # Merge-time validation has no selected deployment; snapshot runtime
-        # requirements default to dev, matching the legacy-compatible path.
-        _require_mapping_sql_bindings(db, scenario, normalized, environment="dev")
+        if for_publication:
+            if "mappings" not in content and db.scalar(select(DataMapping.id).where(
+                DataMapping.scenario_id == scenario.id,
+            ).limit(1)):
+                raise ReleaseConflictError("历史快照未声明数据映射，请重新创建场景发布")
+            if "relation_mappings" not in content and db.scalar(select(RelationDataMapping.id).where(
+                RelationDataMapping.scenario_id == scenario.id,
+            ).limit(1)):
+                raise ReleaseConflictError("历史快照未声明关系映射，请重新创建场景发布")
+            _assert_publishable_runtime_bindings(normalized)
+        audit = connector_service.validate_snapshot_bindings(db, scenario, normalized)
+        _require_mapping_sql_bindings(db, scenario, normalized)
         return audit
     except connector_service.ConnectorBindingError as exc:
-        raise ReleaseConflictError(f"连接器环境门禁未通过：{exc}") from exc
+        raise ReleaseConflictError(f"连接器校验未通过：{exc}") from exc
 
 
 def _require_mapping_sql_bindings(
     db: Session,
     scenario: BusinessScenario,
     content: Mapping[str, Any],
-    *,
-    environment: str,
 ) -> None:
     """Verify mapping-specific adapter and SQL-read capability requirements."""
     mappings = content.get("mappings") or []
@@ -2314,7 +2252,6 @@ def _require_mapping_sql_bindings(
         connector_service.require_ready_binding(
             db,
             scenario,
-            environment=environment,
             binding_key_value=str(metadata["binding_key"]),
             kind="data_source",
             reference=connector_service.with_required_capabilities(
@@ -2337,7 +2274,6 @@ def _require_mapping_sql_bindings(
         connector_service.require_ready_binding(
             db,
             scenario,
-            environment=environment,
             binding_key_value=str(metadata["binding_key"]),
             kind="data_source",
             reference=connector_service.with_required_capabilities(
@@ -2350,8 +2286,6 @@ def _require_snapshot_managed_dependencies(
     db: Session,
     scenario: BusinessScenario,
     content: Mapping[str, Any],
-    *,
-    environment: str,
 ) -> None:
     """Require governed bindings promised by stable reference and rule ports."""
 
@@ -2379,7 +2313,6 @@ def _require_snapshot_managed_dependencies(
             select(ScenarioDatasetBinding).where(
                 ScenarioDatasetBinding.tenant_id == scenario.tenant_id,
                 ScenarioDatasetBinding.scenario_id == scenario.id,
-                ScenarioDatasetBinding.environment == environment,
                 ScenarioDatasetBinding.binding_key == binding_key,
                 ScenarioDatasetBinding.role == role,
                 ScenarioDatasetBinding.status == "active",
@@ -2387,7 +2320,7 @@ def _require_snapshot_managed_dependencies(
         ).scalar_one_or_none()
         if binding is None:
             raise ReleaseValidationError(
-                f"发布环境缺少必填 {role} 端口的受管绑定：{binding_key}"
+                f"发布缺少必填 {role} 端口的受管绑定：{binding_key}"
             )
         mode = str(binding.binding_mode or "").strip().lower()
         if policy == "release_pinned" and mode != "pinned":
@@ -2414,7 +2347,6 @@ def _require_snapshot_managed_dependencies(
                     DatasetHead.id == binding.dataset_head_id,
                     DatasetHead.dataset_id == binding.dataset_id,
                     DatasetHead.tenant_id == scenario.tenant_id,
-                    DatasetHead.environment == environment,
                     DatasetVersion.status == "ready",
                 )
             ).scalar_one_or_none()
@@ -2590,15 +2522,14 @@ def _ensure_active_workflow_definitions_unchanged(
             WorkflowRun.status.in_(NONTERMINAL_WORKFLOW_RUN_STATUSES),
         )
     ).scalars().all()
-    # Frozen staging/prod runs resolve their own release snapshot and must not
-    # prevent dev authoring from moving forward.  Live/dev runs still require
+    # Frozen published runs resolve their own release snapshot and must not
+    # prevent authoring from moving forward.  Authored validation runs still require
     # this historical mutation guard because they intentionally remain bound to
     # the mutable authoring definition.
     active_runs = [
         run
         for run in active_runs
-        if (run.environment or "dev") == "dev"
-        and not run.definition_snapshot_id
+        if not run.definition_snapshot_id
         and (run.definition_source or "live") == "live"
     ]
     if not active_runs:
@@ -2664,31 +2595,30 @@ def assert_scenario_deletion_allowed(
     db: Session,
     scenario: BusinessScenario,
 ) -> None:
-    """Keep the scenario-level anchor while a non-dev release is active."""
+    """Keep the scenario-level anchor while a formal release is active."""
     active_release = db.execute(
         select(OntologyRelease.id)
         .where(
             OntologyRelease.scenario_id == scenario.id,
             OntologyRelease.status == "released",
-            OntologyRelease.environment.in_(("staging", "prod")),
         )
         .with_for_update()
         .limit(1)
     ).scalar_one_or_none()
     if active_release is not None:
-        raise ReleaseConflictError("不能删除仍被活动环境发布引用的业务场景")
+        raise ReleaseConflictError("不能删除仍被有效发布引用的业务场景")
 
 
 def assert_scenario_retirement_allowed(
     db: Session,
     scenario: BusinessScenario,
 ) -> None:
-    """Require active staging/prod deployments to be withdrawn before retirement."""
+    """Require formal releases to be retired before scenario retirement."""
     try:
         assert_scenario_deletion_allowed(db, scenario)
     except ReleaseConflictError as exc:
         raise ReleaseConflictError(
-            "不能退役仍被活动环境发布引用的业务场景"
+            "不能退役仍被有效发布引用的业务场景"
         ) from exc
 
 
@@ -2701,7 +2631,7 @@ def assert_resource_deletion_allowed(
 ) -> None:
     """Fail closed before a live lookup anchor is removed from an active release.
 
-    Staging/prod resolve immutable JSON, but their ordinary API routes first
+    Published calls resolve immutable JSON, but their ordinary API routes first
     use the physical row to locate and authorize the resource.  The governed
     merge path already protects these anchors via ``_guard_safe_removals``;
     direct CRUD deletes must use the same deployment boundary instead of
@@ -2721,7 +2651,6 @@ def assert_resource_deletion_allowed(
         .where(
             OntologyRelease.scenario_id == scenario.id,
             OntologyRelease.status == "released",
-            OntologyRelease.environment.in_(("staging", "prod")),
         )
         .with_for_update()
     ).scalars().all()
@@ -2733,23 +2662,23 @@ def assert_resource_deletion_allowed(
             or snapshot.scenario_id != scenario.id
             or snapshot.tenant_id != scenario.tenant_id
         ):
-            raise ReleaseConflictError("活动环境发布快照不可用，拒绝删除定义")
+            raise ReleaseConflictError("有效发布快照不可用，拒绝删除定义")
         try:
             # Historic snapshots that predate governed mappings cannot prove
-            # that a live mapping is absent.  A non-dev deployment with such
+            # that a live mapping is absent.  A formal release with such
             # evidence must not lose a potential runtime anchor by CRUD.
             if normalized_kind in {"mapping", "relation_mapping", "function"} and collection not in (snapshot.content or {}):
-                raise ReleaseConflictError(f"活动环境发布快照缺少{label}，拒绝删除")
+                raise ReleaseConflictError(f"有效发布快照缺少{label}，拒绝删除")
             snapshot_content = normalize_snapshot_content(snapshot.content or {})
         except ReleaseConflictError:
             raise
         except Exception as exc:  # noqa: BLE001 - corrupted deployment must fail closed.
-            raise ReleaseConflictError("活动环境发布快照无效，拒绝删除定义") from exc
+            raise ReleaseConflictError("有效发布快照无效，拒绝删除定义") from exc
         if any(
             isinstance(item, dict) and str(item.get("id") or "") == normalized_id
             for item in snapshot_content.get(collection, [])
         ):
-            raise ReleaseConflictError(f"不能删除仍被活动环境发布引用的{label}")
+            raise ReleaseConflictError(f"不能删除仍被有效发布引用的{label}")
 
 
 def _guard_safe_removals(
@@ -2779,10 +2708,10 @@ def _guard_safe_removals(
     desired_workflows = {item["id"] for item in content["workflows"]}
 
     # The physical rows remain stable lookup anchors for routes and foreign
-    # keys, while staging/prod execute immutable DTOs from the release JSON.
-    # Deleting an ID still referenced by an active environment release would
+    # keys, while published calls execute immutable DTOs from the release JSON.
+    # Deleting an ID still referenced by an active formal release would
     # make that frozen deployment unreachable, so keep it until each affected
-    # environment has moved to a new release/rollback target.
+    # release has been retired through its lifecycle command.
     released_ids: dict[str, set[str]] = {
         "entity": set(),
         "relation": set(),
@@ -2796,17 +2725,16 @@ def _guard_safe_removals(
         select(OntologyRelease).where(
             OntologyRelease.scenario_id == scenario.id,
             OntologyRelease.status == "released",
-            OntologyRelease.environment.in_(("staging", "prod")),
         )
     ).scalars().all()
     for release in active_releases:
         snapshot = db.get(OntologySnapshot, release.snapshot_id)
         if not snapshot:
-            raise ReleaseValidationError("活动环境发布快照不可用，拒绝删除定义")
+            raise ReleaseValidationError("有效发布快照不可用，拒绝删除定义")
         try:
             snapshot_content = normalize_snapshot_content(snapshot.content or {})
         except Exception as exc:  # noqa: BLE001 - corrupted deployment must fail closed.
-            raise ReleaseValidationError("活动环境发布快照无效，拒绝删除定义") from exc
+            raise ReleaseValidationError("有效发布快照无效，拒绝删除定义") from exc
         for key, collection in (
             ("entity", "entities"),
             ("relation", "relations"),
@@ -2834,7 +2762,7 @@ def _guard_safe_removals(
         (label for label, ids in protected_deletions.items() if ids), None
     )
     if protected:
-        raise ReleaseValidationError(f"不能删除仍被活动环境发布引用的{protected}")
+        raise ReleaseValidationError(f"不能删除仍被有效发布引用的{protected}")
 
     for entity in db.execute(
         select(OntologyEntity).where(OntologyEntity.scenario_id == scenario.id)
@@ -3561,7 +3489,7 @@ def merge_proposal(
         _ensure_live_matches_head(db, scenario, branch)
         # Imports may have been approved while a target connector was later
         # disabled or reconfigured.  Merge must recheck the package's declared
-        # environment bindings before any live ontology rows are touched.
+        # connector bindings before any live ontology rows are touched.
         _require_snapshot_connectors(db, scenario, proposed.content or {})
         head = _snapshot_for_scenario(db, scenario, branch.head_snapshot_id)
         pre_merge = _create_snapshot(
@@ -3649,173 +3577,28 @@ def _resolve_publish_snapshot(
 
 
 def publish_snapshot(
-    db: Session,
-    scenario_id: str,
-    *,
-    environment: str,
-    confirmed: bool,
-    branch_id: str | None = None,
-    proposal_id: str | None = None,
-    snapshot_id: str | None = None,
-    notes: str = "",
+    db: Session, scenario_id: str, *, confirmed: bool,
+    branch_id: str | None = None, proposal_id: str | None = None,
+    snapshot_id: str | None = None, notes: str = "", name: str = "",
 ) -> OntologyRelease:
-    if confirmed is not True:
-        raise ReleaseValidationError("发布必须显式 confirmed=true")
-    if environment not in ENVIRONMENTS:
-        raise ReleaseValidationError("发布环境必须为 dev、staging 或 prod")
-    scenario, principal = _scenario_for_manage(db, scenario_id)
-    scenario = _lock_template_governance_scenario(db, scenario)
-    branch, snapshot, proposal = _resolve_publish_snapshot(
-        db,
-        scenario,
-        branch_id=branch_id,
-        proposal_id=proposal_id,
-        snapshot_id=snapshot_id,
+    """Explicit legacy command, routed through the same manual release lifecycle."""
+    from .scenario_release_service import create_release
+    return create_release(
+        db, scenario_id, confirmed=confirmed, name=name, notes=notes,
+        branch_id=branch_id, proposal_id=proposal_id, snapshot_id=snapshot_id,
     )
-    try:
-        _require_snapshot_modeling_provenance(snapshot.content or {})
-        _validate_snapshot_template_actions(db, scenario, snapshot.content or {})
-        _require_snapshot_managed_dependencies(
-            db,
-            scenario,
-            snapshot.content or {},
-            environment=environment,
-        )
-        connector_audit = _require_snapshot_connectors(
-            db, scenario, snapshot.content or {}, environment=environment
-        )
-        for old_release in db.execute(
-            select(OntologyRelease).where(
-                OntologyRelease.scenario_id == scenario.id,
-                OntologyRelease.environment == environment,
-                OntologyRelease.status == "released",
-            )
-        ).scalars().all():
-            old_release.status = "superseded"
-        release = OntologyRelease(
-            tenant_id=principal.tenant_id,
-            scenario_id=scenario.id,
-            branch_id=branch.id,
-            snapshot_id=snapshot.id,
-            proposal_id=proposal.id if proposal else None,
-            environment=environment,
-            status="released",
-            notes=_string(notes, "发布说明", maximum=8_000),
-            connector_audit=connector_audit,
-            created_by_user_id=principal.user_id,
-        )
-        db.add(release)
-        db.commit()
-        db.refresh(release)
-        return release
-    except Exception:
-        db.rollback()
-        raise
 
 
-def list_releases(
-    db: Session,
-    scenario_id: str,
-    *,
-    environment: str | None = None,
-) -> list[OntologyRelease]:
+def list_releases(db: Session, scenario_id: str) -> list[OntologyRelease]:
     scenario, _ = _scenario_for_read(db, scenario_id)
-    if environment and environment not in ENVIRONMENTS:
-        raise ReleaseValidationError("发布环境必须为 dev、staging 或 prod")
-    stmt = select(OntologyRelease).where(OntologyRelease.scenario_id == scenario.id)
-    if environment:
-        stmt = stmt.where(OntologyRelease.environment == environment)
-    return db.execute(stmt.order_by(OntologyRelease.created_at.desc())).scalars().all()
+    return list(db.scalars(select(OntologyRelease).where(
+        OntologyRelease.scenario_id == scenario.id,
+        OntologyRelease.tenant_id == scenario.tenant_id,
+        OntologyRelease.deleted_at.is_(None),
+    ).order_by(OntologyRelease.created_at.desc()).limit(200)))
 
 
-def withdraw_environment(
-    db: Session,
-    scenario_id: str,
-    *,
-    environment: str,
-    confirmed: bool,
-    reason: str,
-) -> ReleaseWithdrawalResult:
-    """Atomically remove the active staging/prod deployment pointer.
 
-    Release and snapshot rows remain durable.  ``rolled_back`` is the existing
-    inactive release state; the dedicated withdrawal facts distinguish this
-    lifecycle command from an ontology snapshot rollback without inventing a
-    second active-state vocabulary.
-    """
-    if confirmed is not True:
-        raise ReleaseValidationError("撤下发布必须显式 confirmed=true")
-    if environment not in {"staging", "prod"}:
-        raise ReleaseValidationError("只能撤下 staging 或 prod 环境发布")
-    withdrawal_reason = _string(reason, "撤下原因", maximum=8_000).strip()
-    if not withdrawal_reason:
-        raise ReleaseValidationError("撤下原因不能为空")
-
-    scenario, principal = _scenario_for_manage(db, scenario_id)
-    try:
-        scenario = _lock_template_governance_scenario(db, scenario)
-        active_releases = list(
-            db.scalars(
-                select(OntologyRelease)
-                .where(
-                    OntologyRelease.scenario_id == scenario.id,
-                    OntologyRelease.tenant_id == scenario.tenant_id,
-                    OntologyRelease.environment == environment,
-                    OntologyRelease.status == "released",
-                )
-                .order_by(OntologyRelease.id)
-                .execution_options(populate_existing=True)
-                .with_for_update()
-            ).all()
-        )
-        if not active_releases:
-            previous = db.scalar(
-                select(OntologyRelease)
-                .where(
-                    OntologyRelease.scenario_id == scenario.id,
-                    OntologyRelease.tenant_id == scenario.tenant_id,
-                    OntologyRelease.environment == environment,
-                    OntologyRelease.withdrawn_at.is_not(None),
-                )
-                .order_by(
-                    OntologyRelease.withdrawn_at.desc(),
-                    OntologyRelease.created_at.desc(),
-                    OntologyRelease.id.desc(),
-                )
-                .limit(1)
-            )
-            if previous is None:
-                raise ReleaseConflictError(f"{environment} 环境没有可撤下的活动发布")
-            return ReleaseWithdrawalResult(
-                scenario_id=scenario.id,
-                environment=environment,
-                withdrawn_release_ids=(previous.id,),
-                changed=False,
-                withdrawn_at=previous.withdrawn_at,
-                withdrawn_by_user_id=previous.withdrawn_by_user_id,
-                reason=previous.withdraw_reason or "",
-            )
-
-        withdrawn_at = _now()
-        release_ids = tuple(release.id for release in active_releases)
-        for release in active_releases:
-            release.status = "rolled_back"
-            release.withdrawn_at = withdrawn_at
-            release.withdrawn_by_user_id = principal.user_id
-            release.withdraw_reason = withdrawal_reason
-        db.commit()
-        return ReleaseWithdrawalResult(
-            scenario_id=scenario.id,
-            environment=environment,
-            withdrawn_release_ids=release_ids,
-            changed=True,
-            withdrawn_at=withdrawn_at,
-            withdrawn_by_user_id=principal.user_id,
-            reason=withdrawal_reason,
-        )
-    except Exception:
-        db.rollback()
-        raise
 
 
 def rollback_snapshot(
@@ -3825,13 +3608,10 @@ def rollback_snapshot(
     target_snapshot_id: str,
     confirmed: bool,
     branch_id: str | None = None,
-    environment: str | None = None,
     reason: str = "",
 ) -> OntologyRollback:
     if confirmed is not True:
         raise ReleaseValidationError("回滚必须显式 confirmed=true")
-    if environment and environment not in ENVIRONMENTS:
-        raise ReleaseValidationError("发布环境必须为 dev、staging 或 prod")
     scenario, principal = _scenario_for_manage(db, scenario_id)
     target = _snapshot_for_scenario(db, scenario, target_snapshot_id)
     if target.kind not in ROLLBACKABLE_SNAPSHOT_KINDS:
@@ -3853,75 +3633,14 @@ def rollback_snapshot(
             raise ReleaseValidationError("回滚目标必须属于当前分支")
         if not branch.head_snapshot_id:
             raise ReleaseConflictError("分支没有当前快照")
-        if environment:
-            _require_snapshot_modeling_provenance(target.content or {})
         _validate_snapshot_template_actions(db, scenario, target.content or {})
-        # A staging/prod rollback is an environment deployment transition, not
-        # a mutation of the shared dev authoring definition.  In particular it
-        # must remain possible when dev has moved on from the branch head; the
-        # selected immutable snapshot and its environment bindings are the
-        # only inputs that need validation here.
-        if environment in {"staging", "prod"}:
-            connector_audit = _require_snapshot_connectors(
-                db,
-                scenario,
-                target.content or {},
-                environment=environment,
-            )
-            active_releases = db.execute(
-                select(OntologyRelease)
-                .where(
-                    OntologyRelease.scenario_id == scenario.id,
-                    OntologyRelease.environment == environment,
-                    OntologyRelease.status == "released",
-                )
-                .order_by(OntologyRelease.created_at.desc())
-            ).scalars().all()
-            from_snapshot_id = (
-                active_releases[0].snapshot_id
-                if active_releases
-                else branch.head_snapshot_id
-            )
-            rollback_reason = _string(reason, "回滚原因", maximum=8_000)
-            rollback = OntologyRollback(
-                tenant_id=principal.tenant_id,
-                scenario_id=scenario.id,
-                branch_id=branch.id,
-                from_snapshot_id=from_snapshot_id,
-                target_snapshot_id=target.id,
-                # The environment now resolves the existing immutable target;
-                # do not manufacture/apply a shared-live rollback snapshot.
-                result_snapshot_id=target.id,
-                environment=environment,
-                reason=rollback_reason,
-                connector_audit=connector_audit,
-                created_by_user_id=principal.user_id,
-            )
-            db.add(rollback)
-            for old_release in active_releases:
-                old_release.status = "rolled_back"
-            db.add(
-                OntologyRelease(
-                    tenant_id=principal.tenant_id,
-                    scenario_id=scenario.id,
-                    branch_id=branch.id,
-                    snapshot_id=target.id,
-                    environment=environment,
-                    status="released",
-                    notes=f"回滚：{rollback_reason}".strip(),
-                    connector_audit=connector_audit,
-                    created_by_user_id=principal.user_id,
-                )
-            )
-            db.commit()
-            db.refresh(rollback)
-            return rollback
+        # A branch rollback changes the authored definition. Existing formal
+        # releases remain immutable and require separate human lifecycle commands.
         _ensure_live_matches_head(db, scenario, branch)
         connector_audit = _require_snapshot_connectors(
             db,
             scenario,
             target.content or {},
-            environment=environment or "dev",
         )
         head = _snapshot_for_scenario(db, scenario, branch.head_snapshot_id)
         before = _create_snapshot(
@@ -3955,34 +3674,11 @@ def rollback_snapshot(
             from_snapshot_id=before.id,
             target_snapshot_id=target.id,
             result_snapshot_id=result.id,
-            environment=environment,
             reason=_string(reason, "回滚原因", maximum=8_000),
             connector_audit=connector_audit,
             created_by_user_id=principal.user_id,
         )
         db.add(rollback)
-        if environment:
-            for old_release in db.execute(
-                select(OntologyRelease).where(
-                    OntologyRelease.scenario_id == scenario.id,
-                    OntologyRelease.environment == environment,
-                    OntologyRelease.status == "released",
-                )
-            ).scalars().all():
-                old_release.status = "rolled_back"
-            db.add(
-                OntologyRelease(
-                    tenant_id=principal.tenant_id,
-                    scenario_id=scenario.id,
-                    branch_id=branch.id,
-                    snapshot_id=result.id,
-                    environment=environment,
-                    status="released",
-                    notes=f"回滚：{rollback.reason}".strip(),
-                    connector_audit=connector_audit,
-                    created_by_user_id=principal.user_id,
-                )
-            )
         db.commit()
         db.refresh(rollback)
         return rollback

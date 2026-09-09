@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class AgentMCPServiceCreateIn(BaseModel):
+    release_id: str | None = Field(default=None, min_length=1, max_length=32)
     name: str = Field(min_length=1, max_length=120)
     agent_id: str = Field(min_length=1, max_length=32)
     expires_in_days: int = Field(default=365, ge=1, le=3650)
@@ -51,7 +52,6 @@ class AgentMCPServiceOut(BaseModel):
     token_hint: str
     expires_at: datetime | None = None
     last_used_at: datetime | None = None
-    runtime_environment: str
     definition_hash: str
     created_at: datetime
     updated_at: datetime
@@ -68,5 +68,4 @@ class AgentMCPServiceTestOut(BaseModel):
     message: str
     tool_name: str = "invoke_agent"
     agent_name: str
-    runtime_environment: str
     definition_hash: str

@@ -15,6 +15,7 @@ from ..services import (
     runtime_definition_service,
     tenant_service,
     workflow_payload_service,
+    workflow_approval_policy,
 )
 from ..services.auth_service import get_current_user
 
@@ -39,8 +40,8 @@ operations_router = APIRouter(
 def _workflow_for_run(db: Session, run: WorkflowRun):
     """Resolve a run's own definition instead of today's mutable workflow row.
 
-    A staging/prod run can remain in approval while a later release (or a dev
-    merge) changes the live ``OntologyWorkflow``.  Task-center reads must use
+    A released run can remain in approval while a later release or edit
+    changes the authored ``OntologyWorkflow``. Task-center reads must use
     the same immutable resource that the worker will resume.  A missing or
     inconsistent pin is deliberately represented as unavailable: callers must
     not fall back to a live name or ACL decision.
@@ -73,8 +74,7 @@ def _can_read_run(db: Session, run: WorkflowRun) -> bool:
 
 def _run_for_request(db: Session, run_id: str, *, writable: bool = False, verb: str = "read") -> WorkflowRun:
     run = db.get(WorkflowRun, run_id)
-    current_environment = runtime_connector_service.runtime_environment()
-    if not run or str(run.environment or "dev") != current_environment:
+    if not run:
         raise HTTPException(404, "任务不存在")
     tenant_service.require_scenario(db, run.scenario_id, writable=writable)
     workflow = _workflow_for_run(db, run)
@@ -89,7 +89,7 @@ def _run_for_request(db: Session, run_id: str, *, writable: bool = False, verb: 
 
 def _run_out(db: Session, run: WorkflowRun) -> WorkflowRunOut:
     pending = db.execute(
-        select(WorkflowApprovalRequest.id).where(
+        select(WorkflowApprovalRequest).where(
             WorkflowApprovalRequest.workflow_run_id == run.id,
             WorkflowApprovalRequest.status == "pending",
         ).limit(1)
@@ -101,7 +101,6 @@ def _run_out(db: Session, run: WorkflowRun) -> WorkflowRunOut:
         workflow_id=run.workflow_id,
         workflow_name=workflow.name if workflow else "",
         trigger_source=run.trigger_source,
-        environment=run.environment or "dev",
         definition_snapshot_id=run.definition_snapshot_id,
         release_id=run.release_id,
         definition_hash=run.definition_hash or "",
@@ -120,7 +119,7 @@ def _run_out(db: Session, run: WorkflowRun) -> WorkflowRunOut:
         result=run.result or {},
         pending_approval=bool(pending),
         can_execute=bool(workflow and permission_service.check_workflow(db, workflow, "execute").allowed),
-        can_approve=bool(workflow and permission_service.check_workflow(db, workflow, "approve").allowed),
+        can_approve=bool(workflow and permission_service.check_workflow(db, workflow, "approve").allowed and (not pending or workflow_approval_policy.may_reply(db, workflow, pending.node_id))),
         created_at=run.created_at,
         updated_at=run.updated_at,
     )
@@ -131,6 +130,8 @@ def _approval_out(db: Session, approval: WorkflowApprovalRequest) -> WorkflowApp
     workflow = _workflow_for_run(db, run) if run else None
     return WorkflowApprovalOut(
         id=approval.id,
+        revision=approval.revision,
+        requires_evidence=bool(workflow and workflow_approval_policy.audience(workflow_approval_policy.node_config(workflow, approval.node_id)).requires_evidence),
         workflow_run_id=run.id,
         scenario_id=approval.scenario_id,
         workflow_id=run.workflow_id,
@@ -153,13 +154,11 @@ def list_tasks(
     limit: int = Query(default=80, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    current_environment = runtime_connector_service.runtime_environment()
     stmt = (
         select(WorkflowRun)
         .join(BusinessScenario, BusinessScenario.id == WorkflowRun.scenario_id)
         .where(
             tenant_service.visible_clause(BusinessScenario, db),
-            WorkflowRun.environment == current_environment,
         )
         .order_by(WorkflowRun.created_at.desc())
         .limit(limit)
@@ -183,14 +182,12 @@ def list_approvals(
     limit: int = Query(default=80, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    current_environment = runtime_connector_service.runtime_environment()
     stmt = (
         select(WorkflowApprovalRequest)
         .join(WorkflowRun, WorkflowRun.id == WorkflowApprovalRequest.workflow_run_id)
         .join(BusinessScenario, BusinessScenario.id == WorkflowRun.scenario_id)
         .where(
             tenant_service.visible_clause(BusinessScenario, db),
-            WorkflowRun.environment == current_environment,
         )
         .order_by(WorkflowApprovalRequest.requested_at.asc())
         .limit(limit)
@@ -223,6 +220,9 @@ def approve_task(run_id: str, payload: ApprovalDecisionIn, db: Session = Depends
                 db,
                 run,
                 approved=True,
+                approval_id=payload.approval_id,
+                expected_revision=payload.expected_revision,
+                evidence_refs=[item.model_dump(exclude_none=True) for item in payload.evidence],
                 comment=payload.comment,
                 user_id=str(db.info.get("user_id") or "") or None,
             ),
@@ -241,6 +241,9 @@ def reject_task(run_id: str, payload: ApprovalDecisionIn, db: Session = Depends(
                 db,
                 run,
                 approved=False,
+                approval_id=payload.approval_id,
+                expected_revision=payload.expected_revision,
+                evidence_refs=[item.model_dump(exclude_none=True) for item in payload.evidence],
                 comment=payload.comment,
                 user_id=str(db.info.get("user_id") or "") or None,
             ),

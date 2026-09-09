@@ -1,5 +1,6 @@
 """Schemas intentionally isolated from the first-party UI API contract."""
 from __future__ import annotations
+from .channel_interaction_schemas import ChannelDeliveryOut
 
 from datetime import datetime
 from typing import Any, Literal
@@ -127,7 +128,6 @@ class ExternalObjectPageOut(BaseModel):
 
 
 ExternalCapabilityKind = Literal["function", "action", "rule", "workflow"]
-ExternalCapabilityEnvironment = Literal["dev", "staging", "prod"]
 
 
 class ExternalCapabilityPortOut(BaseModel):
@@ -172,7 +172,6 @@ class ExternalCapabilityReadinessOut(BaseModel):
 
 class ExternalCapabilityOut(BaseModel):
     scenario_id: str
-    environment: ExternalCapabilityEnvironment
     kind: ExternalCapabilityKind
     key: str
     name: str
@@ -248,14 +247,12 @@ class ExternalManagedInputOptionOut(BaseModel):
     label: str
     managed_input: ExternalManagedInputIn
     version_number: int | None = None
-    environment: ExternalCapabilityEnvironment | None = None
     connector_kind: Literal["data_source", "mcp", "llm"] | None = None
     updated_at: datetime | None = None
 
 
 class ExternalManagedInputOptionsOut(BaseModel):
     scenario_id: str
-    environment: ExternalCapabilityEnvironment
     kind: ExternalCapabilityKind
     key: str
     port_key: str
@@ -282,7 +279,7 @@ class ExternalConfirmationIn(BaseModel):
 
 
 class ExternalCapabilityInvocationIn(BaseModel):
-    environment: ExternalCapabilityEnvironment = "prod"
+    release_id: str | None = Field(default=None, min_length=1, max_length=32)
     mode: Literal["execute", "preview", "confirm"] = "execute"
     inputs: dict[str, Any] = Field(default_factory=dict)
     managed_inputs: list[ExternalManagedInputIn] = Field(
@@ -343,6 +340,8 @@ class ExternalCapabilityReceiptOut(BaseModel):
         "cancelled",
         "rejected",
         "timed_out",
+        "awaiting_approval",
+        "indeterminate",
     ]
     capability: dict[str, Any]
     definition_hash: str
@@ -352,3 +351,4 @@ class ExternalCapabilityReceiptOut(BaseModel):
     audit_ref: dict[str, Any] = Field(default_factory=dict)
     confirmation: dict[str, Any] = Field(default_factory=dict)
     error: dict[str, Any] | None = None
+    delivery: ChannelDeliveryOut = Field(default_factory=ChannelDeliveryOut)

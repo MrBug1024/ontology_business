@@ -4,6 +4,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -172,13 +173,14 @@ class Settings(BaseSettings):
     agent_mcp_public_url: str = ""
     agent_mcp_allowed_hosts: str = "localhost,localhost:*,127.0.0.1,127.0.0.1:*,testserver"
 
-    # A process is deployed to exactly one governed runtime environment.  This
-    # value is deliberately server-side: callers cannot select prod/staging by
-    # adding a request parameter to an Action or workflow invocation.
+    # Infrastructure configuration only; never a business data, permission,
+    # connection, queue or release selector. Deployments use separate services.
     runtime_environment: Literal["dev", "staging", "prod"] = "dev"
 
     # Authentication / mail
     auth_cookie_name: str = "ontology_session"
+    public_app_url: str = Field(default="", max_length=2048)
+    bootstrap_superadmin_email: str = Field(default="", max_length=320)
     auth_cookie_secure: bool = False
     auth_session_days: int = 7
     verification_code_minutes: int = 10
@@ -191,6 +193,21 @@ class Settings(BaseSettings):
     mail_ssl_tls: bool = True
     mail_use_credentials: bool = True
     mail_timeout_seconds: int = 20
+
+    @model_validator(mode="after")
+    def validate_public_app_url(self) -> "Settings":
+        value = self.public_app_url.strip().rstrip("/")
+        if value:
+            url = urlsplit(value)
+            local = url.hostname in {"localhost", "127.0.0.1", "::1"}
+            if (url.scheme != "https" and not (url.scheme == "http" and local)) or not url.netloc:
+                raise ValueError("PUBLIC_APP_URL 必须为 HTTPS 平台地址，本地开发可使用 loopback HTTP")
+            if url.username or url.password or url.query or url.fragment or url.path not in {"", "/"}:
+                raise ValueError("PUBLIC_APP_URL 只接受平台 origin，不含路径、凭据或查询参数")
+            if not local and not self.auth_cookie_secure:
+                raise ValueError("线上 PUBLIC_APP_URL 要求 AUTH_COOKIE_SECURE=true")
+        self.public_app_url = value
+        return self
 
     @model_validator(mode="after")
     def resolve_database_url(self) -> "Settings":

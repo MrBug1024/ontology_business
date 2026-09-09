@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+import json
 from typing import Any, ClassVar
 
 from sqlalchemy.orm import Session
@@ -16,6 +17,7 @@ from . import (
     permission_service,
     runtime_definition_service,
     workflow_service,
+    workflow_effects,
 )
 from .capability_contracts import (
     Actor,
@@ -24,6 +26,7 @@ from .capability_contracts import (
     ResolvedDeployment,
     RuntimeDataContext,
     canonical_hash,
+    canonical_json,
 )
 from .capability_provider_keys import (
     BUILTIN_PROVIDER_KEYS,
@@ -46,7 +49,6 @@ def _safe_definition(deployment: ResolvedDeployment) -> Any:
     if (
         definition.scenario.id != deployment.scenario_id
         or definition.scenario.tenant_id != deployment.tenant_id
-        or definition.environment != deployment.environment
         or definition.definition_hash != deployment.definition_hash
         or definition.snapshot_id != deployment.snapshot_id
         or definition.release_id != deployment.release_id
@@ -270,7 +272,6 @@ def _preview_log(
         or preview.mode != "dry_run"
         or preview.status != "dry_run"
         or (preview.input_params or {}) != _structured_input_audit(request.inputs)
-        or preview.environment != deployment.environment
         or preview.definition_snapshot_id != deployment.snapshot_id
         or preview.release_id != deployment.release_id
         or preview.definition_hash != deployment.definition_hash
@@ -515,8 +516,7 @@ class OntologyActionProvider(_BuiltinProvider):
             response = workflow_service.preview_action(
                 self._session(),
                 action,
-                dict(request.inputs),
-                runtime_environment=definition.environment,
+                json.loads(canonical_json(request.inputs)),
                 runtime_definition=definition,
                 commit=False,
                 audit_input_params=_structured_input_audit(request.inputs),
@@ -563,7 +563,7 @@ class OntologyActionProvider(_BuiltinProvider):
             response = workflow_service.execute_action(
                 self._session(),
                 action,
-                dict(request.inputs),
+                json.loads(canonical_json(request.inputs)),
                 confirm=True,
                 dry_run=False,
                 idempotency_key=derive_provider_execution_key(
@@ -572,7 +572,6 @@ class OntologyActionProvider(_BuiltinProvider):
                     deployment,
                 ),
                 enforce_policy=True,
-                runtime_environment=definition.environment,
                 runtime_definition=definition,
                 audit_input_params=_structured_input_audit(request.inputs),
                 external_idempotency_required=True,
@@ -622,7 +621,6 @@ class OntologyActionProvider(_BuiltinProvider):
                 deployment,
             ),
             expected_input_audit=_structured_input_audit(request.inputs),
-            runtime_environment=definition.environment,
             runtime_definition=definition,
         )
         state = str(recovery.get("state") or "indeterminate")
@@ -661,8 +659,8 @@ class OntologyWorkflowProvider(_BuiltinProvider):
             ),
             "required_roles": [],
             "required_scopes": [],
-            "side_effect": True,
-            "requires_confirmation": True,
+            "side_effect": workflow_effects.requires_execution_confirmation(workflow),
+            "requires_confirmation": workflow_effects.requires_execution_confirmation(workflow),
             "idempotency_required": True,
         }
 
@@ -683,6 +681,7 @@ class OntologyWorkflowProvider(_BuiltinProvider):
             raise PermissionError("workflow preview is not permitted")
         return {
             "node_count": len(list(workflow.nodes or [])),
+            "summary": f"准备执行：{workflow.name}。\n" + (str(workflow.description).strip() + "\n" if workflow.description else "") + "确认后将执行本流程中已配置的业务操作，可能写入业务记录或调用外部系统。当前尚未执行。",
             "preview": True,
             "side_effects_skipped": True,
             "step_count": len(list(workflow.steps or [])),
@@ -698,16 +697,16 @@ class OntologyWorkflowProvider(_BuiltinProvider):
         data_context: RuntimeDataContext,
     ) -> Mapping[str, Any]:
         self._require_supported_data_context(data_context)
-        if request.mode != "confirm":
+        definition, workflow = self._ready_resource(request.capability, deployment)
+        if workflow_effects.requires_execution_confirmation(workflow) and request.mode != "confirm":
             raise BuiltinCapabilityProviderError(
                 "workflow enqueue requires a confirmed provider invocation"
             )
-        definition, workflow = self._ready_resource(request.capability, deployment)
         created_by_user_id = _session_user_id(self._session(), actor)
         run, created = operations_service.enqueue_workflow_run(
             self._session(),
             workflow,
-            dict(request.inputs),
+            json.loads(canonical_json(request.inputs)),
             trigger_source="manual",
             dedupe_key=derive_provider_execution_key(
                 request,

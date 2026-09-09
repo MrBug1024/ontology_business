@@ -140,7 +140,6 @@ def _dataset_binding_ready(db: Session, binding: ScenarioDatasetBinding) -> bool
                 DatasetHead.id == binding.dataset_head_id,
                 DatasetHead.dataset_id == binding.dataset_id,
                 DatasetHead.tenant_id == binding.tenant_id,
-                DatasetHead.environment == binding.environment,
                 DatasetVersion.status == "ready",
             )
         ).scalar_one_or_none()
@@ -152,7 +151,6 @@ def _runtime_port_issues(
     db: Session,
     agent: Agent,
     definition: Any,
-    environment: str,
 ) -> list[dict[str, Any]]:
     tenant_id = tenant_service.current_tenant_id(db)
     issues: list[dict[str, Any]] = []
@@ -180,7 +178,7 @@ def _runtime_port_issues(
             issues.append(
                 _issue(
                     "runtime_binding_missing",
-                    f"当前环境缺少受管绑定：{getattr(port, 'name', key)}",
+                    f"当前调用缺少受管绑定：{getattr(port, 'name', key)}",
                     f"resource-binding:{key}",
                 )
             )
@@ -191,8 +189,8 @@ def compute_agent_readiness(
     db: Session,
     agent: Agent,
     *,
-    environment: str | None = None,
     runtime_binding_mode: str | None = None,
+    release_id: str | None = None,
 ) -> dict[str, Any]:
     """Compute four independent readiness axes without resolving business data.
 
@@ -237,11 +235,7 @@ def compute_agent_readiness(
         }
         return _with_flat_axes(readiness)
 
-    # Validation is a control-plane activity and always checks the live
-    # authoring definition unless a caller explicitly asks for a released
-    # staging/prod deployment.  The process deployment environment must never
-    # make an online authoring installation unusable.
-    target_environment = environment or "dev"
+    # Validation explicitly selects authored content or one published version.
     definition_issues: list[dict[str, Any]] = []
     validation_issues: list[dict[str, Any]] = []
     release_issues: list[dict[str, Any]] = []
@@ -262,8 +256,8 @@ def compute_agent_readiness(
         else:
             try:
                 permission_service.require_scenario_permission(db, scenario, "read")
-                definition = runtime_definition_service.resolve_active(
-                    db, scenario, environment="dev"
+                definition = runtime_definition_service.resolve_authoring(
+                    db, scenario
                 )
                 agent_capability_service.validate_scope(
                     db,
@@ -298,7 +292,7 @@ def compute_agent_readiness(
         release_issues.extend(definition_issues or [
             _issue("definition_required", "需要有效能力定义", "scenario-definition")
         ])
-    elif target_environment == "dev":
+    elif release_id is None:
         try:
             release_service.capture_snapshot_content(db, scenario)
             target_definition = definition
@@ -313,13 +307,13 @@ def compute_agent_readiness(
     else:
         try:
             target_definition = runtime_definition_service.resolve_active(
-                db, scenario, environment=target_environment
+                db, scenario, release_id=release_id,
             )
         except Exception:
             release_issues.append(
                 _issue(
                     "active_release_required",
-                    f"{target_environment} 环境尚无有效发布",
+                    "指定发布不存在或尚未启用",
                     "release-governance",
                 )
             )
@@ -328,7 +322,7 @@ def compute_agent_readiness(
         runtime_issues.extend(release_issues)
     elif target_definition is not None:
         runtime_issues.extend(
-            _runtime_port_issues(db, agent, target_definition, target_environment)
+            _runtime_port_issues(db, agent, target_definition)
         )
     if mode in _HISTORICAL_RUNTIME_MODES:
         runtime_issues.append(

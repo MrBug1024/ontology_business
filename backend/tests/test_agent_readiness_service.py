@@ -90,7 +90,7 @@ def test_zero_data_capability_is_valid_without_entities_sources_or_mappings() ->
         db.commit()
 
         readiness = agent_readiness_service.compute_agent_readiness(
-            db, agent, environment="dev"
+            db, agent,
         )
         assert readiness["definition_valid"] is True
         assert readiness["validation_ready"] is True
@@ -139,7 +139,7 @@ def test_historical_mode_blocks_runtime_without_reclassifying_invocation_input()
         db.commit()
 
         readiness = agent_readiness_service.compute_agent_readiness(
-            db, agent, environment="dev"
+            db, agent,
         )
         assert readiness["definition_valid"] is True
         assert readiness["validation_ready"] is True
@@ -169,7 +169,7 @@ def test_missing_model_blocks_validation_but_not_definition_or_release() -> None
         db.add(agent)
         db.commit()
         readiness = agent_readiness_service.compute_agent_readiness(
-            db, agent, environment="dev"
+            db, agent,
         )
         assert readiness["definition_valid"] is True
         assert readiness["validation_ready"] is False
@@ -196,7 +196,7 @@ def test_explicit_legacy_mode_keeps_fixed_data_prerequisites() -> None:
         db.add(agent)
         db.commit()
         readiness = agent_readiness_service.compute_agent_readiness(
-            db, agent, environment="dev"
+            db, agent,
         )
         labels = [item["label"] for item in readiness["validation"]["missing"]]
         assert readiness["validation_ready"] is False

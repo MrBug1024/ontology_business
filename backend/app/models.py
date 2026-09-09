@@ -20,6 +20,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    text,
     UniqueConstraint,
 )
 from sqlalchemy.dialects import postgresql
@@ -65,9 +66,6 @@ def _assistant_attachment_expiry() -> datetime:
     return _now() + timedelta(hours=24)
 
 
-def _runtime_environment_default() -> str:
-    """Default control-plane rows without consulting host deployment config."""
-    return "dev"
 
 
 def normalize_mcp_name_key(value: str) -> str:
@@ -98,6 +96,8 @@ class User(Base):
     __tablename__ = "users"
     __table_args__ = (
         UniqueConstraint("id", "tenant_id", name="uq_users_id_tenant"),
+        CheckConstraint("system_role IN ('user', 'superadmin')", name="ck_users_system_role"),
+        CheckConstraint("status IN ('pending', 'active', 'disabled')", name="ck_users_status"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -106,6 +106,9 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(120), default="")
     password_hash: Mapped[str] = mapped_column(String(300), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / active / disabled
+    system_role: Mapped[str] = mapped_column(String(20), default="user", server_default="user")
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
@@ -159,6 +162,7 @@ class OrganizationRole(Base):
     __tablename__ = "organization_roles"
     __table_args__ = (
         UniqueConstraint("organization_id", "key", name="uq_organization_role_key"),
+        UniqueConstraint("id", "organization_id", name="uq_org_roles_id_org"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -172,7 +176,9 @@ class OrganizationRole(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     organization: Mapped[Organization] = relationship(back_populates="roles")
-    members: Mapped[list["OrganizationMember"]] = relationship(back_populates="role")
+    members: Mapped[list["OrganizationMember"]] = relationship(
+        back_populates="role", foreign_keys="OrganizationMember.role_id"
+    )
     grants: Mapped[list["AuthorizationGrant"]] = relationship(back_populates="role")
 
 
@@ -183,6 +189,10 @@ class OrganizationMember(Base):
     __table_args__ = (
         UniqueConstraint("organization_id", "user_id", name="uq_organization_member_user"),
         Index("ix_organization_members_org_role", "organization_id", "role_id"),
+        ForeignKeyConstraint(
+            ["role_id", "organization_id"], ["organization_roles.id", "organization_roles.organization_id"],
+            name="fk_org_member_role_org", ondelete="RESTRICT",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -194,14 +204,15 @@ class OrganizationMember(Base):
         ForeignKey("organization_roles.id", ondelete="RESTRICT"), index=True
     )
     status: Mapped[str] = mapped_column(String(20), default="active")
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
     )
 
-    organization: Mapped[Organization] = relationship(back_populates="members")
+    organization: Mapped[Organization] = relationship(back_populates="members", foreign_keys=[organization_id])
     user: Mapped[User] = relationship(back_populates="organization_memberships")
-    role: Mapped[OrganizationRole] = relationship(back_populates="members")
+    role: Mapped[OrganizationRole] = relationship(back_populates="members", foreign_keys=[role_id])
 
 
 class AuthorizationGrant(Base):
@@ -253,6 +264,9 @@ class AuthSession(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    active_tenant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -603,8 +617,8 @@ class DataMapping(Base):
     data_source_id: Mapped[str] = mapped_column(
         ForeignKey("data_sources.id", ondelete="CASCADE"), index=True
     )
-    # 物理数据源仅用于开发环境兼容与定义预览。非开发环境刷新由逻辑绑定键
-    # 解析到该环境已发布、已验签的连接器，不能据此直接选中 dev 数据源。
+    # 已发布调用通过逻辑绑定键解析并验证连接身份；物理来源引用仅保留于
+    # 旧建模记录，不能替代发布连接的归属与签名校验。
     data_source_binding_key: Mapped[str] = mapped_column(String(180), default="")
     data_source_binding_ref: Mapped[dict] = mapped_column(JSON, default=dict)
     # New catalog-backed mappings point at a stable logical relation.  The
@@ -623,9 +637,6 @@ class DataMapping(Base):
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_row_count: Mapped[int] = mapped_column(Integer, default=0)
     last_imported_count: Mapped[int] = mapped_column(Integer, default=0)
-    # 按部署环境保存刷新状态；旧顶层字段继续承载 dev 的兼容视图，避免共享
-    # 数据库中的 staging/prod worker 覆盖开发环境的可见状态。
-    environment_status: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship(back_populates="data_mappings")
@@ -1030,7 +1041,7 @@ class DataMappingRefreshJob(Base):
 
     __tablename__ = "data_mapping_refresh_jobs"
     __table_args__ = (
-        Index("ix_mapping_refresh_jobs_dispatch", "environment", "status", "available_at"),
+        Index("ix_mapping_refresh_jobs_dispatch", "status", "available_at"),
         Index("ix_mapping_refresh_jobs_mapping_created", "mapping_id", "created_at"),
         UniqueConstraint("tenant_id", "active_key", name="uq_mapping_refresh_jobs_active_key"),
     )
@@ -1044,16 +1055,15 @@ class DataMappingRefreshJob(Base):
     )
     mapping_id: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     requested_by_user_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    environment: Mapped[str] = mapped_column(String(20), default=_runtime_environment_default, index=True)
-    # 同一映射同一环境只保留一个活跃任务；终态会清空，允许下一次刷新。
+    # 同一映射只保留一个活跃任务；终态会清空，允许下一次刷新。
     active_key: Mapped[str | None] = mapped_column(String(260), nullable=True)
     # Immutable, credential-free mapping definition captured when the job is
-    # queued.  A staging/prod worker must never reread mutable live mapping
+    # queued.  A worker executing a pinned release must never reread mutable live mapping
     # fields after a release has been selected.
     mapping_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     mapping_fingerprint: Mapped[str] = mapped_column(String(64), default="")
     relation_mapping_fingerprint: Mapped[str] = mapped_column(String(64), default="")
-    # Release provenance for a frozen mapping job.  ``dev`` jobs explicitly
+    # Release provenance for a frozen mapping job.  Authored validation jobs explicitly
     # retain ``live`` as their source while still carrying mapping_snapshot so
     # queue/retry work cannot drift with later edits.
     definition_snapshot_id: Mapped[str | None] = mapped_column(
@@ -1524,9 +1534,9 @@ class AgentTurnRun(Base):
             name="uq_agent_turn_runs_parent_retry",
         ),
         ForeignKeyConstraint(
-            ["requested_by_user_id", "tenant_id"],
-            ["users.id", "users.tenant_id"],
-            name="fk_agent_turn_runs_user_tenant",
+            ["requested_by_user_id"],
+            ["users.id"],
+            name="fk_agent_turn_runs_user",
         ),
         ForeignKeyConstraint(
             ["agent_id", "tenant_id"],
@@ -1563,10 +1573,6 @@ class AgentTurnRun(Base):
             "'planning', 'invoking_tools', 'responding', 'cancel_requested', "
             "'succeeded', 'failed', 'cancelled', 'indeterminate')",
             name="ck_agent_turn_runs_status",
-        ),
-        CheckConstraint(
-            "environment IN ('dev', 'staging', 'prod')",
-            name="ck_agent_turn_runs_environment",
         ),
         CheckConstraint("revision > 0", name="ck_agent_turn_runs_revision"),
         CheckConstraint(
@@ -1629,9 +1635,6 @@ class AgentTurnRun(Base):
         _json_document_type(), default=dict, nullable=False
     )
     request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    environment: Mapped[str] = mapped_column(
-        String(20), default=_runtime_environment_default, nullable=False
-    )
     status: Mapped[str] = mapped_column(
         String(30), default="accepted", nullable=False, index=True
     )
@@ -1825,9 +1828,9 @@ class AssistantRequestRun(Base):
             name="uq_assistant_request_runs_principal_request",
         ),
         ForeignKeyConstraint(
-            ["requested_by_user_id", "tenant_id"],
-            ["users.id", "users.tenant_id"],
-            name="fk_assistant_request_runs_user_tenant",
+            ["requested_by_user_id"],
+            ["users.id"],
+            name="fk_assistant_request_runs_user",
         ),
         ForeignKeyConstraint(
             ["parent_run_id", "tenant_id"],
@@ -2635,7 +2638,7 @@ class OntologyReview(Base):
 
 
 class OntologyRelease(Base):
-    """向 dev/staging/prod 环境推广一个已治理快照的不可变发布记录。"""
+    """人工创建的场景能力快照及其独立启用生命周期。"""
 
     __tablename__ = "ontology_releases"
     __table_args__ = (
@@ -2646,7 +2649,13 @@ class OntologyRelease(Base):
             "snapshot_id",
             name="uq_releases_id_tenant_scenario_snapshot",
         ),
-        Index("ix_ontology_releases_scenario_environment", "scenario_id", "environment", "created_at"),
+        Index("ix_ontology_releases_scenario", "scenario_id", "created_at"),
+        Index("uq_ontology_releases_enabled", "scenario_id", unique=True,
+              postgresql_where=text("enabled"), sqlite_where=text("enabled")),
+        CheckConstraint("revision > 0", name="ck_ontology_releases_revision"),
+        CheckConstraint("NOT enabled OR (status = 'released' AND deleted_at IS NULL AND retired_at IS NULL)",
+                        name="ck_ontology_releases_enabled"),
+        CheckConstraint("deleted_at IS NULL OR status = 'retired'", name="ck_ontology_releases_deleted"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -2656,8 +2665,8 @@ class OntologyRelease(Base):
     scenario_id: Mapped[str] = mapped_column(
         ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
     )
-    branch_id: Mapped[str] = mapped_column(
-        ForeignKey("ontology_branches.id", ondelete="RESTRICT"), index=True
+    branch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ontology_branches.id", ondelete="RESTRICT"), nullable=True, index=True
     )
     snapshot_id: Mapped[str] = mapped_column(
         ForeignKey("ontology_snapshots.id", ondelete="RESTRICT"), index=True
@@ -2665,15 +2674,16 @@ class OntologyRelease(Base):
     proposal_id: Mapped[str | None] = mapped_column(
         ForeignKey("ontology_proposals.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    # dev / staging / prod
-    environment: Mapped[str] = mapped_column(String(20), nullable=False)
-    # released / superseded / rolled_back.  An explicit environment withdrawal
-    # reuses the inactive ``rolled_back`` state and records its own audit facts
-    # below so it cannot be confused with a snapshot rollback.
+    name: Mapped[str] = mapped_column(String(160), default="", nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Historical inactive statuses remain readable by already-pinned runs.
     status: Mapped[str] = mapped_column(String(20), default="released")
     notes: Mapped[str] = mapped_column(Text, default="")
     # Immutable, credential-free evidence of the bindings that passed the
-    # environment gate at release time.  Runtime connector config never enters
+    # binding checks at release time. Runtime connector config never enters
     # this JSON document.
     connector_audit: Mapped[list] = mapped_column(JSON, default=list)
     created_by_user_id: Mapped[str | None] = mapped_column(
@@ -2689,7 +2699,7 @@ class OntologyRelease(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     scenario: Mapped[BusinessScenario] = relationship(back_populates="ontology_releases")
-    branch: Mapped[OntologyBranch] = relationship(back_populates="releases")
+    branch: Mapped[OntologyBranch | None] = relationship(back_populates="releases")
 
 
 class OntologyRollback(Base):
@@ -2719,7 +2729,6 @@ class OntologyRollback(Base):
     result_snapshot_id: Mapped[str] = mapped_column(
         ForeignKey("ontology_snapshots.id", ondelete="RESTRICT"), index=True
     )
-    environment: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     reason: Mapped[str] = mapped_column(Text, default="")
     connector_audit: Mapped[list] = mapped_column(JSON, default=list)
     created_by_user_id: Mapped[str | None] = mapped_column(
@@ -2732,20 +2741,20 @@ class OntologyRollback(Base):
 
 
 class ConnectorBinding(Base):
-    """A scenario/environment-specific reference to a reusable connector.
+    """A scenario-specific reference to a reusable connector.
 
     Connector credentials remain in ``DataSource``, ``MCPConfig`` or
     ``LLMConfig``.  This table only stores the safe, auditable association that
-    lets an imported package resolve a portable external reference in a target
-    environment.  The connector id is intentionally polymorphic: the kind
+    lets an imported package resolve a portable external reference in its
+    scenario. The connector id is intentionally polymorphic: the kind
     controls which source table is resolved by the service layer.
     """
 
     __tablename__ = "connector_bindings"
     __table_args__ = (
         UniqueConstraint(
-            "scenario_id", "environment", "binding_key",
-            name="uq_connector_bindings_scenario_environment_key",
+            "scenario_id", "binding_key",
+            name="uq_connector_bindings_scenario_key",
         ),
         UniqueConstraint(
             "id", "tenant_id", "scenario_id",
@@ -2758,7 +2767,7 @@ class ConnectorBinding(Base):
             name="ck_connector_bindings_structure_fingerprint",
         ),
         Index("ix_connector_bindings_connector", "connector_kind", "connector_id"),
-        Index("ix_connector_bindings_scenario_environment", "scenario_id", "environment"),
+        Index("ix_connector_bindings_scenario", "scenario_id"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -2768,8 +2777,6 @@ class ConnectorBinding(Base):
     scenario_id: Mapped[str] = mapped_column(
         ForeignKey("business_scenarios.id", ondelete="CASCADE"), index=True
     )
-    # dev / staging / prod; validated centrally in connector_service.
-    environment: Mapped[str] = mapped_column(String(20), nullable=False)
     # Stable portable-reference key.  It never contains a credential or source id.
     binding_key: Mapped[str] = mapped_column(String(180), nullable=False)
     reference_label: Mapped[str] = mapped_column(String(300), default="")
@@ -2855,9 +2862,8 @@ class WorkflowRun(Base):
         _json_document_type(), default=dict, nullable=False
     )
     input_digest: Mapped[str] = mapped_column(String(64), default="", nullable=False)
-    # Fixed when queued so approval/retry cannot silently switch environments.
-    environment: Mapped[str] = mapped_column(String(20), default=_runtime_environment_default)
-    # A staging/prod run pins the immutable released definition.  The live
+    # Fixed when queued so approval/retry cannot silently switch definitions.
+    # A published invocation pins the immutable released definition. The live
     # workflow FK above remains for lineage compatibility and referential safety;
     # execution resolves these fields rather than reading mutable live columns.
     definition_snapshot_id: Mapped[str | None] = mapped_column(
@@ -2910,7 +2916,10 @@ class WorkflowApprovalRequest(Base):
     __tablename__ = "workflow_approval_requests"
     __table_args__ = (
         Index("ix_workflow_approvals_pending", "status", "requested_at"),
-        Index("uq_workflow_approvals_node", "workflow_run_id", "node_id", unique=True),
+        Index("uq_workflow_approvals_execution_node", "workflow_run_id", "execution_key", "node_id", unique=True),
+        CheckConstraint("revision > 0", name="ck_workflow_approval_revision"),
+        UniqueConstraint("id", "scenario_id", name="uq_workflow_approval_id_scenario"),
+        UniqueConstraint("resolved_by_user_id", "decision_message_id", name="uq_workflow_approval_decision_message"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -2932,6 +2941,11 @@ class WorkflowApprovalRequest(Base):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     comment: Mapped[str] = mapped_column(Text, default="")
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    decision_message_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    execution_key: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    decision_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    evidence_refs: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
 
     workflow_run: Mapped[WorkflowRun] = relationship(back_populates="approvals")
 
@@ -2955,13 +2969,15 @@ class EventEnvelope(Base):
     name: Mapped[str] = mapped_column(String(200), default="")
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     source: Mapped[str] = mapped_column(String(60), default="manual")
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=True,
+    )
     source_run_id: Mapped[str | None] = mapped_column(
         ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True
     )
     # Event delivery and its subscribers are resolved from one deployment
     # definition; otherwise an event emitted by release A could enqueue a live
-    # workflow from release B after a dev merge.
-    environment: Mapped[str] = mapped_column(String(20), default=_runtime_environment_default)
+    # workflow from release B after an authoring merge.
     definition_snapshot_id: Mapped[str | None] = mapped_column(
         ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -3018,10 +3034,7 @@ class ActionExecutionLog(Base):
     mode: Mapped[str] = mapped_column(String(20), default="execute")
     # 同一个业务请求的幂等键；预演和确认提醒不要求填写。
     idempotency_key: Mapped[str | None] = mapped_column(String(120), index=True, nullable=True)
-    # Provenance for an execution that came from a frozen staging/prod release.
-    # ``environment`` also scopes idempotency so equal caller keys cannot replay
-    # a result produced in another deployment environment.
-    environment: Mapped[str] = mapped_column(String(20), default=_runtime_environment_default)
+    # Frozen release provenance stays attached to each execution and replay.
     definition_snapshot_id: Mapped[str | None] = mapped_column(
         ForeignKey("ontology_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -3032,7 +3045,7 @@ class ActionExecutionLog(Base):
     definition_source: Mapped[str] = mapped_column(String(20), default="live")
     # 执行结果
     result: Mapped[dict] = mapped_column(JSON, default=dict)
-    # Credential-free runtime connector evidence (environment/key/target only).
+    # Credential-free runtime connector evidence (logical key and signed target).
     connector_audit: Mapped[list] = mapped_column(JSON, default=list)
     # Complete decision-chain provenance.  These columns deliberately remain
     # nullable for legacy/background records that do not carry a verifiable
@@ -3347,9 +3360,9 @@ class ManagedUploadRun(Base):
         ),
         UniqueConstraint("id", "tenant_id", name="uq_managed_upload_runs_id_tenant"),
         ForeignKeyConstraint(
-            ["requested_by_user_id", "tenant_id"],
-            ["users.id", "users.tenant_id"],
-            name="fk_managed_upload_runs_user_tenant",
+            ["requested_by_user_id"],
+            ["users.id"],
+            name="fk_managed_upload_runs_user",
         ),
         ForeignKeyConstraint(
             ["parent_run_id", "tenant_id"],
@@ -4076,11 +4089,11 @@ class DatasetFragment(Base):
 
 
 class DatasetHead(Base):
-    """Atomic environment pointer to the active immutable dataset version."""
+    """Atomic logical dataset pointer to its current immutable version."""
 
     __tablename__ = "dataset_heads"
     __table_args__ = (
-        UniqueConstraint("dataset_id", "environment", name="uq_dataset_heads_environment"),
+        UniqueConstraint("dataset_id", name="uq_dataset_heads_dataset"),
         UniqueConstraint("id", "dataset_id", name="uq_dataset_heads_id_dataset"),
         UniqueConstraint(
             "id", "dataset_id", "tenant_id", name="uq_dataset_heads_id_scope"
@@ -4107,10 +4120,6 @@ class DatasetHead(Base):
             name="fk_dataset_heads_version_dataset",
             ondelete="RESTRICT",
         ),
-        CheckConstraint(
-            "environment IN ('dev', 'staging', 'prod')",
-            name="ck_dataset_heads_environment",
-        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -4120,7 +4129,6 @@ class DatasetHead(Base):
     dataset_id: Mapped[str] = mapped_column(
         ForeignKey("logical_datasets.id", ondelete="RESTRICT"), nullable=False, index=True
     )
-    environment: Mapped[str] = mapped_column(String(20), nullable=False)
     dataset_version_id: Mapped[str] = mapped_column(
         String(32), nullable=False, index=True
     )
@@ -4402,7 +4410,7 @@ class ScenarioDatasetBinding(Base):
     __tablename__ = "scenario_dataset_bindings"
     __table_args__ = (
         UniqueConstraint(
-            "scenario_id", "environment", "binding_key",
+            "scenario_id", "binding_key",
             name="uq_scenario_dataset_binding_key",
         ),
         UniqueConstraint(
@@ -4428,10 +4436,6 @@ class ScenarioDatasetBinding(Base):
             "role IN ('input', 'modeling_evidence', 'test_fixture', "
             "'invocation_input', 'reference', 'rules', 'output')",
             name="ck_scenario_dataset_bindings_role",
-        ),
-        CheckConstraint(
-            "environment IN ('dev', 'staging', 'prod')",
-            name="ck_scenario_dataset_bindings_environment",
         ),
         CheckConstraint(
             "status IN ('active', 'disabled', 'error')",
@@ -4474,8 +4478,8 @@ class ScenarioDatasetBinding(Base):
         ),
         Index("ix_scenario_dataset_bindings_dataset", "dataset_id", "status"),
         Index(
-            "ix_scenario_dataset_bindings_scenario_environment",
-            "scenario_id", "environment", "role", "status",
+            "ix_scenario_dataset_bindings_scenario",
+            "scenario_id", "role", "status",
         ),
     )
 
@@ -4491,9 +4495,6 @@ class ScenarioDatasetBinding(Base):
     )
     binding_key: Mapped[str] = mapped_column(String(180), nullable=False)
     role: Mapped[str] = mapped_column(String(20), default="input", nullable=False)
-    environment: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="dev", server_default="dev"
-    )
     binding_mode: Mapped[str] = mapped_column(String(20), nullable=False)
     dataset_head_id: Mapped[str | None] = mapped_column(
         String(32), nullable=True, index=True
@@ -4673,7 +4674,7 @@ class CapabilityInvocation(Base):
         ),
         UniqueConstraint(
             "tenant_id", "scenario_id", "capability_kind", "capability_key",
-            "definition_hash", "deployment_fingerprint", "idempotency_key",
+            "idempotency_key",
             name="uq_capability_invocations_idempotency",
         ),
         ForeignKeyConstraint(
@@ -4692,10 +4693,6 @@ class CapabilityInvocation(Base):
             ],
             name="fk_capability_invocations_release_scope",
             ondelete="RESTRICT",
-        ),
-        CheckConstraint(
-            "environment IN ('dev', 'staging', 'prod')",
-            name="ck_capability_invocations_environment",
         ),
         CheckConstraint(
             "invocation_source IN ('internal', 'agent', 'rest', 'mcp')",
@@ -4749,7 +4746,7 @@ class CapabilityInvocation(Base):
         ),
         Index(
             "ix_capability_invocations_dispatch",
-            "environment", "status", "created_at",
+            "status", "created_at",
         ),
         Index(
             "ix_capability_invocations_capability_created",
@@ -4787,7 +4784,6 @@ class CapabilityInvocation(Base):
     definition_snapshot_id: Mapped[str | None] = mapped_column(
         String(32), nullable=True, index=True
     )
-    environment: Mapped[str] = mapped_column(String(20), nullable=False)
     capability_kind: Mapped[str] = mapped_column(String(40), nullable=False)
     capability_key: Mapped[str] = mapped_column(String(240), nullable=False)
     definition_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -4804,7 +4800,7 @@ class CapabilityInvocation(Base):
         String(180), nullable=True
     )
     input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     request_document: Mapped[dict] = mapped_column(
         _json_document_type(), default=dict, nullable=False
     )

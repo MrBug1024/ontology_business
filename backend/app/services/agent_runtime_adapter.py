@@ -36,12 +36,14 @@ from ..models import (
     LLMConfig,
 )
 from . import (
+    agent_capability_confirmation_payload,
     agent_capability_service,
     capability_application_service,
+    capability_delivery_service,
     input_contract_validator,
     llm_service,
     permission_service,
-    runtime_connector_service,
+    runtime_definition_service,
     tenant_service,
 )
 from .capability_contracts import (
@@ -457,6 +459,11 @@ def _model_receipt_projection(
     """Return the bounded receipt view allowed in model and chat history."""
 
     plain = json.loads(canonical_json(document))
+    if isinstance(plain.get("confirmation"), dict) and plain["confirmation"]:
+        plain["confirmation"] = {
+            "required": bool(plain["confirmation"].get("required")),
+            "next_step": "等待经认证人员在原会话回复确认；模型不能生成确认或业务审批。",
+        }
     serialized = canonical_json(plain)
     if len(serialized.encode("utf-8")) <= _MAX_MODEL_RECEIPT_BYTES:
         return plain
@@ -485,7 +492,7 @@ def _model_receipt_projection(
             plain.get("data_context_fingerprint") or ""
         )[:128],
         "receipt_hash": canonical_hash(
-            plain,
+            document,
             domain="agent-capability-receipt-v1",
         ),
         "result_hash": canonical_hash(
@@ -615,7 +622,7 @@ class CapabilityAgentRuntime:
         llm: LLMConfig,
         *,
         turn_input: AgentTurnInput | None = None,
-        environment: str | None = None,
+        release_id: str | None = None,
     ) -> None:
         self.db = db
         self.agent = agent
@@ -638,23 +645,23 @@ class CapabilityAgentRuntime:
             "read",
             message="没有使用该 Agent 业务场景的权限",
         )
-        self.environment = runtime_connector_service.runtime_environment(environment)
-        if self.environment not in {"dev", "staging", "prod"}:
-            raise AgentRuntimeAdapterError(
-                "invalid_runtime_environment",
-                "Agent runtime environment must be dev, staging, or prod",
-            )
         try:
+            definition = (
+                runtime_definition_service.resolve_active(db, self.scenario, release_id=release_id)
+                if release_id else runtime_definition_service.resolve_authoring(db, self.scenario)
+            )
             raw_catalog = capability_application_service.list_capabilities(
                 db,
                 self.scenario,
-                environment=self.environment,
+                definition=definition,
             )
             deployment, deployment_inputs = capability_application_service.resolve_deployment(
                 db,
                 self.scenario,
-                environment=self.environment,
+                definition=definition,
             )
+        except runtime_definition_service.RuntimeDefinitionError as exc:
+            raise AgentRuntimeAdapterError("release_unavailable", str(exc)) from exc
         except capability_application_service.CapabilityApplicationError as exc:
             raise AgentRuntimeAdapterError(exc.code, exc.message) from exc
         if any(
@@ -687,7 +694,6 @@ class CapabilityAgentRuntime:
                 select(ConnectorBinding).where(
                     ConnectorBinding.tenant_id == self.tenant_id,
                     ConnectorBinding.scenario_id == self.scenario.id,
-                    ConnectorBinding.environment == self.environment,
                     ConnectorBinding.connector_kind == "data_source",
                     ConnectorBinding.connector_id.in_([item.id for item in self.runtime_connections]),
                 )
@@ -1456,10 +1462,14 @@ class CapabilityAgentRuntime:
                 self.scenario,
                 self._actor(),
                 request,
-                environment=self.environment,
                 invocation_source="agent",
+                definition=self.runtime_definition,
             )
             document = capability_application_service.receipt_document(receipt)
+            if document["status"] == "awaiting_confirmation":
+                agent_capability_confirmation_payload.remember_preview(
+                    self.db, document["invocation_id"], self._actor(), request,
+                )
             self._record_receipt(document)
             return json.dumps(
                 self._model_receipt(document),
@@ -1522,7 +1532,7 @@ class CapabilityAgentRuntime:
         # Legacy rows may contain the canonical receipt. They remain eligible
         # only so replay can replace them with the same bounded projection used
         # for new turns; the full document is never returned to the model.
-        return normalized in (
+        return capability_delivery_service.can_refresh_workflow_history(normalized, current) or normalized in (
             canonical_current,
             projected_current,
             _model_receipt_projection(current),
@@ -1557,7 +1567,7 @@ class CapabilityAgentRuntime:
         normalized = json.loads(canonical_json(parsed))
         canonical_current = json.loads(canonical_json(current))
         projection = self._model_receipt(current)
-        if normalized not in (canonical_current, projection, _model_receipt_projection(current)):
+        if not capability_delivery_service.can_refresh_workflow_history(normalized, current) and normalized not in (canonical_current, projection, _model_receipt_projection(current)):
             return None
         return json.dumps(projection, ensure_ascii=False, sort_keys=True)
 
@@ -1580,6 +1590,9 @@ class CapabilityAgentRuntime:
         return "\n".join(
             [
                 base,
+                "【消息渠道】使用纯文本回答，不使用 Markdown 标记、表格、按钮或弹窗。"
+                "执行回执中的 delivery.text 可直接交付用户；排队不等于完成，等待审批不等于批准。"
+                "需要确认时引用服务端给出的回复文本，不要求用户前往平台页面。内部 ID、哈希和技术字段不进入普通回答。",
                 f"【验证 Agent 职责】{self.agent.description}" if self.agent.description else "",
                 f"【当前业务场景】{self.scenario.name}",
                 "【能力运行约束】只使用本轮提供的通用能力工具。先核对机器可读契约，再按 kind/key 调用；"
@@ -1683,6 +1696,7 @@ class CapabilityAgentRuntime:
             tool_calls: list[dict[str, Any]] = []
             if before_llm_call is not None:
                 before_llm_call()
+            yield {"type": "response_start", "data": None}
             for event in llm_service.chat_stream(
                 self.llm,
                 messages,
@@ -1693,12 +1707,11 @@ class CapabilityAgentRuntime:
             ):
                 if event["type"] == "token":
                     content_parts.append(event["content"])
+                    yield {"type": "token", "data": event["content"]}
                 elif event["type"] == "tool_calls":
                     tool_calls = event["tool_calls"]
             content = "".join(content_parts)
             if not tool_calls:
-                for part in content_parts:
-                    yield {"type": "token", "data": part}
                 if self._evidence_refs:
                     yield {"type": "evidence_refs", "data": self.evidence_snapshot()}
                 yield {"type": "done", "data": content}
@@ -1757,6 +1770,7 @@ class CapabilityAgentRuntime:
                     }
                 )
         fallback = "能力调用轮次已达到上限；请基于已返回的回执说明结论和仍缺少的信息。"
+        yield {"type": "response_start", "data": None}
         yield {"type": "token", "data": fallback}
         if self._evidence_refs:
             yield {"type": "evidence_refs", "data": self.evidence_snapshot()}
@@ -1779,7 +1793,6 @@ def _capability_runtime_fact(
     return {
         "resolved": True,
         "complete": runtime.complete,
-        "environment": runtime.environment,
         "definition_hash": runtime.deployment.definition_hash,
         "deployment_fingerprint": runtime.deployment.fingerprint,
         "data_context_fingerprint": runtime.runtime_data_context.fingerprint,
@@ -1795,7 +1808,7 @@ def build_runtime_context(
     llm: LLMConfig,
     *,
     turn_input: AgentTurnInput | None = None,
-    environment: str | None = None,
+    release_id: str | None = None,
 ) -> Any:
     """Build the only executable Agent runtime and reject historical modes."""
 
@@ -1821,7 +1834,7 @@ def build_runtime_context(
             agent,
             llm,
             turn_input=normalized_input,
-            environment=environment,
+            release_id=release_id,
         )
     except AgentRuntimeAdapterError as exc:
         capability_error = exc

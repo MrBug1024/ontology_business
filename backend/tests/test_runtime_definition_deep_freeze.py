@@ -145,7 +145,6 @@ def _deployment(definition, signature: str):
     binding = ConnectorBinding(
         tenant_id=definition.scenario.tenant_id,
         scenario_id=definition.scenario.id,
-        environment=definition.environment,
         binding_key=port.port_key,
         connector_kind="connector_binding",
         connector_id="managed-reference-a",
@@ -169,10 +168,9 @@ def test_live_resolve_deep_freezes_orm_json_and_deployment_binding(
     workflow = world["workflow"]
     port = world["port"]
 
-    definition_a = runtime_definition_service.resolve_active(
+    definition_a = runtime_definition_service.resolve_authoring(
         db,
         scenario,
-        environment="dev",
     )
     deployment_a, binding = _deployment(definition_a, "a" * 64)
     definition_hash_a = definition_a.definition_hash
@@ -245,10 +243,9 @@ def test_live_resolve_deep_freezes_orm_json_and_deployment_binding(
     )
     assert definition_a.capability_ports[port.id].config["limits"]["rows"] == 100
 
-    definition_b = runtime_definition_service.resolve_active(
+    definition_b = runtime_definition_service.resolve_authoring(
         db,
         scenario,
-        environment="dev",
     )
     deployment_b, _ = _deployment(definition_b, binding.signature)
     assert definition_b.definition_hash != definition_hash_a
@@ -274,8 +271,8 @@ def test_capability_port_owner_is_frozen_and_participates_in_live_hash(
     workflow = world["workflow"]
     port = world["port"]
 
-    definition_a = runtime_definition_service.resolve_active(
-        db, scenario, environment="dev"
+    definition_a = runtime_definition_service.resolve_authoring(
+        db, scenario,
     )
     assert definition_a.capability_ports[port.id].capability_kind == "function"
     assert definition_a.capability_ports[port.id].capability_key == function.id
@@ -283,8 +280,8 @@ def test_capability_port_owner_is_frozen_and_participates_in_live_hash(
     port.capability_kind = "workflow"
     port.capability_key = workflow.id
     db.flush()
-    definition_b = runtime_definition_service.resolve_active(
-        db, scenario, environment="dev"
+    definition_b = runtime_definition_service.resolve_authoring(
+        db, scenario,
     )
 
     assert definition_b.definition_hash != definition_a.definition_hash
@@ -314,7 +311,6 @@ def test_release_resolve_deep_freezes_snapshot_content_and_new_resolve_reads_b(
     )
     definition_a = runtime_definition_service._from_snapshot(
         scenario,
-        "staging",
         snapshot_a,
         release=SimpleNamespace(id="release-deep-freeze-a"),
     )
@@ -359,7 +355,6 @@ def test_release_resolve_deep_freezes_snapshot_content_and_new_resolve_reads_b(
     )
     definition_b = runtime_definition_service._from_snapshot(
         scenario,
-        "staging",
         snapshot_b,
         release=SimpleNamespace(id="release-deep-freeze-b"),
     )

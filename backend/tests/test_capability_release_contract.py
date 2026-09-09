@@ -109,7 +109,7 @@ def _seed(db):
 def test_release_captures_port_contract_without_runtime_data(db) -> None:
     tenant, scenario, dataset, schema, port = _seed(db)
     before = release_service.capture_snapshot_content(db, scenario)
-    assert before["capability_contract_version"] == 2
+    assert before["capability_contract_version"] == 3
     assert before["modeling_source_attestation"] == {
         "version": 1,
         "source_plane": "modeling_material",
@@ -158,7 +158,6 @@ def test_release_captures_port_contract_without_runtime_data(db) -> None:
         scenario_id=scenario.id,
         dataset_id=dataset.id,
         binding_key="records.input",
-        environment="dev",
         role="invocation_input",
         binding_mode="pinned",
         dataset_version_id=version.id,
@@ -213,7 +212,6 @@ def test_publish_rejects_unattested_catalog_dependency_but_allows_manual_contrac
         release_service.publish_snapshot(
             db,
             scenario.id,
-            environment="staging",
             confirmed=True,
             branch_id=branch.id,
         )
@@ -235,7 +233,6 @@ def test_publish_rejects_unattested_catalog_dependency_but_allows_manual_contrac
         release_service.publish_snapshot(
             db,
             scenario.id,
-            environment="staging",
             confirmed=True,
             branch_id=branch.id,
         )
@@ -272,14 +269,13 @@ def test_publish_rejects_unattested_catalog_dependency_but_allows_manual_contrac
     release = release_service.publish_snapshot(
         db,
         scenario.id,
-        environment="staging",
         confirmed=True,
         branch_id=branch.id,
     )
     assert release.status == "released"
 
 
-def test_environment_rollback_rejects_unattested_catalog_dependency(db) -> None:
+def test_authoring_rollback_rejects_a_snapshot_that_differs_from_the_current_baseline(db) -> None:
     _tenant, scenario, _dataset, _schema, _port = _seed(db)
     branch = release_service.create_branch(
         db,
@@ -295,7 +291,7 @@ def test_environment_rollback_rejects_unattested_catalog_dependency(db) -> None:
 
     with pytest.raises(
         release_service.ReleaseValidationError,
-        match="无法证明来自建模资料",
+        match="当前本体已偏离分支基线",
     ):
         release_service.rollback_snapshot(
             db,
@@ -303,7 +299,6 @@ def test_environment_rollback_rejects_unattested_catalog_dependency(db) -> None:
             target_snapshot_id=snapshot.id,
             confirmed=True,
             branch_id=branch.id,
-            environment="prod",
             reason="test legacy source gate",
         )
 
@@ -346,7 +341,7 @@ def test_runtime_definition_reads_v2_ports_and_legacy_v1_as_empty(db) -> None:
         content_hash=release_service.snapshot_hash(content),
     )
     resolved = runtime_definition_service._from_snapshot(
-        scenario, "prod", snapshot, release=None
+        scenario, snapshot, release=None,
     )
     assert set(resolved.capability_ports) == {"port-release-input"}
     assert resolved.capability_ports["port-release-input"].dataset_schema_hash == "a" * 64
@@ -367,7 +362,7 @@ def test_runtime_definition_reads_v2_ports_and_legacy_v1_as_empty(db) -> None:
         content_hash=release_service.snapshot_hash(legacy),
     )
     legacy_resolved = runtime_definition_service._from_snapshot(
-        scenario, "prod", legacy_snapshot, release=None
+        scenario, legacy_snapshot, release=None,
     )
     assert legacy_resolved.capability_ports == {}
 
@@ -397,7 +392,7 @@ def test_runtime_definition_reads_v2_ports_and_legacy_v1_as_empty(db) -> None:
         match="缺少明确归属",
     ):
         runtime_definition_service._from_snapshot(
-            scenario, "prod", unsafe_snapshot, release=None
+            scenario, unsafe_snapshot, release=None,
         )
 
 
@@ -576,7 +571,6 @@ def test_publish_requires_ready_pinned_binding_for_release_pinned_rules(db) -> N
         release_service.publish_snapshot(
             db,
             scenario.id,
-            environment="staging",
             confirmed=True,
             branch_id=branch.id,
         )
@@ -600,7 +594,6 @@ def test_publish_requires_ready_pinned_binding_for_release_pinned_rules(db) -> N
         scenario_id=scenario.id,
         dataset_id=dataset.id,
         binding_key="Rules.Release",
-        environment="staging",
         role="rules",
         binding_mode="pinned",
         dataset_version_id=version.id,
@@ -614,7 +607,6 @@ def test_publish_requires_ready_pinned_binding_for_release_pinned_rules(db) -> N
     release = release_service.publish_snapshot(
         db,
         scenario.id,
-        environment="staging",
         confirmed=True,
         branch_id=branch.id,
     )
@@ -638,7 +630,6 @@ def test_release_pinned_rules_reject_mutable_head_binding(db) -> None:
         id="head-release-rules",
         tenant_id=tenant.id,
         dataset_id=dataset.id,
-        environment="prod",
         dataset_version_id=version.id,
     )
     binding = ScenarioDatasetBinding(
@@ -647,7 +638,6 @@ def test_release_pinned_rules_reject_mutable_head_binding(db) -> None:
         scenario_id=scenario.id,
         dataset_id=dataset.id,
         binding_key=port.port_key,
-        environment="prod",
         role="rules",
         binding_mode="head",
         dataset_head_id=head.id,
@@ -670,7 +660,6 @@ def test_release_pinned_rules_reject_mutable_head_binding(db) -> None:
         release_service.publish_snapshot(
             db,
             scenario.id,
-            environment="prod",
             confirmed=True,
             branch_id=branch.id,
         )
@@ -695,7 +684,6 @@ def test_release_pinned_rules_reject_unready_dataset_version(db) -> None:
         scenario_id=scenario.id,
         dataset_id=dataset.id,
         binding_key=port.port_key,
-        environment="staging",
         role="rules",
         binding_mode="pinned",
         dataset_version_id=version.id,
@@ -713,7 +701,6 @@ def test_release_pinned_rules_reject_unready_dataset_version(db) -> None:
         release_service.publish_snapshot(
             db,
             scenario.id,
-            environment="staging",
             confirmed=True,
             branch_id=branch.id,
         )

@@ -31,7 +31,6 @@ export interface CapabilityAccessManifest {
   manifest_id: string
   scenario: { id: string; name: string }
   deployment: {
-    environment: 'dev' | 'staging' | 'prod'
     definition_source: 'live' | 'release'
     release_id?: string | null
     snapshot_id?: string | null
@@ -75,19 +74,8 @@ export interface CapabilityAccessManifest {
   release_history: Array<{
     id: string
     snapshot_id: string
-    environment: 'dev' | 'staging' | 'prod'
     status: string
     created_at: string
   }>
   checks: Array<{ code: string; passed: boolean; count?: number | null }>
-}
-
-export interface ScenarioReleaseWithdrawal {
-  scenario_id: string
-  environment: 'staging' | 'prod'
-  withdrawn_release_ids: string[]
-  changed: boolean
-  withdrawn_at?: string | null
-  withdrawn_by_user_id?: string | null
-  reason: string
 }

@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base
 from app.models import BusinessScenario, FunctionDefinition, Tenant, User
 from app.routers import capability_access
-from app.services import permission_service
+from app.services import permission_service, scenario_release_service
 from app.services.auth_service import get_tenant_db
 
 
@@ -47,17 +47,23 @@ class CapabilityAccessManifestTests(unittest.TestCase):
                 name="Score text",
                 input_schema={
                     "type": "object",
-                    "properties": {"text": {"type": "string", "example": "customer row"}},
+                    "properties": {"text": {"type": "number", "description": "customer row"}},
                     "required": ["text"],
+                    "additionalProperties": False,
                 },
                 output_schema={"type": "object"},
                 runtime_kind="weighted_score",
-                runtime_config={"weights": {}, "bias": 1},
+                runtime_config={"weights": {"text": 1}, "bias": 1},
             )
             db.add_all([self.tenant, self.owner, self.scenario, function])
             db.commit()
             permission_service.ensure_organization(db, self.tenant.id, owner_user_id=self.owner.id)
             db.commit()
+            db.info.update(tenant_id=self.tenant.id, user_id=self.owner.id)
+            release = scenario_release_service.create_release(db, self.scenario.id, confirmed=True)
+            self.release_id = release.id
+            scenario_release_service.change_release(db, self.scenario.id, release.id,
+                expected_revision=release.revision, action="enable")
         finally:
             db.close()
 
@@ -83,7 +89,7 @@ class CapabilityAccessManifestTests(unittest.TestCase):
     def test_rest_and_mcp_share_one_definition_without_runtime_data(self) -> None:
         response = self.client.get(
             f"/api/developer/capability-access/{self.scenario.id}/manifest",
-            params={"environment": "dev"},
+            params={"release_id": self.release_id},
         )
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
@@ -97,7 +103,9 @@ class CapabilityAccessManifestTests(unittest.TestCase):
             "/api/external/v2/assets/upload",
         )
         self.assertEqual(rest_adapter["optional_scopes"], ["assets:write"])
-        self.assertEqual(payload["deployment"]["definition_source"], "live")
+        self.assertEqual(payload["deployment"]["definition_source"], "release")
+        self.assertEqual(payload["deployment"]["release_id"], self.release_id)
+        self.assertNotIn("environment", payload["deployment"])
         self.assertEqual(len(payload["deployment"]["definition_hash"]), 64)
         self.assertEqual(len(payload["manifest_id"]), 64)
         self.assertEqual(len(payload["capabilities"]), 1)

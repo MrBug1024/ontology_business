@@ -411,7 +411,6 @@ def test_historical_sample_builds_model_and_explicit_fixture_without_contract_lo
         dataset_id=dataset.id,
         binding_key="historical.records.fixture",
         role="test_fixture",
-        environment="dev",
         binding_mode="pinned",
         dataset_version_id=version.id,
         is_required=False,

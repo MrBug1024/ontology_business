@@ -133,7 +133,6 @@ def _world(db: Session, key: str) -> World:
     deployment = ResolvedDeployment(
         scenario_id=scenario.id,
         tenant_id=tenant.id,
-        environment="dev",
         definition_hash="d" * 64,
         definition=SimpleNamespace(
             functions={

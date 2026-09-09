@@ -23,7 +23,6 @@ from sqlalchemy.orm import Session, selectinload
 from ..catalog_schemas import (
     CatalogManagedUploadMetadata,
     CatalogManagedUploadOut,
-    CatalogEnvironment,
     CatalogUsagePlane,
     ConnectorBindingOptionOut,
     DataAssetCreate,
@@ -153,7 +152,7 @@ def _dataset_out(dataset: LogicalDataset) -> LogicalDatasetOut:
         retired_at=dataset.retired_at,
         schema_count=len(dataset.schemas),
         version_count=len(dataset.versions),
-        heads={item.environment: item.dataset_version_id for item in dataset.heads},
+        head_version_id=next((item.dataset_version_id for item in dataset.heads), None),
     )
 
 
@@ -193,7 +192,6 @@ def _binding_out(binding: ScenarioDatasetBinding) -> ScenarioDatasetBindingOut:
         scenario_id=binding.scenario_id,
         dataset_id=binding.dataset_id,
         binding_key=binding.binding_key,
-        environment=binding.environment,
         role=binding.role,
         binding_mode=binding.binding_mode,
         dataset_head_id=binding.dataset_head_id,
@@ -819,12 +817,11 @@ def list_dataset_heads(
 
 
 @router.put(
-    "/datasets/{dataset_id}/heads/{environment}",
+    "/datasets/{dataset_id}/head",
     response_model=DatasetHeadOut,
 )
 def set_dataset_head(
     dataset_id: str,
-    environment: str,
     payload: DatasetHeadSet,
     db: Session = Depends(get_tenant_db),
 ) -> DatasetHeadOut:
@@ -833,7 +830,6 @@ def set_dataset_head(
         head = catalog_service.set_head(
             db,
             dataset,
-            environment,
             payload.dataset_version_id,
             expected_version_id=payload.expected_dataset_version_id,
         )
@@ -851,7 +847,6 @@ def set_dataset_head(
 )
 def list_scenario_connector_binding_options(
     scenario_id: str,
-    environment: CatalogEnvironment = "dev",
     db: Session = Depends(get_tenant_db),
 ) -> list[ConnectorBindingOptionOut]:
     """List portable binding keys without leaking connector ids or config."""
@@ -867,7 +862,6 @@ def list_scenario_connector_binding_options(
                 or ""
             ),
             connector_kind=item["kind"],
-            environment=item["environment"],
             ready=bool(item.get("ready", False)),
             blocking_reason=str(item.get("blocking_reason") or ""),
             capabilities=[
@@ -878,7 +872,7 @@ def list_scenario_connector_binding_options(
             updated_at=item.get("updated_at"),
         )
         for item in connector_service.list_bindings(
-            db, scenario, environment=environment
+            db, scenario
         )
     ]
 

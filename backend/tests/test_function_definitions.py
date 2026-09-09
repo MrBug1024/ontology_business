@@ -171,7 +171,7 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
-    def _publish_staging(self) -> tuple[str, str]:
+    def _publish_enabled(self) -> tuple[str, str]:
         db = self.Session()
         db.info["tenant_id"] = self.tenant.id
         db.info["user_id"] = self.user.id
@@ -184,10 +184,12 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
             release = release_service.publish_snapshot(
                 db,
                 self.scenario.id,
-                environment="staging",
                 confirmed=True,
                 branch_id=branch.id,
             )
+            from app.services import scenario_release_service
+            scenario_release_service.change_release(db, self.scenario.id, release.id,
+                expected_revision=release.revision, action="enable")
             return release.snapshot_id, release.id
         finally:
             db.close()
@@ -285,13 +287,13 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
 
     def test_release_freezes_function_contract_and_blocks_direct_delete(self) -> None:
         created = self._create_function()
-        snapshot_id, release_id = self._publish_staging()
+        snapshot_id, release_id = self._publish_enabled()
 
         db = self.Session()
         try:
             function = db.get(FunctionDefinition, created["id"])
             assert function is not None
-            function.name = "开发中函数（不得在 staging 使用）"
+            function.name = "后续编辑的函数（不得改变旧发布）"
             function.output_schema = _contract_schema({"changed": {"type": "boolean"}})
             db.commit()
 
@@ -300,7 +302,6 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
             frozen = runtime_definition_service.resolve_active(
                 db,
                 scenario,
-                environment="staging",
             )
             released_function = runtime_definition_service.resolve_resource(
                 frozen,
@@ -317,7 +318,7 @@ class FunctionDefinitionRouteTests(unittest.TestCase):
 
         deleted = self.client.delete(f"/api/scenarios/functions/{created['id']}")
         self.assertEqual(deleted.status_code, 409, deleted.text)
-        self.assertIn("活动环境发布引用", deleted.json()["detail"])
+        self.assertIn("发布引用", deleted.json()["detail"])
         verify = self.Session()
         try:
             self.assertIsNotNone(verify.get(FunctionDefinition, created["id"]))

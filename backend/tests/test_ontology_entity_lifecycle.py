@@ -247,8 +247,8 @@ class TestOntologyEntityLifecycleRuntime:
         return entity
 
     def test_live_runtime_detail_and_graph_hide_deprecated_closure(self) -> None:
-        definition = runtime_definition_service.resolve_active(
-            self.db, self.scenario, environment="dev"
+        definition = runtime_definition_service.resolve_authoring(
+            self.db, self.scenario,
         )
         assert set(definition.entities) == {self.active_entity.id}
         assert set(definition.relations) == {self.active_relation.id}
@@ -336,14 +336,14 @@ class TestOntologyEntityLifecycleRuntime:
             scenario_id=self.scenario.id,
             branch_id=branch.id,
             snapshot_id=snapshot.id,
-            environment="staging",
+            enabled=True,
             status="released",
             created_by_user_id=self.user.id,
         )
         self.db.add_all([branch, snapshot, release])
         self.db.commit()
         frozen = runtime_definition_service.resolve_active(
-            self.db, self.scenario, environment="staging"
+            self.db, self.scenario,
         )
         assert set(frozen.entities) == {self.active_entity.id}
         assert set(frozen.relations) == {self.active_relation.id}

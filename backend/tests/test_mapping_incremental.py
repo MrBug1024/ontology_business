@@ -78,7 +78,7 @@ class MappingIncrementalRuntimeTests(unittest.TestCase):
         self.assertEqual(second["instances_created"], 0)
         self.assertEqual(self.db.query(OntologyInstance).count(), 1)
 
-    def test_same_mapping_keeps_imported_instances_isolated_by_runtime_environment(self) -> None:
+    def test_same_mapping_updates_one_logical_record_without_deployment_partition(self) -> None:
         with patch(
             "app.services.datasource_service.run_query",
             return_value={"columns": ["id", "amount"], "rows": [["E-200", 10]]},
@@ -87,7 +87,6 @@ class MappingIncrementalRuntimeTests(unittest.TestCase):
                 self.db,
                 self.scenario,
                 self.mapping,
-                environment="dev",
             )
         with patch(
             "app.services.datasource_service.run_query",
@@ -97,22 +96,18 @@ class MappingIncrementalRuntimeTests(unittest.TestCase):
                 self.db,
                 self.scenario,
                 self.mapping,
-                environment="staging",
             )
 
         self.assertEqual(dev["instances_created"], 1)
-        self.assertEqual(staging["instances_created"], 1)
+        self.assertEqual(staging["instances_created"], 0)
         instances = self.db.scalars(
             select(OntologyInstance)
             .where(OntologyInstance.entity_id == self.entity.id)
             .order_by(OntologyInstance.created_at.asc())
         ).all()
-        self.assertEqual(len(instances), 2)
-        by_environment = {
-            instance.source_metadata["runtime_environment"]: instance.attributes["amount"]
-            for instance in instances
-        }
-        self.assertEqual(by_environment, {"dev": 10, "staging": 25})
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].attributes["amount"], 25)
+        self.assertNotIn("runtime_environment", instances[0].source_metadata)
 
 
 if __name__ == "__main__":

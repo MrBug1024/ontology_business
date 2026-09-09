@@ -1,0 +1,124 @@
+{
+  "schema_version": "1.0.0",
+  "project_id": "example-feedback-project",
+  "context_revision": 7,
+  "title": "反馈提交确认需求评审草稿",
+  "version": "v0.1",
+  "status": "draft",
+  "sections": [
+    {
+      "heading": "背景与目标",
+      "paragraphs": [
+        {
+          "kind": "suggestion",
+          "text": "本草稿供产品负责人组织范围与验收评审。客户运营提出反馈提交确认前可以取消，当前没有提出提交后撤销。尚需确认真实使用问题、发生频率与影响，不能直接把功能诉求当作已验证的业务痛点。",
+          "evidence_ids": [
+            "E002"
+          ]
+        }
+      ]
+    },
+    {
+      "heading": "范围与排除",
+      "paragraphs": [
+        {
+          "kind": "suggestion",
+          "text": "候选范围为提交确认前取消；取消后不应新增一次正式反馈提交，该行为仍需产品和研发按现有流程核对。提交后撤销、审批撤回及历史记录删除均未包含在现有客户陈述中，不纳入已知范围。",
+          "evidence_ids": [
+            "E002"
+          ]
+        }
+      ]
+    },
+    {
+      "heading": "需求与验收建议",
+      "paragraphs": [
+        {
+          "kind": "suggestion",
+          "text": "R001 为提交确认前取消。验收建议：具备现有提交权限的用户进入确认环节，点击取消后，系统不执行正式提交；界面返回位置及草稿是否保留须由产品确认。",
+          "evidence_ids": [
+            "E002"
+          ]
+        },
+        {
+          "kind": "suggestion",
+          "text": "R001 的异常路径应分别核对认证失效、权限不足、内容校验失败和网络失败。现有系统行为未提供，本草稿不臆造具体错误码或权限规则。",
+          "evidence_ids": [
+            "E002"
+          ]
+        },
+        {
+          "kind": "suggestion",
+          "text": "正式提交后的重复请求、并发、数据留存要求需根据现有系统契约评估适用性；本草稿不新增未确认的基础设施要求。",
+          "evidence_ids": [
+            "E002"
+          ]
+        }
+      ]
+    },
+    {
+      "heading": "商务与研发依赖",
+      "paragraphs": [
+        {
+          "kind": "suggestion",
+          "text": "商务自述已签合同，本次未提供可核验条款。需要商务提供可核验的范围、验收、交付及付款条件，并确认当前允许开展的工作。",
+          "evidence_ids": [
+            "E001",
+            "E003"
+          ]
+        },
+        {
+          "kind": "suggestion",
+          "text": "研发经理自述两名开发可参与，但名单、职责、可用性、工作量与计划尚未确认。由研发经理提供技术方案与估算，本草稿不承诺开发周期或交付日期。",
+          "evidence_ids": [
+            "E001",
+            "E003"
+          ]
+        }
+      ]
+    },
+    {
+      "heading": "评审与交付",
+      "paragraphs": [
+        {
+          "kind": "suggestion",
+          "text": "产品负责人评审范围和可观察验收，研发经理确认可行性、方案和计划。第三方保存实际审阅文档并计算 SHA-256，以对应版本发起群内评审；内容修改后重新评审。",
+          "evidence_ids": []
+        },
+        {
+          "kind": "suggestion",
+          "text": "文档由第三方本地生成、保存并交付。草稿生成不代表需求批准、正式排期、已通知群成员、交付验收或收款完成。",
+          "evidence_ids": []
+        }
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "E001",
+      "text": "商务在群里说合同已经签署，但本次没有提供合同、订单或可核验的范围、验收及付款条款。",
+      "source_ref": "example-message-sales",
+      "status": "reported"
+    },
+    {
+      "evidence_id": "E002",
+      "text": "客户运营希望提交反馈前可以取消确认；没有提出提交后撤销。",
+      "source_ref": "example-interview-ops",
+      "status": "reported"
+    },
+    {
+      "evidence_id": "E003",
+      "text": "研发经理说有两名开发可参与，但尚未确认名单、职责、可用时间、工作量和排期。",
+      "source_ref": "example-message-tech",
+      "status": "reported"
+    }
+  ],
+  "open_questions": [
+    "产品负责人需确认取消后的界面位置和草稿保留行为。",
+    "商务需补齐可核验的交接范围和条款。",
+    "研发经理需确认人员、方案与估算所需前提。"
+  ],
+  "review_notes": [
+    "此文件是虚构验收样例，没有真实业务批准；正式评审记录由第三方核验并回传。"
+  ]
+}

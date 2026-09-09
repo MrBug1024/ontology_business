@@ -355,8 +355,8 @@ def test_capability_runtime_metadata_has_scoped_contracts_and_capability_default
     assert Agent.__table__.c.runtime_binding_mode.nullable is False
     assert Agent.__table__.c.runtime_binding_mode.default.arg == "capability_only"
     assert Agent.__table__.c.runtime_binding_mode.server_default.arg == "capability_only"
-    assert ScenarioDatasetBinding.__table__.c.environment.default.arg == "dev"
-    assert ScenarioDatasetBinding.__table__.c.environment.server_default.arg == "dev"
+    assert "environment" not in ScenarioDatasetBinding.__table__.c
+    assert "runtime_environment" not in AgentMCPService.__table__.c
     assert AgentMCPService.__table__.c.publication_mode.default.arg == "legacy_agent"
     assert (
         AgentMCPService.__table__.c.publication_mode.server_default.arg
@@ -402,7 +402,6 @@ def test_capability_runtime_metadata_has_scoped_contracts_and_capability_default
     assert isinstance(binding_identity, UniqueConstraint)
     assert tuple(column.name for column in binding_identity.columns) == (
         "scenario_id",
-        "environment",
         "binding_key",
     )
 
@@ -469,8 +468,6 @@ def test_capability_runtime_metadata_has_scoped_contracts_and_capability_default
         "scenario_id",
         "capability_kind",
         "capability_key",
-        "definition_hash",
-        "deployment_fingerprint",
         "idempotency_key",
     )
     for constraint_name in (
@@ -545,7 +542,6 @@ def test_runtime_binding_sources_and_environment_roles_are_enforced() -> None:
             tenant_id=tenant.id,
             scenario_id=scenario.id,
             agent_id=agent.id,
-            environment="dev",
             capability_kind="provider",
             capability_key="medical-audit",
             definition_hash="d" * 64,
@@ -562,7 +558,6 @@ def test_runtime_binding_sources_and_environment_roles_are_enforced() -> None:
             id="connector-capability",
             tenant_id=tenant.id,
             scenario_id=scenario.id,
-            environment="dev",
             binding_key="claims-db",
             connector_kind="data_source",
             connector_id="legacy-source-id",
@@ -606,7 +601,6 @@ def test_runtime_binding_sources_and_environment_roles_are_enforced() -> None:
             id="invocation-distinct-capability",
             tenant_id=tenant.id,
             scenario_id=scenario.id,
-            environment="dev",
             capability_kind="provider",
             capability_key="project-manager",
             definition_hash="d" * 64,
@@ -626,7 +620,6 @@ def test_runtime_binding_sources_and_environment_roles_are_enforced() -> None:
             id="invocation-duplicate-scope",
             tenant_id=tenant.id,
             scenario_id=scenario.id,
-            environment="dev",
             capability_kind="provider",
             capability_key="medical-audit",
             definition_hash="d" * 64,
@@ -662,13 +655,11 @@ def test_runtime_binding_sources_and_environment_roles_are_enforced() -> None:
                     dataset_id=dataset.id,
                     binding_key=f"role-{role}",
                     role=role,
-                    environment="dev",
                     binding_mode="pinned",
                     dataset_version_id=dataset_version.id,
                 )
             )
-        db.add_all(
-            [
+        shared_bindings = [
                 ScenarioDatasetBinding(
                     id="binding-shared-dev",
                     tenant_id=tenant.id,
@@ -676,7 +667,6 @@ def test_runtime_binding_sources_and_environment_roles_are_enforced() -> None:
                     dataset_id=dataset.id,
                     binding_key="shared-key",
                     role="reference",
-                    environment="dev",
                     binding_mode="pinned",
                     dataset_version_id=dataset_version.id,
                 ),
@@ -687,13 +677,16 @@ def test_runtime_binding_sources_and_environment_roles_are_enforced() -> None:
                     dataset_id=dataset.id,
                     binding_key="shared-key",
                     role="reference",
-                    environment="prod",
                     binding_mode="pinned",
                     dataset_version_id=dataset_version.id,
                 ),
             ]
-        )
+        db.add(shared_bindings[0])
         db.commit()
+        db.add(shared_bindings[1])
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
 
         valid = RunInputBinding(
             id="binding-valid",

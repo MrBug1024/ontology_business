@@ -703,10 +703,9 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
         )
         db.add_all([agent, conversation, message, other_conversation, other_message])
         db.commit()
-        definition = runtime_definition_service.resolve_active(
+        definition = runtime_definition_service.resolve_authoring(
             db,
             self.scenario,
-            environment="dev",
         )
         db.info["action_audit_context"] = {"agent_id": agent.id}
         db.info["llm_trace_context"] = {
@@ -718,7 +717,6 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
             action,
             _docx_variables(),
             dry_run=True,
-            runtime_environment="dev",
             runtime_definition=definition,
         )
         db.info.pop("action_audit_context", None)
@@ -737,7 +735,6 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
             "idempotency_key": "agent-template-confirm",
             "preview_log_id": preview["log_id"],
             "correlation_id": preview["correlation_id"],
-            "expected_environment": preview["environment"],
             "expected_definition_snapshot_id": preview["definition_snapshot_id"],
             "expected_release_id": preview["release_id"],
             "expected_definition_hash": preview["definition_hash"],
@@ -807,12 +804,11 @@ class TemplateActionAndDownloadTests(unittest.TestCase):
     def test_stable_retry_preserves_identity_without_overwriting_prior_object(self) -> None:
         db = self._db()
         action = self._create_template_action(db, "action-template-crash")
-        scoped_key = workflow_service._scoped_idempotency_key("crash-retry", "dev")
+        scoped_key = workflow_service._scoped_idempotency_key("crash-retry")
         stable_id = workflow_service._stable_template_execution_id(
             action,
             parent_action_log_id=None,
             scoped_idempotency_key=scoped_key,
-            environment="dev",
         )
         orphan = datasource_service.save_bucket_file(
             self.outputs,

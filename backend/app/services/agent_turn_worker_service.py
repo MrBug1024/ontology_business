@@ -18,6 +18,7 @@ from . import (
     agent_runtime_adapter,
     agent_turn_input_service,
     agent_turn_payload_service,
+    agent_turn_progress_service,
     permission_service,
     validation_dataset_service,
 )
@@ -550,12 +551,14 @@ def _process_claimed_turn(
             session_factory=session_factory,
         ) as lease_lost:
             execution_started = True
+            progress = agent_turn_progress_service.TurnProgress(run_id, lease, session_factory)
             result = executor(
                 run.agent_id,
                 message=payload.message,
                 conversation_id=run.conversation_id,
                 db=db,
                 inputs=payload.inputs,
+                release_id=payload.release_id,
                 managed_inputs=payload.managed_inputs,
                 attachments=payload.attachments,
                 capability=(
@@ -564,14 +567,15 @@ def _process_claimed_turn(
                     else None
                 ),
                 idempotency_key=f"agent-turn:{run.id}",
-                environment=payload.environment,
                 user_message_id=run.user_message_id,
                 assistant_message_id=run.assistant_message_id,
                 turn_run_id=run.id,
                 turn_lease_token=lease.token,
                 turn_lease_generation=lease.generation,
                 defer_terminal_commit=True,
+                on_event=progress,
             )
+            progress.flush()
         if lease_lost.is_set():
             # The executor may have staged the final Message in this Session.
             # A lost fence must discard it before another owner reconciles.

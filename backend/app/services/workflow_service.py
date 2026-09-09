@@ -97,28 +97,11 @@ def _workflow_action_status(response: dict[str, Any]) -> tuple[str, str]:
 
 def _runtime_provenance(
     runtime_definition: runtime_definition_service.RuntimeDefinition | None,
-    runtime_environment: str | None,
 ) -> dict[str, str | None]:
-    """Return auditable, execution-local definition provenance.
-
-    A frozen definition is not optional metadata: its environment must match
-    the deployment assertion and every child action receives the same release
-    pin.  Legacy callers without a definition remain supported for dev-only
-    internal use, but no non-dev route may rely on that compatibility path.
-    """
-    environment = runtime_connector_service.runtime_environment(runtime_environment)
+    """Carry the explicit definition pin through every child execution."""
     if runtime_definition is None:
-        return {
-            "environment": environment,
-            "definition_snapshot_id": None,
-            "release_id": None,
-            "definition_hash": "",
-            "definition_source": "live",
-        }
-    if runtime_definition.environment != environment:
-        raise PolicyViolation("运行定义环境与当前部署环境不一致，已阻止执行")
+        return {"definition_snapshot_id": None, "release_id": None, "definition_hash": "", "definition_source": "live"}
     return {
-        "environment": environment,
         "definition_snapshot_id": runtime_definition.snapshot_id,
         "release_id": runtime_definition.release_id,
         "definition_hash": runtime_definition.definition_hash,
@@ -126,14 +109,14 @@ def _runtime_provenance(
     }
 
 
-def _scoped_idempotency_key(key: str | None, environment: str) -> str | None:
-    """Make external idempotency keys environment-local without widening SQL keys."""
+def _scoped_idempotency_key(key: str | None) -> str | None:
+    """Bound a caller key; tenant and resource scope are enforced by storage."""
     if not key:
         return None
-    scoped = f"{environment}:{key}"
-    if len(scoped) <= 120:
-        return scoped
-    return f"{environment}:sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+    if len(key) <= 120:
+        return key
+    import hashlib
+    return f"sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
 
 
 def _definition_resource(
@@ -900,7 +883,6 @@ def _action_runtime_connector(
     *,
     kind: str,
     config: dict[str, Any],
-    runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     scenario = db.get(BusinessScenario, action.scenario_id)
@@ -912,7 +894,6 @@ def _action_runtime_connector(
             scenario,
             kind=kind,
             config=config,
-            environment=runtime_environment,
             release_id=(runtime_definition.release_id if runtime_definition else None),
         )
     except runtime_connector_service.RuntimeConnectorError as exc:
@@ -924,7 +905,6 @@ def _action_plan(
     action: Any,
     params: dict[str, Any],
     *,
-    runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
 ) -> dict[str, Any]:
     """生成预演计划；只返回执行元数据和参数，不调用任何执行器。"""
@@ -948,7 +928,6 @@ def _action_plan(
                 action,
                 kind="data_source",
                 config=config,
-                runtime_environment=runtime_environment,
                 runtime_definition=runtime_definition,
             )
             plan["data_source_id"] = str(connector.id)
@@ -963,7 +942,6 @@ def _action_plan(
                 action,
                 kind="mcp",
                 config=config,
-                runtime_environment=runtime_environment,
                 runtime_definition=runtime_definition,
             )
             plan["mcp_id"] = str(connector.id)
@@ -1018,7 +996,6 @@ def _response_from_log(log: ActionExecutionLog, status: str | None = None) -> di
         # A direct Action response is the user's first audit surface.  Keep
         # the immutable execution pin alongside the result (including replay
         # and confirmation responses) rather than making callers query logs.
-        "environment": log.environment or "dev",
         "definition_snapshot_id": log.definition_snapshot_id,
         "release_id": log.release_id,
         "definition_hash": log.definition_hash or "",
@@ -1262,7 +1239,6 @@ def _stable_template_execution_id(
     *,
     parent_action_log_id: str | None,
     scoped_idempotency_key: str | None,
-    environment: str,
 ) -> str | None:
     """Derive a retry-stable execution/file id from the confirmed request."""
     request_identity = parent_action_log_id or scoped_idempotency_key
@@ -1270,10 +1246,9 @@ def _stable_template_execution_id(
         return None
     material = "\x1f".join(
         (
-            "template-action-execution-v1",
+            "template-action-execution-v2",
             str(action.scenario_id),
             str(action.id),
-            str(environment),
             str(request_identity),
         )
     )
@@ -1300,15 +1275,13 @@ def recover_action_execution(
     parent_action_log_id: str,
     execution_key: str,
     expected_input_audit: dict[str, Any],
-    runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
 ) -> dict[str, Any]:
     """Read-only reconciliation for a Capability confirmation crash window."""
 
-    provenance = _runtime_provenance(runtime_definition, runtime_environment)
+    provenance = _runtime_provenance(runtime_definition)
     scoped_key = _scoped_idempotency_key(
         execution_key,
-        str(provenance["environment"]),
     )
     preview = db.get(ActionExecutionLog, parent_action_log_id)
     execution = _find_preview_execution(db, action, parent_action_log_id)
@@ -1326,7 +1299,6 @@ def recover_action_execution(
         and execution.parent_action_log_id == preview.id
         and execution.idempotency_key == scoped_key
         and (execution.input_params or {}) == expected_input_audit
-        and execution.environment == provenance["environment"]
         and execution.definition_snapshot_id == provenance["definition_snapshot_id"]
         and execution.release_id == provenance["release_id"]
         and execution.definition_hash == provenance["definition_hash"]
@@ -1395,7 +1367,6 @@ def preview_action(
     action: Any,
     params: dict[str, Any],
     *,
-    runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
     commit: bool = True,
     audit_input_params: dict[str, Any] | None = None,
@@ -1407,12 +1378,11 @@ def preview_action(
     )
     normalized = validate_action_params(action.input_schema or {}, params)
     _enforce_action_precondition(action, normalized)
-    provenance = _runtime_provenance(runtime_definition, runtime_environment)
+    provenance = _runtime_provenance(runtime_definition)
     plan = _action_plan(
         db,
         action,
         normalized,
-        runtime_environment=runtime_environment,
         runtime_definition=runtime_definition,
     )
     permission = _permission_summary(db, action, confirmed=False, dry_run=True)
@@ -1470,7 +1440,6 @@ def execute_action(
     dry_run: bool = False,
     idempotency_key: str | None = None,
     enforce_policy: bool = True,
-    runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
     audit_input_params: dict[str, Any] | None = None,
     include_preview_input_values: bool = True,
@@ -1482,7 +1451,6 @@ def execute_action(
             db,
             action,
             params,
-            runtime_environment=runtime_environment,
             runtime_definition=runtime_definition,
             audit_input_params=audit_input_params,
             include_preview_input_values=include_preview_input_values,
@@ -1490,9 +1458,9 @@ def execute_action(
     capability_readiness_service.require_executable(
         "action", action, definition=runtime_definition, db=db
     )
-    provenance = _runtime_provenance(runtime_definition, runtime_environment)
+    provenance = _runtime_provenance(runtime_definition)
     scoped_idempotency_key = _scoped_idempotency_key(
-        idempotency_key, str(provenance["environment"])
+        idempotency_key
     )
     normalized = validate_action_params(action.input_schema or {}, params)
     persisted_input_params = (
@@ -1562,7 +1530,6 @@ def execute_action(
             action,
             parent_action_log_id=(str(parent_action_log_id) if parent_action_log_id else None),
             scoped_idempotency_key=scoped_idempotency_key,
-            environment=str(provenance["environment"]),
         )
         if transactional_template
         else None
@@ -1621,7 +1588,6 @@ def execute_action(
             db,
             action,
             normalized,
-            runtime_environment=runtime_environment,
             runtime_definition=runtime_definition,
             execution_log=log,
             execution_key=scoped_idempotency_key,
@@ -1656,7 +1622,6 @@ def _dispatch_executor(
     action: Any,
     params: dict[str, Any],
     *,
-    runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
     execution_log: ActionExecutionLog | None = None,
     execution_key: str | None = None,
@@ -1674,7 +1639,7 @@ def _dispatch_executor(
     # types are therefore not portable, frozen deployment semantics yet.  Keep
     # the runtime guard even though publish-time validation rejects new ones.
     if runtime_definition and runtime_definition.is_frozen and etype in {"http", "skill", "script", "template"}:
-        raise PolicyViolation(f"{etype} Action 不能在已冻结的发布环境执行")
+        raise PolicyViolation(f"{etype} Action 不支持已冻结的发布契约")
 
     if etype == "sql":
         source, audit = _action_runtime_connector(
@@ -1682,7 +1647,6 @@ def _dispatch_executor(
             action,
             kind="data_source",
             config=cfg,
-            runtime_environment=runtime_environment,
             runtime_definition=runtime_definition,
         )
         return _exec_sql(
@@ -1705,7 +1669,6 @@ def _dispatch_executor(
             action,
             kind="mcp",
             config=cfg,
-            runtime_environment=runtime_environment,
             runtime_definition=runtime_definition,
         )
         return _exec_mcp(
@@ -2255,10 +2218,10 @@ def execute_workflow(
     approved_node_ids: set[str] | None = None,
     attempt: int = 1,
     source_run_id: str | None = None,
-    runtime_environment: str | None = None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None = None,
     deadline_at: datetime | None = None,
     audit_input_params: dict[str, Any] | None = None,
+    resumed_results: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """执行工作流：优先可视化 DAG（nodes/edges），回退旧版线性 steps。
 
@@ -2276,7 +2239,7 @@ def execute_workflow(
     if not workflow_permission.allowed:
         raise PolicyViolation("没有执行该工作流的权限")
     start = time.time()
-    provenance = _runtime_provenance(runtime_definition, runtime_environment)
+    provenance = _runtime_provenance(runtime_definition)
     workflow_permission_summary = {
         "allowed": workflow_permission.allowed,
         "scope": "workflow",
@@ -2316,9 +2279,9 @@ def execute_workflow(
                 params,
                 execution_id=execution_key,
                 approved_node_ids=approved_nodes,
+                resumed_results=resumed_results or {},
                 attempt=attempt,
                 source_run_id=source_run_id,
-                runtime_environment=runtime_environment,
                 runtime_definition=runtime_definition,
                 deadline_at=deadline_at,
             )
@@ -2329,9 +2292,9 @@ def execute_workflow(
                 params,
                 execution_id=execution_key,
                 approved_node_ids=approved_nodes,
+                resumed_results=resumed_results or {},
                 attempt=attempt,
                 source_run_id=source_run_id,
-                runtime_environment=runtime_environment,
                 runtime_definition=runtime_definition,
                 deadline_at=deadline_at,
             )
@@ -2378,9 +2341,9 @@ def _execute_steps(
     *,
     execution_id: str,
     approved_node_ids: set[str],
+    resumed_results: dict[str, dict[str, Any]],
     attempt: int,
     source_run_id: str | None,
-    runtime_environment: str | None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None,
     deadline_at: datetime | None,
 ) -> list[dict[str, Any]]:
@@ -2392,6 +2355,12 @@ def _execute_steps(
         step_type = step.get("type", "")
         step_num = step.get("step", i + 1)
         step_result: dict[str, Any] = {"step": step_num, "type": step_type}
+
+        cached = resumed_results.get(f"step_{step_num}")
+        if cached is not None:
+            step_results.append(copy.deepcopy(cached))
+            context[f"step_{step_num}"] = copy.deepcopy(cached.get("result"))
+            continue
 
         if step_type == "action":
             action_id = step.get("action_id", "")
@@ -2414,7 +2383,6 @@ def _execute_steps(
                     confirm=True,
                     idempotency_key=f"workflow:{execution_id}:step:{step_num}",
                     enforce_policy=True,
-                    runtime_environment=runtime_environment,
                     runtime_definition=runtime_definition,
                 )
                 step_result["status"], step_error = _workflow_action_status(r)
@@ -2517,9 +2485,9 @@ def _execute_dag(
     *,
     execution_id: str,
     approved_node_ids: set[str],
+    resumed_results: dict[str, dict[str, Any]],
     attempt: int,
     source_run_id: str | None,
-    runtime_environment: str | None,
     runtime_definition: runtime_definition_service.RuntimeDefinition | None,
     deadline_at: datetime | None,
 ) -> list[dict[str, Any]]:
@@ -2555,6 +2523,18 @@ def _execute_dag(
         data = node.get("data", {}) or {}
         res: dict[str, Any] = {"node": node_id, "name": data.get("name", ""), "type": ntype}
 
+        cached = resumed_results.get(node_id)
+        if cached is not None and ntype != "start":
+            res = copy.deepcopy(cached)
+            results.append(res)
+            ctx[node_id] = _wrap_out(res["result"]) if ntype == "rule" else res.get("result", {})
+            branch = ("true" if res["result"]["matched"] else "false") if ntype == "rule" else ""
+            for target in outs(node_id, branch):
+                run(target)
+                if halted:
+                    break
+            return
+
         if ntype == "start":
             res["status"] = "success"
             # Keep raw parameters in the in-memory graph context for downstream
@@ -2588,7 +2568,6 @@ def _execute_dag(
                     confirm=True,
                     idempotency_key=f"workflow:{execution_id}:node:{node_id}",
                     enforce_policy=True,
-                    runtime_environment=runtime_environment,
                     runtime_definition=runtime_definition,
                 )
                 res["status"], action_error = _workflow_action_status(r)
@@ -2632,12 +2611,11 @@ def _execute_dag(
         elif ntype == "llm":
             llm = None
             try:
-                resolved_environment = runtime_connector_service.runtime_environment(runtime_environment)
                 has_runtime_config = any(
                     key in data
                     for key in ("llm_config_id", "llm_binding_key", "llm_binding_ref")
                 )
-                if has_runtime_config or resolved_environment != "dev":
+                if has_runtime_config or (runtime_definition is not None and runtime_definition.is_frozen):
                     scenario = db.get(BusinessScenario, workflow.scenario_id)
                     if not scenario:
                         raise PolicyViolation("工作流所属业务场景不存在")
@@ -2646,7 +2624,6 @@ def _execute_dag(
                         scenario,
                         kind="llm",
                         config=data,
-                        environment=resolved_environment,
                         release_id=(runtime_definition.release_id if runtime_definition else None),
                     )
                     res["connector_audit"] = [audit]

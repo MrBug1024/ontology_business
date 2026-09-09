@@ -77,11 +77,11 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 def _hash_code(code: str) -> str:
-    return hashlib.sha256(code.encode()).hexdigest()
+    return hashlib.sha256(b"ontology-platform/email-code/v2\0" + code.encode()).hexdigest()
 
 
 def _token_hash(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+    return hashlib.sha256(b"ontology-platform/browser-session/v2\0" + token.encode()).hexdigest()
 
 
 def _mail_message(email: str, code: str, purpose: str) -> EmailMessage:
@@ -110,11 +110,14 @@ def _mail_message(email: str, code: str, purpose: str) -> EmailMessage:
 
 
 def send_verification_email(email: str, code: str, purpose: str) -> None:
+    send_mail_message(email, _mail_message(email, code, purpose))
+
+
+def send_mail_message(email: str, message: EmailMessage) -> None:
     settings = get_settings()
     sender = settings.mail_from.strip() or settings.mail_username.strip()
     if not settings.mail_server.strip() or not sender:
         raise MailConfigurationError("邮件服务未配置")
-    message = _mail_message(email, code, purpose)
     context = ssl.create_default_context()
     timeout = max(3, settings.mail_timeout_seconds)
     if settings.mail_ssl_tls:
@@ -204,7 +207,7 @@ def _extract_token(request: Request) -> str:
     return ""
 
 
-def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
+def get_current_account(request: Request, db: Session = Depends(get_db)) -> User:
     token = _extract_token(request)
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
@@ -217,25 +220,32 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     if not session or not session.user or session.user.status != "active":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已失效，请重新登录")
     request.state.user_id = session.user.id
-    request.state.tenant_id = session.user.tenant_id
+    request.state.tenant_id = session.active_tenant_id or session.user.tenant_id
     request.state.auth_session_id = session.id
     db.info["user_id"] = session.user.id
-    db.info["tenant_id"] = session.user.tenant_id
-    # 仅初始化尚不存在的组织及其历史成员；绝不因一次登录把已被管理员移除的
-    # 用户重新补成 admin。缺失成员身份会在权限校验时保持拒绝，直到管理员显式添加。
-    permission_service.ensure_organization(db, session.user.tenant_id)
-    if not permission_service.ensure_user_membership(db, session.user):
-        db.commit()
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="当前用户没有有效组织成员身份")
-    db.commit()
+    db.info["tenant_id"] = request.state.tenant_id
     return session.user
 
 
-def get_tenant_db(user: User = Depends(get_current_user)) -> Generator[Session, None, None]:
+def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
+    from .workspace_service import membership
+
+    user = get_current_account(request, db)
+    # 仅初始化尚不存在的组织及其历史成员；绝不因一次登录把已被管理员移除的
+    # 用户重新补成 admin。缺失成员身份会在权限校验时保持拒绝，直到管理员显式添加。
+    permission_service.ensure_organization(db, user.tenant_id)
+    if not membership(db, user.id, request.state.tenant_id):
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="当前用户没有有效组织成员身份")
+    db.commit()
+    return user
+
+
+def get_tenant_db(request: Request, user: User = Depends(get_current_user)) -> Generator[Session, None, None]:
     """受保护路由使用的数据库会话，同时携带当前用户与租户上下文。"""
     db = SessionLocal()
     db.info["user_id"] = user.id
-    db.info["tenant_id"] = user.tenant_id
+    db.info["tenant_id"] = request.state.tenant_id
     try:
         yield db
     finally:
@@ -249,11 +259,12 @@ def tenant_id(db: Session) -> str:
     return str(value)
 
 
-def set_session_cookie(response: Response, user: User, db: Session) -> None:
+def set_session_cookie(response: Response, user: User, db: Session, *, active_tenant_id: str | None = None) -> None:
     token = secrets.token_urlsafe(48)
     db.add(
         AuthSession(
             user_id=user.id,
+            active_tenant_id=active_tenant_id or user.tenant_id,
             token_hash=_token_hash(token),
             expires_at=utc_now() + timedelta(days=get_settings().auth_session_days),
         )

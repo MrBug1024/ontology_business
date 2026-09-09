@@ -91,12 +91,12 @@ def issue_key(
 ) -> tuple[ExternalApiKey, str]:
     """Create a key and return its raw value exactly once to the caller."""
     user = db.get(User, user_id)
-    if not user or user.tenant_id != tenant_id or user.status != "active":
+    if not user or user.status != "active":
         raise ExternalApiKeyError("API key 主体不是当前组织的有效用户")
     if not _active_member(db, tenant_id, user_id):
         raise ExternalApiKeyError("API key 主体没有有效组织成员身份")
     issuer = db.get(User, issued_by_user_id)
-    if not issuer or issuer.tenant_id != tenant_id or issuer.status != "active":
+    if not issuer or issuer.status != "active":
         raise ExternalApiKeyError("API key 签发者不是当前组织的有效用户")
     if not _active_member(db, tenant_id, issued_by_user_id):
         raise ExternalApiKeyError("API key 签发者没有有效组织成员身份")
@@ -163,7 +163,7 @@ def revoke_key(
         return None
     if key.status != "revoked":
         revoker = db.get(User, revoked_by_user_id)
-        if not revoker or revoker.tenant_id != tenant_id or revoker.status != "active":
+        if not revoker or revoker.status != "active":
             raise ExternalApiKeyError("API key 撤销者不是当前组织的有效用户")
         if not _active_member(db, tenant_id, revoked_by_user_id):
             raise ExternalApiKeyError("API key 撤销者没有有效组织成员身份")
@@ -210,14 +210,14 @@ def authenticate_token(raw_token: str, db: Session) -> ExternalApiContext:
     if not key:
         raise _invalid_key()
     user = db.get(User, key.user_id)
-    if not user or user.status != "active" or user.tenant_id != key.tenant_id:
+    if not user or user.status != "active":
         raise _invalid_key()
 
     # Bind the request to the subject user and evaluate the same live RBAC/ACL
     # as a first-party request. A role change or membership removal therefore
     # takes effect immediately without rotating every integration key.
     db.info["user_id"] = user.id
-    db.info["tenant_id"] = user.tenant_id
+    db.info["tenant_id"] = key.tenant_id
     try:
         permission_service.require_principal(db)
     except HTTPException as exc:
@@ -239,7 +239,7 @@ def authenticate_token(raw_token: str, db: Session) -> ExternalApiContext:
     return ExternalApiContext(
         db=db,
         key_id=key.id,
-        tenant_id=user.tenant_id,
+        tenant_id=key.tenant_id,
         user_id=user.id,
         scopes=scopes,
         expires_at=key.expires_at,

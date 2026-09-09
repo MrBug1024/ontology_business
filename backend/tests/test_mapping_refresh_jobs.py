@@ -165,7 +165,6 @@ class MappingRefreshJobTests(unittest.TestCase):
         binding = connector_service.upsert_binding(
             self.db,
             self.scenario,
-            environment="staging",
             binding_key_value="orders-refresh-binding",
             kind="data_source",
             connector_id=self.source.id,
@@ -181,12 +180,15 @@ class MappingRefreshJobTests(unittest.TestCase):
             self.scenario.id,
             name="mapping-refresh/staging",
         )
-        return release_service.publish_snapshot(
+        release = release_service.publish_snapshot(
             self.db,
             self.scenario.id,
-            environment="staging",
             confirmed=True,
             branch_id=branch.id,
+        )
+        from app.services import scenario_release_service
+        return scenario_release_service.change_release(
+            self.db, self.scenario.id, release.id, expected_revision=release.revision, action="enable",
         )
 
     @staticmethod
@@ -214,7 +216,7 @@ class MappingRefreshJobTests(unittest.TestCase):
         self.assertEqual(stored.rows_scanned, 1)
         self.assertEqual(stored.instances_created, 1)
         self.assertFalse(stored.active_key)
-        self.assertEqual(stored.connector_audit[0]["environment"], "dev")
+        self.assertNotIn("environment", stored.connector_audit[0])
         self.assertFalse(stored.connector_audit[0]["managed"])
         self.assertEqual(self.mapping.status, "ok")
         instance = self.db.scalar(
@@ -256,11 +258,9 @@ class MappingRefreshJobTests(unittest.TestCase):
 
     def test_staging_job_and_preview_use_frozen_release_mapping_and_connector_pin(self) -> None:
         release = self._publish_mapping_to_staging()
-        with patch(
-            "app.services.runtime_connector_service.get_settings",
-            return_value=SimpleNamespace(runtime_environment="staging"),
-        ):
-            job, created = mapping_refresh_service.enqueue_mapping_refresh(self.db, self.mapping)
+        from app.config import get_settings
+        with patch.object(get_settings(), "runtime_environment", "staging"):
+            job, created = mapping_refresh_service.enqueue_mapping_refresh(self.db, self.mapping, release_id=release.id)
             self.assertTrue(created)
             self.db.commit()
 
@@ -279,10 +279,7 @@ class MappingRefreshJobTests(unittest.TestCase):
         self.mapping.column_map = {"id": "id"}
         self.db.commit()
         real_resolver = runtime_connector_service.resolve_connector
-        with patch(
-            "app.services.runtime_connector_service.get_settings",
-            return_value=SimpleNamespace(runtime_environment="staging"),
-        ), patch(
+        with patch.object(get_settings(), "runtime_environment", "prod"), patch(
             "app.services.mapping_refresh_service.runtime_connector_service.resolve_connector",
             wraps=real_resolver,
         ) as resolve_connector, patch(
@@ -290,7 +287,7 @@ class MappingRefreshJobTests(unittest.TestCase):
             return_value=self._rows([["ORD-STAGING", 77]]),
         ) as query:
             mapping_refresh_service.process_mapping_refresh_jobs(self.db)
-            preview = preview_mapping(self.mapping.id, {"limit": 10}, self.db)
+            preview = preview_mapping(self.mapping.id, {"limit": 10}, self.db, release_id=release.id)
 
         refreshed = self.db.get(DataMappingRefreshJob, job.id)
         assert refreshed is not None
@@ -305,12 +302,13 @@ class MappingRefreshJobTests(unittest.TestCase):
         assert imported is not None
         self.assertEqual(imported.attributes, {"id": "ORD-STAGING", "amount": 77})
 
-    def test_mapping_job_api_hides_jobs_from_another_runtime_environment(self) -> None:
+    def test_mapping_job_visibility_is_independent_of_deployment_mode(self) -> None:
         job = self._enqueue()
-        with patch(
-            "app.services.runtime_connector_service.get_settings",
-            return_value=SimpleNamespace(runtime_environment="staging"),
-        ), self.assertRaises(HTTPException) as error:
+        from app.config import get_settings
+        with patch.object(get_settings(), "runtime_environment", "staging"):
+            self.assertEqual(get_mapping_refresh_job(job.id, Response(), self.db).id, job.id)
+        self.db.info["tenant_id"] = "another-tenant"
+        with self.assertRaises(HTTPException) as error:
             get_mapping_refresh_job(job.id, Response(), self.db)
         self.assertEqual(error.exception.status_code, 404)
 
@@ -339,19 +337,19 @@ class MappingRefreshJobTests(unittest.TestCase):
         self.assertEqual(completed.status, "succeeded")
         self.assertEqual(completed.attempt, 2)
 
-    def test_staging_worker_does_not_claim_a_dev_refresh_job(self) -> None:
+    def test_worker_claim_is_independent_of_deployment_mode(self) -> None:
         job = self._enqueue()
-        with patch(
-            "app.services.runtime_connector_service.get_settings",
-            return_value=SimpleNamespace(runtime_environment="staging"),
-        ), patch("app.services.datasource_service.run_query") as query:
+        from app.config import get_settings
+        with patch.object(get_settings(), "runtime_environment", "staging"), patch(
+            "app.services.datasource_service.run_query", return_value=self._rows([["ORD-MODE", 42]]),
+        ) as query:
             processed = mapping_refresh_service.process_mapping_refresh_jobs(self.db)
         stored = self.db.get(DataMappingRefreshJob, job.id)
         assert stored is not None
-        self.assertEqual(processed, [])
-        self.assertEqual(stored.status, "queued")
-        self.assertEqual(stored.environment, "dev")
-        query.assert_not_called()
+        self.assertEqual([item.id for item in processed], [job.id])
+        self.assertEqual(stored.status, "succeeded")
+        self.assertFalse(hasattr(stored, "environment"))
+        query.assert_called_once()
 
     def test_timeout_rolls_back_flushed_import_before_scheduling_retry(self) -> None:
         job = self._enqueue()
@@ -418,7 +416,6 @@ class MappingRefreshJobTests(unittest.TestCase):
         dev_binding = self.db.scalar(
             select(ConnectorBinding).where(
                 ConnectorBinding.scenario_id == self.scenario.id,
-                ConnectorBinding.environment == "dev",
                 ConnectorBinding.binding_key == saved.data_source_binding_key,
             )
         )

@@ -70,7 +70,6 @@ def require_legacy_chat_readiness(
     agent_id: str,
     *,
     conversation_id: str | None,
-    environment: str,
 ) -> None:
     """Preserve the old chat endpoint's fast control-plane rejection contract.
 
@@ -91,7 +90,6 @@ def require_legacy_chat_readiness(
     readiness = agent_readiness_service.compute_agent_readiness(
         db,
         agent,
-        environment=environment,
     )
     validation_missing = [
         str(item.get("label") or "")
@@ -153,7 +151,6 @@ def _public_run(run: AgentTurnRun) -> dict[str, Any]:
         "parent_run_id": run.parent_run_id,
         "status": run.status,
         "revision": run.revision,
-        "environment": run.environment,
         "definition_hash": run.definition_hash,
         "deployment_fingerprint": run.deployment_fingerprint,
         "data_context_fingerprint": run.data_context_fingerprint,
@@ -255,7 +252,6 @@ def enqueue_turn(
         request_payload={},
         request_summary={},
         request_digest="0" * 64,
-        environment=payload.environment,
         status="accepted",
         revision=1,
         available_at=_now(),

@@ -19,6 +19,8 @@ from . import (
     permission_service,
     runtime_definition_service,
     runtime_input_service,
+    capability_delivery_service,
+    channel_confirmation_input,
 )
 from .capability_contracts import (
     Actor,
@@ -200,7 +202,8 @@ def resolve_deployment(
     db: Session,
     scenario: BusinessScenario,
     *,
-    environment: str,
+    release_id: str | None = None,
+    definition: runtime_definition_service.RuntimeDefinition | None = None,
     capability: CapabilityRef | None = None,
 ) -> tuple[ResolvedDeployment, runtime_input_service.DeploymentInputResolution]:
     """Resolve one definition and current safe binding identities.
@@ -210,11 +213,12 @@ def resolve_deployment(
     """
 
     try:
-        definition = runtime_definition_service.resolve_active(
-            db,
-            scenario,
-            environment=environment,
-        )
+        if definition is None:
+            definition = runtime_definition_service.resolve_active(db, scenario, release_id=release_id)
+        if definition.scenario.id != scenario.id or definition.scenario.tenant_id != scenario.tenant_id:
+            raise runtime_definition_service.RuntimeDefinitionError("能力定义不属于当前场景")
+        if release_id is not None and definition.release_id != release_id:
+            raise runtime_definition_service.RuntimeDefinitionError("能力定义与指定发布版本不一致")
         if capability is None:
             inputs = runtime_input_service.DeploymentInputResolution(
                 runtime_data_context=RuntimeDataContext(),
@@ -228,14 +232,12 @@ def resolve_deployment(
                 db,
                 tenant_id=str(scenario.tenant_id or ""),
                 scenario_id=scenario.id,
-                environment=definition.environment,
                 capability=capability,
                 definition=definition,
             )
         deployment = ResolvedDeployment(
             scenario_id=scenario.id,
             tenant_id=str(scenario.tenant_id or ""),
-            environment=definition.environment,
             definition_hash=definition.definition_hash,
             definition=definition,
             data_ports=inputs.data_ports,
@@ -350,7 +352,7 @@ def _runtime_issues(
                 "message": (
                     "required managed input must be supplied with the invocation"
                     if invocation_supplied
-                    else "required managed input has no environment binding"
+                    else "required managed input has no logical binding"
                 ),
                 "port_key": key,
             }
@@ -405,7 +407,6 @@ def _capability_document(
     issues.extend(_runtime_issues(inputs))
     return {
         "scenario_id": deployment.scenario_id,
-        "environment": deployment.environment,
         "kind": kind,
         "key": key,
         "name": str(_read(resource, "name", "") or key),
@@ -429,10 +430,11 @@ def list_capabilities(
     db: Session,
     scenario: BusinessScenario,
     *,
-    environment: str,
+    release_id: str | None = None,
+    definition: runtime_definition_service.RuntimeDefinition | None = None,
 ) -> list[dict[str, Any]]:
     base_deployment, _inputs = resolve_deployment(
-        db, scenario, environment=environment
+        db, scenario, release_id=release_id, definition=definition,
     )
     result: list[dict[str, Any]] = []
     for kind in DISCOVERABLE_CAPABILITY_KINDS:
@@ -443,7 +445,7 @@ def list_capabilities(
             deployment, inputs = resolve_deployment(
                 db,
                 scenario,
-                environment=environment,
+                definition=base_deployment.definition,
                 capability=capability,
             )
             result.append(
@@ -462,7 +464,8 @@ def get_capability(
     db: Session,
     scenario: BusinessScenario,
     *,
-    environment: str,
+    release_id: str | None = None,
+    definition: runtime_definition_service.RuntimeDefinition | None = None,
     kind: str,
     key: str,
 ) -> dict[str, Any]:
@@ -470,7 +473,8 @@ def get_capability(
     deployment, inputs = resolve_deployment(
         db,
         scenario,
-        environment=environment,
+        release_id=release_id,
+        definition=definition,
         capability=capability,
     )
     resource = _resource(deployment.definition, kind, key)
@@ -488,7 +492,8 @@ def list_managed_input_options(
     db: Session,
     scenario: BusinessScenario,
     *,
-    environment: str,
+    release_id: str | None = None,
+    definition: runtime_definition_service.RuntimeDefinition | None = None,
     kind: str,
     key: str,
     port_key: str,
@@ -501,7 +506,8 @@ def list_managed_input_options(
     deployment, inputs = resolve_deployment(
         db,
         scenario,
-        environment=environment,
+        release_id=release_id,
+        definition=definition,
         capability=capability,
     )
     resource = _resource(deployment.definition, kind, key)
@@ -530,7 +536,7 @@ def list_managed_input_options(
         )
         raise CapabilityApplicationError(
             "capability_not_ready",
-            "capability is not ready in the selected environment",
+            "capability is not ready in the selected definition",
             details={"blocking_codes": blocking_codes},
         )
 
@@ -564,7 +570,6 @@ def list_managed_input_options(
             db,
             tenant_id=str(scenario.tenant_id or ""),
             scenario_id=scenario.id,
-            environment=deployment.environment,
             port=port,
         )
     except runtime_input_service.RuntimeInputResolutionError as exc:
@@ -582,7 +587,6 @@ def list_managed_input_options(
     selected = options[normalized_offset : normalized_offset + normalized_limit]
     return {
         "scenario_id": deployment.scenario_id,
-        "environment": deployment.environment,
         "kind": kind,
         "key": key,
         "port_key": normalized_port_key,
@@ -604,14 +608,16 @@ def invoke(
     actor: Actor,
     request: Request,
     *,
-    environment: str,
+    release_id: str | None = None,
+    definition: runtime_definition_service.RuntimeDefinition | None = None,
     invocation_source: str,
     invoker: CapabilityInvoker | None = None,
 ) -> Receipt:
     deployment, _inputs = resolve_deployment(
         db,
         scenario,
-        environment=environment,
+        release_id=release_id,
+        definition=definition,
         capability=request.capability,
     )
     resource = _resource(
@@ -626,13 +632,16 @@ def invoke(
         resource,
         "execute",
     )
-    return (invoker or CapabilityInvoker()).invoke(
+    receipt = (invoker or CapabilityInvoker()).invoke(
         db,
         deployment,
         actor,
         request,
         invocation_source=invocation_source,
     )
+    if receipt.status == "awaiting_confirmation":
+        channel_confirmation_input.remember(db, receipt.invocation_id, actor, request)
+    return capability_delivery_service.project(db, actor, receipt)
 
 
 def receipt_document(receipt: Receipt, *, replayed: bool | None = None) -> dict[str, Any]:
@@ -652,6 +661,7 @@ def receipt_document(receipt: Receipt, *, replayed: bool | None = None) -> dict[
         "output": _plain(receipt.output),
         "audit_ref": audit_ref,
         "confirmation": _plain(receipt.confirmation),
+        "delivery": _plain(receipt.delivery),
         "error": (
             {
                 "code": receipt.error_code,
@@ -668,12 +678,16 @@ def get_receipt(
     actor: Actor,
     invocation_id: str,
 ) -> dict[str, Any]:
+    principal = permission_service.require_principal(db)
+    if principal.tenant_id != actor.tenant_id or (actor.user_id and principal.user_id != actor.user_id):
+        raise CapabilityApplicationError("invocation_not_found", "capability invocation receipt is unavailable", status_code=404)
     invocation = db.execute(
         select(CapabilityInvocation).where(
             CapabilityInvocation.id == invocation_id,
             CapabilityInvocation.tenant_id == actor.tenant_id,
             CapabilityInvocation.principal_type == actor.actor_type,
             CapabilityInvocation.principal_id == actor.principal_id,
+            CapabilityInvocation.requested_by_user_id == principal.user_id,
         )
     ).scalar_one_or_none()
     if invocation is None:
@@ -695,6 +709,17 @@ def get_receipt(
             "capability invocation receipt is unavailable",
             status_code=404,
         )
+    try:
+        if invocation.release_id:
+            definition = runtime_definition_service.resolve_pinned(db, scenario,
+                snapshot_id=invocation.definition_snapshot_id, release_id=invocation.release_id,
+                definition_hash=invocation.definition_hash)
+        else:
+            definition = runtime_definition_service.resolve_retired_history(db, scenario) if scenario.status == "retired" else runtime_definition_service.resolve_authoring(db, scenario)
+        resource = runtime_definition_service.resolve_resource(definition, invocation.capability_kind, invocation.capability_key)
+        _require_permission(db, definition, invocation.capability_kind, resource, "read")
+    except (runtime_definition_service.RuntimeDefinitionError, CapabilityApplicationError):
+        raise CapabilityApplicationError("invocation_not_found", "capability invocation receipt is unavailable", status_code=404) from None
     result = invocation.result_document if isinstance(invocation.result_document, dict) else {}
     receipt = Receipt(
         invocation_id=invocation.id,
@@ -716,6 +741,10 @@ def get_receipt(
         error_code=invocation.error_code or None,
         error_message=invocation.error_message or "",
     )
+    try:
+        receipt = capability_delivery_service.project(db, actor, receipt)
+    except capability_delivery_service.CapabilityDeliveryError as exc:
+        raise CapabilityApplicationError("invocation_not_found", str(exc), status_code=404) from None
     return receipt_document(receipt, replayed=False)
 
 

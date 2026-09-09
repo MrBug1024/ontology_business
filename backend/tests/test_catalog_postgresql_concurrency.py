@@ -319,7 +319,6 @@ def test_scenario_retirement_preserves_restricted_invocation_audit() -> None:
                     tenant_id=tenant_id,
                     scenario_id=scenario_id,
                     requested_by_user_id=user_id,
-                    environment="dev",
                     capability_kind="function",
                     capability_key="retirement-contract",
                     definition_hash=digest,
@@ -403,7 +402,6 @@ def test_dataset_head_compare_and_set_serializes_real_concurrent_writers() -> No
                 moved = catalog_service.set_head(
                     db,
                     dataset,
-                    "dev",
                     version_b_id,
                     expected_version_id=version_a_id,
                 )
@@ -437,7 +435,6 @@ def test_dataset_head_compare_and_set_serializes_real_concurrent_writers() -> No
                 catalog_service.set_head(
                     db,
                     dataset,
-                    "dev",
                     version_c_id,
                     expected_version_id=version_a_id,
                 )
@@ -643,7 +640,6 @@ def test_dataset_head_compare_and_set_serializes_real_concurrent_writers() -> No
                     id=head_id,
                     tenant_id=tenant_id,
                     dataset_id=dataset_id,
-                    environment="dev",
                     dataset_version_id=version_a_id,
                     updated_by_user_id=user_id,
                 )

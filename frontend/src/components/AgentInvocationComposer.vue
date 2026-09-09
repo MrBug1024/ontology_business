@@ -153,6 +153,7 @@ const props = withDefaults(defineProps<{
   busy?: boolean
   placeholder?: string
   acceptedAttachmentKinds?: string[]
+  requireReadyAttachments?: boolean
 }>(), {
   agentId: '',
   conversationId: '',
@@ -160,6 +161,7 @@ const props = withDefaults(defineProps<{
   busy: false,
   placeholder: '输入业务问题或需求，也可以上传本次处理所需的文件',
   acceptedAttachmentKinds: () => [],
+  requireReadyAttachments: false,
 })
 
 const emit = defineEmits<{
@@ -185,7 +187,7 @@ const submittableAttachments = computed(() => attachments.value.filter((item) =>
   Boolean(item.assetVersionId) || Boolean(item.uploadRunId)
 )))
 const submissionBlocked = computed(() => attachments.value.some((item) => (
-  item.status === 'registering' || item.status === 'error'
+  item.status === 'registering' || item.status === 'error' || (props.requireReadyAttachments && item.status !== 'ready')
 )))
 
 function updateFromUploadRun(item: ChatAttachmentDraft, run: ManagedUploadRun) {
@@ -457,7 +459,6 @@ async function submitDraft() {
   emit('submit', {
     message: text,
     conversation_id: props.conversationId || '',
-    environment: 'dev',
     idempotency_key: invocationIdempotencyKey(),
     attachments: submittableAttachments.value.map((item) => (
       item.assetVersionId

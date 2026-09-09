@@ -885,7 +885,6 @@ def reference_index(
             for template_id in matched:
                 result[template_id]["released"].append({
                     "release_id": release.id,
-                    "environment": release.environment,
                     "scenario_id": release.scenario_id,
                     "snapshot_id": snapshot.id,
                     "action_id": str(raw_action.get("id") or ""),

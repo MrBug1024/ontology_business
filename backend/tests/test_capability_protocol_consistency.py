@@ -33,7 +33,9 @@ from app.services import (
     capability_mcp_service,
     external_api_service,
     permission_service,
+    provider_definition_service,
 )
+from .release_fixtures import enable_current_release
 from app.services.capability_invoker import CapabilityInvoker, resolve_capability_contract
 from app.services.capability_registry import CapabilityProviderRegistry
 
@@ -66,6 +68,12 @@ FORBIDDEN_SCENARIO_MARKERS = (
 class ProtocolDocumentProvider:
     provider_key = "protocol-document"
     provider_version = "1.0.0"
+
+    def validate_definition(self, *, input_schema, output_schema, provider_config, compatibility_mode):
+        expected_output = {"type": "object", "properties": {"score": {"type": "number"}}}
+        if input_schema != self.contract(None, None)["input_schema"] or output_schema != expected_output or provider_config != {}:
+            raise ValueError("Invalid protocol fixture definition")
+        return {}
 
     def contract(self, _capability, _deployment) -> dict:
         return {
@@ -117,7 +125,6 @@ def _semantic_receipt(document: dict) -> dict:
 def _provenance(invocation: CapabilityInvocation) -> dict:
     return {
         "scenario_id": invocation.scenario_id,
-        "environment": invocation.environment,
         "definition_hash": invocation.definition_hash,
         "deployment_fingerprint": invocation.deployment_fingerprint,
         "data_context_fingerprint": invocation.data_context_fingerprint,
@@ -323,15 +330,18 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
                 wraps=shared_invoker.invoke,
             ) as kernel_spy,
             patch.object(capability_mcp_service, "SessionLocal", SessionLocal),
+            patch.object(provider_definition_service, "default_provider_registry", provider_registry),
         ):
             agent_db = SessionLocal()
             try:
                 agent_db.info["tenant_id"] = tenant.id
                 agent_db.info["user_id"] = owner.id
+                release = enable_current_release(agent_db, agent_db.get(BusinessScenario, scenario.id))
                 runtime = agent_runtime_adapter.build_runtime_context(
                     agent_db,
                     agent_db.get(Agent, agent.id),
                     agent_db.get(LLMConfig, llm.id),
+                    release_id=release.id,
                     turn_input=agent_runtime_adapter.AgentTurnInput(
                         structured_inputs=input_document,
                         target_kind="function",
@@ -370,7 +380,7 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
                 ),
                 headers={"X-API-Key": rest_token},
                 json={
-                    "environment": "dev",
+                    "release_id": release.id,
                     "inputs": input_document,
                     "managed_inputs": [
                         {
@@ -391,7 +401,7 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
                 scenario_id=scenario.id,
                 capability_kind="function",
                 capability_key=function.id,
-                environment="dev",
+                release_id=release.id,
                 inputs=input_document,
                 managed_inputs=[
                     {

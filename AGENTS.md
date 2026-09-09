@@ -26,7 +26,7 @@
 
 ### 1.2 终极目标
 
-业务专家应能在不修改平台通用内核的前提下，建立行业无关的本体与版本化能力契约；治理人工、AI 或导入候选；在 `dev / staging / prod` 解析受控部署；每次调用提供当前输入而不重建能力；通过任意受支持协议统一执行，并在多租户、并发、重试和进程故障下保持权限、幂等、版本、证据与审计正确。
+业务专家应能在不修改平台通用内核的前提下，建立行业无关的本体与版本化能力契约；治理人工、AI 或导入候选；人工创建、启停和退役场景能力的不可变正式发布；每次调用提供当前输入而不重建能力；通过任意受支持协议统一执行，并在多租户、并发、重试和进程故障下保持权限、幂等、版本、证据与审计正确。
 
 主链路为 `Definition -> Release/Deployment -> Invocation -> CapabilityInvoker -> Agent/REST/MCP/SDK -> Receipt/Audit`。
 
@@ -173,10 +173,12 @@ Invocation plane  -> data_context_fingerprint
 ```
 
 - Definition 保存业务语义、能力、端口、Schema、策略、Provider identity 和验证要求，不保存客户本次数据。
-- Deployment 解析 Definition、Release、tenant、服务端环境与受信连接身份。
+- Deployment 解析 Definition、明确的 Release、tenant 与受信连接身份；基础设施部署环境不参与业务身份。
 - Invocation 保存 Actor、typed inputs、本次受管引用、确认、幂等、correlation 与审计。
 - 更换数据必须改变 `data_context_fingerprint`，不得改变 `definition_hash`。
-- `dev` 可解析受治理的 live definition；`staging/prod` 使用发布的不可变快照。调用方不得越权选择服务端环境。
+- `dev / staging / prod` 只用于进程部署配置，选择独立数据库及基础设施；禁止进入新业务记录或作为平台内数据、权限、连接、版本、缓存、队列与调度的分区条件。开发与上线通过不同基础设施隔离，不通过同库业务行的环境标签隔离。
+- 建模与显式验证使用受治理的当前定义；正式对外调用解析人工启用的不可变场景发布。Definition source 与 Release identity 是业务契约，禁止通过部署环境推断。正式调用不得静默回退当前草稿。
+- 正式发布由人工创建并设置启用状态，人工停用或退役；删除只移出活动管理列表，保留历史调用需要的不可变定义与审计。平台执行权限、契约和依赖闭包检查，不自动发布，也不以质量评分代替人工发布决定。
 - 发布后修改 ORM、嵌套 JSON、端口或绑定不得反向改变旧 Release。
 
 ### 5.2 数据与运行输入
@@ -257,6 +259,10 @@ Domain contract 不依赖 FastAPI、ORM、具体 Provider 或外部 SDK；Provid
 - 不可信 Markdown 禁止 `v-html`，统一使用 `SafeMarkdown`。内部 ID、hash、原始 JSON 和实现细节不得成为普通用户主流程。
 
 ## 7. 租户、安全与外部执行
+
+- 系统账户与工作区身份分离：`User.system_role` 仅为 `user/superadmin`，不裁决工作区 ACL；`owner/admin/operator/viewer` 只属于工作区。`User.tenant_id` 保留初始工作区归属，浏览器当前工作区由已验证会话选择，外部凭据使用其签发工作区；所有协议/worker 仍校验有效成员身份。全局账户可作为不同工作区任务的发起人，账户引用不再与其初始工作区做复合 FK；任务与场景、父任务及数据对象的租户复合约束必须保留。
+- 成员管理与系统账户变更使用持久串行化、expected revision 和审计，保护最后有效所有者/超级管理员；系统禁用可暂停个人工作区所有者，保留数据与成员关系但拒绝其访问，不能通过注册/验证码解禁。首位超级管理员只由部署者明确指定已验证账户、持久执行一次 bootstrap，禁止重启后自动重新提权。
+- 邀请邮件使用部署配置的前端 origin，URL 不携带 bearer 密钥；加入须登录匹配且已验证的邮箱并显式同意。SMTP 结果未知持久标记为 indeterminate，禁止自动盲重发。浏览器 session v2 使用域分离哈希，升级撤销旧会话而非保留无前缀回退；cookie 写来源校验使用配置的前端 origin，本地未配置时只信任服务 origin 与显式 CORS origin。
 
 - 每个受保护读写验证 authenticated principal、tenant 和资源归属；只有 scenario-scoped 资源才要求对应场景 ACL，role/scope 按入口契约适用。deny 优先 allow，公共资源对非所有者只读，缺失权限按无权处理。
 - 跨租户与不存在资源沿用防枚举语义；错误、日志和时序不得泄露目标细节。worker 必须恢复可审计 execution principal，发起人失效后不得匿名或升级 owner。

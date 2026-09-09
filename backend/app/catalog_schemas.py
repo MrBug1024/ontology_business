@@ -20,7 +20,6 @@ CatalogBindingRole = Literal[
     "output",
     "input",
 ]
-CatalogEnvironment = Literal["dev", "staging", "prod"]
 CatalogUploadPurpose = Literal[
     "managed_asset",
     "validation_asset",
@@ -34,7 +33,6 @@ class ConnectorBindingOptionOut(BaseModel):
     binding_key: str
     label: str
     connector_kind: Literal["data_source", "mcp", "llm"]
-    environment: CatalogEnvironment
     ready: bool
     blocking_reason: str = ""
     capabilities: list[str] = Field(default_factory=list)
@@ -208,7 +206,7 @@ class LogicalDatasetOut(LogicalDatasetCreate):
     retired_at: datetime | None = None
     schema_count: int = 0
     version_count: int = 0
-    heads: dict[str, str] = Field(default_factory=dict)
+    head_version_id: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -327,7 +325,6 @@ class DatasetHeadOut(BaseModel):
     id: str
     tenant_id: str
     dataset_id: str
-    environment: CatalogEnvironment
     dataset_version_id: str
     updated_by_user_id: str | None = None
     updated_at: datetime
@@ -338,7 +335,6 @@ class DatasetHeadOut(BaseModel):
 class ScenarioDatasetBindingCreate(BaseModel):
     dataset_id: str = Field(min_length=1, max_length=32)
     binding_key: str = Field(min_length=1, max_length=180)
-    environment: CatalogEnvironment = "dev"
     role: CatalogBindingRole
     binding_mode: Literal["head", "pinned"]
     dataset_head_id: str | None = Field(default=None, max_length=32)

@@ -4,14 +4,13 @@ import type {
   ExternalApiScope,
   IntegrationKey,
   IntegrationKeyCreated,
-  ScenarioReleaseWithdrawal,
 } from '@/types/capabilityAccess'
 
 export const capabilityAccessApi = {
-  getManifest: (scenarioId: string, environment: 'dev' | 'staging' | 'prod') =>
+  getManifest: (scenarioId: string, releaseId: string, signal?: AbortSignal) =>
     http.get<CapabilityAccessManifest>(
       `/developer/capability-access/${scenarioId}/manifest`,
-      { params: { environment } },
+      { params: { release_id: releaseId }, signal },
     ),
   listKeys: () => http.get<IntegrationKey[]>('/developer/api-keys'),
   createKey: (payload: {
@@ -20,12 +19,4 @@ export const capabilityAccessApi = {
     expires_in_days: number
   }) => http.post<IntegrationKeyCreated>('/developer/api-keys', payload),
   revokeKey: (keyId: string) => http.delete<IntegrationKey>(`/developer/api-keys/${keyId}`),
-  withdrawRelease: (
-    scenarioId: string,
-    environment: 'staging' | 'prod',
-    reason: string,
-  ) => http.post<ScenarioReleaseWithdrawal>(
-    `/scenarios/${scenarioId}/releases/${environment}/withdraw`,
-    { confirmed: true, reason },
-  ),
 }

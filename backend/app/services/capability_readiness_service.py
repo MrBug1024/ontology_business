@@ -2,7 +2,7 @@
 
 Authoring definitions remain discoverable even while incomplete.  A capability
 is called executable only when its own runtime contract is usable in the
-resolved environment; callers receive stable, human-readable blocking reasons
+resolved definition; callers receive stable, human-readable blocking reasons
 instead of inferring readiness from one flag such as ``enabled``.
 """
 from __future__ import annotations
@@ -161,7 +161,7 @@ def _action_readiness(
     if definition is not None and bool(getattr(definition, "is_frozen", False)) and executor_type in {
         "http", "skill", "script", "template",
     }:
-        reasons.append(f"{executor_type} 操作不能在冻结发布环境执行")
+        reasons.append(f"{executor_type} 操作缺少可冻结发布的受治理执行契约")
     if executor_type == "sql":
         if not str(config.get("sql") or "").strip():
             reasons.append("SQL 操作缺少 SQL 模板")
@@ -172,7 +172,6 @@ def _action_readiness(
                     definition.scenario,
                     kind="data_source",
                     config=config,
-                    environment=definition.environment,
                     release_id=definition.release_id,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -191,7 +190,6 @@ def _action_readiness(
                     definition.scenario,
                     kind="mcp",
                     config=config,
-                    environment=definition.environment,
                     release_id=definition.release_id,
                 )
             except Exception as exc:  # noqa: BLE001

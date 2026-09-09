@@ -34,6 +34,7 @@ from app.services import (
     capability_readiness_service,
     operations_service,
     permission_service,
+    scenario_release_service,
     workflow_payload_service,
     workflow_service,
 )
@@ -85,6 +86,10 @@ class OperationsRuntimeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.db.close()
         self.engine.dispose()
+
+    def _enable_release(self) -> None:
+        release = scenario_release_service.create_release(self.db, self.scenario.id, confirmed=True)
+        scenario_release_service.change_release(self.db, self.scenario.id, release.id, expected_revision=1, action="enable")
 
     def _workflow(self, *, name: str, trigger_type: str = "manual", trigger_config: dict | None = None, node_types: tuple[str, ...] = ()) -> OntologyWorkflow:
         nodes, edges = _workflow_nodes(*node_types)
@@ -143,7 +148,6 @@ class OperationsRuntimeTests(unittest.TestCase):
             self.assertTrue(log.input_params["redacted"])
         public_logs = scenarios_router.list_execution_logs(
             self.scenario.id,
-            environment=None,
             limit=50,
             db=self.db,
         )
@@ -156,6 +160,30 @@ class OperationsRuntimeTests(unittest.TestCase):
                 ensure_ascii=False,
             ),
         )
+
+    def test_approval_resume_keeps_reviewed_llm_output_without_regeneration(self) -> None:
+        workflow = self._workflow(name="reviewed-content", node_types=("llm", "approval"))
+        nodes = json.loads(json.dumps(workflow.nodes))
+        nodes[1]["data"]["prompt"] = "Draft for review"
+        nodes[-1]["data"]["summary"] = "{{n1.result}}"
+        workflow.nodes = nodes
+        self.db.commit()
+        run, _ = operations_service.enqueue_workflow_run(self.db, workflow, {})
+        self.db.commit()
+        with patch.object(workflow_service, "_resolve_llm", return_value=SimpleNamespace(id="review-model")), patch.object(
+            workflow_service.llm_service, "chat", side_effect=[{"content": "reviewed draft"}, {"content": "unreviewed replacement"}],
+        ) as model:
+            operations_service.process_available_runs(self.db)
+            self.db.refresh(run)
+            self.assertEqual(run.status, "awaiting_approval")
+            reviewed = run.result["steps"][1]["result"]
+            operations_service.decide_approval(self.db, run, approved=True)
+            operations_service.process_available_runs(self.db)
+            self.db.refresh(run)
+            self.assertEqual(run.status, "succeeded")
+            self.assertEqual(model.call_count, 1)
+            self.assertEqual(run.result["steps"][1]["result"], reviewed)
+            self.assertEqual(run.result["steps"][-1]["result"]["summary"], "reviewed draft")
 
     def test_workflow_input_is_encrypted_at_rest_and_worker_recovers_exact_payload(self) -> None:
         workflow = self._workflow(name="encrypted-input")
@@ -272,6 +300,10 @@ class OperationsRuntimeTests(unittest.TestCase):
         self.db.refresh(run)
         self.assertEqual(run.status, "awaiting_approval")
         self.assertEqual(run.attempt, 1)
+        pending = self.db.scalar(select(WorkflowApprovalRequest).where(WorkflowApprovalRequest.workflow_run_id == run.id, WorkflowApprovalRequest.status == "pending"))
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending.execution_key, run.execution_key)
+        operations_service.decide_approval(self.db, run, approved=True, approval_id=pending.id, expected_revision=1)
 
     def test_event_envelope_enqueues_subscriber_once(self) -> None:
         event = OntologyEvent(id="event-1", scenario_id=self.scenario.id, name="对象已更新")
@@ -306,6 +338,7 @@ class OperationsRuntimeTests(unittest.TestCase):
             trigger_type="scheduled",
             trigger_config={"interval_seconds": 10, "max_attempts": 2, "timeout_seconds": 30},
         )
+        self._enable_release()
         now = operations_service.utc_now()
         first = operations_service.enqueue_due_schedules(self.db, now=now)
         self.db.commit()
@@ -345,6 +378,7 @@ class OperationsRuntimeTests(unittest.TestCase):
 
         # The worker has no HTTP identity.  Earlier P1 behavior delegated this
         # situation to execution_principal, which selected the tenant owner.
+        self._enable_release()
         self.db.info.clear()
         now = operations_service.utc_now()
         scheduled_runs = operations_service.enqueue_due_schedules(self.db, now=now)
@@ -414,6 +448,7 @@ class OperationsRuntimeTests(unittest.TestCase):
         # Simulate a context-free worker/connector after durable user work has
         # established provenance.  The scheduler and the event chain must keep
         # that exact user rather than choosing a tenant owner by default.
+        self._enable_release()
         self.db.info.clear()
         scheduled_runs = operations_service.enqueue_due_schedules(
             self.db,
@@ -896,21 +931,20 @@ class OperationsRuntimeTests(unittest.TestCase):
         with self.assertRaises(PolicyViolation):
             workflow_service._dispatch_executor(self.db, action, {})
 
-    def test_worker_does_not_claim_a_run_from_another_deployment_environment(self) -> None:
+    def test_worker_claims_authorized_run_regardless_of_deployment_mode(self) -> None:
         workflow = self._workflow(name="environment-isolation")
         run, created = operations_service.enqueue_workflow_run(self.db, workflow)
         self.assertTrue(created)
         self.db.commit()
-        self.assertEqual(run.environment, "dev")
+        self.assertFalse(hasattr(run, "environment"))
 
-        with patch(
-            "app.services.runtime_connector_service.get_settings",
-            return_value=SimpleNamespace(runtime_environment="staging"),
-        ), patch("app.services.workflow_service.execute_workflow") as execute_workflow:
+        with patch.object(get_settings(), "runtime_environment", "staging"), patch(
+            "app.services.workflow_service.execute_workflow", wraps=workflow_service.execute_workflow,
+        ) as execute_workflow:
             processed = operations_service.process_available_runs(self.db)
 
         self.db.refresh(run)
-        self.assertEqual(processed, [])
-        self.assertEqual(run.status, "queued")
-        self.assertEqual(run.environment, "dev")
-        execute_workflow.assert_not_called()
+        self.assertEqual([item.id for item in processed], [run.id])
+        self.assertEqual(run.status, "succeeded")
+        self.assertFalse(hasattr(run, "environment"))
+        execute_workflow.assert_called_once()

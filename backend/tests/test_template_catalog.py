@@ -558,7 +558,7 @@ class TemplateCatalogTests(unittest.TestCase):
             scenario_id=self.scenario_a.id,
             branch_id=branch.id,
             snapshot_id=snapshot.id,
-            environment="dev",
+            enabled=True,
             status="released",
         )
         db.add_all([branch, snapshot, release])
@@ -569,6 +569,7 @@ class TemplateCatalogTests(unittest.TestCase):
         self.assertIn("发布快照", release_block.json()["detail"])
 
         release.status = "superseded"
+        release.enabled = False
         db.commit()
         governance_block = self.client.delete(f"/api/templates/{catalog['id']}")
         self.assertEqual(governance_block.status_code, 409, governance_block.text)
@@ -1227,7 +1228,6 @@ class TemplateCatalogTests(unittest.TestCase):
             release_service.publish_snapshot(
                 db,
                 self.scenario_a.id,
-                environment="dev",
                 confirmed=True,
                 branch_id=branch.id,
             )
