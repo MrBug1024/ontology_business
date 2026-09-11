@@ -32,3 +32,5 @@ __pycache__
 .pytest_cache
 .codex-sheet-inspect
 .runtime
+.codex-ppt-build
+outputs
