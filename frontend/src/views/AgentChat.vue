@@ -81,7 +81,7 @@
                 <el-icon aria-hidden="true"><CircleClose /></el-icon>取消
               </el-button>
             </div>
-            <!-- 检索资料来源：由服务端按当前租户和 Agent 已绑定资料库过滤后返回。 -->
+            <!-- 检索资料来源：由服务端按当前租户和 Agent 已授权数据源过滤后返回。 -->
             <section v-if="m.citations?.length" class="citation-sources" :aria-labelledby="`citation-title-${i}`">
               <div class="citation-sources-head">
                 <div>
@@ -108,8 +108,8 @@
               </article>
             </section>
             <!-- 附件卡片 -->
-            <div class="attach-list" v-if="extractMessageAttachments(m).length">
-              <div class="attach-card" v-for="a in extractMessageAttachments(m)" :key="a.id">
+            <div class="attach-list" v-if="extractMessageAttachments(m, agent?.id).length">
+              <div class="attach-card" v-for="a in extractMessageAttachments(m, agent?.id)" :key="a.id">
                 <div class="attach-icon"><el-icon :size="22"><Document /></el-icon></div>
                 <div class="attach-info">
                   <button class="attach-name" type="button" :aria-label="`预览附件：${a.filename}`" @click="preview(a)">{{ a.filename }}</button>
@@ -154,6 +154,7 @@
           ref="composerRef"
           :agent-id="agent?.id || ''"
           :conversation-id="curConv?.id || ''"
+          :scope-required="true"
           :disabled="!agentValidationReady || conversationLoading || currentTurnPending"
           :busy="currentTurnActive && !conversationLoading"
           :placeholder="agentValidationReady ? '描述业务需求，或上传本次处理所需的文件' : validationMissingText"
@@ -186,6 +187,7 @@ import AgentExecutionTrace from '@/components/agent/AgentExecutionTrace.vue'
 import { capabilityInvocationId } from '@/utils/agentCapabilityReceipt'
 import { actionArtifactAttachment } from '@/utils/artifactAttachments'
 import type { ArtifactAttachment } from '@/utils/artifactAttachments'
+import { managedFileDownloadUrl } from '@/utils/managedFileUrls'
 import { normalizeAgentReadiness } from '@/utils/agentReadiness'
 import {
   useAgentDurableTurns,
@@ -276,7 +278,7 @@ function goBack() {
 
 // ── 附件：优先读取工具结果中的结构化 artifact，旧消息再回退到下载链接 ──
 const ATTACH_RE = /\/api\/data-sources\/files\/([a-f0-9]{32})\/download/g
-function extractAttachments(content: string): ArtifactAttachment[] {
+function extractAttachments(content: string, agentId?: string): ArtifactAttachment[] {
   if (!content) return []
   const seen = new Set<string>()
   const out: ArtifactAttachment[] = []
@@ -294,7 +296,7 @@ function extractAttachments(content: string): ArtifactAttachment[] {
       const nameMatch = before.match(/([^\s\[\]()（）]+\.(?:docx|xlsx|md|markdown|txt|csv|pdf))\s*\]\(\s*$/i)
       filename = nameMatch ? nameMatch[1] : `附件-${id.slice(0, 8)}`
     }
-    out.push({ id, filename, format: filename.split('.').pop()?.toLowerCase(), url: `/api/data-sources/files/${id}/download` })
+    out.push({ id, filename, format: filename.split('.').pop()?.toLowerCase(), url: managedFileDownloadUrl(id, agentId) })
   }
   return out
 }
@@ -304,11 +306,11 @@ function parsedToolResult(value: unknown): any {
   try { return JSON.parse(value) } catch { return value }
 }
 
-function extractMessageAttachments(message: AgentTurnViewMessage): ArtifactAttachment[] {
+function extractMessageAttachments(message: AgentTurnViewMessage, agentId?: string): ArtifactAttachment[] {
   const structured = (message.tool_calls || [])
-    .map((tool: any) => actionArtifactAttachment(tool))
+    .map((tool: any) => actionArtifactAttachment(tool, agentId))
     .filter((item): item is ArtifactAttachment => Boolean(item))
-  const legacy = extractAttachments(message.content || '')
+  const legacy = extractAttachments(message.content || '', agentId)
   const unique = new Map<string, ArtifactAttachment>()
   for (const item of [...structured, ...legacy]) if (!unique.has(item.id)) unique.set(item.id, item)
   return [...unique.values()]
@@ -337,7 +339,7 @@ async function preview(a: ArtifactAttachment) {
   previewText.value = ''
   citationPreview.value = null
   try {
-    const r: any = await api.fileText(a.id)
+    const r: any = await api.fileText(a.id, agent.value?.id)
     previewText.value = r.text || ''
   } catch (e: any) {
     previewText.value = `预览失败：${e.message}`
@@ -381,7 +383,7 @@ async function previewCitation(citation: RagCitation) {
   previewFile.value = {
     id: citation.file_id,
     filename: citation.filename,
-    url: `/api/data-sources/files/${citation.file_id}/download`,
+    url: managedFileDownloadUrl(citation.file_id, agent.value?.id),
   }
   previewVisible.value = true
   previewLoading.value = false
@@ -403,7 +405,7 @@ async function previewCitation(citation: RagCitation) {
   citationPreview.value = null
   previewLoading.value = true
   try {
-    const r: any = await api.fileText(citation.file_id)
+    const r: any = await api.fileText(citation.file_id, agent.value?.id)
     previewText.value = r.text || ''
     citationPreview.value = citationPreviewFor(previewText.value, citation)
   } catch (e: any) {

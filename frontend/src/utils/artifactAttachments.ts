@@ -1,3 +1,5 @@
+import { managedFileDownloadUrl } from './managedFileUrls.ts'
+
 export type ArtifactAttachment = {
   id: string
   filename: string
@@ -44,7 +46,7 @@ function safeFilename(value: unknown) {
  * model text and caller-provided download_url values are untrusted; the URL is
  * always rebuilt from the validated BucketFile id on the current origin.
  */
-export function actionArtifactAttachment(toolCall: any): ArtifactAttachment | null {
+export function actionArtifactAttachment(toolCall: any, agentId?: string): ArtifactAttachment | null {
   const name = String(toolCall?.name || toolCall?.function?.name || '')
   if (name !== 'execute_action') return null
   const response = parsedResult(toolCall?.result)
@@ -74,6 +76,6 @@ export function actionArtifactAttachment(toolCall: any): ArtifactAttachment | nu
     mime: spec.mime,
     size,
     sha256: sha256.toLowerCase(),
-    url: `/api/data-sources/files/${id.toLowerCase()}/download`,
+    url: managedFileDownloadUrl(id.toLowerCase(), agentId),
   }
 }

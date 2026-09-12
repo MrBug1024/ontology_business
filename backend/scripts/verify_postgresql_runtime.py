@@ -62,6 +62,257 @@ _UNSAFE_RUNTIME_ROLE_FLAGS = (
     "rolreplication",
 )
 
+# Revisions 31 and 32 make managed runtime inputs explicitly Agent-scoped.
+# Keep this contract here (rather than relying only on ORM metadata) so a
+# deployment with a stale or partially-applied migration fails closed before
+# it can accept an attachment or connector reference.
+_AGENT_SCOPE_COLUMNS: dict[str, frozenset[str]] = {
+    "data_assets": frozenset({"owner_agent_id"}),
+    "managed_upload_runs": frozenset({"owner_agent_id"}),
+    "data_sources": frozenset({"owner_agent_id", "resource_scope"}),
+}
+_AGENT_SCOPE_INDEXES = frozenset(
+    {
+        "ix_data_assets_owner_agent_id",
+        "ix_managed_upload_runs_owner_agent_id",
+        "ix_data_sources_owner_agent_id",
+        "ix_data_sources_resource_scope",
+    }
+)
+_AGENT_SCOPE_CONSTRAINTS: dict[str, dict[str, str | None]] = {
+    "fk_data_assets_owner_agent_tenant": {
+        "table_name": "data_assets",
+        "constraint_type": "f",
+        "delete_action": "r",
+    },
+    "fk_managed_upload_runs_owner_agent_tenant": {
+        "table_name": "managed_upload_runs",
+        "constraint_type": "f",
+        "delete_action": "r",
+    },
+    "fk_data_sources_owner_agent_tenant": {
+        "table_name": "data_sources",
+        "constraint_type": "f",
+        "delete_action": "r",
+    },
+    "ck_data_sources_resource_scope": {
+        "table_name": "data_sources",
+        "constraint_type": "c",
+        "delete_action": None,
+    },
+    "ck_data_sources_owner_scope": {
+        "table_name": "data_sources",
+        "constraint_type": "c",
+        "delete_action": None,
+    },
+}
+
+
+def _validate_agent_scope_columns(
+    columns: dict[str, set[str] | frozenset[str]],
+) -> None:
+    missing_columns = {
+        table_name: sorted(set(required) - set(columns.get(table_name, ())))
+        for table_name, required in _AGENT_SCOPE_COLUMNS.items()
+        if set(required) - set(columns.get(table_name, ()))
+    }
+    if missing_columns:
+        details = "; ".join(
+            f"{table_name}: {', '.join(names)}"
+            for table_name, names in sorted(missing_columns.items())
+        )
+        raise RuntimeError("Agent scope columns are incomplete: " + details)
+
+
+def _validate_agent_scope_indexes(indexes: set[str] | frozenset[str]) -> None:
+    missing_indexes = sorted(set(_AGENT_SCOPE_INDEXES) - set(indexes))
+    if missing_indexes:
+        raise RuntimeError(
+            "Agent scope indexes are incomplete: " + ", ".join(missing_indexes)
+        )
+
+
+def _validate_agent_scope_constraints(
+    constraints: dict[str, dict[str, Any]],
+) -> None:
+    missing_constraints = sorted(
+        set(_AGENT_SCOPE_CONSTRAINTS) - set(constraints)
+    )
+    if missing_constraints:
+        raise RuntimeError(
+            "Agent scope constraints are incomplete: "
+            + ", ".join(missing_constraints)
+        )
+
+    for name, expected in _AGENT_SCOPE_CONSTRAINTS.items():
+        current = constraints[name]
+        if str(current.get("table_name") or "") != expected["table_name"]:
+            raise RuntimeError(f"Agent scope constraint {name} is on the wrong table")
+        if str(current.get("constraint_type") or "") != expected["constraint_type"]:
+            raise RuntimeError(f"Agent scope constraint {name} has the wrong type")
+        if expected["delete_action"] is not None and str(
+            current.get("delete_action") or ""
+        ) != expected["delete_action"]:
+            raise RuntimeError(
+                f"Agent scope constraint {name} must use ON DELETE RESTRICT"
+            )
+
+        definition = str(current.get("definition") or "").casefold()
+        if name == "ck_data_sources_resource_scope":
+            required_markers = ("resource_scope", "modeling", "agent_runtime")
+        elif name == "ck_data_sources_owner_scope":
+            required_markers = (
+                "owner_agent_id",
+                "tenant_id",
+                "agent_runtime",
+            )
+        else:
+            required_markers = (
+                "owner_agent_id",
+                "tenant_id",
+                "agents",
+            )
+        if any(marker not in definition for marker in required_markers):
+            raise RuntimeError(
+                f"Agent scope constraint {name} does not enforce the expected scope"
+            )
+
+
+def _validate_agent_scope_snapshot(
+    columns: dict[str, set[str] | frozenset[str]],
+    *,
+    indexes: set[str] | frozenset[str],
+    constraints: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate the durable ownership contract introduced by rev31/32.
+
+    The function deliberately accepts a detached metadata snapshot so tests
+    can exercise every fail-closed branch without requiring a live PostgreSQL
+    instance.  ``pg_constraint.confdeltype`` uses ``r`` for RESTRICT; a
+    different action would allow deleting an Agent to silently discard or
+    reassign its runtime inputs.
+    """
+
+    _validate_agent_scope_columns(columns)
+    _validate_agent_scope_indexes(indexes)
+    _validate_agent_scope_constraints(constraints)
+    return {
+        "revision": "20260912_32",
+        "scoped_tables": len(_AGENT_SCOPE_COLUMNS),
+        "scoped_indexes": len(_AGENT_SCOPE_INDEXES),
+        "scoped_constraints": len(_AGENT_SCOPE_CONSTRAINTS),
+    }
+
+
+def _verify_agent_scope_contract(connection: Any) -> dict[str, Any]:
+    """Read and validate the PostgreSQL metadata required by rev31/32."""
+
+    table_names = tuple(_AGENT_SCOPE_COLUMNS)
+    column_rows = connection.exec_driver_sql(
+        """
+        SELECT table_name, column_name
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name IN ('data_assets', 'managed_upload_runs', 'data_sources')
+        """
+    ).all()
+    columns: dict[str, set[str]] = {table_name: set() for table_name in table_names}
+    for row in column_rows:
+        table_name, column_name = str(row[0]), str(row[1])
+        if table_name in columns:
+            columns[table_name].add(column_name)
+
+    index_rows = connection.exec_driver_sql(
+        """
+        SELECT indexname
+          FROM pg_indexes
+         WHERE schemaname = 'public'
+           AND indexname IN (
+               'ix_data_assets_owner_agent_id',
+               'ix_managed_upload_runs_owner_agent_id',
+               'ix_data_sources_owner_agent_id',
+               'ix_data_sources_resource_scope'
+           )
+        """
+    ).all()
+    indexes = {str(row[0]) for row in index_rows}
+
+    constraint_rows = connection.exec_driver_sql(
+        """
+        SELECT table_row.relname AS table_name,
+               constraint_row.conname,
+               constraint_row.contype,
+               constraint_row.confdeltype,
+               pg_get_constraintdef(constraint_row.oid) AS definition
+          FROM pg_constraint AS constraint_row
+          JOIN pg_class AS table_row
+            ON table_row.oid = constraint_row.conrelid
+          JOIN pg_namespace AS namespace_row
+            ON namespace_row.oid = table_row.relnamespace
+         WHERE namespace_row.nspname = 'public'
+           AND constraint_row.conname IN (
+               'fk_data_assets_owner_agent_tenant',
+               'fk_managed_upload_runs_owner_agent_tenant',
+               'fk_data_sources_owner_agent_tenant',
+               'ck_data_sources_resource_scope',
+               'ck_data_sources_owner_scope'
+           )
+        """
+    ).all()
+    constraints = {
+        str(row[1]): {
+            "table_name": str(row[0]),
+            "constraint_type": str(row[2]),
+            "delete_action": str(row[3]) if row[3] is not None else None,
+            "definition": str(row[4] or ""),
+        }
+        for row in constraint_rows
+    }
+    return _validate_agent_scope_snapshot(
+        columns,
+        indexes=indexes,
+        constraints=constraints,
+    )
+
+
+def _verify_scenario_audit_purge_contract(connection: Any) -> None:
+    """Ensure the privileged scenario purge function keeps its tenant fence."""
+    row = connection.exec_driver_sql(
+        """
+        SELECT procedure.prosecdef,
+               procedure.proconfig,
+               pg_get_functiondef(procedure.oid) AS definition,
+               EXISTS (
+                   SELECT 1
+                     FROM aclexplode(
+                         COALESCE(
+                             procedure.proacl,
+                             acldefault('f', procedure.proowner)
+                         )
+                     ) AS acl
+                    WHERE acl.grantee = 0
+                      AND acl.privilege_type = 'EXECUTE'
+               ) AS public_execute
+          FROM pg_proc AS procedure
+         WHERE procedure.oid = to_regprocedure(
+             'public.purge_retired_scenario_audit(character varying, character varying)'
+         )
+        """
+    ).one_or_none()
+    if row is None or not bool(row[0]):
+        raise RuntimeError("tenant-fenced scenario audit purge function is missing")
+    if bool(row[3]):
+        raise RuntimeError("scenario audit purge function is executable by PUBLIC")
+    if "search_path=pg_catalog, public" not in set(row[1] or []):
+        raise RuntimeError("scenario audit purge function search_path is not fixed")
+    definition = str(row[2] or "").casefold()
+    required_markers = (
+        "evidence.tenant_id = p_tenant_id",
+        "evidence.action_scenario_id = p_scenario_id",
+    )
+    if any(marker not in definition for marker in required_markers):
+        raise RuntimeError("scenario audit purge function is missing its tenant fence")
+
 
 def _validate_runtime_role_snapshot(
     role: dict[str, Any] | None,
@@ -327,6 +578,8 @@ def main() -> int:
             append_only_tables=RUNTIME_APPEND_ONLY_TABLES,
             mutable_control_tables=RUNTIME_MUTABLE_CONTROL_TABLES,
         )
+        agent_scope = _verify_agent_scope_contract(connection)
+        _verify_scenario_audit_purge_contract(connection)
         _verify_runtime_function_privileges(connection)
         _verify_access_governance_privileges(connection)
         status_capacity = _verify_capability_status_storage(connection)
@@ -350,6 +603,7 @@ def main() -> int:
                     "capability_status_capacity": status_capacity,
                     "role": role,
                     "table_privileges": table_privileges,
+                    "agent_scope": agent_scope,
                     "governed_functions": "executable",
                 },
                 "minio": "healthy",

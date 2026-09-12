@@ -9,7 +9,7 @@
           <small v-else-if="item.status === 'uploading'">正在上传 {{ item.progress }}%，可立即发送</small>
           <small v-else-if="item.status === 'processing'">已接收，正在后台准备</small>
           <small v-else-if="item.status === 'ready'">
-            {{ item.persistent ? '验证资料库' : '仅本次' }} · {{ formatSize(item.size) }}
+            {{ item.persistent ? '附件数据源' : '仅本次' }} · {{ formatSize(item.size) }}
           </small>
           <small v-else class="attachment-error">{{ item.error || '上传失败' }}</small>
           <el-progress v-if="item.status === 'uploading'" :percentage="item.progress" :show-text="false" :stroke-width="3" />
@@ -53,7 +53,7 @@
           size="small"
           aria-label="附件保存方式"
         />
-        <label class="attachment-button" :class="{ disabled: disabled || busy }" :title="uploadMode === 'validation_asset' ? '上传并保存到验证资料库' : '上传仅供本次对话使用'">
+        <label class="attachment-button" :class="{ disabled: disabled || busy }" :title="uploadMode === 'validation_asset' ? '上传并保存到附件数据源' : '上传仅供本次对话使用'">
           <el-icon aria-hidden="true"><Paperclip /></el-icon>
           <span>上传</span>
           <input
@@ -65,9 +65,9 @@
             @change="onFilesPicked"
           />
         </label>
-        <el-button text :disabled="disabled || busy" title="选择已上传的验证资料" @click="openLibrary">
+        <el-button text :disabled="disabled || busy" title="选择当前 Agent 的附件数据源" @click="openLibrary">
           <el-icon><FolderOpened /></el-icon>
-          资料库
+          附件数据源
         </el-button>
         <span class="keyboard-hint">Enter 发送 · Shift + Enter 换行</span>
       </div>
@@ -80,9 +80,9 @@
     </div>
     <p v-if="uploadError" class="composer-error" role="alert">{{ uploadError }}</p>
 
-    <el-dialog v-model="libraryVisible" title="验证资料库" width="min(620px, 92vw)" append-to-body>
+    <el-dialog v-model="libraryVisible" title="附件数据源" width="min(620px, 92vw)" append-to-body>
       <div v-loading="libraryLoading" class="library-list">
-        <el-empty v-if="!libraryLoading && !savedAssets.length" description="暂无可复用资料" :image-size="64" />
+        <el-empty v-if="!libraryLoading && !savedAssets.length" description="暂无可复用附件数据源" :image-size="64" />
         <div v-for="item in savedAssets" :key="item.versionId" class="library-row">
           <el-icon aria-hidden="true"><Document /></el-icon>
           <div class="library-copy">
@@ -98,7 +98,15 @@
           >
             <el-icon><Check /></el-icon>{{ isAttached(item.versionId) ? '已选择' : '选择' }}
           </el-button>
-          <el-button text circle type="danger" title="彻底删除资料" @click="deleteSaved(item)">
+          <el-button
+            text
+            circle
+            type="danger"
+            :loading="deletingAssetId === item.assetId"
+            :disabled="Boolean(deletingAssetId)"
+            title="彻底删除附件数据源"
+            @click="deleteSaved(item)"
+          >
             <el-icon><Delete /></el-icon>
           </el-button>
         </div>
@@ -108,7 +116,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import type { AgentChatRequest, CatalogAsset, CatalogAssetVersion, ManagedUploadRun } from '@/types'
@@ -121,6 +129,7 @@ type AttachmentStatus = 'registering' | 'uploading' | 'processing' | 'ready' | '
 type ChatAttachmentDraft = {
   uid: string
   file?: File
+  ownerAgentId?: string
   assetId?: string
   filename: string
   size: number
@@ -149,6 +158,8 @@ type SavedAsset = {
 const props = withDefaults(defineProps<{
   agentId?: string
   conversationId?: string
+  /** AgentChat must wait for a verified Agent scope before reading/uploads. */
+  scopeRequired?: boolean
   disabled?: boolean
   busy?: boolean
   placeholder?: string
@@ -157,6 +168,7 @@ const props = withDefaults(defineProps<{
 }>(), {
   agentId: '',
   conversationId: '',
+  scopeRequired: false,
   disabled: false,
   busy: false,
   placeholder: '输入业务问题或需求，也可以上传本次处理所需的文件',
@@ -181,7 +193,9 @@ const uploadModeOptions = [
 const libraryVisible = ref(false)
 const libraryLoading = ref(false)
 const savedAssets = ref<SavedAsset[]>([])
+const deletingAssetId = ref('')
 const uploadControllers = new Map<string, AbortController>()
+let savedAssetsRequest = 0
 const CONTENT_UPLOAD_ATTEMPTS = 3
 const submittableAttachments = computed(() => attachments.value.filter((item) => (
   Boolean(item.assetVersionId) || Boolean(item.uploadRunId)
@@ -232,9 +246,17 @@ function waitForPoll(milliseconds: number, signal: AbortSignal) {
   })
 }
 
-async function pollUploadRun(item: ChatAttachmentDraft, signal: AbortSignal): Promise<ManagedUploadRun | null> {
+async function pollUploadRun(
+  item: ChatAttachmentDraft,
+  ownerAgentId: string,
+  signal: AbortSignal,
+): Promise<ManagedUploadRun | null> {
   while (!signal.aborted && item.uploadRunId) {
-    const run = await api.getManagedUploadRun(item.uploadRunId, signal)
+    const run = await api.getManagedUploadRun(
+      item.uploadRunId,
+      ownerAgentId || undefined,
+      signal,
+    )
     updateFromUploadRun(item, run)
     if (
       ['ready', 'failed', 'cancelled'].includes(run.status)
@@ -249,6 +271,7 @@ async function uploadContentWithRetry(
   item: ChatAttachmentDraft,
   file: File,
   initialRun: ManagedUploadRun,
+  ownerAgentId: string,
   controller: AbortController,
 ): Promise<ManagedUploadRun> {
   let run = initialRun
@@ -259,6 +282,7 @@ async function uploadContentWithRetry(
         runId: run.id,
         expectedRevision: run.revision,
         file,
+        agentId: ownerAgentId || undefined,
         signal: controller.signal,
         onProgress: (percent) => { item.progress = percent },
       })
@@ -266,10 +290,14 @@ async function uploadContentWithRetry(
       lastError = error
       if (controller.signal.aborted) throw error
       try {
-        const observed = await api.getManagedUploadRun(run.id, controller.signal)
+        const observed = await api.getManagedUploadRun(
+          run.id,
+          ownerAgentId || undefined,
+          controller.signal,
+        )
         updateFromUploadRun(item, observed)
         run = observed.status === 'uploading'
-          ? (await pollUploadRun(item, controller.signal) || observed)
+          ? (await pollUploadRun(item, ownerAgentId, controller.signal) || observed)
           : observed
       } catch (reconciliationError: unknown) {
         if (controller.signal.aborted) throw reconciliationError
@@ -284,6 +312,13 @@ async function uploadContentWithRetry(
 
 async function uploadOne(item: ChatAttachmentDraft) {
   if (!item.file) return
+  const ownerAgentId = String(item.ownerAgentId || props.agentId || '').trim()
+  if (props.scopeRequired && (!ownerAgentId || ownerAgentId !== String(props.agentId || '').trim())) {
+    item.status = 'error'
+    item.error = '附件所属 Agent 已变化，请重新选择附件'
+    return
+  }
+  item.ownerAgentId = ownerAgentId
   const previous = uploadControllers.get(item.uid)
   previous?.abort()
   const controller = new AbortController()
@@ -291,32 +326,21 @@ async function uploadOne(item: ChatAttachmentDraft) {
   item.progress = 0
   item.error = ''
   uploadError.value = ''
+  const conversationId = props.conversationId || undefined
   try {
-    let run: ManagedUploadRun
-    if (!item.uploadRunId) {
-      item.status = 'registering'
-      run = await api.createManagedUploadRun({
-        filename: item.file.name,
-        byte_size: item.file.size,
-        media_type: item.file.type,
-        purpose: item.persistent ? 'validation_asset' : 'invocation_attachment',
-        idempotency_key: `attachment-${item.uid}`,
-      })
-      updateFromUploadRun(item, run)
-    } else {
-      run = await api.getManagedUploadRun(item.uploadRunId, controller.signal)
-      if (run.status === 'failed') {
-        run = await api.retryManagedUploadRun(run.id, run.revision)
+    let run = await resolveUploadRun(item, item.file, ownerAgentId, conversationId, controller)
+    if (!run) return
+    if (run.status === 'awaiting_upload') {
+      item.status = 'uploading'
+      run = await uploadContentWithRetry(item, item.file, run, ownerAgentId, controller)
+      if (controller.signal.aborted || !uploadScopeIsCurrent(ownerAgentId)) {
+        void cancelAbandonedUploadRun(run.id, ownerAgentId)
+        return
       }
       updateFromUploadRun(item, run)
     }
-    if (run.status === 'awaiting_upload') {
-      item.status = 'uploading'
-      run = await uploadContentWithRetry(item, item.file, run, controller)
-      updateFromUploadRun(item, run)
-    }
     if (!['ready', 'failed', 'cancelled'].includes(run.status)) {
-      await pollUploadRun(item, controller.signal)
+      await pollUploadRun(item, ownerAgentId, controller.signal)
     }
   } catch (error: any) {
     if (controller.signal.aborted) return
@@ -329,18 +353,73 @@ async function uploadOne(item: ChatAttachmentDraft) {
       uploadError.value = item.error || '附件上传失败'
     }
   } finally {
-    if (uploadControllers.get(item.uid) === controller && ['ready', 'error'].includes(item.status)) {
+    if (uploadControllers.get(item.uid) === controller) {
       uploadControllers.delete(item.uid)
     }
   }
+}
+
+async function resolveUploadRun(
+  item: ChatAttachmentDraft,
+  file: File,
+  ownerAgentId: string,
+  conversationId: string | undefined,
+  controller: AbortController,
+): Promise<ManagedUploadRun | null> {
+  let run: ManagedUploadRun
+  if (!item.uploadRunId) {
+    item.status = 'registering'
+    run = await api.createManagedUploadRun({
+      filename: file.name,
+      byte_size: file.size,
+      media_type: file.type,
+      purpose: item.persistent ? 'validation_asset' : 'invocation_attachment',
+      idempotency_key: `attachment-${item.uid}`,
+      agent_id: ownerAgentId || undefined,
+      conversation_id: conversationId,
+    })
+  } else {
+    run = await api.getManagedUploadRun(
+      item.uploadRunId,
+      ownerAgentId || undefined,
+      controller.signal,
+    )
+    if (run.status === 'failed') {
+      run = await api.retryManagedUploadRun(
+        run.id,
+        run.revision,
+        ownerAgentId || undefined,
+      )
+    }
+  }
+  if (controller.signal.aborted || !uploadScopeIsCurrent(ownerAgentId)) {
+    void cancelAbandonedUploadRun(run.id, ownerAgentId)
+    return null
+  }
+  updateFromUploadRun(item, run)
+  return run
 }
 
 function retryUpload(item: ChatAttachmentDraft) {
   void uploadOne(item)
 }
 
+function hasAttachmentScope() {
+  if (!props.scopeRequired || String(props.agentId || '').trim()) return true
+  uploadError.value = 'Agent 身份仍在加载，请稍后再上传附件'
+  return false
+}
+
+function uploadScopeIsCurrent(ownerAgentId: string) {
+  return !props.scopeRequired || ownerAgentId === String(props.agentId || '').trim()
+}
+
 function onFilesPicked(event: Event) {
   const input = event.target as HTMLInputElement
+  if (!hasAttachmentScope()) {
+    input.value = ''
+    return
+  }
   const files = Array.from(input.files || [])
   input.value = ''
   for (const file of files) {
@@ -351,6 +430,7 @@ function onFilesPicked(event: Event) {
     const draft = reactive<ChatAttachmentDraft>({
       uid: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       file,
+      ownerAgentId: String(props.agentId || '').trim() || undefined,
       filename: file.name,
       size: file.size,
       progress: 0,
@@ -363,13 +443,25 @@ function onFilesPicked(event: Event) {
 }
 
 async function loadSavedAssets() {
+  const request = ++savedAssetsRequest
+  const scopedAgentId = String(props.agentId || '').trim()
+  if (props.scopeRequired && !scopedAgentId) {
+    savedAssets.value = []
+    libraryLoading.value = false
+    return
+  }
   libraryLoading.value = true
   try {
-    const assets = (await api.listCatalogAssets('invocation_input')).filter((item: CatalogAsset) => (
-      item.lifecycle_status === 'active' && item.labels?.catalog_purpose === 'validation_asset'
+    const assets = (await api.listCatalogAssets('invocation_input', {
+      agent_id: scopedAgentId || undefined,
+    })).filter((item: CatalogAsset) => (
+      item.lifecycle_status === 'active'
+      && item.labels?.catalog_purpose === 'validation_asset'
+      && (!props.scopeRequired || item.owner_agent_id === scopedAgentId)
     ))
     const rows = await Promise.all(assets.map(async (asset: CatalogAsset) => {
-      const versions = await api.listCatalogAssetVersions(asset.id)
+      const versions = (await api.listCatalogAssetVersions(asset.id, scopedAgentId || undefined))
+        .filter((version: CatalogAssetVersion) => version.asset_id === asset.id)
       const latest = [...versions]
         .filter((version: CatalogAssetVersion) => version.status === 'ready')
         .sort((a: CatalogAssetVersion, b: CatalogAssetVersion) => b.version_number - a.version_number)[0]
@@ -388,15 +480,21 @@ async function loadSavedAssets() {
         createdAt: latest.created_at,
       } satisfies SavedAsset
     }))
+    if (request !== savedAssetsRequest) return
     savedAssets.value = rows.filter((item): item is SavedAsset => item !== null)
   } catch (error: any) {
-    ElMessage.error(error?.response?.data?.detail || '验证资料库加载失败')
+    if (request !== savedAssetsRequest) return
+    ElMessage.error(error?.response?.data?.detail || '附件数据源加载失败')
   } finally {
-    libraryLoading.value = false
+    if (request === savedAssetsRequest) libraryLoading.value = false
   }
 }
 
 function openLibrary() {
+  if (props.scopeRequired && !String(props.agentId || '').trim()) {
+    ElMessage.warning('Agent 身份仍在加载，请稍后再选择附件数据源')
+    return
+  }
   libraryVisible.value = true
   void loadSavedAssets()
 }
@@ -409,6 +507,7 @@ function attachSaved(item: SavedAsset) {
   if (isAttached(item.versionId)) return
   attachments.value.push({
     uid: `saved-${item.versionId}`,
+    ownerAgentId: String(props.agentId || '').trim() || undefined,
     assetId: item.assetId,
     filename: item.filename,
     size: item.size,
@@ -422,26 +521,58 @@ function attachSaved(item: SavedAsset) {
 }
 
 async function deleteSaved(item: SavedAsset) {
-  await ElMessageBox.confirm(
-    `删除“${item.filename}”后，后续验证不能再使用它；已发布的场景能力不会受影响。`,
-    '彻底删除验证资料',
-    { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
-  )
+  if (deletingAssetId.value) return
   try {
-    await api.deleteCatalogAsset(item.assetId)
+    await ElMessageBox.confirm(
+      `删除“${item.filename}”后，当前 Agent 的后续验证不能再使用它；已绑定的场景能力不会受影响。`,
+      '彻底删除附件数据源',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+    deletingAssetId.value = item.assetId
+    await api.deleteCatalogAsset(item.assetId, props.agentId || undefined)
     attachments.value = attachments.value.filter((entry) => entry.assetVersionId !== item.versionId)
     savedAssets.value = savedAssets.value.filter((entry) => entry.assetId !== item.assetId)
-    ElMessage.success('验证资料已删除')
+    ElMessage.success('附件数据源已删除')
   } catch (error: any) {
-    ElMessage.error(error?.response?.data?.detail || '验证资料删除失败')
+    if (error !== 'cancel' && error !== 'close') {
+      ElMessage.error(error?.response?.data?.detail || '附件数据源删除失败')
+    }
+  } finally {
+    deletingAssetId.value = ''
   }
 }
 
-function removeAttachment(uid: string) {
+async function removeAttachment(uid: string) {
+  const item = attachments.value.find((entry) => entry.uid === uid)
   uploadControllers.get(uid)?.abort()
   uploadControllers.delete(uid)
   attachments.value = attachments.value.filter((item) => item.uid !== uid)
   if (!attachments.value.some((item) => item.status === 'error')) uploadError.value = ''
+  // Local removal must also fence a still-pending durable run.  Scope every
+  // follow-up lookup/mutation to this Agent; an Agent UI must never fall back
+  // to the Global Assistant namespace when cancelling an upload.
+  if (item?.uploadRunId) {
+    await cancelAbandonedUploadRun(
+      item.uploadRunId,
+      String(item.ownerAgentId || props.agentId || '').trim(),
+    )
+  }
+}
+
+async function cancelAbandonedUploadRun(runId: string, ownerAgentId: string) {
+  try {
+    const current = await api.getManagedUploadRun(runId, ownerAgentId || undefined)
+    if (!['ready', 'cancelled'].includes(current.status)) {
+      await api.cancelManagedUploadRun(
+        current.id,
+        current.revision,
+        ownerAgentId || undefined,
+      )
+    }
+  } catch {
+    // The draft is already gone locally; a failed cancellation is reconciled
+    // by the server-side upload expiry/Agent cleanup path.
+  }
 }
 
 function invocationIdempotencyKey() {
@@ -452,7 +583,7 @@ function invocationIdempotencyKey() {
 }
 
 async function submitDraft() {
-  if (props.disabled || props.busy || submissionBlocked.value) return
+  if (props.disabled || props.busy || submissionBlocked.value || !hasAttachmentScope()) return
   const text = message.value.trim()
   if (!text && !submittableAttachments.value.length) return
   uploadError.value = ''
@@ -498,11 +629,37 @@ function formatDate(value: string) {
   return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : ''
 }
 
+watch(() => [props.agentId, props.scopeRequired] as const, ([agentId, scopeRequired], [previousAgentId]) => {
+  const nextScope = String(agentId || '').trim()
+  const previousScope = String(previousAgentId || '').trim()
+  savedAssetsRequest += 1
+  savedAssets.value = []
+  if (nextScope !== previousScope) {
+    const abandoned = attachments.value.filter((item) => item.uploadRunId && item.status !== 'ready')
+    for (const controller of uploadControllers.values()) controller.abort()
+    uploadControllers.clear()
+    attachments.value = []
+    message.value = ''
+    uploadError.value = ''
+    libraryVisible.value = false
+    deletingAssetId.value = ''
+    for (const item of abandoned) {
+      void cancelAbandonedUploadRun(
+        String(item.uploadRunId),
+        String(item.ownerAgentId || previousScope).trim(),
+      )
+    }
+  }
+  if (!scopeRequired || nextScope) void loadSavedAssets()
+  else libraryLoading.value = false
+}, { flush: 'post' })
+
 onMounted(() => {
   messageInputRef.value?.focus?.()
-  void loadSavedAssets()
+  if (!props.scopeRequired || String(props.agentId || '').trim()) void loadSavedAssets()
 })
 onBeforeUnmount(() => {
+  savedAssetsRequest += 1
   for (const controller of uploadControllers.values()) controller.abort()
   uploadControllers.clear()
 })

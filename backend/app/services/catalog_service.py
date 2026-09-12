@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
@@ -21,7 +21,9 @@ from ..catalog_schemas import (
     SemanticMappingCreate,
 )
 from ..models import (
+    Agent,
     BucketFile,
+    BusinessScenario,
     DataAsset,
     DataAssetVersion,
     DataSource,
@@ -33,6 +35,7 @@ from ..models import (
     DatasetVersionAsset,
     FunctionDefinition,
     LogicalDataset,
+    ManagedUploadRun,
     OntologyAction,
     OntologyEntity,
     OntologyProperty,
@@ -45,6 +48,7 @@ from ..models import (
     SemanticMapping,
 )
 from . import (
+    agent_scope_access_service,
     datasource_service,
     input_contract_validator,
     permission_service,
@@ -104,6 +108,49 @@ def _actor(db: Session) -> str | None:
 
 def _tenant(db: Session) -> str:
     return tenant_service.current_tenant_id(db)
+
+
+def external_upload_source_id(tenant_id: str) -> str:
+    """Return the stable id of the platform-managed shared upload bucket."""
+    return hashlib.sha256(
+        b"ontology-platform/external-upload-source/v1\0"
+        + str(tenant_id).encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def _require_asset_scope_permission(
+    db: Session,
+    owner_agent_id: str | None,
+    verb: str,
+    *,
+    lock: bool = False,
+):
+    try:
+        return agent_scope_access_service.require_optional_agent_permission(
+            db,
+            owner_agent_id,
+            verb,
+            lock=lock,
+            message="没有该 Agent 所属业务场景的资产权限",
+        )
+    except agent_scope_access_service.AgentScopeNotFoundError as exc:
+        raise CatalogError("资产不存在") from exc
+
+
+def _require_dataset_scope_permission(
+    db: Session,
+    agent_id: str | None,
+    verb: Literal["read", "write"],
+):
+    try:
+        return agent_scope_access_service.require_optional_agent_permission(
+            db,
+            agent_id,
+            verb,
+            message="没有该 Agent 所属业务场景的数据集权限",
+        )
+    except agent_scope_access_service.AgentScopeNotFoundError as exc:
+        raise CatalogError("逻辑数据集不存在") from exc
 
 
 def _canonical_hash(value: Any) -> str:
@@ -200,6 +247,169 @@ def require_asset(db: Session, asset_id: str) -> DataAsset:
     return asset
 
 
+def lock_asset_for_write(db: Session, asset: DataAsset) -> DataAsset:
+    """Recheck owner ACL and lock an asset immediately before a write result.
+
+    Uploads may spend a long time outside the transaction while putting the
+    object.  Callers that return an idempotent existing version still need a
+    short final fence so a revoked Agent scope or concurrent deletion cannot
+    turn that read into an unauthorized success.
+    """
+
+    owner_agent_id = str(asset.owner_agent_id or "") or None
+    _require_asset_scope_permission(
+        db,
+        owner_agent_id,
+        "write",
+        lock=bool(owner_agent_id),
+    )
+    locked = db.execute(
+        select(DataAsset)
+        .where(
+            DataAsset.id == asset.id,
+            DataAsset.tenant_id == _tenant(db),
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if locked is None or locked.lifecycle_status != "active":
+        raise CatalogError("数据资产不可写")
+    locked_owner = str(locked.owner_agent_id or "") or None
+    if locked_owner != owner_agent_id:
+        raise CatalogError("数据资产不属于当前上传作用域")
+    return locked
+
+
+def _require_asset_file_scope(
+    db: Session,
+    asset: DataAsset,
+    bucket_file: BucketFile,
+    source: DataSource,
+    *,
+    allow_shared_runtime_source: bool = False,
+    permission_verb: Literal["read", "write"] = "write",
+    tenant_id: str | None = None,
+) -> None:
+    """Keep a registered file in the asset's explicit ownership namespace.
+
+    A bucket-file id is tenant-local but is not an ownership proof.  In
+    particular, the external runtime bucket is shared by Agent uploads, so a
+    caller must not attach another Agent's file to a private asset merely by
+    guessing its id.  Private registration therefore requires an
+    owner-matching runtime source; global registration accepts only unowned,
+    unscoped sources.
+    """
+    effective_tenant_id = str(tenant_id or "").strip() or _tenant(db)
+    if (
+        bucket_file.data_source_id != source.id
+        or source.tenant_id != asset.tenant_id
+        or asset.tenant_id != effective_tenant_id
+    ):
+        raise CatalogError("登记文件不属于当前资产作用域")
+    # A tenant-local BucketFile row is not sufficient proof that its object is
+    # in the platform-managed store.  Keep the source policy check adjacent to
+    # the ownership check so a forged row cannot use a same-owner local path.
+    if not datasource_service.is_managed_minio_source(source):
+        raise CatalogError("登记文件不属于受管 MinIO 文件桶")
+    try:
+        datasource_service.managed_minio_location(source)
+    except Exception as exc:  # noqa: BLE001 - hide storage configuration details.
+        raise CatalogError("登记文件不属于受管 MinIO 文件桶") from exc
+    asset_owner = str(asset.owner_agent_id or "") or None
+    source_owner = str(source.owner_agent_id or "") or None
+    source_scenario = str(source.scenario_id or "") or None
+    if source_scenario is not None:
+        scenario = db.scalar(
+            select(BusinessScenario).where(
+                BusinessScenario.id == source_scenario,
+                BusinessScenario.tenant_id == asset.tenant_id,
+            )
+        )
+        decision = (
+            permission_service.check_scenario(db, scenario, permission_verb)
+            if scenario is not None
+            else None
+        )
+        if (
+            scenario is None
+            or (permission_verb == "write" and scenario.status == "retired")
+            or decision is None
+            or not decision.allowed
+        ):
+            raise CatalogError("登记文件不属于当前资产作用域")
+
+    # The deterministic external bucket is intentionally shared.  Its
+    # DataSource owner cannot prove which Agent uploaded one file, so inspect
+    # every durable pointer to that exact file before accepting a new link.
+    # This also prevents a Global asset from laundering an Agent-private
+    # object into the tenant-wide namespace.
+    lineage_owners = {
+        str(value)
+        for value in db.scalars(
+            select(ManagedUploadRun.owner_agent_id).where(
+                ManagedUploadRun.tenant_id == asset.tenant_id,
+                ManagedUploadRun.data_source_id == source.id,
+                ManagedUploadRun.bucket_file_id == bucket_file.id,
+                ManagedUploadRun.owner_agent_id.is_not(None),
+            )
+        ).all()
+        if value
+    }
+    lineage_owners.update(
+        str(value)
+        for value in db.scalars(
+            select(DataAsset.owner_agent_id)
+            .join(
+                DataAssetVersion,
+                (DataAssetVersion.asset_id == DataAsset.id)
+                & (DataAssetVersion.tenant_id == DataAsset.tenant_id),
+            )
+            .where(
+                DataAssetVersion.tenant_id == asset.tenant_id,
+                DataAssetVersion.bucket_file_id == bucket_file.id,
+                DataAssetVersion.bucket_data_source_id == source.id,
+                DataAsset.owner_agent_id.is_not(None),
+            )
+        ).all()
+        if value
+    )
+    if lineage_owners and (
+        asset_owner is None or lineage_owners != {asset_owner}
+    ):
+        raise CatalogError("登记文件不属于当前资产作用域")
+    if asset_owner is None:
+        if source_owner is not None:
+            raise CatalogError("登记文件不属于当前资产作用域")
+        # The deterministic external bucket is shared by managed uploads. It
+        # may only be consumed by this trusted ingestion wrapper; a public
+        # version-registration request must not turn a guessed BucketFile id
+        # into a Global asset and thereby expose another Agent's attachment.
+        if source.resource_scope == "modeling":
+            return
+        if not (
+            source.resource_scope == "agent_runtime"
+            and allow_shared_runtime_source
+            and source.id == external_upload_source_id(asset.tenant_id)
+            and source_scenario is None
+        ):
+            raise CatalogError("登记文件不属于当前资产作用域")
+        return
+    if source.resource_scope != "agent_runtime":
+        raise CatalogError("登记文件不属于当前 Agent 作用域")
+    if source_owner is None and not allow_shared_runtime_source:
+        raise CatalogError("登记文件不属于当前 Agent 作用域")
+    if source_owner is None and source.id != external_upload_source_id(asset.tenant_id):
+        raise CatalogError("登记文件不属于当前 Agent 作用域")
+    if source_owner not in {None, asset_owner}:
+        raise CatalogError("登记文件不属于当前 Agent 作用域")
+    owner = db.get(Agent, asset_owner)
+    if owner is None or (
+        source_scenario is not None
+        and source_scenario != (str(owner.scenario_id or "") or None)
+    ):
+        raise CatalogError("登记文件不属于当前 Agent 作用域")
+
+
 def require_asset_version(db: Session, version_id: str) -> DataAssetVersion:
     version = db.execute(
         select(DataAssetVersion).where(
@@ -212,7 +422,221 @@ def require_asset_version(db: Session, version_id: str) -> DataAssetVersion:
     return version
 
 
-def require_dataset(db: Session, dataset_id: str) -> LogicalDataset:
+def _validation_dataset_owner(dataset: LogicalDataset) -> tuple[bool, str | None]:
+    labels = dataset.labels if isinstance(dataset.labels, dict) else {}
+    if labels.get("catalog_purpose") != "validation_dataset":
+        return False, None
+    return True, str(labels.get("owner_agent_id") or "") or None
+
+
+def _validation_dataset_lineage_is_consistent(
+    db: Session,
+    dataset: LogicalDataset,
+    *,
+    owner_agent_id: str | None,
+) -> bool:
+    """Prove that a generated package has not crossed an Agent boundary.
+
+    ``owner_agent_id`` is stored in labels for compatibility with existing
+    validation packages, so the label alone is not an ownership proof.  The
+    immutable DatasetVersionAsset links must agree with it as well.  Empty
+    legacy packages are retained for backwards compatibility; once a package
+    carries source markers or links, every linked asset/version is checked.
+    """
+
+    if dataset.usage_plane != "invocation_input":
+        return False
+    if owner_agent_id is not None:
+        owner = db.scalar(
+            select(Agent.id).where(
+                Agent.id == owner_agent_id,
+                Agent.tenant_id == dataset.tenant_id,
+            )
+        )
+        if owner is None:
+            return False
+
+    labels = dataset.labels if isinstance(dataset.labels, dict) else {}
+    marker_present = "source_asset_version_ids" in labels
+    marker = labels.get("source_asset_version_ids")
+    marked_ids: set[str] | None = None
+    if marker_present:
+        if not isinstance(marker, list) or not marker:
+            return False
+        normalized = [str(value or "").strip() for value in marker]
+        if any(not value for value in normalized) or len(set(normalized)) != len(normalized):
+            return False
+        marked_ids = set(normalized)
+
+    rows = db.execute(
+        select(
+            DatasetVersionAsset.asset_version_id,
+            DataAsset.owner_agent_id,
+            DataAsset.lifecycle_status,
+            DataAsset.usage_plane,
+            DataAssetVersion.status,
+            DataAssetVersion.tenant_id,
+            DatasetVersionAsset.tenant_id,
+        )
+        .join(
+            DataAssetVersion,
+            DataAssetVersion.id == DatasetVersionAsset.asset_version_id,
+        )
+        .join(DataAsset, DataAsset.id == DataAssetVersion.asset_id)
+        .join(
+            DatasetVersion,
+            (DatasetVersion.id == DatasetVersionAsset.dataset_version_id)
+            & (DatasetVersion.dataset_id == DatasetVersionAsset.dataset_id)
+            & (DatasetVersion.tenant_id == DatasetVersionAsset.tenant_id),
+        )
+        .where(
+            DatasetVersionAsset.dataset_id == dataset.id,
+            DatasetVersionAsset.tenant_id == dataset.tenant_id,
+            DataAssetVersion.tenant_id == dataset.tenant_id,
+            DataAsset.tenant_id == dataset.tenant_id,
+        )
+    ).all()
+    linked_ids = {str(row[0]) for row in rows}
+    if not rows:
+        # A freshly queued package is intentionally visible before the worker
+        # writes its DatasetVersionAsset rows.  That compatibility window is
+        # safe only when the durable source marker is present and every
+        # marked version still proves the same tenant/owner/file scope.  An
+        # empty, ownerless package is otherwise indistinguishable from a
+        # malformed import and must fail closed.
+        if marked_ids is None:
+            return False
+        # Older completed validation packages may have a DatasetVersion but
+        # predate the DatasetVersionAsset association.  An owner-bound
+        # package can remain readable when its durable marker proves the
+        # exact source lineage; an ownerless package must still fail closed
+        # because there is no Agent boundary to validate.
+        if owner_agent_id is None and db.scalar(
+            select(DatasetVersion.id).where(
+                DatasetVersion.dataset_id == dataset.id,
+                DatasetVersion.tenant_id == dataset.tenant_id,
+            ).limit(1)
+        ) is not None:
+            return False
+        source_rows = db.execute(
+            select(DataAssetVersion, DataAsset, BucketFile, DataSource)
+            .join(
+                DataAsset,
+                (DataAsset.id == DataAssetVersion.asset_id)
+                & (DataAsset.tenant_id == DataAssetVersion.tenant_id),
+            )
+            .join(
+                BucketFile,
+                (BucketFile.id == DataAssetVersion.bucket_file_id)
+                & (BucketFile.data_source_id == DataAssetVersion.bucket_data_source_id),
+            )
+            .join(
+                DataSource,
+                (DataSource.id == DataAssetVersion.bucket_data_source_id)
+                & (DataSource.tenant_id == DataAssetVersion.tenant_id),
+            )
+            .where(
+                DataAssetVersion.id.in_(sorted(marked_ids)),
+                DataAssetVersion.tenant_id == dataset.tenant_id,
+                DataAsset.tenant_id == dataset.tenant_id,
+                BucketFile.data_source_id == DataAssetVersion.bucket_data_source_id,
+                DataSource.tenant_id == dataset.tenant_id,
+            )
+        ).all()
+        if {str(row[0].id) for row in source_rows} != marked_ids:
+            return False
+        expected_owner = str(owner_agent_id or "") or None
+        for version, asset, bucket_file, source in source_rows:
+            if (
+                (str(asset.owner_agent_id or "") or None) != expected_owner
+                or asset.lifecycle_status != "active"
+                or asset.usage_plane != "invocation_input"
+                or version.status != "ready"
+                or not version.bucket_file_id
+                or not version.bucket_data_source_id
+            ):
+                return False
+            try:
+                _require_asset_file_scope(
+                    db,
+                    asset,
+                    bucket_file,
+                    source,
+                    allow_shared_runtime_source=True,
+                    permission_verb="read",
+                    tenant_id=dataset.tenant_id,
+                )
+            except CatalogError:
+                return False
+        return True
+    if marked_ids is not None and linked_ids != marked_ids:
+        return False
+    expected_owner = str(owner_agent_id or "") or None
+    for (
+        _asset_version_id,
+        asset_owner,
+        asset_lifecycle,
+        asset_usage_plane,
+        version_status,
+        version_tenant_id,
+        link_tenant_id,
+    ) in rows:
+        if (
+            (str(asset_owner or "") or None) != expected_owner
+            or asset_lifecycle != "active"
+            or asset_usage_plane != "invocation_input"
+            or version_status != "ready"
+            or str(version_tenant_id) != str(dataset.tenant_id)
+            or str(link_tenant_id) != str(dataset.tenant_id)
+        ):
+            return False
+    return True
+
+
+def _assert_validation_dataset_readable(
+    db: Session,
+    dataset: LogicalDataset,
+    *,
+    owner_agent_id: str | None,
+) -> None:
+    if dataset.lifecycle_status != "active":
+        raise CatalogError("逻辑数据集不存在")
+    if not _validation_dataset_lineage_is_consistent(
+        db,
+        dataset,
+        owner_agent_id=owner_agent_id,
+    ):
+        raise CatalogError("逻辑数据集不存在")
+    retired_version = db.scalar(
+        select(DatasetVersion.id)
+        .where(
+            DatasetVersion.dataset_id == dataset.id,
+            DatasetVersion.tenant_id == dataset.tenant_id,
+            DatasetVersion.status == "retired",
+        )
+        .limit(1)
+    )
+    if retired_version is not None:
+        raise CatalogError("逻辑数据集不存在")
+
+
+def _reject_generated_validation_dataset_write(dataset: LogicalDataset) -> None:
+    is_validation_dataset, _owner_agent_id = _validation_dataset_owner(dataset)
+    if is_validation_dataset:
+        raise CatalogError("验证数据集只能通过验证任务生成")
+
+
+def require_dataset(
+    db: Session,
+    dataset_id: str,
+    *,
+    agent_id: str | None = None,
+) -> LogicalDataset:
+    scoped_agent = (
+        _require_dataset_scope_permission(db, agent_id, "read")
+        if agent_id is not None
+        else None
+    )
     dataset = db.execute(
         select(LogicalDataset).where(
             LogicalDataset.id == dataset_id,
@@ -220,6 +644,19 @@ def require_dataset(db: Session, dataset_id: str) -> LogicalDataset:
         )
     ).scalar_one_or_none()
     if dataset is None:
+        raise CatalogError("逻辑数据集不存在")
+    is_validation_dataset, owner_agent_id = _validation_dataset_owner(dataset)
+    if is_validation_dataset:
+        normalized_agent_id = str(scoped_agent.id) if scoped_agent is not None else None
+        if owner_agent_id != normalized_agent_id:
+            raise CatalogError("逻辑数据集不存在")
+        _assert_validation_dataset_readable(
+            db,
+            dataset,
+            owner_agent_id=owner_agent_id,
+        )
+    elif scoped_agent is not None:
+        # Agent scope is not a shortcut to the tenant-wide modeling catalog.
         raise CatalogError("逻辑数据集不存在")
     _require_modeling_contract_source_access(db, dataset)
     return dataset
@@ -303,7 +740,13 @@ def _require_modeling_dataset(dataset: LogicalDataset, *, label: str) -> None:
         raise CatalogError(f"{label}只能引用建模资料数据集")
 
 
-def require_schema(db: Session, schema_id: str, *, dataset_id: str | None = None) -> DatasetSchema:
+def require_schema(
+    db: Session,
+    schema_id: str,
+    *,
+    dataset_id: str | None = None,
+    agent_id: str | None = None,
+) -> DatasetSchema:
     statement = select(DatasetSchema).where(
         DatasetSchema.id == schema_id,
         DatasetSchema.tenant_id == _tenant(db),
@@ -313,7 +756,7 @@ def require_schema(db: Session, schema_id: str, *, dataset_id: str | None = None
     schema = db.execute(statement).scalar_one_or_none()
     if schema is None:
         raise CatalogError("数据集 Schema 不存在")
-    require_dataset(db, schema.dataset_id)
+    require_dataset(db, schema.dataset_id, agent_id=agent_id)
     return schema
 
 
@@ -323,6 +766,7 @@ def require_dataset_version(
     *,
     dataset_id: str | None = None,
     ready: bool = False,
+    agent_id: str | None = None,
 ) -> DatasetVersion:
     statement = select(DatasetVersion).where(
         DatasetVersion.id == version_id,
@@ -333,6 +777,7 @@ def require_dataset_version(
     version = db.execute(statement).scalar_one_or_none()
     if version is None:
         raise CatalogError("数据集版本不存在")
+    require_dataset(db, version.dataset_id, agent_id=agent_id)
     if ready and version.status != "ready":
         raise CatalogError("数据集版本尚未就绪")
     return version
@@ -342,28 +787,49 @@ def list_assets(
     db: Session,
     *,
     usage_plane: str | None = None,
+    owner_agent_id: str | None = None,
 ) -> list[DataAsset]:
-    permission_service.require_tenant_permission(db, "read")
+    scoped_agent = _require_asset_scope_permission(db, owner_agent_id, "read")
+    normalized_owner_id = str(scoped_agent.id) if scoped_agent is not None else None
     statement = select(DataAsset)
     if usage_plane is not None:
         normalized_plane = str(usage_plane or "").strip().lower()
         if normalized_plane not in _USAGE_PLANES:
             raise CatalogError("数据资产 usage_plane 无效")
         statement = statement.where(DataAsset.usage_plane == normalized_plane)
+    if normalized_owner_id is None:
+        # Agent-owned uploads are never exposed through the tenant/global
+        # catalog view.  This keeps legacy NULL-owner assets compatible while
+        # making the scope boundary fail closed.
+        statement = statement.where(DataAsset.owner_agent_id.is_(None))
+    else:
+        statement = statement.where(DataAsset.owner_agent_id == normalized_owner_id)
     return list(
         db.scalars(
             statement
             .options(selectinload(DataAsset.versions))
-            .where(DataAsset.tenant_id == _tenant(db))
+            .where(
+                DataAsset.tenant_id == _tenant(db),
+                # Retired Agent-owned assets are immutable tombstones.  They
+                # remain for audit/FK history but must never re-enter a picker
+                # or be discoverable through the active catalog list.
+                DataAsset.lifecycle_status == "active",
+            )
             .order_by(DataAsset.created_at.desc(), DataAsset.id.desc())
         ).all()
     )
 
 
-def create_asset(db: Session, payload: DataAssetCreate) -> DataAsset:
-    permission_service.require_tenant_permission(db, "write")
+def create_asset(
+    db: Session,
+    payload: DataAssetCreate,
+    *,
+    owner_agent_id: str | None = None,
+) -> DataAsset:
+    scoped_agent = _require_asset_scope_permission(db, owner_agent_id, "write")
     asset = DataAsset(
         tenant_id=_tenant(db),
+        owner_agent_id=str(scoped_agent.id) if scoped_agent is not None else None,
         key=_key(payload.key, "资产 key"),
         name=payload.name.strip(),
         description=payload.description,
@@ -385,8 +851,18 @@ def register_asset_version(
     payload: DataAssetVersionRegister,
     *,
     allow_duplicate_content: bool = False,
+    allow_shared_runtime_source: bool = False,
 ) -> DataAssetVersion:
-    permission_service.require_tenant_permission(db, "write")
+    # Asset deletion takes Agent -> asset locks.  Revalidate and acquire the
+    # same owner lock immediately before the durable version write, after any
+    # external object I/O has completed, so a deleted Agent cannot win between
+    # authorization and publication without blocking/failing this write.
+    _require_asset_scope_permission(
+        db,
+        asset.owner_agent_id,
+        "write",
+        lock=bool(asset.owner_agent_id),
+    )
     if asset.tenant_id != _tenant(db) or asset.lifecycle_status != "active":
         raise CatalogError("数据资产不可写")
     asset = db.execute(
@@ -405,10 +881,22 @@ def register_asset_version(
             BucketFile.id == payload.bucket_file_id,
             DataSource.tenant_id == _tenant(db),
         )
+        # The source/file identity is the final storage fence.  Acquire it
+        # only after the asset lock and after any external upload I/O, so a
+        # source reclassification or concurrent cleanup cannot be published
+        # through a stale pre-upload object.
+        .with_for_update()
     ).first()
     if row is None:
         raise CatalogError("登记文件不存在")
     bucket_file, source = row
+    _require_asset_file_scope(
+        db,
+        asset,
+        bucket_file,
+        source,
+        allow_shared_runtime_source=allow_shared_runtime_source,
+    )
     if not datasource_service.is_managed_minio_file(bucket_file):
         raise CatalogError("只有受管 MinIO 文件可以登记为不可变资产版本")
     digest = str(bucket_file.content_sha256 or "").strip().lower()
@@ -471,8 +959,12 @@ def list_datasets(
     *,
     usage_plane: str | None = None,
     scenario_id: str | None = None,
+    agent_id: str | None = None,
 ) -> list[LogicalDataset]:
-    permission_service.require_tenant_permission(db, "read")
+    if scenario_id and agent_id:
+        raise CatalogError("scenario_id 与 agent_id 不能同时提供")
+    scoped_agent = _require_dataset_scope_permission(db, agent_id, "read")
+    normalized_agent_id = str(scoped_agent.id) if scoped_agent is not None else None
     if scenario_id:
         scenario = tenant_service.require_scenario(db, scenario_id)
         permission_service.require_scenario_permission(db, scenario, "read")
@@ -497,6 +989,22 @@ def list_datasets(
     visible: list[LogicalDataset] = []
     for dataset in rows:
         labels = dict(dataset.labels or {})
+        if labels.get("catalog_purpose") == "validation_dataset":
+            owner_agent_id = str(labels.get("owner_agent_id") or "") or None
+            if owner_agent_id != normalized_agent_id:
+                continue
+            try:
+                _assert_validation_dataset_readable(
+                    db,
+                    dataset,
+                    owner_agent_id=owner_agent_id,
+                )
+            except CatalogError:
+                continue
+            visible.append(dataset)
+            continue
+        if normalized_agent_id is not None:
+            continue
         if labels.get("catalog_purpose") != _MODELING_CONTRACT_SOURCE_PURPOSE:
             visible.append(dataset)
             continue
@@ -515,6 +1023,9 @@ def list_datasets(
 
 def create_dataset(db: Session, payload: LogicalDatasetCreate) -> LogicalDataset:
     permission_service.require_tenant_permission(db, "write")
+    labels = _safe_document(payload.labels, label="数据集标签", maximum=32_000)
+    if labels.get("catalog_purpose") == "validation_dataset":
+        raise CatalogError("validation_dataset 是服务端保留的数据集类型")
     dataset = LogicalDataset(
         tenant_id=_tenant(db),
         key=_key(payload.key, "数据集 key"),
@@ -522,7 +1033,7 @@ def create_dataset(db: Session, payload: LogicalDatasetCreate) -> LogicalDataset
         description=payload.description,
         usage_plane=payload.usage_plane,
         lifecycle_status="active",
-        labels=_safe_document(payload.labels, label="数据集标签", maximum=32_000),
+        labels=labels,
         created_by_user_id=_actor(db),
     )
     db.add(dataset)
@@ -536,6 +1047,7 @@ def create_schema(
     payload: DatasetSchemaCreate,
 ) -> DatasetSchema:
     permission_service.require_tenant_permission(db, "write")
+    _reject_generated_validation_dataset_write(dataset)
     if dataset.tenant_id != _tenant(db) or dataset.lifecycle_status != "active":
         raise CatalogError("逻辑数据集不可写")
     contract = {
@@ -609,7 +1121,13 @@ def create_schema(
     return schema
 
 
-def load_schema(db: Session, schema_id: str, *, dataset_id: str | None = None) -> DatasetSchema:
+def load_schema(
+    db: Session,
+    schema_id: str,
+    *,
+    dataset_id: str | None = None,
+    agent_id: str | None = None,
+) -> DatasetSchema:
     statement = (
         select(DatasetSchema)
         .options(
@@ -625,7 +1143,7 @@ def load_schema(db: Session, schema_id: str, *, dataset_id: str | None = None) -
     schema = db.execute(statement).scalar_one_or_none()
     if schema is None:
         raise CatalogError("数据集 Schema 不存在")
-    require_dataset(db, schema.dataset_id)
+    require_dataset(db, schema.dataset_id, agent_id=agent_id)
     return schema
 
 
@@ -635,6 +1153,9 @@ def create_dataset_version(
     payload: DatasetVersionCreate,
 ) -> DatasetVersion:
     permission_service.require_tenant_permission(db, "write")
+    if dataset.tenant_id != _tenant(db) or dataset.lifecycle_status != "active":
+        raise CatalogError("逻辑数据集不可写")
+    _reject_generated_validation_dataset_write(dataset)
     schema = require_schema(db, payload.schema_id, dataset_id=dataset.id)
     parent = None
     if payload.parent_version_id:
@@ -645,19 +1166,94 @@ def create_dataset_version(
             ready=True,
         )
     asset_ids = list(dict.fromkeys(payload.asset_version_ids))
-    assets = list(
-        db.scalars(
-            select(DataAssetVersion)
-            .where(
+    assets: list[DataAssetVersion] = []
+    if asset_ids:
+        version_asset_rows = db.execute(
+            select(DataAssetVersion.id, DataAssetVersion.asset_id).where(
                 DataAssetVersion.id.in_(asset_ids),
                 DataAssetVersion.tenant_id == _tenant(db),
-                DataAssetVersion.status == "ready",
             )
-            .order_by(DataAssetVersion.id)
         ).all()
-    ) if asset_ids else []
-    if len(assets) != len(asset_ids):
-        raise CatalogError("输入资产版本不存在、未就绪或不属于当前租户")
+        if len(version_asset_rows) != len(asset_ids):
+            raise CatalogError("输入资产版本不存在、未就绪或不属于当前租户")
+        parent_asset_ids = {str(asset_id) for _version_id, asset_id in version_asset_rows}
+        locked_assets = list(
+            db.scalars(
+                select(DataAsset)
+                .where(
+                    DataAsset.id.in_(sorted(parent_asset_ids)),
+                    DataAsset.tenant_id == _tenant(db),
+                    DataAsset.owner_agent_id.is_(None),
+                    DataAsset.lifecycle_status == "active",
+                    DataAsset.usage_plane == "invocation_input",
+                )
+                .order_by(DataAsset.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            ).all()
+        )
+        if {str(item.id) for item in locked_assets} != parent_asset_ids:
+            raise CatalogError("输入资产版本不存在、未就绪或不属于当前租户")
+        locked_asset_by_id = {str(item.id): item for item in locked_assets}
+        assets = list(
+            db.scalars(
+                select(DataAssetVersion)
+                .where(
+                    DataAssetVersion.id.in_(asset_ids),
+                    DataAssetVersion.tenant_id == _tenant(db),
+                    DataAssetVersion.asset_id.in_(sorted(parent_asset_ids)),
+                    DataAssetVersion.status == "ready",
+                    DataAssetVersion.bucket_file_id.is_not(None),
+                    DataAssetVersion.bucket_data_source_id.is_not(None),
+                )
+                .order_by(DataAssetVersion.asset_id, DataAssetVersion.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            ).all()
+        )
+        if len(assets) != len(asset_ids):
+            raise CatalogError("输入资产版本不存在、未就绪或不属于当前租户")
+        file_rows = db.execute(
+            select(BucketFile, DataSource)
+            .join(DataSource, DataSource.id == BucketFile.data_source_id)
+            .where(
+                BucketFile.id.in_(
+                    [str(item.bucket_file_id) for item in assets]
+                ),
+                DataSource.tenant_id == _tenant(db),
+            )
+        ).all()
+        file_by_identity = {
+            (str(bucket_file.id), str(source.id)): (bucket_file, source)
+            for bucket_file, source in file_rows
+        }
+        if len(file_by_identity) != len(
+            {
+                (str(item.bucket_file_id), str(item.bucket_data_source_id))
+                for item in assets
+            }
+        ):
+            raise CatalogError("输入资产版本来源作用域无效")
+        for asset_version in assets:
+            asset = locked_asset_by_id[str(asset_version.asset_id)]
+            row = file_by_identity.get(
+                (
+                    str(asset_version.bucket_file_id),
+                    str(asset_version.bucket_data_source_id),
+                )
+            )
+            if row is None:
+                raise CatalogError("输入资产版本来源作用域无效")
+            bucket_file, source = row
+            try:
+                _require_asset_file_scope(
+                    db,
+                    asset,
+                    bucket_file,
+                    source,
+                )
+            except CatalogError as exc:
+                raise CatalogError("输入资产版本来源作用域无效") from exc
     manifest = _safe_document(payload.manifest, label="数据集 manifest")
     identity = {
         "format": "catalog-dataset-version/v1",
@@ -731,6 +1327,7 @@ def set_head(
     expected_version_id: str | None = None,
 ) -> DatasetHead:
     permission_service.require_tenant_permission(db, "write")
+    _reject_generated_validation_dataset_write(dataset)
     version = require_dataset_version(
         db,
         version_id,

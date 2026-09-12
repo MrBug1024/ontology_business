@@ -795,6 +795,7 @@ export interface CatalogAsset {
   created_at: string
   updated_at: string
   retired_at?: string | null
+  owner_agent_id?: string | null
   version_count: number
 }
 
@@ -859,6 +860,7 @@ export interface ManagedUploadRun {
   created_at: string
   updated_at: string
   finished_at?: string | null
+  owner_agent_id?: string | null
 }
 
 export interface ValidationDataset {
@@ -1801,6 +1803,37 @@ export interface AssistantEvidence {
   tools_called: Array<{ name: string; status?: string; purpose?: string }>
   confidence: number
   uncertainties: string[]
+  decision_gate?: AssistantDecisionGate
+}
+
+export interface AssistantDecisionGate {
+  version?: string
+  mode?: 'formalize' | 'clarify' | 'candidate_review' | string
+  reason_codes?: string[]
+  blocking_question_count?: number
+  blocking_issue_count?: number
+  ambiguous_coverage_count?: number
+  missing_evidence_resource_count?: number
+  evidence_coverage?: {
+    total?: number
+    modeled?: number
+    ambiguous?: number
+    context?: number
+    irrelevant?: number
+    modeled_ratio?: number
+  }
+  resource_counts?: Record<string, number>
+  risk_codes?: string[]
+  questions?: Array<{
+    code?: string
+    message: string
+    source_refs?: string[]
+    affected_change_keys?: string[]
+    resolution_hint?: string
+  }>
+  safe_to_formalize?: boolean
+  human_review_required?: boolean
+  explanation?: string
 }
 
 export interface AssistantActionPreview {
@@ -1894,6 +1927,7 @@ export interface AssistantProposal {
   run_revision?: number
   applied_at?: string
   apply_result?: Record<string, any>
+  decision_gate?: AssistantDecisionGate
 }
 
 export interface AssistantModelTask {

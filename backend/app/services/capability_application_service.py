@@ -499,6 +499,7 @@ def list_managed_input_options(
     port_key: str,
     limit: int = 100,
     offset: int = 0,
+    agent_id: str | None = None,
 ) -> dict[str, Any]:
     """Discover governed references for one authoritative input-port contract."""
 
@@ -571,6 +572,7 @@ def list_managed_input_options(
             tenant_id=str(scenario.tenant_id or ""),
             scenario_id=scenario.id,
             port=port,
+            agent_id=agent_id,
         )
     except runtime_input_service.RuntimeInputResolutionError as exc:
         raise CapabilityApplicationError(

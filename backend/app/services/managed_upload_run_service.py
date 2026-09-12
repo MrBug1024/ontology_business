@@ -20,12 +20,14 @@ from ..database import SessionLocal
 from ..managed_upload_schemas import ManagedUploadCreateIn
 from ..models import (
     BucketFile,
+    Conversation,
     DataAsset,
     DataAssetVersion,
     DataSource,
     ManagedUploadRun,
 )
 from . import (
+    agent_scope_access_service,
     catalog_ingestion_service,
     catalog_service,
     datasource_service,
@@ -34,7 +36,9 @@ from . import (
     object_deletion_service,
     object_storage_service,
     permission_service,
+    tenant_service,
 )
+from . import managed_attachment_access
 from . import managed_upload_content_service, managed_upload_processing_service
 from .managed_upload_run_contracts import (
     ContentUploadSnapshot,
@@ -53,6 +57,129 @@ PROCESSING_LEASE_SECONDS = managed_upload_processing_service.PROCESSING_LEASE_SE
 CONTENT_RETRY_GRACE_SECONDS = managed_upload_content_service.CONTENT_RETRY_GRACE_SECONDS
 _now = utc_now
 _as_utc = as_utc
+
+
+def _resolve_agent_scope(
+    db: Session,
+    payload: ManagedUploadCreateIn,
+    *,
+    tenant_id: str,
+    user_id: str,
+) -> str | None:
+    """Authorize an optional Agent/conversation upload scope.
+
+    Global Assistant callers intentionally omit the scope.  Agent callers may
+    upload before a conversation exists, so ``conversation_id`` is validated
+    when present but is not persisted as ownership; the durable Agent owner is
+    the isolation boundary.
+    """
+    if payload.agent_id is None:
+        if payload.conversation_id:
+            raise ManagedUploadError(
+                "invalid_managed_upload_scope",
+                "conversation_id 必须与 agent_id 一起提供",
+                status_code=422,
+            )
+        permission_service.require_tenant_permission(db, "write")
+        return None
+    return _authorize_agent_scope(
+        db,
+        payload.agent_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=payload.conversation_id,
+        active_runtime=True,
+        permission_verb="write",
+        lock=True,
+    )
+
+
+def _authorize_agent_scope(
+    db: Session,
+    agent_id: str,
+    *,
+    tenant_id: str,
+    user_id: str,
+    conversation_id: str | None = None,
+    active_runtime: bool = False,
+    permission_verb: str = "read",
+    lock: bool = False,
+) -> str:
+    """Authorize an existing Agent scope for a follow-up upload operation.
+
+    Creation validates the full request DTO through ``_resolve_agent_scope``;
+    status/retry/cancel/content endpoints only receive the scope token, so
+    they use this smaller helper.  The same tenant and scenario ACL checks are
+    deliberately repeated at each boundary instead of trusting a browser
+    supplied owner id.
+    """
+
+    if not agent_id:
+        raise ManagedUploadError(
+            "invalid_managed_upload_scope",
+            "agent_id 不能为空",
+            status_code=422,
+        )
+    if permission_verb not in {"read", "write"}:
+        raise ManagedUploadError(
+            "invalid_managed_upload_scope",
+            "不支持的 Agent 权限动作",
+            status_code=422,
+        )
+    principal = permission_service.require_principal(db)
+    if principal.tenant_id != tenant_id or principal.user_id != user_id:
+        raise ManagedUploadError(
+            "managed_upload_unavailable",
+            "上传作用域不存在或无权使用",
+            status_code=404,
+        )
+    try:
+        # Upload-run creation is an ownership write.  Keep the Agent row lock
+        # through the INSERT/commit so deletion cannot pass its owner scan and
+        # then leave a newly-created run behind.  Follow-up reads/writes use
+        # the durable run lock and lease CAS instead of holding this lock.
+        agent = agent_scope_access_service.require_optional_agent_permission(
+            db,
+            agent_id,
+            permission_verb,
+            lock=lock,
+            message="没有该 Agent 所属业务场景的权限",
+        )
+    except agent_scope_access_service.AgentScopeNotFoundError as exc:
+        raise ManagedUploadError(
+            "managed_upload_unavailable",
+            "Agent 不存在或无权使用",
+            status_code=404,
+        ) from exc
+    if agent is None:
+        raise ManagedUploadError(
+            "invalid_managed_upload_scope",
+            "agent_id 不能为空",
+            status_code=422,
+        )
+    if agent.scenario_id:
+        scenario = tenant_service.require_scenario(db, agent.scenario_id)
+        if active_runtime and scenario.status == "retired":
+            raise ManagedUploadError(
+                "scenario_retired",
+                "业务场景已退役，不能创建新的附件上传任务",
+                status_code=409,
+            )
+    if conversation_id:
+        conversation = db.scalar(
+            select(Conversation).where(
+                Conversation.id == conversation_id,
+                Conversation.agent_id == agent.id,
+                Conversation.created_by_user_id == user_id,
+            )
+        )
+        if conversation is None:
+            raise ManagedUploadError(
+                "managed_upload_unavailable",
+                "对话不存在或无权使用",
+                status_code=404,
+            )
+    return agent.id
 
 
 def _canonical_hash(value: Mapping[str, Any]) -> str:
@@ -90,13 +217,35 @@ def _owned_run(
     *,
     writable: bool = False,
     lock: bool = False,
+    agent_id: str | None = None,
 ) -> ManagedUploadRun:
     principal = permission_service.require_principal(db)
-    permission_service.require_tenant_permission(db, "write" if writable else "read")
+    # An omitted scope is the Global Assistant namespace.  It must never be a
+    # wildcard over Agent-owned rows; the owner NULL predicate is intentional.
+    owner_clause = ManagedUploadRun.owner_agent_id.is_(None)
+    if agent_id is not None:
+        _authorize_agent_scope(
+            db,
+            agent_id,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            permission_verb="write" if writable else "read",
+        )
+        owner_clause = ManagedUploadRun.owner_agent_id == agent_id
+    else:
+        permission_service.require_tenant_permission(
+            db, "write" if writable else "read"
+        )
     statement = select(ManagedUploadRun).where(
         ManagedUploadRun.id == run_id,
         ManagedUploadRun.tenant_id == principal.tenant_id,
         ManagedUploadRun.requested_by_user_id == principal.user_id,
+        # Agent deletion keeps a compact, fenced audit row on PostgreSQL, but
+        # that tombstone is no longer a readable upload run.  Filtering it at
+        # the ownership lookup prevents guessed ids from exposing lifecycle
+        # metadata or re-entering a retry path.
+        ManagedUploadRun.error_code != "agent_deleted",
+        owner_clause,
     )
     if lock:
         statement = statement.with_for_update()
@@ -112,22 +261,57 @@ def _owned_run(
 
 def _public_run(db: Session, run: ManagedUploadRun) -> dict[str, Any]:
     result = None
+    owner_agent_id = getattr(run, "owner_agent_id", None)
     if run.status == "ready" and run.asset_id and run.asset_version_id:
         asset = db.get(DataAsset, run.asset_id)
         version = db.get(DataAssetVersion, run.asset_version_id)
+        # The compatibility fallbacks keep old unit fixtures and pre-ownership
+        # rows readable while real ORM rows still have to prove every pointer
+        # in the immutable upload chain.
+        run_file_id = getattr(run, "bucket_file_id", None)
+        version_file_id = getattr(version, "bucket_file_id", None) if version else None
+        run_source_id = getattr(run, "data_source_id", None)
+        version_source_id = (
+            getattr(version, "bucket_data_source_id", None) if version else None
+        )
+        pointer_valid = True
+        if hasattr(run, "bucket_file_id"):
+            pointer_valid = bool(run_file_id and version_file_id and run_file_id == version_file_id)
+        if hasattr(run, "data_source_id") and hasattr(version, "bucket_data_source_id"):
+            pointer_valid = pointer_valid and bool(
+                run_source_id and version_source_id and run_source_id == version_source_id
+            )
         if (
             asset is not None
             and version is not None
             and asset.tenant_id == run.tenant_id
             and version.tenant_id == run.tenant_id
             and version.asset_id == asset.id
+            and getattr(asset, "lifecycle_status", "active") == "active"
+            and getattr(version, "status", "ready") == "ready"
+            and asset.owner_agent_id == owner_agent_id
+            and pointer_valid
         ):
-            result = catalog_ingestion_service.managed_upload_document(
-                asset,
-                version,
-                fallback_purpose=run.purpose,
-                created=bool((run.metadata_document or {}).get("created", True)),
-            )
+            try:
+                # The logical owner pair is not enough: the shared upload
+                # bucket can contain another Agent's file.  Re-prove the
+                # immutable version/source lineage before rendering it.
+                managed_attachment_access.require_asset_version_scope(
+                    db,
+                    asset,
+                    version,
+                    tenant_id=run.tenant_id,
+                    agent_id=owner_agent_id,
+                )
+            except managed_attachment_access.AttachmentAccessError:
+                result = None
+            else:
+                result = catalog_ingestion_service.managed_upload_document(
+                    asset,
+                    version,
+                    fallback_purpose=run.purpose,
+                    created=bool((run.metadata_document or {}).get("created", True)),
+                )
     return {
         "id": run.id,
         "parent_run_id": getattr(run, "parent_run_id", None),
@@ -150,12 +334,20 @@ def _public_run(db: Session, run: ManagedUploadRun) -> dict[str, Any]:
         "created_at": run.created_at,
         "updated_at": run.updated_at,
         "finished_at": run.finished_at,
+        # ``SimpleNamespace`` fixtures and pre-ownership rows may not expose
+        # the additive field; keep the public serializer backward compatible.
+        "owner_agent_id": owner_agent_id,
     }
 
 
 def create_upload_run(db: Session, payload: ManagedUploadCreateIn) -> dict[str, Any]:
     principal = permission_service.require_principal(db)
-    permission_service.require_tenant_permission(db, "write")
+    owner_agent_id = _resolve_agent_scope(
+        db,
+        payload,
+        tenant_id=principal.tenant_id,
+        user_id=principal.user_id,
+    )
     safe_name = datasource_service.validate_bucket_filename(payload.filename)
     maximum = int(get_settings().catalog_max_upload_bytes)
     if payload.byte_size > maximum:
@@ -167,6 +359,7 @@ def create_upload_run(db: Session, payload: ManagedUploadCreateIn) -> dict[str, 
     source = catalog_ingestion_service.require_external_upload_bucket(
         db,
         ensure_storage=False,
+        owner_agent_id=owner_agent_id,
     )
     safe_labels = catalog_service.safe_catalog_document(
         payload.labels,
@@ -189,6 +382,8 @@ def create_upload_run(db: Session, payload: ManagedUploadCreateIn) -> dict[str, 
             "filename": safe_name,
             "byte_size": payload.byte_size,
             "media_type": payload.media_type.strip().lower(),
+            "agent_id": owner_agent_id,
+            "conversation_id": payload.conversation_id,
             "metadata": metadata.model_dump(mode="json", exclude_none=True),
         }
     )
@@ -213,6 +408,7 @@ def create_upload_run(db: Session, payload: ManagedUploadCreateIn) -> dict[str, 
     run = ManagedUploadRun(
         tenant_id=principal.tenant_id,
         requested_by_user_id=principal.user_id,
+        owner_agent_id=owner_agent_id,
         data_source_id=source.id,
         idempotency_key=payload.idempotency_key,
         request_fingerprint=fingerprint,
@@ -251,13 +447,20 @@ def create_upload_run(db: Session, payload: ManagedUploadCreateIn) -> dict[str, 
     return _public_run(db, run)
 
 
-def get_upload_run(db: Session, run_id: str) -> dict[str, Any]:
-    return _public_run(db, _owned_run(db, run_id))
+def get_upload_run(
+    db: Session,
+    run_id: str,
+    *,
+    agent_id: str | None = None,
+) -> dict[str, Any]:
+    return _public_run(db, _owned_run(db, run_id, agent_id=agent_id))
 
 
 def get_invocation_upload_runs(
     db: Session,
     run_ids: list[str],
+    *,
+    agent_id: str | None = None,
 ) -> list[ManagedUploadRun]:
     """Return exact owner-scoped temporary runs in caller order."""
 
@@ -271,7 +474,15 @@ def get_invocation_upload_runs(
             status_code=409,
         )
     principal = permission_service.require_principal(db)
-    permission_service.require_tenant_permission(db, "read")
+    if agent_id is not None:
+        _authorize_agent_scope(
+            db,
+            agent_id,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+        )
+    else:
+        permission_service.require_tenant_permission(db, "read")
     rows = list(
         db.scalars(
             select(ManagedUploadRun).where(
@@ -279,6 +490,12 @@ def get_invocation_upload_runs(
                 ManagedUploadRun.tenant_id == principal.tenant_id,
                 ManagedUploadRun.requested_by_user_id == principal.user_id,
                 ManagedUploadRun.purpose == "invocation_attachment",
+                ManagedUploadRun.error_code != "agent_deleted",
+                *(
+                    [ManagedUploadRun.owner_agent_id == agent_id]
+                    if agent_id is not None
+                    else [ManagedUploadRun.owner_agent_id.is_(None)]
+                ),
             )
         ).all()
     )
@@ -303,10 +520,12 @@ def get_invocation_upload_runs(
 def invocation_attachment_documents(
     db: Session,
     run_ids: list[str],
+    *,
+    agent_id: str | None = None,
 ) -> list[ManagedInvocationAttachment]:
     """Resolve ready runs into retrieval inputs without exposing object locators."""
 
-    runs = get_invocation_upload_runs(db, run_ids)
+    runs = get_invocation_upload_runs(db, run_ids, agent_id=agent_id)
     if any(run.status not in {"ready", "failed", "cancelled"} for run in runs):
         raise ManagedUploadConflict("临时附件仍在后台准备")
     failed = [run for run in runs if run.status in {"failed", "cancelled"}]
@@ -319,15 +538,42 @@ def invocation_attachment_documents(
         )
     output: list[ManagedInvocationAttachment] = []
     for run in runs:
+        asset = db.get(DataAsset, run.asset_id) if run.asset_id else None
         version = db.get(DataAssetVersion, run.asset_version_id) if run.asset_version_id else None
         bucket_file = db.get(BucketFile, version.bucket_file_id) if version else None
+        owner_agent_id = getattr(run, "owner_agent_id", None)
+        run_file_id = getattr(run, "bucket_file_id", None)
+        version_file_id = getattr(version, "bucket_file_id", None) if version else None
+        version_source_id = (
+            getattr(version, "bucket_data_source_id", None) if version else None
+        )
+        file_pointer_valid = (
+            not hasattr(run, "bucket_file_id")
+            or bool(run_file_id and version_file_id and run_file_id == version_file_id)
+        )
+        source_pointer_valid = (
+            not hasattr(version, "bucket_data_source_id")
+            or bool(
+                version_source_id
+                and getattr(run, "data_source_id", None)
+                and version_source_id == run.data_source_id
+            )
+        )
         if (
-            version is None
+            asset is None
+            or version is None
             or bucket_file is None
+            or asset.tenant_id != run.tenant_id
+            or asset.owner_agent_id != owner_agent_id
+            or getattr(asset, "lifecycle_status", "active") != "active"
             or version.tenant_id != run.tenant_id
+            or version.asset_id != asset.id
             or version.asset_id != run.asset_id
-            or version.status != "ready"
+            or getattr(version, "status", "ready") != "ready"
+            or not file_pointer_valid
+            or not source_pointer_valid
             or version.content_sha256 != run.content_sha256
+            or getattr(bucket_file, "id", None) != (version_file_id or bucket_file.id)
             or bucket_file.data_source_id != run.data_source_id
             or bucket_file.status != "parsed"
             or bucket_file.content_sha256 != run.content_sha256
@@ -376,11 +622,13 @@ def preflight_content_upload(
     run_id: str,
     *,
     expected_revision: int,
+    agent_id: str | None = None,
 ) -> int:
     return managed_upload_content_service.preflight_content_upload(
         db,
         run_id,
         expected_revision=expected_revision,
+        agent_id=agent_id,
         owned_run=_owned_run,
     )
 
@@ -390,11 +638,13 @@ def claim_content_upload(
     run_id: str,
     *,
     expected_revision: int,
+    agent_id: str | None = None,
 ) -> UploadLease:
     return managed_upload_content_service.claim_content_upload(
         db,
         run_id,
         expected_revision=expected_revision,
+        agent_id=agent_id,
         owned_run=_owned_run,
     )
 
@@ -590,6 +840,7 @@ def create_failed_upload_retry(
         id=uuid.uuid4().hex,
         tenant_id=run.tenant_id,
         requested_by_user_id=run.requested_by_user_id,
+        owner_agent_id=run.owner_agent_id,
         parent_run_id=run.id,
         data_source_id=run.data_source_id,
         bucket_file_id=run.bucket_file_id if has_stored_content else None,
@@ -621,8 +872,15 @@ def retry_upload_run(
     *,
     expected_revision: int,
     idempotency_key: str,
+    agent_id: str | None = None,
 ) -> dict[str, Any]:
-    run = _owned_run(db, run_id, writable=True, lock=True)
+    run = _owned_run(
+        db,
+        run_id,
+        writable=True,
+        lock=True,
+        agent_id=agent_id,
+    )
     replay = db.scalar(
         select(ManagedUploadRun).where(
             ManagedUploadRun.tenant_id == run.tenant_id,
@@ -669,10 +927,17 @@ def cancel_upload_run(
     run_id: str,
     *,
     expected_revision: int,
+    agent_id: str | None = None,
 ) -> dict[str, Any]:
     """Fence unfinished work and durably cancel one owner-scoped upload."""
 
-    run = _owned_run(db, run_id, writable=True, lock=True)
+    run = _owned_run(
+        db,
+        run_id,
+        writable=True,
+        lock=True,
+        agent_id=agent_id,
+    )
     if run.revision != expected_revision:
         raise ManagedUploadConflict()
     if run.status == "cancelled":

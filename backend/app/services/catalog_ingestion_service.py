@@ -34,6 +34,7 @@ from ..catalog_schemas import (
 )
 from ..models import BucketFile, DataAsset, DataAssetVersion, DataSource
 from . import (
+    agent_scope_access_service,
     catalog_service,
     datasource_service,
     doc_parser,
@@ -1343,14 +1344,23 @@ def require_external_upload_bucket(
     db: Session,
     *,
     ensure_storage: bool = True,
+    owner_agent_id: str | None = None,
 ) -> DataSource:
     """Resolve the tenant-owned upload bucket without exposing physical identity."""
-    permission_service.require_tenant_permission(db, "write")
+    try:
+        agent_scope_access_service.require_optional_agent_permission(
+            db,
+            owner_agent_id,
+            "write",
+            # Agent deletion and all scoped catalog writes use Agent as the
+            # ownership fence before touching source/asset rows.
+            lock=bool(owner_agent_id),
+            message="没有该 Agent 所属业务场景的附件写入权限",
+        )
+    except agent_scope_access_service.AgentScopeNotFoundError as exc:
+        raise catalog_service.CatalogError("附件上传作用域不可用") from exc
     tenant_id = tenant_service.current_tenant_id(db)
-    source_id = hashlib.sha256(
-        b"ontology-platform/external-upload-source/v1\0"
-        + tenant_id.encode("utf-8")
-    ).hexdigest()[:32]
+    source_id = catalog_service.external_upload_source_id(tenant_id)
     source = db.scalar(
         select(DataSource)
         .where(
@@ -1404,28 +1414,68 @@ def require_external_upload_bucket(
     return source
 
 
+def scoped_asset_key(
+    prepared: PreparedCatalogUpload | PreparedCatalogPathUpload,
+    owner_agent_id: str | None,
+) -> str:
+    """Return the stable catalog identity for an optional Agent owner."""
+    if not owner_agent_id:
+        return prepared.asset_key
+    scope_digest = hashlib.sha256(
+        f"{owner_agent_id}\0{prepared.asset_key}".encode("utf-8")
+    ).hexdigest()[:16]
+    suffix = prepared.asset_key[:100]
+    return catalog_service.validate_catalog_key(
+        f"agent.{owner_agent_id}.{scope_digest}.{suffix}",
+        "资产 key",
+    )
+
+
 def find_or_create_asset(
-    db: Session, prepared: PreparedCatalogUpload | PreparedCatalogPathUpload
+    db: Session,
+    prepared: PreparedCatalogUpload | PreparedCatalogPathUpload,
+    *,
+    owner_agent_id: str | None = None,
 ) -> tuple[DataAsset, DataAssetVersion | None, bool, bool]:
     """Resolve content-hash idempotency before any object is uploaded."""
+    normalized_owner_agent_id = str(owner_agent_id or "").strip() or None
+    if normalized_owner_agent_id is not None:
+        # Lock the owner before probing/creating the DataAsset.  Agent
+        # deletion takes the same Agent -> asset order, preventing a foreign
+        # key KEY SHARE wait from inverting the ownership fence.
+        catalog_service._require_asset_scope_permission(
+            db,
+            normalized_owner_agent_id,
+            "write",
+            lock=True,
+        )
+    owner_agent_id = normalized_owner_agent_id
     usage_plane = (
         "modeling_material"
         if prepared.metadata.purpose == "managed_asset"
         else "invocation_input"
     )
     reactivated = False
+    # Keep the tenant-level key policy while making the identity deterministic
+    # per Agent. The base custom key is retained only in the upload request.
+    asset_key = scoped_asset_key(prepared, owner_agent_id)
     existing = db.scalar(
         select(DataAsset).where(
             DataAsset.tenant_id == tenant_service.current_tenant_id(db),
-            DataAsset.key == prepared.asset_key,
+            DataAsset.key == asset_key,
         )
+        # The publication worker and asset deletion both use the asset row as
+        # the ownership fence.  Lock an existing identity before inspecting
+        # versions so the later upload-run lock cannot invert that order.
+        .execution_options(populate_existing=True)
+        .with_for_update()
     )
     created = existing is None
     if existing is None:
         existing = catalog_service.create_asset(
             db,
             DataAssetCreate(
-                key=prepared.asset_key,
+                key=asset_key,
                 name=prepared.asset_name,
                 description=prepared.metadata.description,
                 kind="file",
@@ -1433,8 +1483,17 @@ def find_or_create_asset(
                 usage_plane=usage_plane,
                 labels=prepared.labels,
             ),
+            owner_agent_id=owner_agent_id,
         )
     else:
+        # The deterministic key is only an identity hint.  Treat NULL as the
+        # explicit Global namespace and require an exact owner match in both
+        # directions, so a crafted/colliding key cannot bridge Global and an
+        # Agent's private attachment catalog.
+        existing_owner = str(existing.owner_agent_id or "") or None
+        requested_owner = str(owner_agent_id or "") or None
+        if existing_owner != requested_owner:
+            raise catalog_service.CatalogError("数据资产不属于当前上传作用域")
         if existing.lifecycle_status != "active":
             if prepared.metadata.purpose != "validation_asset":
                 raise catalog_service.CatalogError("目标数据资产已退役")
@@ -1465,6 +1524,38 @@ def find_or_create_asset(
         )
         .limit(1)
     )
+    if duplicate is not None:
+        # Content equality is not an ownership proof.  A legacy or manually
+        # corrupted version may point at another Agent's file while retaining
+        # the same digest.  Reuse is allowed only after the exact physical
+        # lineage passes the same catalog scope gate as a fresh registration.
+        duplicate_file_id = str(duplicate.bucket_file_id or "").strip() or None
+        duplicate_source_id = (
+            str(duplicate.bucket_data_source_id or "").strip() or None
+        )
+        if duplicate_file_id is None or duplicate_source_id is None:
+            raise catalog_service.CatalogError("重复数据资产版本缺少受管文件作用域")
+        duplicate_row = db.execute(
+            select(BucketFile, DataSource)
+            .join(DataSource, DataSource.id == BucketFile.data_source_id)
+            .where(
+                BucketFile.id == duplicate_file_id,
+                BucketFile.data_source_id == duplicate_source_id,
+                DataSource.tenant_id == existing.tenant_id,
+            )
+        ).first()
+        if duplicate_row is None:
+            raise catalog_service.CatalogError("重复数据资产版本的文件已不可用")
+        duplicate_file, duplicate_source = duplicate_row
+        catalog_service._require_asset_file_scope(
+            db,
+            existing,
+            duplicate_file,
+            duplicate_source,
+            allow_shared_runtime_source=True,
+            permission_verb="write",
+            tenant_id=existing.tenant_id,
+        )
     replace_expired = reactivated
     if duplicate is not None and prepared.metadata.purpose == "invocation_attachment":
         lifecycle, duplicate_expires_at = lifecycle_from_version(duplicate)
@@ -1519,6 +1610,11 @@ def register_prepared_version(
             },
         ),
         allow_duplicate_content=allow_duplicate_content,
+        # The only caller of this wrapper is the managed-upload ingestion
+        # path, which has already created/claimed the exact BucketFile.  The
+        # public asset-version endpoint keeps the default strict namespace
+        # check and cannot set this internal exception.
+        allow_shared_runtime_source=True,
     )
 
 
@@ -1529,6 +1625,8 @@ def persist_managed_upload(
     filename: str,
     client_media_type: str | None,
     metadata: CatalogManagedUploadMetadata,
+    *,
+    owner_agent_id: str | None = None,
 ) -> ManagedCatalogUploadResult:
     """Atomically register one logical asset version and its exact MinIO object."""
     upload_claim = None
@@ -1553,10 +1651,25 @@ def persist_managed_upload(
             tenant_id=tenant_id,
             asset_key=prepared.asset_key,
         ):
-            asset, duplicate, _asset_created, replace_expired = find_or_create_asset(
-                db, prepared
-            )
+            # Keep the legacy external-upload call shape when no Agent scope
+            # is present; scoped Agent uploads still carry the owner explicitly.
+            if owner_agent_id:
+                asset, duplicate, _asset_created, replace_expired = find_or_create_asset(
+                    db,
+                    prepared,
+                    owner_agent_id=owner_agent_id,
+                )
+            else:
+                asset, duplicate, _asset_created, replace_expired = find_or_create_asset(
+                    db,
+                    prepared,
+                )
             if duplicate is not None:
+                # A duplicate response is still the result of a write
+                # request. Reacquire the owner fence after the initial ACL
+                # check so revocation/deletion during request preparation
+                # cannot return a stale private version.
+                asset = catalog_service.lock_asset_for_write(db, asset)
                 result = ManagedCatalogUploadResult(
                     asset_id=asset.id,
                     version_id=duplicate.id,
@@ -1636,6 +1749,7 @@ def persist_managed_upload_path(
     *,
     content_sha256: str,
     byte_size: int,
+    owner_agent_id: str | None = None,
 ) -> ManagedCatalogUploadResult:
     """Persist a large catalog upload with bounded memory and the same lifecycle fence."""
     upload_claim = None
@@ -1662,10 +1776,19 @@ def persist_managed_upload_path(
             tenant_id=tenant_id,
             asset_key=prepared.asset_key,
         ):
-            asset, duplicate, _asset_created, replace_expired = find_or_create_asset(
-                db, prepared
-            )
+            if owner_agent_id:
+                asset, duplicate, _asset_created, replace_expired = find_or_create_asset(
+                    db,
+                    prepared,
+                    owner_agent_id=owner_agent_id,
+                )
+            else:
+                asset, duplicate, _asset_created, replace_expired = find_or_create_asset(
+                    db,
+                    prepared,
+                )
             if duplicate is not None:
+                asset = catalog_service.lock_asset_for_write(db, asset)
                 result = ManagedCatalogUploadResult(
                     asset_id=asset.id,
                     version_id=duplicate.id,

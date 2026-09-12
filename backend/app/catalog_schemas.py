@@ -59,6 +59,7 @@ class DataAssetOut(DataAssetCreate):
     created_at: datetime
     updated_at: datetime
     retired_at: datetime | None = None
+    owner_agent_id: str | None = None
     version_count: int = 0
 
     model_config = {"from_attributes": True}
@@ -155,6 +156,10 @@ class CatalogManagedUploadOut(BaseModel):
 class ValidationDatasetBuildIn(BaseModel):
     asset_version_ids: list[str] = Field(min_length=1, max_length=20)
     name: str = Field(default="验证数据包", min_length=1, max_length=300)
+    # Validation packages produced from Agent conversation attachments are
+    # private to that Agent.  ``None`` is retained for the generic catalog
+    # endpoint, where only unowned assets may be selected.
+    agent_id: str | None = Field(default=None, min_length=1, max_length=32)
 
     model_config = {"extra": "forbid"}
 

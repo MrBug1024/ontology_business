@@ -253,7 +253,6 @@ def test_agent_rest_and_mcp_preserve_capability_semantics_and_audit_identity() -
         capability_scope=scope,
         runtime_binding_mode="capability_only",
     )
-
     seed_db = SessionLocal()
     try:
         seed_db.add_all([tenant, owner, scenario, function, asset, llm, agent])

@@ -607,6 +607,16 @@ def _verify_head_contract(database_url: URL, *, runtime_role: str, head: str) ->
             }
             if not required_constraints <= constraints:
                 raise RuntimeError("durable ownership constraints are incomplete")
+            if head in {"20260912_32", "20260912_33"}:
+                from scripts.verify_postgresql_runtime import (
+                    _verify_agent_scope_contract,
+                )
+                _verify_agent_scope_contract(connection)
+            if head == "20260912_33":
+                from scripts.verify_postgresql_runtime import (
+                    _verify_scenario_audit_purge_contract,
+                )
+                _verify_scenario_audit_purge_contract(connection)
             privilege_rows = {
                 table_name: {
                     privilege: bool(
@@ -747,20 +757,45 @@ def main() -> int:
             fixture_engine.dispose()
         command.upgrade(config, head)
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
-        command.downgrade(config, "20260908_27")
-        command.upgrade(config, head)
+
+        # Revision 33 deliberately refuses downgrade: restoring the previous
+        # audit function would re-introduce an unscoped cross-tenant delete.
+        # A full ``head -> 27`` command reaches 33 first, so the refusal is
+        # the expected round-trip boundary and the alembic version must stay
+        # at the current head.
+        try:
+            command.downgrade(config, "20260908_27")
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "downgrade is refused" not in message:
+                raise
+        else:
+            raise RuntimeError(
+                "Revision 33 must refuse a downgrade that would restore the "
+                "unsafe scenario-audit purge function"
+            )
+        if _revision(target_url) != head:
+            raise RuntimeError(
+                "Revision 33 downgrade refusal changed the installed schema version"
+            )
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
+
         try:
             command.downgrade(config, "20260907_26")
         except RuntimeError as exc:
-            if "backup" not in str(exc).lower():
+            # The command still starts at revision 33 and therefore reaches
+            # the new refusal before revision 27's historical backup guard.
+            if "downgrade is refused" not in str(exc).lower():
                 raise
         else:
-            raise RuntimeError("Business dimension retirement must reject destructive downgrade")
-        # Alembic commits completed revisions separately: revision 28 can have
-        # reached 27 before 27 refuses reconstructing retired dimensions.
-        _verify_head_contract(target_url, runtime_role=runtime_role, head="20260908_27")
-        command.upgrade(config, head)
+            raise RuntimeError(
+                "Revision 33 must refuse a downgrade crossing the irreversible "
+                "scenario-audit hardening boundary"
+            )
+        if _revision(target_url) != head:
+            raise RuntimeError(
+                "Repeated downgrade refusal changed the installed schema version"
+            )
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
         print(f"Alembic isolated round-trip passed at {head}")
         return 0

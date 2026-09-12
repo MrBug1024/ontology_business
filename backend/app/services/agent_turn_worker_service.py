@@ -459,6 +459,7 @@ def _process_claimed_turn(
                 db,
                 payload,
                 user_id=run.requested_by_user_id,
+                agent_id=run.agent_id,
             )
         )
         if resolved_payload is None:
@@ -478,7 +479,9 @@ def _process_claimed_turn(
                 delay_seconds=TURN_RECHECK_SECONDS,
             )
         payload = resolved_payload
-        table_ids = agent_turn_input_service._table_asset_version_ids(db, payload)
+        table_ids = agent_turn_input_service._table_asset_version_ids(
+            db, payload, agent_id=run.agent_id
+        )
         dataset_result: Mapping[str, Any] | None = None
         if table_ids and not run.preparation_run_id:
             job = validation_dataset_service.enqueue_validation_dataset_job(
@@ -486,6 +489,7 @@ def _process_claimed_turn(
                 ValidationDatasetBuildIn(
                     asset_version_ids=table_ids,
                     name="Agent 输入数据包",
+                    agent_id=run.agent_id,
                 ),
             )
             run = db.scalar(
@@ -519,6 +523,7 @@ def _process_claimed_turn(
             job = validation_dataset_service.get_validation_dataset_job(
                 db,
                 run.preparation_run_id,
+                agent_id=run.agent_id,
             )
             if job["status"] in {"queued", "running"}:
                 return _release_lease(db, run, lease)

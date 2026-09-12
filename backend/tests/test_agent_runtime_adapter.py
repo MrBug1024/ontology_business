@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -12,9 +14,12 @@ from app.models import (
     Agent,
     BusinessScenario,
     CapabilityInvocation,
+    DataAsset,
+    DataAssetVersion,
     Conversation,
     DatasetSchema,
     DatasetVersion,
+    DatasetVersionAsset,
     FunctionDefinition,
     LLMConfig,
     LogicalDataset,
@@ -31,6 +36,7 @@ from app.services import (
     agent_runtime_adapter,
     permission_service,
     input_contract_validator,
+    managed_attachment_access,
 )
 from app.routers import agents as agents_router
 from app.schemas import ChatRequest
@@ -288,6 +294,344 @@ def test_supplementary_attachment_does_not_block_zero_data_capability(db: Sessio
 
     assert runtime.complete is True
     assert runtime.context_issues == []
+
+
+def test_asset_attachment_observation_and_binding_are_agent_scoped(
+    db: Session,
+) -> None:
+    tenant, user, scenario, llm, _function, agent = _world(db, "asset-scope")
+    other_agent = Agent(
+        id="agent-asset-scope-other",
+        tenant_id=tenant.id,
+        name="Other validation Agent",
+        scenario_id=scenario.id,
+        llm_config_id=llm.id,
+        capability_scope=copy.deepcopy(agent.capability_scope),
+        runtime_binding_mode="capability_only",
+    )
+    db.add(other_agent)
+    db.flush()
+    asset = DataAsset(
+        id="asset-agent-scope",
+        tenant_id=tenant.id,
+        owner_agent_id=agent.id,
+        key="agent.scope.document",
+        name="Agent-scoped document",
+        kind="file",
+        usage_plane="invocation_input",
+        lifecycle_status="active",
+        labels={"catalog_purpose": "validation_asset"},
+        created_by_user_id=user.id,
+    )
+    version = DataAssetVersion(
+        id="asset-version-agent-scope",
+        tenant_id=tenant.id,
+        asset_id=asset.id,
+        version_number=1,
+        provenance_kind="upload",
+        status="ready",
+        content_sha256="a" * 64,
+        byte_size=12,
+        version_document={"profile": {"category": "document"}},
+    )
+    db.add_all([other_agent, asset])
+    db.flush()
+    db.add(version)
+    db.commit()
+
+    attachment = agent_runtime_adapter.AgentAttachmentInput(
+        filename="reference.txt",
+        asset_version_id=version.id,
+        expected_signature=version.content_sha256,
+    )
+    owner_runtime = agent_runtime_adapter.build_runtime_context(
+        db,
+        agent,
+        llm,
+        turn_input=agent_runtime_adapter.AgentTurnInput(attachments=(attachment,)),
+    )
+    assert owner_runtime._attachment_observations()[0].profile == {
+        "category": "document"
+    }
+
+    foreign_runtime = agent_runtime_adapter.build_runtime_context(
+        db,
+        other_agent,
+        llm,
+        turn_input=agent_runtime_adapter.AgentTurnInput(attachments=(attachment,)),
+    )
+    capability = {
+        "data_ports": [
+            {
+                "port_key": "document",
+                "direction": "input",
+                "allow_override": True,
+                "required": True,
+                "cardinality": "one",
+                "binding_kinds": ["asset_version"],
+                "schema_document": {},
+            }
+        ]
+    }
+    with pytest.raises(agent_runtime_adapter.AgentRuntimeAdapterError) as captured:
+        foreign_runtime._attachment_overrides(
+            capability,
+            [{"attachment_index": 0, "port_key": "document"}],
+        )
+    assert captured.value.code == "attachment_unavailable"
+    assert foreign_runtime._attachment_observations()[0].profile == {}
+
+    asset.lifecycle_status = "retired"
+    db.flush()
+    retired_runtime = agent_runtime_adapter.build_runtime_context(
+        db,
+        agent,
+        llm,
+        turn_input=agent_runtime_adapter.AgentTurnInput(attachments=(attachment,)),
+    )
+    assert retired_runtime._attachment_observations()[0].profile == {}
+
+
+def test_shared_governed_asset_is_usable_but_private_namespaces_stay_isolated(
+    db: Session,
+) -> None:
+    """NULL owner means tenant-shared only for non-private catalog assets."""
+
+    tenant, user, scenario, llm, _function, agent = _world(db, "shared-asset")
+    other_agent = Agent(
+        id="agent-shared-asset-other",
+        tenant_id=tenant.id,
+        name="Other shared-asset Agent",
+        scenario_id=scenario.id,
+        llm_config_id=llm.id,
+        capability_scope=copy.deepcopy(agent.capability_scope),
+        runtime_binding_mode="capability_only",
+    )
+
+    def add_version(
+        suffix: str,
+        *,
+        owner_agent_id: str | None,
+        purpose: str | None = None,
+    ) -> DataAssetVersion:
+        labels = {"catalog_purpose": purpose} if purpose else {}
+        asset = DataAsset(
+            id=f"asset-shared-{suffix}",
+            tenant_id=tenant.id,
+            owner_agent_id=owner_agent_id,
+            key=f"shared.asset.{suffix}",
+            name=f"Shared asset {suffix}",
+            kind="file",
+            usage_plane="invocation_input",
+            lifecycle_status="active",
+            labels=labels,
+            created_by_user_id=user.id,
+        )
+        db.add(asset)
+        db.flush()
+        version = DataAssetVersion(
+            id=f"version-shared-{suffix}",
+            tenant_id=tenant.id,
+            asset_id=asset.id,
+            version_number=1,
+            provenance_kind="upload",
+            status="ready",
+            content_sha256=("a" if suffix == "generic" else "b") * 64,
+            byte_size=12,
+            version_document={"profile": {"category": "document"}},
+        )
+        db.add(version)
+        db.flush()
+        return version
+
+    shared_version = add_version("generic", owner_agent_id=None)
+    private_unowned_version = add_version(
+        "private-unowned",
+        owner_agent_id=None,
+        purpose="validation_asset",
+    )
+    foreign_version = add_version(
+        "foreign",
+        owner_agent_id=other_agent.id,
+        purpose="validation_asset",
+    )
+    db.commit()
+
+    def reference(version: DataAssetVersion) -> SimpleNamespace:
+        return SimpleNamespace(
+            upload_run_id=None,
+            asset_version_id=version.id,
+            dataset_version_id=None,
+            expected_signature=version.content_sha256,
+        )
+
+    # The common validator and the Agent adapter agree on the shared path.
+    managed_attachment_access.validate_attachments(
+        db,
+        [reference(shared_version)],
+        user_id=user.id,
+        agent_id=agent.id,
+    )
+    shared_runtime = agent_runtime_adapter.build_runtime_context(
+        db,
+        agent,
+        llm,
+        turn_input=agent_runtime_adapter.AgentTurnInput(
+            attachments=(
+                agent_runtime_adapter.AgentAttachmentInput(
+                    asset_version_id=shared_version.id,
+                    filename="shared.txt",
+                    expected_signature=shared_version.content_sha256,
+                ),
+            )
+        ),
+    )
+    assert shared_runtime._attachment_observations()[0].profile == {
+        "category": "document"
+    }
+
+    for version in (private_unowned_version, foreign_version):
+        with pytest.raises(managed_attachment_access.AttachmentAccessError):
+            managed_attachment_access.validate_attachments(
+                db,
+                [reference(version)],
+                user_id=user.id,
+                agent_id=agent.id,
+            )
+        runtime = agent_runtime_adapter.build_runtime_context(
+            db,
+            agent,
+            llm,
+            turn_input=agent_runtime_adapter.AgentTurnInput(
+                attachments=(
+                    agent_runtime_adapter.AgentAttachmentInput(
+                        asset_version_id=version.id,
+                        filename="private.txt",
+                        expected_signature=version.content_sha256,
+                    ),
+                )
+            ),
+        )
+        assert runtime._attachment_observations()[0].profile == {}
+
+
+def test_dataset_attachment_requires_ready_active_validation_lineage(
+    db: Session,
+) -> None:
+    tenant, user, scenario, llm, _function, agent = _world(db, "dataset-scope")
+    other_agent = Agent(
+        id="agent-dataset-scope-other",
+        tenant_id=tenant.id,
+        name="Other dataset Agent",
+        scenario_id=scenario.id,
+        llm_config_id=llm.id,
+        capability_scope=copy.deepcopy(agent.capability_scope),
+        runtime_binding_mode="capability_only",
+    )
+    asset = DataAsset(
+        id="asset-dataset-scope",
+        tenant_id=tenant.id,
+        owner_agent_id=other_agent.id,
+        key="dataset.scope.source",
+        name="Foreign dataset source",
+        kind="file",
+        usage_plane="invocation_input",
+        lifecycle_status="active",
+        created_by_user_id=user.id,
+    )
+    asset_version = DataAssetVersion(
+        id="asset-version-dataset-scope",
+        tenant_id=tenant.id,
+        asset_id=asset.id,
+        version_number=1,
+        provenance_kind="upload",
+        status="ready",
+        content_sha256="b" * 64,
+        byte_size=8,
+    )
+    dataset = LogicalDataset(
+        id="dataset-agent-scope",
+        tenant_id=tenant.id,
+        key="dataset.agent.scope",
+        name="Agent validation dataset",
+        usage_plane="invocation_input",
+        lifecycle_status="active",
+        labels={
+            "catalog_purpose": "validation_dataset",
+            "owner_agent_id": agent.id,
+        },
+    )
+    schema = DatasetSchema(
+        id="schema-agent-scope",
+        tenant_id=tenant.id,
+        dataset_id=dataset.id,
+        schema_version=1,
+        schema_hash="c" * 64,
+        compatibility="none",
+    )
+    version = DatasetVersion(
+        id="dataset-version-agent-scope",
+        tenant_id=tenant.id,
+        dataset_id=dataset.id,
+        schema_id=schema.id,
+        version_number=1,
+        status="ready",
+        content_hash="d" * 64,
+    )
+    link = DatasetVersionAsset(
+        id="dataset-version-asset-scope",
+        tenant_id=tenant.id,
+        dataset_id=dataset.id,
+        dataset_version_id=version.id,
+        asset_version_id=asset_version.id,
+        role="source",
+        ordinal=0,
+    )
+    db.add_all([other_agent, asset, dataset])
+    db.flush()
+    db.add_all([asset_version, schema, version, link])
+    db.commit()
+
+    attachment = agent_runtime_adapter.AgentAttachmentInput(
+        filename="records.csv",
+        dataset_version_id=version.id,
+        expected_signature=version.content_hash,
+    )
+    runtime = agent_runtime_adapter.build_runtime_context(
+        db,
+        agent,
+        llm,
+        turn_input=agent_runtime_adapter.AgentTurnInput(attachments=(attachment,)),
+    )
+    assert runtime._attachment_observations()[0].profile == {}
+    with pytest.raises(agent_runtime_adapter.AgentRuntimeAdapterError) as captured:
+        runtime._attachment_overrides(
+            {
+                "data_ports": [
+                    {
+                        "port_key": "records",
+                        "direction": "input",
+                        "allow_override": True,
+                        "required": True,
+                        "cardinality": "one",
+                        "binding_kinds": ["dataset_version"],
+                        "schema_document": {},
+                    }
+                ]
+            },
+            [{"attachment_index": 0, "port_key": "records"}],
+        )
+    assert captured.value.code == "attachment_unavailable"
+
+    version.status = "assembling"
+    db.flush()
+    stale_runtime = agent_runtime_adapter.build_runtime_context(
+        db,
+        agent,
+        llm,
+        turn_input=agent_runtime_adapter.AgentTurnInput(attachments=(attachment,)),
+    )
+    assert stale_runtime._attachment_observations()[0].profile == {}
 
 
 def _attachment_runtime(

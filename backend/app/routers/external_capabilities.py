@@ -218,6 +218,11 @@ async def upload_invocation_attachment(
             )
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        # Source resolution may take a short row lock while repairing the
+        # deterministic tenant bucket.  Do not retain that lock while the
+        # request body is staged or MinIO I/O runs; the persistence service
+        # reacquires the asset/source fences before publication.
+        context.db.commit()
         settings = get_settings()
         max_upload_bytes = int(
             getattr(settings, "catalog_max_upload_bytes", settings.max_upload_bytes)

@@ -613,6 +613,11 @@ def _visible_files(db: Session, data_source_ids: list[str]) -> list[tuple[Bucket
         .where(
             BucketFile.data_source_id.in_(data_source_ids),
             DataSource.type == "file_bucket",
+            # Generic RAG is deliberately modeling-only.  Validation Agent
+            # attachments are resolved by the owner-scoped managed-upload
+            # path; allowing runtime rows here would turn a source-id guess
+            # into a cross-Agent retrieval channel.
+            DataSource.resource_scope == "modeling",
             BucketFile.status == "parsed",
             BucketFile.parsed_text != "",
         )
@@ -656,6 +661,7 @@ def search(
         .where(
             DocumentChunk.bucket_file_id.in_(allowed_file_ids),
             DataSource.type == "file_bucket",
+            DataSource.resource_scope == "modeling",
         )
     )
     stmt = stmt.where(tenant_service.visible_clause(DataSource, db))

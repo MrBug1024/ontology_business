@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { capabilityInvocationId, receiptResourceId } from '../src/utils/agentCapabilityReceipt.ts'
 import { workflowArtifacts } from '../src/utils/workflowArtifacts.ts'
+import { managedFileDownloadUrl, managedFileTextPath } from '../src/utils/managedFileUrls.ts'
 import { plainMessage } from '../src/utils/plainMessage.ts'
 import { readFileSync } from 'node:fs'
 import { executionAnalysis, executionSteps, executionStatusLabel } from '../src/utils/agentExecutionTrace.ts'
@@ -27,6 +28,20 @@ test('unified capability previews are discoverable even when the receipt was pro
 test('receipt links only accept managed identifiers', () => {
   for (const value of ['https://example.test', '../secret', 'javascript:alert(1)', {}, null]) assert.equal(receiptResourceId(value), '')
   assert.equal(receiptResourceId('b'.repeat(32)), 'b'.repeat(32))
+})
+
+test('managed file links carry Agent scope while legacy modeling links stay compatible', () => {
+  const fileId = 'f'.repeat(32)
+  const agentId = 'agent-one'
+  assert.equal(
+    managedFileDownloadUrl(fileId, agentId),
+    `/api/data-sources/files/${fileId}/download?agent_id=${agentId}`,
+  )
+  assert.equal(
+    managedFileTextPath(fileId, agentId),
+    `/data-sources/files/${fileId}/text?agent_id=${agentId}`,
+  )
+  assert.equal(managedFileDownloadUrl(fileId), `/api/data-sources/files/${fileId}/download`)
 })
 
 test('workflow files require a successful artifact receipt and ignore arbitrary URLs', () => {

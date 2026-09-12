@@ -61,7 +61,14 @@
             <el-button size="small" :type="agentReady(a) ? 'primary' : 'warning'" :text="agentReady(a)" :plain="!agentReady(a)" @click="openEdit(a)">
               <el-icon><Setting /></el-icon> 编辑
             </el-button>
-            <el-button size="small" text type="danger" @click="remove(a)"><el-icon><Delete /></el-icon> 删除</el-button>
+            <el-button
+              size="small"
+              text
+              type="danger"
+              :loading="deletingId === a.id"
+              :disabled="Boolean(deletingId)"
+              @click="remove(a)"
+            ><el-icon><Delete /></el-icon> 删除</el-button>
           </div>
         </article>
       </el-col>
@@ -293,6 +300,7 @@ const visibleAgents = computed(() => filterAgentsByScenario(agents.value, scenar
 const dlg = ref(false)
 const saving = ref(false)
 const loading = ref(false)
+const deletingId = ref('')
 const form = ref<Partial<Agent>>({ data_source_ids: [], capability_scope: allAgentCapabilityScope() })
 const capabilityCatalog = ref<AgentCapabilityCatalog | null>(null)
 const capabilityCatalogLoading = ref(false)
@@ -533,13 +541,26 @@ async function save() {
   }
 }
 async function remove(a: Agent) {
+  if (!a.id || deletingId.value) return
   try {
-    await ElMessageBox.confirm(`删除 Agent「${a.name}」？`, '确认', { type: 'warning' })
-    await api.deleteAgent(a.id!)
+    await ElMessageBox.confirm(
+      `删除验证 Agent「${a.name}」？将同时删除该 Agent 的全部验证会话、对话消息及其上传附件；已绑定的场景能力、场景定义和发布记录不会删除。`,
+      '确认删除验证 Agent',
+      {
+        type: 'warning',
+        confirmButtonText: '删除 Agent',
+        cancelButtonText: '取消',
+        distinguishCancelAndClose: true,
+      },
+    )
+    deletingId.value = a.id
+    await api.deleteAgent(a.id)
     ElMessage.success('已删除')
     await load()
   } catch (e: any) {
     if (e !== 'cancel' && e !== 'close') ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
+  } finally {
+    if (deletingId.value === a.id) deletingId.value = ''
   }
 }
 async function changeScenarioScope(value: unknown) {

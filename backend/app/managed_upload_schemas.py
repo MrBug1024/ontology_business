@@ -35,6 +35,10 @@ class ManagedUploadCreateIn(BaseModel):
         ge=300,
         le=7 * 24 * 60 * 60,
     )
+    # Optional Agent scope.  Global Assistant uploads continue to omit both
+    # fields; Agent routes must provide and authorize the scope server-side.
+    agent_id: str | None = Field(default=None, min_length=1, max_length=32)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=32)
 
     model_config = {"extra": "forbid"}
 
@@ -42,6 +46,8 @@ class ManagedUploadCreateIn(BaseModel):
     def lifecycle_is_explicit(self) -> "ManagedUploadCreateIn":
         if self.purpose != "invocation_attachment" and self.expires_in_seconds is not None:
             raise ValueError("长期验证资料不能设置临时到期时间")
+        if self.conversation_id and not self.agent_id:
+            raise ValueError("conversation_id 必须与 agent_id 一起提供")
         return self
 
 
@@ -70,6 +76,7 @@ class ManagedUploadRunOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     finished_at: datetime | None = None
+    owner_agent_id: str | None = None
 
     model_config = {"extra": "forbid"}
 
@@ -77,11 +84,17 @@ class ManagedUploadRunOut(BaseModel):
 class ManagedUploadRetryIn(BaseModel):
     expected_revision: int = Field(ge=1)
     idempotency_key: str = Field(min_length=1, max_length=180)
+    # Agent-scoped callers must echo the owner on every state transition.
+    # Global Assistant retries intentionally omit this field and therefore
+    # resolve only runs whose owner_agent_id is NULL.
+    agent_id: str | None = Field(default=None, min_length=1, max_length=32)
 
     model_config = {"extra": "forbid"}
 
 
 class ManagedUploadCancelIn(BaseModel):
     expected_revision: int = Field(ge=1)
+    # See ManagedUploadRetryIn.agent_id.
+    agent_id: str | None = Field(default=None, min_length=1, max_length=32)
 
     model_config = {"extra": "forbid"}

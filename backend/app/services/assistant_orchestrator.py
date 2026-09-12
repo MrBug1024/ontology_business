@@ -21,6 +21,7 @@ from . import llm_service
 AssistantGoal = Literal[
     "answer",
     "clarify",
+    "research",
     "create",
     "update",
     "delete",
@@ -30,6 +31,7 @@ AssistantGoal = Literal[
 ]
 AssistantScope = Literal[
     "general",
+    "research",
     "scenario",
     "ontology",
     "mapping",
@@ -40,6 +42,7 @@ AssistantScope = Literal[
 AssistantConfidence = Literal["high", "medium", "low"]
 AssistantCapability = Literal[
     "answer_question",
+    "research_domain",
     "draft_scenario",
     "draft_ontology",
     "draft_mapping",
@@ -52,6 +55,7 @@ AssistantCapability = Literal[
 
 _CAPABILITY_BY_INTENT: dict[str, AssistantCapability] = {
     "chat": "answer_question",
+    "research": "research_domain",
     "explain": "answer_question",
     "scenario": "draft_scenario",
     "ontology": "draft_ontology",
@@ -65,6 +69,7 @@ _CAPABILITY_BY_INTENT: dict[str, AssistantCapability] = {
 
 _CAPABILITY_LABELS: dict[AssistantCapability, str] = {
     "answer_question": "上下文问答",
+    "research_domain": "行业知识检索",
     "draft_scenario": "业务场景草拟",
     "draft_ontology": "本体模型草拟",
     "draft_mapping": "数据映射草拟",
@@ -79,6 +84,11 @@ _CAPABILITY_TOOL_CONFIG: dict[AssistantCapability, dict[str, Any]] = {
         "scope": "general",
         "goals": ["answer", "clarify"],
         "description": "回答、解释或澄清问题；不会创建、修改、应用或执行平台资源。",
+    },
+    "research_domain": {
+        "scope": "research",
+        "goals": ["research", "clarify"],
+        "description": "在受治理的公开来源范围内检索行业知识，返回带时间和来源的只读证据；不会自动写入模型。",
     },
     "draft_scenario": {
         "scope": "scenario",
@@ -212,6 +222,7 @@ class AssistantSemanticDecision(BaseModel):
 class AssistantRoutePlan(BaseModel):
     intent: Literal[
         "chat",
+        "research",
         "explain",
         "scenario",
         "ontology",
@@ -339,6 +350,8 @@ def _govern(state: _RouteState) -> dict[str, Any]:
             "policy_note": "语义规划模型不可用，本条请求已保守保持只读。",
         }
 
+    if decision.goal == "research":
+        return {"intent": "research", "branch": "answer"}
     if decision.goal in {"answer", "clarify"}:
         return {"intent": "chat", "branch": "answer"}
     if decision.goal == "apply_change":

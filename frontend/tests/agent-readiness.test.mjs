@@ -169,3 +169,19 @@ test('new Agent runtime connections do not prefill a host port or username', () 
   assert.match(addSource, /username:\s*''/)
   assert.doesNotMatch(addSource, /127\.0\.0\.1|5432|username:\s*['"]postgres['"]/)
 })
+
+test('retired scenario purge confirmation stays editable until the request is submitted', () => {
+  const source = readFileSync(new URL('../src/views/Scenarios.vue', import.meta.url), 'utf8')
+  assert.match(source, /<el-input v-model="purgeExpectedName" :disabled="purging"/)
+  assert.doesNotMatch(source, /purgeExpectedName"\s+:disabled="!purgePlan\.can_purge/)
+  assert.match(source, /向下拥有的对象、关系、数据源、验证 Agent、会话、附件/)
+})
+
+test('Agent deletion explains downward cleanup and preserves bound scenario capabilities', () => {
+  const source = readFileSync(new URL('../src/views/Agents.vue', import.meta.url), 'utf8')
+  assert.match(source, /:loading="deletingId === a\.id"/)
+  assert.match(source, /const deletingId = ref\(''\)/)
+  assert.match(source, /全部验证会话、对话消息及其上传附件/)
+  assert.match(source, /已绑定的场景能力、场景定义和发布记录不会删除/)
+  assert.match(source, /finally \{[\s\S]*deletingId\.value = ''/)
+})

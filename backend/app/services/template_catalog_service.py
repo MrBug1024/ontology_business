@@ -784,20 +784,27 @@ _MERGEABLE_PROPOSAL_STATUSES = {"draft", "submitted", "approved"}
 
 
 def _governed_snapshots(
-    db: Session, tenant_ids: set[str]
+    db: Session,
+    tenant_ids: set[str],
+    *,
+    exclude_scenario_ids: set[str] | None = None,
 ) -> list[OntologySnapshot]:
     """Snapshots that can still restore definitions through merge/rollback."""
     proposed_ids = select(OntologyProposal.proposed_snapshot_id).where(
         OntologyProposal.tenant_id.in_(tenant_ids),
         OntologyProposal.status.in_(_MERGEABLE_PROPOSAL_STATUSES),
     )
-    return db.scalars(select(OntologySnapshot).where(
+    statement = select(OntologySnapshot).where(
         OntologySnapshot.tenant_id.in_(tenant_ids),
         or_(
             OntologySnapshot.kind.in_(_ROLLBACKABLE_SNAPSHOT_KINDS),
             OntologySnapshot.id.in_(proposed_ids),
         ),
-    )).all()
+    )
+    excluded = {str(value) for value in (exclude_scenario_ids or set()) if value}
+    if excluded:
+        statement = statement.where(OntologySnapshot.scenario_id.not_in(excluded))
+    return db.scalars(statement).all()
 
 
 def reference_index(
@@ -986,34 +993,47 @@ def assert_bucket_files_not_registered(
 
 
 def _template_reference_configs(
-    db: Session, tenant_ids: set[str]
+    db: Session,
+    tenant_ids: set[str],
+    *,
+    exclude_scenario_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return live and restorable template configs inside the tenant boundary."""
     if not tenant_ids:
         return []
     configs: list[dict[str, Any]] = []
-    actions = db.scalars(
+    excluded = {str(value) for value in (exclude_scenario_ids or set()) if value}
+    action_statement = (
         select(OntologyAction)
         .join(BusinessScenario, BusinessScenario.id == OntologyAction.scenario_id)
         .where(
             BusinessScenario.tenant_id.in_(tenant_ids),
             OntologyAction.executor_type == "template",
         )
-    ).all()
+    )
+    if excluded:
+        action_statement = action_statement.where(OntologyAction.scenario_id.not_in(excluded))
+    actions = db.scalars(action_statement).all()
     configs.extend(
         dict(action.executor_config or {})
         for action in actions
         if isinstance(action.executor_config or {}, dict)
     )
-    release_snapshots = db.scalars(
+    release_statement = (
         select(OntologySnapshot)
         .join(OntologyRelease, OntologyRelease.snapshot_id == OntologySnapshot.id)
         .where(
             OntologyRelease.tenant_id.in_(tenant_ids),
             OntologyRelease.status == "released",
         )
-    ).all()
-    for snapshot in [*release_snapshots, *_governed_snapshots(db, tenant_ids)]:
+    )
+    if excluded:
+        release_statement = release_statement.where(OntologyRelease.scenario_id.not_in(excluded))
+    release_snapshots = db.scalars(release_statement).all()
+    for snapshot in [
+        *release_snapshots,
+        *_governed_snapshots(db, tenant_ids, exclude_scenario_ids=excluded),
+    ]:
         for raw_action in (snapshot.content or {}).get("actions") or []:
             if not isinstance(raw_action, dict):
                 continue
@@ -1023,12 +1043,24 @@ def _template_reference_configs(
     return configs
 
 
-def assert_data_source_not_registered(db: Session, data_source_id: str) -> None:
+def assert_data_source_not_registered(
+    db: Session,
+    data_source_id: str,
+    *,
+    exclude_scenario_id: str | None = None,
+) -> None:
     registered = db.execute(
         select(ArtifactTemplateVersion, ArtifactTemplate)
         .join(BucketFile, BucketFile.id == ArtifactTemplateVersion.bucket_file_id)
         .join(ArtifactTemplate, ArtifactTemplate.id == ArtifactTemplateVersion.template_id)
-        .where(BucketFile.data_source_id == data_source_id)
+        .where(
+            BucketFile.data_source_id == data_source_id,
+            or_(
+                exclude_scenario_id is None,
+                ArtifactTemplate.scenario_id.is_(None),
+                ArtifactTemplate.scenario_id != exclude_scenario_id,
+            ),
+        )
         .limit(1)
     ).first()
     if registered:
@@ -1039,7 +1071,12 @@ def assert_data_source_not_registered(db: Session, data_source_id: str) -> None:
     source = db.get(DataSource, data_source_id)
     if not source:
         return
-    configs = _template_reference_configs(db, {str(source.tenant_id)})
+    excluded = {str(exclude_scenario_id)} if exclude_scenario_id else set()
+    configs = _template_reference_configs(
+        db,
+        {str(source.tenant_id)},
+        exclude_scenario_ids=excluded,
+    )
     if any(
         str(config.get("target_data_source_id") or "")
         == data_source_id

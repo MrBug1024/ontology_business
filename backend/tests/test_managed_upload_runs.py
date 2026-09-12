@@ -19,6 +19,7 @@ from app.managed_upload_schemas import ManagedUploadCreateIn
 from app.models import (
     Agent,
     AgentTurnRun,
+    AuthorizationGrant,
     BucketFile,
     BusinessScenario,
     DataAsset,
@@ -100,13 +101,16 @@ def _database(session_factory):
     return db
 
 
-def _create_payload(*, idempotency_key: str = "upload-intent-1") -> ManagedUploadCreateIn:
+def _create_payload(
+    *, idempotency_key: str = "upload-intent-1", agent_id: str | None = None
+) -> ManagedUploadCreateIn:
     return ManagedUploadCreateIn(
         filename="records.csv",
         byte_size=18,
         media_type="text/csv",
         purpose="validation_asset",
         idempotency_key=idempotency_key,
+        agent_id=agent_id,
     )
 
 
@@ -132,6 +136,247 @@ def test_upload_intent_is_committed_without_contacting_object_storage(
             assert created["status"] == "awaiting_upload"
             assert created["result"] is None
             assert db.get(ManagedUploadRun, created["id"]) is not None
+
+
+def test_agent_scoped_upload_followups_cannot_cross_agent_or_global_namespace(
+    upload_database,
+) -> None:
+    """Every follow-up operation must retain the Agent ownership boundary."""
+
+    with _database(upload_database) as db:
+        other_agent = Agent(
+            id="upload-run-agent-other",
+            tenant_id="upload-run-tenant",
+            scenario_id="upload-run-scenario",
+            name="Other upload run agent",
+            runtime_binding_mode="capability_only",
+            capability_scope={},
+        )
+        db.add(other_agent)
+        db.commit()
+
+        owned = managed_upload_run_service.create_upload_run(
+            db,
+            ManagedUploadCreateIn(
+                filename="agent-owned.txt",
+                byte_size=12,
+                media_type="text/plain",
+                purpose="invocation_attachment",
+                idempotency_key="agent-owned-followup",
+                agent_id="upload-run-agent",
+            ),
+        )
+        assert owned["owner_agent_id"] == "upload-run-agent"
+        assert managed_upload_run_service.get_upload_run(
+            db,
+            owned["id"],
+            agent_id="upload-run-agent",
+        )["id"] == owned["id"]
+
+        # Omitting the scope means Global Assistant (owner NULL), not a
+        # wildcard. A different Agent is equally unable to observe the run.
+        for scope in (None, "upload-run-agent-other"):
+            with pytest.raises(managed_upload_run_service.ManagedUploadError) as error:
+                managed_upload_run_service.get_upload_run(
+                    db,
+                    owned["id"],
+                    agent_id=scope,
+                )
+            assert error.value.status_code == 404
+
+        with pytest.raises(managed_upload_run_service.ManagedUploadError) as error:
+            managed_upload_run_service.preflight_content_upload(
+                db,
+                owned["id"],
+                expected_revision=owned["revision"],
+                agent_id="upload-run-agent-other",
+            )
+        assert error.value.status_code == 404
+
+        with pytest.raises(managed_upload_run_service.ManagedUploadError) as error:
+            managed_upload_run_service.claim_content_upload(
+                db,
+                owned["id"],
+                expected_revision=owned["revision"],
+                agent_id="upload-run-agent-other",
+            )
+        assert error.value.status_code == 404
+
+        owned_row = db.get(ManagedUploadRun, owned["id"])
+        assert owned_row is not None
+        owned_row.status = "failed"
+        owned_row.revision += 1
+        owned_row.error_code = "test_failure"
+        owned_row.error_message = "test failure"
+        db.commit()
+        failed_revision = owned_row.revision
+
+        with pytest.raises(managed_upload_run_service.ManagedUploadError) as error:
+            managed_upload_run_service.retry_upload_run(
+                db,
+                owned["id"],
+                expected_revision=failed_revision,
+                idempotency_key="agent-owned-cross-retry",
+                agent_id="upload-run-agent-other",
+            )
+        assert error.value.status_code == 404
+
+        retried = managed_upload_run_service.retry_upload_run(
+            db,
+            owned["id"],
+            expected_revision=failed_revision,
+            idempotency_key="agent-owned-followup-retry",
+            agent_id="upload-run-agent",
+        )
+        assert retried["owner_agent_id"] == "upload-run-agent"
+
+        cancellable = managed_upload_run_service.create_upload_run(
+            db,
+            ManagedUploadCreateIn(
+                filename="agent-owned-cancel.txt",
+                byte_size=12,
+                media_type="text/plain",
+                purpose="invocation_attachment",
+                idempotency_key="agent-owned-cancel",
+                expires_in_seconds=3600,
+                agent_id="upload-run-agent",
+            ),
+        )
+        with pytest.raises(managed_upload_run_service.ManagedUploadError) as error:
+            managed_upload_run_service.cancel_upload_run(
+                db,
+                cancellable["id"],
+                expected_revision=cancellable["revision"],
+                agent_id="upload-run-agent-other",
+            )
+        assert error.value.status_code == 404
+
+        cancelled = managed_upload_run_service.cancel_upload_run(
+            db,
+            cancellable["id"],
+            expected_revision=cancellable["revision"],
+            agent_id="upload-run-agent",
+        )
+        assert cancelled["status"] == "cancelled"
+
+
+def test_scenario_acl_viewer_can_write_agent_upload_but_not_global_upload(
+    upload_database,
+) -> None:
+    worker_content = b"id,name\n1,Alice\n"
+    worker_digest = hashlib.sha256(worker_content).hexdigest()
+    with _database(upload_database) as db:
+        member = db.query(OrganizationMember).filter_by(
+            user_id="upload-run-user"
+        ).one()
+        viewer = db.query(OrganizationRole).filter_by(
+            organization_id=member.organization_id,
+            key="viewer",
+        ).one()
+        member.role_id = viewer.id
+        db.add(
+            AuthorizationGrant(
+                organization_id=member.organization_id,
+                user_id="upload-run-user",
+                resource_type="scenario",
+                resource_id="upload-run-scenario",
+                verb="write",
+                effect="allow",
+                created_by_user_id="upload-run-user",
+            )
+        )
+        db.commit()
+        permission_service.refresh_request_authorization(db)
+
+        scenario = db.get(BusinessScenario, "upload-run-scenario")
+        assert scenario is not None
+        assert not permission_service.check_tenant_permission(db, "write").allowed
+        assert permission_service.check_scenario(db, scenario, "write").allowed
+
+        created = managed_upload_run_service.create_upload_run(
+            db,
+            _create_payload(
+                idempotency_key="scenario-acl-viewer-agent-upload",
+                agent_id="upload-run-agent",
+            ),
+        )
+        assert created["owner_agent_id"] == "upload-run-agent"
+        assert managed_upload_run_service.get_upload_run(
+            db,
+            created["id"],
+            agent_id="upload-run-agent",
+        )["id"] == created["id"]
+        cancelled = managed_upload_run_service.cancel_upload_run(
+            db,
+            created["id"],
+            expected_revision=created["revision"],
+            agent_id="upload-run-agent",
+        )
+        assert cancelled["status"] == "cancelled"
+
+        with pytest.raises(HTTPException) as denied:
+            managed_upload_run_service.create_upload_run(
+                db,
+                _create_payload(idempotency_key="scenario-acl-viewer-global-upload"),
+            )
+        assert denied.value.status_code == 403
+
+        worker_upload = managed_upload_run_service.create_upload_run(
+            db,
+            ManagedUploadCreateIn(
+                filename="viewer-worker.csv",
+                byte_size=len(worker_content),
+                media_type="text/csv",
+                purpose="validation_asset",
+                idempotency_key="scenario-acl-viewer-worker-upload",
+                agent_id="upload-run-agent",
+            ),
+        )
+        worker_run = db.get(ManagedUploadRun, worker_upload["id"])
+        bucket_file = BucketFile(
+            id="scenario-acl-viewer-worker-file",
+            data_source_id=worker_run.data_source_id,
+            filename=worker_run.filename,
+            stored_path="minio://catalog-test/platform/scenario-acl-viewer-worker-file",
+            storage_provider="minio",
+            bucket_name="catalog-test",
+            object_key="platform/scenario-acl-viewer-worker-file",
+            object_version_id="v1",
+            etag="etag",
+            object_url="minio://catalog-test/platform/scenario-acl-viewer-worker-file",
+            size=len(worker_content),
+            mime="text/csv",
+            content_sha256=worker_digest,
+            status="pending",
+        )
+        db.add(bucket_file)
+        db.flush()
+        worker_run.bucket_file_id = bucket_file.id
+        worker_run.byte_size = len(worker_content)
+        worker_run.content_sha256 = worker_digest
+        worker_run.status = "stored"
+        worker_run.revision += 1
+        worker_run.available_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+
+    def download(_bucket, _key, destination, **_kwargs):
+        Path(destination).write_bytes(worker_content)
+        return SimpleNamespace(size=len(worker_content))
+
+    with (
+        patch.object(managed_upload_run_service, "SessionLocal", upload_database),
+        patch.object(
+            object_storage_service,
+            "download_object_to_file",
+            side_effect=download,
+        ),
+    ):
+        assert managed_upload_run_service.process_upload_run(worker_upload["id"])
+
+    with _database(upload_database) as db:
+        worker_run = db.get(ManagedUploadRun, worker_upload["id"])
+        assert worker_run.status == "ready"
+        assert db.get(DataAsset, worker_run.asset_id).owner_agent_id == "upload-run-agent"
 
 
 def test_upload_intent_idempotency_and_content_claim_use_cas(upload_database) -> None:
@@ -462,7 +707,9 @@ def test_agent_turn_accepts_pending_upload_and_resolves_only_after_ready(
     upload_database,
 ) -> None:
     with _database(upload_database) as db:
-        upload = managed_upload_run_service.create_upload_run(db, _create_payload())
+        upload = managed_upload_run_service.create_upload_run(
+            db, _create_payload(agent_id="upload-run-agent")
+        )
         turn = agent_turn_service.enqueue_turn(
             db,
             "upload-run-agent",
@@ -507,6 +754,7 @@ def test_agent_turn_accepts_pending_upload_and_resolves_only_after_ready(
             media_type="text/csv",
             usage_plane="invocation_input",
             labels={"catalog_purpose": "validation_asset"},
+            owner_agent_id="upload-run-agent",
             created_by_user_id="upload-run-user",
         )
         version = DataAssetVersion(
@@ -751,7 +999,9 @@ def test_failed_content_upload_stops_waiting_turn_after_retry_window(
     with _database(upload_database) as db:
         upload = managed_upload_run_service.create_upload_run(
             db,
-            _create_payload(idempotency_key="failed-content-upload"),
+            _create_payload(
+                idempotency_key="failed-content-upload", agent_id="upload-run-agent"
+            ),
         )
         turn = agent_turn_service.enqueue_turn(
             db,
@@ -785,7 +1035,9 @@ def test_expired_temporary_asset_is_rejected_before_turn_acceptance(
     with _database(upload_database) as db:
         upload = managed_upload_run_service.create_upload_run(
             db,
-            _create_payload(idempotency_key="temporary-expiry-source"),
+            _create_payload(
+                idempotency_key="temporary-expiry-source", agent_id="upload-run-agent"
+            ),
         )
         source_id = db.get(ManagedUploadRun, upload["id"]).data_source_id
         bucket_file = BucketFile(
@@ -813,6 +1065,7 @@ def test_expired_temporary_asset_is_rejected_before_turn_acceptance(
             media_type="text/plain",
             usage_plane="invocation_input",
             labels={"catalog_purpose": "invocation_attachment"},
+            owner_agent_id="upload-run-agent",
             created_by_user_id="upload-run-user",
         )
         version = DataAssetVersion(
@@ -895,3 +1148,111 @@ def test_upload_intent_http_endpoint_returns_202_without_storage_io(
     assert response.status_code == 202
     assert response.json()["status"] == "awaiting_upload"
     assert "object_key" not in response.text
+
+
+def test_upload_run_http_followups_enforce_agent_scope(upload_database) -> None:
+    app = FastAPI()
+    app.include_router(managed_uploads.router, prefix="/api")
+
+    def tenant_db_override():
+        with _database(upload_database) as db:
+            yield db
+
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id="upload-run-user",
+        tenant_id="upload-run-tenant",
+    )
+    app.dependency_overrides[get_tenant_db] = tenant_db_override
+
+    with _database(upload_database) as db:
+        other_agent = Agent(
+            id="upload-run-http-other",
+            tenant_id="upload-run-tenant",
+            scenario_id="upload-run-scenario",
+            name="HTTP scope agent",
+            runtime_binding_mode="capability_only",
+            capability_scope={},
+        )
+        db.add(other_agent)
+        db.commit()
+        owned = managed_upload_run_service.create_upload_run(
+            db,
+            ManagedUploadCreateIn(
+                filename="http-agent-owned.txt",
+                byte_size=4,
+                media_type="text/plain",
+                purpose="invocation_attachment",
+                idempotency_key="http-agent-owned",
+                expires_in_seconds=3600,
+                agent_id="upload-run-agent",
+            ),
+        )
+        failed = db.get(ManagedUploadRun, owned["id"])
+        assert failed is not None
+        failed.status = "failed"
+        failed.revision += 1
+        failed.error_code = "test_failure"
+        failed.error_message = "test failure"
+        db.commit()
+        failed_revision = failed.revision
+        cancellable = managed_upload_run_service.create_upload_run(
+            db,
+            ManagedUploadCreateIn(
+                filename="http-agent-cancel.txt",
+                byte_size=4,
+                media_type="text/plain",
+                purpose="invocation_attachment",
+                idempotency_key="http-agent-cancel",
+                expires_in_seconds=3600,
+                agent_id="upload-run-agent",
+            ),
+        )
+
+    with TestClient(app) as client:
+        assert client.get(f"/api/catalog/upload-runs/{owned['id']}").status_code == 404
+        scoped = client.get(
+            f"/api/catalog/upload-runs/{owned['id']}",
+            params={"agent_id": "upload-run-agent"},
+        )
+        assert scoped.status_code == 200
+        assert scoped.json()["owner_agent_id"] == "upload-run-agent"
+
+        wrong_retry = client.post(
+            f"/api/catalog/upload-runs/{owned['id']}/retry",
+            json={
+                "expected_revision": failed_revision,
+                "idempotency_key": "http-agent-wrong-retry",
+                "agent_id": "upload-run-http-other",
+            },
+        )
+        assert wrong_retry.status_code == 404
+
+        wrong_content = client.post(
+            "/api/catalog/upload-runs/content",
+            data={
+                "upload_run_id": owned["id"],
+                "expected_revision": str(failed_revision),
+                "agent_id": "upload-run-http-other",
+            },
+            files={"file": ("payload.txt", b"data", "text/plain")},
+        )
+        assert wrong_content.status_code == 404
+
+        mismatch = client.post(
+            f"/api/catalog/upload-runs/{cancellable['id']}/cancel?agent_id=upload-run-agent",
+            json={
+                "expected_revision": cancellable["revision"],
+                "agent_id": "upload-run-http-other",
+            },
+        )
+        assert mismatch.status_code == 422
+
+        cancelled = client.post(
+            f"/api/catalog/upload-runs/{cancellable['id']}/cancel",
+            json={
+                "expected_revision": cancellable["revision"],
+                "agent_id": "upload-run-agent",
+            },
+        )
+        assert cancelled.status_code == 200
+        assert cancelled.json()["status"] == "cancelled"

@@ -26,10 +26,30 @@ SCHEMA_FIRST_REVISION_PATH = (
     / "versions"
     / "20260905_23_make_semantic_mappings_schema_first.py"
 )
+AGENT_ATTACHMENT_REVISION_PATH = (
+    BACKEND_ROOT
+    / "migrations"
+    / "versions"
+    / "20260911_31_agent_attachment_ownership.py"
+)
+AGENT_SCOPE_REVISION_PATH = (
+    BACKEND_ROOT
+    / "migrations"
+    / "versions"
+    / "20260912_32_harden_data_source_agent_scope.py"
+)
 
 
 def _load_revision():
     spec = importlib.util.spec_from_file_location("catalog_scope_revision", REVISION_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_revision_from(path: Path, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -125,6 +145,128 @@ def test_revision_23_semantic_mapping_scope_is_schema_first() -> None:
     migration = SCHEMA_FIRST_REVISION_PATH.read_text(encoding="utf-8")
     assert "duplicate scenario/entity/schema ownership" in migration
     assert "FROM semantic_relation_mappings" in migration
+
+
+def _valid_agent_scope_snapshot() -> tuple[
+    dict[str, set[str]], set[str], dict[str, dict[str, str | None]]
+]:
+    columns = {
+        table_name: set(column_names)
+        for table_name, column_names in runtime._AGENT_SCOPE_COLUMNS.items()
+    }
+    indexes = set(runtime._AGENT_SCOPE_INDEXES)
+    constraints: dict[str, dict[str, str | None]] = {}
+    for name, expected in runtime._AGENT_SCOPE_CONSTRAINTS.items():
+        if expected["constraint_type"] == "f":
+            definition = (
+                "FOREIGN KEY (owner_agent_id, tenant_id) "
+                "REFERENCES agents (id, tenant_id) ON DELETE RESTRICT"
+            )
+            delete_action = "r"
+        elif name == "ck_data_sources_resource_scope":
+            definition = "resource_scope IN ('modeling', 'agent_runtime')"
+            delete_action = None
+        else:
+            definition = (
+                "owner_agent_id IS NULL OR "
+                "(tenant_id IS NOT NULL AND resource_scope = 'agent_runtime')"
+            )
+            delete_action = None
+        constraints[name] = {
+            "table_name": str(expected["table_name"]),
+            "constraint_type": str(expected["constraint_type"]),
+            "delete_action": delete_action,
+            "definition": definition,
+        }
+    return columns, indexes, constraints
+
+
+def test_agent_scope_migrations_and_runtime_contract_are_fail_closed() -> None:
+    revision_31 = _load_revision_from(
+        AGENT_ATTACHMENT_REVISION_PATH,
+        "agent_attachment_ownership_revision",
+    )
+    revision_32 = _load_revision_from(
+        AGENT_SCOPE_REVISION_PATH,
+        "agent_scope_revision",
+    )
+    assert revision_31.revision == "20260911_31"
+    assert revision_31.down_revision == "20260909_30"
+    assert revision_32.revision == "20260912_32"
+    assert revision_32.down_revision == "20260911_31"
+
+    columns, indexes, constraints = _valid_agent_scope_snapshot()
+    result = runtime._validate_agent_scope_snapshot(
+        columns,
+        indexes=indexes,
+        constraints=constraints,
+    )
+    assert result == {
+        "revision": "20260912_32",
+        "scoped_tables": 3,
+        "scoped_indexes": 4,
+        "scoped_constraints": 5,
+    }
+
+    migration_31 = AGENT_ATTACHMENT_REVISION_PATH.read_text(encoding="utf-8")
+    migration_32 = AGENT_SCOPE_REVISION_PATH.read_text(encoding="utf-8")
+    assert migration_31.count('ondelete="RESTRICT"') == 2
+    assert "_precheck_existing_scope" in migration_32
+    assert "_precheck_downgrade" in migration_32
+    assert "ondelete=\"RESTRICT\"" in migration_32
+
+    data_assets = Base.metadata.tables["data_assets"]
+    managed_upload_runs = Base.metadata.tables["managed_upload_runs"]
+    data_sources = Base.metadata.tables["data_sources"]
+    assert data_assets.c.owner_agent_id.nullable is True
+    assert managed_upload_runs.c.owner_agent_id.nullable is True
+    assert data_sources.c.owner_agent_id.nullable is True
+    assert data_sources.c.resource_scope.nullable is False
+    for table_name, index_name in (
+        ("data_assets", "ix_data_assets_owner_agent_id"),
+        ("managed_upload_runs", "ix_managed_upload_runs_owner_agent_id"),
+        ("data_sources", "ix_data_sources_owner_agent_id"),
+    ):
+        assert index_name in {
+            index.name for index in Base.metadata.tables[table_name].indexes
+        }
+    for name, table_name in (
+        ("fk_data_assets_owner_agent_tenant", "data_assets"),
+        ("fk_managed_upload_runs_owner_agent_tenant", "managed_upload_runs"),
+        ("fk_data_sources_owner_agent_tenant", "data_sources"),
+        ("ck_data_sources_resource_scope", "data_sources"),
+        ("ck_data_sources_owner_scope", "data_sources"),
+    ):
+        assert _named_constraint(table_name, name).name == name
+
+
+def test_agent_scope_runtime_contract_rejects_missing_or_cascading_metadata() -> None:
+    columns, indexes, constraints = _valid_agent_scope_snapshot()
+    del columns["data_assets"]
+    with pytest.raises(RuntimeError, match="columns"):
+        runtime._validate_agent_scope_snapshot(
+            columns,
+            indexes=indexes,
+            constraints=constraints,
+        )
+
+    columns, indexes, constraints = _valid_agent_scope_snapshot()
+    constraints["fk_data_sources_owner_agent_tenant"]["delete_action"] = "c"
+    with pytest.raises(RuntimeError, match="RESTRICT"):
+        runtime._validate_agent_scope_snapshot(
+            columns,
+            indexes=indexes,
+            constraints=constraints,
+        )
+
+    columns, indexes, constraints = _valid_agent_scope_snapshot()
+    indexes.remove("ix_data_assets_owner_agent_id")
+    with pytest.raises(RuntimeError, match="indexes"):
+        runtime._validate_agent_scope_snapshot(
+            columns,
+            indexes=indexes,
+            constraints=constraints,
+        )
 
 
 def test_catalog_scope_tables_compile_for_postgresql() -> None:

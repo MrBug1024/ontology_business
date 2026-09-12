@@ -57,7 +57,7 @@ from .services import (
     invitation_delivery_service,
     system_account_service,
 )
-from .services.auth_request_security import CookieOriginMiddleware
+from .services.auth_request_security import CookieOriginMiddleware, allowed_cookie_origins
 
 
 logger = logging.getLogger(__name__)
@@ -256,7 +256,7 @@ app.add_middleware(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=sorted(allowed_cookie_origins(settings)),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

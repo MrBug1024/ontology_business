@@ -76,6 +76,13 @@ class Settings(BaseSettings):
     ocr_language: str = Field(default="", max_length=64)
     ocr_timeout_seconds: float = Field(default=600.0, ge=1.0, le=600.0)
 
+    # Optional server-owned web research adapter. Results are read-only
+    # evidence and never become formal model definitions automatically.
+    assistant_research_enabled: bool = False
+    assistant_research_endpoint: str = Field(default="", max_length=2048)
+    assistant_research_allowed_hosts: str = Field(default="", max_length=4096)
+    assistant_research_timeout_seconds: float = Field(default=20.0, ge=1.0, le=60.0)
+
     # Agent runtime
     max_tool_rounds: int = 20
     max_query_rows: int = 200

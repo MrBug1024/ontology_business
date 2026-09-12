@@ -671,6 +671,20 @@ class DataSource(Base):
             "resource_scope IN ('modeling', 'agent_runtime')",
             name="ck_data_sources_resource_scope",
         ),
+        # Agent runtime connectors are the only tenant-owned DataSource rows.
+        # A NULL owner is retained for shared platform buckets (including the
+        # external-upload bucket), while a non-NULL owner must be explicitly
+        # classified as agent_runtime and carry a tenant for the composite FK.
+        CheckConstraint(
+            "owner_agent_id IS NULL OR (tenant_id IS NOT NULL AND resource_scope = 'agent_runtime')",
+            name="ck_data_sources_owner_scope",
+        ),
+        ForeignKeyConstraint(
+            ["owner_agent_id", "tenant_id"],
+            ["agents.id", "agents.tenant_id"],
+            name="fk_data_sources_owner_agent_tenant",
+            ondelete="RESTRICT",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -687,7 +701,7 @@ class DataSource(Base):
         String(20), nullable=False, default="modeling", server_default="modeling"
     )
     owner_agent_id: Mapped[str | None] = mapped_column(
-        ForeignKey("agents.id", ondelete="CASCADE"), index=True, nullable=True
+        String(32), index=True, nullable=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     type: Mapped[str] = mapped_column(String(30), nullable=False)  # postgres / file_bucket / dataset
@@ -3204,6 +3218,12 @@ class DataAsset(Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "key", name="uq_data_assets_tenant_key"),
         UniqueConstraint("id", "tenant_id", name="uq_data_assets_id_tenant"),
+        ForeignKeyConstraint(
+            ["owner_agent_id", "tenant_id"],
+            ["agents.id", "agents.tenant_id"],
+            name="fk_data_assets_owner_agent_tenant",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint(
             "kind IN ('file', 'stream', 'api', 'database', 'generated', 'other')",
             name="ck_data_assets_kind",
@@ -3223,6 +3243,11 @@ class DataAsset(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str] = mapped_column(
         ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # NULL keeps legacy tenant-owned assets compatible; scoped uploads are
+    # claimed and checked by the Agent attachment boundary.
+    owner_agent_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
     )
     key: Mapped[str] = mapped_column(String(180), nullable=False)
     name: Mapped[str] = mapped_column(String(300), nullable=False)
@@ -3365,6 +3390,12 @@ class ManagedUploadRun(Base):
         ),
         UniqueConstraint("id", "tenant_id", name="uq_managed_upload_runs_id_tenant"),
         ForeignKeyConstraint(
+            ["owner_agent_id", "tenant_id"],
+            ["agents.id", "agents.tenant_id"],
+            name="fk_managed_upload_runs_owner_agent_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
             ["requested_by_user_id"],
             ["users.id"],
             name="fk_managed_upload_runs_user",
@@ -3452,6 +3483,9 @@ class ManagedUploadRun(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     tenant_id: Mapped[str] = mapped_column(
         ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    owner_agent_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
     )
     requested_by_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True

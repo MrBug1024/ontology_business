@@ -66,6 +66,8 @@ from ..schemas import (
 )
 from ..services import (
     assistant_orchestrator,
+    assistant_decision_gate,
+    assistant_research_service,
     assistant_compilation_job_service,
     assistant_request_run_service,
     assistant_compilation_stream_service,
@@ -4330,6 +4332,11 @@ def _finalize_compilation_success(
                 data,
                 task_id=continuation_task_id,
             )
+        # The compiler produces evidence and unresolved records; this
+        # deterministic gate decides whether the result can be treated as a
+        # formal working-model change, needs clarification, or must remain in
+        # candidate review. It never publishes or bypasses confirmation.
+        data = assistant_decision_gate.attach_decision_gate(data)
         inert_salvage = _is_inert_compilation_salvage(data)
         proposal = _build_proposal("scenario_model", data, scenario)
         if continuation_proposal_id:
@@ -5093,6 +5100,7 @@ def _run_compilation_job_in_background(
                 "resolution_hint": "请基于本轮草稿继续发送修正要求。",
             })
             data["unresolved"] = unresolved
+        data = assistant_decision_gate.attach_decision_gate(data)
         record_compilation_checkpoint(
             data,
             "已将当前可验证结果同步到场景草稿，正在生成本轮总结。",
@@ -5103,14 +5111,26 @@ def _run_compilation_job_in_background(
             scenario_model_compiler._model_task_definition(task_scope)
             if task_scope else None
         )
-        reply = (
-            f"「{task_definition['title']}」的候选草稿已生成。请先核对并确认本任务；"
-            "后续任务尚未生成，内容身份、有界引用片段和已确认定义会保留，等待你继续。"
-            if task_definition is not None
-            else "已根据业务资料生成并持久化本轮完整业务模型的待审核草稿；"
-            "这不代表正式定义已经应用。任务需要逐项确认，不能安全写入的候选保持停用，"
-            "具体缺口在最终总结中按根因合并。"
-        )
+        gate_mode = str((data.get("decision_gate") or {}).get("mode") or "")
+        if gate_mode == "clarify":
+            reply = (
+                "我已完成资料分析，但发现会影响业务含义的关键歧义。"
+                "请先回答建模决策卡中的问题；相关资源会保持为可追溯草稿，"
+                "不会被静默写入正式模型。"
+            )
+        elif gate_mode == "candidate_review":
+            reply = (
+                "我已完成证据覆盖和结构校验；涉及副作用或外部事实的定义将保留为候选，"
+                "安全的工作模型仍可在确认后继续建设。"
+            )
+        else:
+            reply = (
+                f"「{task_definition['title']}」的资料和证据校验已完成，可在确认后直接建设正式工作模型；"
+                "后续任务尚未生成，内容身份、有界引用片段和已确认定义会保留，等待你继续。"
+                if task_definition is not None
+                else "资料和证据校验已完成；安全资源可在确认后直接建设正式工作模型，"
+                "高风险或不完整资源仍会保留在候选区并要求人工审核。"
+            )
         final_thinking = [{
                 "id": "scenario-model",
                 "title": "编译完整业务模型",
@@ -6442,12 +6462,17 @@ def _assistant_evidence(
     if preview:
         tools.append({"name": "action_preview", "status": "completed", "purpose": "参数、权限与副作用预演"})
     confidence = 0.9 if preview else 0.78 if proposal else 0.7 if llm_used else 1.0
-    return {
+    evidence = {
         "rules_used": [{"id": key, "name": key, "result": detail}],
         "tools_called": tools,
         "confidence": confidence,
         "uncertainties": [str(item)[:500] for item in (uncertainties or [])],
     }
+    if isinstance(proposal, dict) and isinstance(proposal.get("payload"), dict):
+        gate = proposal["payload"].get("decision_gate")
+        if isinstance(gate, dict):
+            evidence["decision_gate"] = copy.deepcopy(gate)
+    return evidence
 
 
 def _assistant_action_preview(
@@ -8323,6 +8348,26 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield done_event
                 yield _sse("action_preview", action_preview)
                 yield _sse("token", reply)
+            elif intent == "research":
+                try:
+                    research = assistant_research_service.search(payload.message)
+                    research_sources = research.get("sources") or []
+                    sources.extend(research_sources)
+                    reply = (
+                        f"已完成受治理的行业知识检索，返回 {len(research_sources)} 条带时间和来源的只读证据。"
+                        "这些资料不会自动写入本体或运行配置；如需建模，请确认后再把结论纳入场景资料。"
+                    )
+                    yield progress({"id": "research", "title": "检索行业知识", "detail": reply, "status": "done"})
+                except assistant_research_service.ResearchUnavailable as exc:
+                    reply = f"当前无法进行联网检索：{exc}。你可以先提供行业资料附件，我会基于可追溯附件继续分析。"
+                    questions.append({
+                        "id": "research-config",
+                        "title": "需要配置受治理的检索来源",
+                        "message": reply,
+                        "options": [{"label": "改用附件资料", "value": "use_attachments", "impact": "仅使用当前账号有权访问的资料，不进行联网检索。", "recommended": True}],
+                    })
+                    yield progress({"id": "research", "title": "检索行业知识", "detail": reply, "status": "done"})
+                yield _sse("token", reply)
             elif intent in ("ontology", "mapping", "workflow", "scenario_model") and not scenario:
                 questions.append({
                     "id": "scenario",
@@ -9085,6 +9130,23 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             data = _generate_scenario_draft(db, description)
             proposal = _build_proposal("scenario", data)
             reply = "我已根据你的说明和已授权建模资料生成业务场景草稿。会话附件不会成为建模来源；确认前不会创建场景。"
+        elif intent == "research":
+            try:
+                research = assistant_research_service.search(payload.message)
+                research_sources = research.get("sources") or []
+                sources.extend(research_sources)
+                reply = (
+                    f"已完成受治理的行业知识检索，返回 {len(research_sources)} 条带时间和来源的只读证据。"
+                    "这些资料不会自动写入本体或运行配置；如需建模，请确认后再把结论纳入场景资料。"
+                )
+            except assistant_research_service.ResearchUnavailable as exc:
+                reply = f"当前无法进行联网检索：{exc}。你可以先提供行业资料附件，我会基于可追溯附件继续分析。"
+                questions.append({
+                    "id": "research-config",
+                    "title": "需要配置受治理的检索来源",
+                    "message": reply,
+                    "options": [{"label": "改用附件资料", "value": "use_attachments", "impact": "仅使用当前账号有权访问的资料，不进行联网检索。", "recommended": True}],
+                })
         elif intent == "scenario_model" and scenario:
             # Persist the conversation parent before the unique job insert.
             # A duplicate fingerprint intentionally rolls back its failed

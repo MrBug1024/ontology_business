@@ -103,19 +103,39 @@ def require_legacy_chat_readiness(
         )
 
 
-def _lock_active_scenario(db: Session, agent: Agent) -> None:
-    if not agent.scenario_id:
-        return
-    scenario = db.scalar(
-        select(BusinessScenario)
-        .where(
-            BusinessScenario.id == agent.scenario_id,
-            BusinessScenario.tenant_id == agent.tenant_id,
+def _lock_active_scenario(db: Session, agent: Agent) -> Agent:
+    """Acquire the enqueue fence in scenario -> Agent order.
+
+    Agent deletion and scenario purge use the Agent row as the ownership
+    boundary.  Locking the scenario first keeps this entry point consistent
+    with the other scenario-scoped writers; the refreshed Agent row then
+    prevents a delete or rebinding from passing between authorization and the
+    attachment/turn inserts.
+    """
+    if agent.scenario_id:
+        scenario = db.scalar(
+            select(BusinessScenario)
+            .where(
+                BusinessScenario.id == agent.scenario_id,
+                BusinessScenario.tenant_id == agent.tenant_id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
         )
+        if scenario is None or scenario.status == "retired":
+            raise AgentTurnError("scenario_unavailable", "Agent 所属业务场景已不可用")
+    locked_agent = db.scalar(
+        select(Agent)
+        .where(
+            Agent.id == agent.id,
+            Agent.tenant_id == agent.tenant_id,
+        )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
-    if scenario is None or scenario.status == "retired":
-        raise AgentTurnError("scenario_unavailable", "Agent 所属业务场景已不可用")
+    if locked_agent is None or locked_agent.scenario_id != agent.scenario_id:
+        raise AgentTurnError("agent_unavailable", "Agent 不存在")
+    return locked_agent
 
 
 def _owned_conversation(
@@ -176,6 +196,7 @@ def enqueue_turn(
 ) -> dict[str, Any]:
     principal = permission_service.require_principal(db)
     agent = _require_agent(db, agent_id)
+    agent = _lock_active_scenario(db, agent)
     idempotency_key = str(payload.idempotency_key or "").strip()
     if not idempotency_key:
         raise AgentTurnError(
@@ -202,8 +223,12 @@ def enqueue_turn(
             raise AgentTurnConflict("同一幂等键不能提交不同的 Agent Turn 请求")
         return _public_run(existing)
 
-    _validate_attachment_scope(db, payload, user_id=principal.user_id)
-    _lock_active_scenario(db, agent)
+    _validate_attachment_scope(
+        db,
+        payload,
+        user_id=principal.user_id,
+        agent_id=agent.id,
+    )
     conversation = (
         _owned_conversation(
             db,
@@ -307,8 +332,15 @@ def _owned_run(db: Session, run_id: str, *, writable: bool = False) -> AgentTurn
     )
     if run is None:
         raise AgentTurnError("agent_turn_unavailable", "Agent Turn 不存在", status_code=404)
-    if run.agent_id:
-        _require_agent(db, run.agent_id, active_runtime=writable)
+    # Agent cleanup deliberately retains a redacted/ detached execution row
+    # as internal audit state.  It is no longer a user-visible Turn: allowing
+    # a request that only knows the old run id to pass on tenant/user ownership
+    # would bypass the deleted Agent's scenario ACL and could expose its old
+    # result or event log.  Internal audit readers must use a separate,
+    # explicitly governed path rather than this public compatibility facade.
+    if not run.agent_id:
+        raise AgentTurnError("agent_turn_unavailable", "Agent Turn 不存在", status_code=404)
+    _require_agent(db, run.agent_id, active_runtime=writable)
     return run
 
 

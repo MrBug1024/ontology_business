@@ -5,13 +5,20 @@ from contextlib import nullcontext
 from urllib.parse import quote
 import uuid
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..models import BucketFile, DataSource
+from ..models import (
+    Agent,
+    BucketFile,
+    DataAsset,
+    DataAssetVersion,
+    DataSource,
+    ManagedUploadRun,
+)
 from ..schemas import (
     BucketFileOut,
     DataSourceIn,
@@ -33,6 +40,7 @@ from ..services import (
     object_storage_service,
     permission_service,
     rag_service,
+    managed_attachment_access,
     scenario_model_draft_service,
     template_catalog_service,
     tenant_service,
@@ -124,7 +132,13 @@ def _can_access_data_source(db: Session, ds: DataSource, *, writable: bool = Fal
     return True
 
 
-def _data_source(db: Session, ds_id: str, writable: bool = False) -> DataSource:
+def _data_source(
+    db: Session,
+    ds_id: str,
+    writable: bool = False,
+    *,
+    allow_runtime: bool = False,
+) -> DataSource:
     if writable:
         ds = db.scalar(
             select(DataSource)
@@ -139,7 +153,229 @@ def _data_source(db: Session, ds_id: str, writable: bool = False) -> DataSource:
             raise HTTPException(404, "数据源不存在")
     else:
         ds = tenant_service.require_visible(db, DataSource, ds_id, "数据源不存在")
+    # Runtime connectors are an Agent execution boundary, not modeling
+    # material.  Only the scoped file helper below may open one; keeping this
+    # default closed prevents guessed ids from turning legacy tables/query/RAG
+    # endpoints into a second Agent data path.
+    if ds.resource_scope == "agent_runtime" and not allow_runtime:
+        raise HTTPException(404, "数据源不存在")
     return _require_data_source_access(db, ds, writable=writable)
+
+
+def _file_ownership(
+    db: Session,
+    bucket_file: BucketFile,
+) -> tuple[set[str], bool, bool]:
+    """Return durable Agent owners and whether the file is a tombstone.
+
+    The external upload bucket is intentionally shared, so its DataSource
+    owner is NULL.  Ownership lives on the catalog asset and upload run; every
+    file endpoint must inspect those rows instead of trusting the bucket.
+    Multiple distinct owners or a deleted lifecycle are treated fail-closed.
+    """
+
+    source = db.get(DataSource, bucket_file.data_source_id)
+    if source is None:
+        return set(), True, False
+    owner_ids: set[str] = set()
+    tombstoned = False
+    private_purpose = False
+    versions = db.execute(
+        select(DataAsset.owner_agent_id, DataAsset.lifecycle_status, DataAsset.labels)
+        .join(DataAssetVersion, DataAssetVersion.asset_id == DataAsset.id)
+        .where(
+            DataAssetVersion.bucket_file_id == bucket_file.id,
+            DataAssetVersion.bucket_data_source_id == source.id,
+            DataAsset.tenant_id == source.tenant_id,
+        )
+    ).all()
+    for owner_agent_id, lifecycle_status, labels in versions:
+        if owner_agent_id:
+            owner_ids.add(str(owner_agent_id))
+        if (
+            isinstance(labels, dict)
+            and str(labels.get("catalog_purpose") or "").strip().lower()
+            in managed_attachment_access.AGENT_PRIVATE_PURPOSES
+        ):
+            private_purpose = True
+        if lifecycle_status == "retired" or (
+            isinstance(labels, dict) and labels.get("lifecycle") == "agent_deleted"
+        ):
+            # A retired modeling asset can still be an audit reference, but an
+            # Agent-deletion tombstone must never become readable again.
+            if isinstance(labels, dict) and labels.get("lifecycle") == "agent_deleted":
+                tombstoned = True
+
+    runs = db.scalars(
+        select(ManagedUploadRun).where(
+            ManagedUploadRun.bucket_file_id == bucket_file.id,
+            ManagedUploadRun.data_source_id == source.id,
+            ManagedUploadRun.tenant_id == source.tenant_id,
+        )
+    ).all()
+    for run in runs:
+        if run.owner_agent_id:
+            owner_ids.add(str(run.owner_agent_id))
+        if (
+            str(run.purpose or "").strip().lower()
+            in managed_attachment_access.AGENT_PRIVATE_PURPOSES
+        ):
+            private_purpose = True
+        if run.error_code == "agent_deleted":
+            tombstoned = True
+    return owner_ids, tombstoned, private_purpose
+
+
+def _agent_for_file_scope(
+    db: Session,
+    source: DataSource,
+    *,
+    agent_id: str | None,
+) -> Agent | None:
+    """Validate an explicit Agent context without revealing cross-scope rows."""
+
+    requested = str(agent_id or "").strip() or None
+    if requested and len(requested) > 32:
+        raise HTTPException(404, "文件不存在")
+    if requested is None:
+        return None
+    tenant_id = tenant_service.current_tenant_id(db)
+    agent = db.scalar(
+        select(Agent).where(
+            Agent.id == requested,
+            Agent.tenant_id == tenant_id,
+        )
+    )
+    if agent is None or source.tenant_id != tenant_id:
+        raise HTTPException(404, "文件不存在")
+    if source.scenario_id and source.scenario_id != agent.scenario_id:
+        raise HTTPException(404, "文件不存在")
+    # A valid Agent id is not itself an ACL grant.  The shared external upload
+    # bucket has no scenario id, so this explicit check is the only place the
+    # file URL can inherit the Agent's scenario authorization before the
+    # per-file ownership check runs.
+    if agent.scenario_id:
+        scenario = tenant_service.require_scenario(db, agent.scenario_id)
+        permission_service.require_scenario_permission(
+            db,
+            scenario,
+            "read",
+            message="没有该 Agent 所属业务场景的权限",
+        )
+    else:
+        permission_service.require_tenant_permission(db, "read")
+    return agent
+
+
+def _authorize_file_scope(
+    db: Session,
+    bucket_file: BucketFile,
+    *,
+    agent_id: str | None = None,
+    writable: bool = False,
+) -> DataSource:
+    """Authorize a file and its transitive Agent ownership.
+
+    Agent-owned catalog files in the shared external bucket require the exact
+    Agent id.  Ownerless global files remain available to the tenant-level
+    assistant without an Agent id.  Runtime sources with a direct owner always
+    require that same owner, and modeling sources retain their ACL behavior.
+    """
+
+    source = db.get(DataSource, bucket_file.data_source_id)
+    if source is None or source.type != "file_bucket":
+        raise HTTPException(404, "文件不存在")
+    requested = str(agent_id or "").strip() or None
+    agent = _agent_for_file_scope(db, source, agent_id=requested)
+    owner_ids, tombstoned, private_purpose = _file_ownership(db, bucket_file)
+    if tombstoned:
+        raise HTTPException(404, "文件不存在")
+    source_owner = str(source.owner_agent_id or "").strip() or None
+    if source_owner:
+        owner_ids.add(source_owner)
+    if private_purpose and (
+        len(owner_ids) != 1 or requested not in owner_ids
+    ):
+        # Private upload purposes never inherit the tenant-wide ownerless
+        # compatibility namespace, even when a legacy row lost its owner.
+        raise HTTPException(404, "文件不存在")
+    if owner_ids:
+        # A file must have one unambiguous owner.  This also prevents a shared
+        # or malformed row from being used as a bridge between Agents.
+        if len(owner_ids) != 1 or requested not in owner_ids:
+            raise HTTPException(404, "文件不存在")
+    elif source.resource_scope == "agent_runtime":
+        # Runtime sources are not a public modeling namespace.  The only
+        # ownerless exception is the tenant-level external upload bucket used
+        # by the Global Assistant (scenario_id is NULL).
+        if source.scenario_id is not None or requested is not None:
+            raise HTTPException(404, "文件不存在")
+    elif agent is not None:
+        # A scoped URL for a modeling file still needs a real Agent context;
+        # the source's scenario ACL remains authoritative below.
+        pass
+
+    return _data_source(
+        db,
+        source.id,
+        writable=writable,
+        allow_runtime=True,
+    )
+
+
+def _authorize_source_scope(
+    db: Session,
+    source: DataSource,
+    *,
+    agent_id: str | None = None,
+    writable: bool = False,
+) -> DataSource:
+    """Authorize a whole file bucket before listing or accepting files."""
+
+    requested = str(agent_id or "").strip() or None
+    if requested:
+        _agent_for_file_scope(db, source, agent_id=requested)
+    if source.resource_scope == "agent_runtime":
+        source_owner = str(source.owner_agent_id or "").strip() or None
+        if requested is None or (source_owner and source_owner != requested):
+            raise HTTPException(404, "数据源不存在")
+    return _data_source(
+        db,
+        source.id,
+        writable=writable,
+        allow_runtime=True,
+    )
+
+
+def _file_visible_in_scope(
+    db: Session,
+    bucket_file: BucketFile,
+    *,
+    agent_id: str | None,
+) -> bool:
+    try:
+        _authorize_file_scope(db, bucket_file, agent_id=agent_id)
+    except HTTPException:
+        return False
+    return True
+
+
+def _file_source_for_request(
+    db: Session,
+    bucket_file: BucketFile,
+    *,
+    agent_id: str | None = None,
+) -> DataSource:
+    """Resolve a file's source while preserving Agent attachment isolation.
+
+    Modeling files intentionally keep the legacy tenant/scenario ACL path, so
+    old links without ``agent_id`` remain valid.  Agent runtime sources are a
+    different security domain: they are private to their owning Agent and
+    therefore require an explicit, existing Agent context.  The scope check is
+    performed before the normal ACL lookup so a caller cannot use a scenario
+    permission error as an oracle for another Agent's file.
+    """
+    return _authorize_file_scope(db, bucket_file, agent_id=agent_id)
 
 
 @router.get("", response_model=list[DataSourceOut])
@@ -413,6 +649,11 @@ def search_documents(payload: DocumentSearchIn, db: Session = Depends(get_tenant
         permission_service.require_scenario_permission(db, scenario, "read")
     stmt = select(DataSource).where(
         DataSource.type == "file_bucket",
+        # Agent runtime attachments are a separate, owner-scoped execution
+        # namespace.  The generic modeling search endpoint has no Agent
+        # context, so never hand runtime source ids to RAG (even when a caller
+        # guesses a valid tenant-local id).
+        DataSource.resource_scope == "modeling",
         tenant_service.visible_clause(DataSource, db),
     )
     if payload.data_source_ids:
@@ -460,24 +701,48 @@ def reindex_files(ds_id: str, db: Session = Depends(get_tenant_db)):
 
 
 @router.get("/{ds_id}/files", response_model=list[BucketFileOut])
-def list_files(ds_id: str, db: Session = Depends(get_tenant_db)):
-    ds = _data_source(db, ds_id)
+def list_files(
+    ds_id: str,
+    agent_id: str | None = Query(default=None, min_length=1, max_length=32),
+    db: Session = Depends(get_tenant_db),
+):
+    observed = db.get(DataSource, ds_id)
+    if observed is None:
+        raise HTTPException(404, "数据源不存在")
+    ds = _authorize_source_scope(db, observed, agent_id=agent_id)
     if ds.type != "file_bucket":
         return []
-    refs = modeling_contract_source_service.refs_for_bucket_files(db, ds, list(ds.files))
-    for item in ds.files:
+    files = [
+        item
+        for item in ds.files
+        if _file_visible_in_scope(db, item, agent_id=agent_id)
+    ]
+    refs = modeling_contract_source_service.refs_for_bucket_files(db, ds, files)
+    for item in files:
         ref = refs.get(item.id)
         if ref is not None:
             item.modeling_contract_dataset_id = ref.dataset_id
             item.modeling_contract_schema_id = ref.schema_id
-    return list(ds.files)
+    return files
 
 
 @router.post("/{ds_id}/files", response_model=list[BucketFileOut])
-async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Session = Depends(get_tenant_db)):
-    ds = _data_source(db, ds_id, writable=True)
+async def upload_files(
+    ds_id: str,
+    files: list[UploadFile] = File(...),
+    agent_id: str | None = Query(default=None, min_length=1, max_length=32),
+    db: Session = Depends(get_tenant_db),
+):
+    observed = db.get(DataSource, ds_id)
+    if observed is None:
+        raise HTTPException(404, "数据源不存在")
+    ds = _authorize_source_scope(db, observed, agent_id=agent_id, writable=True)
     if ds.type != "file_bucket":
         raise HTTPException(400, "该数据源不是文件桶")
+    if ds.resource_scope == "agent_runtime":
+        # Runtime attachments must go through the catalog upload protocol so
+        # the resulting DataAsset and upload run receive the exact Agent owner.
+        raise HTTPException(409, "验证附件请使用 Agent 附件上传入口")
     created: list[BucketFile] = []
     settings = get_settings()
     for uf in files:
@@ -618,11 +883,21 @@ async def upload_files(ds_id: str, files: list[UploadFile] = File(...), db: Sess
 
 
 @router.post("/files/{file_id}/reparse", response_model=BucketFileOut)
-def reparse_file(file_id: str, db: Session = Depends(get_tenant_db)):
+def reparse_file(
+    file_id: str,
+    agent_id: str | None = Query(default=None, min_length=1, max_length=32),
+    db: Session = Depends(get_tenant_db),
+):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
-    source = _data_source(db, bf.data_source_id, writable=True)
+    source = _authorize_file_scope(db, bf, agent_id=agent_id, writable=True)
+    if source.resource_scope == "agent_runtime":
+        # Runtime attachments are catalog-managed immutable inputs.  Letting
+        # this legacy endpoint reparse them can materialize a modeling
+        # contract (and deleting them can bypass asset/run lifecycle fences),
+        # so mutations must use the Agent-scoped catalog APIs.
+        raise HTTPException(status_code=409, detail="验证附件请使用附件数据源管理入口")
     existing_ref = modeling_contract_source_service.refs_for_bucket_files(
         db, source, [bf]
     ).get(bf.id)
@@ -666,21 +941,29 @@ def reparse_file(file_id: str, db: Session = Depends(get_tenant_db)):
 
 
 @router.get("/files/{file_id}/text")
-def file_text(file_id: str, db: Session = Depends(get_tenant_db)):
+def file_text(
+    file_id: str,
+    db: Session = Depends(get_tenant_db),
+    agent_id: str | None = None,
+):
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
-    _data_source(db, bf.data_source_id)
+    _file_source_for_request(db, bf, agent_id=agent_id)
     return {"filename": bf.filename, "text": bf.parsed_text}
 
 
 @router.get("/files/{file_id}/download")
-def file_download(file_id: str, db: Session = Depends(get_tenant_db)):
+def file_download(
+    file_id: str,
+    db: Session = Depends(get_tenant_db),
+    agent_id: str | None = None,
+):
     """下载文件桶中的文件（附件）。"""
     bf = db.get(BucketFile, file_id)
     if not bf:
         raise HTTPException(404, "文件不存在")
-    ds = _data_source(db, bf.data_source_id)
+    ds = _file_source_for_request(db, bf, agent_id=agent_id)
     try:
         content, actual_size, media_type = datasource_service.read_bucket_file(bf, ds)
     except FileNotFoundError as exc:
@@ -702,11 +985,22 @@ def file_download(file_id: str, db: Session = Depends(get_tenant_db)):
 
 
 @router.delete("/files/{file_id}", response_model=Msg)
-def delete_file(file_id: str, db: Session = Depends(get_tenant_db)):
+def delete_file(
+    file_id: str,
+    agent_id: str | None = Query(default=None, min_length=1, max_length=32),
+    db: Session = Depends(get_tenant_db),
+):
     observed = db.get(BucketFile, file_id)
     if not observed:
         raise HTTPException(404, "文件不存在")
-    source = _data_source(db, observed.data_source_id, writable=True)
+    source = _authorize_file_scope(
+        db,
+        observed,
+        agent_id=agent_id,
+        writable=True,
+    )
+    if source.resource_scope == "agent_runtime":
+        raise HTTPException(status_code=409, detail="验证附件请使用附件数据源管理入口")
     bf = db.scalar(
         select(BucketFile)
         .where(

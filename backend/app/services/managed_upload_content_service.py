@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..models import BucketFile, DataSource, ManagedUploadRun
-from . import datasource_service, object_deletion_service, permission_service
+from . import agent_scope_access_service, datasource_service, object_deletion_service
 from .managed_upload_run_contracts import (
     ContentUploadSnapshot,
     ManagedUploadConflict,
@@ -28,16 +28,43 @@ from .managed_upload_run_contracts import (
 CONTENT_RETRY_GRACE_SECONDS = 10
 
 
+def _require_run_write_scope(
+    db: Session,
+    owner_agent_id: str | None,
+    *,
+    lock: bool = False,
+) -> None:
+    try:
+        agent_scope_access_service.require_optional_agent_permission(
+            db,
+            owner_agent_id,
+            "write",
+            lock=lock,
+            message="没有该 Agent 所属业务场景的附件写入权限",
+        )
+    except agent_scope_access_service.AgentScopeNotFoundError as exc:
+        raise ManagedUploadError(
+            "managed_upload_owner_unavailable",
+            "所属 Agent 已删除，附件上传已取消",
+            status_code=409,
+        ) from exc
+
+
 def preflight_content_upload(
     db: Session,
     run_id: str,
     *,
     expected_revision: int,
+    agent_id: str | None = None,
     owned_run: Callable[..., ManagedUploadRun],
 ) -> int:
     """Authorize and bound an upload before the request body is consumed."""
 
-    run = owned_run(db, run_id, writable=True)
+    run = (
+        owned_run(db, run_id, writable=True, agent_id=agent_id)
+        if agent_id is not None
+        else owned_run(db, run_id, writable=True)
+    )
     now = utc_now()
     if run.revision != expected_revision:
         raise ManagedUploadConflict()
@@ -59,9 +86,14 @@ def claim_content_upload(
     run_id: str,
     *,
     expected_revision: int,
+    agent_id: str | None = None,
     owned_run: Callable[..., ManagedUploadRun],
 ) -> UploadLease:
-    run = owned_run(db, run_id, writable=True, lock=True)
+    run = (
+        owned_run(db, run_id, writable=True, lock=True, agent_id=agent_id)
+        if agent_id is not None
+        else owned_run(db, run_id, writable=True, lock=True)
+    )
     now = utc_now()
     if run.revision != expected_revision:
         raise ManagedUploadConflict()
@@ -231,11 +263,10 @@ def store_uploaded_content(
                     "managed_upload_size_mismatch",
                     "文件实际大小与登记值不一致",
                     status_code=422,
-                )
+            )
             db.info["tenant_id"] = run.tenant_id
             db.info["user_id"] = run.requested_by_user_id
-            permission_service.require_principal(db)
-            permission_service.require_tenant_permission(db, "write")
+            _require_run_write_scope(db, run.owner_agent_id)
             source = db.scalar(
                 select(DataSource).where(
                     DataSource.id == run.data_source_id,
@@ -297,8 +328,17 @@ def store_uploaded_content(
         try:
             db.info["tenant_id"] = snapshot.tenant_id
             db.info["user_id"] = snapshot.user_id
-            permission_service.require_principal(db)
-            permission_service.require_tenant_permission(db, "write")
+            owner_agent_id = db.scalar(
+                select(ManagedUploadRun.owner_agent_id).where(
+                    ManagedUploadRun.id == run_id,
+                    ManagedUploadRun.tenant_id == snapshot.tenant_id,
+                )
+            )
+            _require_run_write_scope(
+                db,
+                owner_agent_id,
+                lock=bool(owner_agent_id),
+            )
             current = db.scalar(
                 select(ManagedUploadRun)
                 .where(
@@ -318,6 +358,7 @@ def store_uploaded_content(
                 current is None
                 or source is None
                 or not lease_matches(current, lease, as_of=utc_now())
+                or str(current.owner_agent_id or "") != str(owner_agent_id or "")
             ):
                 raise ManagedUploadConflict("上传任务租约已失效")
             bucket_file.status = "pending"

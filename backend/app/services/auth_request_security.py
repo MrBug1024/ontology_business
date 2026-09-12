@@ -72,7 +72,37 @@ def _origin(value: str) -> str:
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
         return ""
-    return f"{parsed.scheme}://{parsed.netloc}".lower()
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if not hostname:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    default_port = (parsed.scheme == "http" and port == 80) or (parsed.scheme == "https" and port == 443)
+    host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+    return f"{parsed.scheme.lower()}://{host}{f':{port}' if port and not default_port else ''}"
+
+
+def allowed_cookie_origins(settings, request: Request | None = None) -> set[str]:
+    """Return explicitly configured origins accepted for cookie writes.
+
+    ``PUBLIC_APP_URL`` identifies the deployed frontend, while ``CORS_ORIGINS``
+    commonly contains local aliases such as localhost and 127.0.0.1.  Both are
+    valid client origins; treating the public URL as a replacement for CORS
+    origins caused local login to fail after a deployment setting was added.
+    The request base URL is trusted only for the in-process ``testserver``
+    fixture; real loopback client origins must still be explicitly configured.
+    """
+    expected = {_origin(settings.public_app_url)}
+    expected.update(_origin(origin) for origin in settings.cors_origins)
+    if request is not None:
+        base_origin = _origin(str(request.base_url))
+        base_hostname = urlsplit(base_origin).hostname if base_origin else None
+        if base_hostname == "testserver":
+            expected.add(base_origin)
+    expected.discard("")
+    return expected
 
 
 class CookieOriginMiddleware:
@@ -85,10 +115,7 @@ class CookieOriginMiddleware:
             settings = get_settings()
             if request.cookies.get(settings.auth_cookie_name):
                 source = request.headers.get("origin") or request.headers.get("referer", "")
-                expected = {_origin(settings.public_app_url)} if settings.public_app_url else {
-                    _origin(str(request.base_url)), *(_origin(origin) for origin in settings.cors_origins)
-                }
-                expected.discard("")
+                expected = allowed_cookie_origins(settings, request)
                 if not _origin(source) or _origin(source) not in expected:
                     await JSONResponse({"detail": "请求来源无效，请从平台页面重新操作"}, status_code=403)(scope, receive, send)
                     return

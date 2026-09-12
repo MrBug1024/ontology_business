@@ -25,6 +25,7 @@ from app.services import auth_service, permission_service, system_account_servic
 from app.services import workspace_invitation_service as invitations
 from app.services import invitation_delivery_service as delivery
 from app.services.auth_request_security import CookieOriginMiddleware, consume_limit
+from app.services import auth_request_security
 from .access_fixtures import seed_access
 
 
@@ -218,6 +219,29 @@ def test_auth_rate_limit_persists_attempts_between_sessions(access_db):
             consume_limit(other, "synthetic:login", maximum=1, seconds=60)
         assert error.value.status_code == 429
     assert db.scalar(select(AuthRateLimit.attempts)) == 2
+
+
+def test_cookie_origin_accepts_cors_alias_when_public_app_url_is_configured(monkeypatch):
+    settings = SimpleNamespace(
+        auth_cookie_name="ontology_session",
+        public_app_url="http://127.0.0.1:5173",
+        cors_origins=["http://localhost:5173"],
+    )
+    monkeypatch.setattr(auth_request_security, "get_settings", lambda: settings)
+    app = FastAPI()
+    app.add_middleware(CookieOriginMiddleware)
+
+    @app.post("/write")
+    def write():
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        client.cookies.set("ontology_session", "synthetic")
+        accepted = client.post("/write", headers={"Origin": "http://localhost:5173"})
+        rejected = client.post("/write", headers={"Origin": "https://foreign.example"})
+
+    assert accepted.status_code == 200
+    assert rejected.status_code == 403
 
 
 def test_switch_rotates_session_and_csrf_rejects_cross_origin_writes(access_db, monkeypatch):

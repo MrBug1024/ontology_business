@@ -247,6 +247,33 @@ class RagRuntimeTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             rag_service.search(self.db, [self.foreign_source.id], "机密")
 
+    def test_search_excludes_agent_runtime_sources_even_with_a_guessed_source_id(self) -> None:
+        """Generic RAG has no Agent context and must never read runtime attachments."""
+
+        runtime_source = DataSource(
+            id="source-runtime-a",
+            tenant_id=self.tenant_a.id,
+            resource_scope="agent_runtime",
+            type="file_bucket",
+            name="Agent runtime uploads",
+            config={},
+        )
+        runtime_file = self._file(
+            "file-runtime-a",
+            runtime_source.id,
+            "private-agent.txt",
+            "运行时附件中的跨 Agent 私密词",
+        )
+        self.db.add_all([runtime_source, runtime_file])
+        self.db.flush()
+        rag_service.index_file(self.db, runtime_file)
+        self.db.commit()
+
+        self.assertEqual(
+            rag_service.search(self.db, [runtime_source.id], "私密词"),
+            [],
+        )
+
     def test_index_uses_configured_embedding_runtime_when_available(self) -> None:
         runtime_config = LLMConfig(
             id="embedding-runtime",

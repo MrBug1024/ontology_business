@@ -214,6 +214,27 @@
                   @click="toggleProposal(index)"
                 >{{ expandedProposal[index] ? '收起详情' : proposalOf(message)?.kind === 'scenario_model' ? '查看建模产物' : '查看详情' }}</button>
               </div>
+              <section v-if="proposalOf(message)?.kind === 'scenario_model' && decisionGateOf(proposalOf(message))" class="assistant-decision-gate" aria-label="智能顾问建模决策">
+                <header>
+                  <div>
+                    <span class="eyebrow">建模决策</span>
+                    <strong>{{ decisionGateLabel(decisionGateOf(proposalOf(message))) }}</strong>
+                  </div>
+                  <el-tag size="small" effect="plain" :type="decisionGateType(decisionGateOf(proposalOf(message)))">{{ decisionGateModeLabel(decisionGateOf(proposalOf(message))) }}</el-tag>
+                </header>
+                <p>{{ decisionGateOf(proposalOf(message))?.explanation }}</p>
+                <div v-if="decisionGateOf(proposalOf(message))?.evidence_coverage" class="decision-gate-metrics">
+                  <span>证据覆盖 {{ decisionGateOf(proposalOf(message))?.evidence_coverage?.modeled || 0 }}/{{ decisionGateOf(proposalOf(message))?.evidence_coverage?.total || 0 }}</span>
+                  <span v-if="decisionGateOf(proposalOf(message))?.blocking_question_count">关键问题 {{ decisionGateOf(proposalOf(message))?.blocking_question_count }}</span>
+                  <span v-if="decisionGateOf(proposalOf(message))?.risk_codes?.length">风险项 {{ decisionGateOf(proposalOf(message))?.risk_codes?.length }}</span>
+                </div>
+                <div v-if="decisionGateOf(proposalOf(message))?.questions?.length" class="decision-gate-questions">
+                  <strong>先与顾问对齐：</strong>
+                  <ul>
+                    <li v-for="question in decisionGateOf(proposalOf(message))?.questions" :key="`${question.code}-${question.message}`">{{ question.message }}<small v-if="question.resolution_hint">{{ question.resolution_hint }}</small></li>
+                  </ul>
+                </div>
+              </section>
               <section
                 v-if="modelTasks(proposalOf(message)).length && Boolean(expandedProposal[index])"
                 class="model-task-plan"
@@ -599,7 +620,7 @@ import { isNavigationFailure, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamAssistantChat, streamAssistantCompilationJob } from '@/api'
 import { useAuthStore } from '@/stores/auth'
-import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationActivity, AssistantCompilationJobStatus, AssistantCompilationLiveness, AssistantCompilationStep, AssistantMessage, AssistantModelExecutionSummary, AssistantModelNextAction, AssistantModelTask, AssistantProposal, AssistantProposalApplyResult, AssistantQuestion, AssistantRequestRun, AssistantSource, AssistantThread, AssistantThought, LLMConfig, MCPConfig, Skill } from '@/types'
+import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationActivity, AssistantCompilationJobStatus, AssistantCompilationLiveness, AssistantCompilationStep, AssistantDecisionGate, AssistantMessage, AssistantModelExecutionSummary, AssistantModelNextAction, AssistantModelTask, AssistantProposal, AssistantProposalApplyResult, AssistantQuestion, AssistantRequestRun, AssistantSource, AssistantThread, AssistantThought, LLMConfig, MCPConfig, Skill } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import {
@@ -2465,6 +2486,32 @@ function finishStream(ai: AssistantMessage) {
   scrollBottom()
 }
 
+function decisionGateOf(proposal: AssistantProposal | null): AssistantDecisionGate | null {
+  if (proposal?.kind !== 'scenario_model') return null
+  const gate = proposal.payload?.decision_gate
+  return gate && typeof gate === 'object' && !Array.isArray(gate)
+    ? gate as AssistantDecisionGate
+    : null
+}
+
+function decisionGateModeLabel(gate: AssistantDecisionGate | null) {
+  if (gate?.mode === 'clarify') return '先对齐问题'
+  if (gate?.mode === 'candidate_review') return '人工审核'
+  return '可直接建设'
+}
+
+function decisionGateType(gate: AssistantDecisionGate | null): 'success' | 'warning' | 'info' {
+  if (gate?.mode === 'clarify') return 'warning'
+  if (gate?.mode === 'candidate_review') return 'info'
+  return 'success'
+}
+
+function decisionGateLabel(gate: AssistantDecisionGate | null) {
+  if (gate?.mode === 'clarify') return '发现影响业务含义的关键歧义'
+  if (gate?.mode === 'candidate_review') return '发现副作用或外部事实风险'
+  return '证据覆盖和确定性校验已通过'
+}
+
 async function submitCompilationGuidance(content: string) {
   const job = activeCompilationJob.value
   const scope = compilationThreadScope(compilationRecoveryThreadId.value || threadId.value)
@@ -3276,6 +3323,16 @@ onBeforeUnmount(() => {
 .proposal-summary { margin-top: 4px; color: var(--text-2); font-size: 11.5px; line-height: 1.5; }
 .proposal-preview { display: flex; align-items: center; gap: 10px; padding: 9px 12px; color: var(--text-2); font-size: 11.5px; }
 .is-model-result .proposal-preview { flex-wrap: wrap; padding: 6px 0 0; }
+.assistant-decision-gate { display: grid; gap: 7px; margin: 10px 0 2px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border)); border-radius: 10px; background: color-mix(in srgb, var(--surface-2) 84%, transparent); }
+.assistant-decision-gate header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.assistant-decision-gate header > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.assistant-decision-gate header strong { color: var(--text); font-size: 12px; }
+.assistant-decision-gate p { margin: 0; color: var(--text-2); font-size: 11px; line-height: 1.5; }
+.decision-gate-metrics { display: flex; flex-wrap: wrap; gap: 6px; color: var(--text-3); font-size: 10px; }
+.decision-gate-metrics span { padding: 3px 6px; border-radius: 999px; background: var(--surface); }
+.decision-gate-questions { padding-top: 6px; border-top: 1px dashed var(--border); color: var(--text-2); font-size: 10.5px; line-height: 1.5; }
+.decision-gate-questions ul { display: grid; gap: 4px; margin: 4px 0 0; padding-left: 18px; }
+.decision-gate-questions small { display: block; color: var(--text-3); }
 .preview-toggle { min-height: 28px; margin-left: auto; padding: 3px 0; border: 0; color: var(--primary-600); background: transparent; cursor: pointer; font: inherit; }
 .preview-toggle:hover, .preview-toggle:focus-visible { color: var(--primary); text-decoration: underline; outline: none; text-underline-offset: 3px; }
 .proposal-disclosure { margin: 0 12px 10px; overflow: hidden; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); }

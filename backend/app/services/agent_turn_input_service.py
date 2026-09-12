@@ -142,9 +142,20 @@ def _require_agent(db: Session, agent_id: str, *, active_runtime: bool = True) -
     return agent
 
 
-def _validate_attachment_scope(db: Session, payload: ChatRequest, *, user_id: str) -> None:
+def _validate_attachment_scope(
+    db: Session,
+    payload: ChatRequest,
+    *,
+    user_id: str,
+    agent_id: str | None = None,
+) -> None:
     try:
-        managed_attachment_access.validate_attachments(db, payload.attachments, user_id=user_id)
+        managed_attachment_access.validate_attachments(
+            db,
+            payload.attachments,
+            user_id=user_id,
+            agent_id=agent_id,
+        )
     except managed_attachment_access.AttachmentAccessError as exc:
         if exc.code == "attachment_conflict":
             raise AgentTurnConflict(exc.message) from None
@@ -156,6 +167,7 @@ def _resolve_upload_attachments(
     payload: ChatRequest,
     *,
     user_id: str,
+    agent_id: str | None = None,
 ) -> tuple[ChatRequest | None, int]:
     tenant_id = tenant_service.current_tenant_id(db)
     document = payload.model_dump(mode="json", exclude_none=True)
@@ -167,13 +179,16 @@ def _resolve_upload_attachments(
         if not upload_run_id:
             resolved.append(attachment)
             continue
-        upload = db.scalar(
-            select(ManagedUploadRun).where(
-                ManagedUploadRun.id == upload_run_id,
-                ManagedUploadRun.tenant_id == tenant_id,
-                ManagedUploadRun.requested_by_user_id == user_id,
-            )
+        statement = select(ManagedUploadRun).where(
+            ManagedUploadRun.id == upload_run_id,
+            ManagedUploadRun.tenant_id == tenant_id,
+            ManagedUploadRun.requested_by_user_id == user_id,
         )
+        if agent_id:
+            statement = statement.where(ManagedUploadRun.owner_agent_id == agent_id)
+        else:
+            statement = statement.where(ManagedUploadRun.owner_agent_id.is_(None))
+        upload = db.scalar(statement)
         if upload is None:
             raise AgentTurnError(
                 "attachment_unavailable",
@@ -217,6 +232,11 @@ def _resolve_upload_attachments(
             version is None
             or asset is None
             or asset.tenant_id != tenant_id
+            or (
+                agent_id
+                and asset.owner_agent_id != agent_id
+            )
+            or (not agent_id and asset.owner_agent_id is not None)
             or asset.lifecycle_status != "active"
             or asset.usage_plane != "invocation_input"
         ):
@@ -252,14 +272,22 @@ def _resolve_upload_attachments(
     return ChatRequest.model_validate(document), 0
 
 
-def _table_asset_version_ids(db: Session, payload: ChatRequest) -> list[str]:
+def _table_asset_version_ids(
+    db: Session, payload: ChatRequest, *, agent_id: str | None = None
+) -> list[str]:
     ids = [item.asset_version_id for item in payload.attachments if item.asset_version_id]
     if not ids:
         return []
     versions = {
         item.id: item
         for item in db.scalars(
-            select(DataAssetVersion).where(DataAssetVersion.id.in_(ids))
+            select(DataAssetVersion)
+            .join(DataAsset, DataAsset.id == DataAssetVersion.asset_id)
+            .where(
+                DataAssetVersion.id.in_(ids),
+                DataAssetVersion.tenant_id == tenant_service.current_tenant_id(db),
+                (DataAsset.owner_agent_id == agent_id if agent_id else DataAsset.owner_agent_id.is_(None)),
+            )
         )
     }
     if any(item_id not in versions for item_id in ids):

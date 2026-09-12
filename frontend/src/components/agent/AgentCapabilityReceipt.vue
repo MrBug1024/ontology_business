@@ -14,7 +14,7 @@
     <span v-else-if="loading" role="status">正在读取处理结果</span>
     <p v-if="error" class="receipt-error" role="alert">{{ error }}</p>
     <div class="receipt-files">
-      <a v-for="file in files" :key="file.id" :href="agentCapabilityReceiptApi.artifactDownloadUrl(file.id)" target="_blank" rel="noopener">
+      <a v-for="file in files" :key="file.id" :href="agentCapabilityReceiptApi.artifactDownloadUrl(file.id, agentId)" target="_blank" rel="noopener">
         <el-icon aria-hidden="true"><Document /></el-icon>{{ file.filename }}
       </a>
       <el-button v-if="error" :loading="loading" aria-label="重新读取处理结果" title="重新读取处理结果" @click="refresh"><el-icon aria-hidden="true"><Refresh /></el-icon></el-button>

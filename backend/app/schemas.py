@@ -2036,6 +2036,7 @@ class AssistantEvidenceOut(BaseModel):
     tools_called: list[dict] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     uncertainties: list[str] = Field(default_factory=list)
+    decision_gate: dict = Field(default_factory=dict)
 
 
 class AssistantReplyOut(BaseModel):

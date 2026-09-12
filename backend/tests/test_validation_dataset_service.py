@@ -13,18 +13,24 @@ from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pyarrow.parquet as parquet
-from sqlalchemy import create_engine, func, select
+from fastapi import HTTPException
+from sqlalchemy import create_engine, delete, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.catalog_schemas import ValidationDatasetBuildIn
 from app.database import Base
 from app.models import (
+    Agent,
+    AuthorizationGrant,
+    BusinessScenario,
     BucketFile,
     DataAsset,
     DataAssetVersion,
     DataSource,
     DatasetFragment,
+    DatasetHead,
+    DatasetSchema,
     DatasetVersion,
     DocumentChunk,
     IngestionRun,
@@ -34,13 +40,16 @@ from app.models import (
 )
 from app.services import (
     catalog_ingestion_service,
+    catalog_service,
     dataset_query_service,
     datasource_service,
     object_deletion_service,
     object_storage_service,
     permission_service,
+    managed_attachment_access,
     validation_dataset_service,
 )
+from app.routers import catalog as catalog_router
 
 
 class ValidationDatasetServiceTests(unittest.TestCase):
@@ -74,10 +83,12 @@ class ValidationDatasetServiceTests(unittest.TestCase):
                 status="active",
             )
             source = DataSource(
-                id="validation-managed-bucket",
+                id=catalog_service.external_upload_source_id(tenant.id),
                 tenant_id=tenant.id,
                 name="Validation managed bucket",
                 type="file_bucket",
+                resource_scope="agent_runtime",
+                owner_agent_id=None,
                 config={
                     "storage_backend": "minio",
                     "bucket_name": "validation-test",
@@ -147,11 +158,20 @@ class ValidationDatasetServiceTests(unittest.TestCase):
                 owner_user_id=user.id,
             )
             db.commit()
-        self.source_id = "validation-managed-bucket"
+        self.source_id = catalog_service.external_upload_source_id(
+            "tenant-validation-data"
+        )
         self.asset_version_id = "validation-csv-version"
         self.raw_objects[("validation-test", "platform/raw/claims.csv")] = content
+        self._storage_config = patch.object(
+            object_storage_service,
+            "require_configuration",
+            return_value=SimpleNamespace(bucket_name="validation-test", prefix="platform"),
+        )
+        self._storage_config.start()
 
     def tearDown(self) -> None:
+        self._storage_config.stop()
         self.engine.dispose()
 
     def _database(self):
@@ -174,6 +194,466 @@ class ValidationDatasetServiceTests(unittest.TestCase):
                         name="Must stay modeling-only",
                     ),
                 )
+
+    def test_validation_dataset_input_is_agent_scoped(self) -> None:
+        with self._database() as db:
+            agent_one = Agent(
+                id="validation-agent-one",
+                tenant_id="tenant-validation-data",
+                name="Agent one",
+            )
+            agent_two = Agent(
+                id="validation-agent-two",
+                tenant_id="tenant-validation-data",
+                name="Agent two",
+            )
+            asset = db.get(DataAsset, "validation-csv-asset")
+            asset.owner_agent_id = agent_one.id
+            db.add_all([agent_one, agent_two])
+            db.commit()
+
+            first = validation_dataset_service.enqueue_validation_dataset_job(
+                db,
+                ValidationDatasetBuildIn(
+                    asset_version_ids=[self.asset_version_id],
+                    name="Agent one package",
+                    agent_id=agent_one.id,
+                ),
+            )
+            self.assertEqual(first["status"], "queued")
+            with self.assertRaises(validation_dataset_service.ValidationDatasetError):
+                validation_dataset_service.enqueue_validation_dataset_job(
+                    db,
+                    ValidationDatasetBuildIn(
+                        asset_version_ids=[self.asset_version_id],
+                        name="Agent two package",
+                        agent_id=agent_two.id,
+                    ),
+                )
+
+    def test_scenario_acl_viewer_can_enqueue_and_job_read_rechecks_acl(self) -> None:
+        with self._database() as db:
+            scenario = BusinessScenario(
+                id="validation-viewer-scenario",
+                tenant_id="tenant-validation-data",
+                name="Validation viewer scenario",
+                status="active",
+            )
+            agent_one = Agent(
+                id="validation-viewer-agent",
+                tenant_id="tenant-validation-data",
+                scenario_id=scenario.id,
+                name="Validation viewer Agent",
+            )
+            agent_two = Agent(
+                id="validation-viewer-other-agent",
+                tenant_id="tenant-validation-data",
+                scenario_id=scenario.id,
+                name="Other validation viewer Agent",
+            )
+            viewer = User(
+                id="validation-viewer-user",
+                tenant_id="tenant-validation-data",
+                email="validation-viewer@example.test",
+                password_hash="test-only",
+                status="active",
+            )
+            modeling_dataset = LogicalDataset(
+                id="validation-viewer-modeling-dataset",
+                tenant_id="tenant-validation-data",
+                key="validation.viewer.modeling",
+                name="Viewer modeling dataset",
+                lifecycle_status="active",
+                usage_plane="modeling_material",
+                labels={},
+                created_by_user_id="user-validation-data",
+            )
+            db.add_all(
+                [scenario, agent_one, agent_two, viewer, modeling_dataset]
+            )
+            db.flush()
+            organization = permission_service.ensure_organization(
+                db,
+                "tenant-validation-data",
+            )
+            permission_service.assign_member_role(
+                db,
+                organization,
+                user_id=viewer.id,
+                role_key="viewer",
+            )
+            db.add(
+                AuthorizationGrant(
+                    organization_id=organization.id,
+                    user_id=viewer.id,
+                    resource_type="scenario",
+                    resource_id=scenario.id,
+                    verb="write",
+                    effect="allow",
+                    created_by_user_id="user-validation-data",
+                )
+            )
+            db.get(DataAsset, "validation-csv-asset").owner_agent_id = agent_one.id
+            db.commit()
+            db.info["user_id"] = viewer.id
+            permission_service.refresh_request_authorization(db)
+
+            self.assertFalse(
+                permission_service.check_tenant_permission(db, "write").allowed
+            )
+            self.assertTrue(
+                permission_service.check_scenario(db, scenario, "write").allowed
+            )
+            with self.assertRaises(HTTPException) as global_denied:
+                validation_dataset_service.enqueue_validation_dataset_job(
+                    db,
+                    ValidationDatasetBuildIn(
+                        asset_version_ids=[self.asset_version_id],
+                        name="Global package",
+                    ),
+                )
+            self.assertEqual(global_denied.exception.status_code, 403)
+
+            queued = validation_dataset_service.enqueue_validation_dataset_job(
+                db,
+                ValidationDatasetBuildIn(
+                    asset_version_ids=[self.asset_version_id],
+                    name="Viewer Agent package",
+                    agent_id=agent_one.id,
+                ),
+            )
+            loaded = validation_dataset_service.get_validation_dataset_job(
+                db,
+                queued["id"],
+                agent_id=agent_one.id,
+            )
+            self.assertEqual(loaded["id"], queued["id"])
+            run = db.get(IngestionRun, queued["id"])
+            dataset_id = str(run.dataset_id)
+            schema = DatasetSchema(
+                id="validation-viewer-schema",
+                tenant_id="tenant-validation-data",
+                dataset_id=dataset_id,
+                schema_version=1,
+                schema_hash="a" * 64,
+                compatibility="none",
+                schema_document={"visibility_marker": "agent-one-only"},
+                created_by_user_id="user-validation-data",
+            )
+            version = DatasetVersion(
+                id="validation-viewer-version",
+                tenant_id="tenant-validation-data",
+                dataset_id=dataset_id,
+                schema_id=schema.id,
+                version_number=1,
+                status="ready",
+                content_hash="b" * 64,
+                manifest={"visibility_marker": "agent-one-only"},
+                created_by_user_id="user-validation-data",
+                ready_at=datetime.now(timezone.utc),
+            )
+            head = DatasetHead(
+                id="validation-viewer-head",
+                tenant_id="tenant-validation-data",
+                dataset_id=dataset_id,
+                dataset_version_id=version.id,
+                updated_by_user_id="user-validation-data",
+            )
+            db.add_all([schema, version, head])
+            db.commit()
+            db.expire_all()
+            self.assertEqual(
+                [item.id for item in catalog_service.list_datasets(db)],
+                [modeling_dataset.id],
+            )
+            self.assertEqual(
+                [
+                    item.id
+                    for item in catalog_service.list_datasets(
+                        db,
+                        agent_id=agent_one.id,
+                    )
+                ],
+                [dataset_id],
+            )
+            self.assertEqual(
+                catalog_service.list_datasets(db, agent_id=agent_two.id),
+                [],
+            )
+            with self.assertRaises(catalog_service.CatalogError):
+                catalog_service.require_dataset(db, dataset_id)
+            self.assertEqual(
+                catalog_service.require_dataset(
+                    db,
+                    dataset_id,
+                    agent_id=agent_one.id,
+                ).id,
+                dataset_id,
+            )
+            self.assertEqual(
+                [
+                    item.id
+                    for item in catalog_router.list_dataset_schemas(
+                        dataset_id,
+                        agent_id=agent_one.id,
+                        db=db,
+                    )
+                ],
+                [schema.id],
+            )
+            self.assertEqual(
+                [
+                    item.id
+                    for item in catalog_router.list_dataset_versions(
+                        dataset_id,
+                        agent_id=agent_one.id,
+                        db=db,
+                    )
+                ],
+                [version.id],
+            )
+            self.assertEqual(
+                [
+                    item.id
+                    for item in catalog_router.list_dataset_heads(
+                        dataset_id,
+                        agent_id=agent_one.id,
+                        db=db,
+                    )
+                ],
+                [head.id],
+            )
+            with self.assertRaises(HTTPException) as unscoped_dataset:
+                catalog_router.list_dataset_versions(dataset_id, db=db)
+            self.assertEqual(unscoped_dataset.exception.status_code, 404)
+            with self.assertRaises(HTTPException) as wrong_agent_dataset:
+                catalog_router.list_dataset_versions(
+                    dataset_id,
+                    agent_id=agent_two.id,
+                    db=db,
+                )
+            self.assertEqual(wrong_agent_dataset.exception.status_code, 404)
+            with self.assertRaisesRegex(
+                validation_dataset_service.ValidationDatasetError,
+                "不属于当前 Agent",
+            ):
+                validation_dataset_service.get_validation_dataset_job(
+                    db,
+                    queued["id"],
+                    agent_id=agent_two.id,
+                )
+
+            db.add(
+                AuthorizationGrant(
+                    organization_id=organization.id,
+                    user_id=viewer.id,
+                    resource_type="scenario",
+                    resource_id=scenario.id,
+                    verb="read",
+                    effect="deny",
+                    created_by_user_id="user-validation-data",
+                )
+            )
+            db.commit()
+            permission_service.refresh_request_authorization(db)
+            with self.assertRaises(HTTPException) as revoked:
+                validation_dataset_service.get_validation_dataset_job(
+                    db,
+                    queued["id"],
+                    agent_id=agent_one.id,
+                )
+            self.assertEqual(revoked.exception.status_code, 403)
+
+    def test_enqueue_does_not_requeue_retired_validation_dataset(self) -> None:
+        """A tombstoned package cannot be resurrected by a repeated enqueue."""
+
+        agent_id = "validation-retired-agent"
+        with self._database() as db:
+            agent = Agent(
+                id=agent_id,
+                tenant_id="tenant-validation-data",
+                name="Retired package agent",
+            )
+            db.get(DataAsset, "validation-csv-asset").owner_agent_id = agent_id
+            db.add(agent)
+            db.commit()
+
+            payload = ValidationDatasetBuildIn(
+                asset_version_ids=[self.asset_version_id],
+                name="Retired package",
+                agent_id=agent_id,
+            )
+            queued = validation_dataset_service.enqueue_validation_dataset_job(
+                db, payload
+            )
+            dataset = db.get(LogicalDataset, queued["result"]["dataset_id"]) if queued.get("result") else None
+            if dataset is None:
+                dataset = db.scalar(
+                    select(LogicalDataset).where(
+                        LogicalDataset.labels["owner_agent_id"].as_string() == agent_id
+                    )
+                )
+            self.assertIsNotNone(dataset)
+            assert dataset is not None
+            run = db.get(IngestionRun, queued["id"])
+            self.assertIsNotNone(run)
+            assert run is not None
+            run.status = "failed"
+            run.error = "synthetic failure"
+            dataset.lifecycle_status = "retired"
+            db.commit()
+
+            with self.assertRaisesRegex(
+                validation_dataset_service.ValidationDatasetError,
+                "已被删除",
+            ):
+                validation_dataset_service.enqueue_validation_dataset_job(
+                    db, payload
+                )
+            db.refresh(run)
+            self.assertEqual(run.status, "failed")
+            self.assertEqual(run.error, "synthetic failure")
+
+            with self.assertRaisesRegex(
+                validation_dataset_service.ValidationDatasetError,
+                "已被删除",
+            ):
+                validation_dataset_service.get_validation_dataset_job(
+                    db,
+                    queued["id"],
+                    agent_id=agent_id,
+                )
+            run.status = "pending"
+            run.error = ""
+            db.commit()
+
+        with patch.object(validation_dataset_service, "SessionLocal", self.Session):
+            self.assertFalse(
+                validation_dataset_service.process_validation_dataset_job(
+                    queued["id"]
+                )
+            )
+
+        with self._database() as db:
+            run = db.get(IngestionRun, queued["id"])
+            self.assertEqual(run.status, "failed")
+            self.assertIn("已被删除", run.error)
+
+    def test_agent_job_rejects_retired_validation_dataset_version(self) -> None:
+        from contextlib import ExitStack
+
+        agent_id = "validation-retired-version-agent"
+        payload = ValidationDatasetBuildIn(
+            asset_version_ids=[self.asset_version_id],
+            name="Retired version package",
+            agent_id=agent_id,
+        )
+        with self._database() as db:
+            db.add(
+                Agent(
+                    id=agent_id,
+                    tenant_id="tenant-validation-data",
+                    name="Retired version Agent",
+                )
+            )
+            db.get(DataAsset, "validation-csv-asset").owner_agent_id = agent_id
+            db.commit()
+            queued = validation_dataset_service.enqueue_validation_dataset_job(
+                db, payload
+            )
+
+        with ExitStack() as stack:
+            for active_patch in self._patches():
+                stack.enter_context(active_patch)
+            stack.enter_context(
+                patch.object(validation_dataset_service, "SessionLocal", self.Session)
+            )
+            self.assertTrue(
+                validation_dataset_service.process_validation_dataset_job(
+                    queued["id"]
+                )
+            )
+
+        with self._database() as db:
+            run = db.get(IngestionRun, queued["id"])
+            self.assertIsNotNone(run.output_version_id)
+            output_version = db.get(DatasetVersion, run.output_version_id)
+            output_version.status = "retired"
+            db.commit()
+
+            with self.assertRaisesRegex(
+                validation_dataset_service.ValidationDatasetError,
+                "版本已被删除",
+            ):
+                validation_dataset_service.get_validation_dataset_job(
+                    db,
+                    queued["id"],
+                    agent_id=agent_id,
+                )
+            with self.assertRaisesRegex(
+                validation_dataset_service.ValidationDatasetError,
+                "版本已被删除",
+            ):
+                validation_dataset_service.enqueue_validation_dataset_job(
+                    db, payload
+                )
+            run.status = "pending"
+            run.error = ""
+            db.commit()
+
+        with patch.object(validation_dataset_service, "SessionLocal", self.Session):
+            self.assertFalse(
+                validation_dataset_service.process_validation_dataset_job(
+                    queued["id"]
+                )
+            )
+
+        with self._database() as db:
+            run = db.get(IngestionRun, queued["id"])
+            self.assertEqual(run.status, "failed")
+            self.assertIn("版本已被删除", run.error)
+
+    def test_enqueue_and_worker_do_not_reuse_old_validation_run(self) -> None:
+        payload = ValidationDatasetBuildIn(
+            asset_version_ids=[self.asset_version_id],
+            name="Old pipeline package",
+        )
+        with self._database() as db:
+            queued = validation_dataset_service.enqueue_validation_dataset_job(
+                db, payload
+            )
+            run = db.get(IngestionRun, queued["id"])
+            run.pipeline_version = "validation-dataset/v1"
+            run.status = "failed"
+            db.commit()
+
+            with self.assertRaisesRegex(
+                validation_dataset_service.ValidationDatasetError,
+                "旧验证数据集任务不可复用",
+            ):
+                validation_dataset_service.enqueue_validation_dataset_job(
+                    db, payload
+                )
+            with self.assertRaisesRegex(
+                validation_dataset_service.ValidationDatasetError,
+                "任务不存在",
+            ):
+                validation_dataset_service.get_validation_dataset_job(
+                    db,
+                    queued["id"],
+                )
+            run.status = "pending"
+            db.commit()
+
+        with patch.object(validation_dataset_service, "SessionLocal", self.Session):
+            self.assertFalse(
+                validation_dataset_service.process_validation_dataset_job(
+                    queued["id"]
+                )
+            )
+
+        with self._database() as db:
+            self.assertEqual(db.get(IngestionRun, queued["id"]).status, "pending")
 
     def _download(
         self,
@@ -334,6 +814,159 @@ class ValidationDatasetServiceTests(unittest.TestCase):
         self.assertEqual(catalog.dataset_version_id, first["dataset_version_id"])
         self.assertEqual(catalog.relations[0].row_count, 2)
 
+    def test_materialized_validation_dataset_cannot_cross_agent_scope(self) -> None:
+        from contextlib import ExitStack
+
+        with self._database() as db:
+            agent_one = Agent(
+                id="validation-scope-agent-one",
+                tenant_id="tenant-validation-data",
+                name="Agent one",
+            )
+            agent_two = Agent(
+                id="validation-scope-agent-two",
+                tenant_id="tenant-validation-data",
+                name="Agent two",
+            )
+            db.get(DataAsset, "validation-csv-asset").owner_agent_id = agent_one.id
+            db.add_all([agent_one, agent_two])
+            db.commit()
+
+        payload = ValidationDatasetBuildIn(
+            asset_version_ids=[self.asset_version_id],
+            name="Scoped package",
+            agent_id="validation-scope-agent-one",
+        )
+        with ExitStack() as stack:
+            for active_patch in self._patches():
+                stack.enter_context(active_patch)
+            with self._database() as db:
+                result = validation_dataset_service.build_validation_dataset(db, payload)
+
+        attachment = SimpleNamespace(
+            upload_run_id=None,
+            asset_version_id=None,
+            dataset_version_id=result["dataset_version_id"],
+            expected_signature=result["content_hash"],
+        )
+        with self._database() as db:
+            managed_attachment_access.validate_attachments(
+                db,
+                [attachment],
+                user_id="user-validation-data",
+                agent_id="validation-scope-agent-one",
+            )
+            with self.assertRaises(managed_attachment_access.AttachmentAccessError):
+                managed_attachment_access.validate_attachments(
+                    db,
+                    [attachment],
+                    user_id="user-validation-data",
+                    agent_id="validation-scope-agent-two",
+                )
+
+    def test_agent_disappearing_after_materialization_cannot_publish_orphan_dataset(self) -> None:
+        from contextlib import ExitStack
+
+        agent_id = "validation-race-agent"
+        with self._database() as db:
+            agent = Agent(
+                id=agent_id,
+                tenant_id="tenant-validation-data",
+                name="Race agent",
+            )
+            db.get(DataAsset, "validation-csv-asset").owner_agent_id = agent_id
+            db.add(agent)
+            db.commit()
+
+        payload = ValidationDatasetBuildIn(
+            asset_version_ids=[self.asset_version_id],
+            name="Race package",
+            agent_id=agent_id,
+        )
+
+        # This callback runs after raw download and table materialization but
+        # before the final publication fence.  The separate session commits
+        # the simulated concurrent delete while the builder is still doing
+        # CPU work; no generated metadata has been staged yet.
+        original_materialize = validation_dataset_service._materialize_raw_file
+
+        def remove_agent_before_publication(*args, **kwargs):
+            result = original_materialize(*args, **kwargs)
+            with self._database() as deleting_db:
+                deleting_db.execute(delete(Agent).where(Agent.id == agent_id))
+                deleting_db.commit()
+            return result
+
+        with ExitStack() as stack:
+            for active_patch in self._patches():
+                stack.enter_context(active_patch)
+            stack.enter_context(
+                patch.object(
+                    validation_dataset_service,
+                    "_materialize_raw_file",
+                    side_effect=remove_agent_before_publication,
+                )
+            )
+            with self._database() as db:
+                with self.assertRaisesRegex(
+                    validation_dataset_service.ValidationDatasetError,
+                    "Agent 已删除",
+                ):
+                    validation_dataset_service.build_validation_dataset(db, payload)
+
+        with self._database() as db:
+            self.assertIsNone(db.get(Agent, agent_id))
+            self.assertEqual(
+                db.scalar(
+                    select(func.count(LogicalDataset.id)).where(
+                        LogicalDataset.labels["owner_agent_id"].as_string() == agent_id
+                    )
+                ),
+                0,
+            )
+            self.assertEqual(db.scalar(select(func.count(DatasetFragment.id))), 0)
+
+    def test_publication_rejects_stale_validation_job_lease(self) -> None:
+        from contextlib import ExitStack
+
+        payload = ValidationDatasetBuildIn(
+            asset_version_ids=[self.asset_version_id],
+            name="Stale lease package",
+        )
+        with self._database() as db:
+            queued = validation_dataset_service.enqueue_validation_dataset_job(
+                db, payload
+            )
+            run = db.get(IngestionRun, queued["id"])
+            run.status = "running"
+            run.lease_token = "current-lease-token"
+            run.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+            db.commit()
+
+        with ExitStack() as stack:
+            for active_patch in self._patches():
+                stack.enter_context(active_patch)
+            with self._database() as db:
+                with self.assertRaisesRegex(
+                    validation_dataset_service.ValidationDatasetError,
+                    "租约已失效",
+                ):
+                    validation_dataset_service.build_validation_dataset(
+                        db,
+                        payload,
+                        _publication_job_id=queued["id"],
+                        _publication_lease_token="stale-lease-token",
+                    )
+
+        with self._database() as db:
+            run = db.get(IngestionRun, queued["id"])
+            self.assertEqual(run.status, "running")
+            self.assertEqual(run.lease_token, "current-lease-token")
+            # Enqueue owns the empty logical-dataset row; publication must not
+            # add a version or fragment after the stale lease is observed.
+            self.assertEqual(db.scalar(select(func.count(LogicalDataset.id))), 1)
+            self.assertEqual(db.scalar(select(func.count(DatasetFragment.id))), 0)
+
     def test_durable_job_materializes_and_exposes_reusable_result(self) -> None:
         from contextlib import ExitStack
 
@@ -349,6 +982,15 @@ class ValidationDatasetServiceTests(unittest.TestCase):
             duplicate = validation_dataset_service.enqueue_validation_dataset_job(
                 db,
                 payload,
+            )
+            global_dataset_id = str(db.get(IngestionRun, queued["id"]).dataset_id)
+            self.assertIn(
+                global_dataset_id,
+                {item.id for item in catalog_service.list_datasets(db)},
+            )
+            self.assertEqual(
+                catalog_service.require_dataset(db, global_dataset_id).id,
+                global_dataset_id,
             )
         self.assertEqual(queued["status"], "queued")
         self.assertEqual(duplicate["id"], queued["id"])
@@ -672,6 +1314,68 @@ class ValidationDatasetServiceTests(unittest.TestCase):
 
         self.assertEqual(result["relation_names"], ["claims"])
         self.assertEqual(result["record_count"], 2)
+
+    def test_validation_builder_rejects_cross_source_bucket_file_lineage(self) -> None:
+        """A forged version->file pointer cannot smuggle modeling data into an Agent package."""
+        agent_id = "validation-lineage-agent"
+        with self._database() as db:
+            agent = Agent(
+                id=agent_id,
+                tenant_id="tenant-validation-data",
+                name="Lineage Agent",
+            )
+            source = DataSource(
+                id="validation-lineage-source",
+                tenant_id="tenant-validation-data",
+                resource_scope="modeling",
+                owner_agent_id=None,
+                name="Modeling source",
+                type="file_bucket",
+                config={
+                    "storage_backend": "minio",
+                    "bucket_name": "validation-test",
+                    "prefix": "platform",
+                },
+                status="ok",
+            )
+            file = BucketFile(
+                id="validation-lineage-file",
+                data_source_id=source.id,
+                filename="forged.csv",
+                stored_path="minio://validation-test/platform/raw/forged.csv",
+                storage_provider="minio",
+                bucket_name="validation-test",
+                object_key="platform/raw/forged.csv",
+                object_version_id="forged-v1",
+                object_url="minio://validation-test/platform/raw/forged.csv",
+                size=1,
+                mime="text/csv",
+                content_sha256="a" * 64,
+                status="parsed",
+            )
+            version = db.get(DataAssetVersion, self.asset_version_id)
+            assert version is not None
+            db.add_all([agent, source, file])
+            db.flush()
+            db.get(DataAsset, "validation-csv-asset").owner_agent_id = agent_id
+            # Keep the composite file/source FK valid while simulating a legacy
+            # row written before the registration scope fence existed.
+            version.bucket_file_id = file.id
+            version.bucket_data_source_id = source.id
+            db.commit()
+
+            with self.assertRaisesRegex(
+                validation_dataset_service.ValidationDatasetError,
+                "来源作用域无效",
+            ):
+                validation_dataset_service.enqueue_validation_dataset_job(
+                    db,
+                    ValidationDatasetBuildIn(
+                        asset_version_ids=[self.asset_version_id],
+                        name="Reject forged lineage",
+                        agent_id=agent_id,
+                    ),
+                )
 
 
 if __name__ == "__main__":

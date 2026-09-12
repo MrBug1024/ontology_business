@@ -28,11 +28,13 @@ from ..models import (
     BusinessScenario,
     CapabilityInvocation,
     ConnectorBinding,
+    DataAsset,
     DataAssetVersion,
     DataSource,
     DatasetRelation,
     DatasetSchema,
     DatasetVersion,
+    LogicalDataset,
     LLMConfig,
 )
 from . import (
@@ -42,6 +44,8 @@ from . import (
     capability_delivery_service,
     input_contract_validator,
     llm_service,
+    managed_asset_lifecycle,
+    managed_attachment_access,
     permission_service,
     runtime_definition_service,
     tenant_service,
@@ -726,6 +730,10 @@ class CapabilityAgentRuntime:
         self._attachment_observations_cache: tuple[
             input_contract_validator.ObservedInput, ...
         ] | None = None
+        # Invalid scoped references stay unobservable and cannot later be
+        # selected by an explicit attachment mapping.  Supplementary files
+        # remain harmlessly unmapped until a capability asks for them.
+        self._unavailable_attachment_indexes: set[int] = set()
         self.context_issues = self._context_issues(raw_catalog)
         self.complete = not self.context_issues
         self.citations: list[dict[str, Any]] = []
@@ -873,11 +881,65 @@ class CapabilityAgentRuntime:
             profile: Mapping[str, Any] = {}
             if attachment.asset_version_id:
                 version = self.db.scalar(
-                    select(DataAssetVersion).where(
+                    select(DataAssetVersion)
+                    .join(DataAsset, DataAsset.id == DataAssetVersion.asset_id)
+                    .where(
                         DataAssetVersion.id == attachment.asset_version_id,
                         DataAssetVersion.tenant_id == self.tenant_id,
+                        DataAsset.tenant_id == self.tenant_id,
+                        DataAssetVersion.status == "ready",
+                        DataAsset.lifecycle_status == "active",
+                        DataAsset.usage_plane != "modeling_material",
                     )
                 )
+                if version is not None:
+                    asset = version.asset
+                    if asset is None:
+                        version = None
+                    else:
+                        current_user_id = str(self.db.info.get("user_id") or "")
+                        try:
+                            managed_asset_lifecycle.require_current_asset_version(
+                                version.version_document
+                                if isinstance(version.version_document, Mapping)
+                                else {}
+                            )
+                        except managed_asset_lifecycle.ManagedAssetLifecycleError:
+                            version = None
+                        try:
+                            # Shared, non-private governed assets have no
+                            # Agent owner and remain usable by every Agent in
+                            # the tenant.  Private upload purposes still go
+                            # through exact ownership and physical-lineage
+                            # checks in the common attachment boundary.
+                            if version is not None:
+                                managed_attachment_access.require_asset_version_scope(
+                                    self.db,
+                                    asset,
+                                    version,
+                                    tenant_id=self.tenant_id,
+                                    agent_id=self.agent.id,
+                                )
+                        except managed_attachment_access.AttachmentAccessError:
+                            version = None
+                        purpose = (
+                            managed_attachment_access._asset_version_purpose(asset, version)
+                            if version is not None
+                            else None
+                        )
+                        if version is not None and purpose == "invocation_attachment" and (
+                            not current_user_id
+                            or str(asset.created_by_user_id or "") != current_user_id
+                        ):
+                            version = None
+                        if (
+                            version is not None
+                            and attachment.expected_signature
+                            and attachment.expected_signature != version.content_sha256
+                        ):
+                            version = None
+                if version is None:
+                    self._unavailable_attachment_indexes.add(index)
                 document = (
                     version.version_document
                     if version is not None
@@ -892,8 +954,45 @@ class CapabilityAgentRuntime:
                     select(DatasetVersion).where(
                         DatasetVersion.id == attachment.dataset_version_id,
                         DatasetVersion.tenant_id == self.tenant_id,
+                        DatasetVersion.status == "ready",
                     )
                 )
+                dataset = (
+                    self.db.get(LogicalDataset, version.dataset_id)
+                    if version is not None
+                    else None
+                )
+                if (
+                    version is None
+                    or dataset is None
+                    or str(dataset.tenant_id) != self.tenant_id
+                    or str(dataset.lifecycle_status or "").lower() != "active"
+                    or str(dataset.usage_plane or "").lower() == "modeling_material"
+                ):
+                    version = None
+                else:
+                    try:
+                        # Validation datasets carry immutable Agent ownership
+                        # in their labels and asset lineage; tenant-level
+                        # governed datasets remain valid through this helper's
+                        # explicit no-op branch.
+                        managed_attachment_access._check_dataset_scope(
+                            self.db,
+                            dataset,
+                            version,
+                            tenant_id=self.tenant_id,
+                            agent_id=self.agent.id,
+                        )
+                    except managed_attachment_access.AttachmentAccessError:
+                        version = None
+                if (
+                    version is not None
+                    and attachment.expected_signature
+                    and attachment.expected_signature != version.content_hash
+                ):
+                    version = None
+                if version is None:
+                    self._unavailable_attachment_indexes.add(index)
                 schema = (
                     self.db.scalar(
                         select(DatasetSchema).where(
@@ -1145,6 +1244,17 @@ class CapabilityAgentRuntime:
             raise AgentRuntimeAdapterError(
                 "invalid_attachment_port",
                 "Attachment mapping contains an incompatible input port",
+            )
+        # Explicit mappings do not go through the automatic matcher above.
+        # Resolve observations first so tenant/Agent/lifecycle failures are
+        # still recorded before a caller can select an attachment by index.
+        if pairs:
+            self._attachment_observations()
+        unavailable = getattr(self, "_unavailable_attachment_indexes", set())
+        if any(index in unavailable for index, _key in pairs):
+            raise AgentRuntimeAdapterError(
+                "attachment_unavailable",
+                "部分附件不存在、已失效或不能作为当前 Agent 的输入",
             )
         for key in set(port_keys):
             port = eligible_by_key[key]

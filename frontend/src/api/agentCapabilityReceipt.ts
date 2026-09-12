@@ -1,8 +1,9 @@
 import { http } from '@/api'
 import type { AgentCapabilityReceipt } from '@/types/agentCapabilityReceipt'
+import { managedFileDownloadUrl } from '@/utils/managedFileUrls'
 
 export const agentCapabilityReceiptApi = {
-  artifactDownloadUrl: (fileId: string) => `/api/data-sources/files/${fileId}/download`,
+  artifactDownloadUrl: (fileId: string, agentId?: string) => managedFileDownloadUrl(fileId, agentId),
   get: (agentId: string, invocationId: string, messageId: string, signal?: AbortSignal) =>
     http.get<AgentCapabilityReceipt>(`/agents/${agentId}/capability-invocations/${invocationId}`, {
       params: { message_id: messageId }, signal,

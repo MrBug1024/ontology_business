@@ -504,6 +504,8 @@ def _load_catalog(source: Any) -> DatasetCatalog:
             getattr(source, "tenant_id", "") or ""
         ):
             raise DatasetQueryError("数据集连接器无权访问该数据集版本")
+        if str(getattr(dataset, "lifecycle_status", "") or "").lower() != "active":
+            raise DatasetQueryError("数据集已退役或不可用")
 
         relation_schema_attr = _model_attr(DatasetRelation, "schema_id")
         schema_id = str(getattr(version, "schema_id", "") or "").strip()

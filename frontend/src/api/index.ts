@@ -86,6 +86,15 @@ import type {
   WorkflowRun,
 } from '@/types'
 
+// Keep this tiny URL builder local: api/index.ts is also loaded by the
+// protocol-boundary tests as an isolated data URL where path aliases are not
+// available.  The browser build still shares the same managed-file contract.
+function managedFileTextPath(fileId: string, agentId?: string) {
+  const path = `/data-sources/files/${encodeURIComponent(String(fileId))}/text`
+  const scope = String(agentId || '').trim()
+  return scope ? `${path}?agent_id=${encodeURIComponent(scope)}` : path
+}
+
 // 响应拦截器已把 r.data 解包，因此客户端方法在类型上直接返回 Promise<T>
 interface ApiClient {
   get<T = any>(url: string, config?: any): Promise<T>
@@ -119,6 +128,7 @@ export const http = instance as unknown as ApiClient
 type ValidationDatasetWaitOptions = {
   signal?: AbortSignal
   onStatus?: (job: ValidationDatasetJob) => void
+  agentId?: string
 }
 
 async function waitForValidationDatasetJob(
@@ -126,12 +136,13 @@ async function waitForValidationDatasetJob(
   options: ValidationDatasetWaitOptions = {},
 ) {
   let job = await http.get<ValidationDatasetJob>(`/catalog/validation-dataset-jobs/${jobId}`, {
+    params: { agent_id: options.agentId || undefined },
     signal: options.signal,
   })
   options.onStatus?.(job)
   const deadline = Date.now() + 4 * 60 * 60 * 1000
   while (job.status === 'queued' || job.status === 'running') {
-    if (Date.now() >= deadline) throw new Error('验证数据集准备超时，请稍后从资料库重试')
+    if (Date.now() >= deadline) throw new Error('验证数据集准备超时，请稍后从附件数据源重试')
     await new Promise<void>((resolve, reject) => {
       const onAbort = () => {
         window.clearTimeout(timer)
@@ -144,6 +155,7 @@ async function waitForValidationDatasetJob(
       options.signal?.addEventListener('abort', onAbort, { once: true })
     })
     job = await http.get<ValidationDatasetJob>(`/catalog/validation-dataset-jobs/${job.id}`, {
+      params: { agent_id: options.agentId || undefined },
       signal: options.signal,
     })
     options.onStatus?.(job)
@@ -380,14 +392,24 @@ export const api = {
   cancelTask: (id: string) => http.post<WorkflowRun>(`/operations/runs/${id}/cancel`),
 
   // 资源目录：LogicalDataset 与场景用途绑定不包含物理连接配置。
-  listCatalogAssets: (usagePlane?: CatalogUsagePlane) => http.get<CatalogAsset[]>('/catalog/assets', {
-    params: { usage_plane: usagePlane },
+  listCatalogAssets: (
+    usagePlane?: CatalogUsagePlane,
+    options: { agent_id?: string } = {},
+  ) => http.get<CatalogAsset[]>('/catalog/assets', {
+    params: {
+      usage_plane: usagePlane,
+      agent_id: options.agent_id || undefined,
+    },
   }),
-  listCatalogAssetVersions: (assetId: string) =>
-    http.get<CatalogAssetVersion[]>(`/catalog/assets/${assetId}/versions`),
+  listCatalogAssetVersions: (assetId: string, agentId?: string) =>
+    http.get<CatalogAssetVersion[]>(`/catalog/assets/${assetId}/versions`, {
+      params: { agent_id: agentId || undefined },
+    }),
   uploadCatalogAttachment: (d: {
     file: File
     purpose?: 'validation_asset' | 'invocation_attachment'
+    agent_id?: string
+    conversation_id?: string
     expires_in_seconds?: number
     onProgress?: (percent: number) => void
   }) => {
@@ -395,6 +417,8 @@ export const api = {
     fd.append('file', d.file)
     fd.append('purpose', d.purpose || 'validation_asset')
     fd.append('name', d.file.name)
+    if (d.agent_id) fd.append('agent_id', d.agent_id)
+    if (d.conversation_id) fd.append('conversation_id', d.conversation_id)
     if (d.expires_in_seconds) fd.append('expires_in_seconds', String(d.expires_in_seconds))
     return http.post<CatalogManagedUpload>('/catalog/uploads', fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -410,18 +434,22 @@ export const api = {
     media_type?: string
     purpose: 'validation_asset' | 'invocation_attachment'
     idempotency_key: string
+    agent_id?: string
+    conversation_id?: string
     expires_in_seconds?: number
   }) => http.post<ManagedUploadRun>('/catalog/upload-runs', d),
   uploadManagedRunContent: (d: {
     runId: string
     expectedRevision: number
     file: File
+    agentId?: string
     signal?: AbortSignal
     onProgress?: (percent: number) => void
   }) => {
     const fd = new FormData()
     fd.append('upload_run_id', d.runId)
     fd.append('expected_revision', String(d.expectedRevision))
+    if (d.agentId) fd.append('agent_id', d.agentId)
     fd.append('file', d.file)
     return http.post<ManagedUploadRun>('/catalog/upload-runs/content', fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -432,25 +460,51 @@ export const api = {
       },
     })
   },
-  getManagedUploadRun: (runId: string, signal?: AbortSignal) =>
-    http.get<ManagedUploadRun>(`/catalog/upload-runs/${runId}`, { signal }),
-  retryManagedUploadRun: (runId: string, expectedRevision: number) =>
+  /**
+   * The second argument remains AbortSignal-compatible for the Global
+   * Assistant's legacy callers. Agent callers may pass (runId, agentId,
+   * signal), while integrations may use (runId, signal, agentId).
+   */
+  getManagedUploadRun: (
+    runId: string,
+    agentIdOrSignal?: string | AbortSignal,
+    signalOrAgentId?: AbortSignal | string,
+  ) => {
+    const agentId = typeof agentIdOrSignal === 'string'
+      ? agentIdOrSignal
+      : typeof signalOrAgentId === 'string' ? signalOrAgentId : undefined
+    const signal = typeof agentIdOrSignal === 'string'
+      ? (typeof signalOrAgentId === 'string' ? undefined : signalOrAgentId)
+      : (agentIdOrSignal || (typeof signalOrAgentId === 'string' ? undefined : signalOrAgentId))
+    return http.get<ManagedUploadRun>(`/catalog/upload-runs/${runId}`, {
+      params: { agent_id: agentId || undefined },
+      signal,
+    })
+  },
+  retryManagedUploadRun: (runId: string, expectedRevision: number, agentId?: string) =>
     http.post<ManagedUploadRun>(`/catalog/upload-runs/${runId}/retry`, {
       expected_revision: expectedRevision,
       idempotency_key: `managed-upload-retry:${runId}`,
+      agent_id: agentId || undefined,
     }),
-  cancelManagedUploadRun: (runId: string, expectedRevision: number) =>
+  cancelManagedUploadRun: (runId: string, expectedRevision: number, agentId?: string) =>
     http.post<ManagedUploadRun>(`/catalog/upload-runs/${runId}/cancel`, {
       expected_revision: expectedRevision,
+      agent_id: agentId || undefined,
     }),
-  deleteCatalogAsset: (assetId: string) => http.delete(`/catalog/assets/${assetId}`),
-  createValidationDatasetJob: (assetVersionIds: string[], name = '验证数据包') =>
+  deleteCatalogAsset: (assetId: string, agentId?: string) => http.delete(`/catalog/assets/${assetId}`, {
+    params: { agent_id: agentId || undefined },
+  }),
+  createValidationDatasetJob: (assetVersionIds: string[], name = '验证数据包', agentId?: string) =>
     http.post<ValidationDatasetJob>('/catalog/validation-dataset-jobs', {
       asset_version_ids: assetVersionIds,
       name,
+      agent_id: agentId || undefined,
     }),
-  getValidationDatasetJob: (jobId: string) =>
-    http.get<ValidationDatasetJob>(`/catalog/validation-dataset-jobs/${jobId}`),
+  getValidationDatasetJob: (jobId: string, agentId?: string) =>
+    http.get<ValidationDatasetJob>(`/catalog/validation-dataset-jobs/${jobId}`, {
+      params: { agent_id: agentId || undefined },
+    }),
   waitForValidationDatasetJob,
   buildValidationDataset: async (
     assetVersionIds: string[],
@@ -460,6 +514,7 @@ export const api = {
     let job = await http.post<ValidationDatasetJob>('/catalog/validation-dataset-jobs', {
       asset_version_ids: assetVersionIds,
       name,
+      agent_id: options.agentId || undefined,
     }, { signal: options.signal })
     options.onStatus?.(job)
     if (job.status === 'succeeded' && job.result) {
@@ -512,7 +567,9 @@ export const api = {
     // Existing tabular files perform the same bounded profiling work as uploads.
     timeout: 60 * 60 * 1000,
   }),
-  fileText: (fid: string) => http.get<{ filename: string; text: string }>(`/data-sources/files/${fid}/text`),
+  fileText: (fid: string, agentId?: string) => http.get<{ filename: string; text: string }>(
+    managedFileTextPath(fid, agentId),
+  ),
   deleteFile: (fid: string) => http.delete(`/data-sources/files/${fid}`),
 
   // 统一附件模板中心

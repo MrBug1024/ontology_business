@@ -83,7 +83,7 @@
           :closable="false"
           show-icon
           title="这是不可恢复操作"
-          description="场景定义、验证 Agent、会话、运行审计和场景自有文件将被删除。独立目录数据集不会被连带误删，删除后可在资源页单独治理。"
+          description="场景定义及其向下拥有的对象、关系、数据源、验证 Agent、会话、附件和运行记录将被删除。不会删除独立目录数据集或其他场景、Agent 引用的能力定义。"
         />
         <template v-if="purgePlan">
           <div v-if="purgePlan.blockers.length" class="purge-blockers" role="alert">
@@ -98,12 +98,17 @@
               <dt>保留的独立数据集</dt><dd>{{ purgePlan.retained.logical_datasets || 0 }}</dd>
             </div>
           </dl>
-          <el-checkbox v-if="purgePlan.requires_audit_confirmation" v-model="purgeAuditConfirmed">
-            我确认同时删除该场景的验证、运行与发布审计历史
-          </el-checkbox>
+          <el-alert
+            v-if="purgePlan.requires_audit_confirmation"
+            type="warning"
+            :closable="false"
+            show-icon
+            title="该场景的历史审计会随场景一起删除"
+            description="退役场景不会再接受新的运行；确认名称后，场景模型、能力、资源、会话、附件、运行记录和审计历史将一并清理。"
+          />
           <label class="purge-name-field">
             <span>输入场景名称 <strong>{{ purgePlan.scenario_name }}</strong> 以确认</span>
-            <el-input v-model="purgeExpectedName" :disabled="!purgePlan.can_purge || purging" autocomplete="off" />
+            <el-input v-model="purgeExpectedName" :disabled="purging" autocomplete="off" />
           </label>
         </template>
       </div>
@@ -144,7 +149,6 @@ const purging = ref(false)
 const purgeTarget = ref<Scenario | null>(null)
 const purgePlan = ref<ScenarioPurgePlan | null>(null)
 const purgeExpectedName = ref('')
-const purgeAuditConfirmed = ref(false)
 const purgeCountLabels: Record<string, string> = {
   object_types: '对象类型', relation_types: '关系类型', object_instances: '对象实例', relation_instances: '关系实例',
   mappings: '数据映射', data_sources: '场景自有接入', dataset_bindings: '资料用途绑定', connector_bindings: '运行连接绑定',
@@ -159,7 +163,6 @@ const visiblePurgeCounts = computed(() => Object.entries(purgePlan.value?.counts
 const canConfirmPurge = computed(() => Boolean(
   purgePlan.value?.can_purge
   && purgeExpectedName.value === purgePlan.value.scenario_name
-  && (!purgePlan.value.requires_audit_confirmation || purgeAuditConfirmed.value),
 ))
 
 async function load() {
@@ -232,7 +235,6 @@ async function openPurge(s: Scenario) {
   purgeTarget.value = s
   purgePlan.value = null
   purgeExpectedName.value = ''
-  purgeAuditConfirmed.value = false
   purgeVisible.value = true
   purgeLoading.value = true
   try {
@@ -251,7 +253,7 @@ async function confirmPurge() {
     await api.purgeScenario(purgeTarget.value.id, {
       expected_name: purgeExpectedName.value,
       confirmed: true,
-      delete_audit_history: purgeAuditConfirmed.value,
+      delete_audit_history: true,
     })
     ElMessage.success(`场景「${purgeTarget.value.name}」已永久删除`)
     purgeVisible.value = false

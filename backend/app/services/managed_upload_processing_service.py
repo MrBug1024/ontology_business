@@ -14,12 +14,12 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..models import BucketFile, DataSource, ManagedUploadRun
 from . import (
+    agent_scope_access_service,
     catalog_ingestion_service,
     catalog_service,
     doc_parser,
     object_deletion_service,
     object_storage_service,
-    permission_service,
 )
 from .managed_upload_run_contracts import (
     ManagedUploadError,
@@ -32,6 +32,28 @@ from .managed_upload_run_contracts import (
 
 
 PROCESSING_LEASE_SECONDS = 120
+
+
+def _require_run_write_scope(
+    db: Session,
+    owner_agent_id: str | None,
+    *,
+    lock: bool = False,
+) -> None:
+    try:
+        agent_scope_access_service.require_optional_agent_permission(
+            db,
+            owner_agent_id,
+            "write",
+            lock=lock,
+            message="没有该 Agent 所属业务场景的附件写入权限",
+        )
+    except agent_scope_access_service.AgentScopeNotFoundError as exc:
+        raise ManagedUploadError(
+            "managed_upload_owner_unavailable",
+            "所属 Agent 已删除，附件处理已取消",
+            status_code=409,
+        ) from exc
 
 
 def claim_processing_run(db: Session, run_id: str) -> UploadLease | None:
@@ -78,8 +100,7 @@ def load_processing_snapshot(
             return None
         db.info["tenant_id"] = run.tenant_id
         db.info["user_id"] = run.requested_by_user_id
-        permission_service.require_principal(db)
-        permission_service.require_tenant_permission(db, "write")
+        _require_run_write_scope(db, run.owner_agent_id)
         source = db.get(DataSource, run.data_source_id)
         bucket_file = db.get(BucketFile, run.bucket_file_id) if run.bucket_file_id else None
         if (
@@ -217,51 +238,93 @@ def profile_stored_upload(
         try:
             db.info["tenant_id"] = snapshot.tenant_id
             db.info["user_id"] = snapshot.user_id
-            permission_service.require_principal(db)
-            permission_service.require_tenant_permission(db, "write")
+
+            # The asset row is the common fence between this publisher and
+            # catalog.delete_asset.  Resolve/lock it before the upload run so
+            # both paths use Agent -> asset -> run (or asset -> run for the
+            # tenant-shared namespace).  A lease is checked once before this
+            # work to avoid creating an asset for an already abandoned run,
+            # then checked again after the ordered row locks are held.
+            owner_agent_id = db.scalar(
+                select(ManagedUploadRun.owner_agent_id).where(
+                    ManagedUploadRun.id == run_id,
+                    ManagedUploadRun.tenant_id == snapshot.tenant_id,
+                )
+            )
+            _require_run_write_scope(
+                db,
+                owner_agent_id,
+                lock=bool(owner_agent_id),
+            )
             current = db.scalar(
                 select(ManagedUploadRun)
                 .where(
                     ManagedUploadRun.id == run_id,
                     ManagedUploadRun.tenant_id == snapshot.tenant_id,
                 )
-                .with_for_update()
                 .execution_options(populate_existing=True)
             )
-            source = db.scalar(
-                select(DataSource).where(
-                    DataSource.id == snapshot.data_source_id,
-                    DataSource.tenant_id == snapshot.tenant_id,
-                )
-            )
-            bucket_file = db.scalar(
-                select(BucketFile).where(
-                    BucketFile.id == snapshot.bucket_file_id,
-                    BucketFile.data_source_id == snapshot.data_source_id,
-                )
-            )
-            if current is None or not lease_matches(current, lease, as_of=utc_now()):
+            if (
+                current is None
+                or not lease_matches(current, lease, as_of=utc_now())
+                or str(getattr(current, "owner_agent_id", None) or "")
+                != str(owner_agent_id or "")
+            ):
                 db.rollback()
                 return False
-            if (
-                source is None
-                or bucket_file is None
-                or current.bucket_file_id != bucket_file.id
-                or bucket_file.content_sha256 != snapshot.content_sha256
-                or int(bucket_file.size or 0) != snapshot.byte_size
-            ):
-                raise ManagedUploadError(
-                    "managed_upload_object_invalid",
-                    "上传对象在后台处理期间已失效",
-                )
             with catalog_ingestion_service._serialize_upload_identity(
                 db,
-                tenant_id=current.tenant_id,
-                asset_key=prepared.asset_key,
+                tenant_id=snapshot.tenant_id,
+                asset_key=catalog_ingestion_service.scoped_asset_key(
+                    prepared,
+                    owner_agent_id,
+                ),
             ):
                 asset, duplicate, created, replace_expired = (
-                    catalog_ingestion_service.find_or_create_asset(db, prepared)
+                    catalog_ingestion_service.find_or_create_asset(
+                        db,
+                        prepared,
+                        owner_agent_id=owner_agent_id,
+                    )
                 )
+                # Acquire the run only after the asset fence.  Re-read all
+                # mutable pointers under that lock; a cancellation, lease
+                # takeover, or deletion that won the race must become a
+                # no-op rather than publishing a stale object.
+                current = db.scalar(
+                    select(ManagedUploadRun)
+                    .where(
+                        ManagedUploadRun.id == run_id,
+                        ManagedUploadRun.tenant_id == snapshot.tenant_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                source = db.scalar(
+                    select(DataSource).where(
+                        DataSource.id == snapshot.data_source_id,
+                        DataSource.tenant_id == snapshot.tenant_id,
+                    )
+                )
+                bucket_file = db.scalar(
+                    select(BucketFile).where(
+                        BucketFile.id == snapshot.bucket_file_id,
+                        BucketFile.data_source_id == snapshot.data_source_id,
+                    )
+                )
+                if (
+                    current is None
+                    or not lease_matches(current, lease, as_of=utc_now())
+                    or str(getattr(current, "owner_agent_id", None) or "")
+                    != str(owner_agent_id or "")
+                    or source is None
+                    or bucket_file is None
+                    or current.bucket_file_id != bucket_file.id
+                    or bucket_file.content_sha256 != snapshot.content_sha256
+                    or int(bucket_file.size or 0) != snapshot.byte_size
+                ):
+                    db.rollback()
+                    return False
                 version = duplicate
                 if version is None:
                     bucket_file.status = "parsed"

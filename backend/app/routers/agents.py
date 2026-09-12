@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..database import SessionLocal
@@ -41,13 +42,16 @@ from ..services import (
     agent_capability_service,
     agent_channel_reply_service,
     agent_confirmation_service,
+    agent_deletion_service,
     agent_engine,
+    agent_turn_service,
     agent_migration_service,
     agent_readiness_service,
     agent_runtime_adapter,
     connector_service,
     datasource_service,
     llm_service,
+    object_deletion_service,
     permission_service,
     runtime_connector_service,
     runtime_definition_service,
@@ -843,7 +847,29 @@ def _validate_bindings(
     scenario_id = payload.scenario_id
     scenario = None
     if scenario_id:
-        scenario = tenant_service.require_scenario(db, scenario_id, writable=True)
+        # Serialize Agent creation/rebinding with retirement and permanent
+        # scenario purge.  A plain existence/read check leaves a window in
+        # which a scenario can be retired (or its Agent set captured by purge)
+        # before this transaction inserts the new binding.
+        current_tenant_id = tenant_service.current_tenant_id(db)
+        scenario = db.scalar(
+            select(BusinessScenario)
+            .where(
+                BusinessScenario.id == scenario_id,
+                or_(
+                    BusinessScenario.tenant_id == current_tenant_id,
+                    BusinessScenario.is_public.is_(True),
+                ),
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if scenario is None:
+            raise HTTPException(404, "业务场景不存在")
+        if scenario.tenant_id != current_tenant_id:
+            raise HTTPException(403, "公共业务场景只读")
+        if scenario.status == "retired":
+            raise HTTPException(409, "业务场景已退役，只允许读取历史定义与审计记录")
         permission_service.require_scenario_permission(db, scenario, "write")
     else:
         permission_service.require_tenant_permission(db, "write")
@@ -993,6 +1019,9 @@ def create_agent(payload: AgentIn, db: Session = Depends(get_tenant_db)):
         db.flush()
         _sync_runtime_connections(db, a, payload.runtime_connections)
         db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Agent 在创建期间发生并发冲突，请重试") from exc
     except Exception:
         db.rollback()
         raise
@@ -1009,6 +1038,7 @@ def get_agent(agent_id: str, db: Session = Depends(get_tenant_db)):
 @router.put("/{agent_id}", response_model=AgentOut)
 def update_agent(agent_id: str, payload: AgentIn, db: Session = Depends(get_tenant_db)):
     a = _agent(db, agent_id, writable=True)
+    initial_scenario_id = a.scenario_id
     try:
         agent_migration_service.assert_direct_mode_update_allowed(
             a,
@@ -1049,6 +1079,23 @@ def update_agent(agent_id: str, payload: AgentIn, db: Session = Depends(get_tena
     capability_scope = _validate_bindings(
         payload, db, capability_scope=capability_scope
     )
+    # Keep the lock order aligned with scenario purge (scenario -> Agent).  A
+    # concurrent delete may remove the row while validation is in progress;
+    # turn that race into a stable conflict instead of a stale UPDATE/500.
+    locked_agent = db.scalar(
+        select(Agent)
+        .where(
+            Agent.id == agent_id,
+            Agent.tenant_id == tenant_service.current_tenant_id(db),
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if locked_agent is None:
+        raise HTTPException(409, "Agent 在更新期间已被删除，请刷新后重试")
+    if locked_agent.scenario_id != initial_scenario_id:
+        raise HTTPException(409, "Agent 在更新期间已变化，请刷新后重试")
+    a = locked_agent
     stored_scope = capability_scope
     values = payload.model_dump(
         exclude={"capability_scope", "runtime_binding_mode", "runtime_connections"}
@@ -1061,6 +1108,9 @@ def update_agent(agent_id: str, payload: AgentIn, db: Session = Depends(get_tena
         db.flush()
         _sync_runtime_connections(db, a, payload.runtime_connections)
         db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Agent 在更新期间发生并发冲突，请重试") from exc
     except Exception:
         db.rollback()
         raise
@@ -1070,10 +1120,52 @@ def update_agent(agent_id: str, payload: AgentIn, db: Session = Depends(get_tena
 
 @router.delete("/{agent_id}", response_model=Msg)
 def delete_agent(agent_id: str, db: Session = Depends(get_tenant_db)):
-    a = _agent(db, agent_id, writable=True)
-    _sync_runtime_connections(db, a, [])
-    db.delete(a)
-    db.commit()
+    # Deletion is an explicit lifecycle operation and remains available after
+    # the bound scenario is retired.  Ordinary edits still use ``writable``
+    # access, which intentionally rejects retired scenarios.
+    # Lock the Agent before reading its scenario for authorization.  A
+    # concurrent rebinding must not change the resource being authorized
+    # between this check and the cleanup service's ownership scan.
+    a = db.scalar(
+        select(Agent)
+        .where(
+            Agent.id == agent_id,
+            Agent.tenant_id == tenant_service.current_tenant_id(db),
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if a is None:
+        raise HTTPException(status_code=404, detail="Agent 不存在")
+    if a.scenario_id:
+        scenario = tenant_service.require_scenario(db, a.scenario_id)
+        permission_service.require_scenario_permission(
+            db,
+            scenario,
+            "write",
+            message="没有该 Agent 所属业务场景的删除权限",
+        )
+    else:
+        permission_service.require_tenant_permission(db, "write")
+    try:
+        cleanup = agent_deletion_service.cleanup_agent_owned_records(db, a)
+        db.commit()
+    except agent_deletion_service.AgentDeletionConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Agent 仍被受保护资源引用，删除已取消",
+        ) from exc
+    except Exception:
+        db.rollback()
+        raise
+    object_deletion_service.drain_jobs_best_effort(
+        db,
+        cleanup.deletion_job_ids,
+    )
     return Msg(message="已删除")
 
 
@@ -1245,6 +1337,16 @@ def invoke_agent_once(
         conv = _conversation(db, conversation_id)
         if conv.agent_id != agent_id:
             raise HTTPException(400, "对话不属于当前 Agent")
+
+    # Keep non-browser transports on the same server-side attachment boundary
+    # as the durable browser turn path.  This must happen before runtime
+    # preparation or any provider/tool execution can observe the input.
+    agent_turn_service._validate_attachment_scope(
+        db,
+        payload,
+        user_id=_current_user_id(db),
+        agent_id=a.id,
+    )
 
     runtime_context = _authorization_context(
         db,

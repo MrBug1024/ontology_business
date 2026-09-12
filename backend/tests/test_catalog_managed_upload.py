@@ -18,6 +18,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.models import (
+    Agent,
+    BusinessScenario,
     BucketFile,
     DataAsset,
     DataAssetVersion,
@@ -306,6 +308,27 @@ class CatalogManagedUploadTests(unittest.TestCase):
             self.assertEqual(db.scalar(select(func.count(ScenarioDatasetBinding.id))), 0)
             self.assertEqual(db.scalar(select(func.count(SemanticMapping.id))), 0)
 
+    def test_retired_agent_asset_versions_are_not_readable_as_a_tombstone(self) -> None:
+        response = self._upload(
+            b"private attachment",
+            "agent-private.txt",
+            "text/plain",
+            purpose="invocation_attachment",
+            asset_key="agent.private.attachment",
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        asset_id = response.json()["asset"]["id"]
+        with self.Session() as db:
+            asset = db.get(DataAsset, asset_id)
+            self.assertIsNotNone(asset)
+            assert asset is not None
+            asset.lifecycle_status = "retired"
+            asset.labels = {"lifecycle": "agent_deleted"}
+            db.commit()
+
+        listed = self.client.get(f"/api/catalog/assets/{asset_id}/versions")
+        self.assertEqual(listed.status_code, 404, listed.text)
+
     def test_renamed_csv_is_profiled_from_content_not_filename(self) -> None:
         content = b"record_id,amount\nA-1,12.5\n"
 
@@ -573,6 +596,71 @@ class CatalogManagedUploadTests(unittest.TestCase):
             self.assertTrue(asset.labels["temporary"])
             self.assertEqual(db.scalar(select(func.count(LogicalDataset.id))), 0)
             self.assertEqual(db.scalar(select(func.count(ScenarioDatasetBinding.id))), 0)
+
+    def test_agent_scope_rejects_tenant_managed_asset_upload(self) -> None:
+        response = self._upload(
+            b"id,value\n1,A\n",
+            "agent-managed.csv",
+            "text/csv",
+            purpose="managed_asset",
+            agent_id="not-a-runtime-scope",
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.saved_calls, [])
+
+    def test_global_upload_cannot_reuse_agent_owned_asset_key(self) -> None:
+        """A colliding custom key must not cross the Global/Agent namespace."""
+        with self.Session() as db:
+            scenario = BusinessScenario(
+                id="upload-collision-scenario",
+                tenant_id="tenant-upload",
+                name="Upload collision scenario",
+                status="active",
+            )
+            agent = Agent(
+                id="upload-collision-agent",
+                tenant_id="tenant-upload",
+                scenario_id=scenario.id,
+                name="Upload collision Agent",
+            )
+            asset = DataAsset(
+                id="upload-collision-asset",
+                tenant_id="tenant-upload",
+                owner_agent_id=agent.id,
+                key="collision.agent.asset",
+                name="Private validation asset",
+                kind="file",
+                media_type="text/csv",
+                usage_plane="modeling_material",
+                labels={"catalog_purpose": "managed_asset"},
+            )
+            db.add_all([scenario, agent, asset])
+            db.commit()
+
+        response = self._upload(
+            b"id,value\n1,A\n",
+            "collision.csv",
+            "text/csv",
+            purpose="managed_asset",
+            asset_key="collision.agent.asset",
+        )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(self.saved_calls, [])
+        with self.Session() as db:
+            self.assertEqual(
+                db.scalar(
+                    select(func.count(DataAsset.id)).where(
+                        DataAsset.key == "collision.agent.asset"
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(
+                db.get(DataAsset, "upload-collision-asset").owner_agent_id,
+                "upload-collision-agent",
+            )
 
     def test_validation_upload_is_fixed_to_invocation_input_plane(self) -> None:
         response = self._upload(

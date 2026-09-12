@@ -40,6 +40,7 @@ from ..models import (
 from . import connector_service
 from . import input_contract_validator
 from . import managed_asset_lifecycle
+from . import managed_attachment_access
 from .capability_contracts import (
     Actor,
     BindingOverride,
@@ -836,6 +837,7 @@ def _load_dataset_version(
     tenant_id: str,
     port: ScenarioCapabilityPort,
     version_id: str,
+    agent_id: str | None = None,
 ) -> tuple[DatasetVersion, str, str]:
     version = _one(
         db,
@@ -945,6 +947,24 @@ def _load_dataset_version(
             "modeling materials cannot be used as invocation data",
             port_key=reference.port_key,
         )
+    try:
+        # Validation datasets are generated from one Agent's uploads.  Keep
+        # that lineage check in the runtime resolver as well as the chat
+        # attachment validator so direct capability invocations cannot use a
+        # dataset discovered under another Agent (or the global namespace).
+        managed_attachment_access._check_dataset_scope(
+            db,
+            dataset,
+            version,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+        )
+    except managed_attachment_access.AttachmentAccessError:
+        raise RuntimeInputResolutionError(
+            "managed_reference_scope_mismatch",
+            "managed dataset is outside the invocation Agent scope",
+            port_key=reference.port_key,
+        ) from None
     if has_content_contract:
         relations = tuple(
             db.scalars(
@@ -991,6 +1011,7 @@ def _resolve_dataset_version(
     port: ScenarioCapabilityPort,
     resolution_source: str,
     default_binding_id: str | None = None,
+    agent_id: str | None = None,
 ) -> _ResolvedInput:
     version, content_hash, schema_hash = _load_dataset_version(
         db,
@@ -998,6 +1019,7 @@ def _resolve_dataset_version(
         tenant_id=tenant_id,
         port=port,
         version_id=reference.reference_id,
+        agent_id=agent_id,
     )
     handle = ResolvedDataHandle(
         port_key=reference.port_key,
@@ -1029,6 +1051,7 @@ def _resolve_dataset_head(
     resolution_source: str,
     default_binding_id: str | None = None,
     lock_reference: bool = True,
+    agent_id: str | None = None,
 ) -> _ResolvedInput:
     # The row lock makes the pointer read and the ensuing invocation audit one
     # atomic operation on PostgreSQL.  The immutable version id is persisted.
@@ -1061,6 +1084,7 @@ def _resolve_dataset_head(
         tenant_id=tenant_id,
         port=port,
         version_id=head.dataset_version_id,
+        agent_id=agent_id,
     )
     if str(version.dataset_id) != str(head.dataset_id):
         raise RuntimeInputResolutionError(
@@ -1097,6 +1121,7 @@ def _resolve_asset_version(
     tenant_id: str,
     port: ScenarioCapabilityPort,
     resolution_source: str,
+    agent_id: str | None = None,
 ) -> _ResolvedInput:
     version = _one(
         db,
@@ -1149,6 +1174,25 @@ def _resolve_asset_version(
         raise RuntimeInputResolutionError(
             exc.code,
             exc.message,
+            port_key=reference.port_key,
+        ) from None
+    try:
+        # ``owner_agent_id=NULL`` is a tenant-shared governed asset unless
+        # the immutable catalog purpose identifies an Agent-private upload.
+        # The common boundary also proves any physical file/source lineage.
+        # Lifecycle is checked first so an expired reference keeps its stable
+        # 410-style error even if its backing source has since been removed.
+        managed_attachment_access.require_asset_version_scope(
+            db,
+            asset,
+            version,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+        )
+    except managed_attachment_access.AttachmentAccessError:
+        raise RuntimeInputResolutionError(
+            "managed_reference_scope_mismatch",
+            "managed asset is outside the invocation Agent scope",
             port_key=reference.port_key,
         ) from None
     content_hash = _signature(
@@ -1337,6 +1381,7 @@ def _resolve_reference(
     resolution_source: str,
     default_binding_id: str | None = None,
     lock_reference: bool = True,
+    agent_id: str | None = None,
 ) -> _ResolvedInput:
     allowed = set(_allowed_kinds(port))
     if reference.kind not in allowed:
@@ -1354,6 +1399,7 @@ def _resolve_reference(
             port=port,
             resolution_source=resolution_source,
             default_binding_id=default_binding_id,
+            agent_id=agent_id,
         )
     if reference.kind == "dataset_head":
         return _resolve_dataset_head(
@@ -1364,6 +1410,7 @@ def _resolve_reference(
             resolution_source=resolution_source,
             default_binding_id=default_binding_id,
             lock_reference=lock_reference,
+            agent_id=agent_id,
         )
     if reference.kind == "asset_version":
         return _resolve_asset_version(
@@ -1372,6 +1419,7 @@ def _resolve_reference(
             tenant_id=tenant_id,
             port=port,
             resolution_source=resolution_source,
+            agent_id=agent_id,
         )
     return _resolve_connector(
         db,
@@ -1390,6 +1438,7 @@ def list_managed_input_options(
     tenant_id: str,
     scenario_id: str,
     port: Any,
+    agent_id: str | None = None,
 ) -> tuple[ManagedInputOption, ...]:
     """List only logical references that this exact input port can resolve.
 
@@ -1403,6 +1452,9 @@ def list_managed_input_options(
 
     normalized_tenant = _text(tenant_id, "tenant id")
     normalized_scenario = _text(scenario_id, "scenario id")
+    normalized_agent = (
+        _text(agent_id, "agent id", maximum=64) if agent_id not in (None, "") else None
+    )
     scenario = _require_scope(
         db,
         tenant_id=normalized_tenant,
@@ -1447,6 +1499,7 @@ def list_managed_input_options(
                 port=port,
                 resolution_source="discovery",
                 lock_reference=False,
+                agent_id=normalized_agent,
             )
         except RuntimeInputResolutionError as exc:
             # One corrupt, stale or expired catalog row must not make unrelated
@@ -1895,6 +1948,7 @@ def resolve_runtime_inputs(
                     scenario_id=normalized_scenario,
                     port=port,
                     resolution_source="invocation_override",
+                    agent_id=agent_id,
                 )
                 for override in port_overrides
             )

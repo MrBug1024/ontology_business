@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
@@ -36,6 +36,21 @@ def _http_error(exc: managed_upload_run_service.ManagedUploadError) -> HTTPExcep
     )
 
 
+def _merge_scope_ids(
+    query_agent_id: str | None,
+    body_agent_id: str | None,
+) -> str | None:
+    """Accept query or body scope while rejecting contradictory values."""
+
+    if (
+        query_agent_id is not None
+        and body_agent_id is not None
+        and query_agent_id != body_agent_id
+    ):
+        raise HTTPException(status_code=422, detail="agent_id 参数不一致")
+    return body_agent_id if body_agent_id is not None else query_agent_id
+
+
 @router.post("", response_model=ManagedUploadRunOut, status_code=status.HTTP_202_ACCEPTED)
 def create_managed_upload_run(
     payload: ManagedUploadCreateIn,
@@ -53,11 +68,16 @@ def create_managed_upload_run(
 @router.get("/{run_id}", response_model=ManagedUploadRunOut)
 def get_managed_upload_run(
     run_id: str,
+    agent_id: str | None = Query(default=None, min_length=1, max_length=32),
     db: Session = Depends(get_tenant_db),
 ) -> ManagedUploadRunOut:
     try:
         return ManagedUploadRunOut.model_validate(
-            managed_upload_run_service.get_upload_run(db, run_id)
+            managed_upload_run_service.get_upload_run(
+                db,
+                run_id,
+                agent_id=agent_id,
+            )
         )
     except managed_upload_run_service.ManagedUploadError as exc:
         raise _http_error(exc) from exc
@@ -71,15 +91,18 @@ def get_managed_upload_run(
 def retry_managed_upload_run(
     run_id: str,
     payload: ManagedUploadRetryIn,
+    agent_id: str | None = Query(default=None, min_length=1, max_length=32),
     db: Session = Depends(get_tenant_db),
 ) -> ManagedUploadRunOut:
     try:
+        scope_agent_id = _merge_scope_ids(agent_id, payload.agent_id)
         return ManagedUploadRunOut.model_validate(
             managed_upload_run_service.retry_upload_run(
                 db,
                 run_id,
                 expected_revision=payload.expected_revision,
                 idempotency_key=payload.idempotency_key,
+                agent_id=scope_agent_id,
             )
         )
     except managed_upload_run_service.ManagedUploadError as exc:
@@ -94,14 +117,17 @@ def retry_managed_upload_run(
 def cancel_managed_upload_run(
     run_id: str,
     payload: ManagedUploadCancelIn,
+    agent_id: str | None = Query(default=None, min_length=1, max_length=32),
     db: Session = Depends(get_tenant_db),
 ) -> ManagedUploadRunOut:
     try:
+        scope_agent_id = _merge_scope_ids(agent_id, payload.agent_id)
         return ManagedUploadRunOut.model_validate(
             managed_upload_run_service.cancel_upload_run(
                 db,
                 run_id,
                 expected_revision=payload.expected_revision,
+                agent_id=scope_agent_id,
             )
         )
     except managed_upload_run_service.ManagedUploadError as exc:
@@ -117,17 +143,26 @@ def cancel_managed_upload_run(
 async def upload_managed_content(
     upload_run_id: str = Form(..., min_length=1, max_length=32),
     expected_revision: int = Form(..., ge=1),
+    agent_id: str | None = Form(default=None, min_length=1, max_length=32),
+    agent_id_query: str | None = Query(
+        default=None,
+        alias="agent_id",
+        min_length=1,
+        max_length=32,
+    ),
     file: UploadFile = File(...),
     db: Session = Depends(get_tenant_db),
 ) -> ManagedUploadRunOut:
     staged = None
     try:
+        scope_agent_id = _merge_scope_ids(agent_id_query, agent_id)
         # Authorize before consuming attacker-controlled bytes. Profiling still
         # happens later in the durable worker, outside this request.
         declared_limit = managed_upload_run_service.preflight_content_upload(
             db,
             upload_run_id,
             expected_revision=expected_revision,
+            agent_id=scope_agent_id,
         )
         db.rollback()
         settings = get_settings()
@@ -140,6 +175,7 @@ async def upload_managed_content(
             db,
             upload_run_id,
             expected_revision=expected_revision,
+            agent_id=scope_agent_id,
         )
         document = await asyncio.to_thread(
             managed_upload_run_service.store_uploaded_content,
