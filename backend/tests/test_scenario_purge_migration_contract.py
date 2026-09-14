@@ -27,4 +27,4 @@ def test_scenario_audit_purge_revision_fences_evidence_by_tenant() -> None:
 
 def test_runtime_schema_revision_matches_latest_migration() -> None:
     source = (BACKEND_ROOT / "app" / "database.py").read_text(encoding="utf-8")
-    assert 'POSTGRESQL_SCHEMA_REVISION = "20260912_33"' in source
+    assert 'POSTGRESQL_SCHEMA_REVISION = "20260912_34"' in source
