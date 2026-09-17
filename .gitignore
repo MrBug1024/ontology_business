@@ -34,3 +34,6 @@ __pycache__
 .runtime
 .codex-ppt-build
 outputs
+.tmp-chrome-profile2
+.tmp-chrome-profile
+.tmp-**
