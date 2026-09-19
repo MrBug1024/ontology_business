@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     database_pool_timeout_seconds: int = Field(default=30, ge=1, le=300)
     database_statement_timeout_ms: int = Field(default=120_000, ge=1_000, le=3_600_000)
     database_lock_timeout_ms: int = Field(default=10_000, ge=100, le=300_000)
+    # Exact hostnames/IPs approved by the deployment owner for research MySQL.
+    library_mysql_allowed_hosts: str = Field(default="", max_length=4096)
 
     redis_host: str = ""
     redis_port: int = Field(default=6379, ge=1, le=65535)
@@ -174,6 +176,9 @@ class Settings(BaseSettings):
     # may opt into HTTP and explicitly allow exact/private host names.
     allow_insecure_mcp_http: bool = False
     mcp_private_host_allowlist: str = ""
+    distillation_browser_enabled: bool = False
+    distillation_browser_max_sessions: int = Field(default=2, ge=1, le=8)
+    distillation_model_timeout_seconds: float = Field(default=120, ge=30, le=300)
     mcp_operation_timeout_seconds: float = 90.0
     # Agent publications share one authenticated Streamable HTTP endpoint.
     # Production deployments should set the public URL and exact proxy Host.

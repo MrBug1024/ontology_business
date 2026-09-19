@@ -20,7 +20,7 @@ def orm_datetime(*, timezone: bool = True):
     return SQLAlchemyDateTime(timezone=timezone)
 
 
-POSTGRESQL_SCHEMA_REVISION = "20260912_34"
+POSTGRESQL_SCHEMA_REVISION = "20260919_40"
 
 _settings = get_settings()
 if not _settings.uses_postgresql_database:
@@ -61,7 +61,7 @@ def get_db(request: Request) -> Generator[Session, None, None]:
 
 def init_db() -> None:
     """Verify the configured PostgreSQL service and migrated schema."""
-    from . import access_models, approval_models, external_api_models, models, release_models  # noqa: F401
+    from . import access_models, approval_models, distillation_access_models, distillation_attachment_models, distillation_conversation_models, distillation_models, external_api_models, models, release_models  # noqa: F401
 
     ensure_runtime_directories(_settings)
     try:

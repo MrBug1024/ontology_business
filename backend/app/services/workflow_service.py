@@ -2888,13 +2888,24 @@ def _workflow_context(description: str) -> str:
     return context
 
 
-def generate_workflow(db: Session, scenario: BusinessScenario, description: str) -> dict[str, Any]:
+def generate_workflow(
+    db: Session, scenario: BusinessScenario, description: str, *,
+    modeling_references: dict | None = None, llm_config_id: str | None = None,
+) -> dict[str, Any]:
     """调用 LLM 生成可视化工作流草稿（DAG 节点+连线，不落库）。"""
     from ..models import OntologyEvent
 
     context = _workflow_context(description or scenario.description or "")
 
-    llm = tenant_service.get_visible(db, LLMConfig, scenario.llm_config_id) if getattr(scenario, "llm_config_id", None) and db.info.get("tenant_id") else None
+    from . import modeling_reference_contract
+
+    reference_context = modeling_reference_contract.prompt(modeling_references)
+    if llm_config_id:
+        llm = next((item for item in llm_service.routable_configs(db, "chat") if item.id == llm_config_id), None)
+        if llm is None:
+            raise ValueError("所选 AI 模型当前不可用，请重新选择")
+    else:
+        llm = tenant_service.get_visible(db, LLMConfig, scenario.llm_config_id) if getattr(scenario, "llm_config_id", None) and db.info.get("tenant_id") else None
     if not llm:
         if db.info.get("tenant_id"):
             candidates = llm_service.routable_configs(db, "chat")
@@ -2961,7 +2972,7 @@ def generate_workflow(db: Session, scenario: BusinessScenario, description: str)
         resp = llm_service.chat(
             llm,
             [
-                {"role": "system", "content": "你只输出 JSON。"},
+                {"role": "system", "content": "你只输出 JSON。" + reference_context},
                 {"role": "user", "content": attempt_prompt},
             ],
             temperature=0.3,

@@ -108,7 +108,7 @@ export function buildInputContractSubmission(
     const datasetId = draft.datasetId.trim()
     const datasetSchemaId = draft.datasetSchemaId.trim()
     if (!datasetId || !datasetSchemaId) {
-      throw new Error('请选择建模资料中的逻辑数据集和 Dataset Schema。')
+      throw new Error('请选择资料库中的逻辑数据集和 Dataset Schema。')
     }
     return {
       dataset_id: datasetId,

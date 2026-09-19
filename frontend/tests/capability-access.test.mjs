@@ -25,16 +25,17 @@ test('access center uses one server manifest for REST and MCP', () => {
   assert.doesNotMatch(view, /data_source_id|dataset_version_id|provider_key|runtime_config/)
 })
 
-test('navigation exposes six target domains and preserves old routes', () => {
+test('navigation puts the material library before distillation and preserves old routes', () => {
   const app = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
   const router = readFileSync(new URL('../src/router/index.ts', import.meta.url), 'utf8')
 
-  for (const label of ['场景能力', '建模资料', '验证中心', '发布与接入', '运行治理', '平台配置']) {
+  for (const label of ['场景能力', '资料库', '业务蒸馏', '验证中心', '发布与接入', '运行治理', '平台设置']) {
     assert.match(app, new RegExp(label))
   }
   for (const path of ['/scenarios', '/data-sources', '/agents', '/access', '/tasks', '/templates', '/mcp']) {
     assert.match(router, new RegExp(`path: '${path.replace('/', '\\/')}`))
   }
+  assert.ok(app.indexOf('index="/data-sources"') < app.indexOf('index="/business-distillation"'))
 })
 
 test('access center keeps loading feedback around manifests without flashing empty states', () => {

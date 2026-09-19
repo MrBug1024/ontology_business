@@ -11,7 +11,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ..external_api_models import ExternalApiKey, ExternalApiKeyAuditEvent
-from ..models import Organization, OrganizationMember, User
+from ..models import BusinessScenario, Organization, OrganizationMember, User
 from . import permission_service
 
 
@@ -38,6 +38,7 @@ class ExternalApiContext:
     db: Session
     key_id: str
     tenant_id: str
+    scenario_id: str
     user_id: str
     scopes: frozenset[str]
     expires_at: datetime | None
@@ -88,6 +89,7 @@ def issue_key(
     name: str,
     scopes: list[str],
     expires_in_days: int,
+    scenario_id: str,
 ) -> tuple[ExternalApiKey, str]:
     """Create a key and return its raw value exactly once to the caller."""
     user = db.get(User, user_id)
@@ -100,6 +102,11 @@ def issue_key(
         raise ExternalApiKeyError("API key 签发者不是当前组织的有效用户")
     if not _active_member(db, tenant_id, issued_by_user_id):
         raise ExternalApiKeyError("API key 签发者没有有效组织成员身份")
+    scenario = db.get(BusinessScenario, scenario_id)
+    if scenario is None or scenario.tenant_id != tenant_id or scenario.status == "retired":
+        raise ExternalApiKeyError("业务场景不存在或不可用于签发密钥")
+    if not permission_service.check_scenario(db, scenario, "manage").allowed:
+        raise ExternalApiKeyError("没有该业务场景的密钥签发权限")
     normalized_scopes = _normalize_scopes(scopes)
     clean_name = str(name or "").strip()
     if not clean_name or len(clean_name) > 120:
@@ -110,6 +117,7 @@ def issue_key(
     raw_token = f"ont_sk_{secrets.token_urlsafe(32)}"
     key = ExternalApiKey(
         tenant_id=tenant_id,
+        scenario_id=scenario_id,
         user_id=user_id,
         issued_by_user_id=issued_by_user_id,
         name=clean_name,
@@ -130,6 +138,7 @@ def issue_key(
             actor_user_id=issued_by_user_id,
             event_type="issued",
             details={
+                "scenario_id": scenario_id,
                 "scopes": normalized_scopes,
                 "expires_at": key.expires_at.isoformat() if key.expires_at else None,
             },
@@ -207,7 +216,7 @@ def authenticate_token(raw_token: str, db: Session) -> ExternalApiContext:
             ExternalApiKey.expires_at > now,
         )
     ).scalars().first()
-    if not key:
+    if not key or not key.scenario_id:
         raise _invalid_key()
     user = db.get(User, key.user_id)
     if not user or user.status != "active":
@@ -218,6 +227,7 @@ def authenticate_token(raw_token: str, db: Session) -> ExternalApiContext:
     # takes effect immediately without rotating every integration key.
     db.info["user_id"] = user.id
     db.info["tenant_id"] = key.tenant_id
+    db.info["external_scenario_id"] = key.scenario_id
     try:
         permission_service.require_principal(db)
     except HTTPException as exc:
@@ -240,6 +250,7 @@ def authenticate_token(raw_token: str, db: Session) -> ExternalApiContext:
         db=db,
         key_id=key.id,
         tenant_id=key.tenant_id,
+        scenario_id=key.scenario_id,
         user_id=user.id,
         scopes=scopes,
         expires_at=key.expires_at,
@@ -265,10 +276,12 @@ def key_metadata(key: ExternalApiKey) -> dict:
         # Corrupt rows remain inspectable/revocable without ever being shown as
         # usable. Authentication independently rejects them above.
         scopes = []
-    effective_status = "active" if key.status == "active" and scopes else "revoked"
+    effective_status = "active" if key.status == "active" and scopes and key.scenario_id else "revoked"
     return {
         "id": key.id,
         "tenant_id": key.tenant_id,
+        "scenario_id": key.scenario_id,
+        "binding_status": "bound" if key.scenario_id else "reissue_required",
         "user_id": key.user_id,
         "issued_by_user_id": key.issued_by_user_id,
         "revoked_by_user_id": key.revoked_by_user_id,

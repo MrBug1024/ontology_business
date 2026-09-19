@@ -27,6 +27,7 @@
   - **数据源**：
   - 版本化数据集：PostgreSQL Catalog 管理元数据，MinIO 保存不可变文件与 Parquet，DuckDB 执行只读查询。
   - PostgreSQL 连接器：表浏览与受控只读 SQL；PostgreSQL 也是平台控制面唯一关系型存储。
+  - 资料库还支持 MySQL 只读结构调查和受管 SQLite3 快照（`.db` / `.sqlite` / `.sqlite3`，最大 32 MB）。SQLite3 文件上传后保存在 MinIO 并校验内容身份，不接受服务器本机路径；这两类调查来源不自动成为正式运行连接器。
   - 文件桶（file bucket）：上传 Excel / Word / Markdown / PDF / 图片，自动解析入库用于 RAG 检索；验证 Agent 的附件先登记持久上传任务、流式写入 MinIO，再由后台 worker 解析，页面请求不等待解析完成。
 - **技能（Skill）**：安装受控的本地能力，供已配置的操作或工作流调用；内置 `ocr-parser`（OCR 文档解析）与 `data-analyzer`。
 - **MCP 服务**：接入 Model Context Protocol 工具服务（SSE / Streamable HTTP，以及由运维显式开启的 stdio）；支持表单配置请求头，也支持批量导入常见客户端的 `mcpServers` JSON。
@@ -35,6 +36,44 @@
 - **验证 Agent**：平台内用于验证场景能力、模型、运行输入和证据链的参考客户端。Agent Turn 可引用仍在上传/解析的持久任务，消息先落库并返回 `202 Accepted`，后台再准备输入和执行；页面可恢复 SSE 进度，并通过 revision 控制取消和重试冲突。是否可验证按能力契约动态判断；没有数据端口的能力不要求数据源或映射。
 - **AI 对话**：场景内可选择完整建模、本体、映射、业务能力、工作流、只读解释或操作预演；完整建模会生成带来源证据、冲突检查和原子确认的跨资源变更清单。带附件的全局顾问消息会先连同占位回复和持久请求台账原子落库，再由后台等待附件并执行，刷新后可恢复、取消或显式重试；重试创建父子审计链，不改写旧终态。文档全文和表格原始行只作为服务端索引/查询来源，LLM 只接收有界检索片段、引用元数据和受限工具结果，不能把未检索部分表述为已阅读。
 - **任务中心**：集中处理工作流状态、重试和人工审批；运行时内部保留权限、连接解析和定义快照等安全内核，但不作为独立业务菜单暴露。
+
+## 业务蒸馏与场景专属接入
+
+导航顺序为资料库 → 业务蒸馏 → 场景能力 → 验证中心 → 发布与接入。资料库沿用 `/data-sources` 路由，统一管理业务理解和建模所用的长期来源及蒸馏交付物；`/business-distillation` 按业务场景组织协作对话。
+
+1. 在顶栏选择业务场景，从“新建对话”输入业务问题。左侧只列出当前场景的会话；切换场景不会修改已有对话的归属。AI 结合连续上下文逐步明确受益者、痛点、目标结果和业务边界。
+2. 需要长期保存的历史文件、结果快照、过程记录和数据库连接统一在资料库维护，蒸馏页选择已有资料供工具调查。对话输入区可上传临时分析附件，显示可用期限，附件不自动登记到资料库。顶栏“业务系统”配置网页链接、登录账号密码及授权范围。Agent 可用真实浏览器登录、读取动态页面与表格、点击导航、填写查询条件；凭据独立加密保存，由后端注入登录控件，不进入模型、项目文档或对话。
+3. AI 对话设置可选择共享模型、调查工具、受信技能方法及 MCP 只读资料。技能读取方法说明，MCP 通过 resources/list/read 调查文本资料；不支持的协议或内容会明确报错。AI 按需调用并显示实际调查步骤与结果。歧义以问题卡交给人，提问后本轮停止，收到回答才继续。对话和工具记录持久保存，刷新可恢复；取消、超时恢复和多实例处理使用 PostgreSQL claim、lease 与 fencing。
+4. 中间按业务价值、ER、流程、血缘、历史案例、证据与待澄清页签展示产物，右侧持续对话。无产物时只有简洁空态；AI 返回的当前版本提案直接显示为“待采用”，人工在对话中纠正或采用。窄屏可切换产物与对话。项目或证据变化后拒绝采用陈旧建议，没有逐主题签字或业务建模表单。
+5. 保存到资料库时，通过简短引导选择继续建设、调整方向或暂缓建设，可补充决定依据，再由人工确认保存。每个版本原子保存为不可变 PostgreSQL 建模文档，可下载 Markdown、现状/目标流程 Mermaid、ER、血缘、JSON 业务契约及证据身份清单。这些有界文档不伪装成 MinIO 上传文件。
+6. 场景顾问/模型编译器读取该场景明确交接的最新基线，保留来源、用途、未决问题及停止判断。历史未归属对话仍可访问，其成果可明确复制到目标场景后保存到资料库。
+
+平台设置位于侧栏底部齿轮，通用、模型、工具、技能、MCP 在全局弹窗中管理；配置仍按工作区隔离。规范与模板附件归资料库管理。智能业务顾问只在 `/scenarios/:id?stage=...` 场景建模页出现；业务蒸馏 AI 和验证中心 Agent 保持独立职责、资源选择和会话状态。
+
+交互与阶段职责见 [业务蒸馏协作设计](./docs/business-distillation-design.md)。
+
+MySQL 调查连接要求受信 TLS，并由部署者通过 `LIBRARY_MYSQL_ALLOWED_HOSTS` 指定精确主机名单（逗号分隔，无通配符）。资料库密码使用现有 `WORKFLOW_PAYLOAD_ENCRYPTION_KEYS` / `WORKFLOW_PAYLOAD_ACTIVE_KEY_ID` 密钥环派生的独立加密域保存；缺少有效密钥时拒绝保存凭据。已有 PostgreSQL 连接仍可读取，显式编辑保存后转为加密配置；接口不返回明文密码，编辑时留空保留原密码。数据库调查支持结构发现及有界样本读取（PostgreSQL、MySQL 和受管 SQLite 快照）：工具仅接受返回的表/字段引用和参数化过滤，不接受 SQL。可对实际样本核对单键/复合键，保留多匹配、未匹配、空值与样本局限，不以样本唯一宣称总体唯一。
+
+
+浏览器调查由部署显式启用：安装依赖后运行 `python -m playwright install chromium`，设置 `DISTILLATION_BROWSER_ENABLED=true`；`DISTILLATION_BROWSER_MAX_SESSIONS` 限制每个 worker 进程的浏览器数量（默认 2）。使用独立的、低权限应用运行账号，保持 Chromium sandbox。网站授权与现有工作流负载密钥环采用不同加密域，缺少密钥时拒绝保存。
+
+浏览器网络只访问配置的同源路径，复用现有 HTTPS/私网白名单及 DNS 固定传输；内网 HTTP 还需部署设置 `ALLOW_INSECURE_MCP_HTTP=true` 和精确 `MCP_PRIVATE_HOST_ALLOWLIST`。所有浏览器 HTTP 经受控传输，无自动重定向；POST 只允许当前登录操作的表单地址/授权登录接口及明确声明的只读查询接口。图片、媒体、下载、WebSocket、服务工作线程和跨站请求不用于调查。验证码、多域 SSO、需执行副作用的页面明确交给专家协调，不宣称可以无人值守登录任何系统。会话仅本轮有效，取消/权限变化拒绝继续；登录中断不自动重放。
+
+受信方法位于 `backend/skills/business-discovery/SKILL.md`。它指导 Agent 从历史结果逆向输入、规则与过程，核对复合身份和反例，并通过问答澄清，不生成固定行业结论。`review_business` 返回方法，浏览器/样本/文件工具返回实际观察，`record_human_statement` 显式引用本轮陈述，`ask_human` 暂停等待，`propose_document` 形成待采用产物。接口、数据样本与访问凭据不会变成正式能力的运行绑定。
+
+REST API v2 与 Capability MCP 沿用现有发布机制，但集成密钥现在必须绑定单个业务场景。服务器对能力目录、调用、回执、审批/交互和本次附件统一收窄范围；知道其他场景资源 ID 也不能扩大授权。升级迁移会撤销历史无场景密钥并记录原因，管理员需在“发布与接入”选择场景重新签发。正常停用/退役方式不变；保留蒸馏证据或外部附件归属时，永久删除计划会明确提示阻断原因。
+
+部署前由迁移角色执行 `python -m alembic -c backend/alembic.ini -x use_admin=1 upgrade head`，读取实际 single head，不复制固定 revision。运行角色不得 DDL。新增隔离验收如下（实际 Python 应为 3.12.x）：
+
+```powershell
+$env:PYTHONPATH=(Resolve-Path .\backend).Path
+$env:RUN_POSTGRESQL_INTEGRATION_TESTS='1'
+python -m pytest .\backend\tests -q
+npm --prefix .\frontend test
+npm --prefix .\frontend run build
+```
+
+浏览器验收可运行 `python backend/tests/run_distillation_browser.py --port 8012 --frontend-port 5175 --scripted-distillation-llm`，另开终端设置 `VITE_API_PROXY_TARGET=http://127.0.0.1:8012` 后启动 `npm --prefix frontend run dev -- --host 127.0.0.1 --port 5175 --strictPort`。脚本自行创建、迁移和清理隔离数据库，打印仅用于该次验收的合成登录账号；输入 `stop` 后回车优雅关闭并清理。真实认证、会话与 Origin 校验保留；该选项使用测试脚本模型驱动实际蒸馏 worker，其他后台 worker 和外部服务禁用，因此此验收不代表真实 LLM、邮件或上传 worker 已验证。
 
 ## 工作区协作与系统账户
 
@@ -209,6 +248,9 @@ stdio 会在 API 宿主机启动进程，因此默认关闭；仅可信的单租
 ALLOW_MCP_STDIO=false
 ALLOW_INSECURE_MCP_HTTP=false
 MCP_PRIVATE_HOST_ALLOWLIST=
+DISTILLATION_BROWSER_ENABLED=false
+DISTILLATION_BROWSER_MAX_SESSIONS=2
+DISTILLATION_MODEL_TIMEOUT_SECONDS=120
 MCP_OPERATION_TIMEOUT_SECONDS=90
 ```
 

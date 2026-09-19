@@ -47,6 +47,7 @@ from . import (
     datasource_service,
     function_definition_service,
     llm_service,
+    modeling_reference_contract,
     mapping_refresh_service,
     ontology_service,
     operations_service,
@@ -1143,7 +1144,7 @@ def _mapping_catalog(
                 tenant_service.visible_clause(DataSource, db),
                 or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == scenario.id),
                 DataSource.resource_scope == "modeling",
-                DataSource.type != "file_bucket",
+                DataSource.type.in_(("postgres", "dataset")),
             ).order_by(DataSource.created_at, DataSource.id)
         ).scalars().all()
     )
@@ -1197,6 +1198,8 @@ def _mapping_catalog(
 def prepare_compilation_context(
     db: Session,
     scenario: BusinessScenario,
+    *,
+    modeling_references: dict | None = None,
 ) -> dict[str, Any]:
     """Freeze the exact credential-free physical schema used by one job."""
     permission_service.require_scenario_permission(
@@ -1205,10 +1208,15 @@ def prepare_compilation_context(
         "write",
         message="完整场景建模需要当前场景的编辑权限",
     )
+    modeling_references = modeling_reference_contract.normalize(modeling_references)
     mapping_catalog, columns = _mapping_catalog(db, scenario)
     working_drafts = scenario_model_draft_service.active_working_draft_context(
         db, scenario
     )
+    from . import distillation_handoff_service, distillation_service
+
+    distillation_documents = distillation_service.modeling_documents(db, scenario.id)
+    distillation_handoff_service.require_compilation_decision(distillation_documents)
     mapping_canonical = json.dumps(
         mapping_catalog,
         ensure_ascii=False,
@@ -1225,12 +1233,14 @@ def prepare_compilation_context(
         "mapping_catalog": mapping_catalog,
         "columns_by_table": columns,
         "working_drafts": working_drafts,
+        "distillation_documents": distillation_documents,
+        **({"modeling_references": modeling_references} if modeling_references else {}),
         "consumed_draft_revisions": {
             str(item.get("draft_id") or ""): int(item.get("revision") or 0)
             for item in working_drafts
             if str(item.get("draft_id") or "")
         },
-        "fingerprint": _context_fingerprint(mapping_catalog, working_drafts),
+        "fingerprint": _context_fingerprint(mapping_catalog, working_drafts, distillation_documents, modeling_references),
     }
 
 
@@ -1258,11 +1268,15 @@ def _sanitized_working_drafts(value: Any) -> list[dict[str, Any]]:
 def _context_fingerprint(
     mapping_catalog: list[dict[str, Any]],
     working_drafts: list[dict[str, Any]],
+    distillation_documents: list[dict[str, Any]] | None = None,
+    modeling_references: dict | None = None,
 ) -> str:
     canonical = json.dumps(
         {
             "mapping_catalog": mapping_catalog,
             "working_drafts": working_drafts,
+            **({"distillation_documents": distillation_documents} if distillation_documents else {}),
+            **({"modeling_references": modeling_reference_contract.normalize(modeling_references)} if modeling_references else {}),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -1336,12 +1350,16 @@ def prepare_source_bundle_preview(
     working_drafts = _sanitized_working_drafts(
         prepared_context.get("working_drafts") or []
     )
-    expected = _context_fingerprint(mapping_catalog, working_drafts)
+    distillation_documents = copy.deepcopy(prepared_context.get("distillation_documents") or [])
+    from .distillation_handoff_service import require_compilation_decision
+
+    require_compilation_decision(distillation_documents)
+    expected = _context_fingerprint(mapping_catalog, working_drafts, distillation_documents, prepared_context.get("modeling_references"))
     if str(prepared_context.get("fingerprint") or "") != expected:
         raise ValueError("编译映射/working draft 上下文指纹不一致，拒绝使用非冻结输入")
     source_bundle = build_source_bundle(
         message,
-        documents,
+        [*documents, *distillation_documents],
         has_working_drafts=bool(working_drafts),
     )
     _append_working_draft_sources(source_bundle, working_drafts)
@@ -1732,6 +1750,7 @@ def _compiler_prompt(
     chunk_index: int | str | None = None,
     chunk_count: int | None = None,
     task_scope: str = "",
+    modeling_reference_context: str = "",
 ) -> str:
     task_scope = normalize_model_task_scope(task_scope)
     chunk_instruction = ""
@@ -1790,6 +1809,7 @@ def _compiler_prompt(
         + mapping_catalog_json
         + "\n编译控制说明（不可作为业务证据）：\n"
         + task_instruction
+        + modeling_reference_context
         + "\n待逐段编译的业务语义来源（附件只包含服务端按需返回的有界片段；"
         "只能引用给出的 ref，不得声称读取或覆盖未返回的原始内容）：\n"
         + json.dumps(paragraphs, ensure_ascii=False, separators=(",", ":"))
@@ -2876,6 +2896,7 @@ def _extract_chunk_models_recursively(
     request_timeout: float | None = None,
     on_progress: ProgressCallback | None = None,
     task_scope: str = "",
+    modeling_reference_context: str = "",
 ) -> list[dict[str, Any]]:
     """Retry only truncated branches by stable character-weighted bisection."""
     chunk_prompt = _compiler_prompt(
@@ -2887,6 +2908,7 @@ def _extract_chunk_models_recursively(
         chunk_index=chunk_label,
         chunk_count=chunk_count,
         task_scope=task_scope,
+        modeling_reference_context=modeling_reference_context,
     )
     _notify_progress(
         on_progress,
@@ -2929,6 +2951,7 @@ def _extract_chunk_models_recursively(
                     request_timeout=request_timeout,
                     on_progress=on_progress,
                     task_scope=task_scope,
+                    modeling_reference_context=modeling_reference_context,
                 )
             except Exception as child_error:  # noqa: BLE001 - preserve sibling drafts.
                 if not _recoverable_chunk_failure(child_error):
@@ -3076,6 +3099,7 @@ def _extract_chunk_once_in_isolated_session(
     request_timeout: float | None,
     on_progress: ProgressCallback | None,
     task_scope: str,
+    modeling_reference_context: str = "",
 ) -> dict[str, Any]:
     """Extract one leaf so recursive splits can reuse the bounded worker pool."""
     with Session(bind=bind, expire_on_commit=False) as chunk_db:
@@ -3096,6 +3120,7 @@ def _extract_chunk_once_in_isolated_session(
             chunk_index=chunk_label,
             chunk_count=chunk_count,
             task_scope=task_scope,
+            modeling_reference_context=modeling_reference_context,
         )
         _notify_progress(
             on_progress,
@@ -3156,6 +3181,7 @@ def _compile_scenario_model_in_chunks(
     on_progress: ProgressCallback | None = None,
     on_checkpoint: CheckpointCallback | None = None,
     task_scope: str = "",
+    modeling_reference_context: str = "",
 ) -> dict[str, Any]:
     """Extract bounded chunks, then normalize once with the complete source view."""
     task_scope = normalize_model_task_scope(task_scope)
@@ -3272,6 +3298,7 @@ def _compile_scenario_model_in_chunks(
                         request_timeout=request_timeout,
                         on_progress=on_progress,
                         task_scope=task_scope,
+                        modeling_reference_context=modeling_reference_context,
                     )
                 ),
             )
@@ -3305,6 +3332,7 @@ def _compile_scenario_model_in_chunks(
                     request_timeout=request_timeout,
                     on_progress=(serialized_progress if on_progress is not None else None),
                     task_scope=task_scope,
+                    modeling_reference_context=modeling_reference_context,
                 )
                 future_chunks[future] = (path, paragraphs)
 
@@ -3533,7 +3561,9 @@ def compile_scenario_model(
         tuple(key): set(value)
         for key, value in (prepared_context.get("columns_by_table") or {}).items()
     }
-    expected_context_hash = _context_fingerprint(mapping_catalog, working_drafts)
+    expected_context_hash = _context_fingerprint(mapping_catalog, working_drafts,
+        prepared_context.get("distillation_documents") or [], prepared_context.get("modeling_references"))
+    modeling_reference_context = modeling_reference_contract.prompt(prepared_context.get("modeling_references"))
     if str(prepared_context.get("fingerprint") or "") != expected_context_hash:
         raise ValueError("编译映射/working draft 上下文指纹不一致，拒绝使用非冻结输入")
     source_bundle = prepare_source_bundle_preview(
@@ -3588,6 +3618,7 @@ def compile_scenario_model(
             on_progress=on_progress,
             on_checkpoint=on_checkpoint,
             task_scope=task_scope,
+            modeling_reference_context=modeling_reference_context,
         )
     prompt = _compiler_prompt(
         scenario,
@@ -3596,6 +3627,7 @@ def compile_scenario_model(
         mapping_catalog=mapping_catalog,
         db=db,
         task_scope=task_scope,
+        modeling_reference_context=modeling_reference_context,
     )
     last_error: Exception | None = None
     best_salvage_raw: dict[str, Any] | None = None
@@ -3647,6 +3679,7 @@ def compile_scenario_model(
                     on_progress=on_progress,
                     on_checkpoint=on_checkpoint,
                     task_scope=task_scope,
+                    modeling_reference_context=modeling_reference_context,
                 )
             if not _is_transient_provider_error(exc):
                 return _mark_staged_task_result(_unavailable_compilation_result(
@@ -3684,6 +3717,7 @@ def compile_scenario_model(
                 on_progress=on_progress,
                 on_checkpoint=on_checkpoint,
                 task_scope=task_scope,
+                modeling_reference_context=modeling_reference_context,
             )
         raw: Any = None
         try:

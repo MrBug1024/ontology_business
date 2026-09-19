@@ -550,6 +550,7 @@
             @close="closeWorkflowEditor"
             @save="saveWorkflow"
             @run-created="openWorkflowRun"
+            @ask-advisor="askWorkflowAdvisor"
           />
         </div>
         <!-- 工作流列表 -->
@@ -1165,8 +1166,8 @@
         <template v-else-if="actionForm.executor_type === 'template'">
           <el-alert title="Action 绑定模板中心中的受管模板；保存时会固定所选模板的当前版本，后续模板升级不会悄悄改变既有执行结果。" type="info" :closable="false" show-icon />
           <div class="template-binding-head">
-            <span>模板资源由模板中心统一管理，不再直接绑定文件 ID。</span>
-            <el-button text type="primary" @click="goToTemplates">打开模板中心</el-button>
+            <span>模板附件由资料库统一管理，不再直接绑定文件 ID。</span>
+            <el-button text type="primary" @click="goToTemplates">打开资料库</el-button>
           </div>
           <el-alert
             v-if="hasLegacyTemplateBinding"
@@ -1206,7 +1207,7 @@
               <el-icon aria-hidden="true"><WarningFilled /></el-icon><span>{{ actionTemplatesError }}</span>
               <el-button text type="primary" size="small" @click="loadActionTemplates">重试</el-button>
             </div>
-            <div v-else-if="!actionTemplatesLoading && !actionTemplates.length" class="form-help">当前场景没有可选模板，请先在模板中心上传并登记。</div>
+            <div v-else-if="!actionTemplatesLoading && !actionTemplates.length" class="form-help">当前场景没有可选模板，请先在资料库中上传并登记。</div>
           </el-form-item>
           <section v-if="selectedActionTemplate" class="selected-template-summary" aria-label="已选模板摘要">
             <header>
@@ -1534,7 +1535,7 @@ const llmConfigs = ref<any[]>([])
 const skills = ref<any[]>([])
 const mcpConfigs = ref<any[]>([])
 const scenarioDataSources = computed(() => dataSources.value.filter((source) => !source.scenario_id || source.scenario_id === sid))
-const databaseDataSources = computed(() => scenarioDataSources.value.filter((source) => source.type !== 'file_bucket'))
+const databaseDataSources = computed(() => scenarioDataSources.value.filter((source) => ['postgres', 'mysql', 'sqlite3', 'dataset'].includes(source.type)))
 const fileBucketSources = computed(() => scenarioDataSources.value.filter((source) => source.type === 'file_bucket'))
 const writableFileBucketSources = computed(() => fileBucketSources.value.filter((source) => source.can_write !== false))
 const stageNames = new Set(['ontology', 'instances', 'mappings', 'functions', 'actions', 'rules', 'events', 'workflows', 'capability-inputs', 'candidates'])
@@ -4301,7 +4302,13 @@ function goToDataSources() {
   router.push({ name: 'data-sources', query: { scenario_id: sid, return_to: route.fullPath } })
 }
 function goToTemplates() {
-  router.push({ name: 'templates', query: { scenario_id: sid, return_to: route.fullPath } })
+  router.push({ name: 'data-sources', query: { scenario_id: sid, return_to: route.fullPath } })
+}
+function askWorkflowAdvisor(prompt: string) {
+  if (!canWrite.value) return
+  window.dispatchEvent(new CustomEvent('open-scenario-modeling-advisor', {
+    detail: { scenario_id: sid, prompt },
+  }))
 }
 function onAssistantApplied(event: Event) {
   const detail = (event as CustomEvent<{ scenario_id?: string }>).detail || {}

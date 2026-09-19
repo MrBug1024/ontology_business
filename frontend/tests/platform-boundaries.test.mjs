@@ -38,15 +38,16 @@ test('reparsing a large modeling file can complete after the ordinary request de
 
 test('modeling materials keep the old route and never become runtime data', () => {
   const viewSource = readFileSync(new URL('../src/views/DataSources.vue', import.meta.url), 'utf8')
+  const editorSource = readFileSync(new URL('../src/components/library/LibraryEditorDialog.vue', import.meta.url), 'utf8')
   const apiSource = readFileSync(new URL('../src/api/index.ts', import.meta.url), 'utf8')
   const routerSource = readFileSync(new URL('../src/router/index.ts', import.meta.url), 'utf8')
 
-  assert.match(viewSource, /<h1>建模资料<\/h1>/)
-  assert.match(viewSource, /本页全部都是建模资料/)
-  assert.match(viewSource, /可绑定到一个业务场景，也可保留为租户共享建模资料/)
-  assert.match(viewSource, /label="建模场景"/)
-  assert.match(viewSource, /只影响建模时的资料选择与访问范围/)
-  assert.match(viewSource, /本页任何资料都不会自动进入正式调用/)
+  assert.match(viewSource, /<h1>资料库<\/h1>/)
+  assert.match(viewSource, /用于业务蒸馏与场景建模/)
+  assert.match(viewSource, /可绑定到一个业务场景，也可保留为工作区共享资料/)
+  assert.match(editorSource, /label="业务场景"/)
+  assert.match(viewSource, /绑定场景后，该场景可选择这些资料进行蒸馏和建模/)
+  assert.match(viewSource, /这里的资料不会自动进入正式调用/)
   assert.doesNotMatch(viewSource, /目录与用途|物理接入与文件|ScenarioDatasetBinding/)
   assert.match(apiSource, /\/catalog\/assets/)
   assert.match(apiSource, /\/catalog\/datasets/)
@@ -82,4 +83,134 @@ test('scenario lifecycle toggle binds stable values instead of display labels', 
   assert.match(toggle, /<el-radio-button value="current">当前场景<\/el-radio-button>/)
   assert.match(toggle, /<el-radio-button value="retired">已退役<\/el-radio-button>/)
   assert.doesNotMatch(toggle, /<el-radio-button\s+label=/)
+})
+
+function routeDefinition(source, path) {
+  const pathIndex = source.indexOf(`path: '${path}'`)
+  assert.notEqual(pathIndex, -1, `missing route for ${path}`)
+  const start = source.lastIndexOf('{', pathIndex)
+  assert.notEqual(start, -1, `missing route object for ${path}`)
+
+  let depth = 0
+  for (let index = start; index < source.length; index += 1) {
+    if (source[index] === '{') depth += 1
+    if (source[index] === '}') depth -= 1
+    if (depth === 0) return source.slice(start, index + 1)
+  }
+  assert.fail(`unterminated route object for ${path}`)
+}
+
+test('platform settings move to the side footer and scenario modeling owns the global advisor', () => {
+  const appSource = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
+  const navStart = appSource.indexOf('<nav class="side-nav"')
+  const navEnd = appSource.indexOf('</nav>', navStart)
+  const footerStart = appSource.indexOf('<div class="side-footer">')
+  const footerEnd = appSource.indexOf('</el-aside>', footerStart)
+  const navigation = appSource.slice(navStart, navEnd)
+  const footer = appSource.slice(footerStart, footerEnd)
+  const advisorTags = appSource.match(/<GlobalAssistant\b/g) || []
+
+  assert.notEqual(navStart, -1)
+  assert.notEqual(navEnd, -1)
+  assert.notEqual(footerStart, -1)
+  assert.notEqual(footerEnd, -1)
+  assert.doesNotMatch(navigation, /<el-sub-menu index="settings">/)
+  assert.doesNotMatch(navigation, /index="\/(?:templates|llm|mcp|skills)"/)
+  assert.match(footer, /aria-label="打开平台设置"/)
+  assert.match(footer, /<Setting/)
+  assert.match(appSource, /PlatformSettingsDialog/)
+  assert.match(appSource, /v-model="platformSettingsOpen"/)
+  assert.match(appSource, /route\.query\.platform_settings/)
+  assert.match(appSource, /platformSettingsQuery\(route\.query, tab\)/)
+  assert.match(appSource, /platformSettingsQuery\(route\.query, null\)/)
+  assert.equal(advisorTags.length, 1, 'the modeling advisor must not mount on unrelated routes')
+  assert.match(appSource, /<GlobalAssistant\b[^>]*\bv-if="[^"]+"/)
+  assert.match(appSource, /route\.name\s*===\s*'scenario-detail'/)
+})
+
+test('legacy configuration URLs always open the global settings surface', () => {
+  const routerSource = readFileSync(new URL('../src/router/index.ts', import.meta.url), 'utf8')
+
+  for (const [path, tab] of [
+    ['/llm', 'llm'],
+    ['/mcp', 'mcp'],
+    ['/skills', 'skills'],
+  ]) {
+    const route = routeDefinition(routerSource, path)
+    assert.match(route, new RegExp(`legacyPlatformSettingsRedirect\\('${tab}'\\)`))
+  }
+
+  assert.doesNotMatch(routerSource, /if \(to\.query\.manage === '1'\) return true/)
+  assert.match(routerSource, /delete query\.manage/)
+  assert.match(routerSource, /name: 'data-sources'/)
+  assert.match(routerSource, /query\.platform_settings = tab/)
+
+  const templatesRoute = routeDefinition(routerSource, '/templates')
+  assert.match(templatesRoute, /redirect\s*:/)
+  assert.match(templatesRoute, /(?:path:\s*'\/data-sources'|name:\s*'data-sources')/)
+  assert.match(templatesRoute, /library_tab:\s*'templates'/)
+  assert.doesNotMatch(templatesRoute, /component\s*:/)
+})
+
+test('settings queries retain the current work and close cleanly on navigation', async () => {
+  const compiled = ts.transpileModule(readFileSync(new URL('../src/utils/platformSettings.ts', import.meta.url), 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  const { platformSettingsQuery, platformSettingsTabFromQuery } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+  const context = { stage: 'actions', scenario_id: 'synthetic-scenario', filters: ['active', 'owned'] }
+  const opened = platformSettingsQuery(context, 'llm')
+  assert.deepEqual(opened, { ...context, platform_settings: 'llm' })
+  assert.equal(platformSettingsTabFromQuery(opened.platform_settings), 'llm')
+  const switched = platformSettingsQuery(opened, 'mcp')
+  assert.equal(platformSettingsTabFromQuery(switched.platform_settings), 'mcp')
+  assert.deepEqual(platformSettingsQuery(switched, null), context)
+  assert.deepEqual(context, { stage: 'actions', scenario_id: 'synthetic-scenario', filters: ['active', 'owned'] })
+  assert.equal(platformSettingsTabFromQuery(['skills', 'mcp']), 'skills')
+  for (const invalid of [undefined, null, '', 'templates', '/llm', {}, [null, 'llm']]) {
+    assert.equal(platformSettingsTabFromQuery(invalid), null)
+  }
+})
+
+test('settings manage resources inside the modal and keep nested editors above it', () => {
+  const dialog = readFileSync(new URL('../src/components/platform/PlatformSettingsDialog.vue', import.meta.url), 'utf8')
+  assert.doesNotMatch(dialog, /openPage|useRouter|完整管理/)
+  for (const panel of ['ModelSettingsPanel', 'SkillSettingsPanel', 'McpSettingsPanel']) {
+    assert.match(dialog, new RegExp(`<${panel}`))
+    const source = readFileSync(new URL(`../src/components/platform/${panel}.vue`, import.meta.url), 'utf8')
+    for (const tag of source.matchAll(/<el-(?:dialog|drawer)\b[^>]*>/g)) {
+      assert.match(tag[0], /append-to-body/)
+    }
+  }
+  assert.match(dialog, /:close-on-click-modal="false"/)
+  assert.match(dialog, /v-if="modelValue"/)
+})
+
+test('global tool settings show the server catalog for the distinct distillation role', () => {
+  const tools = readFileSync(new URL('../src/components/platform/ToolSettingsPanel.vue', import.meta.url), 'utf8')
+  assert.match(tools, /distillationConversationApi\.resources\(request\.signal\)/)
+  assert.match(tools, /resources\.investigation_tools\.tools/)
+  assert.match(tools, /tool\.always_available/)
+  assert.match(tools, /connector\.mode === 'resources'/)
+  assert.match(tools, /业务蒸馏 · 内置调查工具/)
+  assert.doesNotMatch(tools, /api\.mcpTools|tools\/call/)
+  assert.match(tools, /onBeforeUnmount\(\(\) => \{ controller\?\.abort\(\)/)
+})
+
+test('artifact templates stay manageable inside the library after the legacy route redirect', () => {
+  const librarySource = readFileSync(new URL('../src/views/DataSources.vue', import.meta.url), 'utf8')
+  const templateSource = readFileSync(new URL('../src/views/Templates.vue', import.meta.url), 'utf8')
+
+  assert.match(librarySource, /<el-tab-pane label="产物模板" name="templates"/)
+  assert.match(librarySource, /<Templates embedded @show-materials="showMaterials"/)
+  assert.match(librarySource, /function libraryTabFromQuery[\s\S]*?candidate === 'templates'/)
+  assert.match(librarySource, /query\.library_tab = 'templates'/)
+  assert.match(librarySource, /delete query\.library_tab/)
+
+  assert.match(templateSource, /defineProps<\{ embedded\?: boolean \}>/)
+  assert.match(templateSource, /template-section-header/)
+  assert.match(templateSource, /emit\('showMaterials'\)/)
+  assert.match(templateSource, /const query = \{ \.\.\.route\.query \}/)
+  assert.match(templateSource, /await api\.uploadTemplateVersion/)
+  assert.match(templateSource, /current_version_id: versionId/)
+  assert.match(templateSource, /function goToAction/)
 })

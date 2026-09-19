@@ -102,7 +102,7 @@ _SECRET_STRING_PATTERNS = (
     # Embedded ``key=value`` / JSON-like ``\"token\": \"...\"`` strings.
     re.compile(
         r"(?:api[_-]?key|access[_-]?token|token|client[_-]?secret|password|passwd|"
-        r"secret|credential|authorization)\s*(?:=|:)\s*[^\s,;]+",
+        r"secret|credential|authorization)[\"']?\s*(?:=|:)\s*[^\s,;]+",
         re.IGNORECASE,
     ),
     # Credential-bearing database/HTTP connection URLs.  A redaction is safer than

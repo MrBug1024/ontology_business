@@ -61,6 +61,7 @@
 | 前端 | Vue 3、TypeScript 5.x（精确版本以 lockfile 为准）、Vite 6、Pinia、Vue Router、Element Plus、Axios、Vue Flow、Marked |
 | 后端 | Python 3.12、FastAPI、同步 SQLAlchemy 2、Pydantic v2/settings、psycopg 3、Alembic |
 | AI / 协议 | OpenAI 兼容接口、LangChain/LangGraph、MCP SDK、httpx |
+| 业务系统调查 | 可选 Playwright / Chromium；按已授权站点进行有界浏览器读取 |
 | PostgreSQL | 租户、权限、定义、发布、目录、任务、审计与控制面权威 |
 | MinIO | 不可变上传、Parquet、产物和证据对象 |
 | Redis | 可失效、可降级、可重建的缓存 |
@@ -93,6 +94,8 @@ python -m venv .venv
 python -m pip install -r .\backend\requirements.txt
 python -m pip install 'pytest>=8.3,<9'
 python .\backend\scripts\install_duckdb_extensions.py
+# Optional: required before enabling DISTILLATION_BROWSER_ENABLED
+python -m playwright install chromium
 if (-not (Test-Path -LiteralPath .\backend\.env)) {
     Copy-Item -LiteralPath .\backend\.env.example -Destination .\backend\.env
 }
@@ -268,6 +271,7 @@ Domain contract 不依赖 FastAPI、ORM、具体 Provider 或外部 SDK；Provid
 - 每个受保护读写验证 authenticated principal、tenant 和资源归属；只有 scenario-scoped 资源才要求对应场景 ACL，role/scope 按入口契约适用。deny 优先 allow，公共资源对非所有者只读，缺失权限按无权处理。
 - 跨租户与不存在资源沿用防枚举语义；错误、日志和时序不得泄露目标细节。worker 必须恢复可审计 execution principal，发起人失效后不得匿名或升级 owner。
 - 浏览器 HttpOnly session、外部 `X-API-Key` 和 Agent MCP token 是独立认证域，不互相回退或复用 hash domain。token 原文只在创建时返回一次，数据库保存域分离 hash。
+- 对外集成密钥必须持久绑定签发时的唯一业务场景；REST API v2 与 Capability MCP 的发现、调用、回执、业务交互和受管附件均取该场景与成员权限的交集，不得通过资源 ID、管理员身份或公开资源扩大范围。历史无场景密钥必须撤销并保留可审计的重新签发提示，禁止猜测归属。
 - Cookie 认证的状态写请求必须有同源 Origin/Referer 或 CSRF token 防护；生产必须启用 Secure Cookie，并在登录、密码重置和权限敏感变化后轮换/撤销会话。登录、验证码、重置和 token issuance 使用跨进程持久限流，不依赖单进程计数。
 - 所有 token 类型（含浏览器 session）必须使用显式 domain separation；遗留无前缀格式只能通过有版本、可回归的兼容迁移退出，不得成为新 token 的模板。
 - 真实 password/API key/token/header/env/key ring/连接 URL/明文 workflow input 不进入 repr、日志、错误、prompt、snapshot、Receipt、fixture、URL、localStorage 或普通前端状态。安全测试可使用不可复用的 synthetic/ephemeral 值；缺少部署加密 key 时 fail closed。

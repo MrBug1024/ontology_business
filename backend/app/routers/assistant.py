@@ -1,4 +1,4 @@
-"""全局 AI 助手：跨页面上下文、临时附件、草稿生成与确认应用。"""
+"""场景建模智能业务顾问：授权资料、建模参考、草稿生成与确认应用。"""
 from __future__ import annotations
 
 import json
@@ -68,6 +68,8 @@ from ..services import (
     assistant_orchestrator,
     assistant_decision_gate,
     assistant_research_service,
+    assistant_resource_context_service,
+    modeling_reference_contract,
     assistant_compilation_job_service,
     assistant_request_run_service,
     assistant_compilation_stream_service,
@@ -151,7 +153,7 @@ _LEGACY_MODELING_RAG_SOURCE_FIELDS = frozenset({
     "char_start",
     "char_end",
 })
-_MAX_LEGACY_MODELING_RAG_SOURCES = 5
+_MAX_LEGACY_MODELING_RAG_SOURCES = 25  # Five retrieved chunks plus twenty bounded handoffs.
 
 # Compound compilation is proposal-only and each job has a durable single-
 # flight claim. A small process-local pool keeps provider work independent of
@@ -172,6 +174,7 @@ _COMPILATION_HEARTBEAT_SECONDS = max(
 )
 _COMPILATION_STREAM_REFRESH_SECONDS = 1.0
 _COMPILATION_STREAM_LIVENESS_SECONDS = 8.0
+_SELECTED_ASSISTANT_REFERENCE_UNAVAILABLE = "所选参考资源当前不可用，请刷新后重新选择"
 
 
 def _durable_prepared_context(value: dict[str, Any]) -> dict[str, Any]:
@@ -191,6 +194,8 @@ def _durable_prepared_context(value: dict[str, Any]) -> dict[str, Any]:
         "mapping_catalog": copy.deepcopy(value.get("mapping_catalog") or []),
         "columns_by_table": columns,
         "working_drafts": copy.deepcopy(value.get("working_drafts") or []),
+        "distillation_documents": copy.deepcopy(value.get("distillation_documents") or []),
+        **({"modeling_references": modeling_reference_contract.normalize(value["modeling_references"])} if value.get("modeling_references") else {}),
         "consumed_draft_revisions": copy.deepcopy(
             value.get("consumed_draft_revisions") or {}
         ),
@@ -218,6 +223,8 @@ def _restore_durable_prepared_context(value: Any) -> dict[str, Any]:
         "mapping_catalog": copy.deepcopy(value.get("mapping_catalog") or []),
         "columns_by_table": columns,
         "working_drafts": copy.deepcopy(value.get("working_drafts") or []),
+        "distillation_documents": copy.deepcopy(value.get("distillation_documents") or []),
+        **({"modeling_references": modeling_reference_contract.normalize(value["modeling_references"])} if value.get("modeling_references") else {}),
         "consumed_draft_revisions": copy.deepcopy(
             value.get("consumed_draft_revisions") or {}
         ),
@@ -448,7 +455,10 @@ def _llm(db: Session) -> LLMConfig | None:
     candidates = llm_service.routable_configs(db, "chat")
     selected_id = str(db.info.get("assistant_llm_config_id") or "")
     if selected_id:
-        return next((candidate for candidate in candidates if candidate.id == selected_id), None)
+        selected = next((candidate for candidate in candidates if candidate.id == selected_id), None)
+        if selected is None:
+            raise HTTPException(409, "所选 AI 模型当前不可用，请重新选择")
+        return selected
     return candidates[0] if candidates else None
 
 
@@ -456,8 +466,8 @@ def _configure_assistant_runtime(db: Session, payload: AssistantChatRequest) -> 
     """Resolve optional assistant capabilities once for this request.
 
     The selected model is still subject to the normal tenant visibility and
-    routing checks.  Skills/MCP entries only become prompt context here; they
-    never bypass the governed runtime tool registry.
+    routing checks. Selected methods and MCP declarations are read through
+    the independent, bounded reference service; they grant no execution.
     """
     if payload.llm_config_id:
         selected = next(
@@ -469,46 +479,20 @@ def _configure_assistant_runtime(db: Session, payload: AssistantChatRequest) -> 
         db.info["assistant_llm_config_id"] = selected.id
 
 
-def _assistant_capability_context(db: Session, payload: AssistantChatRequest) -> str:
-    selected_skills = []
-    if payload.skill_ids:
-        selected_skills = db.execute(
-            select(Skill)
-            .where(
-                Skill.id.in_(payload.skill_ids),
-                Skill.enabled.is_(True),
-                tenant_service.visible_clause(Skill, db),
-            )
-            .order_by(Skill.name)
-        ).scalars().all()
-    selected_mcps = []
-    if payload.mcp_ids:
-        selected_mcps = db.execute(
-            select(MCPConfig)
-            .where(
-                MCPConfig.id.in_(payload.mcp_ids),
-                MCPConfig.enabled.is_(True),
-                tenant_service.visible_clause(MCPConfig, db),
-            )
-            .order_by(MCPConfig.name)
-        ).scalars().all()
-    lines = ["\n\n【本次助手能力配置】"]
-    lines.append(
-        "模型："
-        + ("已按本次请求选择专用模型。" if payload.llm_config_id else "使用平台默认可用模型。")
-    )
-    lines.append(
-        "技能："
-        + ("、".join(item.name for item in selected_skills) if selected_skills else "未指定")
-    )
-    lines.append(
-        "MCP："
-        + ("、".join(item.name for item in selected_mcps) if selected_mcps else "未指定")
-    )
-    lines.append(
-        "技能和 MCP 只能在本轮工具定义明确提供时调用；配置本身不会绕过权限、确认或平台受控执行流程。"
-    )
-    return "\n".join(lines)
+def _assistant_capability_context(db: Session, payload: AssistantChatRequest) -> dict:
+    """Own the read transaction around the advisor's bounded external reads."""
+    try:
+        selected = assistant_resource_context_service.resolve(db, payload.skill_ids, payload.mcp_ids)
+        if not selected.skills and not selected.mcps:
+            return {}
+        if db.new or db.dirty or db.deleted:
+            raise assistant_resource_context_service.AssistantResourceUnavailable("建模参考必须在保存变更前读取，请重新发送")
+        db.rollback()
+        document = assistant_resource_context_service.read(selected)
+        assistant_resource_context_service.revalidate(db, selected)
+        return document
+    except assistant_resource_context_service.AssistantResourceUnavailable as exc:
+        raise HTTPException(409, str(exc)) from None
 
 
 def _scenario_context(db: Session, scenario: BusinessScenario | None) -> str:
@@ -5386,6 +5370,9 @@ def _authorized_rag_context(
     """
     if not scenario or not (query or "").strip():
         return "", []
+    from ..services import distillation_handoff_service
+
+    handoff_context, handoff_sources = distillation_handoff_service.advisor_context(db, scenario.id)
     source_ids = list(
         db.scalars(
             select(DataSource.id).where(
@@ -5396,10 +5383,10 @@ def _authorized_rag_context(
         ).all()
     )
     if not source_ids:
-        return "", []
+        return handoff_context, handoff_sources
     results = rag_service.search(db, source_ids, query, top_k=5, max_chars=4_000)
     if not results:
-        return "", []
+        return handoff_context, handoff_sources
     sources = [
         {
             # Keep a complete, versioned reference rather than only a display
@@ -5422,7 +5409,7 @@ def _authorized_rag_context(
         }
         for item in results
     ]
-    return rag_service.build_context(results), sources
+    return "\n\n".join(filter(None, [handoff_context, rag_service.build_context(results)])), [*handoff_sources, *sources]
 
 
 _HISTORICAL_RAG_REDACTION = "该历史回答引用的资料已不在当前访问范围，内容已隐藏。"
@@ -5451,7 +5438,7 @@ def _current_rag_source(
     db: Session,
     thread: AssistantThread,
     source_meta: object,
-) -> tuple[DataSource, BucketFile, DocumentChunk | None] | None:
+) -> tuple[DataSource, BucketFile | None, DocumentChunk | None] | None:
     """Re-authorize one persisted assistant RAG citation.
 
     The source must still be visible to the request tenant, remain bound to the
@@ -5462,6 +5449,11 @@ def _current_rag_source(
     """
     if not isinstance(source_meta, dict) or not thread.scenario_id:
         return None
+    if source_meta.get("kind") == "distillation":
+        from ..services import distillation_handoff_service
+
+        source = distillation_handoff_service.current_source(db, thread.scenario_id, source_meta)
+        return (source, None, None) if source is not None else None
     source_id = str(source_meta.get("data_source_id") or "")
     file_id = str(source_meta.get("file_id") or "")
     chunk_id = str(source_meta.get("chunk_id") or "")
@@ -5527,6 +5519,10 @@ def _legacy_modeling_description(
 
 
 def _legacy_modeling_rag_source(source: object) -> dict[str, Any]:
+    if isinstance(source, dict) and source.get("kind") == "distillation":
+        from ..services import distillation_handoff_service
+
+        return distillation_handoff_service.normalize_citation(source)
     if not isinstance(source, dict) or source.get("kind") != "rag":
         raise ValueError("legacy modeling source must be an authorized RAG citation")
     char_start = source.get("char_start")
@@ -5569,13 +5565,16 @@ def _ordered_legacy_modeling_rag_sources(
     sources: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     normalized = [_legacy_modeling_rag_source(source) for source in sources]
+    if (sum(item["kind"] == "rag" for item in normalized) > 5
+            or sum(item["kind"] == "distillation" for item in normalized) > 20):
+        raise ValueError("legacy modeling proposal has too many source citations")
     normalized.sort(
         key=lambda item: (
             item["data_source_id"],
-            item["file_id"],
-            item["chunk_id"],
-            item["char_start"],
-            item["char_end"],
+            item.get("file_id") or item.get("publication_id") or "",
+            item.get("chunk_id") or "",
+            item.get("char_start", 0),
+            item.get("char_end", 0),
         )
     )
     identities = {
@@ -5679,9 +5678,12 @@ def _require_legacy_modeling_source_evidence(
     ):
         reject()
     try:
+        from ..services import distillation_handoff_service
+
         if any(
             not isinstance(source, dict)
-            or set(source) != _LEGACY_MODELING_RAG_SOURCE_FIELDS
+            or set(source) != (distillation_handoff_service.CITATION_FIELDS
+                if source.get("kind") == "distillation" else _LEGACY_MODELING_RAG_SOURCE_FIELDS)
             for source in raw_sources
         ):
             reject()
@@ -5955,6 +5957,7 @@ def _assistant_route_fingerprint(
     payload: AssistantChatRequest,
     *,
     scope_key: str,
+    modeling_references: dict | None = None,
 ) -> str:
     canonical = {
         "message": payload.message,
@@ -5970,6 +5973,8 @@ def _assistant_route_fingerprint(
         "mode": payload.mode,
         "draft_kind": payload.draft_kind,
     }
+    if modeling_references:
+        canonical["modeling_reference_fingerprint"] = modeling_reference_contract.normalize(modeling_references)["fingerprint"]
     try:
         return capability_contracts.canonical_hash(
             canonical,
@@ -6219,13 +6224,14 @@ def _claimed_request_route_plan(
     scope_key: str,
     request_id: str,
     pending_thread_id: str,
+    modeling_references: dict | None = None,
 ) -> tuple[
     assistant_orchestrator.AssistantRoutePlan,
     str,
     list[AssistantAttachment],
 ]:
     """Single-flight one semantic decision and freeze it before generation."""
-    fingerprint = _assistant_route_fingerprint(payload, scope_key=scope_key)
+    fingerprint = _assistant_route_fingerprint(payload, scope_key=scope_key, modeling_references=modeling_references)
     tenant_id = _tenant(db)
     user_id = _current_user_id(db)
     candidate_thread_id = thread.id if thread is not None else pending_thread_id
@@ -6625,7 +6631,9 @@ def _assistant_action_preview(
     return analysis, None, f"已完成操作“{runtime_action.name}”的预演；{approval}，本次没有触发外部副作用。"
 
 
-def _generate_scenario_draft(db: Session, description: str) -> dict[str, Any]:
+def _generate_scenario_draft(
+    db: Session, description: str, *, modeling_references: dict | None = None,
+) -> dict[str, Any]:
     """Generate a minimal global scenario draft without writing platform state."""
     llm = _llm(db)
     if not llm:
@@ -6639,7 +6647,7 @@ def _generate_scenario_draft(db: Session, description: str) -> dict[str, Any]:
     response = llm_service.chat(
         llm,
         [
-            {"role": "system", "content": "你只输出合法 JSON，不执行任何操作。"},
+            {"role": "system", "content": "你只输出合法 JSON，不执行任何操作。" + modeling_reference_contract.prompt(modeling_references)},
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
@@ -6670,7 +6678,7 @@ def _mapping_catalog(
                 tenant_service.visible_clause(DataSource, db),
                 or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == scenario.id),
                 DataSource.resource_scope == "modeling",
-                DataSource.type != "file_bucket",
+                DataSource.type.in_(("postgres", "dataset")),
             )
             .order_by(DataSource.created_at, DataSource.id)
             .limit(10)
@@ -6810,6 +6818,8 @@ def _generate_mapping_draft(
     scenario: BusinessScenario,
     description: str,
     selection: dict[str, Any] | None = None,
+    *,
+    modeling_references: dict | None = None,
 ) -> dict[str, Any]:
     llm = _llm(db)
     if not llm:
@@ -6849,7 +6859,7 @@ def _generate_mapping_draft(
     response = llm_service.chat(
         llm,
         [
-            {"role": "system", "content": "你只选择给定 ID、表和列并输出合法 JSON。"},
+            {"role": "system", "content": "你只选择给定 ID、表和列并输出合法 JSON。" + modeling_reference_contract.prompt(modeling_references)},
             {"role": "user", "content": prompt},
         ],
         temperature=0.1,
@@ -7918,7 +7928,8 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         )
     scenario = _scenario(db, payload.scenario_id, require_active=True)
     _configure_assistant_runtime(db, payload)
-    capability_context = _assistant_capability_context(db, payload)
+    modeling_references = _assistant_capability_context(db, payload)
+    capability_context = modeling_reference_contract.prompt(modeling_references)
     thread = _thread(db, payload.thread_id) if payload.thread_id else None
     scope_key = _context_scope(payload.scenario_id, payload.path)
     if thread:
@@ -7934,6 +7945,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         scope_key=scope_key,
         request_id=effective_request_id,
         pending_thread_id=pending_thread_id,
+        modeling_references=modeling_references,
     )
     if thread is None:
         thread = db.execute(
@@ -7946,6 +7958,8 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         if thread is not None:
             _assert_thread_scope(thread, payload.scenario_id, payload.page, payload.path)
     intent = route_plan.intent
+    if modeling_references and intent not in assistant_resource_context_service.SUPPORTED_INTENTS:
+        raise HTTPException(409, "所选技能方法和 MCP 契约仅用于问答与建模；当前操作不支持，请取消资源选择或改为建模提问")
     if intent == "scenario_model" and scenario:
         permission_service.require_scenario_permission(
             db, scenario, "write", message="完整场景建模需要当前场景的编辑权限"
@@ -7992,7 +8006,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
     sources = [*sources, *managed_sources]
     attachments = [*attachments, *managed_attachments]
     rag_context, rag_sources = _authorized_rag_context(db, scenario, payload.message)
-    sources = [*sources, *rag_sources]
+    sources = [*sources, *rag_sources, *assistant_resource_context_service.sources(modeling_references)]
     context = {
         "request_id": effective_request_id,
         "page": payload.page,
@@ -8004,6 +8018,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
         "llm_config_id": payload.llm_config_id,
         "skill_ids": payload.skill_ids,
         "mcp_ids": payload.mcp_ids,
+        "modeling_references": modeling_references,
         "routing": route_plan.public_context(),
     }
     attachment_meta = [{"id": x.id, "filename": x.filename, "status": x.status} for x in attachments]
@@ -8400,7 +8415,8 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     payload.message,
                     modeling_material_context=rag_context,
                 )
-                data = _generate_scenario_draft(db, description)
+                data = _generate_scenario_draft(db, description,
+                    **({"modeling_references": modeling_references} if modeling_references else {}))
                 proposal = _build_proposal("scenario", data)
                 reply = "我已根据你的说明和已授权建模资料生成业务场景草稿。会话附件不会成为建模来源；确认前不会创建场景。"
                 done_event = progress({"id": "scenario", "title": "生成业务场景草稿", "detail": "场景名称、目标与边界已整理完成。", "status": "done"})
@@ -8436,7 +8452,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 )
                 prepared_context = (
                     scenario_model_compiler.prepare_compilation_context(
-                        db, scenario
+                        db, scenario, modeling_references=modeling_references
                     )
                 )
                 (
@@ -8645,7 +8661,9 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     payload.message,
                     modeling_material_context=rag_context,
                 )
-                data = ontology_service.generate_ontology(db, scenario, description)
+                data = ontology_service.generate_ontology(db, scenario, description,
+                    **({"modeling_references": modeling_references, "llm_config_id": payload.llm_config_id}
+                       if modeling_references or payload.llm_config_id else {}))
                 proposal = _build_proposal("ontology", data, scenario)
                 reply = "我已经根据当前场景、你的说明和已授权建模资料生成本体草稿。请检查变更内容，确认后再应用到场景。"
                 done_event = progress({"id": "ontology", "title": "生成本体草稿", "detail": "实体和关系建议已整理完成。", "status": "done"})
@@ -8672,7 +8690,8 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     payload.message,
                     modeling_material_context=rag_context,
                 )
-                data = _generate_mapping_draft(db, scenario, description, payload.selection)
+                data = _generate_mapping_draft(db, scenario, description, payload.selection,
+                    **({"modeling_references": modeling_references} if modeling_references else {}))
                 proposal = _build_proposal("mapping", data, scenario)
                 reply = "我已生成并校验数据映射草稿。确认后才会保存映射，刷新数据仍需单独提交。"
                 done_event = progress({"id": "mapping", "title": "生成数据映射草稿", "detail": "字段引用和主键覆盖已校验。", "status": "done"})
@@ -8699,7 +8718,9 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     payload.message,
                     modeling_material_context=rag_context,
                 )
-                data = workflow_service.generate_workflow(db, scenario, description)
+                data = workflow_service.generate_workflow(db, scenario, description,
+                    **({"modeling_references": modeling_references, "llm_config_id": payload.llm_config_id}
+                       if modeling_references or payload.llm_config_id else {}))
                 proposal = _build_proposal("workflow", data, scenario)
                 reply = "我已经生成了工作流草稿。请先检查节点、分支和动作引用，确认后再保存。"
                 done_event = progress({"id": "workflow", "title": "编排工作流草稿", "detail": "节点和连线建议已整理完成。", "status": "done"})
@@ -8923,7 +8944,8 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         )
     scenario = _scenario(db, payload.scenario_id, require_active=True)
     _configure_assistant_runtime(db, payload)
-    capability_context = _assistant_capability_context(db, payload)
+    modeling_references = _assistant_capability_context(db, payload)
+    capability_context = modeling_reference_contract.prompt(modeling_references)
     thread = _thread(db, payload.thread_id) if payload.thread_id else None
     scope_key = _context_scope(payload.scenario_id, payload.path)
     if thread:
@@ -8938,6 +8960,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         scope_key=scope_key,
         request_id=effective_request_id,
         pending_thread_id=pending_thread_id,
+        modeling_references=modeling_references,
     )
     if thread is None:
         thread = db.execute(
@@ -8950,6 +8973,8 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         if thread is not None:
             _assert_thread_scope(thread, payload.scenario_id, payload.page, payload.path)
     intent = route_plan.intent
+    if modeling_references and intent not in assistant_resource_context_service.SUPPORTED_INTENTS:
+        raise HTTPException(409, "所选技能方法和 MCP 契约仅用于问答与建模；当前操作不支持，请取消资源选择或改为建模提问")
     if intent == "scenario_model" and scenario:
         permission_service.require_scenario_permission(
             db, scenario, "write", message="完整场景建模需要当前场景的编辑权限"
@@ -8995,7 +9020,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     legacy_attachments = attachments
     attachments = [*attachments, *managed_attachments]
     rag_context, rag_sources = _authorized_rag_context(db, scenario, payload.message)
-    sources = [*sources, *rag_sources]
+    sources = [*sources, *rag_sources, *assistant_resource_context_service.sources(modeling_references)]
     context = {
         "request_id": effective_request_id,
         "page": payload.page,
@@ -9007,6 +9032,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
         "llm_config_id": payload.llm_config_id,
         "skill_ids": payload.skill_ids,
         "mcp_ids": payload.mcp_ids,
+        "modeling_references": modeling_references,
         "routing": route_plan.public_context(),
     }
     attachment_meta = [{"id": x.id, "filename": x.filename, "status": x.status} for x in attachments]
@@ -9127,7 +9153,8 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 payload.message,
                 modeling_material_context=rag_context,
             )
-            data = _generate_scenario_draft(db, description)
+            data = _generate_scenario_draft(db, description,
+                    **({"modeling_references": modeling_references} if modeling_references else {}))
             proposal = _build_proposal("scenario", data)
             reply = "我已根据你的说明和已授权建模资料生成业务场景草稿。会话附件不会成为建模来源；确认前不会创建场景。"
         elif intent == "research":
@@ -9166,7 +9193,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 )
             )
             prepared_context = (
-                scenario_model_compiler.prepare_compilation_context(db, scenario)
+                scenario_model_compiler.prepare_compilation_context(db, scenario, modeling_references=modeling_references)
             )
             (
                 source_bundle_preview,
@@ -9328,7 +9355,9 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 payload.message,
                 modeling_material_context=rag_context,
             )
-            data = ontology_service.generate_ontology(db, scenario, description)
+            data = ontology_service.generate_ontology(db, scenario, description,
+                    **({"modeling_references": modeling_references, "llm_config_id": payload.llm_config_id}
+                       if modeling_references or payload.llm_config_id else {}))
             proposal = _build_proposal("ontology", data, scenario)
             reply = "我已经根据当前场景、你的说明和已授权建模资料生成本体草稿。请检查变更内容，确认后再应用到场景。"
         elif intent == "mapping" and scenario:
@@ -9336,7 +9365,8 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 payload.message,
                 modeling_material_context=rag_context,
             )
-            data = _generate_mapping_draft(db, scenario, description, payload.selection)
+            data = _generate_mapping_draft(db, scenario, description, payload.selection,
+                    **({"modeling_references": modeling_references} if modeling_references else {}))
             proposal = _build_proposal("mapping", data, scenario)
             reply = "我已生成并校验数据映射草稿。确认后才会保存映射，刷新数据仍需单独提交。"
         elif intent == "workflow" and scenario:
@@ -9344,7 +9374,9 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 payload.message,
                 modeling_material_context=rag_context,
             )
-            data = workflow_service.generate_workflow(db, scenario, description)
+            data = workflow_service.generate_workflow(db, scenario, description,
+                    **({"modeling_references": modeling_references, "llm_config_id": payload.llm_config_id}
+                       if modeling_references or payload.llm_config_id else {}))
             proposal = _build_proposal("workflow", data, scenario)
             reply = "我已经生成了工作流草稿。请先检查节点、分支和动作引用，确认后再保存。"
         else:
@@ -9622,13 +9654,20 @@ def continue_model_task(
     if source_execution.get("recovery_issue"):
         raise HTTPException(409, "当前有界引用不足以继续，请补充或重新上传资料")
 
-    prepared_context = scenario_model_compiler.prepare_compilation_context(db, scenario)
+    prepared_context = scenario_model_compiler.prepare_compilation_context(
+        db, scenario, modeling_references=(source_execution.get("prepared_context") or {}).get("modeling_references")
+    )
     source_bundle, recovery_issue = _source_bundle_preview_with_recovery(
         compiler_message=compiler_message,
         compiler_documents=compiler_documents,
         prepared_context=prepared_context,
     )
+    original_llm_id = str(source_execution.get("llm_config_id") or "")
+    if original_llm_id:
+        db.info["assistant_llm_config_id"] = original_llm_id
     llm = _llm(db)
+    if original_llm_id and llm is None:
+        raise HTTPException(409, "原建模任务选择的 AI 模型已不可用，请重新发起建模")
     settings = get_settings()
     continuation_context = {
         **copy.deepcopy(proposal_context),

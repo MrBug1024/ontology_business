@@ -12,6 +12,20 @@ logic. Create a credential with `capabilities:read` and
 integration must upload new invocation documents. Copy its token immediately
 because it is returned only once.
 
+Each credential is bound to exactly one business scenario in its issuing workspace.
+Select that scenario when creating the credential (`scenario_id` is required).
+REST v1/v2 and Capability MCP restrict discovery, calls, receipts, interactions,
+and temporary attachments to that scenario, even if its subject owns other scenarios.
+Changing a request's scenario or release id cannot widen this boundary. A key can
+use enabled releases of its own scenario; the existing human publication lifecycle
+is unchanged. Temporary uploads are private to that scenario and cannot be reused
+through a different scenario's key by guessing an asset id.
+
+The scenario-binding migration revokes historical unbound keys because their
+intended scenario cannot be inferred safely. They remain visible as requiring
+reissuance. Create replacement scenario-bound credentials and update your REST/MCP
+clients; old tokens are never automatically reactivated after rollback.
+
 Each credential remains bound to the workspace in which it was issued. Switching
 the browser's active workspace does not change SDK authorization. The server
 checks the subject's active membership and scenario ACL on every request; a

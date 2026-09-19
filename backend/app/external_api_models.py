@@ -13,6 +13,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     JSON,
@@ -43,11 +44,17 @@ class ExternalApiKey(Base):
 
     __tablename__ = "external_api_keys"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"], ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_external_api_keys_scenario_tenant", ondelete="CASCADE",
+        ),
+        CheckConstraint("status <> 'active' OR scenario_id IS NOT NULL", name="ck_external_api_keys_bound_active"),
         Index("ix_external_api_keys_tenant_status", "tenant_id", "status"),
         Index("ix_external_api_keys_user_status", "user_id", "status"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    scenario_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     tenant_id: Mapped[str] = mapped_column(
         ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
     )
@@ -74,6 +81,22 @@ class ExternalApiKey(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+
+class ExternalScenarioAsset(Base):
+    """Immutable scenario ownership of an external invocation upload."""
+
+    __tablename__ = "external_scenario_assets"
+    __table_args__ = (
+        ForeignKeyConstraint(["scenario_id", "tenant_id"],
+            ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_external_scenario_assets_scenario", ondelete="RESTRICT"),
+        ForeignKeyConstraint(["asset_id", "tenant_id"], ["data_assets.id", "data_assets.tenant_id"],
+            name="fk_external_scenario_assets_asset", ondelete="CASCADE"),
+    )
+    asset_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    scenario_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
 
 
 class ExternalApiKeyAuditEvent(Base):

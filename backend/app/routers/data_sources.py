@@ -7,6 +7,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -45,32 +46,19 @@ from ..services import (
     template_catalog_service,
     tenant_service,
     upload_staging_service,
+    library_credential_service,
+    library_database_service,
+    library_sqlite_upload_service,
 )
 from ..config import get_settings
 from ..services.auth_service import get_tenant_db
+from ..services.library_mysql_adapter import LibraryConfigurationError
 
 router = APIRouter(prefix="/data-sources", tags=["data-sources"])
 
-_SECRET_KEYS = {"password", "api_key", "token", "secret", "access_token"}
-
-
 def _public_config(config: dict) -> dict:
     """返回可给前端展示的配置，凭据字段永不回显。"""
-    safe = dict(config or {})
-    for key in _SECRET_KEYS:
-        if key in safe:
-            safe[key] = ""
-    return safe
-
-
-def _merge_config(old: dict, new: dict) -> dict:
-    """编辑数据源时，空凭据表示保持原值，避免前端必须读取密钥。"""
-    merged = dict(new or {})
-    for key in _SECRET_KEYS:
-        if not merged.get(key):
-            if key in old:
-                merged[key] = old[key]
-    return merged
+    return library_credential_service.public_config(config or {})
 
 
 def _out(ds: DataSource, db: Session) -> DataSourceOut:
@@ -85,12 +73,14 @@ def _out(ds: DataSource, db: Session) -> DataSourceOut:
         created_at=ds.created_at,
         file_count=len(ds.files),
         can_write=(
-            ds.type != "dataset"
+            ds.type not in {"dataset", "distillation"}
             and
             ds.tenant_id == tenant_service.current_tenant_id(db)
             and _can_access_data_source(db, ds, writable=True)
         ),
         can_delete=(
+            ds.type != "distillation"
+            and
             ds.tenant_id == tenant_service.current_tenant_id(db)
             and _can_access_data_source(db, ds, writable=True)
         ),
@@ -159,7 +149,10 @@ def _data_source(
     # endpoints into a second Agent data path.
     if ds.resource_scope == "agent_runtime" and not allow_runtime:
         raise HTTPException(404, "数据源不存在")
-    return _require_data_source_access(db, ds, writable=writable)
+    _require_data_source_access(db, ds, writable=writable)
+    if writable and ds.type == "distillation":
+        raise HTTPException(409, "业务蒸馏交接资料不可变，请在蒸馏项目中创建新版本")
+    return ds
 
 
 def _file_ownership(
@@ -412,27 +405,19 @@ def create_data_source(payload: DataSourceIn, db: Session = Depends(get_tenant_d
     except template_catalog_service.TemplateCatalogError as exc:
         raise HTTPException(409, str(exc)) from exc
     values = payload.model_dump()
-    if values.get("type") == "file_bucket":
-        try:
-            values["config"] = datasource_service.normalize_file_bucket_config(
-                values.get("config")
-            )
-        except object_storage_service.ObjectStorageError as exc:
-            raise HTTPException(503, str(exc)) from exc
-    elif values.get("type") == "postgres":
-        try:
-            values["config"] = datasource_service.normalize_postgres_config(
-                values.get("config")
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
+    try:
+        values["config"] = library_database_service.write_config(payload.type, payload.config)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except object_storage_service.ObjectStorageError as exc:
+        raise HTTPException(503, "托管存储暂不可用") from exc
     ds = DataSource(
         tenant_id=tenant_service.current_tenant_id(db),
         resource_scope="modeling",
         owner_agent_id=None,
         **values,
     )
-    if ds.type == "file_bucket":
+    if ds.type in {"file_bucket", "sqlite3"}:
         try:
             datasource_service.ensure_file_bucket_storage(ds)
         except object_storage_service.ObjectStorageError as exc:
@@ -448,6 +433,8 @@ def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(
     observed = tenant_service.require_visible(
         db, DataSource, ds_id, "数据源不存在"
     )
+    if observed.type == "distillation":
+        raise HTTPException(409, "业务蒸馏交接资料不可变，请在蒸馏项目中创建新版本")
     if observed.type == "dataset" or payload.type == "dataset":
         raise HTTPException(409, "版本化数据集只能通过数据资产目录发布和切换")
     _require_data_source_access(db, observed, writable=True)
@@ -490,24 +477,18 @@ def update_data_source(ds_id: str, payload: DataSourceIn, db: Session = Depends(
                 detail="已登记模板所在文件桶不能变更类型或建模场景，请先在模板中心解除引用并删除模板",
             ) from exc
     values = payload.model_dump()
-    values["config"] = _merge_config(ds.config or {}, values.get("config", {}))
-    if values.get("type") == "file_bucket":
-        try:
-            values["config"] = datasource_service.normalize_file_bucket_config(
-                values.get("config")
-            )
-        except object_storage_service.ObjectStorageError as exc:
-            raise HTTPException(503, str(exc)) from exc
-    elif values.get("type") == "postgres":
-        try:
-            values["config"] = datasource_service.normalize_postgres_config(
-                values.get("config")
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
+    if scenario_changed and ds.type == "sqlite3" and ds.files:
+        raise HTTPException(409, "已有快照的 SQLite3 资料库不能改变场景归属，请创建新的资料库")
+    try:
+        values["config"] = library_database_service.write_config(payload.type, payload.config,
+            old_config=ds.config if not type_changed else None)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except object_storage_service.ObjectStorageError as exc:
+        raise HTTPException(503, "托管存储暂不可用") from exc
     for k, v in values.items():
         setattr(ds, k, v)
-    if ds.type == "file_bucket":
+    if ds.type in {"file_bucket", "sqlite3"}:
         try:
             datasource_service.ensure_file_bucket_storage(ds)
         except (ValueError, object_storage_service.ObjectStorageError) as exc:
@@ -578,6 +559,24 @@ def delete_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
 @router.post("/{ds_id}/test", response_model=Msg)
 def test_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
     ds = _data_source(db, ds_id, writable=True)
+    if ds.type in library_database_service.DATABASE_TYPES:
+        frozen = library_database_service.snapshot(ds)
+        revision = ds.connector_revision
+        db.commit()
+        try:
+            library_database_service.database_schema(frozen)
+            ok, msg = True, "连接成功，资料结构可读取"
+        except LibraryConfigurationError as exc:
+            ok, msg = False, str(exc)
+        except Exception:  # External driver/storage boundary; never return diagnostics.
+            ok, msg = False, "连接或结构读取失败，请检查配置、只读权限和部署允许名单"
+        permission_service.refresh_request_authorization(db)
+        ds = _data_source(db, ds_id, writable=True)
+        if ds.connector_revision != revision:
+            raise HTTPException(409, "测试期间资料库已变化，请重试")
+        ds.status, ds.last_error = ("ok", "") if ok else ("error", msg)
+        db.commit()
+        return Msg(ok=ok, message=msg)
     if ds.type == "file_bucket":
         try:
             datasource_service.ensure_file_bucket_storage(ds)
@@ -617,8 +616,23 @@ def test_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
 @router.get("/{ds_id}/tables", response_model=list[TableInfo])
 def list_tables(ds_id: str, db: Session = Depends(get_tenant_db)):
     ds = _data_source(db, ds_id)
-    if ds.type == "file_bucket":
+    if ds.type in {"file_bucket", "distillation"}:
         return []
+    if ds.type in library_database_service.DATABASE_TYPES:
+        frozen = library_database_service.snapshot(ds)
+        revision = ds.connector_revision
+        db.commit()
+        try:
+            tables = library_database_service.database_schema(frozen)
+        except LibraryConfigurationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(422, "资料结构读取失败、超时或超过 40 表/80 列上限，请检查配置或缩小资料范围") from exc
+        permission_service.refresh_request_authorization(db)
+        current = _data_source(db, ds_id)
+        if current.connector_revision != revision:
+            raise HTTPException(409, "读取期间资料库已变化，请重试")
+        return tables
     try:
         return datasource_service.list_tables(ds)
     except Exception as exc:  # noqa: BLE001
@@ -628,6 +642,10 @@ def list_tables(ds_id: str, db: Session = Depends(get_tenant_db)):
 @router.post("/{ds_id}/query", response_model=QueryResult)
 def query(ds_id: str, payload: dict, db: Session = Depends(get_tenant_db)):
     ds = _data_source(db, ds_id)
+    if ds.type == "distillation":
+        raise HTTPException(422, "业务蒸馏资料只用于建模理解，不是运行数据库")
+    if ds.type in {"mysql", "sqlite3"}:
+        raise HTTPException(422, "该资料库只支持结构调查，不接受任意 SQL")
     sql = payload.get("sql", "")
     if not sql.strip():
         raise HTTPException(400, "SQL 不能为空")
@@ -687,6 +705,39 @@ def search_documents(payload: DocumentSearchIn, db: Session = Depends(get_tenant
 
 
 # ── 文件桶 ────────────────────────────────────
+def _sqlite_upload_source(db: Session, ds_id: str) -> DataSource:
+    source = _data_source(db, ds_id, writable=True)
+    if source.type != "sqlite3":
+        raise HTTPException(422, "请选择 SQLite3 资料库")
+    frozen = library_database_service.snapshot(source)
+    db.commit()
+    return frozen
+
+
+@router.post("/{ds_id}/sqlite-file", response_model=BucketFileOut)
+async def upload_sqlite_file(ds_id: str, file: UploadFile = File(...), db: Session = Depends(get_tenant_db)):
+    frozen = await run_in_threadpool(_sqlite_upload_source, db, ds_id)
+    from ..services.library_sqlite_adapter import MAX_SQLITE_BYTES
+    filename = file.filename or "snapshot.sqlite3"
+    # Release the authorization lock before receiving/parsing/PUT. The service
+    # rechecks revision, membership, ACL and ownership under a final row lock.
+    try:
+        staged = await upload_staging_service.stage_upload(file, max_bytes=MAX_SQLITE_BYTES,
+            chunk_bytes=int(get_settings().upload_stream_chunk_bytes))
+    except upload_staging_service.UploadTooLargeError as exc:
+        raise HTTPException(413, "SQLite3 快照不能超过 32 MB") from exc
+    except ValueError as exc:
+        raise HTTPException(422, "SQLite3 快照不能为空") from exc
+    try:
+        return await run_in_threadpool(library_sqlite_upload_service.attach_snapshot, db, frozen, staged, filename)
+    except HTTPException:
+        raise
+    except Exception as exc:  # Bounded parser/storage boundary.
+        raise HTTPException(422, "SQLite3 快照上传失败，请检查文件格式和存储状态后重试") from exc
+    finally:
+        staged.remove()
+
+
 @router.post("/{ds_id}/reindex", response_model=DocumentReindexOut)
 def reindex_files(ds_id: str, db: Session = Depends(get_tenant_db)):
     """显式排队重建资料库索引，适用于历史文件或模型版本升级后。"""

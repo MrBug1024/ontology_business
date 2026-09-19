@@ -247,6 +247,10 @@ def check_scenario(
     if verb not in VALID_VERBS:
         return PermissionDecision(False, "不支持的权限动作", principal.role_key)
 
+    bound_scenario = db.info.get("external_scenario_id")
+    if bound_scenario is not None and (not bound_scenario or scenario.id != bound_scenario):
+        return PermissionDecision(False, "资源不在密钥授权场景内", principal.role_key)
+
     if not _same_tenant(principal, scenario):
         if scenario.is_public and verb == "read":
             return PermissionDecision(True, "公共场景只读访问", principal.role_key)
@@ -313,6 +317,10 @@ def _check_resource(
         return PermissionDecision(False, missing_reason)
     if resource_type not in VALID_RESOURCE_TYPES or verb not in VALID_VERBS:
         return PermissionDecision(False, "不支持的资源或权限动作", principal.role_key)
+
+    bound_scenario = db.info.get("external_scenario_id")
+    if bound_scenario is not None and (not bound_scenario or scenario.id != bound_scenario):
+        return PermissionDecision(False, "资源不在密钥授权场景内", principal.role_key)
 
     # 先处理同一租户内的 deny；所有下级资源都会受场景 deny 约束。
     if _same_tenant(principal, scenario):

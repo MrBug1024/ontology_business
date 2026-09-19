@@ -33,7 +33,7 @@
             :model-value="modelValue.datasetId"
             filterable
             :loading="datasetsLoading"
-            placeholder="选择建模资料数据集"
+            placeholder="选择资料库中的数据集"
             style="width: 100%"
             @update:model-value="updateDataset"
           >

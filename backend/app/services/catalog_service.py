@@ -842,6 +842,8 @@ def create_asset(
     )
     db.add(asset)
     db.flush()
+    from .external_scenario_asset_service import bind_created_asset
+    bind_created_asset(db, asset)
     return asset
 
 

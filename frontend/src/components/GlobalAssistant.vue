@@ -38,32 +38,7 @@
           </div>
         </div>
         <div class="assistant-head-actions">
-          <el-popover placement="bottom-end" :width="340" trigger="click" @show="loadAssistantCapabilities">
-            <template #reference>
-              <el-button text circle aria-label="配置助手能力" title="配置助手能力">
-                <el-icon aria-hidden="true"><Setting /></el-icon>
-              </el-button>
-            </template>
-            <section class="assistant-settings" aria-label="助手能力配置">
-              <div class="assistant-settings-head">
-                <div><strong>模型与参考配置</strong><span>选择本次请求使用的模型及可参考能力</span></div>
-                <el-icon v-if="capabilitiesLoading" class="is-loading" aria-hidden="true"><Loading /></el-icon>
-              </div>
-              <label class="assistant-setting-label" for="assistant-llm">AI 模型</label>
-              <el-select id="assistant-llm" v-model="assistantConfig.llmConfigId" class="assistant-setting-control" clearable placeholder="自动选择默认模型" @change="persistAssistantConfig">
-                <el-option v-for="llm in assistantLLMs" :key="llm.id" :label="`${llm.name} · ${llm.model}`" :value="llm.id" />
-              </el-select>
-              <label class="assistant-setting-label" for="assistant-skills">参考技能</label>
-              <el-select id="assistant-skills" v-model="assistantConfig.skillIds" class="assistant-setting-control" multiple collapse-tags collapse-tags-tooltip placeholder="不指定技能" @change="persistAssistantConfig">
-                <el-option v-for="skill in assistantSkills" :key="skill.id" :label="skill.name" :value="skill.id" />
-              </el-select>
-              <label class="assistant-setting-label" for="assistant-mcps">参考 MCP</label>
-              <el-select id="assistant-mcps" v-model="assistantConfig.mcpIds" class="assistant-setting-control" multiple collapse-tags collapse-tags-tooltip placeholder="不指定 MCP" @change="persistAssistantConfig">
-                <el-option v-for="mcp in assistantMCPs" :key="mcp.id" :label="mcp.name" :value="mcp.id" />
-              </el-select>
-              <p class="assistant-settings-note">这里选择的是模型参考配置；只有平台为本轮明确注册工具时才会调用。外部调用、写入和高风险操作仍遵循权限、预演与确认流程。</p>
-            </section>
-          </el-popover>
+          <ModelingAdvisorSettings v-model="assistantConfig" :scope-key="assistantResourceScopeKey" :disabled="loading" />
           <el-button text circle aria-label="关闭智能业务顾问" title="关闭" @click="visible = false">
             <el-icon aria-hidden="true"><Close /></el-icon>
           </el-button>
@@ -495,14 +470,14 @@
                 :key="source.id || source.filename"
                 type="button"
                 class="source-card"
-                :class="{ 'is-clickable': source.file_id }"
-                :disabled="!source.file_id"
-                :title="source.file_id ? `查看引用原文：${source.filename}` : '本次对话的临时附件'"
+                :class="{ 'is-clickable': assistantSourceDisplay(source).canPreview }"
+                :disabled="!assistantSourceDisplay(source).canPreview"
+                :title="assistantSourceDisplay(source).title"
                 @click="openSource(source)"
               >
-                <span class="source-mark">{{ source.citation_id || (source.kind === 'rag' ? '引用' : '附件') }}</span>
-                <span class="source-copy"><strong>{{ source.filename }}</strong><small>{{ source.data_source_name || (source.file_id ? '正式资料库' : '临时上下文') }}</small></span>
-                <el-icon v-if="source.file_id" aria-hidden="true"><ArrowRight /></el-icon>
+                <span class="source-mark">{{ assistantSourceDisplay(source).mark }}</span>
+                <span class="source-copy"><strong>{{ source.filename }}</strong><small>{{ assistantSourceDisplay(source).origin }}</small></span>
+                <el-icon v-if="assistantSourceDisplay(source).canPreview" aria-hidden="true"><ArrowRight /></el-icon>
               </button>
             </div>
 
@@ -601,13 +576,13 @@
     </div>
   </el-drawer>
 
-  <el-dialog v-model="sourcePreviewVisible" title="引用原文" width="min(720px, 94vw)" append-to-body>
+  <el-dialog v-model="sourcePreviewVisible" :title="sourcePreview && assistantSourceDisplay(sourcePreview).reference ? '建模参考摘要' : '引用原文'" width="min(720px, 94vw)" append-to-body>
     <div v-loading="sourcePreviewLoading" class="source-preview">
       <div v-if="sourcePreview" class="source-preview-meta">
         <el-tag v-if="sourcePreview.citation_id" type="info" effect="plain">{{ sourcePreview.citation_id }}</el-tag>
-        <div><strong>{{ sourcePreview.filename }}</strong><span>{{ sourcePreview.data_source_name || '正式资料库' }}</span></div>
+        <div><strong>{{ sourcePreview.filename }}</strong><span>{{ assistantSourceDisplay(sourcePreview).origin }}</span></div>
       </div>
-      <el-alert title="以下内容按当前账号权限重新读取；历史引用失效或权限收回后将无法显示。" type="info" :closable="false" show-icon />
+      <el-alert v-if="sourcePreview" :title="assistantSourceDisplay(sourcePreview).notice" type="info" :closable="false" show-icon />
       <pre class="source-preview-text">{{ sourcePreviewText || '暂无可显示的引用片段' }}</pre>
     </div>
     <template #footer><el-button type="primary" @click="sourcePreviewVisible = false">关闭</el-button></template>
@@ -620,9 +595,12 @@ import { isNavigationFailure, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, streamAssistantChat, streamAssistantCompilationJob } from '@/api'
 import { useAuthStore } from '@/stores/auth'
-import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationActivity, AssistantCompilationJobStatus, AssistantCompilationLiveness, AssistantCompilationStep, AssistantDecisionGate, AssistantMessage, AssistantModelExecutionSummary, AssistantModelNextAction, AssistantModelTask, AssistantProposal, AssistantProposalApplyResult, AssistantQuestion, AssistantRequestRun, AssistantSource, AssistantThread, AssistantThought, LLMConfig, MCPConfig, Skill } from '@/types'
+import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationActivity, AssistantCompilationJobStatus, AssistantCompilationLiveness, AssistantCompilationStep, AssistantDecisionGate, AssistantMessage, AssistantModelExecutionSummary, AssistantModelNextAction, AssistantModelTask, AssistantProposal, AssistantProposalApplyResult, AssistantQuestion, AssistantRequestRun, AssistantSource, AssistantThread, AssistantThought } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
+import ModelingAdvisorSettings from '@/components/assistant/ModelingAdvisorSettings.vue'
+import { emptyModelingAdvisorSelection } from '@/composables/useModelingAdvisorResources'
+import { assistantSourceDisplay } from '@/utils/assistantSourceDisplay'
 import {
   clearCompilationJobBookmark,
   clearPendingCompilationJobBookmark,
@@ -668,21 +646,14 @@ const sourcePreviewVisible = ref(false)
 const sourcePreviewLoading = ref(false)
 const sourcePreview = ref<AssistantSource | null>(null)
 const sourcePreviewText = ref('')
+let sourcePreviewRequest = 0
 const expandedProposal = reactive<Record<number, boolean>>({})
 const expandedModelPlans = reactive<Record<string, boolean>>({})
 const expandedChangeLists = reactive<Record<string, boolean>>({})
 const expandedIssueGroups = reactive<Record<string, boolean>>({})
 const selection = reactive<{ label: string; kind: string; id: string }>({ label: '', kind: '', id: '' })
-const assistantConfig = reactive<{ llmConfigId: string; skillIds: string[]; mcpIds: string[] }>({
-  llmConfigId: '',
-  skillIds: [],
-  mcpIds: [],
-})
-const assistantLLMs = ref<LLMConfig[]>([])
-const assistantSkills = ref<Skill[]>([])
-const assistantMCPs = ref<MCPConfig[]>([])
-const capabilitiesLoading = ref(false)
-const capabilitiesLoaded = ref(false)
+const assistantConfig = ref(emptyModelingAdvisorSelection())
+const assistantResourceScopeKey = computed(() => JSON.stringify([auth.user?.id || '', auth.user?.tenant_id || '', props.context.scenario_id || '']))
 const activeCompilationJob = ref<AssistantCompilationJobStatus | null>(null)
 const compilationRecoveryThreadId = ref('')
 const compilationLiveness = reactive<Record<string, AssistantCompilationLiveness[]>>({})
@@ -723,8 +694,6 @@ const {
   threadId,
   reloadThread: (id) => loadThread(id, false),
 })
-
-const assistantConfigStorageKey = 'ontology-assistant-capabilities'
 
 const context = computed(() => ({
   page: props.context.page || '工作台',
@@ -1107,43 +1076,6 @@ function modelTaskOutputCount(task?: AssistantModelTask) {
   return Math.trunc(Math.max(0, ...values))
 }
 
-function restoreAssistantConfig() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(assistantConfigStorageKey) || '{}') as Partial<typeof assistantConfig>
-    assistantConfig.llmConfigId = String(saved.llmConfigId || '')
-    assistantConfig.skillIds = Array.isArray(saved.skillIds) ? saved.skillIds.map(String) : []
-    assistantConfig.mcpIds = Array.isArray(saved.mcpIds) ? saved.mcpIds.map(String) : []
-  } catch {
-    assistantConfig.llmConfigId = ''
-    assistantConfig.skillIds = []
-    assistantConfig.mcpIds = []
-  }
-}
-
-function persistAssistantConfig() {
-  localStorage.setItem(assistantConfigStorageKey, JSON.stringify(assistantConfig))
-}
-
-async function loadAssistantCapabilities() {
-  if (capabilitiesLoaded.value || capabilitiesLoading.value) return
-  capabilitiesLoading.value = true
-  try {
-    const [llms, skills, mcps] = await Promise.all([api.listLLM(), api.listSkills(), api.listMCP()])
-    assistantLLMs.value = llms.filter((item) => item.enabled !== false && (!item.capabilities?.length || item.capabilities.includes('chat')))
-    assistantSkills.value = skills.filter((item) => item.enabled)
-    assistantMCPs.value = mcps.filter((item) => item.enabled !== false)
-    if (assistantConfig.llmConfigId && !assistantLLMs.value.some((item) => item.id === assistantConfig.llmConfigId)) assistantConfig.llmConfigId = ''
-    assistantConfig.skillIds = assistantConfig.skillIds.filter((id) => assistantSkills.value.some((item) => item.id === id))
-    assistantConfig.mcpIds = assistantConfig.mcpIds.filter((id) => assistantMCPs.value.some((item) => item.id === id))
-    persistAssistantConfig()
-    capabilitiesLoaded.value = true
-  } catch (error: any) {
-    ElMessage.warning(error.message || '助手能力配置加载失败，将使用平台默认配置')
-  } finally {
-    capabilitiesLoading.value = false
-  }
-}
-
 function proposalCanApply(proposal: AssistantProposal | null) {
   if (!proposal) return false
   if (proposal.status === 'read_only' || proposal.requires_confirmation === false) return false
@@ -1341,13 +1273,28 @@ async function continueGovernedAction(preview?: AssistantActionPreview) {
 }
 
 async function openSource(source: AssistantSource) {
-  if (!source.file_id) return
+  const display = assistantSourceDisplay(source)
+  if (!display.canPreview) return
+  const request = ++sourcePreviewRequest
+  if (display.libraryPath) {
+    sourcePreviewVisible.value = false
+    sourcePreviewLoading.value = false
+    await router.push(display.libraryPath)
+    return
+  }
   sourcePreview.value = source
   sourcePreviewText.value = ''
   sourcePreviewVisible.value = true
+  if (display.inlineText !== null) {
+    sourcePreviewText.value = display.inlineText
+    sourcePreviewLoading.value = false
+    return
+  }
+  if (!source.file_id) return
   sourcePreviewLoading.value = true
   try {
     const result = await api.fileText(source.file_id)
+    if (request !== sourcePreviewRequest || !sourcePreviewVisible.value) return
     const text = result.text || ''
     const hasRange = Number.isFinite(source.char_start) && Number.isFinite(source.char_end)
     if (!hasRange) {
@@ -1359,11 +1306,12 @@ async function openSource(source: AssistantSource) {
     const contextStart = Math.max(start - 240, 0)
     const contextEnd = Math.min(end + 240, text.length)
     sourcePreviewText.value = `${contextStart > 0 ? '…' : ''}${text.slice(contextStart, contextEnd)}${contextEnd < text.length ? '…' : ''}`
-  } catch (error: any) {
+  } catch (error: unknown) {
+    if (request !== sourcePreviewRequest || !sourcePreviewVisible.value) return
     sourcePreviewText.value = ''
-    ElMessage.error(error.message || '引用原文读取失败，资料可能已变更或权限已收回')
+    ElMessage.error(error instanceof Error ? error.message : '引用原文读取失败，资料可能已变更或权限已收回')
   } finally {
-    sourcePreviewLoading.value = false
+    if (request === sourcePreviewRequest) sourcePreviewLoading.value = false
   }
 }
 
@@ -2601,9 +2549,9 @@ function send(text?: string) {
       selection: selection.id ? { ...selection } : {},
       attachment_ids: currentAttachments.filter((item) => !item.upload_run_id).map((item) => item.id),
       upload_run_ids: currentAttachments.flatMap((item) => item.upload_run_id ? [item.upload_run_id] : []),
-      llm_config_id: assistantConfig.llmConfigId || undefined,
-      skill_ids: [...assistantConfig.skillIds],
-      mcp_ids: [...assistantConfig.mcpIds],
+      llm_config_id: assistantConfig.value.llm_config_id || undefined,
+      skill_ids: [...assistantConfig.value.skill_ids],
+      mcp_ids: [...assistantConfig.value.mcp_ids],
       // Route by the LangGraph/LLM semantic planner. The client only sends
       // the user's intent and context; it does not select a hidden task mode.
       mode: 'ask',
@@ -3097,6 +3045,14 @@ function onSelection(event: Event) {
   selection.id = detail.id || ''
 }
 
+function onScenarioModelingAdvisor(event: Event) {
+  const detail = (event as CustomEvent<{ scenario_id?: string; prompt?: string }>).detail || {}
+  if (!detail.scenario_id || detail.scenario_id !== context.value.scenario_id) return
+  const prompt = String(detail.prompt || '').trim()
+  if (prompt) input.value = prompt
+  void openAssistant()
+}
+
 watch(() => storageKey.value, async () => {
   streamGeneration += 1
   streamController = null
@@ -3123,17 +3079,19 @@ watch(showLauncher, (show) => {
 })
 
 onMounted(() => {
-  restoreAssistantConfig()
   window.addEventListener('ontology-selection-change', onSelection)
+  window.addEventListener('open-scenario-modeling-advisor', onScenarioModelingAdvisor)
   document.addEventListener('visibilitychange', onCompilationVisibilityChange)
 })
 onBeforeUnmount(() => {
   componentDisposed = true
+  sourcePreviewRequest += 1
   streamGeneration += 1
   streamController = null
   clearCompilationStream()
   clearModelTaskRecovery()
   window.removeEventListener('ontology-selection-change', onSelection)
+  window.removeEventListener('open-scenario-modeling-advisor', onScenarioModelingAdvisor)
   document.removeEventListener('visibilitychange', onCompilationVisibilityChange)
 })
 </script>
@@ -3193,14 +3151,6 @@ onBeforeUnmount(() => {
 .assistant-avatar { width: 38px; height: 38px; border-radius: 12px; }
 .assistant-title { display: flex; align-items: center; gap: 7px; font-size: 15px; font-weight: 800; color: var(--text); }
 .assistant-subtitle { margin-top: 3px; color: var(--text-3); font-size: 11px; }
-.assistant-settings { display: grid; gap: 7px; color: var(--text-2); }
-.assistant-settings-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
-.assistant-settings-head div { display: flex; flex-direction: column; gap: 2px; }
-.assistant-settings-head strong { color: var(--text); font-size: 13px; }
-.assistant-settings-head span { color: var(--text-3); font-size: 10px; }
-.assistant-setting-label { margin-top: 3px; color: var(--text-2); font-size: 10.5px; font-weight: 750; }
-.assistant-setting-control { width: 100%; }
-.assistant-settings-note { margin: 2px 0 0; padding-top: 7px; border-top: 1px dashed var(--border); color: var(--text-3); font-size: 10px; line-height: 1.5; }
 .assistant-context { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 10px 18px; border-bottom: 1px solid var(--border); background: var(--surface-2); }
 .context-hint { color: var(--text-3); font-size: 11px; margin-left: auto; }
 .assistant-session-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 18px; border-bottom: 1px solid var(--border); background: var(--surface); }

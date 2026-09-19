@@ -26,6 +26,7 @@ RUNTIME_IMMUTABLE_TABLES = (
     "derivation_run_inputs",
     "assertions",
     "derivation_evidence",
+    "distillation_publications",
 )
 RUNTIME_MIGRATION_LEDGER_TABLES = (
     "alembic_version",
@@ -36,8 +37,11 @@ RUNTIME_REQUIRED_UPDATE_TABLES = (
     "dataset_heads",
     "ingestion_runs",
     "derivation_runs",
+    "distillation_projects",
+    "distillation_conversation_turns",
+    "distillation_attachments",
 )
-RUNTIME_APPEND_ONLY_TABLES = ("agent_turn_events", "release_lifecycle_events", "workflow_approval_evidence")
+RUNTIME_APPEND_ONLY_TABLES = ("agent_turn_events", "release_lifecycle_events", "workflow_approval_evidence", "distillation_turn_attachments")
 RUNTIME_MUTABLE_CONTROL_TABLES = (
     "agent_turn_runs",
     "assistant_request_runs",
@@ -443,9 +447,13 @@ def _validate_runtime_table_privileges(
             raise RuntimeError(
                 f"runtime role lacks mutable control access to {table_name}"
             )
+        # Revision 34 permits lineage cleanup for this table only.
+        expected_delete = table_name == "assistant_request_runs"
+        if bool(current.get("delete", False)) != expected_delete:
+            raise RuntimeError(f"runtime cleanup privilege differs for {table_name}")
         if any(
             current.get(name, False)
-            for name in ("delete", "truncate", "references", "trigger")
+            for name in ("truncate", "references", "trigger")
         ):
             raise RuntimeError(
                 f"runtime role has excessive retained-control privileges on {table_name}"
@@ -558,10 +566,106 @@ def _verify_capability_status_storage(connection: Any) -> int:
     return int(capacity)
 
 
+def _validate_external_asset_privileges(privileges: dict[str, bool]) -> None:
+    allowed = {"select", "insert", "delete"}
+    for privilege in _TABLE_PRIVILEGES:
+        if bool(privileges.get(privilege)) != (privilege in allowed):
+            raise RuntimeError(
+                f"runtime external_scenario_assets {privilege.upper()} privilege is incorrect"
+            )
+
+
+def _verify_external_scenario_contract(connection: Any) -> dict[str, Any]:
+    """Verify rev35 ownership grants and validated tenant/scenario constraints."""
+    row = connection.exec_driver_sql(
+        "SELECT " + ", ".join(
+            "has_table_privilege(current_user, 'public.external_scenario_assets', '"
+            + privilege.upper() + "')" for privilege in _TABLE_PRIVILEGES
+        )
+    ).one()
+    _validate_external_asset_privileges({
+        privilege: bool(row[index]) for index, privilege in enumerate(_TABLE_PRIVILEGES)
+    })
+    expected = {
+        "ck_external_api_keys_bound_active": (
+            "external_api_keys", "CHECK (status <> 'active' OR scenario_id IS NOT NULL)"),
+        "fk_external_api_keys_scenario_tenant": (
+            "external_api_keys", "FOREIGN KEY (scenario_id, tenant_id) "
+            "REFERENCES business_scenarios(id, tenant_id) ON DELETE CASCADE"),
+        "fk_external_scenario_assets_asset": (
+            "external_scenario_assets", "FOREIGN KEY (asset_id, tenant_id) "
+            "REFERENCES data_assets(id, tenant_id) ON DELETE CASCADE"),
+        "fk_external_scenario_assets_scenario": (
+            "external_scenario_assets", "FOREIGN KEY (scenario_id, tenant_id) "
+            "REFERENCES business_scenarios(id, tenant_id) ON DELETE RESTRICT"),
+    }
+    rows = connection.exec_driver_sql(
+        """
+        SELECT relation.relname, constraint_row.conname, constraint_row.convalidated,
+               pg_get_constraintdef(constraint_row.oid)
+          FROM pg_constraint AS constraint_row
+          JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
+          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND constraint_row.conname IN (%s, %s, %s, %s)
+        """, tuple(expected),
+    ).all()
+    actual = {str(row[1]): row for row in rows}
+
+    def normalized(definition: str) -> str:
+        value = definition.casefold().replace("::text", "").replace("public.", "")
+        return "".join(value.split()).replace("(", "").replace(")", "")
+
+    for name, (table, definition) in expected.items():
+        current = actual.get(name)
+        if (current is None or str(current[0]) != table or not current[2]
+                or normalized(str(current[3])) != normalized(definition)):
+            raise RuntimeError(f"external scenario constraint {name} is missing or incorrect")
+    return {"ownership_privileges": "select_insert_delete", "validated_constraints": len(expected)}
+
+
+def _verify_distillation_conversation_contract(connection: Any) -> dict[str, Any]:
+    """Read-only checks of durable ownership, request uniqueness and active claim exclusion."""
+    privileges = connection.exec_driver_sql("SELECT " + ", ".join(
+        "has_table_privilege(current_user, 'public.distillation_conversation_turns', '" + item.upper() + "')"
+        for item in _TABLE_PRIVILEGES)).one()
+    for index, privilege in enumerate(_TABLE_PRIVILEGES):
+        if bool(privileges[index]) != (privilege in {"select", "insert", "update"}):
+            raise RuntimeError(f"runtime distillation conversation {privilege.upper()} privilege is incorrect")
+    expected = {
+        "fk_distillation_turn_project_tenant": ("f", "FOREIGN KEY (project_id, tenant_id) REFERENCES distillation_projects(id, tenant_id) ON DELETE RESTRICT"),
+        "uq_distillation_turn_request": ("u", "UNIQUE (project_id, request_id)"),
+        "uq_distillation_turn_number": ("u", "UNIQUE (project_id, turn_number)"),
+        "ck_distillation_turn_status": ("c", None),
+        "ck_distillation_turn_counters": ("c", None),
+    }
+    rows = connection.exec_driver_sql("""
+        SELECT conname, contype, convalidated, pg_get_constraintdef(oid)
+        FROM pg_constraint WHERE conrelid = 'public.distillation_conversation_turns'::regclass
+    """).all()
+    actual = {str(row[0]): row for row in rows}
+    normalize = lambda value: "".join(value.replace("public.", "").split()).casefold()
+    for name, (kind, definition) in expected.items():
+        row = actual.get(name)
+        if row is None or str(row[1]) != kind or not row[2] or (definition and normalize(row[3]) != normalize(definition)):
+            raise RuntimeError(f"distillation conversation constraint {name} is missing or incorrect")
+    index = connection.exec_driver_sql("""
+        SELECT i.indisunique, i.indisvalid, pg_get_indexdef(i.indexrelid, 1, true), pg_get_expr(i.indpred, i.indrelid)
+        FROM pg_index AS i JOIN pg_class AS c ON c.oid = i.indexrelid
+        WHERE i.indrelid = 'public.distillation_conversation_turns'::regclass
+          AND c.relname = 'uq_distillation_turn_active'
+    """).one_or_none()
+    predicate = "((status)::text = ANY ((ARRAY['queued'::character varying, 'running'::character varying])::text[]))"
+    if index is None or not index[0] or not index[1] or index[2] != "project_id" or normalize(index[3] or "") != normalize(predicate):
+        raise RuntimeError("distillation active turn exclusion index is missing or incorrect")
+    return {"privileges": "select_insert_update", "validated_constraints": len(expected), "active_turn_unique": True}
+
+
 def main() -> int:
     from app.config import get_settings
     from app.database import engine, init_db
     from app.services import cache_service, object_storage_service
+    from scripts.verify_distillation_storage import verify_attachment_contract, verify_discovery_contract
 
     settings = get_settings()
     init_db()
@@ -579,6 +683,10 @@ def main() -> int:
             mutable_control_tables=RUNTIME_MUTABLE_CONTROL_TABLES,
         )
         agent_scope = _verify_agent_scope_contract(connection)
+        external_scenario_scope = _verify_external_scenario_contract(connection)
+        distillation_conversation = _verify_distillation_conversation_contract(connection)
+        distillation_attachments = verify_attachment_contract(connection)
+        distillation_discovery = verify_discovery_contract(connection)
         _verify_scenario_audit_purge_contract(connection)
         _verify_runtime_function_privileges(connection)
         _verify_access_governance_privileges(connection)
@@ -604,6 +712,10 @@ def main() -> int:
                     "role": role,
                     "table_privileges": table_privileges,
                     "agent_scope": agent_scope,
+                    "distillation_conversation": distillation_conversation,
+                    "distillation_attachments": distillation_attachments,
+                    "distillation_discovery": distillation_discovery,
+                    "external_scenario_scope": external_scenario_scope,
                     "governed_functions": "executable",
                 },
                 "minio": "healthy",

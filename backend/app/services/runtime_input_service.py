@@ -958,6 +958,7 @@ def _load_dataset_version(
             version,
             tenant_id=tenant_id,
             agent_id=agent_id,
+            scenario_id=port.scenario_id,
         )
     except managed_attachment_access.AttachmentAccessError:
         raise RuntimeInputResolutionError(
@@ -1188,6 +1189,7 @@ def _resolve_asset_version(
             version,
             tenant_id=tenant_id,
             agent_id=agent_id,
+            scenario_id=port.scenario_id,
         )
     except managed_attachment_access.AttachmentAccessError:
         raise RuntimeInputResolutionError(

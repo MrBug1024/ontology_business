@@ -179,6 +179,8 @@ def _modeling_source_in_scenario(
     source = _source_in_scenario(db, scenario_id, source_id)
     if source.resource_scope != "modeling":
         raise HTTPException(400, "建模数据映射只能引用建模资料数据源")
+    if source.type not in {"postgres", "dataset", "file_bucket"}:
+        raise HTTPException(422, "该资料只用于业务理解，不能作为数据库映射来源")
     return source
 
 

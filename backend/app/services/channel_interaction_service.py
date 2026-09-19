@@ -48,6 +48,8 @@ def approval_context(db: Session, actor: Actor, approval_id: str, *, lock: bool 
         WorkflowApprovalRequest.id == approval_id, BusinessScenario.tenant_id == actor.tenant_id,
         WorkflowApprovalRequest.scenario_id == BusinessScenario.id,
     )
+    if db.info.get("external_scenario_id") is not None:
+        statement = statement.where(WorkflowApprovalRequest.scenario_id == db.info["external_scenario_id"])
     if lock:
         statement = statement.with_for_update(of=WorkflowApprovalRequest)
     approval = db.scalar(statement.execution_options(populate_existing=True))

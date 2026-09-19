@@ -271,7 +271,10 @@ def _adapter(kind: str, connector: Any) -> str:
 
 def _capabilities(kind: str, connector: Any) -> list[str]:
     if kind == "data_source":
-        return ["document_search"] if getattr(connector, "type", "") == "file_bucket" else ["sql_read", "schema"]
+        adapter_type = getattr(connector, "type", "")
+        if adapter_type == "file_bucket":
+            return ["document_search"]
+        return ["sql_read", "schema"] if adapter_type in {"postgres", "dataset"} else []
     if kind == "mcp":
         return ["tool"]
     values = getattr(connector, "capabilities", []) or []
@@ -427,6 +430,8 @@ def _resolve_connector(
         raise ConnectorBindingConflictError("绑定的连接器已不存在")
     if str(getattr(connector, "tenant_id", "") or "") != str(scenario.tenant_id or ""):
         raise ConnectorBindingConflictError("连接器必须属于当前租户")
+    if normalized_kind == "data_source" and getattr(connector, "type", "") not in {"postgres", "dataset", "file_bucket"}:
+        raise ConnectorBindingConflictError("该资料只用于建模理解，不能作为可执行连接器绑定")
     if normalized_kind == "data_source" and getattr(connector, "scenario_id", None) not in {None, scenario.id}:
         raise ConnectorBindingConflictError("数据源只能绑定到当前场景或租户级范围")
     if not _connector_enabled(normalized_kind, connector):
@@ -515,6 +520,7 @@ def list_catalog(db: Session, scenario: BusinessScenario) -> list[dict[str, Any]
     sources = db.execute(
         select(DataSource).where(
             DataSource.tenant_id == tenant_id,
+            DataSource.type.in_(("postgres", "dataset", "file_bucket")),
             or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == scenario.id),
         )
     ).scalars().all()

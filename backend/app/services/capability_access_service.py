@@ -127,7 +127,7 @@ def build_manifest(
                 "invocation": f"{scenario_path}/capabilities/{{kind}}/{{capability_key}}/invoke",
                 "receipt": f"{api_prefix}/external/v2/invocations/{{invocation_id}}",
                 "managed_input_upload": f"{api_prefix}/external/v2/assets/upload",
-                "authentication": {"scheme": "api_key", "header": "X-API-Key"},
+                "authentication": {"scheme": "api_key", "header": "X-API-Key", "scenario_id": scenario.id},
                 "required_scopes": ["capabilities:read", "capabilities:invoke"],
                 "optional_scopes": ["assets:write"],
                 "tools": [],
@@ -135,7 +135,7 @@ def build_manifest(
             {
                 "protocol": "mcp",
                 "endpoint": mcp_endpoint,
-                "authentication": {"scheme": "bearer", "header": "Authorization"},
+                "authentication": {"scheme": "bearer", "header": "Authorization", "scenario_id": scenario.id},
                 "required_scopes": ["capabilities:read", "capabilities:invoke"],
                 "tools": [
                     "list_capabilities",

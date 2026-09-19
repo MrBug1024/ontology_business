@@ -1,0 +1,47 @@
+.distillation-page { --distill-gap: 20px; }
+.distill-actions, .distill-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.distill-actions { justify-content: flex-start; }
+.distill-intro { padding: 22px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--grad-soft); margin-bottom: 20px; }
+.distill-intro h2 { margin: 0 0 8px; font-size: 20px; }
+.distill-intro p { margin: 0; color: var(--text-2); max-width: 85ch; }
+.distill-layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); align-items: start; gap: var(--distill-gap); }
+.distill-projects, .distill-workspace { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; min-width: 0; }
+.distill-projects { padding: 14px; }
+.distill-projects h2 { font-size: 15px; margin: 0 0 14px; }
+.distill-project-item { display: block; width: 100%; text-align: left; background: transparent; color: var(--text); border: 1px solid transparent; border-radius: 8px; padding: 12px; cursor: pointer; margin: 4px 0; overflow-wrap: anywhere; }
+.distill-project-item[aria-current='true'] { border-color: var(--border-strong); background: var(--primary-soft); }
+.distill-project-item:hover { background: var(--surface-2); }
+.distill-project-item strong, .distill-project-item small { display: block; }
+.distill-project-item small { color: var(--text-2); margin-top: 4px; }
+.distill-steps { display: flex; flex-wrap: wrap; gap: 8px; padding: 18px 0; margin: 16px 0; border-block: 1px solid var(--border); }
+.distill-steps button { flex: 1 1 120px; min-height: 44px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; color: var(--text-2); cursor: pointer; }
+.distill-steps button[aria-current='step'] { background: var(--primary-soft); color: var(--text); border-color: var(--primary); font-weight: 600; }
+.distill-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 20px; }
+.distill-fields .el-select { width: 100%; }
+.distill-workspace h2 { font-size: 18px; margin: 10px 0; }
+.distill-workspace h3 { font-size: 15px; }
+.distill-workspace h4 { margin: 6px 0 12px; }
+.distill-hint { color: var(--text-2); line-height: 1.75; margin-bottom: 22px; }
+.distill-item { padding: 16px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; margin: 16px 0; }
+.distill-source-guide { background: var(--primary-soft); padding: 18px; border-radius: 10px; margin-bottom: 20px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.distill-source-guide p { color: var(--text-2); margin-bottom: 0; }
+.distill-source-guide .el-button { margin: 0; }
+.distill-link-row { display: grid; grid-template-columns: 1fr 1fr 1.2fr auto; align-items: center; gap: 12px; }
+.distill-graph { border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 8px; margin: 20px 0; color: var(--text-2); max-height: 450px; overflow: auto; }
+.distill-graph svg { display: block; width: 100%; min-width: 480px; }
+.distill-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.distill-summary-grid dt { color: var(--text-2); font-size: 13px; }
+.distill-summary-grid dd { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.distill-review { background: var(--warning-soft); padding: 16px 22px; border-radius: 10px; margin: 18px 0; }
+.distill-review li, .distill-summary li { margin: 8px 0; }
+.distill-error { color: var(--danger); }
+.distill-status { margin-bottom: 16px; }
+.distill-editor { padding: 0; margin: 0; border: 0; min-width: 0; }
+.distill-footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
+.distill-publication { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 16px; }
+.distill-publication .el-button { margin: 4px; }
+.distill-workspace summary, .distill-summary summary { cursor: pointer; padding: 12px 0; font-weight: 600; }
+.distill-proposal { max-height: 62vh; overflow-y: auto; padding: 0 8px; }
+@media (max-width: 1100px) { .distill-layout { grid-template-columns: 190px minmax(0, 1fr); } .distill-link-row { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 760px) { .distill-layout { grid-template-columns: minmax(0, 1fr); } .distill-projects { max-height: 260px; overflow: auto; } .distill-fields, .distill-source-guide, .distill-summary-grid { grid-template-columns: minmax(0, 1fr); } .distill-workspace { padding: 16px; } .distill-link-row { grid-template-columns: minmax(0, 1fr); } .distill-link-row .el-form-item { margin-bottom: 4px; } }
+@media (prefers-reduced-motion: reduce) { .distillation-page { animation: none; } }

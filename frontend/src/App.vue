@@ -47,8 +47,9 @@
           active-text-color="var(--sidebar-title)"
           @select="sidebarOpen = false"
         >
+          <el-menu-item index="/data-sources"><el-icon aria-hidden="true"><Coin /></el-icon><span>资料库</span></el-menu-item>
+          <el-menu-item index="/business-distillation"><el-icon aria-hidden="true"><Compass /></el-icon><span>业务蒸馏</span></el-menu-item>
           <el-menu-item index="/scenarios"><el-icon aria-hidden="true"><OfficeBuilding /></el-icon><span>场景能力</span></el-menu-item>
-          <el-menu-item index="/data-sources"><el-icon aria-hidden="true"><Coin /></el-icon><span>建模资料</span></el-menu-item>
           <el-menu-item index="/agents"><el-icon aria-hidden="true"><Cpu /></el-icon><span>验证中心</span></el-menu-item>
           <el-menu-item index="/access"><el-icon aria-hidden="true"><Connection /></el-icon><span>发布与接入</span></el-menu-item>
         </el-menu>
@@ -66,7 +67,7 @@
           <el-menu-item index="/tasks"><el-icon aria-hidden="true"><List /></el-icon><span>运行治理</span></el-menu-item>
         </el-menu>
 
-        <div class="nav-label">平台管理</div>
+        <div class="nav-label">工作区管理</div>
         <el-menu
           :default-active="activeRoute"
           router
@@ -76,21 +77,19 @@
           active-text-color="var(--sidebar-title)"
           @select="sidebarOpen = false"
         >
-          <el-sub-menu index="settings">
-            <template #title><el-icon aria-hidden="true"><Setting /></el-icon><span>平台配置</span></template>
-            <el-menu-item index="/templates">产物模板</el-menu-item>
-            <el-menu-item index="/llm">大模型</el-menu-item>
-            <el-menu-item index="/mcp">外部工具</el-menu-item>
-            <el-menu-item index="/skills">本地技能</el-menu-item>
-          </el-sub-menu>
           <el-menu-item index="/members"><el-icon aria-hidden="true"><User /></el-icon><span>成员与权限</span></el-menu-item>
           <el-menu-item v-if="auth.user?.system_role === 'superadmin'" index="/accounts"><el-icon aria-hidden="true"><Setting /></el-icon><span>账户管理</span></el-menu-item>
         </el-menu>
       </nav>
 
       <div class="side-footer">
-        <span class="status-dot" aria-hidden="true" />
-        <span><b>工作区已连接</b><small>业务工作区</small></span>
+        <div class="side-connection">
+          <span class="status-dot" aria-hidden="true" />
+          <span><b>工作区已连接</b><small>业务工作区</small></span>
+        </div>
+        <el-button class="platform-settings-button" text circle aria-label="打开平台设置" title="平台设置" @click="openPlatformSettings()">
+          <el-icon aria-hidden="true"><Setting /></el-icon>
+        </el-button>
       </div>
     </el-aside>
 
@@ -134,8 +133,9 @@
       <div class="route-viewport">
         <router-view />
       </div>
-      <GlobalAssistant :context="assistantContext" :hide-launcher="sidebarOpen" />
+      <GlobalAssistant v-if="route.name === 'scenario-detail'" :context="assistantContext" :hide-launcher="sidebarOpen" />
     </el-main>
+    <PlatformSettingsDialog v-model="platformSettingsOpen" :initial-tab="platformSettingsTab" :theme="theme" @tab-change="changePlatformSettingsTab" @toggle-theme="toggleTheme" />
   </el-container>
 </template>
 
@@ -145,22 +145,31 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import GlobalAssistant from '@/components/GlobalAssistant.vue'
 import WorkspaceMenu from '@/components/access/WorkspaceMenu.vue'
+import PlatformSettingsDialog from '@/components/platform/PlatformSettingsDialog.vue'
+import { platformSettingsQuery, platformSettingsTabFromQuery, type PlatformSettingsTab } from '@/utils/platformSettings'
 
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 const sidebarOpen = ref(false)
 const theme = ref<'light' | 'dark'>((localStorage.getItem('ontology-theme') as 'light' | 'dark') || 'light')
+const platformSettingsTab = computed(() => platformSettingsTabFromQuery(route.query.platform_settings) || 'general')
+const platformSettingsOpen = computed({
+  get: () => platformSettingsTabFromQuery(route.query.platform_settings) !== null,
+  set: (visible: boolean) => {
+    if (!visible) void router.replace({ query: platformSettingsQuery(route.query, null), hash: route.hash })
+  },
+})
 
 const activeRoute = computed(() => {
+  if (route.path.startsWith('/business-distillation')) return '/business-distillation'
   if (route.path.startsWith('/scenarios')) return '/scenarios'
   if (route.path.startsWith('/agents')) return '/agents'
   if (route.path.startsWith('/access')) return '/access'
   return route.path
 })
 const pageTitle = computed(() => String(route.meta.title || '业务场景'))
-const assistantSafeArea = computed(() => !route.path.match(/^\/agents\/[^/]+\/chat(?:\/|$)/)
-  && !route.path.match(/^\/scenarios\/[^/]+(?:\/|$)/))
+const assistantSafeArea = computed(() => route.name === 'scenario-detail')
 const assistantContext = computed(() => {
   const queryScenario = Array.isArray(route.query.scenario_id)
     ? String(route.query.scenario_id[0] || '')
@@ -182,6 +191,13 @@ function applyTheme() {
 function toggleTheme() {
   theme.value = theme.value === 'light' ? 'dark' : 'light'
   applyTheme()
+}
+function openPlatformSettings(tab: PlatformSettingsTab = 'general') {
+  sidebarOpen.value = false
+  void router.push({ query: platformSettingsQuery(route.query, tab), hash: route.hash })
+}
+function changePlatformSettingsTab(tab: PlatformSettingsTab) {
+  void router.replace({ query: platformSettingsQuery(route.query, tab), hash: route.hash })
 }
 function onUserCommand(command: string) {
   if (command === 'logout') auth.logout().then(() => router.replace('/login'))
@@ -219,11 +235,14 @@ onBeforeUnmount(() => window.removeEventListener('ontology-theme-change', syncTh
 .side-menu :deep(.el-menu-item:hover), .side-menu :deep(.el-sub-menu__title:hover) { background: var(--sidebar-hover); color: var(--sidebar-title); }
 .side-menu :deep(.el-menu-item.is-active) { background: var(--sidebar-active); color: var(--sidebar-title); font-weight: 680; box-shadow: var(--shadow-sm); }
 .side-menu :deep(.el-sub-menu .el-menu-item) { min-width: 0; padding-left: 48px !important; font-size: 12px; }
-.side-footer { position: relative; z-index: 1; display: flex; align-items: center; gap: 9px; margin-top: auto; padding: 14px 17px; border-top: 1px solid var(--sidebar-border); color: var(--sidebar-muted); }
-.side-footer > span:last-child { display: flex; flex-direction: column; gap: 2px; }
+.side-footer { position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 9px; margin-top: auto; padding: 12px 13px 12px 17px; border-top: 1px solid var(--sidebar-border); color: var(--sidebar-muted); }
+.side-connection { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.side-connection > span:last-child { display: flex; flex-direction: column; gap: 2px; }
 .side-footer b { color: var(--sidebar-text); font-size: 10.5px; font-weight: 680; }
 .side-footer small { font-size: 9px; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #34d399; box-shadow: 0 0 0 4px rgba(52, 211, 153, .12); }
+.platform-settings-button { flex: 0 0 auto; min-width: 44px; min-height: 44px; color: var(--sidebar-text); }
+.platform-settings-button:hover { background: var(--sidebar-hover); color: var(--sidebar-title); }
 .main-area { min-width: 0; height: 100%; min-height: 0; padding: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; background: transparent; }
 .main-area.navigation-open { overflow: hidden; }
 .route-viewport { position: relative; min-width: 0; }

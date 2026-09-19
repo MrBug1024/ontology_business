@@ -92,6 +92,7 @@ def _owned_scenario(
         select(BusinessScenario).where(
             BusinessScenario.id == scenario_id,
             BusinessScenario.tenant_id == context.tenant_id,
+            BusinessScenario.id == context.scenario_id,
         )
     ).scalar_one_or_none()
     if scenario is None:
@@ -189,6 +190,7 @@ async def upload_invocation_attachment(
 ) -> CatalogManagedUploadOut:
     """Create a temporary logical asset without exposing storage coordinates."""
     external_api_service.require_scope(context, "assets:write")
+    _active_owned_scenario(context, context.scenario_id)
     form = await request.form()
     supplied_fields = {str(key).strip().lower() for key in form.keys()}
     disallowed = supplied_fields - _EXTERNAL_UPLOAD_FIELDS
@@ -246,6 +248,9 @@ async def upload_invocation_attachment(
                 ),
             ) from exc
         try:
+            metadata = metadata.model_copy(update={
+                "asset_key": f"external.{context.scenario_id}.{staged.content_sha256}",
+            })
             if staged.byte_size <= in_memory_bytes:
                 result = catalog_ingestion_service.persist_managed_upload(
                     context.db,
@@ -313,6 +318,7 @@ def list_scenarios(
         select(BusinessScenario)
         .where(
             BusinessScenario.tenant_id == context.tenant_id,
+            BusinessScenario.id == context.scenario_id,
             BusinessScenario.status != "retired",
         )
         .order_by(BusinessScenario.name, BusinessScenario.id)

@@ -8,6 +8,9 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from ..distillation_models import DistillationProject
+from ..external_api_models import ExternalApiKey, ExternalScenarioAsset
+
 from ..models import (
     ActionExecutionLog,
     Agent,
@@ -308,6 +311,7 @@ def _audit_counts(
 ) -> dict[str, int]:
     return {
         "assertions": _count_scenario(db, Assertion, scenario),
+        "external_api_keys": _count_scenario(db, ExternalApiKey, scenario),
         "derivation_runs": _count_scenario(db, DerivationRun, scenario),
         "derivation_evidence": _count_where(
             db, DerivationEvidence, queries.evidence_for_scenario
@@ -369,6 +373,8 @@ def _plan_blockers(
         blockers.append("场景历史数据的租户归属不一致，已停止永久删除，请先修复数据")
     if scenario.status != "retired":
         blockers.append("请先退役场景，确认不再接受新的验证和运行请求")
+    if _count_scenario(db, DistillationProject, scenario):
+        blockers.append("业务蒸馏项目与不可变交接证据需保留，不能永久删除该场景")
     if _count_where(
         db,
         OntologyRelease,
@@ -437,8 +443,15 @@ def build_purge_plan(
         **_audit_counts(db, scenario, queries),
     }
     retained = _retained_dataset_counts(db, scenario)
+    retained["distillation_projects"] = _count_scenario(db, DistillationProject, scenario)
     blockers = _plan_blockers(db, scenario, queries)
+    external_assets = _count_where(db, ExternalScenarioAsset,
+        ExternalScenarioAsset.scenario_id == scenario.id, ExternalScenarioAsset.tenant_id == scenario.tenant_id)
+    retained["external_scenario_assets"] = external_assets
+    if external_assets:
+        blockers += ("场景仍保留外部调用附件及其归属证据，可退役但暂不能永久删除",)
     audit_keys = (
+        "external_api_keys",
         "conversations",
         "messages",
         "capability_invocations",

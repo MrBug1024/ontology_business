@@ -2,49 +2,28 @@
   <div class="page data-sources-page">
     <div class="page-header">
       <div>
-        <h1>建模资料</h1>
-        <div class="sub">上传历史样本、参考文档或连接样本数据库，帮助平台理解业务场景</div>
+        <h1>资料库</h1>
+        <div class="sub">统一管理数据库、资料文件与业务产物模板</div>
       </div>
       <div class="data-source-header-actions">
         <el-button v-if="returnPath" @click="returnToPreviousFlow"><el-icon><ArrowLeft /></el-icon> 返回上一步</el-button>
-        <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新增建模资料</el-button>
+        <el-button v-if="activeLibraryTab === 'materials'" type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 创建资料库</el-button>
       </div>
     </div>
 
-    <section class="card resource-boundary" aria-labelledby="resource-boundary-title">
-      <header>
-        <span class="eyebrow">DATA BOUNDARY</span>
-        <h2 id="resource-boundary-title">这里保存的是场景认知材料，不是客户永远不变的业务数据</h2>
-      </header>
-      <div class="resource-boundary-grid">
-        <article>
-          <strong>本页全部都是建模资料</strong>
-          <p>历史 Excel、文档、规则、表结构和数据库连接只用于场景建模；可绑定到一个业务场景，也可保留为租户共享建模资料。</p>
-        </article>
-        <article>
-          <strong>正式运行数据</strong>
-          <p>只来自验证对话或第三方 Agent 当次上传的文件，以及创建 Agent 时专门配置的业务数据库；本页任何资料都不会自动进入正式调用。</p>
-        </article>
-      </div>
-    </section>
+    <p class="library-purpose">用于业务蒸馏与场景建模。可绑定到一个业务场景，也可保留为工作区共享资料。这里的资料不会自动进入正式调用。规范和模板附件也可在这里保存、引用，供 AI 理解产物要求。</p>
 
+    <el-tabs v-model="activeLibraryTab" class="library-tabs" aria-label="资料库内容" @tab-change="onLibraryTabChanged">
+      <el-tab-pane label="资料文件与数据库" name="materials">
     <section class="resource-section-group" aria-labelledby="connections-title">
       <header class="resource-group-heading">
         <div><span class="eyebrow">MODELING MATERIALS</span><h2 id="connections-title">资料文件与数据库样本</h2></div>
-        <p>绑定场景后，仅该场景的建模过程可选择这些资料；未绑定的资料可供当前租户的各场景建模使用。</p>
+        <p>绑定场景后，该场景可选择这些资料进行蒸馏和建模；未绑定的资料可供当前工作区的场景共享使用。</p>
       </header>
-        <el-alert
-          class="physical-connection-note"
-          type="info"
-          :closable="false"
-          show-icon
-          title="本页连接和文件永远只用于建模"
-          description="正式验证数据只来自对话上传附件或 Agent 创建/编辑时单独配置的业务数据库。"
-        />
         <el-row :gutter="16" class="physical-workspace">
       <el-col class="data-sources-list-col" :xs="24" :md="9">
         <div class="card data-sources-list-card" v-loading="loading">
-          <div class="card-title"><el-icon><Coin /></el-icon> 建模资料</div>
+          <div class="card-title"><el-icon><Coin /></el-icon> 资料库</div>
           <div class="ds-list">
             <button v-for="ds in dataSources" :key="ds.id" type="button" class="ds-item" :class="{ active: selected?.id === ds.id }" :aria-current="selected?.id === ds.id ? 'true' : undefined" :aria-label="`选择数据源：${ds.name}`" @click="select(ds)">
               <div class="ds-icon" :class="ds.type">
@@ -61,8 +40,8 @@
             </button>
             <div v-if="!loading && !dataSources.length" class="empty-wrap">
               <div class="empty-icon"><el-icon :size="26"><Coin /></el-icon></div>
-              <div>暂无建模资料</div>
-              <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 新增建模资料</el-button>
+              <div>暂无资料库</div>
+              <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 创建资料库</el-button>
             </div>
           </div>
         </div>
@@ -75,34 +54,37 @@
             <el-tag size="small" type="info">{{ typeLabel(selected.type) }}</el-tag>
             <el-tag size="small" effect="plain">{{ modelingScopeLabel(selected) }}</el-tag>
             <el-tag v-if="selected.type === 'dataset' && selected.can_delete" size="small" type="warning" effect="plain">不可编辑，可删除连接</el-tag>
+            <el-tag v-else-if="selected.type === 'distillation'" size="small" type="info" effect="plain">不可变阶段资料</el-tag>
             <el-tag v-else-if="!selected.can_write && !selected.can_delete" size="small" type="warning" effect="plain">只读公开资源</el-tag>
             <div style="margin-left:auto;display:flex;gap:6px">
               <template v-if="selected.can_write">
                 <el-button size="small" @click="testConn" :loading="testing"><el-icon><Link /></el-icon> 测试连接</el-button>
                 <el-button size="small" @click="openEdit(selected)"><el-icon><Edit /></el-icon> 编辑</el-button>
               </template>
-              <el-button v-if="selected.can_delete" size="small" type="danger" @click="remove(selected)" aria-label="删除建模资料" title="删除建模资料"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
+              <el-button v-if="selected.can_delete" size="small" type="danger" @click="remove(selected)" aria-label="删除资料库" title="删除资料库"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
             </div>
           </div>
 
           <!-- 数据库表结构；原始 SQL 仅保留为后端管理诊断能力，不向普通业务用户开放。 -->
-          <template v-if="selected.type !== 'file_bucket'">
+          <DistillationMaterialPanel v-if="selected.type === 'distillation'" :source="selected" />
+          <template v-else-if="selected.type !== 'file_bucket'">
             <el-alert
               v-if="selected.type === 'dataset' && selected.can_delete"
               title="版本化数据集连接可以删除"
-              description="删除会移除这条建模资料连接记录；底层目录版本仍受引用保护，不会被误删。"
+              description="删除会移除这条资料库连接记录；底层目录版本仍受引用保护，不会被误删。"
               type="info"
               :closable="false"
               show-icon
               class="readonly-note"
             />
-            <section class="database-tables" aria-labelledby="database-tables-title">
+            <el-empty v-if="selected.type === 'sqlite3' && !selected.file_count" description="尚未上传 SQLite3 快照，可通过编辑资料库继续上传。" />
+            <section v-else class="database-tables" aria-labelledby="database-tables-title">
               <h3 id="database-tables-title">数据表</h3>
-              <el-table :data="tables" size="small" max-height="520">
+              <el-table v-loading="loadingTables" :data="tables" size="small" max-height="520">
                 <el-table-column prop="name" label="表名" min-width="160">
                   <template #default="{ row }"><button type="button" class="table-open mono" @click="openTable(row)">{{ row.name }}</button></template>
                 </el-table-column>
-                <el-table-column prop="row_count" label="行数" width="90" align="right" />
+                <el-table-column label="行数" width="90" align="right"><template #default="{ row }">{{ row.row_count >= 0 ? row.row_count : '未采集' }}</template></el-table-column>
                 <el-table-column label="字段" min-width="220">
                   <template #default="{ row }">
                     <el-tag v-for="c in row.columns.slice(0, 5)" :key="c.name" size="small" effect="plain" style="margin:2px">
@@ -227,59 +209,17 @@
             </div>
           </template>
         </div>
-        <el-empty v-else description="选择左侧建模资料查看详情" />
+        <el-empty v-else description="选择左侧资料库查看详情" />
       </el-col>
         </el-row>
     </section>
+      </el-tab-pane>
+      <el-tab-pane label="产物模板" name="templates" lazy>
+        <Templates embedded @show-materials="showMaterials" />
+      </el-tab-pane>
+    </el-tabs>
 
-    <!-- 新建/编辑建模资料 -->
-    <el-dialog v-model="dlg" :title="form.id ? '编辑建模资料' : '新增建模资料'" width="560px">
-      <el-form :model="form" label-width="90px" class="data-source-form">
-        <el-form-item label="名称" required><el-input v-model="form.name" placeholder="如：历史业务样本、规则参考资料" /></el-form-item>
-        <el-form-item label="类型" required>
-          <el-radio-group v-model="form.type" @change="onTypeChange">
-            <el-radio value="postgres">PostgreSQL</el-radio>
-            <el-radio value="file_bucket">文件桶</el-radio>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item label="建模场景">
-          <el-select
-            v-model="form.scenario_id"
-            clearable
-            filterable
-            placeholder="租户共享（所有场景建模可用）"
-            aria-label="选择建模资料绑定的业务场景"
-          >
-            <el-option
-              v-for="scenario in writableScenarios"
-              :key="scenario.id"
-              :label="scenario.name"
-              :value="scenario.id"
-            />
-          </el-select>
-          <div class="form-help">只影响建模时的资料选择与访问范围；不会把资料绑定为验证或正式运行数据。</div>
-        </el-form-item>
-
-        <template v-if="form.type === 'postgres'">
-          <el-row :gutter="10">
-            <el-col :span="14"><el-form-item label="主机"><el-input v-model="form.config.host" placeholder="数据库主机或域名" /></el-form-item></el-col>
-            <el-col :span="10"><el-form-item label="端口"><el-input v-model.number="form.config.port" placeholder="连接端口" /></el-form-item></el-col>
-          </el-row>
-          <el-row :gutter="10">
-            <el-col :span="14"><el-form-item label="数据库"><el-input v-model="form.config.database" /></el-form-item></el-col>
-            <el-col :span="10"><el-form-item label="用户名"><el-input v-model="form.config.username" /></el-form-item></el-col>
-          </el-row>
-          <el-form-item label="密码"><el-input v-model="form.config.password" type="password" show-password /></el-form-item>
-        </template>
-        <template v-else>
-          <el-form-item label="说明"><div class="muted">文件桶用于上传业务文档（Excel / Word / PDF / 图片等），平台自动解析为文本供 Agent 检索。</div></el-form-item>
-        </template>
-      </el-form>
-      <template #footer>
-        <el-button @click="dlg=false">取消</el-button>
-        <el-button type="primary" :loading="saving" @click="save">保存</el-button>
-      </template>
-    </el-dialog>
+    <LibraryEditorDialog v-if="activeLibraryTab === 'materials'" v-model="dlg" :source="editingSource" :scenarios="writableScenarios" :scenario-id="routeScenarioId" @saved="onLibrarySaved" />
 
     <!-- 表详情 -->
     <el-dialog v-model="tableDlg" :title="'表结构：' + (curTable?.name || '')" width="640px">
@@ -294,7 +234,7 @@
           <template #default="{ row }"><el-tag v-if="row.pk" size="small" type="warning">PK</el-tag></template>
         </el-table-column>
       </el-table>
-      <div class="muted" style="margin-top:8px">共 {{ curTable?.row_count }} 行</div>
+      <div class="muted" style="margin-top:8px">{{ (curTable?.row_count ?? -1) >= 0 ? `共 ${curTable?.row_count} 行` : '只读取结构，未采集业务行' }}</div>
     </el-dialog>
 
     <!-- 文件文本 -->
@@ -310,6 +250,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { api } from '@/api'
+import { libraryApi } from '@/api/library'
 import type {
   BucketFile,
   DataSource,
@@ -318,6 +259,9 @@ import type {
   TableInfo,
 } from '@/types'
 import { dataSourceLocationLabel } from '@/utils/dataSources'
+import DistillationMaterialPanel from '@/components/distillation/DistillationMaterialPanel.vue'
+import LibraryEditorDialog from '@/components/library/LibraryEditorDialog.vue'
+import Templates from '@/views/Templates.vue'
 
 const dataSources = ref<DataSource[]>([])
 const scenarios = ref<Scenario[]>([])
@@ -325,6 +269,25 @@ const selected = ref<DataSource | null>(null)
 const loading = ref(false)
 const route = useRoute()
 const router = useRouter()
+type LibraryTab = 'materials' | 'templates'
+function libraryTabFromQuery(value: unknown): LibraryTab {
+  const candidate = Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
+  return candidate === 'templates' ? 'templates' : 'materials'
+}
+const activeLibraryTab = ref<LibraryTab>(libraryTabFromQuery(route.query.library_tab))
+function onLibraryTabChanged(value: string | number) {
+  const next: LibraryTab = value === 'templates' ? 'templates' : 'materials'
+  if (activeLibraryTab.value !== next) activeLibraryTab.value = next
+  const query = { ...route.query }
+  if (next === 'templates') query.library_tab = 'templates'
+  else delete query.library_tab
+  if (libraryTabFromQuery(route.query.library_tab) !== next) {
+    void router.replace({ name: 'data-sources', query })
+  }
+}
+function showMaterials() {
+  onLibraryTabChanged('materials')
+}
 function safeReturnPath(value: unknown): string {
   const candidate = Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
   if (!candidate.startsWith('/') || candidate.startsWith('//') || candidate.includes('\\')) return ''
@@ -333,8 +296,8 @@ function safeReturnPath(value: unknown): string {
 const returnPath = ref(safeReturnPath(route.query.return_to))
 
 const dlg = ref(false)
-const saving = ref(false)
-const form = ref<Partial<DataSource> & { config: Record<string, any> }>({ type: 'postgres', config: {} })
+const editingSource = ref<DataSource | null>(null)
+const routeScenarioId = computed(() => typeof route.query.scenario_id === 'string' ? route.query.scenario_id : '')
 
 const testing = ref(false)
 const tables = ref<TableInfo[]>([])
@@ -367,7 +330,7 @@ let testRequest = 0
 let textRequest = 0
 
 const TYPE_LABELS: Record<string, string> = {
-  postgres: 'PostgreSQL', dataset: '数据集', file_bucket: '文件桶',
+  postgres: 'PostgreSQL', mysql: 'MySQL', sqlite3: 'SQLite3', dataset: '数据集', file_bucket: '文件桶', distillation: '业务蒸馏',
 }
 const uploadFailureSummary = computed(() => {
   const visibleFailures = uploadFailures.value.slice(0, 3)
@@ -379,9 +342,9 @@ const uploadFailureSummary = computed(() => {
 function typeLabel(t: string) { return TYPE_LABELS[t] || t }
 const writableScenarios = computed(() => scenarios.value.filter((scenario) => scenario.can_write !== false))
 function modelingScopeLabel(source: Pick<DataSource, 'scenario_id'>) {
-  if (!source.scenario_id) return '租户共享建模'
+  if (!source.scenario_id) return '工作区共享资料'
   const scenario = scenarios.value.find((item) => item.id === source.scenario_id)
-  return scenario ? `仅用于「${scenario.name}」建模` : '场景专属建模'
+  return scenario ? `「${scenario.name}」专属资料` : '场景专属资料'
 }
 function fmtSize(n: number) {
   if (n < 1024) return n + ' B'
@@ -457,8 +420,8 @@ function select(ds: DataSource, syncRoute = true) {
   searched.value = false
   searchError.value = ''
   searchNotice.value = ''
-  if (ds.type !== 'file_bucket') void loadTables()
-  else void loadFiles()
+  if (ds.type === 'file_bucket') void loadFiles()
+  else if (ds.type !== 'distillation' && (ds.type !== 'sqlite3' || ds.file_count)) void loadTables()
   if (syncRoute && route.query.source_id !== ds.id) {
     void router.replace({ name: 'data-sources', query: { ...route.query, source_id: ds.id, view: 'connections' } })
   }
@@ -490,8 +453,9 @@ async function testConn() {
   const request = ++testRequest
   testing.value = true
   try {
-    const r: any = await api.testDataSource(source.id)
+    const r = await libraryApi.test(source.id)
     if (viewDisposed || request !== testRequest || selected.value?.id !== source.id) return
+    if (!r.ok) throw new Error(r.message || '连接测试未通过')
     ElMessage.success(r.message || '连接成功')
     source.status = 'ok'
   } catch (e: any) {
@@ -674,71 +638,32 @@ async function removeFile(f: BucketFile) {
   }
 }
 
-// ── 建模资料新建/编辑 ──
-function onTypeChange() {
-  form.value.config =
-    form.value.type === 'file_bucket'
-      ? {}
-      : emptyPostgresConfig()
-}
-function emptyPostgresConfig() {
-  return { host: '', port: undefined, database: '', username: '', password: '' }
-}
+// ── 资料库创建/编辑由独立组件管理 ──
 function openCreate() {
-  const routeScenarioId = Array.isArray(route.query.scenario_id)
-    ? String(route.query.scenario_id[0] || '')
-    : typeof route.query.scenario_id === 'string' ? route.query.scenario_id : ''
-  form.value = {
-    name: '',
-    scenario_id: writableScenarios.value.some((scenario) => scenario.id === routeScenarioId)
-      ? routeScenarioId
-      : undefined,
-    type: 'postgres',
-    config: emptyPostgresConfig(),
-  }
+  editingSource.value = null
   dlg.value = true
 }
 function openEdit(ds: DataSource) {
-  form.value = { ...ds, config: { ...ds.config } }
+  editingSource.value = ds
   dlg.value = true
 }
-async function save() {
-  if (!form.value.name) return ElMessage.warning('请填写名称')
-  if (form.value.type === 'postgres') {
-    const config = form.value.config || {}
-    const port = Number(config.port)
-    if (!String(config.host || '').trim() || !Number.isInteger(port) || port < 1 || port > 65535
-      || !String(config.database || '').trim() || !String(config.username || '').trim()) {
-      return ElMessage.warning('请完整填写数据库主机、端口、数据库和用户名')
-    }
+async function onLibrarySaved(saved: DataSource) {
+  ElMessage.success('资料库已保存')
+  if (saved.id) {
+    await router.replace({ name: 'data-sources', query: { ...route.query, source_id: saved.id, view: 'connections' } })
   }
-  saving.value = true
-  try {
-    const saved = form.value.id
-      ? await api.updateDataSource(form.value.id, form.value)
-      : await api.createDataSource(form.value)
-    ElMessage.success('建模资料已保存')
-    dlg.value = false
-    if (saved.id) {
-      await router.replace({ name: 'data-sources', query: { ...route.query, source_id: saved.id, view: 'connections' } })
-    }
-    await load()
-  } catch (e: any) {
-    ElMessage.error(e.message)
-  } finally {
-    saving.value = false
-  }
+  await load()
 }
 async function remove(ds: DataSource) {
   try {
-    const detail = ds.type === 'postgres'
-      ? '这只会删除本平台保存的连接配置，不会执行任何删除远程 PostgreSQL 数据的操作。'
+    const detail = ['postgres', 'mysql'].includes(ds.type)
+      ? '这只会删除本平台保存的连接配置，不会执行任何删除远程数据库数据的操作。'
       : ds.type === 'dataset'
-      ? '这会移除当前建模资料中的连接记录，不会删除仍被目录或审计引用的底层版本。'
+      ? '这会移除当前资料库中的连接记录，不会删除仍被目录或审计引用的底层版本。'
       : `这会删除资料记录及其 ${ds.file_count || 0} 个托管文件；数据库会保留清理审计，MinIO 对象进入清理队列。`
-    await ElMessageBox.confirm(`删除建模资料「${ds.name}」？${detail}`, '确认删除', {
+    await ElMessageBox.confirm(`删除资料库「${ds.name}」？${detail}`, '确认删除', {
       type: 'warning',
-      confirmButtonText: '删除建模资料',
+      confirmButtonText: '删除资料库',
       cancelButtonText: '取消',
     })
     const result: any = await api.deleteDataSource(ds.id!)
@@ -767,6 +692,9 @@ watch(() => route.query.source_id, (value) => {
 watch(() => route.query.return_to, (value) => {
   returnPath.value = safeReturnPath(value)
 })
+watch(() => route.query.library_tab, (value) => {
+  activeLibraryTab.value = libraryTabFromQuery(value)
+})
 onBeforeUnmount(() => {
   viewDisposed = true
   loadRequest += 1
@@ -776,6 +704,7 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.library-purpose { color: var(--text-3); font-size: 13px; line-height: 1.7; margin: 0 0 20px; }
 .ds-item {
   display: flex;
   width: 100%;
@@ -822,7 +751,7 @@ onBeforeUnmount(() => {
 }
 .ds-classification { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 5px; margin-top: 5px; color: var(--warning); font-size: 10px; line-height: 1.35; }
 
-/* ── 建模资料与连接工作区 ── */
+/* ── 资料库与连接工作区 ── */
 .data-sources-page {
   min-height: 100%;
   box-sizing: border-box;

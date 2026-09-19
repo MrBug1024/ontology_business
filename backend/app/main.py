@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -26,6 +27,7 @@ from .routers import (
     capability_access,
     auth,
     catalog,
+    business_distillation,
     data_sources,
     external_api,
     external_capabilities,
@@ -58,10 +60,15 @@ from .services import (
     system_account_service,
 )
 from .services.auth_request_security import CookieOriginMiddleware, allowed_cookie_origins
+from .services.distillation_attachment_parser import MAX_ATTACHMENT_BYTES
+from .services.library_sqlite_adapter import MAX_SQLITE_BYTES
+from .routers import distillation_access, distillation_conversation
+from .services import distillation_attachment_service, distillation_conversation_worker
 
 
 logger = logging.getLogger(__name__)
 ASSISTANT_CHAT_MAX_BODY_BYTES = 128 * 1024
+UPLOAD_MULTIPART_OVERHEAD_BYTES = 64 * 1024
 
 
 async def _operations_worker() -> None:
@@ -138,6 +145,27 @@ async def _assistant_request_worker() -> None:
         await asyncio.sleep(0.2 if worked else 1)
 
 
+async def _distillation_conversation_worker() -> None:
+    """Reclaim persisted investigation turns with one bounded worker per process."""
+    while True:
+        try:
+            worked = await asyncio.to_thread(distillation_conversation_worker.process_next_turn)
+        except Exception:
+            logger.exception("业务蒸馏对话 worker 轮询失败")
+            worked = False
+        await asyncio.sleep(0.2 if worked else 1)
+
+
+async def _distillation_attachment_cleanup_worker() -> None:
+    """Expire input text even while all conversation workers are in provider calls."""
+    while True:
+        try:
+            await asyncio.to_thread(distillation_attachment_service.cleanup_tick)
+        except Exception:
+            logger.exception("业务蒸馏临时附件清理失败")
+        await asyncio.sleep(30)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
@@ -202,6 +230,8 @@ async def lifespan(_: FastAPI):
             _assistant_request_worker(),
             name="assistant-request-worker",
         )
+        distillation_worker = asyncio.create_task(_distillation_conversation_worker(), name="business-distillation-worker")
+        distillation_cleanup = asyncio.create_task(_distillation_attachment_cleanup_worker(), name="distillation-attachment-cleanup")
         try:
             yield
         finally:
@@ -212,6 +242,8 @@ async def lifespan(_: FastAPI):
             agent_turn_worker.cancel()
             managed_upload_worker.cancel()
             assistant_request_worker.cancel()
+            distillation_worker.cancel()
+            distillation_cleanup.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await invitation_worker
             with contextlib.suppress(asyncio.CancelledError):
@@ -226,6 +258,10 @@ async def lifespan(_: FastAPI):
                 await managed_upload_worker
             with contextlib.suppress(asyncio.CancelledError):
                 await assistant_request_worker
+            with contextlib.suppress(asyncio.CancelledError):
+                await distillation_worker
+            with contextlib.suppress(asyncio.CancelledError):
+                await distillation_cleanup
 
 
 settings = get_settings()
@@ -235,6 +271,10 @@ app.add_middleware(CookieOriginMiddleware)
 app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=16384,
     paths={f"{settings.api_prefix}/auth/{action}" for action in (
         "login", "register", "verify-email", "resend-code", "forgot-password", "reset-password")})
+app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=MAX_ATTACHMENT_BYTES + UPLOAD_MULTIPART_OVERHEAD_BYTES,
+    paths=(), path_patterns=(rf"{re.escape(settings.api_prefix)}/business-distillation/[^/]+/conversation/attachments",))
+app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=MAX_SQLITE_BYTES + UPLOAD_MULTIPART_OVERHEAD_BYTES,
+    paths=(), path_patterns=(rf"{re.escape(settings.api_prefix)}/data-sources/[^/]+/sqlite-file",))
 
 app.add_middleware(
     RequestBodyLimitMiddleware,
@@ -268,6 +308,9 @@ app.include_router(workspace_access.router, prefix=settings.api_prefix)
 app.include_router(system_accounts.router, prefix=settings.api_prefix)
 app.include_router(data_sources.router, prefix=settings.api_prefix)
 app.include_router(catalog.router, prefix=settings.api_prefix)
+app.include_router(business_distillation.router, prefix=settings.api_prefix)
+app.include_router(distillation_conversation.router, prefix=settings.api_prefix)
+app.include_router(distillation_access.router, prefix=settings.api_prefix)
 app.include_router(catalog.scenario_router, prefix=settings.api_prefix)
 app.include_router(managed_uploads.router, prefix=settings.api_prefix)
 app.include_router(llm_configs.router, prefix=settings.api_prefix)

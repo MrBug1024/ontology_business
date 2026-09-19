@@ -117,7 +117,7 @@
           <div class="runtime-connection-heading">
             <div>
               <h3 id="runtime-connection-heading">业务数据库</h3>
-              <p>可选。这里只配置 Agent 正式运行时可访问的数据库；“建模资料”中的连接不会出现在这里，也不会被运行时使用。</p>
+              <p>可选。这里只配置 Agent 正式运行时可访问的数据库；“资料库”中的连接用于业务理解与建模，不会被运行时自动使用。</p>
             </div>
             <el-button size="small" :disabled="!form.scenario_id" @click="addRuntimeConnection">
               <el-icon><Plus /></el-icon>添加数据库

@@ -642,13 +642,15 @@ class ScenarioDetail(ScenarioOut):
 # 数据源
 # ──────────────────────────────────────────────
 class DataSourceIn(BaseModel):
-    name: str
-    type: Literal["postgres", "file_bucket", "dataset"] = "postgres"
-    scenario_id: str | None = None
-    config: dict = Field(default_factory=dict)
+    name: str = Field(min_length=1, max_length=200)
+    type: Literal["postgres", "mysql", "sqlite3", "file_bucket", "dataset"] = "postgres"
+    scenario_id: str | None = Field(default=None, min_length=1, max_length=32)
+    config: dict = Field(default_factory=dict, repr=False)
+    model_config = {"extra": "forbid", "hide_input_in_errors": True}
 
 
 class DataSourceOut(DataSourceIn):
+    type: Literal["postgres", "mysql", "sqlite3", "file_bucket", "dataset", "distillation"] = "postgres"
     id: str
     scenario_id: str | None = None
     status: str = "unknown"

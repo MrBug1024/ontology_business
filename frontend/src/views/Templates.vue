@@ -1,10 +1,25 @@
 <template>
-  <section class="page template-page" aria-labelledby="template-page-title">
-    <header class="page-header">
+  <section class="page template-page" :class="{ 'template-page--embedded': embedded }" :aria-labelledby="embedded ? 'template-registry-title' : 'template-page-title'">
+    <header v-if="!embedded" class="page-header">
       <div>
         <div class="eyebrow">GOVERNED ARTIFACTS</div>
         <h1 id="template-page-title">模板中心</h1>
         <p class="sub">集中管理各业务场景的 Word、Excel 与 Markdown 模板；版本、变量和引用关系始终可追溯。</p>
+      </div>
+      <el-tooltip :disabled="Boolean(writableBuckets.length)" content="请先创建一个可写文件桶" placement="bottom">
+        <span :tabindex="writableBuckets.length ? undefined : 0" :aria-label="writableBuckets.length ? undefined : '上传模板不可用：请先创建一个可写文件桶'">
+          <el-button type="primary" :disabled="!writableBuckets.length" @click="openCreate">
+            <el-icon aria-hidden="true"><Upload /></el-icon>上传模板
+          </el-button>
+        </span>
+      </el-tooltip>
+    </header>
+
+    <header v-else class="template-section-header">
+      <div>
+        <div class="eyebrow">GOVERNED ARTIFACTS</div>
+        <h2 id="template-registry-title">产物模板</h2>
+        <p>集中管理各业务场景的 Word、Excel 与 Markdown 模板；版本、变量和 Action 引用关系始终可追溯。</p>
       </div>
       <el-tooltip :disabled="Boolean(writableBuckets.length)" content="请先创建一个可写文件桶" placement="bottom">
         <span :tabindex="writableBuckets.length ? undefined : 0" :aria-label="writableBuckets.length ? undefined : '上传模板不可用：请先创建一个可写文件桶'">
@@ -350,12 +365,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import type { ArtifactTemplate, ArtifactTemplateDetail, ArtifactTemplateReference, BucketFile, DataSource, Scenario } from '@/types'
 import { TEMPLATE_FILE_ACCEPT, isSupportedTemplateFilename, isTemplateBucketInScope, templateFormatLabel } from '@/utils/templates'
+
+withDefaults(defineProps<{ embedded?: boolean }>(), {
+  embedded: false,
+})
+const emit = defineEmits<{ showMaterials: [] }>()
 
 const route = useRoute()
 const router = useRouter()
@@ -381,12 +401,16 @@ let searchTimer: number | undefined
 watch(() => [filters.q, filters.scenario_id, filters.artifact_format, filters.status], () => {
   window.clearTimeout(searchTimer)
   searchTimer = window.setTimeout(() => {
-    void router.replace({ query: {
-      ...(filters.q ? { q: filters.q } : {}),
-      ...(filters.scenario_id ? { scenario_id: filters.scenario_id } : {}),
-      ...(filters.artifact_format ? { artifact_format: filters.artifact_format } : {}),
-      ...(filters.status ? { status: filters.status } : {}),
-    } })
+    const query = { ...route.query }
+    if (filters.q) query.q = filters.q
+    else delete query.q
+    if (filters.scenario_id) query.scenario_id = filters.scenario_id
+    else delete query.scenario_id
+    if (filters.artifact_format) query.artifact_format = filters.artifact_format
+    else delete query.artifact_format
+    if (filters.status) query.status = filters.status
+    else delete query.status
+    void router.replace({ query })
     void loadTemplates()
   }, 260)
 })
@@ -444,7 +468,10 @@ function deleteDisabledReason(template: ArtifactTemplate) {
   return '当前模板暂不可删除'
 }
 function goToDataSources() {
-  void router.push({ name: 'data-sources', query: { return_to: route.fullPath } })
+  emit('showMaterials')
+  if (!route.matched.some((record) => record.name === 'data-sources')) {
+    void router.push({ name: 'data-sources', query: { ...route.query, library_tab: 'materials' } })
+  }
 }
 
 const createDialog = ref(false)
@@ -751,10 +778,17 @@ async function removeTemplate(template: ArtifactTemplate) {
 onMounted(async () => {
   await Promise.all([loadResources(), loadTemplates()])
 })
+onBeforeUnmount(() => {
+  if (searchTimer !== undefined) window.clearTimeout(searchTimer)
+})
 </script>
 
 <style scoped>
 .template-page { position: relative; }
+.template-page--embedded { padding: 4px 0 0; }
+.template-section-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin: 2px 0 16px; }
+.template-section-header h2 { margin: 0; color: var(--text); font-size: 20px; }
+.template-section-header p { max-width: 760px; margin: 5px 0 0; color: var(--text-3); font-size: 13px; line-height: 1.65; }
 .eyebrow { margin-bottom: 5px; color: var(--primary-600); font-size: 10px; font-weight: 800; letter-spacing: 1.6px; }
 .operation-notice { margin-bottom: 14px; }
 .filter-card { padding: 16px 18px 12px; }
@@ -832,6 +866,8 @@ onMounted(async () => {
   .filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
+  .template-section-header { align-items: stretch; flex-direction: column; }
+  .template-section-header > :deep(.el-tooltip__trigger) { align-self: flex-start; }
   .filter-grid, .form-grid { grid-template-columns: minmax(0, 1fr); }
   .template-table { display: none; }
   .template-list-card { padding: 12px; }

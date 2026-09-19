@@ -8,6 +8,8 @@ export type ExternalApiScope =
 export interface IntegrationKey {
   id: string
   tenant_id: string
+  scenario_id: string | null
+  binding_status: 'bound' | 'reissue_required'
   user_id: string
   issued_by_user_id?: string | null
   revoked_by_user_id?: string | null

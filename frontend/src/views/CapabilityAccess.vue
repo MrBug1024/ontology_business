@@ -64,7 +64,7 @@
               <span class="adapter-icon"><el-icon><component :is="adapter.protocol === 'rest' ? 'Link' : 'Connection'" /></el-icon></span>
               <div>
                 <h2>{{ adapter.protocol === 'rest' ? 'REST API v2' : 'Capability MCP' }}</h2>
-                <span>已发布场景能力</span>
+                <span>仅允许访问“{{ manifest?.scenario.name }}”，请使用该场景的集成密钥</span>
               </div>
               <el-tag size="small" :type="manifestReady ? 'success' : 'warning'">{{ manifestReady ? '可接入' : '需检查' }}</el-tag>
             </header>
@@ -95,16 +95,20 @@
           <header class="section-toolbar">
             <div>
               <h2>Integration API keys</h2>
-              <span>REST 与 MCP 可复用同一组 capabilities scopes</span>
+              <span>每个密钥只允许访问其绑定场景，REST 与 MCP 使用相同边界</span>
             </div>
             <el-button v-if="canManage" type="primary" @click="openCreateKey">
               <el-icon><Plus /></el-icon>新建密钥
             </el-button>
           </header>
           <el-alert v-if="!canManage" type="info" title="当前账户无密钥管理权限" :closable="false" show-icon />
-          <el-table v-else :data="keys" empty-text="暂无集成密钥">
+          <el-alert v-if="keys.some((key) => key.binding_status === 'reissue_required')" type="warning" title="历史未绑定场景的密钥已停用，请选择业务场景重新签发" :closable="false" show-icon />
+          <el-table v-if="canManage" :data="visibleKeys" empty-text="暂无集成密钥">
             <el-table-column label="名称" min-width="170">
               <template #default="{ row }"><strong>{{ row.name }}</strong></template>
+            </el-table-column>
+            <el-table-column label="授权场景" min-width="160">
+              <template #default="{ row }">{{ scenarioName(row.scenario_id) }}</template>
             </el-table-column>
             <el-table-column label="标识" min-width="150">
               <template #default="{ row }"><code>{{ row.key_prefix }}…{{ row.token_hint }}</code></template>
@@ -115,7 +119,7 @@
               </template>
             </el-table-column>
             <el-table-column label="状态" width="100">
-              <template #default="{ row }"><el-tag :type="row.status === 'active' ? 'success' : 'info'">{{ row.status === 'active' ? '有效' : '已撤销' }}</el-tag></template>
+              <template #default="{ row }"><el-tag :type="row.status === 'active' ? 'success' : 'info'">{{ row.binding_status === 'reissue_required' ? '需重新签发' : row.status === 'active' ? '有效' : '已撤销' }}</el-tag></template>
             </el-table-column>
             <el-table-column label="到期" min-width="150">
               <template #default="{ row }">{{ formatDate(row.expires_at) }}</template>
@@ -172,6 +176,11 @@
     <el-dialog v-model="createKeyVisible" title="新建集成密钥" width="min(560px, 94vw)" @closed="resetKeyForm">
       <div v-if="keyFormError" ref="keyErrorRef" class="form-error" role="alert" tabindex="-1">{{ keyFormError }}</div>
       <el-form label-position="top" @submit.prevent="createKey">
+        <el-form-item label="授权业务场景" required>
+          <el-select v-model="keyForm.scenario_id" filterable placeholder="选择唯一允许访问的场景" :disabled="creatingKey">
+            <el-option v-for="scenario in scenarios.filter((item) => item.status !== 'retired')" :key="scenario.id" :label="scenario.name" :value="scenario.id" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="名称" required>
           <el-input v-model="keyForm.name" maxlength="120" placeholder="如：客户工作台生产接入" />
         </el-form-item>
@@ -250,16 +259,23 @@ let manifestController: AbortController | undefined
 let disposed = false
 
 const keyForm = reactive<{
+  scenario_id: string
   name: string
   scopes: ExternalApiScope[]
   expires_in_days: number
 }>({
+  scenario_id: '',
   name: '',
   scopes: ['capabilities:read', 'capabilities:invoke'],
   expires_in_days: 90,
 })
 
 const readyCount = computed(() => manifest.value?.capabilities.filter((item) => item.ready).length || 0)
+const visibleKeys = computed(() => scenarioId.value ? keys.value.filter((key) => key.scenario_id === scenarioId.value) : keys.value)
+
+function scenarioName(id: string | null) {
+  return id ? scenarios.value.find((item) => item.id === id)?.name || '场景不可用' : '未绑定（需重新签发）'
+}
 const manifestReady = computed(() => Boolean(manifest.value?.checks.every((check) => check.passed)))
 const secretMcpConfig = computed(() => {
   const adapter = manifest.value?.adapters.find((item) => item.protocol === 'mcp')
@@ -321,10 +337,12 @@ async function loadKeys() {
 
 function openCreateKey() {
   keyFormError.value = ''
+  keyForm.scenario_id = scenarioId.value
   createKeyVisible.value = true
 }
 
 function resetKeyForm() {
+  keyForm.scenario_id = ''
   keyForm.name = ''
   keyForm.scopes = ['capabilities:read', 'capabilities:invoke']
   keyForm.expires_in_days = 90
@@ -332,7 +350,9 @@ function resetKeyForm() {
 }
 
 async function createKey() {
-  if (!keyForm.name.trim()) keyFormError.value = '请输入密钥名称'
+  if (creatingKey.value) return
+  if (!keyForm.scenario_id) keyFormError.value = '请选择授权业务场景'
+  else if (!keyForm.name.trim()) keyFormError.value = '请输入密钥名称'
   else if (!keyForm.scopes.length) keyFormError.value = '至少选择一个 scope'
   else keyFormError.value = ''
   if (keyFormError.value) {
@@ -342,6 +362,7 @@ async function createKey() {
   creatingKey.value = true
   try {
     const created = await capabilityAccessApi.createKey({
+      scenario_id: keyForm.scenario_id,
       name: keyForm.name.trim(),
       scopes: keyForm.scopes,
       expires_in_days: keyForm.expires_in_days,

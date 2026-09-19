@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import time
@@ -326,11 +327,15 @@ def _persist_trace(payload: TracePayload, *, db: Session | None = None) -> None:
         # worker 内部可能正持有事务；同一事务的最终 commit 仍可保存 trace。
         if db is not None:
             try:
-                db.add(_trace_model(payload))
-                db.flush()
-            except Exception:  # noqa: BLE001
-                # 可观测性故障不能让实际业务调用失败。
-                return
+                # A rejected trace rolls back only its savepoint, without
+                # poisoning the caller's business transaction.
+                with db.begin_nested():
+                    db.add(_trace_model(payload))
+                    db.flush()
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "LLM trace persistence failed error_type=%s", type(exc).__name__
+                )
 
 
 def _record_trace(

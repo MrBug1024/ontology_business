@@ -10,5 +10,7 @@ export function dataSourceLocationLabel(
     return '托管存储'
   }
   if (source.type === 'dataset') return 'MinIO 版本化数据集'
+  if (source.type === 'distillation') return '不可变阶段资料'
+  if (source.type === 'sqlite3') return '受管数据库快照'
   return String(config.host || '未配置')
 }

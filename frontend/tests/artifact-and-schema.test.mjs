@@ -1465,3 +1465,13 @@ test('shared templates never use a scenario-owned file bucket', () => {
   assert.equal(isTemplateBucketInScope('scenario-a', 'scenario-a'), true)
   assert.equal(isTemplateBucketInScope('scenario-b', 'scenario-a'), false)
 })
+
+test('workflow editor delegates workflow design to the scenario advisor', () => {
+  const source = readFileSync(new URL('../src/components/workflow/WorkflowEditor.vue', import.meta.url), 'utf8')
+
+  assert.match(source, /\(e: 'ask-advisor', prompt: string\): void/)
+  assert.match(source, /emit\('ask-advisor', WORKFLOW_ADVISOR_PROMPT\)/)
+  assert.match(source, /询问智能业务顾问/)
+  assert.doesNotMatch(source, /generateWorkflow/)
+  assert.doesNotMatch(source, /AI 生成工作流/)
+})

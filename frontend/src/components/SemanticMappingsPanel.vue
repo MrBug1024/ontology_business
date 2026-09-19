@@ -3,14 +3,14 @@
     <header class="semantic-toolbar">
       <div>
         <h2 id="semantic-mapping-heading">Catalog 语义映射</h2>
-        <p>从建模资料 Schema 定义字段语义；正式调用仍需在每次 Invocation 中显式提供受管数据。</p>
+        <p>从资料库中的 Schema 定义字段语义；正式调用仍需在每次 Invocation 中显式提供受管数据。</p>
       </div>
       <div class="semantic-actions">
         <el-button text :loading="loading" title="刷新语义映射" @click="loadAll">
           <el-icon><Refresh /></el-icon>
           刷新
         </el-button>
-        <el-tooltip :disabled="Boolean(datasets.length && entities.length)" content="请先上传可识别表结构的建模资料并创建对象类型" placement="top">
+        <el-tooltip :disabled="Boolean(datasets.length && entities.length)" content="请先在资料库上传可识别表结构的资料并创建对象类型" placement="top">
           <span>
             <el-button
               v-if="canWrite"
@@ -36,7 +36,7 @@
     />
 
     <div class="semantic-summary" role="status" aria-live="polite">
-      <span>建模资料 <b>{{ datasets.length }}</b></span>
+      <span>资料库数据集 <b>{{ datasets.length }}</b></span>
       <span>可用 Schema <b>{{ schemaCount }}</b></span>
       <span>已激活对象映射 <b>{{ activeMappingCount }}</b></span>
     </div>
@@ -80,7 +80,7 @@
       <el-form label-position="top" @submit.prevent>
         <div v-if="mappingError" class="form-error-summary" role="alert" tabindex="-1">{{ mappingError }}</div>
         <div class="form-grid">
-          <el-form-item label="建模资料" required>
+          <el-form-item label="资料库数据集" required>
             <el-select v-model="mappingForm.dataset_id" filterable style="width: 100%" @change="onMappingDatasetChange">
               <el-option v-for="dataset in datasets" :key="dataset.id" :label="dataset.name" :value="dataset.id" />
             </el-select>
@@ -248,7 +248,7 @@ async function saveMapping() {
   const entity = selectedEntity.value
   const relation = selectedRelation.value
   if (!schema || !entity?.id || !relation || !/^[a-z0-9][a-z0-9._-]{0,179}$/.test(mappingForm.value.mapping_key)) {
-    mappingError.value = '请完整选择建模资料 Schema、对象类型和数据关系，并填写有效的映射 key。'
+    mappingError.value = '请完整选择资料库 Schema、对象类型和数据关系，并填写有效的映射 key。'
     return
   }
   const keyProperties = entity.properties.filter((property) => property.is_key)

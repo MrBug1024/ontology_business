@@ -672,7 +672,7 @@ def _verify_head_contract(database_url: URL, *, runtime_role: str, head: str) ->
                     "select": True,
                     "insert": True,
                     "update": True,
-                    "delete": False,
+                    "delete": True,
                     "truncate": False,
                     "references": False,
                     "trigger": False,
@@ -761,8 +761,8 @@ def main() -> int:
         # Revision 33 deliberately refuses downgrade: restoring the previous
         # audit function would re-introduce an unscoped cross-tenant delete.
         # A full ``head -> 27`` command reaches 33 first, so the refusal is
-        # the expected round-trip boundary and the alembic version must stay
-        # at the current head.
+        # the expected boundary. Alembic commits each prior migration, so the
+        # reversible revisions above 33 have already been downgraded.
         try:
             command.downgrade(config, "20260908_27")
         except RuntimeError as exc:
@@ -774,10 +774,11 @@ def main() -> int:
                 "Revision 33 must refuse a downgrade that would restore the "
                 "unsafe scenario-audit purge function"
             )
-        if _revision(target_url) != head:
+        if _revision(target_url) != "20260912_33":
             raise RuntimeError(
-                "Revision 33 downgrade refusal changed the installed schema version"
+                "Revision 33 downgrade refusal did not preserve its boundary"
             )
+        command.upgrade(config, head)
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
 
         try:
@@ -792,10 +793,11 @@ def main() -> int:
                 "Revision 33 must refuse a downgrade crossing the irreversible "
                 "scenario-audit hardening boundary"
             )
-        if _revision(target_url) != head:
+        if _revision(target_url) != "20260912_33":
             raise RuntimeError(
-                "Repeated downgrade refusal changed the installed schema version"
+                "Repeated downgrade refusal did not preserve revision 33"
             )
+        command.upgrade(config, head)
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
         print(f"Alembic isolated round-trip passed at {head}")
         return 0

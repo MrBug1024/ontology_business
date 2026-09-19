@@ -68,6 +68,8 @@ def normalize_postgres_config(config: Mapping[str, Any] | None) -> dict[str, Any
     """
     if config is None or not isinstance(config, Mapping):
         raise ValueError("PostgreSQL 数据源配置必须是对象")
+    from .library_credential_service import open_config
+    config = open_config(config)
     normalized = dict(config)
     host = _required_postgres_text(
         config,
@@ -355,11 +357,11 @@ def _is_minio_source(ds: DataSource) -> bool:
 
 def is_managed_minio_source(ds: DataSource) -> bool:
     """Return whether a file-bucket source uses the managed MinIO backend."""
-    return ds.type == "file_bucket" and _is_minio_source(ds)
+    return ds.type in {"file_bucket", "sqlite3"} and _is_minio_source(ds)
 
 
 def managed_minio_location(ds: DataSource) -> tuple[str, str]:
-    if ds.type != "file_bucket" or not _is_minio_source(ds):
+    if ds.type not in {"file_bucket", "sqlite3"} or not _is_minio_source(ds):
         raise ValueError("数据源未配置为 MinIO 文件桶")
     configured = object_storage_service.require_configuration()
     source_config = ds.config or {}
@@ -791,7 +793,7 @@ def save_bucket_file_path(
     content_sha256: str = "",
 ) -> BucketFile:
     """Stream a local staging file to managed MinIO without loading it in RAM."""
-    if ds.type != "file_bucket" or not is_managed_minio_source(ds):
+    if ds.type not in {"file_bucket", "sqlite3"} or not is_managed_minio_source(ds):
         raise ValueError("文件桶必须使用 MinIO 存储")
     requested_name = validate_bucket_filename(filename)
     file_id = str(stable_file_id or uuid.uuid4().hex).lower()
@@ -872,7 +874,7 @@ def _validated_bucket_mime(filename: str, recorded_mime: str) -> str:
 
 
 def minio_file_identity(bf: BucketFile, ds: DataSource) -> tuple[str, str, str]:
-    if bf.data_source_id != ds.id or ds.type != "file_bucket":
+    if bf.data_source_id != ds.id or ds.type not in {"file_bucket", "sqlite3"}:
         raise ValueError("附件不属于指定文件桶")
     safe_name = validate_bucket_filename(bf.filename)
     bucket_name, _prefix = managed_minio_location(ds)
@@ -943,7 +945,7 @@ def _minio_file_deletion_identity(
     bucket/key recorded in the control-plane database; the configured bucket
     and prefix remain an independent server-side boundary.
     """
-    if bf.data_source_id != ds.id or ds.type != "file_bucket":
+    if bf.data_source_id != ds.id or ds.type not in {"file_bucket", "sqlite3"}:
         raise ValueError("附件不属于指定文件桶")
     safe_name = validate_bucket_filename(bf.filename)
     bucket_name, prefix = managed_minio_location(ds)

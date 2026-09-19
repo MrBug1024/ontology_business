@@ -14,6 +14,7 @@ export const capabilityAccessApi = {
     ),
   listKeys: () => http.get<IntegrationKey[]>('/developer/api-keys'),
   createKey: (payload: {
+    scenario_id: string
     name: string
     scopes: ExternalApiScope[]
     expires_in_days: number

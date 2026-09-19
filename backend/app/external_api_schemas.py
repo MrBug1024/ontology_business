@@ -18,6 +18,9 @@ ExternalApiScope = Literal[
 
 
 class ExternalApiKeyCreateIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    scenario_id: str = Field(min_length=1, max_length=32)
     name: str = Field(min_length=1, max_length=120)
     # An owner may issue a constrained integration credential for another active
     # member; the external caller still executes with that member's live RBAC
@@ -37,6 +40,8 @@ class ExternalApiKeyCreateIn(BaseModel):
 class ExternalApiKeyOut(BaseModel):
     id: str
     tenant_id: str
+    scenario_id: str | None = None
+    binding_status: Literal["bound", "reissue_required"]
     user_id: str
     issued_by_user_id: str | None = None
     revoked_by_user_id: str | None = None
@@ -61,6 +66,7 @@ class ExternalApiIdentityOut(BaseModel):
     api_version: Literal["v1"] = "v1"
     key_id: str
     tenant_id: str
+    scenario_id: str
     user_id: str
     scopes: list[ExternalApiScope]
     expires_at: datetime | None = None

@@ -2016,6 +2016,7 @@ def auto_repair_data_source_drafts(
             DataSource.tenant_id == tenant_id,
             DataSource.scenario_id == scenario_id,
             DataSource.status == "ok",
+            DataSource.type.in_(("postgres", "dataset", "file_bucket")),
         )
         .order_by(DataSource.created_at, DataSource.id)
     ).all())

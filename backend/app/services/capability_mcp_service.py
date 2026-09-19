@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from ..database import SessionLocal
+from ..external_api_models import ExternalApiKey
 from ..models import BusinessScenario
 from ..channel_interaction_schemas import ChannelReplyIn
 from . import channel_interaction_service, agent_turn_payload_service
@@ -26,6 +27,7 @@ class CapabilityMCPError(ValueError):
 class AuthenticatedCapabilityMCP:
     key_id: str
     tenant_id: str
+    scenario_id: str
     user_id: str
     scopes: frozenset[str]
 
@@ -42,6 +44,7 @@ def authenticate_token(raw_token: str) -> AuthenticatedCapabilityMCP | None:
         return AuthenticatedCapabilityMCP(
             key_id=context.key_id,
             tenant_id=context.tenant_id,
+            scenario_id=context.scenario_id,
             user_id=context.user_id,
             scopes=context.scopes,
         )
@@ -59,6 +62,7 @@ def _scenario(db, auth: AuthenticatedCapabilityMCP, scenario_id: str) -> Busines
         select(BusinessScenario).where(
             BusinessScenario.id == scenario_id,
             BusinessScenario.tenant_id == auth.tenant_id,
+            BusinessScenario.id == auth.scenario_id,
         )
     ).scalar_one_or_none()
     if scenario is None or not permission_service.check_scenario(db, scenario, "read").allowed:
@@ -85,8 +89,18 @@ def _actor(db, auth: AuthenticatedCapabilityMCP) -> Actor:
 
 
 def _bind(db, auth: AuthenticatedCapabilityMCP) -> None:
+    # MCP transports can outlive key rotation/revocation. Revalidate every tool
+    # call rather than trusting the identity captured at transport setup.
+    key = db.get(ExternalApiKey, auth.key_id)
+    if (key is None or key.status != "active" or not key.scenario_id
+            or key.tenant_id != auth.tenant_id or key.user_id != auth.user_id
+            or key.scenario_id != auth.scenario_id or key.expires_at is None
+            or key.expires_at <= external_api_service.utc_now()
+            or not auth.scopes.issubset(set(key.scopes or []))):
+        raise CapabilityMCPError("capability MCP credential is no longer active")
     db.info["tenant_id"] = auth.tenant_id
     db.info["user_id"] = auth.user_id
+    db.info["external_scenario_id"] = auth.scenario_id
     principal = permission_service.require_principal(db)
     if principal.tenant_id != auth.tenant_id or principal.user_id != auth.user_id:
         raise CapabilityMCPError("capability MCP principal is no longer active")

@@ -32,6 +32,7 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'save', w: any): void
   (e: 'run-created', run: WorkflowRun): void
+  (e: 'ask-advisor', prompt: string): void
 }>()
 
 // 注入场景资源给节点卡片（显示引用的操作/规则/事件名称）
@@ -73,6 +74,8 @@ const PALETTE = [
   { type: 'approval', label: '人工审批', icon: 'UserFilled', color: 'var(--warning)', desc: '暂停执行，等待人工决定' },
   { type: 'end', label: '结束', icon: 'CircleCheck', color: 'var(--text-3)', desc: '流程结束' },
 ]
+
+const WORKFLOW_ADVISOR_PROMPT = '请协助我梳理当前工作流的触发、判断、审批和执行约束，并给出可审核的节点方案。'
 
 // ── 画布状态 ──
 const nodes = ref<any[]>([])
@@ -434,31 +437,8 @@ async function confirmExecute() {
   }
 }
 
-// ── AI 生成 ──
-const aiDlg = ref(false)
-const aiDesc = ref('')
-const aiLoading = ref(false)
-async function runAiGenerate() {
-  aiLoading.value = true
-  try {
-    const res = await api.generateWorkflow(props.scenarioId, aiDesc.value)
-    graph.value = { nodes: res.nodes, edges: res.edges }
-    const updated: any = { ...props.modelValue, nodes: res.nodes, edges: res.edges }
-    if (!props.modelValue.name) {
-      updated.name = res.name
-      updated.description = res.description
-    }
-    // 记录 lastEmitted，避免 modelValue watcher 触发 loadFromModel 清空刚生成的图
-    lastEmitted = updated
-    emit('update:modelValue', updated)
-    syncToFlow()
-    aiDlg.value = false
-    ElMessage.success('AI 已生成工作流草稿，请检查节点配置后保存')
-  } catch (e: any) {
-    ElMessage.error(e?.message || '生成失败')
-  } finally {
-    aiLoading.value = false
-  }
+function askAdvisor() {
+  emit('ask-advisor', WORKFLOW_ADVISOR_PROMPT)
 }
 
 const wf = computed({
@@ -576,7 +556,7 @@ const wf = computed({
         <div class="wfe-toolbar">
           <el-button size="small" @click="autoLayout"><el-icon><Sort /></el-icon> 自动布局</el-button>
           <el-button size="small" @click="validateNow"><el-icon><CircleCheck /></el-icon> 校验</el-button>
-          <el-button size="small" @click="aiDlg = true"><el-icon><MagicStick /></el-icon> AI 生成</el-button>
+          <el-button size="small" @click="askAdvisor"><el-icon><MagicStick /></el-icon> 询问智能业务顾问</el-button>
           <el-button size="small" type="primary" :loading="executing" @click="doExecute"><el-icon><VideoPlay /></el-icon> 执行</el-button>
           <el-button size="small" type="success" @click="save"><el-icon><Check /></el-icon> 保存</el-button>
         </div>
@@ -584,7 +564,8 @@ const wf = computed({
         <!-- 空状态 -->
         <div v-if="!nodes.length" class="wfe-empty">
           <el-icon :size="36"><Share /></el-icon>
-          <p>从左侧拖入节点开始编排，或点击「AI 生成」</p>
+          <p>从左侧拖入节点开始编排，或请智能业务顾问先梳理流程。</p>
+          <el-button size="small" type="primary" plain @click="askAdvisor"><el-icon><MagicStick /></el-icon> 询问智能业务顾问</el-button>
         </div>
       </div>
 
@@ -695,20 +676,6 @@ const wf = computed({
         </div>
       </div>
     </div>
-
-    <!-- AI 生成对话框 -->
-    <el-dialog v-model="aiDlg" title="AI 生成工作流" width="560px" class="glass-dialog">
-      <el-input
-        v-model="aiDesc"
-        type="textarea"
-        :rows="4"
-        placeholder="描述业务流程，AI 将自动编排节点与连线。例如：查询业务数据，判断是否命中规则，命中后生成结果，最后结束"
-      />
-      <template #footer>
-        <el-button @click="aiDlg = false">取消</el-button>
-        <el-button type="primary" :loading="aiLoading" @click="runAiGenerate">生成</el-button>
-      </template>
-    </el-dialog>
 
     <el-dialog v-model="runParamsDlg" title="执行工作流" width="600px" class="glass-dialog">
       <p class="wfe-run-help">系统已从流程中的 <code>{{ '{params.field}' }}</code> 引用识别参数；也可以按需添加字段。</p>
@@ -891,6 +858,9 @@ const wf = computed({
 }
 .wfe-empty p {
   font-size: 13px;
+}
+.wfe-empty :deep(.el-button) {
+  pointer-events: auto;
 }
 
 /* ── 配置面板 ── */

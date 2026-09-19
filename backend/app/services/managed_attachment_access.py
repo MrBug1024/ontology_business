@@ -162,6 +162,7 @@ def require_asset_version_scope(
     *,
     tenant_id: str,
     agent_id: str | None,
+    scenario_id: str | None = None,
 ) -> None:
     """Validate both logical ownership and an optional physical-file lineage."""
 
@@ -170,6 +171,9 @@ def require_asset_version_scope(
         agent_id=agent_id,
         purpose=_asset_version_purpose(asset, version),
     )
+    from .external_scenario_asset_service import can_use_asset
+    if asset is None or not can_use_asset(db, asset, scenario_id=scenario_id, purpose=_asset_version_purpose(asset, version)):
+        raise AttachmentAccessError("attachment_unavailable", "附件不存在或不属于当前业务场景", status_code=404)
     file_id = str(version.bucket_file_id or "").strip() or None
     source_id = str(version.bucket_data_source_id or "").strip() or None
     if file_id is None and source_id is None:
@@ -234,8 +238,12 @@ def _check_dataset_scope(
     *,
     tenant_id: str,
     agent_id: str | None,
+    scenario_id: str | None = None,
 ) -> None:
     """Validate generated dataset ownership through its immutable lineage."""
+    from .external_scenario_asset_service import can_use_dataset
+    if not can_use_dataset(db, version.id, scenario_id=scenario_id):
+        raise AttachmentAccessError("attachment_unavailable", "数据集不存在或不属于当前业务场景", status_code=404)
     labels = dataset.labels if isinstance(dataset.labels, dict) else {}
     # Only generated validation packages carry Agent-private lineage. Other
     # governed datasets keep their existing tenant-level access semantics.

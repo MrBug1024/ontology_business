@@ -1039,7 +1039,7 @@ export interface DataSource {
   id?: string
   scenario_id?: string
   name: string
-  type: string // postgres / dataset / file_bucket
+  type: string // postgres / mysql / sqlite3 / dataset / file_bucket / distillation
   config: Record<string, any>
   status?: string
   last_error?: string
@@ -1851,7 +1851,7 @@ export interface AssistantActionPreview {
 /** A re-authorized source card attached to an assistant answer. */
 export interface AssistantSource {
   id: string
-  kind?: 'rag' | 'attachment' | string
+  kind?: 'rag' | 'attachment' | 'skill_method' | 'mcp_tool_catalog' | string
   filename: string
   status?: string
   citation_id?: string
@@ -1864,6 +1864,7 @@ export interface AssistantSource {
   content_hash?: string
   file_content_hash?: string
   index_version?: string
+  snippet?: string
 }
 
 /** P1 检索命中：可直接跳转至原文的稳定引用。 */

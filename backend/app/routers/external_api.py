@@ -77,6 +77,7 @@ def create_api_key(
             name=payload.name,
             scopes=list(payload.scopes),
             expires_in_days=payload.expires_in_days,
+            scenario_id=payload.scenario_id,
         )
         db.commit()
         db.refresh(key)
@@ -123,6 +124,7 @@ def _owned_scenario(
         select(BusinessScenario).where(
             BusinessScenario.id == scenario_id,
             BusinessScenario.tenant_id == context.tenant_id,
+            BusinessScenario.id == context.scenario_id,
         )
     ).scalars().first()
     if not scenario:
@@ -187,6 +189,7 @@ def identity(
     return ExternalApiIdentityOut(
         key_id=context.key_id,
         tenant_id=context.tenant_id,
+        scenario_id=context.scenario_id,
         user_id=context.user_id,
         scopes=sorted(context.scopes),
         expires_at=context.expires_at,
@@ -200,7 +203,7 @@ def list_scenarios(
     external_api_service.require_scope(context, "scenarios:read")
     scenarios = context.db.execute(
         select(BusinessScenario)
-        .where(BusinessScenario.tenant_id == context.tenant_id)
+        .where(BusinessScenario.tenant_id == context.tenant_id, BusinessScenario.id == context.scenario_id)
         .order_by(BusinessScenario.created_at.desc(), BusinessScenario.id.desc())
     ).scalars().all()
     return [

@@ -151,3 +151,91 @@ cannot represent both contracts without data loss.
 Run the downgrade rehearsal on an isolated database copy before any temporary
 attachment expiry sweep. Never use a live customer database as a migration
 round-trip fixture.
+
+## Scenario-bound external access
+
+Revision `20260918_35` binds each external API key to one explicitly selected
+scenario through a tenant-composite foreign key and a validated constraint that
+requires every active key to have a scenario. Historical keys have no reliable
+scenario ownership evidence, so migration revokes them and records deterministic
+`scenario_binding_required` lifecycle audit events. An authorized user must issue
+a replacement for the intended scenario; the migration never guesses ownership.
+Downgrade also revokes any active scoped keys with `scenario_binding_rollback`
+audit events before removing the boundary. It never reactivates historical keys.
+
+External upload ownership is stored in `external_scenario_assets` with composite
+tenant foreign keys to its asset and scenario. The runtime role receives only
+SELECT, INSERT and DELETE; UPDATE is forbidden so ownership cannot be reassigned.
+Deleting an asset removes its ownership row, while the scenario foreign key uses
+RESTRICT. Scenario retirement retains this evidence, and the physical purge plan
+blocks deletion while scoped assets remain. Explicitly confirmed purge includes
+scenario keys in its audit-deletion counts and removes their associated lifecycle
+audit through the existing cascade.
+
+The read-only runtime verifier checks these exact grants, the active-key binding
+constraint and all three validated tenant-composite foreign keys. Test migration
+and rollback only in an isolated PostgreSQL database.
+
+Revision `20260918_36` introduces tenant-scoped business distillation projects
+and immutable modeling-material publications. Each publication atomically stores
+the reviewed document plus seven UTF-8 files (Markdown, Mermaid and JSON) in
+PostgreSQL and creates a `distillation` catalog source. These are bounded modeling
+documents, not MinIO objects or runtime datasets. Publication identity is unique
+per project revision; retries return the same publication. Runtime grants allow
+project reads/inserts/updates and publication reads/inserts only. Database triggers
+also protect published content and catalog sources from modification/deletion.
+The provenance file freezes connector revisions and selected file content/index
+identities; it records that a live database's rows are not copied into the evidence.
+
+Published evidence remains retained when a scenario is retired; the purge plan
+explicitly blocks physical scenario deletion while a distillation project exists.
+Downgrade is allowed only on an empty distillation schema and refuses to discard
+existing drafts or publications. Verify the empty-schema round trip and populated
+schema refusal in an isolated database. The read-only runtime verifier checks the
+new table permissions along with the installed schema head.
+
+Revision `20260918_37` adds tenant-composite conversation ownership, unique
+per-project request IDs and turn numbers, and a partial unique index allowing
+only one queued/running investigation per project. Durable turns record the
+initiator, frozen project revision/evidence identity, bounded history/checkpoints,
+tool summaries, clarification questions and unadopted proposals. A database
+claim uses SKIP LOCKED; lease tokens, generations and expiry fence every write.
+Independent heartbeat transactions renew long provider/read-only tool calls.
+Expired claims resume from the last completed read-only round with at most three
+attempts and ten provider calls. Cancellation clears ownership so late results
+cannot overwrite the cancelled state. Asking a human atomically saves the
+question and ends the turn; only an explicit, revision-checked adoption updates
+the project. Existing history prevents moving the project to another scenario.
+
+The runtime role receives SELECT, INSERT and UPDATE only. Website observations
+store a sanitized bounded excerpt, response hash, retrieval time and exact
+coverage; accepted evidence references the actual saved tool receipt. Connector
+configuration and website access grants are excluded from modeling contracts.
+The read-only runtime verifier checks table grants, ownership/idempotency
+constraints and the valid unique active-turn index. Empty-schema downgrade to
+the preceding revision is supported; any retained conversation history makes
+downgrade fail closed. Rehearse only in the isolated acceptance database.
+
+Revision `20260918_38` adds temporary conversation inputs and append-only turn
+links. Each link uses composite foreign keys fixing its tenant, project and
+initiating user on both the turn and input. Uploads are idempotent per project,
+user and request ID. They cannot be transferred to another scenario, including
+before the first message is sent. First use is explicit; later turns inherit
+only the same user's previously submitted, still-live inputs in that conversation.
+Unsent uploads are never inherited. No DataSource or BucketFile is created.
+
+Original bytes are staged temporarily, parsed in a restricted child process,
+and removed immediately. Only a bounded parsed excerpt and SHA-256 identity are
+kept for 24 hours. Limits are 10 MiB raw bytes, 200,000 parsed characters, 32 MiB
+expanded Office content, and 35 seconds wall time; the parser also has CPU and
+memory limits. Multi-worker cleanup uses bounded SKIP LOCKED batches, erases
+expired/removed text and raw tool checkpoints, and fences active turns. Conversation
+messages, human-adopted findings and audit metadata remain retained; expiry is
+not a claim that all derived information has been deleted.
+
+Runtime grants allow SELECT/INSERT/UPDATE on input rows and SELECT/INSERT only
+on turn links. The read-only deployment verifier checks these exact grants,
+validated composite ownership constraints, retention checks and cleanup indexes.
+The empty-schema downgrade is reversible. Any retained attachment history makes
+downgrade refuse rather than discard ownership or evidence; test only in the
+isolated acceptance database.

@@ -662,7 +662,7 @@ class DataMapping(Base):
 # 数据源
 # ──────────────────────────────────────────────
 class DataSource(Base):
-    """数据源：PostgreSQL、MinIO 文件桶或 MinIO 版本化数据集。"""
+    """资料来源：外部数据库、受管 SQLite3、文件/数据集或蒸馏交付物。"""
 
     __tablename__ = "data_sources"
     __table_args__ = (
@@ -704,7 +704,7 @@ class DataSource(Base):
         String(32), index=True, nullable=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    type: Mapped[str] = mapped_column(String(30), nullable=False)  # postgres / file_bucket / dataset
+    type: Mapped[str] = mapped_column(String(30), nullable=False)  # postgres / mysql / sqlite3 / file_bucket / dataset / distillation
     config: Mapped[dict] = mapped_column(JSON, default=dict)
     # A durable, monotonic revision of all runtime-relevant configuration.
     # Releases record this value instead of storing an unsafe configuration
