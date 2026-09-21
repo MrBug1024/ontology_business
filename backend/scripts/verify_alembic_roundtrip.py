@@ -758,25 +758,25 @@ def main() -> int:
         command.upgrade(config, head)
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
 
-        # Revision 33 deliberately refuses downgrade: restoring the previous
-        # audit function would re-introduce an unscoped cross-tenant delete.
-        # A full ``head -> 27`` command reaches 33 first, so the refusal is
-        # the expected boundary. Alembic commits each prior migration, so the
-        # reversible revisions above 33 have already been downgraded.
+        # Revision 48 deliberately refuses downgrade because restoring the
+        # previous purge function would reintroduce a protected-history
+        # deletion failure. Older revisions also retain their own refusal
+        # boundary at revision 33; the current head must be the first refusal
+        # observed when the full path starts from head.
         try:
             command.downgrade(config, "20260908_27")
         except RuntimeError as exc:
             message = str(exc).lower()
             if "downgrade is refused" not in message:
                 raise
+            if _revision(target_url) != head:
+                raise RuntimeError(
+                    "Current head downgrade refusal did not preserve the head"
+                ) from exc
         else:
             raise RuntimeError(
-                "Revision 33 must refuse a downgrade that would restore the "
-                "unsafe scenario-audit purge function"
-            )
-        if _revision(target_url) != "20260912_33":
-            raise RuntimeError(
-                "Revision 33 downgrade refusal did not preserve its boundary"
+                "The current head must refuse a downgrade that would restore "
+                "an unsafe scenario-purge function"
             )
         command.upgrade(config, head)
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
@@ -784,19 +784,17 @@ def main() -> int:
         try:
             command.downgrade(config, "20260907_26")
         except RuntimeError as exc:
-            # The command still starts at revision 33 and therefore reaches
-            # the new refusal before revision 27's historical backup guard.
+            # The command still starts at the current head and therefore
+            # reaches the current irreversible boundary first.
             if "downgrade is refused" not in str(exc).lower():
                 raise
         else:
             raise RuntimeError(
-                "Revision 33 must refuse a downgrade crossing the irreversible "
-                "scenario-audit hardening boundary"
+                "The current head must refuse a downgrade crossing the "
+                "irreversible scenario-purge hardening boundary"
             )
-        if _revision(target_url) != "20260912_33":
-            raise RuntimeError(
-                "Repeated downgrade refusal did not preserve revision 33"
-            )
+        if _revision(target_url) != head:
+            raise RuntimeError("Repeated downgrade refusal did not preserve the head")
         command.upgrade(config, head)
         _verify_head_contract(target_url, runtime_role=runtime_role, head=head)
         print(f"Alembic isolated round-trip passed at {head}")

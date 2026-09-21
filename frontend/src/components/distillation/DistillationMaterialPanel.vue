@@ -8,12 +8,14 @@
       <el-button @click="openDistillation">回到业务蒸馏</el-button>
       <el-button v-if="source.scenario_id" type="primary" @click="router.push({ name: 'scenario-detail', params: { id: source.scenario_id }, query: { stage: 'ontology' } })">进入能力建设</el-button>
       <el-button v-else @click="router.push('/scenarios')">前往场景能力</el-button>
+      <el-button type="danger" plain :loading="busy === 'delete'" :disabled="!!busy && busy !== 'delete'" @click="remove">删除本版本</el-button>
     </template>
   </section>
 </template>
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { businessDistillationApi } from '@/api/businessDistillation'
 import type { DataSource } from '@/types'
 import type { DistillationArtifact, DistillationPublication } from '@/types/businessDistillation'
@@ -40,7 +42,7 @@ async function load() {
   loading.value = true
   try {
     if (!projectId.value || !publicationId.value) throw new Error('资料库中的阶段交接资料引用不完整，请返回业务蒸馏核对。')
-    const result = await businessDistillationApi.publication(projectId.value, publicationId.value, request.signal)
+    const result = await businessDistillationApi.publicationById(publicationId.value, request.signal)
     if (!request.signal.aborted) publication.value = result
   } catch (caught: unknown) {
     if (!request.signal.aborted) error.value = caught instanceof Error ? caught.message : '资料加载失败'
@@ -51,7 +53,7 @@ async function download(artifact: DistillationArtifact) {
   const request = controller
   busy.value = artifact.key
   try {
-    const blob = await businessDistillationApi.artifact(projectId.value, publicationId.value, artifact.key, request.signal)
+    const blob = await businessDistillationApi.artifactByPublicationId(publicationId.value, artifact.key, request.signal)
     if (request.signal.aborted) return
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
@@ -62,6 +64,30 @@ async function download(artifact: DistillationArtifact) {
   } catch (caught: unknown) {
     if (!request.signal.aborted) error.value = caught instanceof Error ? caught.message : '下载失败'
   } finally { if (!request.signal.aborted) busy.value = '' }
+}
+async function remove() {
+  if (!publication.value || busy.value) return
+  try {
+    await ElMessageBox.confirm(
+      `删除交接版本 ${publication.value.project_revision}？会同时移除场景资料投影和本版本全部产物。`,
+      '删除业务蒸馏产物',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch { return }
+  busy.value = 'delete'
+  try {
+    await businessDistillationApi.deleteProduct(publicationId.value, new AbortController().signal)
+    ElMessage.success('业务蒸馏产物已删除')
+    if (props.source.scenario_id) {
+      await router.replace({ name: 'scenario-detail', params: { id: props.source.scenario_id }, query: { stage: 'materials' } })
+    } else {
+      await router.replace({ name: 'data-sources' })
+    }
+  } catch (caught: unknown) {
+    ElMessage.error(caught instanceof Error ? caught.message : '删除失败')
+  } finally {
+    if (busy.value === 'delete') busy.value = ''
+  }
 }
 watch(() => props.source.id, () => { busy.value = ''; void load() }, { immediate: true })
 onBeforeUnmount(() => controller?.abort())

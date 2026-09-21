@@ -35,6 +35,28 @@ test('editing a draft does not mutate saved evidence or historical versions', ()
   assert.ok(reviewQuestions(draft.document).some(value => value.includes('最终结果')))
 })
 
+test('published business products can be removed independently from their conversation', async () => {
+  const publication = { id: 'publication-1', project_id: null, scenario_id: null, project_revision: 3, data_source_id: 'source-1', artifacts: [], created_at: '2026-09-21T00:00:00Z' }
+  const previousGet = fakeApi.get, previousPublications = fakeApi.publications, previousDelete = fakeApi.deleteProduct
+  let deleted
+  fakeApi.get = async id => row(id)
+  fakeApi.publications = async () => [publication]
+  fakeApi.deleteProduct = async id => { deleted = id }
+  const { state, stop } = mount('product')
+  try {
+    await flush()
+    assert.deepEqual(state.publications.value, [publication])
+    assert.equal(await state.removePublication(publication), true)
+    assert.equal(deleted, publication.id)
+    assert.deepEqual(state.publications.value, [])
+  } finally {
+    stop()
+    fakeApi.get = previousGet
+    fakeApi.publications = previousPublications
+    fakeApi.deleteProduct = previousDelete
+  }
+})
+
 function deferred() {
   let resolve
   const promise = new Promise(done => { resolve = done })

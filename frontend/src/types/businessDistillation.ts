@@ -125,7 +125,7 @@ export interface DistillationPublication {
   project_id: string | null
   scenario_id: string | null
   project_revision: number
-  data_source_id: string
+  data_source_id: string | null
   created_at: string
   artifacts: DistillationArtifact[]
 }

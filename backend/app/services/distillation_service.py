@@ -276,6 +276,160 @@ def scenario_publication(
     return row
 
 
+def delete_publication(
+    db: Session,
+    project_id: str,
+    publication_id: str,
+) -> DistillationPublication:
+    owning_project = project(db, project_id, write=True)
+    publication = db.scalar(
+        select(DistillationPublication)
+        .where(
+            DistillationPublication.id == publication_id,
+            DistillationPublication.project_id == project_id,
+            DistillationPublication.tenant_id == owning_project.tenant_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if publication is None:
+        raise HTTPException(404, "业务蒸馏产物不存在")
+    return _delete_publication_row(db, publication)
+
+
+def delete_scenario_publication(
+    db: Session,
+    scenario_id: str,
+    publication_id: str,
+) -> DistillationPublication:
+    """Delete a product even after its source project was removed.
+
+    A publication is a user-owned handoff product.  Its catalog projection is
+    disposable and is removed with it when the product is explicitly deleted;
+    deleting that projection alone keeps the publication row and document.
+    """
+
+    principal = permission_service.require_principal(db)
+    authorize_scope(db, scenario_id, write=True)
+    publication = db.scalar(
+        select(DistillationPublication)
+        .where(
+            DistillationPublication.id == publication_id,
+            DistillationPublication.scenario_id == scenario_id,
+            DistillationPublication.tenant_id == principal.tenant_id,
+        )
+        .with_for_update()
+    )
+    if publication is None:
+        raise HTTPException(404, "业务蒸馏产物不存在")
+    return _delete_publication_row(db, publication)
+
+
+def delete_publication_by_id(
+    db: Session,
+    publication_id: str,
+) -> DistillationPublication:
+    """Delete one tenant-owned handoff through its own governed scope."""
+
+    principal = permission_service.require_principal(db)
+    publication = db.scalar(
+        select(DistillationPublication)
+        .where(
+            DistillationPublication.id == publication_id,
+            DistillationPublication.tenant_id == principal.tenant_id,
+        )
+        .with_for_update()
+    )
+    if publication is None:
+        raise HTTPException(404, "业务蒸馏产物不存在")
+    if publication.scenario_id:
+        authorize_scope(db, publication.scenario_id, write=True)
+    elif publication.project_id:
+        project(db, publication.project_id, write=True)
+    else:
+        permission_service.require_tenant_permission(db, "write")
+    return _delete_publication_row(db, publication)
+
+
+def detach_publication_data_source(
+    db: Session,
+    publication: DistillationPublication,
+) -> None:
+    """Remove only the disposable modeling projection from a publication."""
+
+    detached = db.scalar(select(func.detach_distillation_publication(
+        publication.id,
+        publication.tenant_id,
+        "data_source",
+    )))
+    if not detached:
+        raise HTTPException(404, "业务蒸馏产物不存在")
+    db.refresh(publication)
+
+
+def detach_publication_project(
+    db: Session,
+    publication: DistillationPublication,
+) -> None:
+    """Keep a publication readable after its editable project is removed."""
+
+    detached = db.scalar(select(func.detach_distillation_publication(
+        publication.id,
+        publication.tenant_id,
+        "project",
+    )))
+    if not detached:
+        raise HTTPException(404, "业务蒸馏产物不存在")
+    db.refresh(publication)
+
+
+def publication_by_id(
+    db: Session,
+    publication_id: str,
+    *,
+    write: bool = False,
+) -> DistillationPublication:
+    """Resolve a handoff without requiring its source project to survive."""
+
+    principal = permission_service.require_principal(db)
+    row = db.scalar(select(DistillationPublication).where(
+        DistillationPublication.id == publication_id,
+        DistillationPublication.tenant_id == principal.tenant_id,
+    ))
+    if row is None:
+        raise HTTPException(404, "业务蒸馏产物不存在")
+    if row.scenario_id:
+        authorize_scope(db, row.scenario_id, write=write)
+    elif row.project_id:
+        project(db, row.project_id, write=write)
+    else:
+        permission_service.require_tenant_permission(db, "write" if write else "read")
+    return row
+
+
+def _delete_publication_row(
+    db: Session,
+    publication: DistillationPublication,
+) -> DistillationPublication:
+    deleted = db.scalar(select(func.delete_distillation_publication(
+        publication.id,
+        publication.tenant_id,
+    )))
+    if not deleted:
+        raise HTTPException(404, "业务蒸馏产物不存在")
+    db.flush()
+    return publication
+
+
+def delete_publication_record(
+    db: Session,
+    publication: DistillationPublication,
+) -> None:
+    """Delete a locked publication through the tenant-bound database function."""
+
+    _delete_publication_row(db, publication)
+
+
 def delete_project(db: Session, project_id: str) -> None:
     from ..distillation_access_models import DistillationSystemAccess
     from ..distillation_attachment_models import DistillationAttachment, DistillationTurnAttachment
@@ -287,10 +441,12 @@ def delete_project(db: Session, project_id: str) -> None:
         DistillationConversationTurn.status.in_(("queued", "running")),
     ).limit(1)):
         raise HTTPException(409, "会话调查仍在进行，完成或取消后再删除")
-    db.execute(update(DistillationPublication).where(
+    publications = list(db.scalars(select(DistillationPublication).where(
         DistillationPublication.project_id == row.id,
         DistillationPublication.tenant_id == row.tenant_id,
-    ).values(project_id=None))
+    ).with_for_update()))
+    for publication in publications:
+        detach_publication_project(db, publication)
     db.execute(DistillationTurnAttachment.__table__.delete().where(
         DistillationTurnAttachment.project_id == row.id,
         DistillationTurnAttachment.tenant_id == row.tenant_id,

@@ -252,6 +252,6 @@ class PublicationOut(ClosedModel):
     project_id: str | None
     scenario_id: str | None
     project_revision: int
-    data_source_id: str
+    data_source_id: str | None
     created_at: datetime
     artifacts: list[ArtifactOut]

@@ -26,6 +26,12 @@ It adds manual scenario release lifecycle state and append-only lifecycle audit.
 Legacy immutable snapshots remain byte-identical and are decoded only by the
 historical contract adapter. They never select current data or permissions.
 
+Revision `20260921_48` makes explicitly confirmed retired-scenario purge
+complete for owned append-only history. The migration-owned, tenant-fenced
+purge function removes release lifecycle events and workflow approval evidence
+before the corresponding Release and scenario rows are deleted. The runtime
+role still cannot delete either append-only table directly.
+
 Stop all API and worker instances before upgrading. Provide the existing payload
 key ring: stored workflow and pending Agent inputs are authenticated, re-encrypted
 without the retired dimension, and retain replay identity. Duplicate logical

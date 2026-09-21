@@ -738,7 +738,6 @@ def inspect_scenario_sources(
         ).all()
     }
     deletable: list[DataSource] = []
-    blocker_kinds: set[str] = set()
     for source in sources:
         if source.resource_scope != "modeling":
             is_owned_runtime_source = (
@@ -747,10 +746,8 @@ def inspect_scenario_sources(
                 and str(source.owner_agent_id) in scenario_agent_ids
             )
             if not is_owned_runtime_source:
-                blocker_kinds.add("scope")
-            continue
+                continue
         if source.owner_agent_id is not None:
-            blocker_kinds.add("owner")
             continue
         reference_kinds = _source_reference_kinds(
             db,
@@ -760,9 +757,8 @@ def inspect_scenario_sources(
             check_template_refs=check_template_refs,
         )
         if reference_kinds:
-            blocker_kinds.update(reference_kinds)
-        else:
-            deletable.append(source)
+            continue
+        deletable.append(source)
 
     files = _load_source_files(db, scenario, deletable, lock=lock)
     protected_source_ids: set[str] = set()
@@ -774,7 +770,6 @@ def inspect_scenario_sources(
             scenario_agent_ids=scenario_agent_ids,
         )
         if file_kinds:
-            blocker_kinds.update(file_kinds)
             protected_source_ids.add(bucket_file.data_source_id)
     if protected_source_ids:
         deletable = [
@@ -786,11 +781,7 @@ def inspect_scenario_sources(
             if bucket_file.data_source_id not in protected_source_ids
         ]
 
-    ordered_kinds = ("scope", "owner", "external", "template", "index")
-    blockers = tuple(
-        _BLOCKER_MESSAGES[kind] for kind in ordered_kinds if kind in blocker_kinds
-    )
-    return ScenarioPurgeSourceState(tuple(deletable), tuple(files), blockers)
+    return ScenarioPurgeSourceState(tuple(deletable), tuple(files), ())
 
 
 def detach_cleaned_runtime_sources(

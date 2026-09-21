@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from sqlalchemy import exists, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..distillation_models import DistillationProject, DistillationPublication
@@ -68,10 +69,47 @@ def get_scenario_publication(scenario_id: str, publication_id: str, db: Session 
     return _publication_out(distillation_service.scenario_publication(db, scenario_id, publication_id))
 
 
+@router.delete("/scenario/{scenario_id}/publications/{publication_id}", status_code=204)
+def delete_scenario_publication(scenario_id: str, publication_id: str, db: Session = Depends(get_tenant_db)):
+    try:
+        distillation_service.delete_scenario_publication(db, scenario_id, publication_id)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "业务蒸馏产物仍被受保护资源引用，请先解除引用") from exc
+    return Response(status_code=204)
+
+
 @router.get("/scenario/{scenario_id}/publications/{publication_id}/artifacts/{artifact_key}")
 def download_scenario_artifact(scenario_id: str, publication_id: str, artifact_key: str,
                                db: Session = Depends(get_tenant_db)):
     publication = distillation_service.scenario_publication(db, scenario_id, publication_id)
+    artifact = distillation_service.artifact_content(publication, artifact_key)
+    return Response(content=artifact["content"], media_type=artifact["mime"], headers={
+        "Content-Disposition": f'attachment; filename="{artifact["filename"]}"',
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-store",
+    })
+
+
+@router.delete("/publications/{publication_id}", status_code=204)
+def delete_publication_by_id(publication_id: str, db: Session = Depends(get_tenant_db)):
+    try:
+        distillation_service.delete_publication_by_id(db, publication_id)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "业务蒸馏产物仍被受保护资源引用，请先解除引用") from exc
+    return Response(status_code=204)
+
+
+@router.get("/publications/{publication_id}", response_model=PublicationOut)
+def get_publication_by_id(publication_id: str, db: Session = Depends(get_tenant_db)):
+    return _publication_out(distillation_service.publication_by_id(db, publication_id))
+
+
+@router.get("/publications/{publication_id}/artifacts/{artifact_key}")
+def download_publication_artifact(publication_id: str, artifact_key: str, db: Session = Depends(get_tenant_db)):
+    publication = distillation_service.publication_by_id(db, publication_id)
     artifact = distillation_service.artifact_content(publication, artifact_key)
     return Response(content=artifact["content"], media_type=artifact["mime"], headers={
         "Content-Disposition": f'attachment; filename="{artifact["filename"]}"',
@@ -188,3 +226,14 @@ def get_publication(project_id: str, publication_id: str, db: Session = Depends(
     if publication is None:
         raise HTTPException(404, "交接资料不存在")
     return _publication_out(publication)
+
+
+@router.delete("/{project_id}/publications/{publication_id}", status_code=204)
+def delete_project_publication(project_id: str, publication_id: str, db: Session = Depends(get_tenant_db)):
+    try:
+        distillation_service.delete_publication(db, project_id, publication_id)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "业务蒸馏产物仍被业务资源引用，请解除引用后删除") from exc
+    return Response(status_code=204)

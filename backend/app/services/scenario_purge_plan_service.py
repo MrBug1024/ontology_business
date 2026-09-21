@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from ..approval_models import WorkflowApprovalEvidence
 from ..distillation_models import DistillationProject
 from ..external_api_models import ExternalApiKey, ExternalScenarioAsset
+from ..release_models import ReleaseLifecycleEvent
 
 from ..models import (
     ActionExecutionLog,
@@ -322,6 +323,12 @@ def _audit_counts(
         "action_logs": _count_scenario(db, ActionExecutionLog, scenario),
         "workflow_runs": _count_scenario(db, WorkflowRun, scenario),
         "releases": _count_scenario(db, OntologyRelease, scenario),
+        "release_lifecycle_events": _count_scenario(
+            db, ReleaseLifecycleEvent, scenario
+        ),
+        "workflow_approval_evidence": _count_scenario(
+            db, WorkflowApprovalEvidence, scenario
+        ),
         "llm_traces": _count_where(
             db,
             LLMInvocationTrace,
@@ -373,58 +380,6 @@ def _plan_blockers(
         blockers.append("场景历史数据的租户归属不一致，已停止永久删除，请先修复数据")
     if scenario.status != "retired":
         blockers.append("请先退役场景，确认不再接受新的验证和运行请求")
-    if _count_scenario(db, DistillationProject, scenario):
-        blockers.append("业务蒸馏项目与不可变交接证据需保留，不能永久删除该场景")
-    if _count_where(
-        db,
-        OntologyRelease,
-        OntologyRelease.id.in_(scenario_scoped_ids(OntologyRelease, scenario)),
-        OntologyRelease.status == "released",
-    ):
-        blockers.append("仍有预发布或生产 Release，请先在发布与接入中撤下")
-    active_invocations = db.execute(
-        select(CapabilityInvocation.status, CapabilityInvocation.result_document).where(
-            CapabilityInvocation.id.in_(scenario_scoped_ids(CapabilityInvocation, scenario)),
-            CapabilityInvocation.status.in_(("pending", "running", "awaiting_confirmation")),
-        )
-    ).all()
-    now = datetime.now(timezone.utc)
-    has_active_invocation = False
-    for status, result_document in active_invocations:
-        if status != "awaiting_confirmation":
-            has_active_invocation = True
-            break
-        confirmation = (result_document or {}).get("confirmation", {})
-        raw_expiry = confirmation.get("expires_at") if isinstance(confirmation, dict) else None
-        try:
-            expiry = datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            # Missing/invalid expiry cannot prove that the confirmation is stale.
-            has_active_invocation = True
-            break
-        if expiry > now:
-            has_active_invocation = True
-            break
-    if has_active_invocation:
-        blockers.append("仍有进行中的能力调用")
-    if _count_where(
-        db,
-        WorkflowRun,
-        WorkflowRun.id.in_(scenario_scoped_ids(WorkflowRun, scenario)),
-        WorkflowRun.status.in_(
-            ("queued", "running", "awaiting_approval", "retry_waiting")
-        ),
-    ):
-        blockers.append("仍有进行中的工作流任务")
-    if _count_where(
-        db,
-        AgentTurnRun,
-        AgentTurnRun.id.in_(queries.turn_run_ids),
-        AgentTurnRun.status.in_(agent_deletion_service.ACTIVE_TURN_STATUSES),
-    ):
-        blockers.append("仍有进行中的 Agent 对话任务")
     source_state = scenario_purge_asset_service.inspect_scenario_sources(db, scenario)
     blockers.extend(item for item in source_state.blockers if item not in blockers)
     return tuple(blockers)
@@ -448,8 +403,6 @@ def build_purge_plan(
     external_assets = _count_where(db, ExternalScenarioAsset,
         ExternalScenarioAsset.scenario_id == scenario.id, ExternalScenarioAsset.tenant_id == scenario.tenant_id)
     retained["external_scenario_assets"] = external_assets
-    if external_assets:
-        blockers += ("场景仍保留外部调用附件及其归属证据，可退役但暂不能永久删除",)
     audit_keys = (
         "external_api_keys",
         "conversations",
@@ -458,6 +411,8 @@ def build_purge_plan(
         "action_logs",
         "workflow_runs",
         "releases",
+        "release_lifecycle_events",
+        "workflow_approval_evidence",
         "llm_traces",
         "assertions",
         "derivation_runs",

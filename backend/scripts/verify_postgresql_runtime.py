@@ -319,6 +319,10 @@ def _verify_scenario_audit_purge_contract(connection: Any) -> None:
     required_markers = (
         "evidence.tenant_id = p_tenant_id",
         "evidence.action_scenario_id = p_scenario_id",
+        "event.tenant_id = p_tenant_id",
+        "event.scenario_id = p_scenario_id",
+        "delete from public.release_lifecycle_events",
+        "delete from public.workflow_approval_evidence",
     )
     if any(marker not in definition for marker in required_markers):
         raise RuntimeError("scenario audit purge function is missing its tenant fence")
@@ -542,6 +546,14 @@ def _verify_runtime_function_privileges(connection: Any) -> None:
         (
             "public.detach_data_source_file_references(varchar,varchar,varchar[])",
             "public.detach_data_source_file_references",
+        ),
+        (
+            "public.delete_distillation_publication(varchar,varchar)",
+            "public.delete_distillation_publication",
+        ),
+        (
+            "public.detach_distillation_publication(varchar,varchar,varchar)",
+            "public.detach_distillation_publication",
         ),
     )
     for signature, label in signatures:

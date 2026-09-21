@@ -27,18 +27,31 @@
       <span class="discovery-canvas-state">{{ pending ? 'AI 产物 · 待采用' : dirty ? '资料引用有待保存的调整' : hasArtifacts ? '已保存的阶段产物' : '等待产物' }}</span>
       <el-button type="primary" plain :disabled="!canPublish || !hasArtifacts || pending" @click="$emit('publish')">保存到资料库</el-button>
     </footer>
+    <section v-if="publications.length" class="discovery-publications" aria-label="业务蒸馏交付物">
+      <div class="discovery-publications-heading"><strong>已保存交付物</strong><small>每个版本可独立删除</small></div>
+      <article v-for="version in publications" :key="version.id" class="discovery-publication-row">
+        <span>版本 {{ version.project_revision }}</span>
+        <div class="discovery-publication-actions">
+          <el-button text :disabled="!version.data_source_id" @click="$emit('open-publication', version)">查看资料</el-button>
+          <el-button v-for="artifact in version.artifacts" :key="artifact.key" text :disabled="!!publicationBusy" @click="$emit('download-publication', version, artifact)">下载 {{ artifact.filename }}</el-button>
+          <el-button v-if="canEdit" type="danger" text :disabled="!!publicationBusy" @click="$emit('delete-publication', version)">删除版本</el-button>
+        </div>
+      </article>
+    </section>
   </section>
 </template>
 <script setup lang="ts">
 import { computed, nextTick, ref, useId } from 'vue'
 import { Close } from '@element-plus/icons-vue'
-import type { DistillationDocument, DistillationProject } from '@/types/businessDistillation'
+import type { DistillationArtifact, DistillationDocument, DistillationProject, DistillationPublication } from '@/types/businessDistillation'
 import DistillationFindings from './DistillationFindings.vue'
 import DistillationEvidenceFindings from './DistillationEvidenceFindings.vue'
 import DistillationCases from './DistillationCases.vue'
 
-const props = defineProps<{ document: DistillationDocument; project?: DistillationProject; projectId?: string; revision?: number; dirty: boolean; canEdit: boolean; canPublish: boolean; embedded?: boolean; loading?: boolean; pending?: boolean }>()
-defineEmits<{ close: []; publish: []; ask: [message: string]; updated: [project: DistillationProject] }>()
+const props = withDefaults(defineProps<{ document: DistillationDocument; project?: DistillationProject; projectId?: string; revision?: number; dirty: boolean; canEdit: boolean; canPublish: boolean; embedded?: boolean; loading?: boolean; pending?: boolean; publications?: DistillationPublication[]; publicationBusy?: string }>(), {
+  publications: () => [], publicationBusy: '',
+})
+defineEmits<{ close: []; publish: []; ask: [message: string]; updated: [project: DistillationProject]; 'open-publication': [publication: DistillationPublication]; 'download-publication': [publication: DistillationPublication, artifact: DistillationArtifact]; 'delete-publication': [publication: DistillationPublication] }>()
 const hasArtifacts = computed(() => {
   const document = props.document
   return [document.beneficiary, document.pain, document.desired_outcome, document.success_metric, document.scope, document.non_goals].some(value => value.trim())

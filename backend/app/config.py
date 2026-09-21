@@ -178,6 +178,8 @@ class Settings(BaseSettings):
     mcp_private_host_allowlist: str = ""
     distillation_browser_enabled: bool = False
     distillation_browser_max_sessions: int = Field(default=2, ge=1, le=8)
+    # Timeout for the AI model used by business discovery; this is not a model
+    # distillation/training setting.
     distillation_model_timeout_seconds: float = Field(default=120, ge=30, le=300)
     mcp_operation_timeout_seconds: float = 90.0
     # Agent publications share one authenticated Streamable HTTP endpoint.

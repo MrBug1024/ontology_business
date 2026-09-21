@@ -595,18 +595,31 @@ def cleanup_agent_owned_records(
     )
     db.flush()
 
-    active = db.scalar(
-        select(AgentTurnRun.id)
+    active_runs = list(
+        db.scalars(
+            select(AgentTurnRun)
         .where(
             AgentTurnRun.agent_id == locked_agent.id,
             AgentTurnRun.tenant_id == locked_agent.tenant_id,
             AgentTurnRun.status.in_(ACTIVE_TURN_STATUSES),
         )
         .with_for_update()
-        .limit(1)
+            .order_by(AgentTurnRun.id)
     )
-    if active is not None:
-        raise AgentDeletionConflict("Agent 仍有后台对话任务运行，请先取消并等待任务结束")
+        .all()
+    )
+    for run in active_runs:
+        run.status = "cancelled"
+        run.revision += 1
+        run.lease_token = ""
+        run.lease_expires_at = None
+        run.lease_generation += 1
+        run.error_code = "agent_deleted"
+        run.error_message = "Agent 已删除，任务已取消"
+        run.cancel_requested_at = run.cancel_requested_at or now
+        run.finished_at = now
+    if active_runs:
+        db.flush()
 
     upload_runs = _lock_upload_runs(db, locked_agent)
     assets = _lock_assets(db, locked_agent)

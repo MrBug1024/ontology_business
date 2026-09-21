@@ -159,6 +159,12 @@
 .discovery-canvas > footer { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px; border-top: 1px solid var(--border); }
 .discovery-canvas > footer .el-button + .el-button { margin: 0; }
 .discovery-canvas-state { flex: 1 1 180px; align-self: center; color: var(--text-2); font-size: 11px; line-height: 1.5; }
+.discovery-publications { flex: 0 0 auto; max-height: 210px; overflow-y: auto; border-top: 1px solid var(--border); background: var(--surface); }
+.discovery-publications-heading { display: flex; justify-content: space-between; gap: 12px; padding: 10px 14px 6px; color: var(--text); font-size: 12px; }
+.discovery-publications-heading small { color: var(--text-2); font-size: 11px; }
+.discovery-publication-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 14px; border-top: 1px solid var(--border); font-size: 12px; }
+.discovery-publication-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+.discovery-publication-actions .el-button + .el-button { margin: 0; }
 .discovery-system-list { display: grid; gap: 10px; }
 .discovery-system-card { padding: 14px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
 .discovery-system-card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }

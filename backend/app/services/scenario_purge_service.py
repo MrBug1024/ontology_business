@@ -7,6 +7,7 @@ storage deletion jobs only after commit succeeds.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError, ProgrammingError
@@ -40,11 +41,21 @@ from ..models import (
     SemanticMapping,
     SemanticRelationMapping,
 )
+from ..distillation_access_models import DistillationSystemAccess
+from ..distillation_attachment_models import DistillationAttachment, DistillationTurnAttachment
+from ..distillation_conversation_models import DistillationConversationTurn
+from ..distillation_models import (
+    DistillationProject,
+    DistillationPublication,
+    DistillationScenarioState,
+)
+from ..external_api_models import ExternalScenarioAsset
 from . import (
     agent_deletion_service,
     object_deletion_service,
     object_storage_service,
     release_service,
+    distillation_service,
     scenario_purge_asset_service,
     scenario_purge_plan_service,
     template_catalog_service,
@@ -352,6 +363,89 @@ def _delete_invocation_and_reasoning_records(
         )
 
 
+def _detach_distillation_sources(db: Session, scenario: BusinessScenario) -> None:
+    publications = list(db.scalars(
+        select(DistillationPublication)
+        .where(
+            DistillationPublication.scenario_id == scenario.id,
+            DistillationPublication.tenant_id == scenario.tenant_id,
+        )
+        .with_for_update()
+    ))
+    for publication in publications:
+        distillation_service.detach_publication_data_source(db, publication)
+
+
+def _delete_distillation_history(db: Session, scenario: BusinessScenario) -> None:
+    project_ids = select(DistillationProject.id).where(
+        DistillationProject.scenario_id == scenario.id,
+        DistillationProject.tenant_id == scenario.tenant_id,
+    )
+    now = datetime.now(timezone.utc)
+    db.execute(
+        update(DistillationConversationTurn)
+        .where(
+            DistillationConversationTurn.project_id.in_(project_ids),
+            DistillationConversationTurn.tenant_id == scenario.tenant_id,
+            DistillationConversationTurn.status.in_(("queued", "running", "waiting")),
+        )
+        .values(
+            status="cancelled",
+            lease_token=None,
+            lease_expires_at=None,
+            lease_generation=DistillationConversationTurn.lease_generation + 1,
+            completed_at=now,
+            updated_at=now,
+        )
+    )
+    db.execute(
+        delete(DistillationTurnAttachment).where(
+            DistillationTurnAttachment.project_id.in_(project_ids),
+            DistillationTurnAttachment.tenant_id == scenario.tenant_id,
+        )
+    )
+    db.execute(
+        delete(DistillationConversationTurn).where(
+            DistillationConversationTurn.project_id.in_(project_ids),
+            DistillationConversationTurn.tenant_id == scenario.tenant_id,
+        )
+    )
+    db.execute(
+        delete(DistillationAttachment).where(
+            DistillationAttachment.project_id.in_(project_ids),
+            DistillationAttachment.tenant_id == scenario.tenant_id,
+        )
+    )
+    db.execute(
+        delete(DistillationSystemAccess).where(
+            DistillationSystemAccess.project_id.in_(project_ids),
+            DistillationSystemAccess.tenant_id == scenario.tenant_id,
+        )
+    )
+    publications = list(db.scalars(
+        select(DistillationPublication)
+        .where(
+            DistillationPublication.scenario_id == scenario.id,
+            DistillationPublication.tenant_id == scenario.tenant_id,
+        )
+        .with_for_update()
+    ))
+    for publication in publications:
+        distillation_service.delete_publication_record(db, publication)
+    db.execute(
+        delete(DistillationProject).where(
+            DistillationProject.scenario_id == scenario.id,
+            DistillationProject.tenant_id == scenario.tenant_id,
+        )
+    )
+    db.execute(
+        delete(DistillationScenarioState).where(
+            DistillationScenarioState.scenario_id == scenario.id,
+            DistillationScenarioState.tenant_id == scenario.tenant_id,
+        )
+    )
+
+
 def _delete_semantic_bindings(db: Session, scenario: BusinessScenario) -> None:
     # Logical datasets are shared catalog objects; only scenario bindings and
     # scenario-owned semantic mappings belong to this purge.
@@ -381,6 +475,15 @@ def _delete_semantic_bindings(db: Session, scenario: BusinessScenario) -> None:
         delete(ScenarioDatasetBinding).where(
             ScenarioDatasetBinding.scenario_id == scenario.id,
             ScenarioDatasetBinding.tenant_id == scenario.tenant_id,
+        )
+    )
+
+
+def _delete_external_assets(db: Session, scenario: BusinessScenario) -> None:
+    db.execute(
+        delete(ExternalScenarioAsset).where(
+            ExternalScenarioAsset.scenario_id == scenario.id,
+            ExternalScenarioAsset.tenant_id == scenario.tenant_id,
         )
     )
 
@@ -433,6 +536,8 @@ def _delete_assistant_history(db: Session, scenario: BusinessScenario) -> None:
 
 
 def _delete_scenario_records(db: Session, scenario: BusinessScenario) -> None:
+    _delete_distillation_history(db, scenario)
+    _delete_external_assets(db, scenario)
     _delete_invocation_and_reasoning_records(db, scenario)
     _delete_semantic_bindings(db, scenario)
     _delete_assistant_history(db, scenario)
@@ -468,6 +573,8 @@ def prepare_scenario_purge(
         delete_audit_history=delete_audit_history,
     )
     _prepare_templates(db, scenario)
+    _detach_distillation_sources(db, scenario)
+    _delete_external_assets(db, scenario)
     deletion_job_ids = _cleanup_agents(db, scenario)
 
     source_state = scenario_purge_asset_service.inspect_scenario_sources(

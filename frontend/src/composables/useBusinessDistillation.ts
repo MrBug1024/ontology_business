@@ -205,6 +205,14 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
     URL.revokeObjectURL(url)
   }
 
+  async function removePublication(publication: DistillationPublication) {
+    const result = await run('delete-publication', signal => api.deleteProduct(publication.id, signal))
+    if (result === null) return false
+    publications.value = publications.value.filter(item => item.id !== publication.id)
+    notice.value = `业务蒸馏产物版本 ${publication.project_revision} 已删除，资料库投影同时移除。`
+    return true
+  }
+
   function cancelAnalysis() {
     if (busy.value !== 'analyze') return
     actionController?.abort()
@@ -274,6 +282,6 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
   })
   return { projects, project, draft, scenarios, materials, publications, proposal, error, notice, loading, listing,
     busy, offset, hasMore, dirty, materialOffset, materialHasMore, materialLoading, materialPageSize,
-    list, load, save, analyze, applyProposal, publish, download, cancelAnalysis, refreshOptions, remove,
+    list, load, save, analyze, applyProposal, publish, download, removePublication, cancelAnalysis, refreshOptions, remove,
     previousMaterialPage, nextMaterialPage, copyToScenario }
 }

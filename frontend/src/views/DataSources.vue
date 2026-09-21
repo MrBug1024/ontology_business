@@ -755,6 +755,8 @@ async function remove(ds: DataSource) {
       ? '这只会删除本平台保存的连接配置，不会执行任何删除远程数据库数据的操作。'
       : ds.type === 'dataset'
       ? '这会移除当前资料库中的连接记录，不会删除仍被目录或审计引用的底层版本。'
+      : ds.type === 'distillation'
+      ? '这会只移除场景资料中的交接版本投影；业务蒸馏页的原始产物会保留，可在业务蒸馏产物页单独删除。'
       : `这会删除资料记录及其 ${ds.file_count || 0} 个托管文件；数据库会保留清理审计，MinIO 对象进入清理队列。`
     await ElMessageBox.confirm(`删除资料库「${ds.name}」？${detail}`, '确认删除', {
       type: 'warning',

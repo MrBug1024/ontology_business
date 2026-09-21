@@ -57,7 +57,7 @@
         <button type="button" :aria-pressed="mobilePane === 'conversation'" @click="mobilePane = 'conversation'">业务蒸馏 AI</button>
       </div>
       <div v-if="!projectId || project || loading" class="distillation-studio-body" :class="`is-${mobilePane}`">
-        <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="!!project && canEdit && !loading && !actionBusy" :can-publish="!!project && canEdit && !dirty && !actionBusy && !active && !artifactProposal" @ask="discussFinding" @publish="confirmPublish" @updated="acceptProjectUpdate" />
+        <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :publications="publications" :publication-busy="busy" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="canEdit && !loading && !actionBusy" :can-publish="!!project && canEdit && !dirty && !actionBusy && !active && !artifactProposal" @ask="discussFinding" @publish="confirmPublish" @updated="acceptProjectUpdate" @open-publication="openMaterial" @download-publication="downloadPublication" @delete-publication="deletePublication" />
         <aside class="distillation-advisor-panel" aria-label="业务蒸馏顾问对话">
         <DistillationConversation v-model="input" :scope-key="draftKey" :scenario-id="props.scenarioId" :turns="turns" :loading="loading || conversationLoading" :has-more="conversationHasMore" :working="!!active" :sending="sending || busy === 'save'" :cancelling="cancelling" :applying="applying" :disabled="!canEdit || loading || actionBusy" :can-apply="canEdit && !dirty && !actionBusy" :error="conversationError" :blocked-reason="blockedReason" :upload-busy="attachmentBusy" :removing-attachment="removingAttachment" :compact="embedded" :workspace-actions="embedded" @send="sendMessage" @cancel="cancel" @reload="reconnectConversation" @older="loadConversation(true)" @sources="openSources" @files="addAttachments" @remove-submitted="removeSubmittedAttachment" @preview="previewTurn = $event" @apply="applyTurn" @new="newConversation" @history="projectsOpen = true" @systems="openSystems">
             <template #attachments><DistillationAttachments :items="attachments" :error="attachmentError" :disabled="!canEdit || !!active || sending" @retry="retryAttachment" @remove="removeAttachment" @reload="loadAttachments" /></template>
@@ -152,7 +152,7 @@ const draftKey = computed(() => projectId.value || `new:${historyScope.value}`)
 const {
   projects, project, draft, scenarios, materials, publications, error, notice, loading, listing, busy,
   offset, hasMore, dirty, materialOffset, materialHasMore, materialLoading, materialPageSize,
-  list, load, save, publish, refreshOptions, previousMaterialPage, nextMaterialPage, copyToScenario, remove,
+  list, load, save, publish, download, refreshOptions, previousMaterialPage, nextMaterialPage, copyToScenario, remove, removePublication,
 } = useBusinessDistillation(projectId, historyScope, props.embedded)
 const authorizedProjectId = computed(() => {
   const row = project.value
@@ -321,6 +321,19 @@ function openMaterial(version: DistillationPublication) {
   void router.push({ name: 'data-sources', query: { source_id: version.data_source_id, return_to: route.fullPath } })
 }
 function openLatestPublication() { const latest = publications.value[0]; if (latest) openMaterial(latest) }
+async function downloadPublication(publication: DistillationPublication, artifact: DistillationPublication['artifacts'][number]) {
+  await download(publication, artifact)
+}
+async function deletePublication(publication: DistillationPublication) {
+  try {
+    await ElMessageBox.confirm(
+      `删除业务蒸馏产物版本 ${publication.project_revision}？资料库中的对应投影也会移除。`,
+      '删除业务蒸馏产物',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch { return }
+  await removePublication(publication)
+}
 function buildScenario() { if (project.value?.scenario_id) void router.push({ name: 'scenario-detail', params: { id: project.value.scenario_id }, query: { stage: 'ontology', return_to: route.fullPath } }) }
 async function allowLeave() {
   if (internalNavigation) return true

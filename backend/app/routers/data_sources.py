@@ -21,6 +21,7 @@ from ..models import (
     DataSource,
     ManagedUploadRun,
 )
+from ..distillation_models import DistillationPublication
 from ..schemas import (
     BucketFileOut,
     DataSourceCatalogOut,
@@ -38,6 +39,7 @@ from ..services import (
     catalog_ingestion_service,
     connector_service,
     datasource_service,
+    distillation_service,
     distillation_library_service,
     modeling_contract_source_service,
     object_deletion_service,
@@ -67,7 +69,6 @@ def _public_config(config: dict) -> dict:
 def _out(ds: DataSource, db: Session, *, context_read_only: bool = False) -> DataSourceOut:
     can_mutate = (
         not context_read_only
-        and ds.type != "distillation"
         and ds.tenant_id == tenant_service.current_tenant_id(db)
         and _can_access_data_source(db, ds, writable=True)
     )
@@ -84,7 +85,7 @@ def _out(ds: DataSource, db: Session, *, context_read_only: bool = False) -> Dat
         last_error=ds.last_error if can_mutate else "",
         created_at=ds.created_at,
         file_count=len(ds.files),
-        can_write=can_mutate and ds.type != "dataset",
+        can_write=can_mutate and ds.type not in {"dataset", "distillation"},
         can_delete=can_mutate,
     )
 
@@ -152,8 +153,6 @@ def _data_source(
     if ds.resource_scope == "agent_runtime" and not allow_runtime:
         raise HTTPException(404, "数据源不存在")
     _require_data_source_access(db, ds, writable=writable)
-    if writable and ds.type == "distillation":
-        raise HTTPException(409, "业务蒸馏交接资料不可变，请在蒸馏项目中创建新版本")
     return ds
 
 
@@ -561,6 +560,17 @@ def delete_data_source(ds_id: str, db: Session = Depends(get_tenant_db)):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     bucket_files = list(ds.files)
     try:
+        if ds.type == "distillation":
+            publication = db.scalar(
+                select(DistillationPublication)
+                .where(
+                    DistillationPublication.data_source_id == ds.id,
+                    DistillationPublication.tenant_id == ds.tenant_id,
+                )
+                .with_for_update()
+            )
+            if publication is not None:
+                distillation_service.detach_publication_data_source(db, publication)
         modeling_contract_source_service.retire_for_data_source_deletion(db, ds)
         deletion_job_ids = [
             object_deletion_service.enqueue_bucket_file_deletion(

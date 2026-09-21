@@ -32,8 +32,16 @@ export const businessDistillationApi = {
     http.get<DistillationPublication[]>(`${root}/scenario/${encodeURIComponent(scenarioId)}/publications`, { signal }),
   publication: (id: string, publicationId: string, signal: AbortSignal) =>
     http.get<DistillationPublication>(`${projectPath(id)}/publications/${encodeURIComponent(publicationId)}`, { signal }),
+  publicationById: (publicationId: string, signal: AbortSignal) =>
+    http.get<DistillationPublication>(`${root}/publications/${encodeURIComponent(publicationId)}`, { signal }),
   artifact: (id: string, publicationId: string, key: string, signal: AbortSignal) =>
     http.get<Blob>(`${projectPath(id)}/publications/${encodeURIComponent(publicationId)}/artifacts/${encodeURIComponent(key)}`, { signal, responseType: 'blob' }),
+  artifactByPublicationId: (publicationId: string, key: string, signal: AbortSignal) =>
+    http.get<Blob>(`${root}/publications/${encodeURIComponent(publicationId)}/artifacts/${encodeURIComponent(key)}`, { signal, responseType: 'blob' }),
+  deletePublication: (id: string, publicationId: string, signal: AbortSignal) =>
+    http.delete<void>(`${projectPath(id)}/publications/${encodeURIComponent(publicationId)}`, { signal }),
+  deleteProduct: (publicationId: string, signal: AbortSignal) =>
+    http.delete<void>(`${root}/publications/${encodeURIComponent(publicationId)}`, { signal }),
   scenarioArtifact: (scenarioId: string, publicationId: string, key: string, signal: AbortSignal) =>
     http.get<Blob>(`${root}/scenario/${encodeURIComponent(scenarioId)}/publications/${encodeURIComponent(publicationId)}/artifacts/${encodeURIComponent(key)}`, { signal, responseType: 'blob' }),
   scenarios: (signal: AbortSignal) => http.get<Scenario[]>('/scenarios', { signal }),
