@@ -35,6 +35,14 @@ test('model thinking remains a live collapsible section while the answer streams
   ])
 })
 
+test('an empty conversation history does not read status from an absent turn', async () => {
+  fakeApi.list = async () => ({ turns: [], has_more: false })
+  const { state, stop } = mount()
+  await flush()
+  assert.equal(state.error.value, '')
+  stop()
+})
+
 test('a newly created project can enqueue its first turn before route authorization catches up', async () => {
   fakeApi.list = async () => ({ turns: [], has_more: false })
   const requests = []

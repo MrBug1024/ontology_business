@@ -5,7 +5,7 @@ import ts from 'typescript'
 import { computed, createRenderer, h, nextTick, ref } from 'vue'
 import { compileScript, parse } from '@vue/compiler-sfc'
 import { handoffDecision } from '../src/utils/distillationHandoff.ts'
-import { draftOf, emptyDistillationDocument, removeEvidence, removeProcessNode, reviewQuestions } from '../src/utils/businessDistillation.ts'
+import { draftOf, emptyDistillationDocument, isMaterialReferenceOnlyChange, removeEvidence, removeProcessNode, reviewQuestions } from '../src/utils/businessDistillation.ts'
 
 test('removing proof clears graph citations and downgrades an unsupported fact', () => {
   const document = emptyDistillationDocument()
@@ -33,6 +33,25 @@ test('editing a draft does not mutate saved evidence or historical versions', ()
   draft.document.to_be.nodes.push({ key: 'new' })
   assert.equal(row.document.to_be.nodes.length, 0)
   assert.ok(reviewQuestions(draft.document).some(value => value.includes('最终结果')))
+})
+
+test('a library reference is the only draft change that can be persisted with the next question', () => {
+  const row = { id: 'p', name: 'Original', scenario_id: null, revision: 1, document: emptyDistillationDocument() }
+  const baseline = draftOf(row)
+  const withReference = draftOf(row)
+  withReference.document.evidence.push({ key: 'library_source', title: '业务资料', kind: 'material', role: 'reference', data_source_id: 'source', bucket_file_id: null, summary: '', coverage: '', limitations: '' })
+  assert.equal(isMaterialReferenceOnlyChange(withReference, baseline), true)
+  withReference.document.pain = '新增的阶段编辑'
+  assert.equal(isMaterialReferenceOnlyChange(withReference, baseline), false)
+})
+
+test('sending a reference selection saves only that selection before enqueueing the turn', () => {
+  const source = readFileSync(new URL('../src/components/distillation/DistillationWorkspace.vue', import.meta.url), 'utf8')
+  const send = source.slice(source.indexOf('async function sendMessage'), source.indexOf('function acceptProjectUpdate'))
+  assert.match(send, /unsavedStageChanges\.value/)
+  assert.match(send, /if \(row && materialOnlyDirty\.value\) \{[\s\S]*?row = await saveDraft\(false\)/)
+  assert.match(send, /if \(!row\) return/)
+  assert.ok(send.indexOf('saveDraft(false)') < send.indexOf('await send(text'))
 })
 
 test('published business products can be removed independently from their conversation', async () => {
@@ -164,6 +183,7 @@ test('new conversations inherit the chosen scenario without becoming an unsaved 
   state.draft.value.name = 'First question'
   await state.save()
   assert.equal(saved.scenario_id, 'scenario-a')
+  assert.equal(saved.expected_scenario_revision, 1)
   stop()
 })
 

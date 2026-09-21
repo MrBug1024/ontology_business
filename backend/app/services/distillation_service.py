@@ -150,8 +150,17 @@ def create_project(db: Session, payload: ProjectCreate) -> DistillationProject:
             db.add(state)
             db.flush()
         else:
-            document = DistillationDocument.model_validate(state.document)
+            if payload.expected_scenario_revision is not None and state.revision != payload.expected_scenario_revision:
+                raise HTTPException(409, "场景业务蒸馏基线已变化，请保留当前草稿并刷新后合并")
+            if payload.expected_scenario_revision is None:
+                document = DistillationDocument.model_validate(state.document)
     validate_document(db, document, payload.scenario_id)
+    if payload.scenario_id and payload.expected_scenario_revision is not None and state is not None:
+        state.document = document.model_dump()
+        state.revision += 1
+        state.updated_at = datetime.now(timezone.utc)
+        state.updated_by = principal.user_id
+        db.flush()
     if release_service.safe_snapshot_content({"name": payload.name}) != {"name": payload.name}:
         raise HTTPException(422, "项目名称不能包含凭据")
     row = DistillationProject(tenant_id=principal.tenant_id, scenario_id=payload.scenario_id,

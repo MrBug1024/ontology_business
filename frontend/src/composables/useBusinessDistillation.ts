@@ -9,6 +9,7 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
   const project = ref<DistillationProject | null>(null)
   const draft = ref(draftOf())
   const baseline = ref(draftOf())
+  const scenarioRevision = ref<number | null>(null)
   const scenarios = ref<Scenario[]>([])
   const materials = ref<DataSource[]>([])
   const publications = ref<DistillationPublication[]>([])
@@ -72,6 +73,7 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
     proposal.value = null
     project.value = null
     publications.value = []
+    scenarioRevision.value = null
     draft.value = emptyDraft()
     baseline.value = draftOf()
     const scenarioId = historyScope.value && historyScope.value !== 'shared' ? historyScope.value : ''
@@ -85,6 +87,7 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
         ])
         if (disposed || current !== generation) return
         draft.value = { name: '', scenario_id: scenarioId, document: state.document }
+        scenarioRevision.value = state.revision
         baseline.value = draftOf({ id: '', name: '', scenario_id: scenarioId, revision: state.revision,
           document: state.document, created_at: state.updated_at, updated_at: state.updated_at, can_write: true })
         publications.value = versions
@@ -107,6 +110,7 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
       }
       project.value = row
       draft.value = draftOf(row)
+      scenarioRevision.value = null
       baseline.value = draftOf(row)
       publications.value = versions
     } catch (caught: unknown) {
@@ -138,12 +142,16 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
   async function save() {
     if (!draft.value.name.trim()) { error.value = '请先填写蒸馏项目名称。'; return null }
     if (lockScope) draft.value.scenario_id = historyScope.value
+    const payload = !project.value && scenarioRevision.value !== null
+      ? { ...draft.value, expected_scenario_revision: scenarioRevision.value }
+      : draft.value
     const row = await run('save', signal => project.value
       ? api.update(project.value.id, project.value.revision, draft.value, signal)
-      : api.create(draft.value, signal))
+      : api.create(payload, signal))
     if (!row) return null
     project.value = row
     draft.value = draftOf(row)
+    scenarioRevision.value = null
     proposal.value = null
     notice.value = '已保存，可继续分析或编辑。'
     void list()
@@ -280,7 +288,7 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
     actionController?.abort()
     optionsController?.abort()
   })
-  return { projects, project, draft, scenarios, materials, publications, proposal, error, notice, loading, listing,
+  return { projects, project, draft, baseline, scenarioRevision, scenarios, materials, publications, proposal, error, notice, loading, listing,
     busy, offset, hasMore, dirty, materialOffset, materialHasMore, materialLoading, materialPageSize,
     list, load, save, analyze, applyProposal, publish, download, removePublication, cancelAnalysis, refreshOptions, remove,
     previousMaterialPage, nextMaterialPage, copyToScenario }

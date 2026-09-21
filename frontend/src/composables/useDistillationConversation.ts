@@ -28,26 +28,25 @@ export function useDistillationConversation(projectId: Ref<string>, draftKey: Re
   function message(caught: unknown) { return caught instanceof Error ? caught.message : '对话操作未完成，请重试。你的输入已保留。' }
   function current(epoch: number, control: AbortController) { return !disposed && epoch === generation && !control.signal.aborted }
   function receive(turn: DistillationTurn) { turns.value = mergeTurns(turns.value, [turn]) }
-  function observe(turn: DistillationTurn) {
-    if (isWorking(turn)) {
-      const epoch = generation
-      const control = api.stream(turn.project_id, turn.id, result => {
-        if (current(epoch, control)) receive(result)
-      }, () => {
-        controllers.delete(control)
+  function observe(turn?: DistillationTurn) {
+    if (!turn || !isWorking(turn)) return
+    const epoch = generation
+    const control = api.stream(turn.project_id, turn.id, result => {
+      if (current(epoch, control)) receive(result)
+    }, () => {
+      controllers.delete(control)
+      streaming.value = false
+    }, () => {
+      controllers.delete(control)
+      if (current(epoch, control)) {
         streaming.value = false
-      }, () => {
-        controllers.delete(control)
-        if (current(epoch, control)) {
-          streaming.value = false
-          reconnecting.value = true
-          schedulePoll()
-        }
-      })
-      streaming.value = true
-      reconnecting.value = false
-      controllers.add(control)
-    }
+        reconnecting.value = true
+        schedulePoll()
+      }
+    })
+    streaming.value = true
+    reconnecting.value = false
+    controllers.add(control)
   }
   function schedulePoll() {
     clearTimeout(timer)

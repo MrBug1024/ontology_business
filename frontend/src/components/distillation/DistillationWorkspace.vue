@@ -124,7 +124,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useBusinessDistillation } from '@/composables/useBusinessDistillation'
 import { useDistillationConversation } from '@/composables/useDistillationConversation'
 import { useDistillationAttachments } from '@/composables/useDistillationAttachments'
-import { DECISION_LABELS, draftOf } from '@/utils/businessDistillation'
+import { DECISION_LABELS, draftOf, isMaterialReferenceOnlyChange } from '@/utils/businessDistillation'
 import { conversationTitle, latestArtifactProposal } from '@/utils/distillationConversation'
 import type { DistillationProject, DistillationPublication } from '@/types/businessDistillation'
 import type { DistillationResourceSelection, DistillationTurn } from '@/types/distillationConversation'
@@ -150,7 +150,7 @@ const historyScope = ref(routeScope())
 const selectedScenario = computed(() => historyScope.value === 'shared' ? '' : historyScope.value)
 const draftKey = computed(() => projectId.value || `new:${historyScope.value}`)
 const {
-  projects, project, draft, scenarios, materials, publications, error, notice, loading, listing, busy,
+  projects, project, draft, baseline, scenarios, materials, publications, error, notice, loading, listing, busy,
   offset, hasMore, dirty, materialOffset, materialHasMore, materialLoading, materialPageSize,
   list, load, save, publish, download, refreshOptions, previousMaterialPage, nextMaterialPage, copyToScenario, remove, removePublication,
 } = useBusinessDistillation(projectId, historyScope, props.embedded)
@@ -168,7 +168,10 @@ const canEdit = computed(() => project.value ? project.value.can_write : !projec
 const removingAttachment = ref('')
 const actionBusy = computed(() => !!busy.value || !!applying.value || sending.value || !!removingAttachment.value)
 const eligibleMaterials = computed(() => materials.value.filter(source => !source.scenario_id || source.scenario_id === historyScope.value))
-const blockedReason = computed(() => dirty.value ? '请先保存阶段结论或资料引用。' : attachmentBlocked.value ? '请等待附件就绪，或重试、移除未就绪附件。' : '')
+const baselineDraft = computed(() => baseline.value)
+const materialOnlyDirty = computed(() => dirty.value && isMaterialReferenceOnlyChange(draft.value, baselineDraft.value))
+const unsavedStageChanges = computed(() => dirty.value && !materialOnlyDirty.value)
+const blockedReason = computed(() => unsavedStageChanges.value ? '请先保存阶段结论，再发送新的调查问题。' : attachmentBlocked.value ? '请等待附件就绪，或重试、移除未就绪附件。' : '')
 const projectsOpen = ref(false), sourcesOpen = ref(false), systemsOpen = ref(false)
 const mobilePane = ref<'findings' | 'conversation'>('conversation')
 const publishDialog = ref(false)
@@ -273,9 +276,15 @@ async function removeSubmittedAttachment(id: string) {
 }
 async function sendMessage(selection: DistillationResourceSelection = {}) {
   const text = input.value
-  if (!text.trim() || !canEdit.value || dirty.value || actionBusy.value || attachmentBlocked.value || active.value) return
+  if (!text.trim() || !canEdit.value || unsavedStageChanges.value || actionBusy.value || attachmentBlocked.value || active.value) return
   const existingProject = project.value
-  const row = existingProject || await ensureProject(text, false), ids = [...readyIds.value]
+  let row = existingProject
+  if (row && materialOnlyDirty.value) {
+    row = await saveDraft(false)
+    if (!row) return
+  }
+  if (!row) row = await ensureProject(text, false)
+  const ids = [...readyIds.value]
   const sent = row ? await send(text, row.revision, ids, selection, row.id) : false
   if (sent) { attachmentsSent(ids); notice.value = '' }
   if (!existingProject && row) {

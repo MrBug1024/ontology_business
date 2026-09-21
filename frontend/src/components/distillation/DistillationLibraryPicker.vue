@@ -9,7 +9,7 @@
       <span>第 {{ Math.floor(offset / pageSize) + 1 }} 页</span>
       <el-button text :disabled="loading || !hasMore" @click="$emit('next')">下一页</el-button>
     </div>
-    <p v-if="document.evidence.some(item => item.kind === 'material')" class="discovery-muted">已引用 {{ document.evidence.filter(item => item.kind === 'material').length }} 项资料。保存后，顾问可在调查中读取。</p>
+    <p v-if="document.evidence.some(item => item.kind === 'material')" class="discovery-muted">已引用 {{ document.evidence.filter(item => item.kind === 'material').length }} 项资料。发送调查问题时会一并保存引用。</p>
   </div>
 </template>
 <script setup lang="ts">

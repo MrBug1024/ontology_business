@@ -104,7 +104,7 @@ export interface HistoricalCase {
   discrepancies: string
   limitations: string
 }
-export interface DistillationDraft { name: string; scenario_id: string | null; document: DistillationDocument }
+export interface DistillationDraft { name: string; scenario_id: string | null; document: DistillationDocument; expected_scenario_revision?: number }
 export interface DistillationProject extends DistillationDraft {
   id: string
   revision: number

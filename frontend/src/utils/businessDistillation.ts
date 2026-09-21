@@ -17,6 +17,30 @@ export function draftOf(project?: DistillationProject): DistillationDraft {
     : { name: '', scenario_id: null, document: emptyDistillationDocument() }
 }
 
+function withoutMaterialReferences(draft: DistillationDraft): DistillationDraft {
+  const copy = JSON.parse(JSON.stringify(draft)) as DistillationDraft
+  const materialKeys = new Set(copy.document.evidence.filter(item => item.kind === 'material').map(item => item.key))
+  copy.document.evidence = copy.document.evidence.filter(item => !materialKeys.has(item.key))
+  const strip = (items: { evidence_refs?: string[] }[]) => items.forEach(item => {
+    if (item.evidence_refs) item.evidence_refs = item.evidence_refs.filter(ref => !materialKeys.has(ref))
+  })
+  strip([...copy.document.assertions, ...copy.document.as_is.nodes, ...copy.document.to_be.nodes,
+    ...copy.document.entities, ...copy.document.relations, ...copy.document.lineage])
+  for (const item of copy.document.historical_cases) {
+    item.result_refs = item.result_refs.filter(ref => !materialKeys.has(ref))
+    item.input_refs = item.input_refs.filter(ref => !materialKeys.has(ref))
+    item.process_refs = item.process_refs.filter(ref => !materialKeys.has(ref))
+    item.knowledge_refs = item.knowledge_refs.filter(ref => !materialKeys.has(ref))
+    strip(item.steps)
+  }
+  return copy
+}
+
+export function isMaterialReferenceOnlyChange(current: DistillationDraft, baseline: DistillationDraft): boolean {
+  if (current.name !== baseline.name || current.scenario_id !== baseline.scenario_id) return false
+  return JSON.stringify(withoutMaterialReferences(current).document) === JSON.stringify(withoutMaterialReferences(baseline).document)
+}
+
 export function linesOf(value: string): string[] {
   return value.split('\n').map(line => line.trim()).filter(Boolean)
 }

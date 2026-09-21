@@ -18,7 +18,7 @@ from ..distillation_conversation_schemas import (
     TurnOut,
 )
 from ..distillation_schemas import DistillationDocument, ProjectUpdate
-from ..models import LLMConfig, MCPConfig, Skill
+from ..models import BusinessScenario, LLMConfig, MCPConfig, Skill
 from . import (
     capability_contracts,
     distillation_conversation_tools,
@@ -37,6 +37,20 @@ ACTIVE_STATUSES = ("queued", "running")
 RESOURCE_SELECTION_KEY = "resource_selection"
 RESOURCE_SELECTION_VERSION = 3
 RESOURCE_UNAVAILABLE_MESSAGE = "所选模型、技能方法、MCP资料连接或调查工具当前不可用，请刷新后重新选择"
+
+
+def _scenario_identity(scenario: BusinessScenario) -> dict[str, str]:
+    """Keep only bounded, sanitized scene context in a conversation snapshot."""
+    safe = release_service.safe_snapshot_content({
+        "scenario_id": str(scenario.id),
+        "name": str(scenario.name or "")[:200],
+        "description": str(scenario.description or "")[:4_000],
+    })
+    return {
+        "scenario_id": str(safe.get("scenario_id") or ""),
+        "name": str(safe.get("name") or "")[:200],
+        "description": str(safe.get("description") or "")[:4_000],
+    }
 
 
 def _safe_resource_text(value: object, maximum: int = 200) -> str:
@@ -349,8 +363,15 @@ def enqueue(db: Session, project_id: str, payload: TurnCreate) -> Turn:
         state = distillation_service.scenario_state(db, project.scenario_id, write=True, lock=True)
         if state is None or state.document != project.document:
             raise HTTPException(409, "场景业务蒸馏基线已变化，请刷新会话后重试")
+        scenario = db.scalar(select(BusinessScenario).where(
+            BusinessScenario.id == project.scenario_id,
+            BusinessScenario.tenant_id == project.tenant_id,
+        ))
+        if scenario is None:
+            raise HTTPException(409, "当前业务场景已不可用，请刷新会话后重试")
         publications = distillation_service.list_scenario_publications(db, project.scenario_id, limit=5)
         scenario_context = {
+            **_scenario_identity(scenario),
             "state_revision": state.revision,
             "publications": [
                 {
@@ -401,6 +422,16 @@ def assert_current_context(db: Session, row: Turn) -> None:
         state = distillation_service.scenario_state(db, project.scenario_id, write=True)
         if state is None or not isinstance(baseline, dict) or state.revision != baseline.get("state_revision") or state.document != project.document:
             raise HTTPException(409, "场景业务蒸馏基线已变化，请重新发送问题")
+        if isinstance(baseline, dict) and any(key in baseline for key in ("scenario_id", "name", "description")):
+            scenario = db.scalar(select(BusinessScenario).where(
+                BusinessScenario.id == project.scenario_id,
+                BusinessScenario.tenant_id == project.tenant_id,
+            ))
+            if scenario is None or _scenario_identity(scenario) != {
+                key: str(baseline.get(key) or "")
+                for key in ("scenario_id", "name", "description")
+            }:
+                raise HTTPException(409, "当前业务场景描述已变化，请重新发送问题")
     document = DistillationDocument.model_validate(row.context["document"])
     if capture_evidence_identity(db, document, project.scenario_id) != row.context["evidence_identity"]:
         raise HTTPException(409, "调查资料或连接已变化，请重新发送问题")

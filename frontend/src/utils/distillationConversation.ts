@@ -1,6 +1,6 @@
 import type { DistillationTurn } from '../types/distillationConversation'
 
-export function isWorking(turn: DistillationTurn): boolean { return turn.status === 'queued' || turn.status === 'running' }
+export function isWorking(turn: DistillationTurn | undefined | null): boolean { return turn?.status === 'queued' || turn?.status === 'running' }
 export interface AssistantMessagePart {
   kind: 'thinking' | 'answer'
   content: string

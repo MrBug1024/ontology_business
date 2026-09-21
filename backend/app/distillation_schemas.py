@@ -205,6 +205,9 @@ class ProjectCreate(ClosedModel):
     name: Annotated[str, Field(min_length=1, max_length=200)]
     scenario_id: ResourceId | None = None
     document: DistillationDocument = Field(default_factory=DistillationDocument)
+    # Only used when a new scenario-scoped project is created from the current
+    # browser snapshot. Exclude it from project responses; it is a write CAS.
+    expected_scenario_revision: int | None = Field(default=None, ge=1, exclude=True)
 
 
 class RevisionRequest(ClosedModel):
