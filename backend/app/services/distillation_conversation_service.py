@@ -344,12 +344,29 @@ def enqueue(db: Session, project_id: str, payload: TurnCreate) -> Turn:
     distillation_service.validate_document(db, document, project.scenario_id)
     identity = capture_evidence_identity(db, document, project.scenario_id)
     _selected_llm, resource_selection = resolve_resource_selection(db, payload.resource_selection)
+    scenario_context: dict | None = None
+    if project.scenario_id:
+        state = distillation_service.scenario_state(db, project.scenario_id, write=True, lock=True)
+        if state is None or state.document != project.document:
+            raise HTTPException(409, "场景业务蒸馏基线已变化，请刷新会话后重试")
+        publications = distillation_service.list_scenario_publications(db, project.scenario_id, limit=5)
+        scenario_context = {
+            "state_revision": state.revision,
+            "publications": [
+                {
+                    "publication_id": publication.id,
+                    "revision": publication.project_revision,
+                    "artifact_keys": [item["key"] for item in publication.artifacts],
+                }
+                for publication in publications
+            ],
+        }
     previous_number = db.scalar(select(func.max(Turn.turn_number)).where(Turn.project_id == project.id)) or 0
     row = Turn(tenant_id=project.tenant_id, project_id=project.id,
         created_by=permission_service.require_principal(db).user_id,
         turn_number=previous_number + 1, request_id=payload.request_id, input_hash=fingerprint,
         base_revision=project.revision, message=payload.message,
-        context={"document": document.model_dump(), "evidence_identity": identity,
+        context={"document": document.model_dump(), "evidence_identity": identity, "scenario_baseline": scenario_context,
             "scenario_id": project.scenario_id, RESOURCE_SELECTION_KEY: resource_selection}, checkpoint=[])
     db.add(row)
     db.flush()
@@ -379,6 +396,11 @@ def assert_current_context(db: Session, row: Turn) -> None:
     distillation_service.assert_revision(project, row.base_revision)
     if project.scenario_id != row.context["scenario_id"]:
         raise HTTPException(409, "项目调查范围已变化，请重新发送问题")
+    baseline = row.context.get("scenario_baseline")
+    if project.scenario_id:
+        state = distillation_service.scenario_state(db, project.scenario_id, write=True)
+        if state is None or not isinstance(baseline, dict) or state.revision != baseline.get("state_revision") or state.document != project.document:
+            raise HTTPException(409, "场景业务蒸馏基线已变化，请重新发送问题")
     document = DistillationDocument.model_validate(row.context["document"])
     if capture_evidence_identity(db, document, project.scenario_id) != row.context["evidence_identity"]:
         raise HTTPException(409, "调查资料或连接已变化，请重新发送问题")

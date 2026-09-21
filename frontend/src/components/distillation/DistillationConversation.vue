@@ -1,5 +1,16 @@
 <template>
   <section class="discovery-conversation" aria-label="业务蒸馏对话">
+    <header v-if="workspaceActions" class="discovery-conversation-toolbar">
+      <div>
+        <strong>业务蒸馏 AI</strong>
+        <small>会话可删除，场景产物保留</small>
+      </div>
+      <div class="distill-actions">
+        <el-button text :disabled="disabled" @click="$emit('new')">新建会话</el-button>
+        <el-button text @click="$emit('history')">会话记录</el-button>
+        <el-button text :disabled="disabled" @click="$emit('systems')">业务系统</el-button>
+      </div>
+    </header>
     <div ref="scrollArea" class="discovery-messages" :class="{ 'is-empty': !turns.length }" @scroll="trackScroll">
       <div v-if="!turns.length && !loading" class="discovery-welcome" :class="{ 'is-compact': compact }">
         <div class="discovery-kicker">业务蒸馏</div>
@@ -48,7 +59,7 @@
         <div class="discovery-composer-footer">
           <div class="distill-actions">
             <DistillationResourceSettings v-model="resourceSelection" :disabled="disabled || working || sending" :scope-key="scopeKey" :scenario-id="scenarioId" />
-            <el-button text :disabled="disabled || working || uploadBusy" @click="filePicker?.click()"><el-icon><Paperclip /></el-icon>临时附件</el-button>
+            <el-button text circle :disabled="disabled || working || uploadBusy" aria-label="添加临时附件" title="临时附件" @click="filePicker?.click()"><el-icon aria-hidden="true"><Paperclip /></el-icon></el-button>
             <el-button text :disabled="disabled || working || uploadBusy" @click="$emit('sources')">引用资料库</el-button>
           </div>
           <el-button v-if="working" :loading="cancelling" @click="$emit('cancel')">停止本轮</el-button>
@@ -69,8 +80,8 @@ import DistillationResourceSettings from './DistillationResourceSettings.vue'
 import type { DistillationQuestion, DistillationResourceSelection, DistillationTurn } from '@/types/distillationConversation'
 import { composeClarificationAnswer, isWorking, TURN_STATUS_LABELS } from '@/utils/distillationConversation'
 const input = defineModel<string>({ required: true })
-const props = withDefaults(defineProps<{ turns: DistillationTurn[]; loading: boolean; hasMore: boolean; working: boolean; sending: boolean; cancelling: boolean; applying: string; disabled: boolean; canApply: boolean; error: string; blockedReason: string; uploadBusy: boolean; removingAttachment: string; scopeKey: string; scenarioId?: string; compact?: boolean }>(), { compact: false, scenarioId: '' })
-const emit = defineEmits<{ send: [selection: DistillationResourceSelection]; cancel: []; reload: []; older: []; sources: []; files: [files: File[]]; 'remove-submitted': [id: string]; preview: [turn: DistillationTurn]; apply: [turn: DistillationTurn] }>()
+const props = withDefaults(defineProps<{ turns: DistillationTurn[]; loading: boolean; hasMore: boolean; working: boolean; sending: boolean; cancelling: boolean; applying: string; disabled: boolean; canApply: boolean; error: string; blockedReason: string; uploadBusy: boolean; removingAttachment: string; scopeKey: string; scenarioId?: string; compact?: boolean; workspaceActions?: boolean }>(), { compact: false, scenarioId: '', workspaceActions: false })
+const emit = defineEmits<{ send: [selection: DistillationResourceSelection]; cancel: []; reload: []; older: []; sources: []; files: [files: File[]]; 'remove-submitted': [id: string]; preview: [turn: DistillationTurn]; apply: [turn: DistillationTurn]; new: []; history: []; systems: [] }>()
 const scrollArea = ref<HTMLElement>(), textarea = ref<HTMLTextAreaElement>()
 const filePicker = ref<HTMLInputElement>()
 const nearBottom = ref(true)

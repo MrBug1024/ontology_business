@@ -102,6 +102,8 @@ test('scenario workspace starts with distillation and keeps all twelve stages in
   assert.match(scenariosSource, /query:\s*\{ stage: 'distillation' \}/)
   assert.match(appSource, /normalizeScenarioStage\(route\.query\.stage\)/)
   assert.match(appSource, /!\['distillation', 'materials'\]\.includes\(scenarioStage\.value\)/)
+  assert.match(appSource, /<GlobalAssistant v-if="showGlobalAssistant"/)
+  assert.doesNotMatch(appSource, /<GlobalAssistant[^\n]*v-show="showGlobalAssistant"/)
 })
 
 test('scenario stage normalization gives navigation and the global advisor one fallback', async () => {
@@ -241,13 +243,15 @@ test('settings manage resources inside the modal and keep nested editors above i
   assert.match(dialog, /v-if="modelValue"/)
 })
 
-test('global tool settings show the server catalog for the distinct distillation role', () => {
+test('global tool settings separate governed tools from skill methods', () => {
   const tools = readFileSync(new URL('../src/components/platform/ToolSettingsPanel.vue', import.meta.url), 'utf8')
   assert.match(tools, /distillationConversationApi\.resources\(request\.signal\)/)
-  assert.match(tools, /resources\.investigation_tools\.tools/)
-  assert.match(tools, /tool\.always_available/)
+  assert.match(tools, /工具 \/ 技能边界/)
+  assert.match(tools, /工具是平台统一执行的小颗粒能力/)
+  assert.match(tools, /受信方法包/)
+  assert.doesNotMatch(tools, /resources\.investigation_tools\.tools/)
   assert.match(tools, /connector\.mode === 'resources'/)
-  assert.match(tools, /业务蒸馏 · 内置调查工具/)
+  assert.match(tools, /业务蒸馏 · MCP 资料连接/)
   assert.doesNotMatch(tools, /api\.mcpTools|tools\/call/)
   assert.match(tools, /onBeforeUnmount\(\(\) => \{ controller\?\.abort\(\)/)
 })

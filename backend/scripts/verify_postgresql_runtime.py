@@ -41,7 +41,13 @@ RUNTIME_REQUIRED_UPDATE_TABLES = (
     "distillation_conversation_turns",
     "distillation_attachments",
 )
-RUNTIME_APPEND_ONLY_TABLES = ("agent_turn_events", "release_lifecycle_events", "workflow_approval_evidence", "distillation_turn_attachments")
+RUNTIME_APPEND_ONLY_TABLES = ("agent_turn_events", "release_lifecycle_events", "workflow_approval_evidence")
+RUNTIME_CHAT_CLEANUP_TABLES = (
+    "distillation_conversation_turns",
+    "distillation_turn_attachments",
+    "distillation_attachments",
+    "distillation_system_access",
+)
 RUNTIME_MUTABLE_CONTROL_TABLES = (
     "agent_turn_runs",
     "assistant_request_runs",
@@ -401,6 +407,7 @@ def _validate_runtime_table_privileges(
     required_update_tables: tuple[str, ...],
     append_only_tables: tuple[str, ...] = (),
     mutable_control_tables: tuple[str, ...] = (),
+    chat_cleanup_tables: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     expected = (
         set(immutable_tables)
@@ -408,6 +415,7 @@ def _validate_runtime_table_privileges(
         | set(required_update_tables)
         | set(append_only_tables)
         | set(mutable_control_tables)
+        | set(chat_cleanup_tables)
     )
     missing = sorted(expected - set(privileges))
     if missing:
@@ -458,12 +466,19 @@ def _validate_runtime_table_privileges(
             raise RuntimeError(
                 f"runtime role has excessive retained-control privileges on {table_name}"
             )
+    for table_name in chat_cleanup_tables:
+        current = privileges[table_name]
+        if not all(current.get(name, False) for name in ("select", "insert", "delete")):
+            raise RuntimeError(f"runtime role lacks chat cleanup access to {table_name}")
+        if any(current.get(name, False) for name in ("truncate", "references", "trigger")):
+            raise RuntimeError(f"runtime role has excessive chat cleanup privileges on {table_name}")
     return {
         "immutable_tables": len(immutable_tables),
         "ledger_tables": len(ledger_tables),
         "required_update_tables": len(required_update_tables),
         "append_only_tables": len(append_only_tables),
         "mutable_control_tables": len(mutable_control_tables),
+        "chat_cleanup_tables": len(chat_cleanup_tables),
     }
 
 
@@ -475,6 +490,7 @@ def _verify_runtime_table_privileges(
     required_update_tables: tuple[str, ...],
     append_only_tables: tuple[str, ...] = (),
     mutable_control_tables: tuple[str, ...] = (),
+    chat_cleanup_tables: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     table_names = tuple(
         dict.fromkeys(
@@ -482,8 +498,9 @@ def _verify_runtime_table_privileges(
                 *immutable_tables,
                 *ledger_tables,
                 *required_update_tables,
-                *append_only_tables,
-                *mutable_control_tables,
+            *append_only_tables,
+            *mutable_control_tables,
+            *chat_cleanup_tables,
             )
         )
     )
@@ -511,6 +528,7 @@ def _verify_runtime_table_privileges(
         required_update_tables=required_update_tables,
         append_only_tables=append_only_tables,
         mutable_control_tables=mutable_control_tables,
+        chat_cleanup_tables=chat_cleanup_tables,
     )
 
 
@@ -630,7 +648,7 @@ def _verify_distillation_conversation_contract(connection: Any) -> dict[str, Any
         "has_table_privilege(current_user, 'public.distillation_conversation_turns', '" + item.upper() + "')"
         for item in _TABLE_PRIVILEGES)).one()
     for index, privilege in enumerate(_TABLE_PRIVILEGES):
-        if bool(privileges[index]) != (privilege in {"select", "insert", "update"}):
+        if bool(privileges[index]) != (privilege in {"select", "insert", "update", "delete"}):
             raise RuntimeError(f"runtime distillation conversation {privilege.upper()} privilege is incorrect")
     expected = {
         "fk_distillation_turn_project_tenant": ("f", "FOREIGN KEY (project_id, tenant_id) REFERENCES distillation_projects(id, tenant_id) ON DELETE RESTRICT"),
@@ -658,7 +676,7 @@ def _verify_distillation_conversation_contract(connection: Any) -> dict[str, Any
     predicate = "((status)::text = ANY ((ARRAY['queued'::character varying, 'running'::character varying])::text[]))"
     if index is None or not index[0] or not index[1] or index[2] != "project_id" or normalize(index[3] or "") != normalize(predicate):
         raise RuntimeError("distillation active turn exclusion index is missing or incorrect")
-    return {"privileges": "select_insert_update", "validated_constraints": len(expected), "active_turn_unique": True}
+    return {"privileges": "select_insert_update_delete", "validated_constraints": len(expected), "active_turn_unique": True}
 
 
 def main() -> int:
@@ -681,6 +699,7 @@ def main() -> int:
             required_update_tables=RUNTIME_REQUIRED_UPDATE_TABLES,
             append_only_tables=RUNTIME_APPEND_ONLY_TABLES,
             mutable_control_tables=RUNTIME_MUTABLE_CONTROL_TABLES,
+            chat_cleanup_tables=RUNTIME_CHAT_CLEANUP_TABLES,
         )
         agent_scope = _verify_agent_scope_contract(connection)
         external_scenario_scope = _verify_external_scenario_contract(connection)

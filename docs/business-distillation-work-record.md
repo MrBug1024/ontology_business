@@ -122,3 +122,25 @@ U10 影响图：已认证项目读取 → 受信内置调查工具目录 → `Re
 | S7 | 业务蒸馏和场景资料的全部场景数据，只要拥有该场景权限即可协作查看 | 不扩大到其他场景、跨租户公共投影或运行时 Agent 附件 | 同场景 `read` 可查看项目、全部对话轮次、阶段建议、发布产物、场景资料、模板和已绑定/待处理蒸馏附件；`write` 才能发送、上传、采用、发布、移除 | 场景 ACL、蒸馏附件模型/服务、资源目录、资料 API、前端场景上下文 | 租户/场景复合 FK、上传者审计与请求幂等、TTL/清理、凭据脱敏、工作区共享资料的独立权限 | PostgreSQL 协作者回归、附件跨成员绑定/读取、跨项目/租户拒绝、前端测试与构建 |
 
 临时蒸馏附件是场景协作数据，不再按上传者隔离读取；`created_by` 只用于审计和上传请求幂等。附件链接仍绑定租户、项目和轮次，场景 `read` 只读，场景 `write` 才可上传或移除。运行时 Agent/助手附件继续保持原有独立所有者边界。公共跨租户场景仍只展示显式公开资料，不暴露私有蒸馏历史或资源配置。
+
+## 场景级蒸馏产物与会话治理（2026-09-21）
+
+| 需求 ID | 原文目标 | 非目标 | 可观察验收 | 影响层/文件 | 保持不变项 | 测试证据 |
+| --- | --- | --- | --- | --- | --- | --- |
+| P1 | 场景内移除重复蒸馏工具栏；新建/查看会话、业务系统和临时附件入口集中在业务蒸馏 AI 面板 | 移除独立业务蒸馏路由的完整工作台 | 嵌入模式不再渲染 `discovery-toolbar`/左侧会话栏；AI 面板顶部提供新建、会话记录、业务系统；临时附件仅图标并保留可访问名称 | `DistillationWorkspace.vue`、`DistillationConversation.vue`、`distillation-workspace.css` | 场景 ACL、会话 CAS、附件 TTL、独立路由兼容 | 前端蒸馏测试、全量前端测试、构建 |
+| P2 | 业务蒸馏与场景资料不显示浮动智能业务顾问，其它 Tab 不变 | 移除其它建模阶段的顾问 | `App.vue` 按 `scenarioStage` 卸载 `distillation/materials` 的顾问入口，仅其它阶段挂载 | `App.vue` | 顾问上下文、权限和事件协议 | `platform-boundaries` 回归 + 真实浏览器 |
+| P3 | 7 类阶段产物绑定当前场景；会话可删除且产物保留；新会话携带场景产物上下文 | 让聊天记录自动成为正式能力或绕过人工发布 | 新增场景级 `distillation_scenario_states`；发布补 `scenario_id`；删除会话清理轮次/附件/系统授权但保留场景状态与不可变发布；新轮次冻结 `scenario_baseline`；并行会话不得覆盖陈旧场景基线 | `distillation_models.py`、migration 42、`distillation_service.py`、conversation service/worker、前端 composable/API | 人工采用、发布不可变、expected revision、租户/场景 ACL、审计 | 真实 PG 保留性/基线/并行冲突测试、迁移往返、蒸馏回归 |
+| P4 | 平台设置区分工具与技能；业务方法按需进入技能而非伪装成工具 | 直接执行外部 Skill 包或给租户任意代码权限 | 工具页只保留统一执行边界与 MCP 资料连接，技能页声明“方法包不扩大权限”；对话内仍可按轮次选择受信技能 | `ToolSettingsPanel.vue`、`SkillSettingsPanel.vue`、前端边界测试 | Provider/内核不复制行业逻辑，工具仍由服务端封闭 Schema、权限和审计 | 前端平台边界测试 |
+| P5 | 后端启动发现版本标记为 42 但实际结构半应用 | 手工绕过 Alembic 或改写已应用迁移 | 新增幂等修复 revision 43，只补缺失状态表/回填/索引/约束/触发器/最小权限；正常 42 环境升级无损 | migration 43、`database.py`、真实 PG 半应用回归 | 不删除既有项目/产物，不改写 revision 42，运行角色最小权限 | 单项真库测试、Alembic head/往返、当前库 `init_db()` |
+
+影响图：场景详情 `stage=distillation` → 嵌入工作区 → 场景级 state/publication API → 会话/轮次/附件 → worker 场景基线 → 人工采用/发布；`platform_settings=tools/skills` → 治理展示，不参与运行时授权。
+
+本地 `E:\skill` 中的 `derive-business-flow`、`discover-data-relations`、`distill-business-capability` 是完整方法/执行包，包含上游产物指纹、脚本、依赖和人工验收链。为避免把未经审计的路径、脚本或行业流程硬编码进通用内核，本轮未直接复制执行；它们应按受信内置包逐个审查、版本化、裁剪依赖并通过“方法说明可读、执行入口受限、产物契约可验收”的迁移进入 `backend/skills`。当前平台已有的 `read_selected_skill` 会读取精确受信包说明，能满足业务整理与顾问按需选择方法指导；执行型能力仍必须走统一工具/Action 门禁。
+
+### 2026-09-21 交付验证记录
+
+- `npm --prefix frontend test`：192 passed；`npm --prefix frontend run build`：通过，仅既有大 chunk 警告。
+- 真实浏览器验收：隔离 PostgreSQL + 后端 8012 + Vite 5175，登录合成工作区后检查 `/scenarios/:id?stage=distillation`；`discovery-toolbar` 数量为 0，AI 面板顶部各有 1 个“新建会话 / 会话记录 / 业务系统”，临时附件仅图标且保留可访问名称；业务蒸馏和场景资料智能顾问入口数量为 0，本体模型入口数量为 1。
+- 本机只有 Python 3.14.6，未找到 3.12.x 或 `.venv`；本轮 Python 回归是在 3.14.6 环境通过，不能替代项目声明支持版本的最终复验。`py` 启动器不存在。
+- `verify_postgresql_runtime.py` 依赖部署 MinIO/Redis 健康检查，本轮未作为完整部署检查运行；其表权限与蒸馏会话契约已由隔离迁移测试覆盖。
+- 启动修复追加：当前数据库曾出现 `alembic_version=20260921_42` 但状态表、索引、可空 `project_id` 与清理权限缺失的半应用状态。执行 revision 43 后，`init_db()` 输出 `schema check passed`。

@@ -131,7 +131,7 @@
       <div class="route-viewport">
         <router-view />
       </div>
-      <GlobalAssistant v-if="route.name === 'scenario-detail'" v-show="showGlobalAssistant" :context="assistantContext" :hide-launcher="sidebarOpen" />
+      <GlobalAssistant v-if="showGlobalAssistant" :context="assistantContext" :hide-launcher="sidebarOpen" />
     </el-main>
     <PlatformSettingsDialog v-model="platformSettingsOpen" :initial-tab="platformSettingsTab" :theme="theme" @tab-change="changePlatformSettingsTab" @toggle-theme="toggleTheme" />
   </el-container>

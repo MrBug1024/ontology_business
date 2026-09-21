@@ -37,6 +37,27 @@ class DistillationProject(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class DistillationScenarioState(Base):
+    __tablename__ = "distillation_scenario_states"
+    __table_args__ = (
+        UniqueConstraint("scenario_id", "tenant_id", name="uq_distillation_scenario_state"),
+        CheckConstraint("revision >= 1", name="ck_distillation_scenario_state_revision"),
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"], ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_distillation_scenario_state_tenant", ondelete="RESTRICT",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    scenario_id: Mapped[str] = mapped_column(String(32))
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    document: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    updated_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class DistillationPublication(Base):
     __tablename__ = "distillation_publications"
     __table_args__ = (
@@ -44,7 +65,11 @@ class DistillationPublication(Base):
         UniqueConstraint("data_source_id", name="uq_distillation_publication_source"),
         ForeignKeyConstraint(
             ["project_id", "tenant_id"], ["distillation_projects.id", "distillation_projects.tenant_id"],
-            name="fk_distillation_publication_project_tenant", ondelete="RESTRICT",
+            name="fk_distillation_publication_project_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["scenario_id", "tenant_id"], ["business_scenarios.id", "business_scenarios.tenant_id"],
+            name="fk_distillation_publication_scenario_tenant", ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
             ["data_source_id", "tenant_id"], ["data_sources.id", "data_sources.tenant_id"],
@@ -54,6 +79,7 @@ class DistillationPublication(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
     tenant_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     project_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    scenario_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     project_revision: Mapped[int] = mapped_column(Integer, nullable=False)
     data_source_id: Mapped[str] = mapped_column(String(32), nullable=False)
     document: Mapped[dict] = mapped_column(JSONB, nullable=False)

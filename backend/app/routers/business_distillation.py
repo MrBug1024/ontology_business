@@ -1,6 +1,7 @@
 """Browser-authenticated business discovery and modeling-material handoff."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from sqlalchemy import exists, or_, select
@@ -11,7 +12,7 @@ from ..distillation_resource_schemas import InvestigationResourceCatalogOut
 from ..models import AuthorizationGrant
 from ..distillation_schemas import (
     AnalysisOut, AnalyzeRequest, ArtifactOut, DistillationDocument, ProjectCreate,
-    ProjectOut, ProjectUpdate, PublicationOut, RevisionRequest,
+    ProjectOut, ProjectUpdate, PublicationOut, RevisionRequest, ScenarioStateOut,
 )
 from ..services import distillation_analysis_service, distillation_service, permission_service
 from ..services import distillation_resource_service
@@ -39,9 +40,43 @@ def _project_out(db: Session, row: DistillationProject) -> ProjectOut:
 
 
 def _publication_out(row: DistillationPublication) -> PublicationOut:
-    return PublicationOut(id=row.id, project_id=row.project_id, project_revision=row.project_revision,
-        data_source_id=row.data_source_id, created_at=row.created_at,
+    return PublicationOut(id=row.id, project_id=row.project_id, scenario_id=row.scenario_id,
+        project_revision=row.project_revision, data_source_id=row.data_source_id, created_at=row.created_at,
         artifacts=[ArtifactOut(**{key: item[key] for key in ("key", "filename", "mime", "sha256")}) for item in row.artifacts])
+
+
+@router.get("/scenario/{scenario_id}/state", response_model=ScenarioStateOut)
+def get_scenario_state(scenario_id: str, db: Session = Depends(get_tenant_db)):
+    row = distillation_service.scenario_state(db, scenario_id, write=False, create=False)
+    if row is None:
+        return ScenarioStateOut(scenario_id=scenario_id, revision=1,
+            document=DistillationDocument(), updated_at=datetime.now(timezone.utc))
+    return ScenarioStateOut(scenario_id=row.scenario_id, revision=row.revision,
+        document=DistillationDocument.model_validate(row.document), updated_at=row.updated_at)
+
+
+@router.get("/scenario/{scenario_id}/publications", response_model=list[PublicationOut])
+def list_scenario_publications(scenario_id: str, limit: int = Query(50, ge=1, le=100),
+                               offset: int = Query(0, ge=0, le=100_000), db: Session = Depends(get_tenant_db)):
+    return [_publication_out(row) for row in distillation_service.list_scenario_publications(
+        db, scenario_id, limit=limit, offset=offset,
+    )]
+
+
+@router.get("/scenario/{scenario_id}/publications/{publication_id}", response_model=PublicationOut)
+def get_scenario_publication(scenario_id: str, publication_id: str, db: Session = Depends(get_tenant_db)):
+    return _publication_out(distillation_service.scenario_publication(db, scenario_id, publication_id))
+
+
+@router.get("/scenario/{scenario_id}/publications/{publication_id}/artifacts/{artifact_key}")
+def download_scenario_artifact(scenario_id: str, publication_id: str, artifact_key: str,
+                               db: Session = Depends(get_tenant_db)):
+    publication = distillation_service.scenario_publication(db, scenario_id, publication_id)
+    artifact = distillation_service.artifact_content(publication, artifact_key)
+    return Response(content=artifact["content"], media_type=artifact["mime"], headers={
+        "Content-Disposition": f'attachment; filename="{artifact["filename"]}"',
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-store",
+    })
 
 
 @router.get("", response_model=list[ProjectOut])
@@ -100,6 +135,13 @@ def update_project(project_id: str, payload: ProjectUpdate, db: Session = Depend
     row = distillation_service.update_project(db, project_id, payload)
     db.commit()
     return _project_out(db, row)
+
+
+@router.delete("/{project_id}", status_code=204)
+def delete_project(project_id: str, db: Session = Depends(get_tenant_db)):
+    distillation_service.delete_project(db, project_id)
+    db.commit()
+    return Response(status_code=204)
 
 
 @router.post("/{project_id}/analyze", response_model=AnalysisOut)

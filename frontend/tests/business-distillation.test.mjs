@@ -43,6 +43,8 @@ function deferred() {
 function row(id, revision = 1) { return { id, revision, name: id, scenario_id: null, document: emptyDistillationDocument(), can_write: true } }
 const fakeApi = {
   list: async () => [], scenarios: async () => [], materials: async () => ({ items: [], has_more: false, next_offset: null }), publications: async () => [],
+  scenarioState: async scenarioId => ({ scenario_id: scenarioId, revision: 1, document: emptyDistillationDocument(), updated_at: '2026-09-21T00:00:00Z' }),
+  scenarioPublications: async () => [],
   get: async id => row(id), update: async (id, revision, draft) => ({ ...row(id, revision + 1), ...draft }),
 }
 globalThis.__distillationTestApi = fakeApi

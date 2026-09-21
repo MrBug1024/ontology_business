@@ -7,8 +7,8 @@ from typing import Any
 def verify_attachment_contract(connection: Any) -> dict[str, Any]:
     privileges = ("select", "insert", "update", "delete", "truncate", "references", "trigger")
     for table, allowed in (
-        ("distillation_attachments", {"select", "insert", "update"}),
-        ("distillation_turn_attachments", {"select", "insert"}),
+        ("distillation_attachments", {"select", "insert", "update", "delete"}),
+        ("distillation_turn_attachments", {"select", "insert", "delete"}),
     ):
         values = connection.exec_driver_sql("SELECT " + ", ".join(
             "has_table_privilege(current_user, %s, '" + item.upper() + "')" for item in privileges),
@@ -74,14 +74,14 @@ def verify_attachment_contract(connection: Any) -> dict[str, Any]:
         row = by_name.get(name)
         if row is None or not row[1] or columns not in str(row[2]):
             raise RuntimeError(f"temporary-input cleanup index {name} is missing or incorrect")
-    return {"ownership_constraints": len(expected), "retention_checks": len(checks), "links": "append_only"}
+    return {"ownership_constraints": len(expected), "retention_checks": len(checks), "links": "chat_scoped"}
 
 
 def verify_discovery_contract(connection: Any) -> dict[str, Any]:
     for table in ("distillation_system_access",):
         for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
             actual = connection.exec_driver_sql("SELECT has_table_privilege(current_user, %s, %s)", (table, privilege)).scalar_one()
-            if bool(actual) != (privilege in {"SELECT", "INSERT"}):
+            if bool(actual) != (privilege in {"SELECT", "INSERT", "DELETE"}):
                 raise RuntimeError(f"discovery privileges are incorrect for {table}")
     rows = connection.exec_driver_sql("""SELECT column_name, privilege_type FROM information_schema.column_privileges
         WHERE table_schema='public' AND table_name='distillation_system_access' AND grantee=current_user

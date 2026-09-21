@@ -30,6 +30,15 @@
 .distillation-stage.discovery-canvas { height: 100%; border-left: 0; }
 .distillation-advisor-panel { display: flex; min-width: 0; min-height: 0; border-left: 1px solid var(--border); background: var(--surface); }
 .distillation-advisor-panel > .discovery-conversation { min-height: 0; }
+.discovery-conversation-toolbar { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.discovery-conversation-toolbar > div:first-child { display: grid; min-width: 0; gap: 2px; }
+.discovery-conversation-toolbar strong { color: var(--text); font-size: 13px; }
+.discovery-conversation-toolbar small { color: var(--text-2); font-size: 11px; }
+.discovery-conversation-toolbar .el-button { min-height: 36px; margin-left: 0; }
+.discovery-project-list.is-drawer article { display: flex; align-items: center; gap: 6px; }
+.discovery-project-list.is-drawer article > button { flex: 1; min-width: 0; }
+.discovery-project-list.is-drawer article.is-active > button { color: var(--primary); }
+.discovery-conversation-delete-note { margin: 14px 0 0; color: var(--text-2); font-size: 12px; line-height: 1.6; }
 .discovery-attachments { max-height: 190px; overflow-y: auto; margin-bottom: 8px; }
 .discovery-attachment { display: flex; align-items: center; gap: 10px; padding: 10px 12px; margin: 6px 0; border: 1px solid var(--border); background: var(--surface-2); border-radius: 8px; }
 .discovery-attachment > div { flex: 1; min-width: 0; }

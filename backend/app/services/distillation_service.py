@@ -7,10 +7,14 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from ..distillation_models import DistillationProject, DistillationPublication
+from ..distillation_models import (
+    DistillationProject,
+    DistillationPublication,
+    DistillationScenarioState,
+)
 from ..distillation_schemas import DistillationDocument, ProjectCreate, ProjectUpdate
 from ..models import BucketFile, BusinessScenario, DataSource
 from . import permission_service, release_service
@@ -57,6 +61,31 @@ def can_write(db: Session, row: DistillationProject) -> bool:
         return True
     except HTTPException:
         return False
+
+
+def scenario_state(
+    db: Session, scenario_id: str, *, write: bool = False, lock: bool = False, create: bool = True,
+) -> DistillationScenarioState | None:
+    principal = permission_service.require_principal(db)
+    authorize_scope(db, scenario_id, write=write)
+    query = select(DistillationScenarioState).where(
+        DistillationScenarioState.scenario_id == scenario_id,
+        DistillationScenarioState.tenant_id == principal.tenant_id,
+    )
+    if lock:
+        query = query.with_for_update()
+    row = db.scalar(query)
+    if row is None and write and create:
+        row = DistillationScenarioState(
+            tenant_id=principal.tenant_id,
+            scenario_id=scenario_id,
+            document=DistillationDocument().model_dump(),
+            created_by=principal.user_id,
+            updated_by=principal.user_id,
+        )
+        db.add(row)
+        db.flush()
+    return row
 
 
 def evidence_source(db: Session, source_id: str, scenario_id: str | None) -> DataSource:
@@ -107,11 +136,26 @@ def validate_document(db: Session, document: DistillationDocument, scenario_id: 
 def create_project(db: Session, payload: ProjectCreate) -> DistillationProject:
     principal = permission_service.require_principal(db)
     authorize_scope(db, payload.scenario_id, write=True)
-    validate_document(db, payload.document, payload.scenario_id)
+    document = payload.document
+    if payload.scenario_id:
+        state = scenario_state(db, payload.scenario_id, write=True, lock=True, create=False)
+        if state is None:
+            state = DistillationScenarioState(
+                tenant_id=principal.tenant_id,
+                scenario_id=payload.scenario_id,
+                document=payload.document.model_dump(),
+                created_by=principal.user_id,
+                updated_by=principal.user_id,
+            )
+            db.add(state)
+            db.flush()
+        else:
+            document = DistillationDocument.model_validate(state.document)
+    validate_document(db, document, payload.scenario_id)
     if release_service.safe_snapshot_content({"name": payload.name}) != {"name": payload.name}:
         raise HTTPException(422, "项目名称不能包含凭据")
     row = DistillationProject(tenant_id=principal.tenant_id, scenario_id=payload.scenario_id,
-        name=payload.name, document=payload.document.model_dump(), created_by=principal.user_id,
+        name=payload.name, document=document.model_dump(), created_by=principal.user_id,
         updated_by=principal.user_id)
     db.add(row)
     db.flush()
@@ -122,6 +166,7 @@ def update_project(db: Session, project_id: str, payload: ProjectUpdate) -> Dist
     from ..distillation_conversation_models import DistillationConversationTurn
     from ..distillation_attachment_models import DistillationAttachment
 
+    principal = permission_service.require_principal(db)
     row = project(db, project_id, write=True, lock=True)
     assert_revision(row, payload.expected_revision)
     authorize_scope(db, payload.scenario_id, write=True)
@@ -131,6 +176,21 @@ def update_project(db: Session, project_id: str, payload: ProjectUpdate) -> Dist
         attached = db.scalar(select(DistillationAttachment.id).where(DistillationAttachment.project_id == row.id).limit(1))
         if published or investigated or attached:
             raise HTTPException(409, "已有附件、调查历史或交接记录的项目不能改变场景归属，请创建新项目")
+    scenario_state_row = None
+    if payload.scenario_id:
+        scenario_state_row = scenario_state(db, payload.scenario_id, write=True, lock=True, create=False)
+        if scenario_state_row is None:
+            scenario_state_row = DistillationScenarioState(
+                tenant_id=principal.tenant_id,
+                scenario_id=payload.scenario_id,
+                document=payload.document.model_dump(),
+                created_by=principal.user_id,
+                updated_by=principal.user_id,
+            )
+            db.add(scenario_state_row)
+            db.flush()
+        elif scenario_state_row.document != row.document:
+            raise HTTPException(409, "场景业务蒸馏基线已变化，请刷新会话后合并")
     validate_document(db, payload.document, payload.scenario_id)
     if release_service.safe_snapshot_content({"name": payload.name}) != {"name": payload.name}:
         raise HTTPException(422, "项目名称不能包含凭据")
@@ -142,6 +202,12 @@ def update_project(db: Session, project_id: str, payload: ProjectUpdate) -> Dist
              updated_by=permission_service.require_principal(db).user_id).execution_options(synchronize_session=False))
     if result.rowcount != 1:
         raise HTTPException(409, "项目已被更新，请保留当前草稿并刷新后合并")
+    if scenario_state_row is not None:
+        scenario_state_row.document = payload.document.model_dump()
+        scenario_state_row.revision += 1
+        scenario_state_row.updated_at = datetime.now(timezone.utc)
+        scenario_state_row.updated_by = permission_service.require_principal(db).user_id
+        db.flush()
     return project(db, project_id, write=True)
 
 
@@ -176,12 +242,73 @@ def publish(db: Session, project_id: str, expected_revision: int) -> Distillatio
     artifacts.append({"key": "provenance", "filename": "evidence-provenance.json", "mime": "application/json",
                       "content": provenance, "sha256": hashlib.sha256(provenance.encode("utf-8")).hexdigest()})
     publication = DistillationPublication(id=publication_id, tenant_id=row.tenant_id,
-        project_id=row.id, project_revision=row.revision, data_source_id=source_id,
+        project_id=row.id, scenario_id=row.scenario_id, project_revision=row.revision, data_source_id=source_id,
         document=document.model_dump(), artifacts=artifacts,
         created_by=permission_service.require_principal(db).user_id)
     db.add(publication)
     db.flush()
     return publication
+
+
+def list_scenario_publications(
+    db: Session, scenario_id: str, *, limit: int = 50, offset: int = 0,
+) -> list[DistillationPublication]:
+    principal = permission_service.require_principal(db)
+    authorize_scope(db, scenario_id)
+    return list(db.scalars(select(DistillationPublication).where(
+        DistillationPublication.tenant_id == principal.tenant_id,
+        DistillationPublication.scenario_id == scenario_id,
+    ).order_by(DistillationPublication.created_at.desc(), DistillationPublication.id.desc()).offset(offset).limit(limit)))
+
+
+def scenario_publication(
+    db: Session, scenario_id: str, publication_id: str, *, write: bool = False,
+) -> DistillationPublication:
+    principal = permission_service.require_principal(db)
+    authorize_scope(db, scenario_id, write=write)
+    row = db.scalar(select(DistillationPublication).where(
+        DistillationPublication.id == publication_id,
+        DistillationPublication.tenant_id == principal.tenant_id,
+        DistillationPublication.scenario_id == scenario_id,
+    ))
+    if row is None:
+        raise HTTPException(404, "业务蒸馏产物不存在")
+    return row
+
+
+def delete_project(db: Session, project_id: str) -> None:
+    from ..distillation_access_models import DistillationSystemAccess
+    from ..distillation_attachment_models import DistillationAttachment, DistillationTurnAttachment
+    from ..distillation_conversation_models import DistillationConversationTurn
+
+    row = project(db, project_id, write=True, lock=True)
+    if db.scalar(select(DistillationConversationTurn.id).where(
+        DistillationConversationTurn.project_id == row.id,
+        DistillationConversationTurn.status.in_(("queued", "running")),
+    ).limit(1)):
+        raise HTTPException(409, "会话调查仍在进行，完成或取消后再删除")
+    db.execute(update(DistillationPublication).where(
+        DistillationPublication.project_id == row.id,
+        DistillationPublication.tenant_id == row.tenant_id,
+    ).values(project_id=None))
+    db.execute(DistillationTurnAttachment.__table__.delete().where(
+        DistillationTurnAttachment.project_id == row.id,
+        DistillationTurnAttachment.tenant_id == row.tenant_id,
+    ))
+    db.execute(DistillationConversationTurn.__table__.delete().where(
+        DistillationConversationTurn.project_id == row.id,
+        DistillationConversationTurn.tenant_id == row.tenant_id,
+    ))
+    db.execute(DistillationAttachment.__table__.delete().where(
+        DistillationAttachment.project_id == row.id,
+        DistillationAttachment.tenant_id == row.tenant_id,
+    ))
+    db.execute(DistillationSystemAccess.__table__.delete().where(
+        DistillationSystemAccess.project_id == row.id,
+        DistillationSystemAccess.tenant_id == row.tenant_id,
+    ))
+    db.delete(row)
+    db.flush()
 
 
 def artifact_content(publication: DistillationPublication, artifact_key: str) -> dict[str, str]:
@@ -197,14 +324,19 @@ def modeling_documents(db: Session, scenario_id: str) -> list[dict]:
     """Only explicitly scenario-bound handoffs are injected into its advisor."""
     principal = permission_service.require_principal(db)
     authorize_scope(db, scenario_id)
+    publication_group = func.coalesce(
+        DistillationPublication.project_id,
+        DataSource.config["distillation_project_id"].as_string(),
+    )
     query = select(DistillationPublication, DataSource).join(DataSource,
         DataSource.id == DistillationPublication.data_source_id).where(
         DistillationPublication.tenant_id == principal.tenant_id,
         DataSource.tenant_id == principal.tenant_id, DataSource.resource_scope == "modeling",
         DataSource.type == "distillation",
         DataSource.scenario_id == scenario_id,
-    ).distinct(DistillationPublication.project_id).order_by(
-        DistillationPublication.project_id, DistillationPublication.project_revision.desc()).limit(21)
+    ).distinct(publication_group).order_by(
+        publication_group, DistillationPublication.project_revision.desc(),
+        DistillationPublication.created_at.desc(), DistillationPublication.id.desc()).limit(21)
     rows = db.execute(query).all()
     if len(rows) > 20:
         raise HTTPException(422, "业务蒸馏交接资料超过单次 20 个项目，请缩小场景资料范围")

@@ -112,11 +112,18 @@ export interface DistillationProject extends DistillationDraft {
   updated_at: string
   can_write: boolean
 }
+export interface DistillationScenarioState {
+  scenario_id: string
+  revision: number
+  document: DistillationDocument
+  updated_at: string
+}
 export interface DistillationProposal { base_revision: number; document: DistillationDocument; limitations: string[] }
 export interface DistillationArtifact { key: string; filename: string; mime: string; sha256: string }
 export interface DistillationPublication {
   id: string
-  project_id: string
+  project_id: string | null
+  scenario_id: string | null
   project_revision: number
   data_source_id: string
   created_at: string

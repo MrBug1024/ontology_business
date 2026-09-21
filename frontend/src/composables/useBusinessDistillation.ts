@@ -2,12 +2,13 @@ import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { businessDistillationApi as api } from '@/api/businessDistillation'
 import { draftOf } from '@/utils/businessDistillation'
 import type { DataSource, Scenario } from '@/types'
-import type { DistillationArtifact, DistillationProject, DistillationProposal, DistillationPublication } from '@/types/businessDistillation'
+import type { DistillationArtifact, DistillationProject, DistillationProposal, DistillationPublication, DistillationScenarioState } from '@/types/businessDistillation'
 
 export function useBusinessDistillation(projectId: Ref<string>, historyScope: Ref<string> = ref(''), lockScope = false) {
   const projects = ref<DistillationProject[]>([])
   const project = ref<DistillationProject | null>(null)
   const draft = ref(draftOf())
+  const baseline = ref(draftOf())
   const scenarios = ref<Scenario[]>([])
   const materials = ref<DataSource[]>([])
   const publications = ref<DistillationPublication[]>([])
@@ -23,7 +24,7 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
   const materialLoading = ref(false)
   const hasMore = computed(() => projects.value.length === 50)
   function emptyDraft() { const value = draftOf(); value.scenario_id = historyScope.value && historyScope.value !== 'shared' ? historyScope.value : null; return value }
-  const dirty = computed(() => JSON.stringify(draft.value) !== JSON.stringify(project.value ? draftOf(project.value) : emptyDraft()))
+  const dirty = computed(() => JSON.stringify(draft.value) !== JSON.stringify(project.value ? draftOf(project.value) : baseline.value))
   let generation = 0
   let disposed = false
   let loadController: AbortController | undefined
@@ -72,18 +73,41 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
     project.value = null
     publications.value = []
     draft.value = emptyDraft()
-    if (!projectId.value) { loading.value = false; return }
+    baseline.value = draftOf()
+    const scenarioId = historyScope.value && historyScope.value !== 'shared' ? historyScope.value : ''
+    if (!projectId.value) {
+      if (!scenarioId) { loading.value = false; return }
+      loading.value = true
+      try {
+        const [state, versions] = await Promise.all([
+          api.scenarioState(scenarioId, controller.signal),
+          api.scenarioPublications(scenarioId, controller.signal),
+        ])
+        if (disposed || current !== generation) return
+        draft.value = { name: '', scenario_id: scenarioId, document: state.document }
+        baseline.value = draftOf({ id: '', name: '', scenario_id: scenarioId, revision: state.revision,
+          document: state.document, created_at: state.updated_at, updated_at: state.updated_at, can_write: true })
+        publications.value = versions
+      } catch (caught: unknown) {
+        if (!disposed && current === generation && !controller.signal.aborted) error.value = errorMessage(caught)
+      } finally {
+        if (!disposed && current === generation) loading.value = false
+      }
+      return
+    }
     loading.value = true
     try {
-      const [row, versions] = await Promise.all([
-        api.get(projectId.value, controller.signal), api.publications(projectId.value, controller.signal),
-      ])
+      const row = await api.get(projectId.value, controller.signal)
+      const versions = row.scenario_id
+        ? await api.scenarioPublications(row.scenario_id, controller.signal)
+        : await api.publications(row.id, controller.signal)
       if (disposed || current !== generation) return
       if (lockScope && (!historyScope.value || historyScope.value === 'shared' || row.scenario_id !== historyScope.value)) {
         throw new Error('该蒸馏会话不属于当前业务场景')
       }
       project.value = row
       draft.value = draftOf(row)
+      baseline.value = draftOf(row)
       publications.value = versions
     } catch (caught: unknown) {
       if (!disposed && current === generation && !controller.signal.aborted) error.value = errorMessage(caught)
@@ -169,7 +193,9 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
   }
 
   async function download(publication: DistillationPublication, artifact: DistillationArtifact) {
-    const result = await run('download', signal => api.artifact(publication.project_id, publication.id, artifact.key, signal))
+    const result = await run('download', signal => publication.project_id
+      ? api.artifact(publication.project_id, publication.id, artifact.key, signal)
+      : api.scenarioArtifact(publication.scenario_id || historyScope.value, publication.id, artifact.key, signal))
     if (!result) return
     const url = URL.createObjectURL(result)
     const link = document.createElement('a')
@@ -184,6 +210,12 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
     actionController?.abort()
     busy.value = ''
     notice.value = '已停止等待分析结果，当前草稿已保留。'
+  }
+
+  async function remove(projectId: string) {
+    const result = await run('delete', signal => api.remove(projectId, signal))
+    if (result !== null) void list()
+    return result !== null
   }
 
   async function refreshOptions() {
@@ -226,7 +258,7 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
     materials.value = []
     materialHasMore.value = false
     offset.value = 0
-    if (!projectId.value) draft.value = emptyDraft()
+    if (!projectId.value) { draft.value = emptyDraft(); void load() }
     if (materialOffset.value) materialOffset.value = 0
     else void refreshOptions()
     void list()
@@ -242,6 +274,6 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
   })
   return { projects, project, draft, scenarios, materials, publications, proposal, error, notice, loading, listing,
     busy, offset, hasMore, dirty, materialOffset, materialHasMore, materialLoading, materialPageSize,
-    list, load, save, analyze, applyProposal, publish, download, cancelAnalysis, refreshOptions,
+    list, load, save, analyze, applyProposal, publish, download, cancelAnalysis, refreshOptions, remove,
     previousMaterialPage, nextMaterialPage, copyToScenario }
 }

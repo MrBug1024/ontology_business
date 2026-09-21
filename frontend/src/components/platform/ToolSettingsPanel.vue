@@ -3,7 +3,7 @@
     <header class="tools-heading">
       <div>
         <h2 id="tool-settings-title">工具</h2>
-        <p>各类 AI 的工具按职责提供。这里展示业务蒸馏可用的调查工具和资料连接，在该对话的设置中选择。</p>
+        <p>工具是平台统一执行的小颗粒能力：读取授权资料、访问受管系统或输出结构化结果。工具不承载业务方法，也不会因某个场景改写规则。</p>
       </div>
       <el-button plain @click="emit('configure-mcp')">配置 MCP</el-button>
     </header>
@@ -12,18 +12,12 @@
     </el-alert>
     <el-skeleton v-else-if="loading" :rows="5" animated />
     <template v-else-if="resources">
-      <section class="tool-group" aria-labelledby="investigation-tools-title">
-        <h3 id="investigation-tools-title">业务蒸馏 · 内置调查工具</h3>
-        <el-empty v-if="!resources.investigation_tools.tools.length" description="当前没有可用调查工具" :image-size="64" />
-        <dl v-else class="tool-list">
-          <div v-for="tool in resources.investigation_tools.tools" :key="tool.key">
-            <dt>{{ tool.title }}</dt>
-            <dd>{{ tool.description }}</dd>
-            <el-tag size="small" :type="tool.always_available ? 'success' : 'info'" effect="plain">
-              {{ tool.always_available ? '始终可用' : '按对话选择' }}
-            </el-tag>
-          </div>
-        </dl>
+      <section class="tool-group" aria-labelledby="tool-skill-boundary-title">
+        <h3 id="tool-skill-boundary-title">工具 / 技能边界</h3>
+        <div class="boundary-grid">
+          <article><strong>工具</strong><p>由平台内核注册、校验参数并执行；每次调用有权限、租户、输入边界和审计。</p></article>
+          <article><strong>技能</strong><p>受信方法包，只提供调查步骤、验收标准和提示词指导；按对话显式选择，不能扩大工具权限。</p></article>
+        </div>
       </section>
       <section class="tool-group" aria-labelledby="mcp-resource-title">
         <h3 id="mcp-resource-title">业务蒸馏 · MCP 资料连接</h3>
@@ -80,6 +74,10 @@ onBeforeUnmount(() => { controller?.abort(); controller = null })
 .tools-heading p, .group-description { margin: 0; color: var(--text-2); font-size: 13px; line-height: 1.6; }
 .tool-group + .tool-group { margin-top: 28px; }
 .tool-group h3 { margin: 0 0 12px; color: var(--text); font-size: 15px; }
+.boundary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.boundary-grid article { padding: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.boundary-grid strong { display: block; margin-bottom: 6px; color: var(--text); font-size: 13px; }
+.boundary-grid p { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.6; }
 .tool-list { margin: 0; }
 .tool-list > div { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(0, 3fr) auto; align-items: start; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--border); }
 .tool-list dt { overflow-wrap: anywhere; color: var(--text); font-size: 13px; }
@@ -90,6 +88,7 @@ onBeforeUnmount(() => { controller?.abort(); controller = null })
 .connector-entry span { color: var(--text-3); font-size: 12px; }
 @media (max-width: 720px) {
   .tools-settings { padding: 18px 14px 24px; }
+  .boundary-grid { grid-template-columns: 1fr; }
   .tools-heading { flex-direction: column; }
   .tool-list > div { grid-template-columns: 1fr; gap: 6px; }
   .tool-list .el-tag { justify-self: start; }

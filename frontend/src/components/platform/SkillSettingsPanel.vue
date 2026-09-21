@@ -3,7 +3,7 @@
     <div class="page-header">
       <div>
         <h2>技能</h2>
-        <div class="sub">管理已安装的受信技能，各类 AI 可按自己的职责选择使用。</div>
+        <div class="sub">管理受信方法包。技能提供调查步骤、验收标准和执行边界；实际读取、写入或外部调用仍必须经过平台工具的统一权限与审计。</div>
       </div>
       <el-button v-if="canManage" @click="rescan"><el-icon><Refresh /></el-icon> 刷新技能列表</el-button>
     </div>

@@ -1,6 +1,6 @@
 <template>
-  <div class="discovery-workspace distillation-studio" :class="{ 'with-projects': projectsOpen, 'is-embedded': embedded }">
-    <aside class="discovery-sidebar" aria-label="蒸馏会话">
+  <div class="discovery-workspace distillation-studio" :class="{ 'with-projects': projectsOpen && !embedded, 'is-embedded': embedded }">
+    <aside v-if="!embedded" class="discovery-sidebar" aria-label="蒸馏会话">
       <div class="discovery-sidebar-heading">
         <strong>{{ embedded ? '蒸馏会话' : '业务蒸馏' }}</strong>
         <el-button text circle aria-label="收起会话列表" @click="projectsOpen = false"><el-icon><Close /></el-icon></el-button>
@@ -24,7 +24,7 @@
     </aside>
 
     <section class="discovery-main" aria-label="业务蒸馏工作区">
-      <header class="discovery-toolbar">
+      <header v-if="!embedded" class="discovery-toolbar">
         <div class="discovery-toolbar-title">
           <el-button text circle :aria-expanded="projectsOpen" aria-label="打开会话列表" @click="projectsOpen = !projectsOpen"><el-icon><Menu /></el-icon></el-button>
           <template v-if="!embedded">
@@ -38,7 +38,6 @@
           <small v-if="project && !project.can_write">只读</small>
         </div>
         <div class="distill-actions">
-          <el-button :disabled="(!canEdit && !project) || actionBusy || !!active || loading" @click="openSystems">业务系统</el-button>
           <el-button :disabled="(!canEdit && !project) || actionBusy || !!active || loading" @click="openSources">引用资料</el-button>
           <el-button v-if="publications.length" text @click="openLatestPublication">查看产物</el-button>
           <el-button v-if="!embedded && project?.scenario_id && publications.length" text type="primary" @click="buildScenario">进入场景</el-button>
@@ -58,15 +57,35 @@
         <button type="button" :aria-pressed="mobilePane === 'conversation'" @click="mobilePane = 'conversation'">业务蒸馏 AI</button>
       </div>
       <div v-if="!projectId || project || loading" class="distillation-studio-body" :class="`is-${mobilePane}`">
-        <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="canEdit && !loading && !actionBusy" :can-publish="!!project && canEdit && !dirty && !actionBusy && !active && !artifactProposal" @ask="discussFinding" @publish="confirmPublish" @updated="acceptProjectUpdate" />
+        <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="!!project && canEdit && !loading && !actionBusy" :can-publish="!!project && canEdit && !dirty && !actionBusy && !active && !artifactProposal" @ask="discussFinding" @publish="confirmPublish" @updated="acceptProjectUpdate" />
         <aside class="distillation-advisor-panel" aria-label="业务蒸馏顾问对话">
-        <DistillationConversation v-model="input" :scope-key="draftKey" :scenario-id="props.scenarioId" :turns="turns" :loading="loading || conversationLoading" :has-more="conversationHasMore" :working="!!active" :sending="sending || busy === 'save'" :cancelling="cancelling" :applying="applying" :disabled="!canEdit || loading || actionBusy" :can-apply="canEdit && !dirty && !actionBusy" :error="conversationError" :blocked-reason="blockedReason" :upload-busy="attachmentBusy" :removing-attachment="removingAttachment" :compact="embedded" @send="sendMessage" @cancel="cancel" @reload="reconnectConversation" @older="loadConversation(true)" @sources="openSources" @files="addAttachments" @remove-submitted="removeSubmittedAttachment" @preview="previewTurn = $event" @apply="applyTurn">
+        <DistillationConversation v-model="input" :scope-key="draftKey" :scenario-id="props.scenarioId" :turns="turns" :loading="loading || conversationLoading" :has-more="conversationHasMore" :working="!!active" :sending="sending || busy === 'save'" :cancelling="cancelling" :applying="applying" :disabled="!canEdit || loading || actionBusy" :can-apply="canEdit && !dirty && !actionBusy" :error="conversationError" :blocked-reason="blockedReason" :upload-busy="attachmentBusy" :removing-attachment="removingAttachment" :compact="embedded" :workspace-actions="embedded" @send="sendMessage" @cancel="cancel" @reload="reconnectConversation" @older="loadConversation(true)" @sources="openSources" @files="addAttachments" @remove-submitted="removeSubmittedAttachment" @preview="previewTurn = $event" @apply="applyTurn" @new="newConversation" @history="projectsOpen = true" @systems="openSystems">
             <template #attachments><DistillationAttachments :items="attachments" :error="attachmentError" :disabled="!canEdit || !!active || sending" @retry="retryAttachment" @remove="removeAttachment" @reload="loadAttachments" /></template>
           </DistillationConversation>
         </aside>
       </div>
     </section>
-    <button v-if="projectsOpen" class="discovery-sidebar-scrim" type="button" aria-label="关闭会话列表" @click="projectsOpen = false" />
+    <button v-if="projectsOpen && !embedded" class="discovery-sidebar-scrim" type="button" aria-label="关闭会话列表" @click="projectsOpen = false" />
+
+    <el-drawer v-if="embedded" v-model="projectsOpen" title="会话记录" size="min(420px, 96vw)" append-to-body>
+      <div class="discovery-project-list is-drawer">
+        <article v-for="row in projects" :key="row.id" :class="{ 'is-active': row.id === projectId }">
+          <button type="button" :aria-current="row.id === projectId ? 'page' : undefined" @click="openProject(row.id)">
+            <span>{{ row.name }}</span><small>{{ DECISION_LABELS[row.document.decision] }}</small>
+          </button>
+          <el-button text circle :disabled="actionBusy || !props.canWrite" :aria-label="`删除会话 ${row.name}`" title="删除会话" @click="deleteProject(row)"><el-icon><Delete /></el-icon></el-button>
+        </article>
+        <p v-if="!projects.length && !listing" class="discovery-muted">暂无会话</p>
+      </div>
+      <div v-if="hasMore || offset" class="discovery-project-pages">
+        <el-button text :disabled="!offset || listing" @click="offset -= 50">上一页</el-button>
+        <el-button text :disabled="!hasMore || listing" @click="offset += 50">下一页</el-button>
+      </div>
+      <p class="discovery-conversation-delete-note">删除会话只清理对话与临时输入；已保存的场景阶段结论和发布产物保留。</p>
+      <template #footer>
+        <el-button type="primary" :disabled="!canCreate" @click="newConversation">新建会话</el-button>
+      </template>
+    </el-drawer>
 
     <el-drawer v-model="systemsOpen" title="业务系统" size="min(540px, 96vw)"><DistillationSystemAccess v-if="systemsOpen && project" :key="project.id" :project="project" :can-edit="canEdit && !actionBusy && !active" :dirty="dirty" @updated="acceptProjectUpdate" /></el-drawer>
     <DistillationPublishDecisionDialog v-model="publishDialog" :document="draft.document" :busy="actionBusy" :error="error" @confirm="publishDecision" />
@@ -100,7 +119,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter, type LocationQueryRaw } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
-import { Close, Menu, Plus, Refresh } from '@element-plus/icons-vue'
+import { Close, Delete, Menu, Plus, Refresh } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
 import { useBusinessDistillation } from '@/composables/useBusinessDistillation'
 import { useDistillationConversation } from '@/composables/useDistillationConversation'
@@ -133,7 +152,7 @@ const draftKey = computed(() => projectId.value || `new:${historyScope.value}`)
 const {
   projects, project, draft, scenarios, materials, publications, error, notice, loading, listing, busy,
   offset, hasMore, dirty, materialOffset, materialHasMore, materialLoading, materialPageSize,
-  list, load, save, publish, refreshOptions, previousMaterialPage, nextMaterialPage, copyToScenario,
+  list, load, save, publish, refreshOptions, previousMaterialPage, nextMaterialPage, copyToScenario, remove,
 } = useBusinessDistillation(projectId, historyScope, props.embedded)
 const authorizedProjectId = computed(() => {
   const row = project.value
@@ -191,6 +210,21 @@ async function showUnscopedProjects() {
 async function openProject(id: string) {
   if (id === projectId.value || !await allowLeave()) return
   await changeWorkspace(props.embedded ? scenarioLocation(props.scenarioId, id) : legacyLocation(id))
+}
+
+async function deleteProject(row: DistillationProject) {
+  if (actionBusy.value || !props.canWrite) return
+  try {
+    await ElMessageBox.confirm(
+      `删除会话“${row.name}”？对话记录和临时附件会清理；场景阶段结论与已发布产物保留。`,
+      '删除会话',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch { return }
+  if (await remove(row.id)) {
+    if (row.id === projectId.value) await changeWorkspace(scenarioLocation(props.scenarioId), true)
+    else void list()
+  }
 }
 function openSources() {
   if ((!canEdit.value && !project.value) || actionBusy.value || active.value || loading.value) return

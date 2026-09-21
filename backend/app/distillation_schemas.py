@@ -227,6 +227,13 @@ class ProjectOut(ProjectCreate):
     can_write: bool
 
 
+class ScenarioStateOut(ClosedModel):
+    scenario_id: ResourceId
+    revision: int
+    document: DistillationDocument
+    updated_at: datetime
+
+
 class AnalysisOut(ClosedModel):
     base_revision: int
     document: DistillationDocument
@@ -242,7 +249,8 @@ class ArtifactOut(ClosedModel):
 
 class PublicationOut(ClosedModel):
     id: str
-    project_id: str
+    project_id: str | None
+    scenario_id: str | None
     project_revision: int
     data_source_id: str
     created_at: datetime
