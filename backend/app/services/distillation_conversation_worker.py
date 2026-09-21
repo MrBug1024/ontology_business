@@ -5,6 +5,7 @@ import json
 import logging
 import traceback
 import uuid
+import time
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -28,10 +29,16 @@ MAX_PROMPT_CHARS = 350_000
 MAX_CHECKPOINT_BYTES = 1_000_000
 MAX_TOOL_STEPS = 40
 MAX_TOOLS_PER_BATCH = 4
+MAX_ASSISTANT_CHARS = 16_000
+STREAM_FLUSH_CHARS = 240
+STREAM_FLUSH_SECONDS = 0.35
 SYSTEM_PROMPT = (
     "你是与人持续协作的业务蒸馏顾问。先明确受益者、核心痛点、真实结果和成功标准，允许质疑无价值需求。"
     "这是对话，不是一次性填表或黑盒生成。没有资料时先交流价值问题；不要捏造业务事实。"
     "根据需要主动调用受信调查工具和review_business技能；只能读取人工配置的资料和目标页面。"
+    "先区分两类任务：已有业务要从真实结果和证据逆向核对输入、流程、ER、规则、痛点与缺口；新想法要检验受益者、假设、可行性、边界和最小价值闭环，再推导目标流程与ER。"
+    "每轮先用简短中文说明当前理解、已核实事实和下一步；再按需调查，不要把底层调用日志当业务进展。"
+    "资料不足或方向不明时先提出少量阻断性问题；不要为了显得完整而生成大而全草案。"
     "单次最多调用4个工具；收到未执行反馈时拆分调用，不得声称已取得结果。"
     "可用list_library_sources查找当前场景/授权共享资料库，list_library_files选择文件，再read_library_source实际调查，无须让人重复上传。"
     "临时附件由场景协作者显式提交，后续轮次固定当前项目内仍有效的附件。读取必须调用read_attachment；过期或移除后不能假称读取原文。"
@@ -54,6 +61,12 @@ SYSTEM_PROMPT = (
 
 def _safe(value):
     if release_service.safe_snapshot_content(value) != value:
+        raise ValueError("Investigation output contains credentials")
+    return value
+
+
+def _safe_text(value: str) -> str:
+    if release_service.safe_snapshot_content({"content": value}) != {"content": value}:
         raise ValueError("Investigation output contains credentials")
     return value
 
@@ -169,6 +182,29 @@ def _checkpoint(lease, session_factory, messages):
     _save(lease, session_factory, lambda row: setattr(row, "checkpoint", messages))
 
 
+def _reset_visible_output(lease, session_factory):
+    _save(lease, session_factory, lambda row: setattr(row, "assistant_message", ""))
+
+
+def _persist_visible_output(lease, session_factory, value: str):
+    safe_value = _safe_text(value)
+    if len(safe_value) > MAX_ASSISTANT_CHARS:
+        raise ValueError("Investigation response limit reached")
+    _save(lease, session_factory, lambda row: setattr(row, "assistant_message", safe_value))
+
+
+def _final_visible_output(prefix: str, message: str) -> str:
+    if not prefix.strip():
+        return message
+    if not message.strip():
+        return prefix
+    combined = f"{prefix.rstrip()}\n\n{message}"
+    if len(combined) <= MAX_ASSISTANT_CHARS:
+        return combined
+    remaining = max(0, MAX_ASSISTANT_CHARS - len(message) - 2)
+    return f"{prefix[-remaining:] if remaining else ''}\n\n{message}"
+
+
 def _start_step(lease, session_factory, name: str) -> str:
     step_id = uuid.uuid4().hex
     title = tools.tool_title(name)
@@ -231,7 +267,7 @@ def _complete_step(lease, session_factory, step_id, result):
     _save(lease, session_factory, mutate)
 
 
-def _model_call(lease, session_factory, messages):
+def _model_call(lease, session_factory, messages, visible_prefix: str = ""):
     if len(json.dumps(messages, ensure_ascii=False)) > MAX_PROMPT_CHARS:
         raise ValueError("Investigation prompt limit reached")
     with session_factory() as db:
@@ -253,12 +289,45 @@ def _model_call(lease, session_factory, messages):
         # lazy reload transaction during the actual network request.
         db.expunge(cfg)
         db.commit()
-        result = llm_service.chat(cfg, messages, tools=definitions, temperature=0,
-            max_tokens=10_000, request_timeout=get_settings().distillation_model_timeout_seconds,
-            max_retries=0, retry_on_length=False,
-            db=db, operation="distillation_conversation", before_provider_call=db.commit)
+        content_parts: list[str] = []
+        flushed_chars = len(visible_prefix)
+        flushed_at = time.monotonic()
+
+        def flush(force: bool = False) -> None:
+            nonlocal flushed_chars, flushed_at
+            value = visible_prefix + "".join(content_parts)
+            should_flush = force or len(value) - flushed_chars >= STREAM_FLUSH_CHARS or time.monotonic() - flushed_at >= STREAM_FLUSH_SECONDS
+            if not should_flush:
+                return
+            _persist_visible_output(lease, session_factory, value)
+            flushed_chars, flushed_at = len(value), time.monotonic()
+
+        _persist_visible_output(lease, session_factory, visible_prefix)
+        calls: list[dict] = []
+        content = ""
+        try:
+            for event in llm_service.chat_stream(cfg, messages, tools=definitions, temperature=0,
+                max_tokens=10_000, request_timeout=get_settings().distillation_model_timeout_seconds,
+                max_retries=0,
+                db=db, operation="distillation_conversation", before_provider_call=db.commit):
+                if event["type"] == "token":
+                    content_parts.append(event["content"])
+                    flush()
+                elif event["type"] == "tool_calls":
+                    calls = event["tool_calls"]
+        except Exception:
+            if content_parts or calls:
+                raise
+            result = llm_service.chat(cfg, messages, tools=definitions, temperature=0,
+                max_tokens=10_000, request_timeout=get_settings().distillation_model_timeout_seconds,
+                max_retries=0, retry_on_length=False,
+                db=db, operation="distillation_conversation", before_provider_call=db.commit)
+            content_parts.append(result.get("content") or "")
+            calls = result.get("tool_calls") or []
+        content = "".join(content_parts)
+        flush(force=True)
         db.commit()
-        return _safe({"content": result.get("content") or "", "tool_calls": result.get("tool_calls") or []})
+        return _safe({"content": content or "", "tool_calls": calls, "visible_content": visible_prefix + content})
 
 
 def execute_claim(lease: leases.Lease, session_factory) -> None:
@@ -284,18 +353,20 @@ def execute_claim(lease: leases.Lease, session_factory) -> None:
         messages = row.checkpoint or _initial_messages(db, row)
         db.commit()
     _checkpoint(lease, session_factory, messages)
+    _reset_visible_output(lease, session_factory)
     with leases.heartbeat(lease, session_factory) as lost, BrowserTurn(authorize_browser) as browser:
         while True:
             if lost.is_set():
                 raise leases.LeaseLost("Heartbeat lost")
             response = _model_call(lease, session_factory, messages)
             calls, content = response["tool_calls"], response["content"]
+            visible_output = response["visible_content"]
             if not isinstance(content, str) or len(content) > 16_000 or not isinstance(calls, list) or len(calls) > MAX_TOOL_STEPS:
                 raise ValueError("Invalid model response")
             if not calls:
                 if not content.strip():
                     raise ValueError("Empty model response")
-                _finish(lease, session_factory, "succeeded", message=content)
+                _finish(lease, session_factory, "succeeded", message=visible_output)
                 return
             # A clarification is an absolute stopping point even if a provider
             # batches a proposal after it in the same response.
@@ -352,14 +423,16 @@ def execute_claim(lease: leases.Lease, session_factory) -> None:
                         "proposal": result.proposal.model_dump() if result.proposal else None})
                     db.commit()
                 if result.questions:
-                    _finish(lease, session_factory, "waiting", message=result.message, questions=result.questions,
+                    _finish(lease, session_factory, "waiting", message=_final_visible_output(visible_output, result.message),
+                        questions=result.questions,
                         step_id=step_id, result=result)
                     return
                 if result.proposal is not None:
                     with session_factory() as db:
                         row = leases.owned(db, lease)
                         distillation_service.validate_document(db, result.proposal, row.context["scenario_id"])
-                    _finish(lease, session_factory, "succeeded", message=result.message, proposal=result.proposal,
+                    _finish(lease, session_factory, "succeeded", message=_final_visible_output(visible_output, result.message),
+                        proposal=result.proposal,
                         step_id=step_id, result=result)
                     return
                 _complete_step(lease, session_factory, step_id, result)

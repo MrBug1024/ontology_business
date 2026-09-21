@@ -514,6 +514,10 @@ def chat_stream(
     max_tokens: Optional[int] = None,
     *,
     db: Session | None = None,
+    request_timeout: float | None = None,
+    max_retries: int | None = None,
+    operation: str = "chat_stream",
+    before_provider_call: Callable[[], None] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """流式对话；在完整结束、异常或取消后都写入一次脱敏 trace。"""
     started_at = time.perf_counter()
@@ -533,7 +537,9 @@ def chat_stream(
             input_tokens=input_estimate,
             output_tokens=max(1, int(max_tokens if max_tokens is not None else cfg.max_tokens or 1)),
         )
-        client = _client(cfg)
+        client = _client(cfg, timeout=request_timeout, max_retries=max_retries)
+        if before_provider_call is not None:
+            before_provider_call()
         kwargs: dict[str, Any] = {
             "model": cfg.model,
             "messages": messages,
@@ -605,7 +611,7 @@ def chat_stream(
                 cfg,
                 db=db,
                 capability=trace_capability,
-                operation="chat_stream",
+                operation=operation,
                 status=status,
                 started_at=started_at,
                 input_tokens=input_tokens,

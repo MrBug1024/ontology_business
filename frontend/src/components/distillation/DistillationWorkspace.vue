@@ -59,7 +59,7 @@
       <div v-if="!projectId || project || loading" class="distillation-studio-body" :class="`is-${mobilePane}`">
         <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :publications="publications" :publication-busy="busy" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="canEdit && !loading && !actionBusy" :can-publish="!!project && canEdit && !dirty && !actionBusy && !active && !artifactProposal" @ask="discussFinding" @publish="confirmPublish" @updated="acceptProjectUpdate" @open-publication="openMaterial" @download-publication="downloadPublication" @delete-publication="deletePublication" />
         <aside class="distillation-advisor-panel" aria-label="业务蒸馏顾问对话">
-        <DistillationConversation v-model="input" :scope-key="draftKey" :scenario-id="props.scenarioId" :turns="turns" :loading="loading || conversationLoading" :has-more="conversationHasMore" :working="!!active" :sending="sending || busy === 'save'" :cancelling="cancelling" :applying="applying" :disabled="!canEdit || loading || actionBusy" :can-apply="canEdit && !dirty && !actionBusy" :error="conversationError" :blocked-reason="blockedReason" :upload-busy="attachmentBusy" :removing-attachment="removingAttachment" :compact="embedded" :workspace-actions="embedded" @send="sendMessage" @cancel="cancel" @reload="reconnectConversation" @older="loadConversation(true)" @sources="openSources" @files="addAttachments" @remove-submitted="removeSubmittedAttachment" @preview="previewTurn = $event" @apply="applyTurn" @new="newConversation" @history="projectsOpen = true" @systems="openSystems">
+        <DistillationConversation v-model="input" :scope-key="draftKey" :scenario-id="props.scenarioId" :turns="turns" :loading="loading || conversationLoading" :has-more="conversationHasMore" :working="!!active" :sending="sending || busy === 'save'" :cancelling="cancelling" :applying="applying" :disabled="!canEdit || loading || actionBusy" :can-apply="canEdit && !dirty && !actionBusy" :error="conversationError" :blocked-reason="blockedReason" :upload-busy="attachmentBusy" :removing-attachment="removingAttachment" :compact="embedded" :workspace-actions="embedded" :streaming="streaming" :reconnecting="reconnecting" @send="sendMessage" @cancel="cancel" @reload="reconnectConversation" @older="loadConversation(true)" @sources="openSources" @files="addAttachments" @remove-submitted="removeSubmittedAttachment" @preview="previewTurn = $event" @apply="applyTurn" @new="newConversation" @history="projectsOpen = true" @systems="openSystems">
             <template #attachments><DistillationAttachments :items="attachments" :error="attachmentError" :disabled="!canEdit || !!active || sending" @retry="retryAttachment" @remove="removeAttachment" @reload="loadAttachments" /></template>
           </DistillationConversation>
         </aside>
@@ -160,7 +160,7 @@ const authorizedProjectId = computed(() => {
   if (props.embedded && row.scenario_id !== props.scenarioId) return ''
   return row.id
 })
-const { turns, input, error: conversationError, loading: conversationLoading, sending, applying, cancelling, hasMore: conversationHasMore, active, load: loadConversation, send, cancel, apply } = useDistillationConversation(authorizedProjectId, draftKey)
+const { turns, input, error: conversationError, loading: conversationLoading, sending, applying, cancelling, hasMore: conversationHasMore, streaming, reconnecting, active, load: loadConversation, send, cancel, apply } = useDistillationConversation(authorizedProjectId, draftKey)
 const { attachments, error: attachmentError, busy: attachmentBusy, blocked: attachmentBlocked, readyIds, add: uploadAttachments, retry: retryAttachment, remove: removeAttachment, sent: attachmentsSent, load: loadAttachments, removeSubmitted } = useDistillationAttachments(authorizedProjectId)
 const artifactProposal = computed(() => project.value ? latestArtifactProposal(turns.value, project.value.id, project.value.revision) : undefined)
 const canCreate = computed(() => props.embedded ? props.canWrite : auth.user?.workspace_role !== 'viewer')
@@ -238,22 +238,22 @@ async function discussFinding(message: string) {
   await nextTick()
   document.getElementById('distillation-message')?.focus()
 }
-async function saveDraft() {
+async function saveDraft(navigate = true) {
   if (!draft.value.name.trim()) draft.value.name = conversationTitle(input.value || '新的业务探索')
   const row = await save()
-  if (row && row.id !== projectId.value) {
+  if (navigate && row && row.id !== projectId.value) {
     const text = input.value
     await changeWorkspace(props.embedded ? scenarioLocation(props.scenarioId, row.id) : legacyLocation(row.id), true)
     input.value = text
   }
   return row
 }
-async function ensureProject(title: string) {
+async function ensureProject(title: string, navigate = true) {
   if (project.value) return project.value
   if (!canCreate.value) return null
   const previousName = draft.value.name
   draft.value.name = conversationTitle(title)
-  const row = await saveDraft()
+  const row = await saveDraft(navigate)
   if (!row) draft.value.name = previousName
   return row
 }
@@ -274,8 +274,14 @@ async function removeSubmittedAttachment(id: string) {
 async function sendMessage(selection: DistillationResourceSelection = {}) {
   const text = input.value
   if (!text.trim() || !canEdit.value || dirty.value || actionBusy.value || attachmentBlocked.value || active.value) return
-  const row = await ensureProject(text), ids = [...readyIds.value]
-  if (row && await send(text, row.revision, ids, selection)) { attachmentsSent(ids); notice.value = '' }
+  const existingProject = project.value
+  const row = existingProject || await ensureProject(text, false), ids = [...readyIds.value]
+  const sent = row ? await send(text, row.revision, ids, selection, row.id) : false
+  if (sent) { attachmentsSent(ids); notice.value = '' }
+  if (!existingProject && row) {
+    await changeWorkspace(props.embedded ? scenarioLocation(props.scenarioId, row.id) : legacyLocation(row.id), true)
+    if (!sent && !input.value.trim()) input.value = text
+  }
 }
 function acceptProjectUpdate(row: DistillationProject) { if (row.id === projectId.value) { project.value = row; draft.value = draftOf(row); void list() } }
 async function applyTurn(turn: DistillationTurn) {

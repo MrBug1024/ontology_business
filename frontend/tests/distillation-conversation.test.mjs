@@ -3,12 +3,12 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 import { createRenderer, h, nextTick, ref } from 'vue'
-import { composeClarificationAnswer, conversationTitle, mergeTurns, latestArtifactProposal } from '../src/utils/distillationConversation.ts'
+import { composeClarificationAnswer, conversationTitle, mergeTurns, latestArtifactProposal, splitAssistantMessage } from '../src/utils/distillationConversation.ts'
 
 const now = '2026-09-18T02:00:00Z'
 function turn(id, status = 'waiting', overrides = {}) { return { id, project_id: 'p', turn_number: 1, request_id: 'request', status, base_revision: 1, message: 'question', assistant_message: 'Please clarify', steps: [], questions: [], proposal: null, applied_revision: null, error: '', created_at: now, updated_at: now, completed_at: null, ...overrides } }
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-const fakeApi = { list: async () => ({ turns: [], has_more: false }), get: async () => turn('1'), send: async () => turn('1'), cancel: async () => turn('1', 'cancelled'), apply: async () => ({ id: 'p', revision: 2 }) }
+const fakeApi = { list: async () => ({ turns: [], has_more: false }), get: async () => turn('1'), send: async () => turn('1'), stream: () => new AbortController(), cancel: async () => turn('1', 'cancelled'), apply: async () => ({ id: 'p', revision: 2 }) }
 globalThis.__distillationConversationApi = fakeApi
 const encode = source => `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 const transpile = path => ts.transpileModule(readFileSync(new URL(path, import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText
@@ -23,6 +23,33 @@ async function flush() { await nextTick(); await new Promise(resolve => setImmed
 test('first sentence becomes a short project title without requiring a form', () => {
   assert.equal(conversationTitle('  想弄清真实价值。这里是后续事实。'), '想弄清真实价值')
   assert.equal(conversationTitle('x'.repeat(70)).length, 36)
+})
+
+test('model thinking remains a live collapsible section while the answer streams', () => {
+  const live = splitAssistantMessage('<think>先核对结果来源\n正在追')
+  assert.deepEqual(live, [{ kind: 'thinking', content: '先核对结果来源\n正在追', streaming: true }])
+  const completed = splitAssistantMessage('<think>先核对结果来源<\\think>\n\n结论需要继续澄清输入与结果的一对多关系。')
+  assert.deepEqual(completed, [
+    { kind: 'thinking', content: '先核对结果来源', streaming: false },
+    { kind: 'answer', content: '\n\n结论需要继续澄清输入与结果的一对多关系。', streaming: false },
+  ])
+})
+
+test('a newly created project can enqueue its first turn before route authorization catches up', async () => {
+  fakeApi.list = async () => ({ turns: [], has_more: false })
+  const requests = []
+  fakeApi.send = async (project) => { requests.push(project); return turn('first', 'running') }
+  const projectId = ref('')
+  let state
+  const app = renderer.createApp({ setup() { state = useDistillationConversation(projectId); return () => h('div') } })
+  app.mount({})
+  state.input.value = 'First question in a new conversation'
+  await flush()
+  assert.equal(await state.send(state.input.value, 1, [], {}, 'created-project'), true)
+  assert.deepEqual(requests, ['created-project'])
+  assert.equal(state.turns.value[0].id, 'first')
+  assert.equal(state.input.value, '')
+  app.unmount()
 })
 test('multiple clarification answers preserve other selections and free-form evidence', () => {
   let input = '补充现场观察：结果未得到请求人确认。'
@@ -218,4 +245,26 @@ test('only current unadopted server proposals appear on the artifact canvas', ()
   assert.equal(latestArtifactProposal([stale, foreign, adopted, candidate], 'p', 1).id, 'candidate')
   assert.equal(latestArtifactProposal([candidate], 'p', 2), undefined)
   assert.equal(latestArtifactProposal([candidate], 'another', 1), undefined)
+})
+
+test('a proposal produced by a running turn is visible before the model round finishes', () => {
+  const running = turn('running', 'running', { proposal: { beneficiary: 'Requester' } })
+  assert.equal(latestArtifactProposal([running], 'p', 1).id, 'running')
+})
+
+test('a first message creates the durable project before enqueueing its turn and only then changes route', () => {
+  const source = readFileSync(new URL('../src/components/distillation/DistillationWorkspace.vue', import.meta.url), 'utf8')
+  const send = source.slice(source.indexOf('async function sendMessage'), source.indexOf('function acceptProjectUpdate'))
+  assert.match(send, /ensureProject\(text, false\)/)
+  assert.ok(send.indexOf('ensureProject(text, false)') < send.indexOf('await send(text'))
+  assert.ok(send.indexOf('await send(text') < send.indexOf('await changeWorkspace'))
+})
+
+test('the live activity summary reflects only authoritative server investigation states', () => {
+  const source = readFileSync(new URL('../src/components/distillation/DistillationLiveActivity.vue', import.meta.url), 'utf8')
+  assert.match(source, /turn\.questions\.length/)
+  assert.match(source, /turn\.steps\.filter/)
+  assert.match(source, /turn\.proposal/)
+  assert.doesNotMatch(source, /readiness|canPublish|自动采用|autoApply/)
+  assert.match(readFileSync(new URL('../src/styles/distillation-workspace.css', import.meta.url), 'utf8'), /prefers-reduced-motion: reduce/)
 })

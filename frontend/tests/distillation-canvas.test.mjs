@@ -104,6 +104,43 @@ test('questions display AI findings without topic signoff forms or automatic cha
   view.stop()
 })
 
+test('saved publication artifacts stay within their matching conclusion tabs', async () => {
+  const artifact = (key, filename) => ({ key, filename, mime: 'text/plain', sha256: `${key}-sha256` })
+  const version = {
+    id: 'publication-1', project_id: 'project-1', scenario_id: null, project_revision: 3,
+    data_source_id: 'source-1', created_at: '2026-09-21T00:00:00Z',
+    artifacts: [
+      artifact('brief', 'business-brief.md'), artifact('as_is', 'process-as-is.mmd'),
+      artifact('to_be', 'process-to-be.mmd'), artifact('er', 'entity-relations.mmd'),
+      artifact('lineage', 'data-lineage.mmd'), artifact('contract', 'business-contract.json'),
+      artifact('provenance', 'evidence-provenance.json'),
+    ],
+  }
+  const downloads = []
+  const view = mount(emptyDistillationDocument(), {
+    publications: [version],
+    onDownloadPublication: (_publication, artifact) => downloads.push(artifact.key),
+  })
+
+  assert.doesNotMatch(view.text(), /已保存交付物/)
+  await view.choose('ER')
+  assert.match(view.text(), /ER交付物/)
+  assert.ok(view.all().find(target => target.props.role === 'tabpanel')?.children.some(target => target.props['aria-label'] === '当前分类已保存交付物'))
+  assert.ok(view.button('下载 entity-relations.mmd'))
+  assert.equal(view.button('下载 process-as-is.mmd'), undefined)
+  view.button('下载 entity-relations.mmd').props.onClick()
+  await view.choose('流程')
+  assert.ok(view.button('下载 process-as-is.mmd'))
+  assert.ok(view.button('下载 process-to-be.mmd'))
+  assert.equal(view.button('下载 entity-relations.mmd'), undefined)
+  await view.choose('血缘')
+  assert.ok(view.button('下载 data-lineage.mmd'))
+  await view.choose('证据')
+  assert.ok(view.button('下载 evidence-provenance.json'))
+  assert.deepEqual(downloads, ['er'])
+  view.stop()
+})
+
 test('unconfirmed entity relationships display uncertainty without a definite cardinality', async () => {
   const document = emptyDistillationDocument()
   document.entities = [{ key: 'request', name: '请求', description: '', attributes: [] }, { key: 'result', name: '结果', description: '', attributes: [] }]

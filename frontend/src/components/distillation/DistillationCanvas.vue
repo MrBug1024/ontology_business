@@ -22,22 +22,22 @@
         <DistillationCases v-else-if="tab === 'cases'" :document="document" />
         <DistillationFindings v-else :document="document" :tab="tab" />
       </template>
+      <section v-if="activePublications.length" class="discovery-tab-publications" aria-label="当前分类已保存交付物">
+        <div class="discovery-tab-publications-heading"><strong>{{ activeTabName }}交付物</strong><small>每个版本可独立删除</small></div>
+        <article v-for="publication in activePublications" :key="publication.version.id" class="discovery-tab-publication-row">
+          <span>版本 {{ publication.version.project_revision }}</span>
+          <div class="discovery-tab-publication-actions">
+            <el-button text :disabled="!publication.version.data_source_id" @click="$emit('open-publication', publication.version)">查看资料</el-button>
+            <el-button v-for="artifact in publication.artifacts" :key="artifact.key" text :disabled="!!publicationBusy" @click="$emit('download-publication', publication.version, artifact)">下载 {{ artifact.filename }}</el-button>
+            <el-button v-if="canEdit" type="danger" text :disabled="!!publicationBusy" @click="$emit('delete-publication', publication.version)">删除版本</el-button>
+          </div>
+        </article>
+      </section>
     </div>
     <footer>
       <span class="discovery-canvas-state">{{ pending ? 'AI 产物 · 待采用' : dirty ? '资料引用有待保存的调整' : hasArtifacts ? '已保存的阶段产物' : '等待产物' }}</span>
       <el-button type="primary" plain :disabled="!canPublish || !hasArtifacts || pending" @click="$emit('publish')">保存到资料库</el-button>
     </footer>
-    <section v-if="publications.length" class="discovery-publications" aria-label="业务蒸馏交付物">
-      <div class="discovery-publications-heading"><strong>已保存交付物</strong><small>每个版本可独立删除</small></div>
-      <article v-for="version in publications" :key="version.id" class="discovery-publication-row">
-        <span>版本 {{ version.project_revision }}</span>
-        <div class="discovery-publication-actions">
-          <el-button text :disabled="!version.data_source_id" @click="$emit('open-publication', version)">查看资料</el-button>
-          <el-button v-for="artifact in version.artifacts" :key="artifact.key" text :disabled="!!publicationBusy" @click="$emit('download-publication', version, artifact)">下载 {{ artifact.filename }}</el-button>
-          <el-button v-if="canEdit" type="danger" text :disabled="!!publicationBusy" @click="$emit('delete-publication', version)">删除版本</el-button>
-        </div>
-      </article>
-    </section>
   </section>
 </template>
 <script setup lang="ts">
@@ -67,9 +67,23 @@ const tabs = [
   { key: 'questions', name: '待澄清' },
 ] as const
 type FindingTab = typeof tabs[number]['key']
+const artifactKeysByTab: Record<FindingTab, readonly string[]> = {
+  value: ['brief', 'contract'],
+  entities: ['er'],
+  process: ['as_is', 'to_be'],
+  lineage: ['lineage'],
+  cases: ['brief', 'contract'],
+  evidence: ['provenance', 'brief'],
+  questions: ['brief'],
+}
 const canvasId = `distillation-${useId()}`
 const tab = ref<FindingTab>('value')
 const tabButtons = ref<HTMLButtonElement[]>([])
+const activeTabName = computed(() => tabs.find(item => item.key === tab.value)?.name || '')
+const activePublications = computed(() => props.publications.map(version => ({
+  version,
+  artifacts: version.artifacts.filter(artifact => artifactKeysByTab[tab.value].includes(artifact.key)),
+})).filter(publication => publication.artifacts.length > 0))
 async function navigateTabs(event: KeyboardEvent, index: number) {
   let nextIndex: number
   if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length

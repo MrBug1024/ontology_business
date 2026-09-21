@@ -1,8 +1,41 @@
 import type { DistillationTurn } from '../types/distillationConversation'
 
 export function isWorking(turn: DistillationTurn): boolean { return turn.status === 'queued' || turn.status === 'running' }
+export interface AssistantMessagePart {
+  kind: 'thinking' | 'answer'
+  content: string
+  streaming: boolean
+}
+export function splitAssistantMessage(content: string): AssistantMessagePart[] {
+  const parts: AssistantMessagePart[] = []
+  const opening = /<think>/ig
+  const closing = /(?:<\/think>|<\\think>)/ig
+  let cursor = 0
+  let match: RegExpExecArray | null
+  while ((match = opening.exec(content)) !== null) {
+    const before = content.slice(cursor, match.index)
+    if (before.trim()) parts.push({ kind: 'answer', content: before, streaming: false })
+    closing.lastIndex = match.index + match[0].length
+    const end = closing.exec(content)
+    if (end) {
+      const thought = content.slice(match.index + match[0].length, end.index)
+      if (thought.trim()) parts.push({ kind: 'thinking', content: thought, streaming: false })
+      cursor = end.index + end[0].length
+      opening.lastIndex = cursor
+    } else {
+      const thought = content.slice(match.index + match[0].length)
+      if (thought.trim()) parts.push({ kind: 'thinking', content: thought, streaming: true })
+      cursor = content.length
+      break
+    }
+  }
+  const remainder = content.slice(cursor)
+  if (remainder.trim()) parts.push({ kind: 'answer', content: remainder, streaming: false })
+  return parts
+}
 export function latestArtifactProposal(turns: DistillationTurn[], projectId: string, revision: number): DistillationTurn | undefined {
-  return turns.filter(turn => turn.project_id === projectId && turn.base_revision === revision && turn.status === 'succeeded' && turn.proposal && !turn.applied_revision)
+  return turns.filter(turn => turn.project_id === projectId && turn.base_revision === revision
+    && (turn.status === 'succeeded' || isWorking(turn)) && turn.proposal && !turn.applied_revision)
     .sort((left, right) => right.turn_number - left.turn_number)[0]
 }
 export function mergeTurns(current: DistillationTurn[], received: DistillationTurn[]): DistillationTurn[] {

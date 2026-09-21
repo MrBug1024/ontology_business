@@ -15,6 +15,7 @@ function stableResourceSelection(selection: DistillationResourceSelection = {}) 
 export function useDistillationConversation(projectId: Ref<string>, draftKey: Ref<string> = projectId) {
   const turns = ref<DistillationTurn[]>([]), input = ref(''), error = ref('')
   const loading = ref(false), sending = ref(false), applying = ref(''), cancelling = ref(false), hasMore = ref(false)
+  const streaming = ref(false), reconnecting = ref(false)
   const active = computed(() => turns.value.find(isWorking))
   const lastTurn = computed(() => turns.value[turns.value.length - 1])
   const drafts = new Map<string, string>()
@@ -27,6 +28,27 @@ export function useDistillationConversation(projectId: Ref<string>, draftKey: Re
   function message(caught: unknown) { return caught instanceof Error ? caught.message : '对话操作未完成，请重试。你的输入已保留。' }
   function current(epoch: number, control: AbortController) { return !disposed && epoch === generation && !control.signal.aborted }
   function receive(turn: DistillationTurn) { turns.value = mergeTurns(turns.value, [turn]) }
+  function observe(turn: DistillationTurn) {
+    if (isWorking(turn)) {
+      const epoch = generation
+      const control = api.stream(turn.project_id, turn.id, result => {
+        if (current(epoch, control)) receive(result)
+      }, () => {
+        controllers.delete(control)
+        streaming.value = false
+      }, () => {
+        controllers.delete(control)
+        if (current(epoch, control)) {
+          streaming.value = false
+          reconnecting.value = true
+          schedulePoll()
+        }
+      })
+      streaming.value = true
+      reconnecting.value = false
+      controllers.add(control)
+    }
+  }
   function schedulePoll() {
     clearTimeout(timer)
     if (active.value && !disposed) timer = setTimeout(() => { void poll() }, 1200)
@@ -37,7 +59,7 @@ export function useDistillationConversation(projectId: Ref<string>, draftKey: Re
     const epoch = generation, control = controller()
     try {
       const result = await api.get(turn.project_id, turn.id, control.signal)
-      if (current(epoch, control)) { receive(result); error.value = ''; schedulePoll() }
+      if (current(epoch, control)) { receive(result); error.value = ''; reconnecting.value = false; observe(result) }
     } catch (caught: unknown) {
       if (current(epoch, control)) error.value = `${message(caught)} 已保存的对话可重新连接继续查看。`
     } finally { controllers.delete(control) }
@@ -52,13 +74,14 @@ export function useDistillationConversation(projectId: Ref<string>, draftKey: Re
       turns.value = mergeTurns(turns.value, page.turns)
       hasMore.value = page.has_more
       error.value = ''
-      schedulePoll()
+      observe(turns.value.find(isWorking) || turns.value[turns.value.length - 1])
     } catch (caught: unknown) { if (current(epoch, control)) error.value = message(caught) }
     finally { controllers.delete(control); if (current(epoch, control)) loading.value = false }
   }
-  async function send(text: string, revision: number, attachmentIds: string[] = [], resourceSelection: DistillationResourceSelection = {}) {
-    if (!projectId.value || sending.value || active.value || !text.trim()) return false
-    const epoch = generation, id = projectId.value, control = controller()
+  async function send(text: string, revision: number, attachmentIds: string[] = [], resourceSelection: DistillationResourceSelection = {}, targetProjectId = '') {
+    const id = targetProjectId || projectId.value
+    if (!id || sending.value || active.value || !text.trim()) return false
+    const epoch = generation, control = controller()
     const attachments = JSON.stringify(attachmentIds)
     const selectedResources = stableResourceSelection(resourceSelection)
     const resources = JSON.stringify(selectedResources)
@@ -73,7 +96,7 @@ export function useDistillationConversation(projectId: Ref<string>, draftKey: Re
       receive(result)
       pending = undefined
       if (input.value === text) input.value = ''
-      schedulePoll()
+      observe(result)
       return true
     } catch (caught: unknown) { if (current(epoch, control)) error.value = message(caught); return false }
     finally { controllers.delete(control); if (current(epoch, control)) sending.value = false }
@@ -85,7 +108,7 @@ export function useDistillationConversation(projectId: Ref<string>, draftKey: Re
     cancelling.value = true
     try {
       const result = await api.cancel(turn.project_id, turn.id, control.signal)
-      if (current(epoch, control)) { receive(result); error.value = ''; schedulePoll() }
+      if (current(epoch, control)) { receive(result); error.value = ''; observe(result) }
     } catch (caught: unknown) { if (current(epoch, control)) error.value = message(caught) }
     finally { controllers.delete(control); if (current(epoch, control)) cancelling.value = false }
   }
@@ -110,9 +133,10 @@ export function useDistillationConversation(projectId: Ref<string>, draftKey: Re
     for (const control of controllers) control.abort()
     controllers.clear()
     turns.value = []; input.value = drafts.get(key) || ''; error.value = ''; loading.value = false
+    streaming.value = false; reconnecting.value = false
     sending.value = false; applying.value = ''; cancelling.value = false; hasMore.value = false
     void load()
   }, { immediate: true })
   onBeforeUnmount(() => { disposed = true; generation += 1; clearTimeout(timer); for (const control of controllers) control.abort() })
-  return { turns, input, error, loading, sending, applying, cancelling, hasMore, active, lastTurn, load, send, cancel, apply }
+  return { turns, input, error, loading, sending, applying, cancelling, hasMore, streaming, reconnecting, active, lastTurn, load, send, cancel, apply }
 }

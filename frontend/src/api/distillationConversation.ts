@@ -55,6 +55,65 @@ export const distillationConversationApi = {
   },
   removeAttachment: (projectId: string, attachmentId: string, signal: AbortSignal) => http.delete<void>(`${path(projectId)}/attachments/${encodeURIComponent(attachmentId)}`, { signal }),
   get: (projectId: string, turnId: string, signal: AbortSignal) => http.get<DistillationTurn>(turnPath(projectId, turnId), { signal }),
+  stream: (
+    projectId: string,
+    turnId: string,
+    onTurn: (turn: DistillationTurn) => void,
+    onDone: () => void,
+    onError: (error: Error) => void,
+  ) => {
+    const control = new AbortController()
+    void (async () => {
+      try {
+        const response = await fetch(`/api${turnPath(projectId, turnId)}/events`, {
+          headers: { Accept: 'text/event-stream' },
+          credentials: 'include',
+          cache: 'no-store',
+          signal: control.signal,
+        })
+        if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        let eventName = ''
+        let receivedDone = false
+        while (!control.signal.aborted) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+          for (const rawLine of lines) {
+            const line = rawLine.trim()
+            if (line.startsWith('event:')) {
+              eventName = line.slice(6).trim()
+              continue
+            }
+            if (!line.startsWith('data:')) continue
+            const data = line.slice(5).trim()
+            if (data === '[DONE]') {
+              receivedDone = true
+              onDone()
+              return
+            }
+            if (eventName === 'error') {
+              throw new Error('业务蒸馏对话流不可用或权限已变化')
+            }
+            eventName = ''
+            try {
+              onTurn(JSON.parse(data) as DistillationTurn)
+            } catch {
+              throw new Error('业务蒸馏对话流格式异常')
+            }
+          }
+        }
+        if (!control.signal.aborted && !receivedDone) onError(new Error('业务蒸馏对话流意外结束'))
+      } catch (error: unknown) {
+        if (!control.signal.aborted) onError(error instanceof Error ? error : new Error('业务蒸馏对话流中断'))
+      }
+    })()
+    return control
+  },
   cancel: (projectId: string, turnId: string, signal: AbortSignal) => http.post<DistillationTurn>(`${turnPath(projectId, turnId)}/cancel`, {}, { signal }),
   apply: (projectId: string, turnId: string, revision: number, signal: AbortSignal) =>
     http.post<DistillationProject>(`${turnPath(projectId, turnId)}/apply`, { expected_revision: revision }, { signal }),
