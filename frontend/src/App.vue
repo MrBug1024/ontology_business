@@ -47,8 +47,6 @@
           active-text-color="var(--sidebar-title)"
           @select="sidebarOpen = false"
         >
-          <el-menu-item index="/data-sources"><el-icon aria-hidden="true"><Coin /></el-icon><span>资料库</span></el-menu-item>
-          <el-menu-item index="/business-distillation"><el-icon aria-hidden="true"><Compass /></el-icon><span>业务蒸馏</span></el-menu-item>
           <el-menu-item index="/scenarios"><el-icon aria-hidden="true"><OfficeBuilding /></el-icon><span>场景能力</span></el-menu-item>
           <el-menu-item index="/agents"><el-icon aria-hidden="true"><Cpu /></el-icon><span>验证中心</span></el-menu-item>
           <el-menu-item index="/access"><el-icon aria-hidden="true"><Connection /></el-icon><span>发布与接入</span></el-menu-item>
@@ -133,7 +131,7 @@
       <div class="route-viewport">
         <router-view />
       </div>
-      <GlobalAssistant v-if="route.name === 'scenario-detail'" :context="assistantContext" :hide-launcher="sidebarOpen" />
+      <GlobalAssistant v-if="route.name === 'scenario-detail'" v-show="showGlobalAssistant" :context="assistantContext" :hide-launcher="sidebarOpen" />
     </el-main>
     <PlatformSettingsDialog v-model="platformSettingsOpen" :initial-tab="platformSettingsTab" :theme="theme" @tab-change="changePlatformSettingsTab" @toggle-theme="toggleTheme" />
   </el-container>
@@ -147,6 +145,7 @@ import GlobalAssistant from '@/components/GlobalAssistant.vue'
 import WorkspaceMenu from '@/components/access/WorkspaceMenu.vue'
 import PlatformSettingsDialog from '@/components/platform/PlatformSettingsDialog.vue'
 import { platformSettingsQuery, platformSettingsTabFromQuery, type PlatformSettingsTab } from '@/utils/platformSettings'
+import { normalizeScenarioStage } from '@/utils/scenarioStages'
 
 const route = useRoute()
 const router = useRouter()
@@ -162,14 +161,15 @@ const platformSettingsOpen = computed({
 })
 
 const activeRoute = computed(() => {
-  if (route.path.startsWith('/business-distillation')) return '/business-distillation'
   if (route.path.startsWith('/scenarios')) return '/scenarios'
   if (route.path.startsWith('/agents')) return '/agents'
   if (route.path.startsWith('/access')) return '/access'
   return route.path
 })
 const pageTitle = computed(() => String(route.meta.title || '业务场景'))
-const assistantSafeArea = computed(() => route.name === 'scenario-detail')
+const scenarioStage = computed(() => normalizeScenarioStage(route.query.stage))
+const showGlobalAssistant = computed(() => route.name === 'scenario-detail' && !['distillation', 'materials'].includes(scenarioStage.value))
+const assistantSafeArea = computed(() => showGlobalAssistant.value)
 const assistantContext = computed(() => {
   const queryScenario = Array.isArray(route.query.scenario_id)
     ? String(route.query.scenario_id[0] || '')

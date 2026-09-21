@@ -1,4 +1,4 @@
-"""Owner-scoped temporary inputs, explicit turn binding and durable expiry cleanup."""
+"""Scenario-shared temporary inputs, explicit turn binding and durable expiry cleanup."""
 from __future__ import annotations
 
 import asyncio
@@ -31,11 +31,15 @@ def public_attachment(row: Attachment) -> AttachmentOut:
 
 
 def list_pending(db: Session, project_id: str) -> list[AttachmentOut]:
-    project = distillation_service.project(db, project_id, write=True)
-    principal = permission_service.require_principal(db)
+    # The project ACL is the sole visibility boundary. Uploading/removing
+    # inputs still requires project write access, but collaborators with read
+    # access must see inputs uploaded by every member.
+    project = distillation_service.project(db, project_id)
     rows = db.scalars(select(Attachment).where(Attachment.project_id == project.id,
-        Attachment.tenant_id == principal.tenant_id, Attachment.created_by == principal.user_id,
-        Attachment.status == "ready", Attachment.expires_at > now()).order_by(Attachment.created_at).limit(MAX_READY_ATTACHMENTS)).all()
+        Attachment.tenant_id == project.tenant_id,
+        Attachment.status.in_(('ready', 'bound')), Attachment.expires_at > now()).order_by(
+            Attachment.created_at, Attachment.id,
+        ).limit(MAX_READY_ATTACHMENTS)).all()
     return [public_attachment(row) for row in rows]
 
 
@@ -56,10 +60,11 @@ def persist_parsed(db: Session, project_id: str, *, request_id: str, filename: s
         return existing
     if release_service.safe_snapshot_content({"filename": filename, "content": parsed.text}) != {"filename": filename, "content": parsed.text}:
         raise HTTPException(422, "附件包含疑似凭据，请先脱敏后重新上传")
-    count = db.scalar(select(func.count()).select_from(Attachment).where(Attachment.project_id == project.id,
-        Attachment.created_by == principal.user_id, Attachment.status.in_(("ready", "bound")), Attachment.expires_at > now()))
+    count = db.scalar(select(func.count()).select_from(Attachment).where(
+        Attachment.project_id == project.id, Attachment.tenant_id == project.tenant_id,
+        Attachment.status.in_(("ready", "bound")), Attachment.expires_at > now()))
     if count >= MAX_READY_ATTACHMENTS:
-        raise HTTPException(409, "本会话的临时附件已达 20 份，请先移除不再使用的附件")
+        raise HTTPException(409, "本项目的临时附件已达 20 份，请先移除不再使用的附件")
     row = Attachment(tenant_id=principal.tenant_id, project_id=project.id, scenario_id=project.scenario_id,
         created_by=principal.user_id, request_id=request_id, filename=filename,
         media_type=parsed.media_type, byte_size=byte_size, content_sha256=content_sha256,
@@ -99,14 +104,19 @@ def upload(db: Session, project_id: str, file: UploadFile, request_id: str) -> A
 
 
 def bind(db: Session, turn: Turn, attachment_ids: list[str]) -> list[dict]:
-    # Earlier explicit submissions remain available in this same owner's
-    # conversation. Every new turn fixes that live set before execution starts.
-    rows = list(db.scalars(select(Attachment).where(or_(Attachment.id.in_(attachment_ids),
-        (Attachment.status == "bound") & (Attachment.expires_at > now())),
-        Attachment.tenant_id == turn.tenant_id, Attachment.project_id == turn.project_id,
-        Attachment.created_by == turn.created_by).order_by(Attachment.id).with_for_update()))
+    # Earlier submissions remain available to every collaborator in the same
+    # project. Every new turn fixes that live set before execution starts.
+    rows = list(db.scalars(select(Attachment).where(
+        or_(
+            Attachment.id.in_(attachment_ids),
+            (Attachment.status == "bound") & (Attachment.expires_at > now()),
+        ),
+        Attachment.tenant_id == turn.tenant_id,
+        Attachment.project_id == turn.project_id,
+        Attachment.scenario_id == turn.context["scenario_id"],
+        ).order_by(Attachment.id).with_for_update()))
     if not set(attachment_ids).issubset({row.id for row in rows}):
-        raise HTTPException(404, "临时附件不存在或不属于当前账号及会话")
+        raise HTTPException(404, "临时附件不存在或不属于当前会话")
     for row in rows:
         if row.scenario_id != turn.context["scenario_id"] or row.status not in {"ready", "bound"} or row.expires_at <= now():
             raise HTTPException(409, "临时附件已失效，请移除后重新上传")
@@ -123,7 +133,7 @@ def assert_available(db: Session, turn: Turn) -> None:
         return
     count = db.scalar(select(func.count()).select_from(Link).join(Attachment, Attachment.id == Link.attachment_id).where(
         Link.turn_id == turn.id, Link.tenant_id == turn.tenant_id, Link.project_id == turn.project_id,
-        Link.user_id == turn.created_by, Attachment.id.in_(ids), Attachment.created_by == turn.created_by,
+        Attachment.id.in_(ids), Attachment.scenario_id == turn.context["scenario_id"],
         Attachment.status.in_(("ready", "bound")), Attachment.expires_at > now()))
     if count != len(ids):
         raise HTTPException(409, "本轮临时附件已移除或过期，请重新上传后发送")
@@ -136,13 +146,13 @@ def read_attachment(db: Session, turn: Turn, attachment_id: str, offset: int, li
     result = db.execute(select(Attachment.filename, Attachment.content_sha256,
         func.char_length(Attachment.parsed_text), func.substr(Attachment.parsed_text, offset + 1, limit)).where(
         Attachment.id == attachment_id, Attachment.project_id == turn.project_id,
-        Attachment.tenant_id == turn.tenant_id, Attachment.created_by == turn.created_by)).one_or_none()
+        Attachment.tenant_id == turn.tenant_id, Attachment.scenario_id == turn.context["scenario_id"])).one_or_none()
     if result is None:
         raise HTTPException(404, "临时附件不存在")
     return {"attachment_id": attachment_id, "filename": result[0], "content_sha256": result[1],
         "content": result[3], "offset": offset, "total_characters": result[2],
         "complete": offset == 0 and len(result[3]) >= result[2],
-        "limitations": ["临时附件仅供当前账号在本会话分析，不会进入资料库；原文件未保留，解析文本 24 小时后清理。",
+        "limitations": ["临时附件供当前场景协作者在本项目分析，不会进入资料库；原文件未保留，解析文本 24 小时后清理。",
             "这是有界文本节选；未实际执行数据匹配或业务操作。"]}
 
 
@@ -169,10 +179,8 @@ def cleanup_invalid_turns(db: Session, *, limit: int = 50) -> int:
 
 def remove(db: Session, project_id: str, attachment_id: str) -> None:
     project = distillation_service.project(db, project_id, write=True, lock=True)
-    principal = permission_service.require_principal(db)
     row = db.scalar(select(Attachment).where(Attachment.id == attachment_id,
-        Attachment.project_id == project.id, Attachment.tenant_id == principal.tenant_id,
-        Attachment.created_by == principal.user_id).with_for_update())
+        Attachment.project_id == project.id, Attachment.tenant_id == project.tenant_id).with_for_update())
     if row is None:
         raise HTTPException(404, "临时附件不存在")
     _invalidate(db, row, "removed")

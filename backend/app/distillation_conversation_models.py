@@ -22,7 +22,12 @@ class DistillationConversationTurn(Base):
             name="fk_distillation_turn_project_tenant", ondelete="RESTRICT"),
         UniqueConstraint("project_id", "request_id", name="uq_distillation_turn_request"),
         UniqueConstraint("project_id", "turn_number", name="uq_distillation_turn_number"),
+        # Turns are visible through the project's scenario ACL. Keep both the
+        # historical owner key (for migration compatibility) and a
+        # tenant/project-scoped key for link integrity; ``created_by`` is
+        # audit metadata, not an access boundary.
         UniqueConstraint("id", "project_id", "tenant_id", "created_by", name="uq_distillation_turn_owner"),
+        UniqueConstraint("id", "project_id", "tenant_id", name="uq_distillation_turn_scope"),
         CheckConstraint("status IN ('queued','running','waiting','succeeded','cancelled','failed')", name="ck_distillation_turn_status"),
         CheckConstraint("base_revision >= 1 AND turn_number >= 1 AND attempt >= 0 AND model_calls >= 0 AND lease_generation >= 0", name="ck_distillation_turn_counters"),
         Index("uq_distillation_turn_active", "project_id", unique=True, postgresql_where=text("status IN ('queued','running')")),

@@ -30,7 +30,8 @@ test('failed upload retains its file and durable request ID for retry', async ()
   assert.equal(requests[1].file, file)
   assert.deepEqual(state.readyIds.value, ['ready'])
   state.sent(['ready'])
-  assert.deepEqual(state.attachments.value, [])
+  assert.equal(state.attachments.value[0].status, 'bound')
+  assert.deepEqual(state.readyIds.value, ['ready'])
   stop()
 })
 test('ready attachment remains visible until server confirms removal', async () => {
@@ -41,6 +42,24 @@ test('ready attachment remains visible until server confirms removal', async () 
   assert.equal(state.attachments.value[0].status, 'removing')
   deletion.resolve(); await removing
   assert.deepEqual(state.attachments.value, [])
+  stop()
+})
+test('bound attachments are restored for collaborators and remain selectable', async () => {
+  fakeApi.attachments = async () => [{ ...attachment('bound'), status: 'bound' }]
+  const { state, stop } = mount(); await flush()
+  assert.equal(state.attachments.value[0].status, 'bound')
+  assert.deepEqual(state.readyIds.value, ['bound'])
+  assert.equal(state.blocked.value, false)
+  stop()
+})
+test('removing a submitted attachment also clears its composer projection', async () => {
+  fakeApi.attachments = async () => [{ ...attachment('submitted'), status: 'bound' }]
+  fakeApi.removeAttachment = async () => undefined
+  const { state, stop } = mount(); await flush()
+  assert.deepEqual(state.readyIds.value, ['submitted'])
+  assert.equal(await state.removeSubmitted('submitted'), true)
+  assert.deepEqual(state.attachments.value, [])
+  assert.deepEqual(state.readyIds.value, [])
   stop()
 })
 test('switching project aborts upload and never uploads remaining selected files into the new project', async () => {
@@ -67,14 +86,15 @@ test('expired attachment cannot be selected for a new turn and oversized files a
   assert.match(state.attachments.value[1].error, /10 MB/)
   stop()
 })
-test('a late pending list cannot restore an attachment already acknowledged as sent', async () => {
+test('a late pending list does not duplicate an attachment already acknowledged as sent', async () => {
   fakeApi.attachments = async () => [attachment('sent')]
   const { state, stop } = mount(); await flush()
   const pending = deferred(); fakeApi.attachments = async () => pending.promise
   const reloading = state.load()
   state.sent(['sent'])
   pending.resolve([attachment('sent')]); await reloading
-  assert.deepEqual(state.attachments.value, [])
+  assert.equal(state.attachments.value.length, 1)
+  assert.equal(state.attachments.value[0].status, 'bound')
   stop()
 })
 test('restoring after a lost upload response merges by server request identity without duplicate file cards', async () => {

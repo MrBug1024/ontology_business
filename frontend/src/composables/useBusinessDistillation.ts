@@ -4,7 +4,7 @@ import { draftOf } from '@/utils/businessDistillation'
 import type { DataSource, Scenario } from '@/types'
 import type { DistillationArtifact, DistillationProject, DistillationProposal, DistillationPublication } from '@/types/businessDistillation'
 
-export function useBusinessDistillation(projectId: Ref<string>, historyScope: Ref<string> = ref('')) {
+export function useBusinessDistillation(projectId: Ref<string>, historyScope: Ref<string> = ref(''), lockScope = false) {
   const projects = ref<DistillationProject[]>([])
   const project = ref<DistillationProject | null>(null)
   const draft = ref(draftOf())
@@ -18,6 +18,9 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
   const listing = ref(false)
   const busy = ref('')
   const offset = ref(0)
+  const materialOffset = ref(0)
+  const materialHasMore = ref(false)
+  const materialLoading = ref(false)
   const hasMore = computed(() => projects.value.length === 50)
   function emptyDraft() { const value = draftOf(); value.scenario_id = historyScope.value && historyScope.value !== 'shared' ? historyScope.value : null; return value }
   const dirty = computed(() => JSON.stringify(draft.value) !== JSON.stringify(project.value ? draftOf(project.value) : emptyDraft()))
@@ -26,7 +29,9 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
   let loadController: AbortController | undefined
   let listController: AbortController | undefined
   let actionController: AbortController | undefined
-  const optionsController = new AbortController()
+  let optionsController: AbortController | undefined
+  let optionsGeneration = 0
+  const materialPageSize = 50
 
   function errorMessage(caught: unknown): string {
     if (caught instanceof Error && 'status' in caught && caught.status === 409) {
@@ -74,6 +79,9 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
         api.get(projectId.value, controller.signal), api.publications(projectId.value, controller.signal),
       ])
       if (disposed || current !== generation) return
+      if (lockScope && (!historyScope.value || historyScope.value === 'shared' || row.scenario_id !== historyScope.value)) {
+        throw new Error('该蒸馏会话不属于当前业务场景')
+      }
       project.value = row
       draft.value = draftOf(row)
       publications.value = versions
@@ -105,6 +113,7 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
 
   async function save() {
     if (!draft.value.name.trim()) { error.value = '请先填写蒸馏项目名称。'; return null }
+    if (lockScope) draft.value.scenario_id = historyScope.value
     const row = await run('save', signal => project.value
       ? api.update(project.value.id, project.value.revision, draft.value, signal)
       : api.create(draft.value, signal))
@@ -178,26 +187,61 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
   }
 
   async function refreshOptions() {
-    const results = await Promise.allSettled([api.scenarios(optionsController.signal), api.materials(optionsController.signal)])
-    if (disposed) return
+    optionsController?.abort()
+    const controller = new AbortController()
+    optionsController = controller
+    const current = ++optionsGeneration
+    materialLoading.value = true
+    const scenarioId = historyScope.value && historyScope.value !== 'shared' ? historyScope.value : undefined
+    const results = await Promise.allSettled([
+      // The embedded scene workspace already has a fixed scene context and
+      // must not require workspace-level scenario-list permission just to
+      // load its own materials.
+      lockScope ? Promise.resolve(scenarios.value) : api.scenarios(controller.signal),
+      api.materials(scenarioId, materialOffset.value, materialPageSize, controller.signal),
+    ])
+    if (disposed || controller.signal.aborted || current !== optionsGeneration) return
     const [scenarioResult, materialResult] = results
     if (scenarioResult.status === 'fulfilled') scenarios.value = scenarioResult.value
-    if (materialResult.status === 'fulfilled') materials.value = materialResult.value
+    if (materialResult.status === 'fulfilled') {
+      materials.value = materialResult.value.items
+      materialHasMore.value = materialResult.value.has_more
+    }
     if (results.some(item => item.status === 'rejected')) error.value = '部分场景或资料库加载失败，请刷新资料选项重试。'
+    materialLoading.value = false
+  }
+
+  function previousMaterialPage() {
+    if (!materialLoading.value && materialOffset.value > 0) materialOffset.value = Math.max(0, materialOffset.value - materialPageSize)
+  }
+
+  function nextMaterialPage() {
+    if (!materialLoading.value && materialHasMore.value) materialOffset.value += materialPageSize
   }
 
   watch(projectId, () => { void load() }, { immediate: true })
   watch(offset, () => { void list() }, { immediate: true })
-  watch(historyScope, () => { projects.value = []; offset.value = 0; if (!projectId.value) draft.value = emptyDraft(); void list() }, { immediate: true })
-  void refreshOptions()
+  watch(historyScope, () => {
+    projects.value = []
+    materials.value = []
+    materialHasMore.value = false
+    offset.value = 0
+    if (!projectId.value) draft.value = emptyDraft()
+    if (materialOffset.value) materialOffset.value = 0
+    else void refreshOptions()
+    void list()
+  }, { immediate: true })
+  watch(materialOffset, () => { void refreshOptions() })
   onBeforeUnmount(() => {
     disposed = true
     generation += 1
     loadController?.abort()
     listController?.abort()
     actionController?.abort()
-    optionsController.abort()
+    optionsController?.abort()
   })
   return { projects, project, draft, scenarios, materials, publications, proposal, error, notice, loading, listing,
-    busy, offset, hasMore, dirty, list, load, save, analyze, applyProposal, publish, download, cancelAnalysis, refreshOptions, copyToScenario }
+    busy, offset, hasMore, dirty, materialOffset, materialHasMore, materialLoading, materialPageSize,
+    list, load, save, analyze, applyProposal, publish, download, cancelAnalysis, refreshOptions,
+    previousMaterialPage, nextMaterialPage, copyToScenario }
 }

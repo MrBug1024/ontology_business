@@ -25,17 +25,20 @@ test('access center uses one server manifest for REST and MCP', () => {
   assert.doesNotMatch(view, /data_source_id|dataset_version_id|provider_key|runtime_config/)
 })
 
-test('navigation puts the material library before distillation and preserves old routes', () => {
+test('navigation starts from scenarios while legacy material and distillation routes remain compatible', () => {
   const app = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
   const router = readFileSync(new URL('../src/router/index.ts', import.meta.url), 'utf8')
+  const nav = app.slice(app.indexOf('<nav class="side-nav"'), app.indexOf('</nav>'))
 
-  for (const label of ['场景能力', '资料库', '业务蒸馏', '验证中心', '发布与接入', '运行治理', '平台设置']) {
-    assert.match(app, new RegExp(label))
+  for (const label of ['场景能力', '验证中心', '发布与接入', '运行治理']) {
+    assert.match(nav, new RegExp(label))
   }
-  for (const path of ['/scenarios', '/data-sources', '/agents', '/access', '/tasks', '/templates', '/mcp']) {
+  assert.doesNotMatch(nav, /index="\/(?:data-sources|business-distillation)"/)
+  for (const path of ['/scenarios', '/data-sources', '/business-distillation/:id?', '/agents', '/access', '/tasks', '/templates', '/mcp']) {
     assert.match(router, new RegExp(`path: '${path.replace('/', '\\/')}`))
   }
-  assert.ok(app.indexOf('index="/data-sources"') < app.indexOf('index="/business-distillation"'))
+  assert.ok(nav.indexOf('index="/scenarios"') < nav.indexOf('index="/agents"'))
+  assert.ok(nav.indexOf('index="/agents"') < nav.indexOf('index="/access"'))
 })
 
 test('access center keeps loading feedback around manifests without flashing empty states', () => {

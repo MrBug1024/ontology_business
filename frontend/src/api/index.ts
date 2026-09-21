@@ -37,6 +37,7 @@ import type {
   DocumentReindexResult,
   DocumentSearchResult,
   DataSource,
+  DataSourceCatalog,
   DatasetHead,
   DatasetSchema,
   DatasetVersion,
@@ -546,6 +547,10 @@ export const api = {
   // 物理接入与文件管理（保留旧 API 兼容）。
   listDataSources: (sid?: string) =>
     http.get<DataSource[]>('/data-sources', { params: sid ? { scenario_id: sid } : {} }),
+  listDataSourceCatalog: (
+    params: { scenario_id?: string; offset?: number; limit?: number } = {},
+    signal?: AbortSignal,
+  ) => http.get<DataSourceCatalog>('/data-sources/catalog', { params, signal }),
   createDataSource: (d: Partial<DataSource>) => http.post<DataSource>('/data-sources', d),
   updateDataSource: (id: string, d: Partial<DataSource>) => http.put<DataSource>(`/data-sources/${id}`, d),
   deleteDataSource: (id: string) => http.delete(`/data-sources/${id}`),
@@ -573,8 +578,10 @@ export const api = {
   deleteFile: (fid: string) => http.delete(`/data-sources/files/${fid}`),
 
   // 统一附件模板中心
-  listTemplates: (params: { scenario_id?: string; status?: string; artifact_format?: string; q?: string } = {}) =>
-    http.get<ArtifactTemplate[]>('/templates', { params }),
+  listTemplates: (
+    params: { scenario_id?: string; status?: string; artifact_format?: string; q?: string } = {},
+    signal?: AbortSignal,
+  ) => http.get<ArtifactTemplate[]>('/templates', { params, signal }),
   getTemplate: (id: string) => http.get<ArtifactTemplateDetail>(`/templates/${id}`),
   registerTemplate: (d: {
     file_id: string

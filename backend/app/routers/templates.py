@@ -5,7 +5,7 @@ from contextlib import nullcontext
 import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy import or_, select
+from sqlalchemy import false, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -421,6 +421,44 @@ def _create(
         raise HTTPException(409, "模板标识或版本发生并发冲突，请刷新后重试") from exc
 
 
+def _visible_template_catalog_statement(
+    db: Session,
+    scenario_id: str | None,
+):
+    """Build a catalog query without crossing scenario/workspace visibility."""
+
+    tenant_id = tenant_service.current_tenant_id(db)
+    stmt = select(ArtifactTemplate).options(
+        selectinload(ArtifactTemplate.versions).selectinload(
+            ArtifactTemplateVersion.bucket_file
+        )
+    )
+    if scenario_id is None:
+        permission_service.require_tenant_permission(db, "read")
+        return stmt.where(ArtifactTemplate.tenant_id == tenant_id)
+
+    scenario = tenant_service.require_scenario(db, scenario_id)
+    permission_service.require_scenario_permission(db, scenario, "read")
+    if scenario.tenant_id != tenant_id:
+        # Template detail/download remains tenant-owned. Do not list foreign
+        # entries that the same principal cannot subsequently open.
+        return stmt.where(false())
+
+    scope = ArtifactTemplate.scenario_id == scenario.id
+    if db.info.get("external_scenario_id") is None:
+        # A scenario grant does not implicitly grant the workspace's shared
+        # catalog.  Keep the same boundary as the modeling-material catalog:
+        # merge tenant-shared templates only when the principal can read the
+        # workspace scope as well.
+        try:
+            permission_service.require_tenant_permission(db, "read")
+        except HTTPException:
+            pass
+        else:
+            scope = or_(ArtifactTemplate.scenario_id.is_(None), scope)
+    return stmt.where(ArtifactTemplate.tenant_id == tenant_id, scope)
+
+
 @router.get("", response_model=list[ArtifactTemplateSummaryOut])
 def list_templates(
     scenario_id: str | None = None,
@@ -433,21 +471,7 @@ def list_templates(
         raise HTTPException(400, "模板状态筛选值无效")
     if artifact_format not in (None, "docx", "xlsx", "markdown"):
         raise HTTPException(400, "模板格式筛选值无效")
-    tenant_id = tenant_service.current_tenant_id(db)
-    stmt = select(ArtifactTemplate).options(
-        selectinload(ArtifactTemplate.versions).selectinload(
-            ArtifactTemplateVersion.bucket_file
-        )
-    ).where(ArtifactTemplate.tenant_id == tenant_id)
-    if scenario_id:
-        _scenario_access(db, scenario_id, writable=False)
-        # A scenario workspace sees its own templates plus tenant-shared ones.
-        stmt = stmt.where(or_(
-            ArtifactTemplate.scenario_id.is_(None),
-            ArtifactTemplate.scenario_id == scenario_id,
-        ))
-    else:
-        permission_service.require_tenant_permission(db, "read")
+    stmt = _visible_template_catalog_statement(db, scenario_id)
     if status:
         stmt = stmt.where(ArtifactTemplate.status == status)
     search = q.strip()

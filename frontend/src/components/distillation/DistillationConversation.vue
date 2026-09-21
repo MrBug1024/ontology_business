@@ -1,12 +1,11 @@
 <template>
   <section class="discovery-conversation" aria-label="业务蒸馏对话">
     <div ref="scrollArea" class="discovery-messages" :class="{ 'is-empty': !turns.length }" @scroll="trackScroll">
-      <div v-if="!turns.length && !loading" class="discovery-welcome">
+      <div v-if="!turns.length && !loading" class="discovery-welcome" :class="{ 'is-compact': compact }">
         <div class="discovery-kicker">业务蒸馏</div>
-        <h1>先聊聊，你想弄清楚哪件事？</h1>
-        <p>从一个真实问题开始，一起查证事实、追问价值，找到值得建设的能力。</p>
+        <h1>从一个真实问题开始</h1>
         <div class="discovery-starters">
-          <button v-for="starter in starters" :key="starter.title" :disabled="disabled" @click="choose(starter.message)"><strong>{{ starter.title }}</strong><span>{{ starter.caption }}</span></button>
+          <button v-for="starter in starters" :key="starter.title" :disabled="disabled" @click="choose(starter.message)"><strong>{{ starter.title }}</strong><span v-if="!compact">{{ starter.caption }}</span></button>
         </div>
       </div>
       <p v-if="loading" class="discovery-muted" role="status">正在恢复对话…</p>
@@ -48,7 +47,7 @@
         <input ref="filePicker" class="discovery-visually-hidden" type="file" multiple tabindex="-1" aria-label="选择临时附件" :disabled="disabled || working || uploadBusy" @change="filesSelected" />
         <div class="discovery-composer-footer">
           <div class="distill-actions">
-            <DistillationResourceSettings v-model="resourceSelection" :disabled="disabled || working || sending" :scope-key="scopeKey" />
+            <DistillationResourceSettings v-model="resourceSelection" :disabled="disabled || working || sending" :scope-key="scopeKey" :scenario-id="scenarioId" />
             <el-button text :disabled="disabled || working || uploadBusy" @click="filePicker?.click()"><el-icon><Paperclip /></el-icon>临时附件</el-button>
             <el-button text :disabled="disabled || working || uploadBusy" @click="$emit('sources')">引用资料库</el-button>
           </div>
@@ -56,7 +55,7 @@
           <el-button v-else native-type="submit" type="primary" :disabled="disabled || !!blockedReason || uploadBusy || !input.trim()" :loading="sending">发送<el-icon class="discovery-send-icon"><Top /></el-icon></el-button>
         </div>
       </form>
-      <p class="discovery-composer-note">Ctrl / ⌘ + Enter 发送 · 临时附件不入资料库 · 阶段建议和结论由你核对后保存到资料库</p>
+      <p v-if="!compact" class="discovery-composer-note">Ctrl / ⌘ + Enter 发送 · 临时附件不入资料库 · 阶段建议经核对后保存</p>
     </div>
   </section>
 </template>
@@ -70,7 +69,7 @@ import DistillationResourceSettings from './DistillationResourceSettings.vue'
 import type { DistillationQuestion, DistillationResourceSelection, DistillationTurn } from '@/types/distillationConversation'
 import { composeClarificationAnswer, isWorking, TURN_STATUS_LABELS } from '@/utils/distillationConversation'
 const input = defineModel<string>({ required: true })
-const props = defineProps<{ turns: DistillationTurn[]; loading: boolean; hasMore: boolean; working: boolean; sending: boolean; cancelling: boolean; applying: string; disabled: boolean; canApply: boolean; error: string; blockedReason: string; uploadBusy: boolean; removingAttachment: string; scopeKey: string }>()
+const props = withDefaults(defineProps<{ turns: DistillationTurn[]; loading: boolean; hasMore: boolean; working: boolean; sending: boolean; cancelling: boolean; applying: string; disabled: boolean; canApply: boolean; error: string; blockedReason: string; uploadBusy: boolean; removingAttachment: string; scopeKey: string; scenarioId?: string; compact?: boolean }>(), { compact: false, scenarioId: '' })
 const emit = defineEmits<{ send: [selection: DistillationResourceSelection]; cancel: []; reload: []; older: []; sources: []; files: [files: File[]]; 'remove-submitted': [id: string]; preview: [turn: DistillationTurn]; apply: [turn: DistillationTurn] }>()
 const scrollArea = ref<HTMLElement>(), textarea = ref<HTMLTextAreaElement>()
 const filePicker = ref<HTMLInputElement>()

@@ -7,12 +7,19 @@ import uuid
 from dataclasses import dataclass
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from ..distillation_schemas import DistillationDocument, Evidence
 from ..models import BucketFile, DataSource
-from . import distillation_analysis_service as analysis, distillation_service, permission_service, release_service
+from . import (
+    distillation_analysis_service as analysis,
+    distillation_service,
+    permission_service,
+    release_service,
+    tenant_service,
+)
 from .distillation_evidence_service import capture_evidence_identity
 
 
@@ -25,17 +32,70 @@ def _safe_label(value: str) -> str:
     return text[:200] if isinstance(text, str) else "已隐藏敏感名称"
 
 
-def list_sources(db: Session, scenario_id: str | None, offset: int, limit: int) -> dict:
+def authorized_source_filters(
+    db: Session,
+    scenario_id: str | None,
+    *,
+    include_shared: bool,
+) -> tuple[ColumnElement[bool], ...]:
+    """Authorize and build the exact source scope for a catalog page."""
+
     principal = permission_service.require_principal(db)
-    distillation_service.authorize_scope(db, scenario_id)
-    try:
-        distillation_service.authorize_scope(db, None)
-        scope = or_(DataSource.scenario_id == scenario_id, DataSource.scenario_id.is_(None))
-    except HTTPException:
-        scope = DataSource.scenario_id == scenario_id
+    external_scenario_id = db.info.get("external_scenario_id")
+    common = (
+        DataSource.resource_scope == "modeling",
+        DataSource.type.in_(LIBRARY_TYPES),
+    )
+    if scenario_id is None:
+        if external_scenario_id is not None:
+            raise HTTPException(403, "场景凭据不能访问工作区共享资料")
+        permission_service.require_tenant_permission(db, "read")
+        return (
+            *common,
+            DataSource.tenant_id == principal.tenant_id,
+            DataSource.scenario_id.is_(None),
+        )
+
+    scenario = tenant_service.require_scenario(db, scenario_id)
+    permission_service.require_scenario_permission(db, scenario, "read")
+    if scenario.tenant_id != principal.tenant_id:
+        # A public scenario and a public source are separate visibility grants.
+        # Never blend the caller's workspace-shared rows into a foreign scenario.
+        return (
+            *common,
+            DataSource.tenant_id == scenario.tenant_id,
+            DataSource.scenario_id == scenario.id,
+            DataSource.is_public.is_(True),
+        )
+
+    scenario_scope = and_(
+        DataSource.tenant_id == principal.tenant_id,
+        DataSource.scenario_id == scenario.id,
+    )
+    shared_allowed = False
+    if include_shared and external_scenario_id is None:
+        try:
+            permission_service.require_tenant_permission(db, "read")
+            shared_allowed = True
+        except HTTPException:
+            # A scenario-specific allow must not implicitly grant workspace scope.
+            pass
+    if shared_allowed:
+        scope = or_(
+            scenario_scope,
+            and_(
+                DataSource.tenant_id == principal.tenant_id,
+                DataSource.scenario_id.is_(None),
+            ),
+        )
+    else:
+        scope = scenario_scope
+    return (*common, scope)
+
+
+def list_sources(db: Session, scenario_id: str | None, offset: int, limit: int) -> dict:
     rows = db.execute(select(DataSource.id, DataSource.name, DataSource.type, DataSource.scenario_id).where(
-        DataSource.tenant_id == principal.tenant_id, DataSource.resource_scope == "modeling",
-        DataSource.type.in_(LIBRARY_TYPES), scope)
+        *authorized_source_filters(db, scenario_id, include_shared=True))
         .order_by(DataSource.created_at.desc(), DataSource.id).offset(offset).limit(limit + 1)).all()
     return {"sources": [{"data_source_id": row.id, "name": _safe_label(row.name), "type": row.type,
         "scope": "scenario" if row.scenario_id else "shared"} for row in rows[:limit]], "has_more": len(rows) > limit,

@@ -85,6 +85,62 @@ test('scenario lifecycle toggle binds stable values instead of display labels', 
   assert.doesNotMatch(toggle, /<el-radio-button\s+label=/)
 })
 
+test('scenario workspace starts with distillation and keeps all twelve stages in order', () => {
+  const detailSource = readFileSync(new URL('../src/views/ScenarioDetail.vue', import.meta.url), 'utf8')
+  const scenariosSource = readFileSync(new URL('../src/views/Scenarios.vue', import.meta.url), 'utf8')
+  const appSource = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
+  const stages = [...detailSource.matchAll(/<el-tab-pane\b[^>]*\bname="([^"]+)"/g)].map((match) => match[1])
+
+  assert.deepEqual(stages, [
+    'distillation', 'materials', 'ontology', 'instances', 'mappings', 'functions',
+    'actions', 'rules', 'events', 'workflows', 'capability-inputs', 'candidates',
+  ])
+  assert.match(detailSource, /<el-tab-pane name="distillation"[\s\S]*?业务蒸馏/)
+  assert.match(detailSource, /<el-tab-pane name="materials"[\s\S]*?场景资料/)
+  assert.match(detailSource, /normalizeScenarioStage\(route\.query\.stage\)/)
+  assert.match(detailSource, /function goToDataSources\(\)[\s\S]*?stage: 'materials'/)
+  assert.match(scenariosSource, /query:\s*\{ stage: 'distillation' \}/)
+  assert.match(appSource, /normalizeScenarioStage\(route\.query\.stage\)/)
+  assert.match(appSource, /!\['distillation', 'materials'\]\.includes\(scenarioStage\.value\)/)
+})
+
+test('scenario stage normalization gives navigation and the global advisor one fallback', async () => {
+  const source = ts.transpileModule(
+    readFileSync(new URL('../src/utils/scenarioStages.ts', import.meta.url), 'utf8'),
+    { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } },
+  ).outputText
+  const { normalizeScenarioStage, SCENARIO_STAGES } = await import(
+    `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
+  )
+
+  assert.equal(SCENARIO_STAGES.length, 12)
+  assert.equal(normalizeScenarioStage('ontology'), 'ontology')
+  for (const value of [undefined, null, '', 'unknown', ['invalid', 'ontology'], {}]) {
+    assert.equal(normalizeScenarioStage(value), 'distillation')
+  }
+})
+
+test('embedded scenario materials lock writes to the current scenario permission', () => {
+  const viewSource = readFileSync(new URL('../src/views/DataSources.vue', import.meta.url), 'utf8')
+  const editorSource = readFileSync(new URL('../src/components/library/LibraryEditorDialog.vue', import.meta.url), 'utf8')
+  const scenarioSource = readFileSync(new URL('../src/views/ScenarioDetail.vue', import.meta.url), 'utf8')
+
+  assert.match(viewSource, /:lock-scenario="embedded"/)
+  assert.match(viewSource, /api\.listDataSourceCatalog\(\{ scenario_id: props\.scenarioId, offset: catalogOffset\.value, limit: CATALOG_PAGE_SIZE \}\)/)
+  assert.match(viewSource, /catalogHasMore\.value = Array\.isArray\(sourceResult\) \? false : sourceResult\.has_more/)
+  assert.match(viewSource, /else if \(props\.embedded\) \{\s*catalogOffset\.value = 0\s*await router\.replace\(sourceLocation\(id\)\)\s*await load\(\)/)
+  assert.match(viewSource, /materials_offset/)
+  assert.match(scenarioSource, /v-if="detail\.can_read_workspace_context"/)
+  assert.match(scenarioSource, /:show-templates="detail\.can_read_workspace_context"/)
+  assert.match(editorSource, /if \(props\.lockScenario\) form\.value\.scenario_id = props\.scenarioId/)
+  assert.match(viewSource, /v-if="canWrite" type="primary" size="small" @click="openCreate"/)
+  assert.match(viewSource, /:disabled="!canWrite \|\| !selected\.can_write \|\| !uploadList\.length"/)
+  assert.match(viewSource, /:disabled="!canWrite \|\| !selected\.can_write" @click="reindexFiles"/)
+  assert.match(viewSource, /async function doUpload\(\) \{\s*if \(!canWrite\.value \|\| !selected\.value\?\.can_write\) return/)
+  assert.match(viewSource, /async function reindexFiles\(\) \{\s*if \(!canWrite\.value \|\| !selected\.value\?\.can_write\) return/)
+  assert.match(viewSource, /\.resource-section-group \{[^}]*min-width: 0;[^}]*grid-template-columns: minmax\(0, 1fr\)/)
+})
+
 function routeDefinition(source, path) {
   const pathIndex = source.indexOf(`path: '${path}'`)
   assert.notEqual(pathIndex, -1, `missing route for ${path}`)
@@ -199,15 +255,26 @@ test('global tool settings show the server catalog for the distinct distillation
 test('artifact templates stay manageable inside the library after the legacy route redirect', () => {
   const librarySource = readFileSync(new URL('../src/views/DataSources.vue', import.meta.url), 'utf8')
   const templateSource = readFileSync(new URL('../src/views/Templates.vue', import.meta.url), 'utf8')
+  const scenarioSource = readFileSync(new URL('../src/views/ScenarioDetail.vue', import.meta.url), 'utf8')
 
-  assert.match(librarySource, /<el-tab-pane label="产物模板" name="templates"/)
-  assert.match(librarySource, /<Templates embedded @show-materials="showMaterials"/)
+  assert.match(librarySource, /<el-tab-pane[^>]*label="产物模板"[^>]*name="library-templates"/)
+  assert.match(librarySource, /<el-tab-pane[^>]*label="资料文件与数据库"[^>]*name="library-materials"/)
+  assert.match(librarySource, /<Templates embedded :scenario-id="routeScenarioId" :can-write="canWrite" :active="activeLibraryTab === 'templates'" @show-materials="showMaterials"/)
   assert.match(librarySource, /function libraryTabFromQuery[\s\S]*?candidate === 'templates'/)
+  assert.match(librarySource, /watch\(showTemplates, \(visible\) => \{[\s\S]*?activeLibraryTab\.value = libraryTabFromQuery\(route\.query\.library_tab\)/)
+  assert.doesNotMatch(librarySource, /onMounted\(\(\) => \{[\s\S]*?showTemplates\.value[^\n]*route\.query\.library_tab[^\n]*onLibraryTabChanged\('materials'\)/)
   assert.match(librarySource, /query\.library_tab = 'templates'/)
   assert.match(librarySource, /delete query\.library_tab/)
+  assert.match(scenarioSource, /stage: 'materials', library_tab: 'templates'/)
 
-  assert.match(templateSource, /defineProps<\{ embedded\?: boolean \}>/)
-  assert.match(templateSource, /template-section-header/)
+  assert.match(templateSource, /defineProps<\{ embedded\?: boolean; scenarioId\?: string; canWrite\?: boolean; active\?: boolean \}>/)
+  assert.match(templateSource, /template-section-toolbar/)
+  assert.match(templateSource, /canMutateTemplate/)
+  assert.match(templateSource, /api\.listDataSources\(props\.embedded \? props\.scenarioId : undefined\)/)
+  assert.match(templateSource, /watch\(\(\) => props\.active[\s\S]*?loadResources\(\)/)
+  assert.match(templateSource, /templatesController\?\.abort\(\)/)
+  assert.match(templateSource, /request !== templateRequest \|\| controller\.signal\.aborted/)
+  assert.match(templateSource, /route\.query\.q, route\.query\.scenario_id, route\.query\.artifact_format, route\.query\.status/)
   assert.match(templateSource, /emit\('showMaterials'\)/)
   assert.match(templateSource, /const query = \{ \.\.\.route\.query \}/)
   assert.match(templateSource, /await api\.uploadTemplateVersion/)

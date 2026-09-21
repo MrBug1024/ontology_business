@@ -1,5 +1,5 @@
 <template>
-  <section class="page template-page" :class="{ 'template-page--embedded': embedded }" :aria-labelledby="embedded ? 'template-registry-title' : 'template-page-title'">
+  <section class="page template-page" :class="{ 'template-page--embedded': embedded }" :aria-labelledby="embedded ? undefined : 'template-page-title'" :aria-label="embedded ? '产物模板' : undefined">
     <header v-if="!embedded" class="page-header">
       <div>
         <div class="eyebrow">GOVERNED ARTIFACTS</div>
@@ -15,14 +15,10 @@
       </el-tooltip>
     </header>
 
-    <header v-else class="template-section-header">
-      <div>
-        <div class="eyebrow">GOVERNED ARTIFACTS</div>
-        <h2 id="template-registry-title">产物模板</h2>
-        <p>集中管理各业务场景的 Word、Excel 与 Markdown 模板；版本、变量和 Action 引用关系始终可追溯。</p>
-      </div>
+    <header v-else class="template-section-toolbar">
+      <span>本页 {{ visibleTemplates.length }} 个模板</span>
       <el-tooltip :disabled="Boolean(writableBuckets.length)" content="请先创建一个可写文件桶" placement="bottom">
-        <span :tabindex="writableBuckets.length ? undefined : 0" :aria-label="writableBuckets.length ? undefined : '上传模板不可用：请先创建一个可写文件桶'">
+        <span v-if="canManage" :tabindex="writableBuckets.length ? undefined : 0" :aria-label="writableBuckets.length ? undefined : '上传模板不可用：请先创建一个可写文件桶'">
           <el-button type="primary" :disabled="!writableBuckets.length" @click="openCreate">
             <el-icon aria-hidden="true"><Upload /></el-icon>上传模板
           </el-button>
@@ -49,7 +45,7 @@
             <template #prefix><el-icon aria-hidden="true"><Search /></el-icon></template>
           </el-input>
         </label>
-        <label class="filter-field">
+        <label v-if="!embedded" class="filter-field">
           <span>业务场景</span>
           <el-select v-model="filters.scenario_id" clearable aria-label="按业务场景筛选">
             <el-option label="全部场景" value="" />
@@ -90,8 +86,8 @@
       <el-empty v-else-if="!visibleTemplates.length" :description="hasFilters ? '没有符合当前筛选条件的模板' : '还没有统一管理的附件模板'">
         <div class="empty-actions">
           <el-button v-if="hasFilters" @click="clearFilters">清除筛选</el-button>
-          <el-button v-if="writableBuckets.length" type="primary" @click="openCreate">上传第一个模板</el-button>
-          <el-button v-else type="primary" plain @click="goToDataSources">创建文件桶</el-button>
+          <el-button v-if="canManage && writableBuckets.length" type="primary" @click="openCreate">上传第一个模板</el-button>
+          <el-button v-else-if="canManage" type="primary" plain @click="goToDataSources">创建文件桶</el-button>
         </div>
       </el-empty>
       <template v-else>
@@ -141,8 +137,8 @@
             <template #default="{ row }">
               <div class="row-actions">
                 <el-button text type="primary" @click="openDetail(row)">查看</el-button>
-                <el-button text @click="openEdit(row)">编辑</el-button>
-                <el-dropdown trigger="click" @command="(command: string) => onRowCommand(command, row)">
+                <el-button v-if="canMutateTemplate(row)" text @click="openEdit(row)">编辑</el-button>
+                <el-dropdown v-if="canMutateTemplate(row)" trigger="click" @command="(command: string) => onRowCommand(command, row)">
                   <el-button text aria-label="更多模板操作">更多<el-icon aria-hidden="true"><ArrowDown /></el-icon></el-button>
                   <template #dropdown>
                     <el-dropdown-menu>
@@ -176,7 +172,7 @@
             </dl>
             <footer>
               <el-button type="primary" plain @click="openDetail(template)">查看详情</el-button>
-              <el-button @click="openEdit(template)">编辑</el-button>
+              <el-button v-if="canMutateTemplate(template)" @click="openEdit(template)">编辑</el-button>
             </footer>
           </article>
         </div>
@@ -191,7 +187,7 @@
           <el-radio-button value="register">登记桶内文件</el-radio-button>
         </el-radio-group>
         <div class="form-grid">
-          <el-form-item label="业务场景">
+          <el-form-item v-if="!embedded" label="业务场景">
             <el-select v-model="createForm.scenario_id" clearable placeholder="租户共享" aria-label="模板所属业务场景" @change="onCreateScenarioChanged">
               <el-option label="租户共享（所有场景可用）" value="" />
               <el-option v-for="scenario in scenarios" :key="scenario.id" :label="scenario.name" :value="scenario.id" />
@@ -244,7 +240,7 @@
         </div>
         <el-form-item label="说明"><el-input v-model.trim="editForm.description" type="textarea" :rows="3" maxlength="500" show-word-limit /></el-form-item>
         <div class="form-grid">
-          <el-form-item label="业务场景">
+          <el-form-item v-if="!embedded" label="业务场景">
             <el-select v-model="editForm.scenario_id" clearable placeholder="租户共享">
               <el-option label="租户共享（所有场景可用）" value="" />
               <el-option v-for="scenario in scenarios" :key="scenario.id" :label="scenario.name" :value="scenario.id" />
@@ -325,7 +321,7 @@
           <el-tab-pane :label="`版本 (${templateDetail.versions.length})`" name="versions">
             <div class="detail-tab-actions">
               <span>切换当前版本不会改写已固定版本的 Action。</span>
-              <el-button type="primary" plain :disabled="templateDetail.status !== 'active'" @click="openVersion(templateDetail)">添加版本</el-button>
+              <el-button v-if="canMutateTemplate(templateDetail)" type="primary" plain :disabled="templateDetail.status !== 'active'" @click="openVersion(templateDetail)">添加版本</el-button>
             </div>
             <div class="version-list">
               <article v-for="version in sortedVersions" :key="version.id" class="version-card">
@@ -342,7 +338,7 @@
                 </dl>
                 <footer>
                   <a class="el-button el-button--small is-text" :href="`/api/data-sources/files/${version.bucket_file_id}/download`">下载原文件</a>
-                  <el-button v-if="version.id !== templateDetail.current_version_id" text type="primary" :disabled="templateDetail.status !== 'active'" @click="setCurrentVersion(version.id)">设为当前</el-button>
+                  <el-button v-if="canMutateTemplate(templateDetail) && version.id !== templateDetail.current_version_id" text type="primary" :disabled="templateDetail.status !== 'active'" @click="setCurrentVersion(version.id)">设为当前</el-button>
                 </footer>
               </article>
             </div>
@@ -372,8 +368,8 @@ import { api } from '@/api'
 import type { ArtifactTemplate, ArtifactTemplateDetail, ArtifactTemplateReference, BucketFile, DataSource, Scenario } from '@/types'
 import { TEMPLATE_FILE_ACCEPT, isSupportedTemplateFilename, isTemplateBucketInScope, templateFormatLabel } from '@/utils/templates'
 
-withDefaults(defineProps<{ embedded?: boolean }>(), {
-  embedded: false,
+const props = withDefaults(defineProps<{ embedded?: boolean; scenarioId?: string; canWrite?: boolean; active?: boolean }>(), {
+  embedded: false, scenarioId: '', canWrite: false, active: true,
 })
 const emit = defineEmits<{ showMaterials: [] }>()
 
@@ -385,26 +381,46 @@ const dataSources = ref<DataSource[]>([])
 const loading = ref(true)
 const loadError = ref('')
 const operationNotice = reactive<{ type: 'success' | 'warning' | 'info' | 'error'; message: string }>({ type: 'success', message: '' })
-const filters = reactive({
-  q: typeof route.query.q === 'string' ? route.query.q : '',
-  scenario_id: typeof route.query.scenario_id === 'string' ? route.query.scenario_id : '',
-  artifact_format: typeof route.query.artifact_format === 'string' ? route.query.artifact_format : '',
-  status: typeof route.query.status === 'string' ? route.query.status : 'active',
-})
-const writableBuckets = computed(() => dataSources.value.filter((source) => source.type === 'file_bucket' && source.can_write !== false && source.id))
+const canManage = computed(() => !props.embedded || props.canWrite)
+function queryText(value: unknown) {
+  const candidate = Array.isArray(value) ? value[0] : value
+  return typeof candidate === 'string' ? candidate : ''
+}
+function routeFilters() {
+  return {
+    q: queryText(route.query.q),
+    scenario_id: props.embedded ? props.scenarioId : queryText(route.query.scenario_id),
+    artifact_format: queryText(route.query.artifact_format),
+    status: queryText(route.query.status) || 'active',
+  }
+}
+const filters = reactive(routeFilters())
+const writableBuckets = computed(() => canManage.value
+  ? dataSources.value.filter((source) => source.type === 'file_bucket'
+    && source.can_write !== false
+    && source.id
+    && (!props.embedded || isTemplateBucketInScope(source.scenario_id, props.scenarioId)))
+  : [])
 const visibleTemplates = computed(() => filters.scenario_id === '__shared__'
   ? templates.value.filter((template) => !template.scenario_id)
   : templates.value)
-const hasFilters = computed(() => Boolean(filters.q || filters.scenario_id || filters.artifact_format || filters.status !== 'active'))
+const hasFilters = computed(() => Boolean(
+  filters.q || (!props.embedded && filters.scenario_id) || filters.artifact_format || filters.status !== 'active',
+))
+function canMutateTemplate(template: Pick<ArtifactTemplate, 'scenario_id'>) {
+  return canManage.value && (!props.embedded || template.scenario_id === props.scenarioId)
+}
 
 let searchTimer: number | undefined
+let syncingRouteFilters = false
 watch(() => [filters.q, filters.scenario_id, filters.artifact_format, filters.status], () => {
+  if (syncingRouteFilters) return
   window.clearTimeout(searchTimer)
   searchTimer = window.setTimeout(() => {
     const query = { ...route.query }
     if (filters.q) query.q = filters.q
     else delete query.q
-    if (filters.scenario_id) query.scenario_id = filters.scenario_id
+    if (!props.embedded && filters.scenario_id) query.scenario_id = filters.scenario_id
     else delete query.scenario_id
     if (filters.artifact_format) query.artifact_format = filters.artifact_format
     else delete query.artifact_format
@@ -413,38 +429,93 @@ watch(() => [filters.q, filters.scenario_id, filters.artifact_format, filters.st
     void router.replace({ query })
     void loadTemplates()
   }, 260)
-})
+}, { flush: 'sync' })
 
+watch(
+  () => [route.query.q, route.query.scenario_id, route.query.artifact_format, route.query.status, props.scenarioId],
+  () => {
+    const next = routeFilters()
+    if (
+      next.q === filters.q
+      && next.scenario_id === filters.scenario_id
+      && next.artifact_format === filters.artifact_format
+      && next.status === filters.status
+    ) return
+    window.clearTimeout(searchTimer)
+    syncingRouteFilters = true
+    Object.assign(filters, next)
+    syncingRouteFilters = false
+    void loadTemplates()
+  },
+)
+
+let resourceRequest = 0
 async function loadResources() {
+  const request = ++resourceRequest
   try {
-    const [scenarioRows, sourceRows] = await Promise.all([api.listScenarios(), api.listDataSources()])
-    scenarios.value = scenarioRows
-    dataSources.value = sourceRows
+    const [scenarioResult, scopedResult, sharedResult] = await Promise.allSettled([
+      api.listScenarios(),
+      // Keep the embedded request explicitly scoped to the current scenario.
+      // A second tenant-visible read supplies shared buckets used by template
+      // authoring; writableBuckets narrows the result back to these two scopes.
+      api.listDataSources(props.embedded ? props.scenarioId : undefined),
+      props.embedded ? api.listDataSources() : Promise.resolve([]),
+    ])
+    if (request !== resourceRequest) return
+    if (scopedResult.status === 'rejected') throw scopedResult.reason
+    scenarios.value = scenarioResult.status === 'fulfilled' ? scenarioResult.value : []
+    if (scenarioResult.status === 'rejected') {
+      operationNotice.type = 'warning'
+      operationNotice.message = props.embedded
+        ? '场景列表暂不可用，当前仍可管理已有文件桶'
+        : '场景列表加载失败，模板目录仍可使用'
+    }
+    const byId = new Map<string, DataSource>()
+    const scopedSources = scopedResult.value
+    const sharedSources = sharedResult.status === 'fulfilled' ? sharedResult.value : []
+    for (const source of [...scopedSources, ...sharedSources]) {
+      if (source.id) byId.set(source.id, source)
+    }
+    dataSources.value = [...byId.values()]
+    if (sharedResult.status === 'rejected' && props.embedded) {
+      operationNotice.type = 'info'
+      operationNotice.message = '工作区共享文件桶暂不可用，当前仅显示场景文件桶'
+    }
   } catch (error: any) {
+    if (request !== resourceRequest) return
     operationNotice.type = 'error'
     operationNotice.message = error?.message || '场景与文件桶加载失败，部分操作暂不可用'
   }
 }
 
+let templateRequest = 0
+let templatesController: AbortController | undefined
 async function loadTemplates() {
+  const request = ++templateRequest
+  templatesController?.abort()
+  const controller = new AbortController()
+  templatesController = controller
   loading.value = true
   loadError.value = ''
   try {
-    templates.value = await api.listTemplates({
+    const rows = await api.listTemplates({
       ...(filters.scenario_id && filters.scenario_id !== '__shared__' ? { scenario_id: filters.scenario_id } : {}),
       ...(filters.status ? { status: filters.status } : {}),
       ...(filters.artifact_format ? { artifact_format: filters.artifact_format } : {}),
       ...(filters.q.trim() ? { q: filters.q.trim() } : {}),
-    })
+    }, controller.signal)
+    if (request !== templateRequest || controller.signal.aborted) return
+    templates.value = rows
   } catch (error: any) {
+    if (request !== templateRequest || controller.signal.aborted) return
     loadError.value = error?.message || '请稍后重试。'
   } finally {
-    loading.value = false
+    if (request === templateRequest && !controller.signal.aborted) loading.value = false
   }
 }
 
 function clearFilters() {
-  Object.assign(filters, { q: '', scenario_id: '', artifact_format: '', status: 'active' })
+  Object.assign(filters, { q: '', scenario_id: props.embedded ? props.scenarioId : '', artifact_format: '', status: 'active' })
 }
 function scenarioName(id?: string | null) {
   if (!id) return '租户共享'
@@ -469,6 +540,7 @@ function deleteDisabledReason(template: ArtifactTemplate) {
 }
 function goToDataSources() {
   emit('showMaterials')
+  if (props.embedded) return
   if (!route.matched.some((record) => record.name === 'data-sources')) {
     void router.push({ name: 'data-sources', query: { ...route.query, library_tab: 'materials' } })
   }
@@ -491,8 +563,9 @@ const canSubmitCreate = computed(() => Boolean(
 ))
 
 function openCreate() {
+  if (!canManage.value) return
   resetCreateForm()
-  const scenarioId = filters.scenario_id && filters.scenario_id !== '__shared__' ? filters.scenario_id : ''
+  const scenarioId = props.embedded ? props.scenarioId : filters.scenario_id && filters.scenario_id !== '__shared__' ? filters.scenario_id : ''
   createForm.scenario_id = scenarioId
   createForm.data_source_id = createBuckets.value[0]?.id || ''
   createDialog.value = true
@@ -539,7 +612,8 @@ watch(() => createForm.mode, () => {
   if (createForm.mode === 'register') void loadRegistrationFiles()
 })
 async function createTemplate() {
-  if (!canSubmitCreate.value || createSaving.value) return
+  if (!canManage.value || !canSubmitCreate.value || createSaving.value) return
+  if (props.embedded) createForm.scenario_id = props.scenarioId
   createSaving.value = true
   createError.value = ''
   uploadProgress.value = 0
@@ -573,6 +647,7 @@ const editSaving = ref(false)
 const editError = ref('')
 const editForm = reactive({ id: '', name: '', purpose: '', description: '', key: '', scenario_id: '' })
 function openEdit(template: ArtifactTemplate) {
+  if (!canMutateTemplate(template)) return
   Object.assign(editForm, {
     id: template.id, name: template.name, purpose: template.purpose || '', description: template.description || '',
     key: template.key, scenario_id: template.scenario_id || '',
@@ -581,7 +656,8 @@ function openEdit(template: ArtifactTemplate) {
   editDialog.value = true
 }
 async function saveMetadata() {
-  if (!editForm.id || !editForm.name || !editForm.purpose || editSaving.value) return
+  if (!canManage.value || !editForm.id || !editForm.name || !editForm.purpose || editSaving.value) return
+  if (props.embedded) editForm.scenario_id = props.scenarioId
   editSaving.value = true
   editError.value = ''
   try {
@@ -612,6 +688,7 @@ const versionForm = reactive({ mode: 'upload' as 'upload' | 'register', data_sou
 const versionBuckets = computed(() => writableBuckets.value.filter((bucket) => isTemplateBucketInScope(bucket.scenario_id, versionTarget.value?.scenario_id)))
 const canSubmitVersion = computed(() => Boolean(versionForm.data_source_id && (versionForm.mode === 'upload' ? versionForm.file : versionForm.file_id)))
 function openVersion(template: ArtifactTemplate) {
+  if (!canMutateTemplate(template)) return
   if (template.status !== 'active') return ElMessage.warning('已停用模板不能添加新版本，请先恢复模板')
   resetVersionForm()
   versionTarget.value = template
@@ -655,7 +732,7 @@ watch(() => versionForm.mode, () => {
   if (versionForm.mode === 'register') void loadVersionRegistrationFiles()
 })
 async function createVersion() {
-  if (!versionTarget.value || !canSubmitVersion.value || versionSaving.value) return
+  if (!versionTarget.value || !canMutateTemplate(versionTarget.value) || !canSubmitVersion.value || versionSaving.value) return
   versionSaving.value = true
   versionError.value = ''
   uploadProgress.value = 0
@@ -716,7 +793,7 @@ async function reloadDetail() {
   if (id) await loadDetail(id)
 }
 async function setCurrentVersion(versionId: string) {
-  if (!templateDetail.value) return
+  if (!templateDetail.value || !canMutateTemplate(templateDetail.value)) return
   try {
     templateDetail.value = await api.updateTemplate(templateDetail.value.id, { current_version_id: versionId })
     operationNotice.type = 'success'
@@ -738,6 +815,7 @@ async function onRowCommand(command: string, template: ArtifactTemplate) {
   if (command === 'delete') return removeTemplate(template)
 }
 async function changeStatus(template: ArtifactTemplate, status: 'active' | 'deprecated') {
+  if (!canMutateTemplate(template)) return
   if (status === 'deprecated') {
     try {
       await ElMessageBox.confirm(
@@ -759,6 +837,7 @@ async function changeStatus(template: ArtifactTemplate, status: 'active' | 'depr
   }
 }
 async function removeTemplate(template: ArtifactTemplate) {
+  if (!canMutateTemplate(template)) return
   if (!template.deletable) return ElMessage.warning(deleteDisabledReason(template))
   try {
     await ElMessageBox.confirm('模板及其版本记录将被删除；文件桶中的原文件由文件桶独立管理。确认继续？', `删除模板“${template.name}”`, {
@@ -778,7 +857,13 @@ async function removeTemplate(template: ArtifactTemplate) {
 onMounted(async () => {
   await Promise.all([loadResources(), loadTemplates()])
 })
+watch(() => props.active, (active, previous) => {
+  if (active && previous === false) void loadResources()
+})
 onBeforeUnmount(() => {
+  resourceRequest += 1
+  templateRequest += 1
+  templatesController?.abort()
   if (searchTimer !== undefined) window.clearTimeout(searchTimer)
 })
 </script>
@@ -786,6 +871,8 @@ onBeforeUnmount(() => {
 <style scoped>
 .template-page { position: relative; }
 .template-page--embedded { padding: 4px 0 0; }
+.template-section-toolbar { display: flex; min-height: 42px; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 8px; color: var(--text-3); font-size: 12px; }
+.template-page--embedded .filter-grid { grid-template-columns: minmax(230px, 1.6fr) repeat(2, minmax(150px, .75fr)); }
 .template-section-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin: 2px 0 16px; }
 .template-section-header h2 { margin: 0; color: var(--text); font-size: 20px; }
 .template-section-header p { max-width: 760px; margin: 5px 0 0; color: var(--text-3); font-size: 13px; line-height: 1.65; }
@@ -864,6 +951,7 @@ onBeforeUnmount(() => {
 
 @media (max-width: 1100px) {
   .filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .template-page--embedded .filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
   .template-section-header { align-items: stretch; flex-direction: column; }

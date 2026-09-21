@@ -1,5 +1,5 @@
 import { http } from '@/api'
-import type { BucketFile, DataSource, Scenario } from '@/types'
+import type { BucketFile, DataSourceCatalog, Scenario } from '@/types'
 import type { DistillationDraft, DistillationProject, DistillationProposal, DistillationPublication, DistillationTargetSystem } from '@/types/businessDistillation'
 
 const root = '/business-distillation'
@@ -30,7 +30,11 @@ export const businessDistillationApi = {
   artifact: (id: string, publicationId: string, key: string, signal: AbortSignal) =>
     http.get<Blob>(`${projectPath(id)}/publications/${encodeURIComponent(publicationId)}/artifacts/${encodeURIComponent(key)}`, { signal, responseType: 'blob' }),
   scenarios: (signal: AbortSignal) => http.get<Scenario[]>('/scenarios', { signal }),
-  materials: (signal: AbortSignal) => http.get<DataSource[]>('/data-sources', { signal }),
+  materials: (scenarioId: string | undefined, offset: number, limit: number, signal: AbortSignal) =>
+    http.get<DataSourceCatalog>('/data-sources/catalog', {
+      params: { scenario_id: scenarioId, offset, limit },
+      signal,
+    }),
   files: (sourceId: string, signal: AbortSignal) => http.get<BucketFile[]>(`/data-sources/${encodeURIComponent(sourceId)}/files`, { signal }),
 }
 

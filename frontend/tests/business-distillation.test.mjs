@@ -42,7 +42,7 @@ function deferred() {
 }
 function row(id, revision = 1) { return { id, revision, name: id, scenario_id: null, document: emptyDistillationDocument(), can_write: true } }
 const fakeApi = {
-  list: async () => [], scenarios: async () => [], materials: async () => [], publications: async () => [],
+  list: async () => [], scenarios: async () => [], materials: async () => ({ items: [], has_more: false, next_offset: null }), publications: async () => [],
   get: async id => row(id), update: async (id, revision, draft) => ({ ...row(id, revision + 1), ...draft }),
 }
 globalThis.__distillationTestApi = fakeApi
@@ -61,11 +61,11 @@ const renderer = createRenderer({
   insert() {}, remove() {}, setText() {}, setElementText() {}, patchProp() {},
   parentNode: () => null, nextSibling: () => null,
 })
-function mount(id, scope = '') {
+function mount(id, scope = '', lockScope = false) {
   const projectId = ref(id)
   const historyScope = ref(scope)
   let state
-  const app = renderer.createApp({ setup() { state = useBusinessDistillation(projectId, historyScope); return () => h('div') } })
+  const app = renderer.createApp({ setup() { state = useBusinessDistillation(projectId, historyScope, lockScope); return () => h('div') } })
   app.mount({})
   return { state, projectId, historyScope, stop: () => app.unmount() }
 }
@@ -133,7 +133,7 @@ test('missing model configuration keeps the actionable server explanation and dr
 test('new conversations inherit the chosen scenario without becoming an unsaved shared draft', async () => {
   let saved
   fakeApi.create = async draft => { saved = JSON.parse(JSON.stringify(draft)); return { ...row('created'), ...draft } }
-  const { state, stop } = mount('', 'scenario-a')
+  const { state, stop } = mount('', 'scenario-a', true)
   await flush()
   assert.equal(state.draft.value.scenario_id, 'scenario-a')
   assert.equal(state.dirty.value, false)
@@ -163,17 +163,59 @@ test('scenario history is filtered on the server, and the default history is the
   stop()
 })
 
-test('the workspace permits an upstream unscoped conversation and keeps the scenario picker optional', () => {
-  const view = readFileSync(new URL('../src/views/BusinessDistillation.vue', import.meta.url), 'utf8')
+test('scenario workspace fixes distillation to the current scenario while the old route remains a thin compatibility shell', async () => {
+  const legacyView = readFileSync(new URL('../src/views/BusinessDistillation.vue', import.meta.url), 'utf8')
+  const workspace = readFileSync(new URL('../src/components/distillation/DistillationWorkspace.vue', import.meta.url), 'utf8')
   const scenarioDetail = readFileSync(new URL('../src/views/ScenarioDetail.vue', import.meta.url), 'utf8')
 
-  assert.match(view, /placeholder="可选：关联业务场景"/)
-  assert.match(view, /未关联场景的对话/)
-  assert.match(view, /return route\.query\.shared === '1' \? 'shared'[^\n]*: 'shared'/)
-  assert.doesNotMatch(view, /!canCreate \|\| !selectedScenario/)
-  assert.doesNotMatch(view, /!projectId && !selectedScenario/)
-  assert.match(view, /if \(!canCreate\.value\) return null/)
+  assert.match(legacyView, /<DistillationWorkspace\s*\/>/)
+  assert.match(scenarioDetail, /<DistillationWorkspace[^>]*embedded[^>]*:scenario-id="scenarioId"/)
+  assert.match(workspace, /props\.scenarioId \|\|/)
+  assert.match(workspace, /useBusinessDistillation\(projectId, historyScope, props\.embedded\)/)
+  assert.match(workspace, /const authorizedProjectId = computed/)
+  assert.match(workspace, /useDistillationConversation\(authorizedProjectId, draftKey\)/)
+  assert.match(workspace, /useDistillationAttachments\(authorizedProjectId\)/)
+  assert.match(workspace, /v-if="!embedded" class="discovery-sources"/)
+  assert.match(workspace, /v-if="!embedded"[\s\S]*?placeholder="选择场景"/)
   assert.match(scenarioDetail, /\['postgres', 'mysql', 'sqlite3', 'dataset'\]\.includes\(source\.type\)/)
+
+  fakeApi.get = async id => ({ ...row(id), scenario_id: 'other-scenario' })
+  const { state, stop } = mount('foreign-project', 'scenario-a', true)
+  await flush()
+  assert.equal(state.project.value, null)
+  assert.match(state.error.value, /不属于当前业务场景/)
+  stop()
+})
+
+test('scenario material picker uses the bounded catalog and resets its page when scope changes', async () => {
+  const requests = []
+  fakeApi.materials = async (scenarioId, offset, limit) => {
+    requests.push({ scenarioId, offset, limit })
+    return { items: [{ id: `${scenarioId}-${offset}`, name: 'Material', scenario_id: scenarioId, type: 'file_bucket', config: {} }], has_more: offset === 0, next_offset: offset === 0 ? 50 : null }
+  }
+  const { state, historyScope, stop } = mount('', 'scenario-a', true)
+  await flush()
+  assert.deepEqual(requests.at(-1), { scenarioId: 'scenario-a', offset: 0, limit: 50 })
+  assert.equal(state.materials.value[0].id, 'scenario-a-0')
+  state.nextMaterialPage()
+  await flush()
+  assert.deepEqual(requests.at(-1), { scenarioId: 'scenario-a', offset: 50, limit: 50 })
+  historyScope.value = 'scenario-b'
+  await flush()
+  assert.equal(state.materialOffset.value, 0)
+  assert.deepEqual(requests.at(-1), { scenarioId: 'scenario-b', offset: 0, limit: 50 })
+  stop()
+})
+
+test('scenario readers can inspect distillation context and browse material pages without write access', () => {
+  const workspace = readFileSync(new URL('../src/components/distillation/DistillationWorkspace.vue', import.meta.url), 'utf8')
+  const picker = readFileSync(new URL('../src/components/distillation/DistillationLibraryPicker.vue', import.meta.url), 'utf8')
+
+  assert.match(workspace, /:disabled="\(!canEdit && !project\) \|\| actionBusy \|\| !!active \|\| loading"/)
+  assert.match(workspace, /function openSources\(\)[\s\S]*?if \(\(!canEdit\.value && !project\.value\) \|\| actionBusy\.value \|\| active\.value \|\| loading\.value\) return/)
+  assert.match(workspace, /async function openSystems\(\)[\s\S]*?if \(\(!canEdit\.value && !project\.value\) \|\| actionBusy\.value \|\| active\.value \|\| loading\.value\) return/)
+  assert.match(picker, /:disabled="loading \|\| !offset"/)
+  assert.match(picker, /:disabled="loading \|\| !hasMore"/)
 })
 
 
@@ -212,7 +254,7 @@ test('explicit handoff decision survives a failed publication and can be retried
   stop()
 })
 
-const decisionViewSource = readFileSync(new URL('../src/views/BusinessDistillation.vue', import.meta.url), 'utf8')
+const decisionViewSource = readFileSync(new URL('../src/components/distillation/DistillationWorkspace.vue', import.meta.url), 'utf8')
 const decisionPublishFunction = decisionViewSource.slice(decisionViewSource.indexOf('async function publishDecision('), decisionViewSource.indexOf('\nfunction openMaterial('))
 const decisionPublisherModule = ts.transpileModule(`
   export function decisionPublisher(project, draft, dirty, save, publish) {

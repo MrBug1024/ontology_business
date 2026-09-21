@@ -23,7 +23,10 @@ function selectionPayload(selection: DistillationResourceSelection = {}): Requir
 export const distillationConversationApi = {
   list: (projectId: string, beforeTurn: number | undefined, signal: AbortSignal) =>
     http.get<DistillationConversationPage>(path(projectId), { params: { limit: 20, before_turn_number: beforeTurn }, signal }),
-  resources: (signal: AbortSignal) => http.get<DistillationResourceOptions>('/business-distillation/resources', { signal }),
+  resources: (signal: AbortSignal, scenarioId?: string) => http.get<DistillationResourceOptions>('/business-distillation/resources', {
+    params: { scenario_id: scenarioId || undefined },
+    signal,
+  }),
   send: (
     projectId: string,
     requestId: string,

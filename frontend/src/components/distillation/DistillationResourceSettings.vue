@@ -28,7 +28,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { Setting } from '@element-plus/icons-vue'
 import { distillationConversationApi } from '@/api/distillationConversation'
 import type { DistillationResourceOptions, DistillationResourceSelection, InvestigationToolKey } from '@/types/distillationConversation'
-const props = defineProps<{ disabled: boolean; scopeKey: string }>()
+const props = defineProps<{ disabled: boolean; scopeKey: string; scenarioId?: string }>()
 const selection = defineModel<DistillationResourceSelection>({ required: true })
 const route = useRoute(), router = useRouter()
 const emptyOptions = (): DistillationResourceOptions => ({ models: [], skills: [], mcps: [], investigation_tools: { default_tool_keys: [], always_available_tool_keys: [], tools: [] } })
@@ -48,13 +48,13 @@ async function load() {
   controller = current
   loading.value = true; error.value = ''
   try {
-    const result = await distillationConversationApi.resources(current.signal)
+    const result = await distillationConversationApi.resources(current.signal, props.scenarioId)
     if (!current.signal.aborted) { options.value = result; loaded.value = true }
   } catch (caught: unknown) {
     if (!current.signal.aborted) error.value = caught instanceof Error ? caught.message : '配置加载失败，请重试。'
   } finally { if (controller === current) { loading.value = false; controller = undefined } }
 }
-watch(() => props.scopeKey, () => {
+watch(() => [props.scopeKey, props.scenarioId], () => {
   controller?.abort(); controller = undefined
   options.value = emptyOptions(); loaded.value = false; loading.value = false; error.value = ''
   selection.value = { llm_config_id: null, skill_ids: [], mcp_ids: [], investigation_tool_keys: null }

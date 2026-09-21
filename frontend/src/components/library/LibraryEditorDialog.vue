@@ -8,7 +8,7 @@
           <el-radio v-for="type in LIBRARY_TYPES" :key="type.value" :value="type.value">{{ type.label }}</el-radio>
         </el-radio-group>
       </el-form-item>
-      <el-form-item label="业务场景">
+      <el-form-item v-if="!lockScenario" label="业务场景">
         <el-select v-model="form.scenario_id" clearable filterable :disabled="saving || !!pendingSource || (source?.type === 'sqlite3' && !!source.file_count)" placeholder="工作区共享资料" aria-label="选择资料库业务场景">
           <el-option v-for="scenario in scenarios" :key="scenario.id" :value="scenario.id" :label="scenario.name" />
         </el-select>
@@ -49,7 +49,9 @@ import type { DataSource, Scenario } from '@/types'
 import { libraryApi } from '@/api/library'
 import { LIBRARY_TYPES, defaultLibraryPort, libraryForm, libraryPayload, validateSqliteFile } from '@/utils/library'
 
-const props = defineProps<{ modelValue: boolean; source: DataSource | null; scenarios: Scenario[]; scenarioId?: string }>()
+const props = withDefaults(defineProps<{ modelValue: boolean; source: DataSource | null; scenarios: Scenario[]; scenarioId?: string; lockScenario?: boolean }>(), {
+  scenarioId: '', lockScenario: false,
+})
 const emit = defineEmits<{ 'update:modelValue': [value: boolean]; saved: [source: DataSource] }>()
 const form = ref(libraryForm())
 const saving = ref(false)
@@ -87,6 +89,7 @@ async function save() {
   if (saving.value) return
   error.value = ''
   try {
+    if (props.lockScenario) form.value.scenario_id = props.scenarioId
     const payload = libraryPayload(form.value)
     if (payload.type === 'sqlite3' && !props.source?.file_count) {
       if (!picked.value) throw new Error('请选择 SQLite3 数据库快照')

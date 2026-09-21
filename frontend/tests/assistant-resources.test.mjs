@@ -149,11 +149,12 @@ const advisorSource = readFileSync(new URL('../src/components/GlobalAssistant.vu
 const previewFunction = advisorSource.slice(advisorSource.indexOf('async function openSource('), advisorSource.indexOf('\nfunction toggleProposal('))
 const previewHarness = ts.transpileModule(`
   import { assistantSourceDisplay } from '${new URL('../src/utils/assistantSourceDisplay.ts', import.meta.url).href}'
-  export function createPreview(fileText) {
+  export function createPreview(fileText, scenarioId = '') {
     const api = { fileText }, sourcePreview = { value: null }, sourcePreviewText = { value: '' }
     const sourcePreviewVisible = { value: false }, sourcePreviewLoading = { value: false }, errors = []
     const ElMessage = { error: message => errors.push(message) }, navigations = []
     const router = { push: async path => navigations.push(path) }
+    const context = { value: { scenario_id: scenarioId } }
     let sourcePreviewRequest = 0
     ${previewFunction}
     return { openSource, sourcePreview, sourcePreviewText, sourcePreviewVisible, sourcePreviewLoading, errors, navigations }
@@ -212,4 +213,14 @@ test('immutable distillation citations open their governed library source instea
   assert.deepEqual(preview.navigations, ['/data-sources?source_id=source'])
   assert.equal(preview.sourcePreviewVisible.value, false)
   assert.equal(reads, 0)
+})
+
+test('scene-scoped distillation citations stay inside the scene workspace', async () => {
+  const preview = createPreview(async () => ({ text: '' }), 'scene-a')
+  await preview.openSource({ id: 'distillation:publication', kind: 'distillation', filename: '业务蒸馏 v3', data_source_id: 'source' })
+  assert.deepEqual(preview.navigations, [{
+    name: 'scenario-detail',
+    params: { id: 'scene-a' },
+    query: { stage: 'materials', source_id: 'source' },
+  }])
 })

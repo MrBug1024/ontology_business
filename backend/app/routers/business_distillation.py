@@ -22,8 +22,14 @@ router = APIRouter(prefix="/business-distillation", tags=["business-distillation
 
 
 @router.get("/resources", response_model=InvestigationResourceCatalogOut)
-def list_investigation_resources(db: Session = Depends(get_tenant_db)):
-    return distillation_resource_service.resource_catalog(db)
+def list_investigation_resources(
+    scenario_id: str | None = Query(None, max_length=32),
+    db: Session = Depends(get_tenant_db),
+):
+    try:
+        return distillation_resource_service.resource_catalog(db, scenario_id)
+    except PermissionError as exc:
+        raise HTTPException(403, "没有该业务场景的调查资源权限") from exc
 
 
 def _project_out(db: Session, row: DistillationProject) -> ProjectOut:
@@ -43,7 +49,10 @@ def list_projects(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, g
                   scenario_id: str | None = Query(None, max_length=32), shared_only: bool = False,
                   db: Session = Depends(get_tenant_db)):
     principal = permission_service.require_principal(db)
-    permission_service.require_tenant_permission(db, "read")
+    # A scenario-scoped view is governed by that scenario's ACL.  Do not
+    # require workspace-level read here: a collaborator may have an explicit
+    # scenario read grant while the workspace's shared catalog remains out of
+    # scope.  The tenant gate is retained for global/shared history below.
     query = select(DistillationProject).where(DistillationProject.tenant_id == principal.tenant_id)
     denied = exists(select(AuthorizationGrant.id).where(
         AuthorizationGrant.organization_id == principal.organization_id,
@@ -56,10 +65,13 @@ def list_projects(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, g
     if shared_only and scenario_id:
         raise HTTPException(422, "场景筛选和共享历史筛选不能同时使用")
     if shared_only:
+        permission_service.require_tenant_permission(db, "read")
         query = query.where(DistillationProject.scenario_id.is_(None))
     if scenario_id:
         distillation_service.authorize_scope(db, scenario_id)
         query = query.where(DistillationProject.scenario_id == scenario_id)
+    elif not shared_only:
+        permission_service.require_tenant_permission(db, "read")
     rows = db.scalars(query.order_by(DistillationProject.updated_at.desc(), DistillationProject.id).offset(offset).limit(limit)).all()
     result = []
     for row in rows:

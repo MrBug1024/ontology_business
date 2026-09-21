@@ -1,4 +1,5 @@
 .discovery-workspace { position: relative; display: block; height: calc(100dvh - 64px); min-height: 0; overflow: hidden; background: var(--surface); color: var(--text); }
+.discovery-workspace.is-embedded { height: clamp(620px, calc(100dvh - 178px), 900px); border: 1px solid var(--border); border-radius: 8px; }
 .discovery-sidebar { position: absolute; z-index: 22; top: 0; bottom: 0; left: 0; display: none; width: min(276px, calc(100vw - 32px)); min-width: 0; min-height: 0; flex-direction: column; padding: 16px 12px; border-right: 1px solid var(--border); background: var(--surface-2); box-shadow: var(--shadow-lg); }
 .with-projects .discovery-sidebar { display: flex; }
 .discovery-sidebar-heading, .discovery-sidebar-label, .discovery-toolbar, .discovery-toolbar-title, .discovery-composer-footer, .discovery-speaker { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
@@ -44,14 +45,17 @@
 .discovery-library-options input { margin-top: 4px; width: 17px; height: 17px; accent-color: var(--primary); }
 .discovery-library-options strong { display: block; font-size: 13px; line-height: 1.6; }
 .discovery-library-options small { display: block; color: var(--text-2); margin-top: 4px; }
+.discovery-library-pages { display: flex; min-height: 36px; align-items: center; justify-content: space-between; gap: 8px; color: var(--text-3); font-size: 12px; }
 .discovery-toolbar .distill-actions { flex-shrink: 0; gap: 4px; }
 .discovery-notices { padding: 10px 20px 0; }
 .discovery-conversation { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
 .discovery-messages { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 24px max(24px, calc((100% - 760px) / 2)); scroll-behavior: auto; }
 .discovery-messages.is-empty { display: flex; align-items: center; justify-content: center; }
 .discovery-welcome { width: 100%; max-width: 700px; padding: 36px 0 24px; }
+.discovery-welcome.is-compact { max-width: 620px; padding: 16px 0; }
 .discovery-kicker { color: var(--primary); font-size: 12px; font-weight: 650; letter-spacing: 2px; margin-bottom: 16px; }
 .discovery-welcome h1 { font-size: clamp(23px, 2vw, 30px); line-height: 1.45; font-weight: 600; margin: 0 0 14px; letter-spacing: -.5px; }
+.discovery-welcome.is-compact h1 { margin-bottom: 8px; font-size: 20px; letter-spacing: 0; }
 .discovery-welcome > p { color: var(--text-2); font-size: 14px; line-height: 1.8; max-width: 46ch; }
 .discovery-starters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 28px; }
 .discovery-starters button { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 14px; color: var(--text); text-align: left; cursor: pointer; font: inherit; }
@@ -179,6 +183,7 @@
 }
 @media (max-width: 760px) {
   .discovery-workspace { height: calc(100dvh - 60px); }
+  .discovery-workspace.is-embedded { height: 680px; min-height: 680px; }
   .discovery-sidebar { width: min(290px, calc(100vw - 24px)); }
   .discovery-toolbar { padding: 0 10px; gap: 4px; }
   .discovery-toolbar-title { flex: 1; }

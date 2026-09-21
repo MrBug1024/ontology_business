@@ -37,7 +37,7 @@
             <div><b>{{ s.data_source_count || 0 }}</b><span>建模接入</span></div>
           </div>
           <div class="sc-actions">
-            <el-button size="small" type="primary" plain @click="$router.push('/scenarios/' + s.id)"><el-icon><ArrowRight /></el-icon> {{ s.status === 'retired' ? '查看审计' : '进入场景' }}</el-button>
+            <el-button size="small" type="primary" plain @click="$router.push({ name: 'scenario-detail', params: { id: s.id }, query: { stage: 'distillation' } })"><el-icon><ArrowRight /></el-icon> {{ s.status === 'retired' ? '查看审计' : '进入场景' }}</el-button>
             <el-button v-if="s.status !== 'retired'" size="small" text type="primary" @click="openEdit(s)"><el-icon><Edit /></el-icon> 编辑</el-button>
             <el-button v-if="s.status !== 'retired'" size="small" text type="danger" @click="remove(s)"><el-icon><Delete /></el-icon> 退役</el-button>
             <el-button v-if="s.status === 'retired'" size="small" text type="primary" :loading="restoringId === s.id" @click="restore(s)"><el-icon><RefreshLeft /></el-icon> 恢复</el-button>
@@ -198,7 +198,7 @@ async function save() {
     const created = await api.createScenario(form.value)
     dlg.value = false
     ElMessage.success('场景已创建')
-    await router.push({ name: 'scenario-detail', params: { id: created.id }, query: { stage: 'ontology' } })
+    await router.push({ name: 'scenario-detail', params: { id: created.id }, query: { stage: 'distillation' } })
   } catch (e: any) {
     ElMessage.error(e.message)
   } finally {

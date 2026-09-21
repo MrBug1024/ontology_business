@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from typing import Annotated
 from urllib.parse import quote
 import uuid
 
@@ -10,7 +11,7 @@ from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from ..models import (
     Agent,
@@ -22,6 +23,7 @@ from ..models import (
 )
 from ..schemas import (
     BucketFileOut,
+    DataSourceCatalogOut,
     DataSourceIn,
     DataSourceOut,
     DocumentReindexOut,
@@ -36,6 +38,7 @@ from ..services import (
     catalog_ingestion_service,
     connector_service,
     datasource_service,
+    distillation_library_service,
     modeling_contract_source_service,
     object_deletion_service,
     object_storage_service,
@@ -61,7 +64,13 @@ def _public_config(config: dict) -> dict:
     return library_credential_service.public_config(config or {})
 
 
-def _out(ds: DataSource, db: Session) -> DataSourceOut:
+def _out(ds: DataSource, db: Session, *, context_read_only: bool = False) -> DataSourceOut:
+    can_mutate = (
+        not context_read_only
+        and ds.type != "distillation"
+        and ds.tenant_id == tenant_service.current_tenant_id(db)
+        and _can_access_data_source(db, ds, writable=True)
+    )
     return DataSourceOut(
         id=ds.id,
         scenario_id=ds.scenario_id,
@@ -69,21 +78,14 @@ def _out(ds: DataSource, db: Session) -> DataSourceOut:
         type=ds.type,
         config=_public_config(ds.config or {}),
         status=ds.status,
-        last_error=ds.last_error,
+        # Read-only scenario projections may be visible outside the owning
+        # workspace. Keep the health state, but never expose connector/vendor
+        # error text across that boundary.
+        last_error=ds.last_error if can_mutate else "",
         created_at=ds.created_at,
         file_count=len(ds.files),
-        can_write=(
-            ds.type not in {"dataset", "distillation"}
-            and
-            ds.tenant_id == tenant_service.current_tenant_id(db)
-            and _can_access_data_source(db, ds, writable=True)
-        ),
-        can_delete=(
-            ds.type != "distillation"
-            and
-            ds.tenant_id == tenant_service.current_tenant_id(db)
-            and _can_access_data_source(db, ds, writable=True)
-        ),
+        can_write=can_mutate and ds.type != "dataset",
+        can_delete=can_mutate,
     )
 
 
@@ -385,6 +387,51 @@ def list_data_sources(scenario_id: str | None = None, db: Session = Depends(get_
         for d in db.execute(stmt).scalars().all()
         if _can_access_data_source(db, d)
     ]
+
+
+@router.get("/catalog", response_model=DataSourceCatalogOut)
+def list_data_source_catalog(
+    scenario_id: Annotated[
+        str | None,
+        Query(min_length=1, max_length=32),
+    ] = None,
+    offset: Annotated[int, Query(ge=0, le=100_000)] = 0,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    db: Session = Depends(get_tenant_db),
+) -> DataSourceCatalogOut:
+    stmt = (
+        select(DataSource)
+        .where(
+            *distillation_library_service.authorized_source_filters(
+                db,
+                scenario_id,
+                include_shared=True,
+            )
+        )
+        .options(selectinload(DataSource.files))
+        .order_by(DataSource.created_at.desc(), DataSource.id)
+        .offset(offset)
+        .limit(limit + 1)
+    )
+    rows = db.execute(stmt).scalars().all()
+    has_more = len(rows) > limit
+    tenant_id = tenant_service.current_tenant_id(db)
+    items = [
+        _out(
+            source,
+            db,
+            context_read_only=(
+                source.tenant_id != tenant_id
+                or (scenario_id is not None and source.scenario_id is None)
+            ),
+        )
+        for source in rows[:limit]
+    ]
+    return DataSourceCatalogOut(
+        items=items,
+        has_more=has_more,
+        next_offset=offset + limit if has_more else None,
+    )
 
 
 @router.post("", response_model=DataSourceOut)

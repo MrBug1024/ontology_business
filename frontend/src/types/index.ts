@@ -558,6 +558,7 @@ export interface ActionExecutionLog {
 
 export interface ScenarioDetail extends Scenario {
   can_write?: boolean
+  can_read_workspace_context?: boolean
   entities: Entity[]
   relations: Relation[]
   data_sources: DataSource[]
@@ -1045,8 +1046,15 @@ export interface DataSource {
   last_error?: string
   created_at?: string
   file_count?: number
+  is_public?: boolean
   can_write?: boolean
   can_delete?: boolean
+}
+
+export interface DataSourceCatalog {
+  items: DataSource[]
+  has_more: boolean
+  next_offset?: number | null
 }
 
 export interface BucketFile {

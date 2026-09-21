@@ -621,6 +621,9 @@ class ScenarioDetail(ScenarioOut):
     # 由服务端按当前主体的 RBAC + 场景 ACL 计算。前端不能仅依据角色或
     # 场景归属推断该能力，否则显式 deny 与公共场景只读语义会被绕过。
     can_write: bool = False
+    # Internal investigation history remains workspace-private even when the
+    # formal scenario definition is publicly readable.
+    can_read_workspace_context: bool = False
     entities: list[EntityOut] = []
     relations: list[RelationOut] = []
     data_sources: list["DataSourceOut"] = []
@@ -664,6 +667,12 @@ class DataSourceOut(DataSourceIn):
     can_delete: bool = False
 
     model_config = {"from_attributes": True}
+
+
+class DataSourceCatalogOut(BaseModel):
+    items: list[DataSourceOut] = Field(default_factory=list)
+    has_more: bool = False
+    next_offset: int | None = None
 
 
 class BucketFileOut(BaseModel):

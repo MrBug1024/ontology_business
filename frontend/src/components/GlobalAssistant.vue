@@ -1279,7 +1279,20 @@ async function openSource(source: AssistantSource) {
   if (display.libraryPath) {
     sourcePreviewVisible.value = false
     sourcePreviewLoading.value = false
-    await router.push(display.libraryPath)
+    // Keep the extracted preview helper usable in legacy/no-context callers;
+    // the mounted assistant always provides the reactive scenario context.
+    const scenarioId = typeof context === 'undefined'
+      ? ''
+      : String(context.value?.scenario_id || '').trim()
+    if (scenarioId && source.data_source_id) {
+      await router.push({
+        name: 'scenario-detail',
+        params: { id: scenarioId },
+        query: { stage: 'materials', source_id: source.data_source_id },
+      })
+    } else {
+      await router.push(display.libraryPath)
+    }
     return
   }
   sourcePreview.value = source

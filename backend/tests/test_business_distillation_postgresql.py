@@ -17,7 +17,16 @@ from sqlalchemy.orm import Session
 from app.distillation_models import DistillationProject, DistillationPublication
 from app.distillation_schemas import DistillationDocument, Evidence, ProjectCreate, ProjectUpdate
 from app.external_api_models import ExternalApiKey
-from app.models import BucketFile, BusinessScenario, DataSource, OrganizationMember, OrganizationRole
+from app.routers import business_distillation
+from app.models import (
+    AuthorizationGrant,
+    BucketFile,
+    BusinessScenario,
+    DataSource,
+    OrganizationMember,
+    OrganizationRole,
+    User,
+)
 from app.services import connector_service, distillation_analysis_service, distillation_connector_service, distillation_handoff_service, distillation_service, scenario_purge_plan_service
 from isolated_postgresql import (
     IsolatedPostgreSQL,
@@ -244,6 +253,57 @@ def test_distillation_reads_and_writes_require_live_tenant_membership(isolated_p
         db.commit()
     with tenant_session(isolated_postgresql.runtime_engine, first) as db:
         assert distillation_service.project(db, project_id).id == project_id
+        with pytest.raises(HTTPException) as failure:
+            distillation_service.publish(db, project_id, 1)
+        assert failure.value.status_code == 403
+
+
+def test_scenario_read_grant_lists_distillation_without_workspace_read(isolated_postgresql):
+    workspace = seed_workspace(isolated_postgresql.admin_engine)
+    project_id = _create_project(isolated_postgresql, workspace)
+    collaborator_id = uuid4().hex
+    role_id = uuid4().hex
+    with Session(isolated_postgresql.admin_engine) as db:
+        db.add(User(
+            id=collaborator_id,
+            tenant_id=workspace["tenant_id"],
+            email=f"{collaborator_id}@acceptance.invalid",
+            password_hash="unusable",
+            status="active",
+        ))
+        db.add(OrganizationRole(
+            id=role_id,
+            organization_id=workspace["organization_id"],
+            key="scenario_collaborator",
+            name="Scenario collaborator",
+            is_system=False,
+        ))
+        db.flush()
+        db.add(OrganizationMember(
+            organization_id=workspace["organization_id"],
+            user_id=collaborator_id,
+            role_id=role_id,
+            status="active",
+        ))
+        db.add(AuthorizationGrant(
+            organization_id=workspace["organization_id"],
+            role_id=role_id,
+            resource_type="scenario",
+            resource_id=workspace["scenario_id"],
+            verb="read",
+            effect="allow",
+        ))
+        db.commit()
+
+    collaborator = {**workspace, "user_id": collaborator_id}
+    with tenant_session(isolated_postgresql.runtime_engine, collaborator) as db:
+        rows = business_distillation.list_projects(
+            limit=50,
+            offset=0,
+            scenario_id=workspace["scenario_id"],
+            db=db,
+        )
+        assert [row.id for row in rows] == [project_id]
         with pytest.raises(HTTPException) as failure:
             distillation_service.publish(db, project_id, 1)
         assert failure.value.status_code == 403

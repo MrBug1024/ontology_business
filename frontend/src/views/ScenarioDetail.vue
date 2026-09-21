@@ -45,6 +45,17 @@
     />
 
     <el-tabs v-model="tab" class="sd-tabs">
+      <el-tab-pane name="distillation" lazy>
+        <template #label><span class="scenario-context-tab"><el-icon><Compass /></el-icon>业务蒸馏</span></template>
+        <DistillationWorkspace v-if="detail.can_read_workspace_context" :key="`distillation:${scenarioId}`" embedded :scenario-id="scenarioId" :can-write="canWrite" />
+        <el-empty v-else description="业务蒸馏记录仅对场景成员开放" :image-size="64" />
+      </el-tab-pane>
+
+      <el-tab-pane name="materials" lazy>
+        <template #label><span class="scenario-context-tab scenario-context-tab-end"><el-icon><Coin /></el-icon>场景资料</span></template>
+        <DataSources :key="`materials:${scenarioId}`" embedded :scenario-id="scenarioId" :can-write="canWrite" :show-templates="detail.can_read_workspace_context" />
+      </el-tab-pane>
+
       <!-- ═══════════ 本体 ═══════════ -->
       <el-tab-pane label="本体模型" name="ontology" lazy>
         <div class="tab-toolbar">
@@ -1444,7 +1455,7 @@
 
 <script setup lang="ts">
 import { ref, shallowRef, computed, watch, nextTick, onMounted, onBeforeUnmount, toRaw } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, type LocationQueryRaw } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import { cloneForForm } from '@/utils/clone'
@@ -1461,7 +1472,10 @@ import CandidateReviewPanel from '@/components/CandidateReviewPanel.vue'
 import CapabilityPortsPanel from '@/components/CapabilityPortsPanel.vue'
 import SemanticMappingsPanel from '@/components/SemanticMappingsPanel.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
+import DistillationWorkspace from '@/components/distillation/DistillationWorkspace.vue'
+import DataSources from '@/views/DataSources.vue'
 import { safeInternalReturnPath } from '@/utils/navigation'
+import { normalizeScenarioStage } from '@/utils/scenarioStages'
 import {
   captureFunctionContractSchemas,
   createProviderRuntimeConfig,
@@ -1487,6 +1501,7 @@ import { draftRefToken, normalizeScenarioModelDrafts, scenarioDraftIsOpen, scena
 const route = useRoute()
 const router = useRouter()
 let sid = String(route.params.id || '')
+const scenarioId = computed(() => String(route.params.id || ''))
 let scenarioLoadRequest = 0
 const scenarioLoading = ref(true)
 const scenarioAccessDenied = ref(false)
@@ -1534,13 +1549,16 @@ const dataSources = ref<any[]>([])
 const llmConfigs = ref<any[]>([])
 const skills = ref<any[]>([])
 const mcpConfigs = ref<any[]>([])
+const modelingResourcesLoaded = ref(false)
+const modelingResourcesLoading = ref(false)
+let modelingResourcesRequest = 0
+let modelingResourcesPromise: Promise<void> | null = null
+let scenarioDraftsLoadedFor = ''
 const scenarioDataSources = computed(() => dataSources.value.filter((source) => !source.scenario_id || source.scenario_id === sid))
 const databaseDataSources = computed(() => scenarioDataSources.value.filter((source) => ['postgres', 'mysql', 'sqlite3', 'dataset'].includes(source.type)))
 const fileBucketSources = computed(() => scenarioDataSources.value.filter((source) => source.type === 'file_bucket'))
 const writableFileBucketSources = computed(() => fileBucketSources.value.filter((source) => source.can_write !== false))
-const stageNames = new Set(['ontology', 'instances', 'mappings', 'functions', 'actions', 'rules', 'events', 'workflows', 'capability-inputs', 'candidates'])
-const requestedStage = Array.isArray(route.query.stage) ? route.query.stage[0] : route.query.stage
-const tab = ref(typeof requestedStage === 'string' && stageNames.has(requestedStage) ? requestedStage : 'ontology')
+const tab = ref(normalizeScenarioStage(route.query.stage))
 const instFilter = ref('')
 const saving = ref(false)
 const objectQuery = ref('')
@@ -1586,13 +1604,18 @@ watch(tab, (value, previousValue) => {
     void loadRelationInstances()
   }
   if (value === 'candidates' && previousValue !== 'candidates') void loadScenarioDrafts(true)
+  if (value !== 'distillation' && value !== 'materials') {
+    void ensureModelingResources()
+    if (value !== 'candidates' && scenarioDraftsLoadedFor !== sid) void loadScenarioDrafts()
+  }
   if (route.query.stage !== value) {
     void router.replace({ query: { ...route.query, stage: value } })
   }
 })
 watch(() => route.query.stage, (value) => {
-  const stage = Array.isArray(value) ? value[0] : value
-  if (typeof stage === 'string' && stageNames.has(stage) && stage !== tab.value) tab.value = stage
+  const stage = normalizeScenarioStage(value)
+  if (stage !== tab.value) tab.value = stage
+  else if (value !== stage) void router.replace({ query: { ...route.query, stage } })
 })
 watch(instFilter, () => {
   if (tab.value === 'instances') searchObjects()
@@ -4228,6 +4251,7 @@ async function loadScenarioDrafts(includeIssues = tab.value === 'candidates') {
     scenarioDrafts.value = normalized
     scenarioDrafts.value = normalized.map(withDraftReferenceIssues)
     scenarioDraftSummary.value = governanceSummary
+    scenarioDraftsLoadedFor = sid
   } catch (error: any) {
     if (scenarioDraftViewDisposed || request !== scenarioDraftRequest) return
     scenarioDraftsError.value = error?.message || '请稍后重试；正式场景资源不受影响。'
@@ -4246,6 +4270,47 @@ async function refreshCandidateReview(definitionChanged: boolean) {
     }
   }
   await loadScenarioDrafts(true)
+}
+
+async function ensureModelingResources() {
+  if (modelingResourcesLoaded.value) return
+  if (modelingResourcesPromise) return modelingResourcesPromise
+  const request = ++modelingResourcesRequest
+  const requestSid = sid
+  modelingResourcesLoading.value = true
+  modelingResourcesPromise = Promise.allSettled([
+    // Scenario ACL and workspace ACL are independent.  Keep the scoped read
+    // useful for collaborators who cannot browse the workspace catalog, while
+    // still adding shared materials when the workspace read is allowed.
+    api.listDataSources(requestSid),
+    api.listDataSources(),
+    api.listLLM(), api.listSkills(), api.listMCP(),
+  ]).then(([scopedResult, sharedResult, configsResult, skillsResult, mcpResult]) => {
+    if (request !== modelingResourcesRequest || requestSid !== sid) return
+    const sourceRows = [
+      ...(scopedResult.status === 'fulfilled' ? scopedResult.value : []),
+      ...(sharedResult.status === 'fulfilled' ? sharedResult.value : []),
+    ]
+    const sources = [...new Map(sourceRows.filter((source) => source.id).map((source) => [source.id, source])).values()]
+    dataSources.value = sources.filter((source) => !source.scenario_id || source.scenario_id === requestSid)
+    if (configsResult.status === 'fulfilled') llmConfigs.value = configsResult.value
+    if (skillsResult.status === 'fulfilled') skills.value = skillsResult.value
+    if (mcpResult.status === 'fulfilled') mcpConfigs.value = mcpResult.value
+    if (scopedResult.status === 'rejected' && sharedResult.status === 'rejected') {
+      throw scopedResult.reason || sharedResult.reason || new Error('场景资料加载失败')
+    }
+    modelingResourcesLoaded.value = true
+  }).catch((error: any) => {
+    if (request === modelingResourcesRequest && requestSid === sid) {
+      ElMessage.error(error?.response?.data?.detail || error?.message || '场景关联资源加载失败')
+    }
+  }).finally(() => {
+    if (request === modelingResourcesRequest && requestSid === sid) {
+      modelingResourcesLoading.value = false
+      modelingResourcesPromise = null
+    }
+  })
+  return modelingResourcesPromise
 }
 
 // ── 加载 ──
@@ -4273,23 +4338,13 @@ async function load() {
   } finally {
     if (request === scenarioLoadRequest && scenarioId === sid) scenarioLoading.value = false
   }
-  try {
-    const [sources, configs, skillItems, mcpItems] = await Promise.all([
-      api.listDataSources(), api.listLLM(), api.listSkills(), api.listMCP(),
-    ])
-    if (request !== scenarioLoadRequest || scenarioId !== sid) return
-    dataSources.value = sources
-    llmConfigs.value = configs
-    skills.value = skillItems
-    mcpConfigs.value = mcpItems
-  } catch (e: any) {
-    if (request === scenarioLoadRequest && scenarioId === sid) {
-      ElMessage.error(e?.response?.data?.detail || e?.message || '场景关联资源加载失败')
-    }
-  } finally {
-    if (request === scenarioLoadRequest && scenarioId === sid) await loadScenarioDrafts()
-  }
   if (request !== scenarioLoadRequest || scenarioId !== sid) return
+  if (tab.value !== 'distillation' && tab.value !== 'materials') {
+    await ensureModelingResources()
+    if (request !== scenarioLoadRequest || scenarioId !== sid) return
+    if (tab.value === 'candidates') await loadScenarioDrafts(true)
+    else if (scenarioDraftsLoadedFor !== sid) void loadScenarioDrafts()
+  }
   // The object explorer is only visible on the instances tab. Avoid doing a
   // runtime object scan while the ontology tab is becoming interactive.
   if (tab.value === 'instances') {
@@ -4299,10 +4354,21 @@ async function load() {
 }
 function goBack() { void router.push(returnPath.value) }
 function goToDataSources() {
-  router.push({ name: 'data-sources', query: { scenario_id: sid, return_to: route.fullPath } })
+  actionDlg.value = false
+  const query: LocationQueryRaw = { ...route.query, stage: 'materials' }
+  delete query.library_tab
+  delete query.materials_offset
+  delete query.action_id
+  delete query.edit_action_id
+  void router.push({ name: 'scenario-detail', params: { id: sid }, query })
 }
 function goToTemplates() {
-  router.push({ name: 'data-sources', query: { scenario_id: sid, return_to: route.fullPath } })
+  actionDlg.value = false
+  const query: LocationQueryRaw = { ...route.query, stage: 'materials', library_tab: 'templates' }
+  delete query.materials_offset
+  delete query.action_id
+  delete query.edit_action_id
+  void router.push({ name: 'scenario-detail', params: { id: sid }, query })
 }
 function askWorkflowAdvisor(prompt: string) {
   if (!canWrite.value) return
@@ -4415,6 +4481,18 @@ watch(() => route.params.id, async (value) => {
   if (!nextId || nextId === sid) return
   scenarioLoadRequest += 1
   scenarioDraftRequest += 1
+  // Invalidate and clear resources owned by the previous scenario before the
+  // new detail request starts.  The resource list is used by model editors and
+  // must never briefly expose a different scenario's connections or tools.
+  modelingResourcesRequest += 1
+  modelingResourcesPromise = null
+  modelingResourcesLoaded.value = false
+  modelingResourcesLoading.value = false
+  scenarioDraftsLoadedFor = ''
+  dataSources.value = []
+  llmConfigs.value = []
+  skills.value = []
+  mcpConfigs.value = []
   objectRequestId += 1
   mappingTableRequest += 1
   for (const timer of mappingRefreshTimers.values()) window.clearTimeout(timer)
@@ -4443,8 +4521,7 @@ watch(() => route.params.id, async (value) => {
   execResultDlg.value = false
   recordInputDlg.value = false
   wfEditor.value = null
-  const nextStage = Array.isArray(route.query.stage) ? route.query.stage[0] : route.query.stage
-  tab.value = typeof nextStage === 'string' && stageNames.has(nextStage) ? nextStage : 'ontology'
+  tab.value = normalizeScenarioStage(route.query.stage)
   await load()
   await openRequestedRouteAction()
 })
@@ -4543,6 +4620,9 @@ onBeforeUnmount(() => {
   font-size: 14px;
   font-weight: 600;
 }
+.scenario-context-tab { display: inline-flex; align-items: center; gap: 5px; }
+.scenario-context-tab-end { margin-right: 6px; padding-right: 14px; border-right: 1px solid var(--border); }
+.scenario-context-tab :deep(.el-icon) { font-size: 14px; }
 .candidate-tab-count {
   display: inline-flex;
   min-width: 20px;
@@ -5658,7 +5738,7 @@ onBeforeUnmount(() => {
 .sd-tabs :deep(.el-tabs__item) {
   height: 40px;
   color: var(--text-2);
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 700;
 }
 .sd-tabs :deep(.el-tabs__item.is-active) { color: var(--primary-600); }

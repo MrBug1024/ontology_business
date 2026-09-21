@@ -17,7 +17,11 @@ class DistillationAttachment(Base):
             name="fk_distillation_attachment_project", ondelete="RESTRICT"),
         ForeignKeyConstraint(["scenario_id", "tenant_id"], ["business_scenarios.id", "business_scenarios.tenant_id"],
             name="fk_distillation_attachment_scenario", ondelete="RESTRICT"),
+        # Attachment visibility follows the owning project's scenario ACL.
+        # Retain the historical owner key for downgrade compatibility;
+        # ``created_by`` remains an audit/idempotency field only.
         UniqueConstraint("id", "project_id", "tenant_id", "created_by", name="uq_distillation_attachment_owner"),
+        UniqueConstraint("id", "project_id", "tenant_id", name="uq_distillation_attachment_scope"),
         UniqueConstraint("project_id", "created_by", "request_id", name="uq_distillation_attachment_request"),
         CheckConstraint("status IN ('ready','bound','removed','expired')", name="ck_distillation_attachment_status"),
         CheckConstraint("byte_size > 0 AND byte_size <= 10485760 AND char_length(parsed_text) <= 200000", name="ck_distillation_attachment_size"),
@@ -42,18 +46,19 @@ class DistillationAttachment(Base):
 class DistillationTurnAttachment(Base):
     __tablename__ = "distillation_turn_attachments"
     __table_args__ = (
-        ForeignKeyConstraint(["turn_id", "project_id", "tenant_id", "user_id"],
+        ForeignKeyConstraint(["turn_id", "project_id", "tenant_id"],
             ["distillation_conversation_turns.id", "distillation_conversation_turns.project_id",
-             "distillation_conversation_turns.tenant_id", "distillation_conversation_turns.created_by"],
-            name="fk_distillation_turn_attachment_turn_owner", ondelete="RESTRICT"),
-        ForeignKeyConstraint(["attachment_id", "project_id", "tenant_id", "user_id"],
+             "distillation_conversation_turns.tenant_id"],
+            name="fk_distillation_turn_attachment_turn_scope", ondelete="RESTRICT"),
+        ForeignKeyConstraint(["attachment_id", "project_id", "tenant_id"],
             ["distillation_attachments.id", "distillation_attachments.project_id",
-             "distillation_attachments.tenant_id", "distillation_attachments.created_by"],
-            name="fk_distillation_turn_attachment_input_owner", ondelete="RESTRICT"),
+             "distillation_attachments.tenant_id"],
+            name="fk_distillation_turn_attachment_input_scope", ondelete="RESTRICT"),
+        ForeignKeyConstraint(["user_id", "tenant_id"], ["users.id", "users.tenant_id"],
+            name="fk_distillation_turn_attachment_actor_tenant", ondelete="RESTRICT"),
     )
     turn_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     attachment_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(32))
     project_id: Mapped[str] = mapped_column(String(32))
     user_id: Mapped[str] = mapped_column(String(32))
-

@@ -155,11 +155,20 @@ def execute(db, name: str, arguments: dict, turn):
         resource_keys={cfg.id: [item["resource_key"] for item in resources]})
 
 
-def resource_catalog(db: Session) -> InvestigationResourceCatalogOut:
+def resource_catalog(db: Session, scenario_id: str | None = None) -> InvestigationResourceCatalogOut:
     from . import distillation_conversation_tools as tools
 
-    permission_service.require_principal(db)
-    permission_service.require_tenant_permission(db, "read")
+    principal = permission_service.require_principal(db)
+    if scenario_id:
+        scenario = tenant_service.require_scenario(db, scenario_id)
+        # A scenario-scoped catalog is an in-tenant collaboration surface. A
+        # public foreign scenario must not expose the current workspace's
+        # model, skill, or MCP configuration through this endpoint.
+        if scenario.tenant_id != principal.tenant_id:
+            raise PermissionError("scenario resource catalog is tenant-scoped")
+        permission_service.require_scenario_permission(db, scenario, "read")
+    else:
+        permission_service.require_tenant_permission(db, "read")
     skills = db.scalars(select(Skill).where(Skill.enabled.is_(True), Skill.source == "builtin",
         tenant_service.visible_clause(Skill, db)).order_by(Skill.name, Skill.id).limit(200)).all()
     available_skills = []

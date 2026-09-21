@@ -18,18 +18,24 @@ def verify_attachment_contract(connection: Any) -> dict[str, Any]:
     expected = {
         "uq_distillation_turn_owner": ("distillation_conversation_turns", "u",
             "UNIQUE (id, project_id, tenant_id, created_by)"),
+        "uq_distillation_turn_scope": ("distillation_conversation_turns", "u",
+            "UNIQUE (id, project_id, tenant_id)"),
         "fk_distillation_attachment_project": ("distillation_attachments", "f",
             "FOREIGN KEY (project_id, tenant_id) REFERENCES distillation_projects(id, tenant_id) ON DELETE RESTRICT"),
         "fk_distillation_attachment_scenario": ("distillation_attachments", "f",
             "FOREIGN KEY (scenario_id, tenant_id) REFERENCES business_scenarios(id, tenant_id) ON DELETE RESTRICT"),
         "uq_distillation_attachment_owner": ("distillation_attachments", "u",
             "UNIQUE (id, project_id, tenant_id, created_by)"),
+        "uq_distillation_attachment_scope": ("distillation_attachments", "u",
+            "UNIQUE (id, project_id, tenant_id)"),
         "uq_distillation_attachment_request": ("distillation_attachments", "u",
             "UNIQUE (project_id, created_by, request_id)"),
-        "fk_distillation_turn_attachment_turn_owner": ("distillation_turn_attachments", "f",
-            "FOREIGN KEY (turn_id, project_id, tenant_id, user_id) REFERENCES distillation_conversation_turns(id, project_id, tenant_id, created_by) ON DELETE RESTRICT"),
-        "fk_distillation_turn_attachment_input_owner": ("distillation_turn_attachments", "f",
-            "FOREIGN KEY (attachment_id, project_id, tenant_id, user_id) REFERENCES distillation_attachments(id, project_id, tenant_id, created_by) ON DELETE RESTRICT"),
+        "fk_distillation_turn_attachment_turn_scope": ("distillation_turn_attachments", "f",
+            "FOREIGN KEY (turn_id, project_id, tenant_id) REFERENCES distillation_conversation_turns(id, project_id, tenant_id) ON DELETE RESTRICT"),
+        "fk_distillation_turn_attachment_input_scope": ("distillation_turn_attachments", "f",
+            "FOREIGN KEY (attachment_id, project_id, tenant_id) REFERENCES distillation_attachments(id, project_id, tenant_id) ON DELETE RESTRICT"),
+        "fk_distillation_turn_attachment_actor_tenant": ("distillation_turn_attachments", "f",
+            "FOREIGN KEY (user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT"),
     }
     rows = connection.exec_driver_sql("""
         SELECT c.conname, r.relname, c.contype, c.convalidated, pg_get_constraintdef(c.oid)

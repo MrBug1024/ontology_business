@@ -1,6 +1,6 @@
 <template>
-  <div class="page data-sources-page">
-    <div class="page-header">
+  <div class="page data-sources-page" :class="{ 'is-embedded': embedded }">
+    <div v-if="!embedded" class="page-header">
       <div>
         <h1>资料库</h1>
         <div class="sub">统一管理数据库、资料文件与业务产物模板</div>
@@ -11,19 +11,23 @@
       </div>
     </div>
 
-    <p class="library-purpose">用于业务蒸馏与场景建模。可绑定到一个业务场景，也可保留为工作区共享资料。这里的资料不会自动进入正式调用。规范和模板附件也可在这里保存、引用，供 AI 理解产物要求。</p>
+    <p v-if="!embedded" class="library-purpose">用于业务蒸馏与场景建模。可绑定到一个业务场景，也可保留为工作区共享资料。这里的资料不会自动进入正式调用。规范和模板附件也可在这里保存、引用，供 AI 理解产物要求。</p>
 
-    <el-tabs v-model="activeLibraryTab" class="library-tabs" aria-label="资料库内容" @tab-change="onLibraryTabChanged">
-      <el-tab-pane label="资料文件与数据库" name="materials">
+    <el-tabs v-model="activeLibraryPane" class="library-tabs" :class="{ 'is-embedded': embedded }" aria-label="资料库内容" @tab-change="onLibraryTabChanged">
+      <el-tab-pane label="资料文件与数据库" name="library-materials">
     <section class="resource-section-group" aria-labelledby="connections-title">
-      <header class="resource-group-heading">
+      <header v-if="embedded" class="scenario-material-toolbar">
+        <span>本页 {{ dataSources.length }} 项</span>
+        <el-button v-if="canWrite" type="primary" @click="openCreate"><el-icon><Plus /></el-icon>新增资料</el-button>
+      </header>
+      <header v-else class="resource-group-heading">
         <div><span class="eyebrow">MODELING MATERIALS</span><h2 id="connections-title">资料文件与数据库样本</h2></div>
         <p>绑定场景后，该场景可选择这些资料进行蒸馏和建模；未绑定的资料可供当前工作区的场景共享使用。</p>
       </header>
         <el-row :gutter="16" class="physical-workspace">
       <el-col class="data-sources-list-col" :xs="24" :md="9">
         <div class="card data-sources-list-card" v-loading="loading">
-          <div class="card-title"><el-icon><Coin /></el-icon> 资料库</div>
+          <div class="card-title"><el-icon><Coin /></el-icon> {{ embedded ? '场景资料' : '资料库' }}</div>
           <div class="ds-list">
             <button v-for="ds in dataSources" :key="ds.id" type="button" class="ds-item" :class="{ active: selected?.id === ds.id }" :aria-current="selected?.id === ds.id ? 'true' : undefined" :aria-label="`选择数据源：${ds.name}`" @click="select(ds)">
               <div class="ds-icon" :class="ds.type">
@@ -41,8 +45,13 @@
             <div v-if="!loading && !dataSources.length" class="empty-wrap">
               <div class="empty-icon"><el-icon :size="26"><Coin /></el-icon></div>
               <div>暂无资料库</div>
-              <el-button type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 创建资料库</el-button>
+              <el-button v-if="canWrite" type="primary" size="small" @click="openCreate"><el-icon><Plus /></el-icon> 创建资料库</el-button>
             </div>
+          </div>
+          <div v-if="embedded && (catalogOffset || catalogHasMore)" class="scenario-material-pages" aria-label="场景资料分页">
+            <el-button text :disabled="loading || !catalogOffset" @click="previousCatalogPage">上一页</el-button>
+            <span>第 {{ Math.floor(catalogOffset / CATALOG_PAGE_SIZE) + 1 }} 页</span>
+            <el-button text :disabled="loading || !catalogHasMore" @click="nextCatalogPage">下一页</el-button>
           </div>
         </div>
       </el-col>
@@ -55,13 +64,13 @@
             <el-tag size="small" effect="plain">{{ modelingScopeLabel(selected) }}</el-tag>
             <el-tag v-if="selected.type === 'dataset' && selected.can_delete" size="small" type="warning" effect="plain">不可编辑，可删除连接</el-tag>
             <el-tag v-else-if="selected.type === 'distillation'" size="small" type="info" effect="plain">不可变阶段资料</el-tag>
-            <el-tag v-else-if="!selected.can_write && !selected.can_delete" size="small" type="warning" effect="plain">只读公开资源</el-tag>
+            <el-tag v-else-if="!selected.can_write && !selected.can_delete" size="small" type="warning" effect="plain">只读资料</el-tag>
             <div style="margin-left:auto;display:flex;gap:6px">
-              <template v-if="selected.can_write">
+              <template v-if="selected.can_write && canWrite">
                 <el-button size="small" @click="testConn" :loading="testing"><el-icon><Link /></el-icon> 测试连接</el-button>
                 <el-button size="small" @click="openEdit(selected)"><el-icon><Edit /></el-icon> 编辑</el-button>
               </template>
-              <el-button v-if="selected.can_delete" size="small" type="danger" @click="remove(selected)" aria-label="删除资料库" title="删除资料库"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
+                <el-button v-if="selected.can_delete && canWrite" size="small" type="danger" @click="remove(selected)" aria-label="删除资料库" title="删除资料库"><el-icon aria-hidden="true"><Delete /></el-icon></el-button>
             </div>
           </div>
 
@@ -111,7 +120,7 @@
                 show-icon
                 class="readonly-note"
               />
-              <el-upload v-if="selected.can_write" drag :auto-upload="false" :file-list="uploadList" :on-change="onFilePick" :on-remove="() => {}" multiple>
+              <el-upload v-if="selected.can_write && canWrite" drag :auto-upload="false" :file-list="uploadList" :on-change="onFilePick" :on-remove="() => {}" multiple>
                 <el-icon class="el-icon--upload" :size="40"><UploadFilled /></el-icon>
                 <div class="el-upload__text">拖拽文件到此处，或 <em>点击选择</em></div>
                 <template #tip>
@@ -119,10 +128,10 @@
                 </template>
               </el-upload>
               <div class="bucket-actions">
-                <el-button type="primary" :loading="uploading" :disabled="!selected.can_write || !uploadList.length" @click="doUpload">
+                <el-button type="primary" :loading="uploading" :disabled="!canWrite || !selected.can_write || !uploadList.length" @click="doUpload">
                   <el-icon><Upload /></el-icon> 上传并解析（{{ uploadList.length }}）
                 </el-button>
-                <el-button :loading="reindexing" :disabled="!selected.can_write" @click="reindexFiles">
+                <el-button :loading="reindexing" :disabled="!canWrite || !selected.can_write" @click="reindexFiles">
                   <el-icon><Refresh /></el-icon> 重建索引
                 </el-button>
                 <el-button @click="loadFiles" :loading="loadingFiles"><el-icon><Refresh /></el-icon> 刷新</el-button>
@@ -201,8 +210,8 @@
                 <el-table-column label="" width="170" align="center">
                   <template #default="{ row }">
                     <el-button size="small" text type="primary" @click="viewText(row)">查看文本</el-button>
-                    <el-button v-if="selected?.can_write && !row.modeling_contract_schema_id" size="small" text @click="reparse(row)" :loading="row._loading">重解析</el-button>
-                    <el-button v-if="selected?.can_write" size="small" text type="danger" @click="removeFile(row)">删除</el-button>
+                    <el-button v-if="selected?.can_write && canWrite && !row.modeling_contract_schema_id" size="small" text @click="reparse(row)" :loading="row._loading">重解析</el-button>
+                    <el-button v-if="selected?.can_write && canWrite" size="small" text type="danger" @click="removeFile(row)">删除</el-button>
                   </template>
                 </el-table-column>
               </el-table>
@@ -214,12 +223,12 @@
         </el-row>
     </section>
       </el-tab-pane>
-      <el-tab-pane label="产物模板" name="templates" lazy>
-        <Templates embedded @show-materials="showMaterials" />
+      <el-tab-pane v-if="showTemplates" label="产物模板" name="library-templates" lazy>
+        <Templates embedded :scenario-id="routeScenarioId" :can-write="canWrite" :active="activeLibraryTab === 'templates'" @show-materials="showMaterials" />
       </el-tab-pane>
     </el-tabs>
 
-    <LibraryEditorDialog v-if="activeLibraryTab === 'materials'" v-model="dlg" :source="editingSource" :scenarios="writableScenarios" :scenario-id="routeScenarioId" @saved="onLibrarySaved" />
+    <LibraryEditorDialog v-if="activeLibraryTab === 'materials'" v-model="dlg" :source="editingSource" :scenarios="writableScenarios" :scenario-id="routeScenarioId" :lock-scenario="embedded" @saved="onLibrarySaved" />
 
     <!-- 表详情 -->
     <el-dialog v-model="tableDlg" :title="'表结构：' + (curTable?.name || '')" width="640px">
@@ -246,7 +255,7 @@
 
 <script setup lang="ts">
 import { computed, ref, onBeforeUnmount, onMounted, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, type LocationQueryRaw } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { api } from '@/api'
@@ -263,26 +272,52 @@ import DistillationMaterialPanel from '@/components/distillation/DistillationMat
 import LibraryEditorDialog from '@/components/library/LibraryEditorDialog.vue'
 import Templates from '@/views/Templates.vue'
 
+const props = withDefaults(defineProps<{ embedded?: boolean; scenarioId?: string; canWrite?: boolean; showTemplates?: boolean }>(), {
+  embedded: false, scenarioId: '', canWrite: false, showTemplates: true,
+})
+const embedded = computed(() => props.embedded)
+const canWrite = computed(() => !props.embedded || props.canWrite)
+const showTemplates = computed(() => !props.embedded || props.showTemplates)
+
 const dataSources = ref<DataSource[]>([])
 const scenarios = ref<Scenario[]>([])
 const selected = ref<DataSource | null>(null)
 const loading = ref(false)
 const route = useRoute()
 const router = useRouter()
+const CATALOG_PAGE_SIZE = 50
+function catalogOffsetFromQuery(value: unknown) {
+  const candidate = Array.isArray(value) ? value[0] : value
+  const parsed = Number(candidate)
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= 100_000 && parsed % CATALOG_PAGE_SIZE === 0 ? parsed : 0
+}
+const catalogOffset = ref(props.embedded ? catalogOffsetFromQuery(route.query.materials_offset) : 0)
+const catalogHasMore = ref(false)
 type LibraryTab = 'materials' | 'templates'
+type LibraryPane = 'library-materials' | 'library-templates'
+function libraryTabFromPane(value: string | number): LibraryTab {
+  return String(value) === 'library-templates' || String(value) === 'templates' ? 'templates' : 'materials'
+}
 function libraryTabFromQuery(value: unknown): LibraryTab {
   const candidate = Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
-  return candidate === 'templates' ? 'templates' : 'materials'
+  return candidate === 'templates' && showTemplates.value ? 'templates' : 'materials'
 }
 const activeLibraryTab = ref<LibraryTab>(libraryTabFromQuery(route.query.library_tab))
+const activeLibraryPane = computed<LibraryPane>({
+  get: () => activeLibraryTab.value === 'templates' ? 'library-templates' : 'library-materials',
+  set: value => { activeLibraryTab.value = libraryTabFromPane(value) },
+})
 function onLibraryTabChanged(value: string | number) {
-  const next: LibraryTab = value === 'templates' ? 'templates' : 'materials'
+  const next = libraryTabFromPane(value)
   if (activeLibraryTab.value !== next) activeLibraryTab.value = next
   const query = { ...route.query }
   if (next === 'templates') query.library_tab = 'templates'
   else delete query.library_tab
-  if (libraryTabFromQuery(route.query.library_tab) !== next) {
-    void router.replace({ name: 'data-sources', query })
+  const current = Array.isArray(route.query.library_tab) ? route.query.library_tab[0] : route.query.library_tab
+  if ((current === 'templates' ? 'templates' : 'materials') !== next) {
+    void router.replace(props.embedded
+      ? { name: 'scenario-detail', params: { id: props.scenarioId }, query: { ...query, stage: 'materials' } }
+      : { name: 'data-sources', query })
   }
 }
 function showMaterials() {
@@ -297,7 +332,20 @@ const returnPath = ref(safeReturnPath(route.query.return_to))
 
 const dlg = ref(false)
 const editingSource = ref<DataSource | null>(null)
-const routeScenarioId = computed(() => typeof route.query.scenario_id === 'string' ? route.query.scenario_id : '')
+const routeScenarioId = computed(() => props.scenarioId || (typeof route.query.scenario_id === 'string' ? route.query.scenario_id : ''))
+function sourceLocation(sourceId: string) {
+  if (props.embedded) {
+    const query: LocationQueryRaw = { ...route.query, stage: 'materials', source_id: sourceId }
+    if (catalogOffset.value) query.materials_offset = String(catalogOffset.value)
+    else delete query.materials_offset
+    return {
+      name: 'scenario-detail',
+      params: { id: props.scenarioId },
+      query,
+    }
+  }
+  return { name: 'data-sources', query: { ...route.query, source_id: sourceId, view: 'connections' } }
+}
 
 const testing = ref(false)
 const tables = ref<TableInfo[]>([])
@@ -368,17 +416,43 @@ async function load() {
   const request = ++loadRequest
   loading.value = true
   try {
-    const [ds, scenarioRows] = await Promise.all([
-      api.listDataSources(),
+    const [sourceResponse, scenarioResponse] = await Promise.allSettled([
+      props.embedded
+        ? api.listDataSourceCatalog({ scenario_id: props.scenarioId, offset: catalogOffset.value, limit: CATALOG_PAGE_SIZE })
+        : api.listDataSources(),
       api.listScenarios(),
     ])
     if (viewDisposed || request !== loadRequest) return
-    dataSources.value = ds
-    scenarios.value = scenarioRows
+    if (sourceResponse.status === 'rejected') throw sourceResponse.reason
+    const sourceResult = sourceResponse.value
+    const ds = Array.isArray(sourceResult) ? sourceResult : sourceResult.items
+    catalogHasMore.value = Array.isArray(sourceResult) ? false : sourceResult.has_more
+    const visibleSources = props.embedded
+      ? ds.filter((source) => !source.scenario_id || source.scenario_id === props.scenarioId)
+        .map((source) => source.scenario_id ? source : { ...source, can_write: false, can_delete: false })
+      : ds
+    dataSources.value = visibleSources
+    if (scenarioResponse.status === 'fulfilled') {
+      scenarios.value = scenarioResponse.value
+    } else {
+      // A public cross-tenant scenario may expose its catalog without exposing
+      // the caller's workspace scenario list. Keep the catalog usable; labels
+      // and write dialogs simply remain unavailable until a later retry.
+      scenarios.value = []
+      if (!props.embedded) ElMessage.warning('场景列表加载失败，资料目录仍可使用')
+    }
     const requestedSource = Array.isArray(route.query.source_id) ? route.query.source_id[0] : route.query.source_id
-    const nextSelection = ds.find((source) => source.id === requestedSource)
-      || ds.find((source) => source.id === selected.value?.id)
-      || ds[0]
+    const requestedMatch = visibleSources.find((source) => source.id === requestedSource)
+    if (props.embedded && requestedSource && !requestedMatch) {
+      const query = { ...route.query }
+      delete query.source_id
+      await router.replace({ name: 'scenario-detail', params: { id: props.scenarioId }, query })
+      if (viewDisposed || request !== loadRequest) return
+      ElMessage.warning('目标资料不在当前页或已不可用')
+    }
+    const nextSelection = requestedMatch
+      || visibleSources.find((source) => source.id === selected.value?.id)
+      || visibleSources[0]
     if (nextSelection) select(nextSelection, false)
     else clearSelection()
   } catch (e: any) {
@@ -386,6 +460,22 @@ async function load() {
   } finally {
     if (!viewDisposed && request === loadRequest) loading.value = false
   }
+}
+
+async function changeCatalogPage(nextOffset: number) {
+  if (!props.embedded || loading.value || nextOffset < 0) return
+  catalogOffset.value = nextOffset
+  clearSelection()
+  const query = { ...route.query }
+  delete query.source_id
+  if (nextOffset) query.materials_offset = String(nextOffset)
+  else delete query.materials_offset
+  await router.replace({ name: 'scenario-detail', params: { id: props.scenarioId }, query })
+  await load()
+}
+function previousCatalogPage() { void changeCatalogPage(Math.max(0, catalogOffset.value - CATALOG_PAGE_SIZE)) }
+function nextCatalogPage() {
+  if (catalogHasMore.value) void changeCatalogPage(catalogOffset.value + CATALOG_PAGE_SIZE)
 }
 function invalidateDetailRequests() {
   tableRequest += 1
@@ -423,7 +513,7 @@ function select(ds: DataSource, syncRoute = true) {
   if (ds.type === 'file_bucket') void loadFiles()
   else if (ds.type !== 'distillation' && (ds.type !== 'sqlite3' || ds.file_count)) void loadTables()
   if (syncRoute && route.query.source_id !== ds.id) {
-    void router.replace({ name: 'data-sources', query: { ...route.query, source_id: ds.id, view: 'connections' } })
+    void router.replace(sourceLocation(ds.id || ''))
   }
 }
 async function loadTables() {
@@ -480,6 +570,7 @@ function onFilePick(f: UploadFile) {
   }
 }
 async function doUpload() {
+  if (!canWrite.value || !selected.value?.can_write) return
   const pending = uploadList.value.filter((item) => item.raw)
   if (!pending.length) return
   uploading.value = true
@@ -567,7 +658,7 @@ async function reparse(f: BucketFile & { _loading?: boolean }) {
   }
 }
 async function reindexFiles() {
-  if (!selected.value) return
+  if (!canWrite.value || !selected.value?.can_write) return
   reindexing.value = true
   try {
     const result = await api.reindexFiles(selected.value.id!)
@@ -605,7 +696,9 @@ async function searchDocuments() {
     if (viewDisposed || request !== searchRequest || selected.value?.id !== source.id) return
     searchResults.value = result.results || []
     searchNotice.value = result.permission_message || (
-      source.can_write ? '' : '当前为只读公开资料库，结果仅来自已建立的公开索引。'
+      source.can_write ? '' : source.is_public
+        ? '当前为只读公开资料库，结果仅来自已建立的公开索引。'
+        : '当前资料为只读，结果仅来自已建立的索引。'
     )
     if (!searchResults.value.length && files.value.some((file) => ['pending', 'queued'].includes(file.index_status || 'pending'))) {
       searchNotice.value = '资料仍在后台解析或建立索引，请稍候自动刷新后再次检索。'
@@ -640,6 +733,7 @@ async function removeFile(f: BucketFile) {
 
 // ── 资料库创建/编辑由独立组件管理 ──
 function openCreate() {
+  if (!canWrite.value) return
   editingSource.value = null
   dlg.value = true
 }
@@ -650,7 +744,8 @@ function openEdit(ds: DataSource) {
 async function onLibrarySaved(saved: DataSource) {
   ElMessage.success('资料库已保存')
   if (saved.id) {
-    await router.replace({ name: 'data-sources', query: { ...route.query, source_id: saved.id, view: 'connections' } })
+    if (props.embedded && !editingSource.value?.id) catalogOffset.value = 0
+    await router.replace(sourceLocation(saved.id))
   }
   await load()
 }
@@ -683,14 +778,41 @@ onMounted(() => {
   viewDisposed = false
   void load()
 })
-watch(() => route.query.source_id, (value) => {
+// The parent scenario detail loads ACL metadata asynchronously. Preserve a
+// direct template-tab deep link while that metadata is still pending; once the
+// read grant arrives, the embedded catalog can reveal the requested tab.
+watch(showTemplates, (visible) => {
+  if (visible) activeLibraryTab.value = libraryTabFromQuery(route.query.library_tab)
+  else if (activeLibraryTab.value === 'templates') activeLibraryTab.value = 'materials'
+})
+watch(() => route.query.source_id, async (value) => {
   const id = Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
   if (!id || id === selected.value?.id) return
   const source = dataSources.value.find((item) => item.id === id)
   if (source) select(source, false)
+  else if (props.embedded) {
+    catalogOffset.value = 0
+    await router.replace(sourceLocation(id))
+    await load()
+  }
 })
 watch(() => route.query.return_to, (value) => {
   returnPath.value = safeReturnPath(value)
+})
+watch(() => route.query.materials_offset, (value) => {
+  if (!props.embedded) return
+  const next = catalogOffsetFromQuery(value)
+  if (next === catalogOffset.value) return
+  catalogOffset.value = next
+  clearSelection()
+  void load()
+})
+watch(() => props.scenarioId, (value, previous) => {
+  if (!props.embedded || !value || value === previous) return
+  catalogOffset.value = 0
+  catalogHasMore.value = false
+  clearSelection()
+  void load()
 })
 watch(() => route.query.library_tab, (value) => {
   activeLibraryTab.value = libraryTabFromQuery(value)
@@ -756,13 +878,21 @@ onBeforeUnmount(() => {
   min-height: 100%;
   box-sizing: border-box;
 }
+.data-sources-page.is-embedded { padding: 0; animation: none; }
+.library-tabs.is-embedded :deep(.el-tabs__header) { margin-bottom: 12px; }
+.library-tabs.is-embedded :deep(.el-tabs__content),
+.library-tabs.is-embedded :deep(.el-tab-pane) { overflow: visible; }
+.data-sources-page.is-embedded .resource-section-group { margin-top: 0; }
+.scenario-material-toolbar { display: flex; min-height: 42px; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 2px; color: var(--text-3); font-size: 12px; }
+.scenario-material-pages { display: flex; min-height: 36px; align-items: center; justify-content: space-between; gap: 8px; color: var(--text-3); font-size: 12px; }
 .resource-boundary { display: grid; gap: 14px; margin-bottom: 22px; }
 .resource-boundary header h2 { margin: 4px 0 0; color: var(--text); font-size: clamp(17px, 2vw, 22px); line-height: 1.4; }
 .resource-boundary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .resource-boundary-grid article { padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-2); }
 .resource-boundary-grid strong { display: block; margin-bottom: 5px; color: var(--text); font-size: 14px; }
 .resource-boundary-grid p { margin: 0; color: var(--text-2); font-size: 12px; line-height: 1.65; }
-.resource-section-group { display: grid; gap: 14px; margin-top: 24px; }
+.resource-section-group { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr); gap: 14px; margin-top: 24px; }
+.resource-section-group > * { min-width: 0; }
 .resource-group-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; }
 .resource-group-heading h2 { margin: 3px 0 0; color: var(--text); font-size: 20px; }
 .resource-group-heading p { max-width: 640px; margin: 0; color: var(--text-3); font-size: 12px; line-height: 1.55; text-align: right; }
@@ -786,6 +916,8 @@ onBeforeUnmount(() => {
 .binding-option-description { float: right; max-width: 360px; margin-left: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .binding-safe-note, .legacy-scope-note { margin-bottom: 14px; }
 .physical-workspace {
+  width: 100%;
+  min-width: 0;
   align-items: flex-start;
 }
 .physical-workspace > .el-col {
@@ -852,6 +984,7 @@ onBeforeUnmount(() => {
   .data-sources-page {
     padding: 14px;
   }
+  .data-sources-page.is-embedded { padding: 0; }
   .catalog-grid {
     grid-template-columns: 1fr;
   }
@@ -865,14 +998,17 @@ onBeforeUnmount(() => {
   .catalog-section-head > :deep(.el-tag) { align-self: flex-start; }
   .physical-workspace {
     flex-direction: column;
+    flex-wrap: nowrap;
   }
   .physical-workspace > .data-sources-list-col {
     width: 100%;
     max-width: none;
+    flex: 0 0 auto;
   }
   .physical-workspace > .data-source-detail-col {
     width: 100%;
     max-width: none;
+    flex: 0 0 auto;
     margin-top: 12px;
   }
   .data-sources-list-card { padding: 14px; }

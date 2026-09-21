@@ -20,9 +20,10 @@ from app.distillation_conversation_models import DistillationConversationTurn as
 from app.distillation_conversation_schemas import TurnCreate
 from app.distillation_models import DistillationProject, DistillationPublication
 from app.distillation_schemas import DistillationDocument, ProjectCreate, ProjectUpdate
-from app.models import BucketFile, DataSource, LLMConfig, OrganizationMember, User
-from app.routers import business_distillation, distillation_conversation
+from app.models import AuthorizationGrant, BusinessScenario, BucketFile, DataSource, LLMConfig, OrganizationMember, OrganizationRole, User
+from app.routers import business_distillation, data_sources, distillation_access, distillation_conversation
 from app.services import distillation_attachment_service as attachments, distillation_conversation_service as conversations
+from app.services import distillation_resource_service as resources
 from app.services import distillation_conversation_worker as worker, distillation_library_service as library, distillation_service, llm_service
 from app.services import distillation_conversation_lease as leases
 from app.services.auth_service import get_tenant_db
@@ -120,7 +121,7 @@ def test_investigation_tool_catalog_requires_project_scope_and_exposes_selection
         assert client.get(f"/api/business-distillation/{uuid4().hex}/conversation/tools").status_code == 404
 
 
-def test_inputs_require_same_user_project_tenant_and_block_scope_move_before_first_turn(isolated_postgresql):
+def test_inputs_share_with_scenario_collaborators_and_block_scope_move_before_first_turn(isolated_postgresql):
     isolated = isolated_postgresql
     workspace, project_id, _factory = setup(isolated)
     attachment_id = input_record(isolated, workspace, project_id)
@@ -133,14 +134,18 @@ def test_inputs_require_same_user_project_tenant_and_block_scope_move_before_fir
             role_id=workspace["role_id"], status="active"))
         db.commit()
     another_user = {**workspace, "user_id": other_id}
-    with pytest.raises(HTTPException) as wrong_user:
-        enqueue(isolated, another_user, project_id, [attachment_id])
-    assert wrong_user.value.status_code == 404
     with tenant_session(isolated.runtime_engine, another_user) as db:
-        assert attachments.list_pending(db, project_id) == []
-        with pytest.raises(HTTPException) as removal:
-            attachments.remove(db, project_id, attachment_id)
-        assert removal.value.status_code == 404
+        assert [item.id for item in attachments.list_pending(db, project_id)] == [attachment_id]
+    shared_turn = enqueue(isolated, another_user, project_id, [attachment_id])
+    with tenant_session(isolated.runtime_engine, another_user) as db:
+        row = db.get(Turn, shared_turn)
+        assert row is not None
+        assert attachments.read_attachment(db, row, attachment_id, 0, 12000)["content"]
+        conversations.cancel(db, project_id, shared_turn)
+        db.commit()
+        # A bound input remains visible to every collaborator and can be
+        # selected again for a later turn until its normal expiry.
+        assert [item.id for item in attachments.list_pending(db, project_id)] == [attachment_id]
     with tenant_session(isolated.runtime_engine, workspace) as db:
         with pytest.raises(HTTPException) as move:
             distillation_service.update_project(db, project_id, ProjectUpdate(name="Moved",
@@ -157,6 +162,93 @@ def test_inputs_require_same_user_project_tenant_and_block_scope_move_before_fir
     with pytest.raises(HTTPException) as wrong_tenant:
         enqueue(isolated, foreign, foreign_project, [attachment_id])
     assert wrong_tenant.value.status_code == 404
+
+
+def test_scenario_read_member_sees_distillation_history_materials_and_inputs_without_write(isolated_postgresql):
+    isolated = isolated_postgresql
+    workspace, project_id, _factory = setup(isolated)
+    attachment_id = input_record(isolated, workspace, project_id)
+    turn_id = enqueue(isolated, workspace, project_id, [attachment_id])
+    pending_id = input_record(isolated, workspace, project_id, text="A second shared note remains pending.")
+    with tenant_session(isolated.runtime_engine, workspace) as db:
+        publication = distillation_service.publish(db, project_id, 1)
+        db.commit()
+        publication_id = publication.id
+    with Session(isolated.admin_engine) as db:
+        db.add(DataSource(
+            tenant_id=workspace["tenant_id"], scenario_id=workspace["scenario_id"],
+            name="Collaborative scenario material", type="file_bucket", config={},
+        ))
+        viewer_id, role_id = uuid4().hex, uuid4().hex
+        db.add(User(
+            id=viewer_id,
+            tenant_id=workspace["tenant_id"],
+            email=f"{viewer_id}@acceptance.invalid",
+            password_hash="unusable",
+            status="active",
+        ))
+        db.add(OrganizationRole(
+            id=role_id,
+            organization_id=workspace["organization_id"],
+            key="scenario_reader",
+            name="Scenario reader",
+            is_system=False,
+        ))
+        db.flush()
+        db.add(OrganizationMember(
+            organization_id=workspace["organization_id"],
+            user_id=viewer_id,
+            role_id=role_id,
+            status="active",
+        ))
+        db.add(AuthorizationGrant(
+            organization_id=workspace["organization_id"],
+            role_id=role_id,
+            resource_type="scenario",
+            resource_id=workspace["scenario_id"],
+            verb="read",
+            effect="allow",
+        ))
+        db.commit()
+
+    viewer = {**workspace, "user_id": viewer_id}
+    with tenant_session(isolated.runtime_engine, viewer) as db:
+        projects = business_distillation.list_projects(
+            limit=50, offset=0, scenario_id=workspace["scenario_id"], db=db,
+        )
+        assert [row.id for row in projects] == [project_id]
+        project_detail = business_distillation.get_project(project_id, db)
+        assert project_detail.id == project_id
+        assert project_detail.scenario_id == workspace["scenario_id"]
+        assert project_detail.can_write is False
+
+        turns = conversations.list_turns(db, project_id, 20, None)
+        assert [row.id for row in turns.turns] == [turn_id]
+        turn_detail = distillation_conversation.get_turn(project_id, turn_id, db)
+        assert turn_detail.id == turn_id
+        assert turn_detail.attachments[0].id == attachment_id
+        tool_catalog = distillation_conversation.list_investigation_tools(project_id, db)
+        assert tool_catalog.tools
+        publications = business_distillation.list_publications(project_id, 50, 0, db)
+        assert [row.id for row in publications] == [publication_id]
+        publication_detail = business_distillation.get_publication(project_id, publication_id, db)
+        assert publication_detail.id == publication_id
+        artifact_response = business_distillation.download_artifact(
+            project_id, publication_id, "brief", db,
+        )
+        assert artifact_response.body
+        assert artifact_response.headers["cache-control"] == "private, no-store"
+        assert distillation_access.list_access(project_id, db) == []
+        assert {item.id for item in attachments.list_pending(db, project_id)} == {attachment_id, pending_id}
+        catalog = data_sources.list_data_source_catalog(
+            scenario_id=workspace["scenario_id"], offset=0, limit=20, db=db,
+        )
+        assert any(item.scenario_id == workspace["scenario_id"] for item in catalog.items)
+        resource_catalog = resources.resource_catalog(db, workspace["scenario_id"])
+        assert resource_catalog.models
+        with pytest.raises(HTTPException) as removal:
+            attachments.remove(db, project_id, attachment_id)
+        assert removal.value.status_code == 403
 
 
 def test_followup_reads_prior_input_and_expiry_erases_text_checkpoint_and_fences_worker(isolated_postgresql, monkeypatch):
@@ -176,7 +268,7 @@ def test_followup_reads_prior_input_and_expiry_erases_text_checkpoint_and_fences
         second = enqueue(isolated, workspace, project_id)
         assert worker.process_next_turn(session_factory=factory)
         with tenant_session(isolated.runtime_engine, workspace) as db:
-            assert attachments.list_pending(db, project_id) == []
+            assert [item.id for item in attachments.list_pending(db, project_id)] == [attachment_id]
             first_row, second_row = db.get(Turn, first), db.get(Turn, second)
             assert first_row.status == second_row.status == "succeeded"
             assert first_row.context["attachments"][0]["id"] == attachment_id
@@ -213,6 +305,7 @@ def test_followup_reads_prior_input_and_expiry_erases_text_checkpoint_and_fences
 def test_scenario_history_and_library_discovery_are_filtered_on_server(isolated_postgresql):
     isolated = isolated_postgresql
     workspace, project_id, _factory = setup(isolated)
+    foreign = seed_workspace(isolated.admin_engine)
     with tenant_session(isolated.runtime_engine, workspace) as db:
         shared = distillation_service.create_project(db, ProjectCreate(name="Legacy shared"))
         other = distillation_service.create_project(db, ProjectCreate(name="Other history", scenario_id=workspace["other_scenario_id"]))
@@ -223,12 +316,39 @@ def test_scenario_history_and_library_discovery_are_filtered_on_server(isolated_
     with Session(isolated.admin_engine) as db:
         sources = [DataSource(tenant_id=workspace["tenant_id"], scenario_id=scenario_id, name=name, type="file_bucket", config={})
             for scenario_id, name in ((workspace["scenario_id"], "Current"), (workspace["other_scenario_id"], "Other"), (None, "Shared"))]
-        db.add_all(sources)
+        public_scenario = db.get(BusinessScenario, foreign["scenario_id"])
+        public_scenario.is_public = True
+        public_source = DataSource(tenant_id=foreign["tenant_id"], scenario_id=foreign["scenario_id"],
+            name="Public foreign", type="file_bucket", config={}, is_public=True)
+        private_source = DataSource(tenant_id=foreign["tenant_id"], scenario_id=foreign["scenario_id"],
+            name="Private foreign", type="file_bucket", config={})
+        db.add_all([*sources, public_source, private_source])
         db.commit()
         ids = [row.id for row in sources]
+        public_source_id = public_source.id
     with tenant_session(isolated.runtime_engine, workspace) as db:
         listed = library.list_sources(db, workspace["scenario_id"], 0, 20)
         assert {item["data_source_id"] for item in listed["sources"]} == {ids[0], ids[2]}
+        catalog = data_sources.list_data_source_catalog(
+            scenario_id=workspace["scenario_id"],
+            offset=0,
+            limit=20,
+            db=db,
+        )
+        assert {item.id for item in catalog.items} == {ids[0], ids[2]}
+        assert next(item for item in catalog.items if item.id == ids[0]).can_write
+        assert not next(item for item in catalog.items if item.id == ids[2]).can_write
+        first_page = data_sources.list_data_source_catalog(
+            scenario_id=workspace["scenario_id"], offset=0, limit=1, db=db,
+        )
+        assert len(first_page.items) == 1 and first_page.has_more and first_page.next_offset == 1
+        shared_catalog = data_sources.list_data_source_catalog(offset=0, limit=20, db=db)
+        assert [item.id for item in shared_catalog.items] == [ids[2]]
+        public_catalog = data_sources.list_data_source_catalog(
+            scenario_id=foreign["scenario_id"], offset=0, limit=20, db=db,
+        )
+        assert [item.id for item in public_catalog.items] == [public_source_id]
+        assert not public_catalog.items[0].can_write and not public_catalog.items[0].can_delete
         with pytest.raises(HTTPException) as other_scope:
             library.read_source(db, workspace["scenario_id"], ids[1], None)
         assert other_scope.value.status_code == 422
@@ -319,8 +439,8 @@ def test_input_owner_foreign_keys_and_erasure_check_reject_invalid_persistent_st
     foreign, foreign_project, _ = setup(isolated)
     foreign_input = input_record(isolated, foreign, foreign_project)
     for values, constraint in (
-        ({"turn_id": turn_id, "attachment_id": attachment_id, "user_id": foreign["user_id"]}, "fk_distillation_turn_attachment_turn_owner"),
-        ({"turn_id": turn_id, "attachment_id": foreign_input, "user_id": workspace["user_id"]}, "fk_distillation_turn_attachment_input_owner"),
+        ({"turn_id": turn_id, "attachment_id": attachment_id, "user_id": foreign["user_id"]}, "fk_distillation_turn_attachment_actor_tenant"),
+        ({"turn_id": turn_id, "attachment_id": foreign_input, "user_id": workspace["user_id"]}, "fk_distillation_turn_attachment_input_scope"),
     ):
         with Session(isolated.runtime_engine) as db:
             db.add(Link(**values, tenant_id=workspace["tenant_id"], project_id=project_id))
@@ -348,5 +468,6 @@ def test_attachment_runtime_grants_and_migration_refuse_history_loss():
         input_record(isolated, workspace, project_id)
         with pytest.raises(RuntimeError, match="attachment history exists"):
             isolated.migrate("20260918_37", downgrade=True)
+        isolated.migrate(isolated.head)
         with isolated.runtime_engine.connect() as connection:
-            assert verify_attachment_contract(connection)["ownership_constraints"] == 7
+            assert verify_attachment_contract(connection)["ownership_constraints"] == 10

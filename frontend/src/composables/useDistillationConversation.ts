@@ -102,13 +102,14 @@ export function useDistillationConversation(projectId: Ref<string>, draftKey: Re
     } catch (caught: unknown) { if (current(epoch, control)) error.value = message(caught); return null }
     finally { controllers.delete(control); if (current(epoch, control)) applying.value = '' }
   }
-  watch(draftKey, (id, previous) => {
-    if (previous !== undefined) drafts.set(previous, input.value)
+  watch([draftKey, projectId], ([key], previous) => {
+    const previousKey = previous?.[0]
+    if (previousKey !== undefined) drafts.set(previousKey, input.value)
     generation += 1
     clearTimeout(timer)
     for (const control of controllers) control.abort()
     controllers.clear()
-    turns.value = []; input.value = drafts.get(id) || ''; error.value = ''; loading.value = false
+    turns.value = []; input.value = drafts.get(key) || ''; error.value = ''; loading.value = false
     sending.value = false; applying.value = ''; cancelling.value = false; hasMore.value = false
     void load()
   }, { immediate: true })

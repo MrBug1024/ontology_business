@@ -1,14 +1,12 @@
 <template>
   <section class="distillation-material" v-loading="loading" aria-label="业务蒸馏交接资料">
-    <el-alert title="这是已保存的业务蒸馏阶段资料" description="流程、对象和血缘用于指导场景建模。假设、冲突与暂缓决定仍需保留；这些资料不会成为正式运行数据。" :closable="false" type="info" />
     <p v-if="error" role="alert">{{ error }} <el-button text @click="load">重试</el-button></p>
     <template v-if="publication">
-      <h3>交接版本 {{ publication.project_revision }}</h3>
-      <p>场景建模顾问可将该阶段资料作为资料库依据读取，并按文件用途理解流程、ER 关系、数据血缘及业务边界。</p>
-      <p v-if="!source.scenario_id">此版本尚未关联场景。请返回业务蒸馏，使用“复制到目标场景”并发布场景版本，供该场景顾问自动读取。</p>
+      <header><h3>交接版本 {{ publication.project_revision }}</h3><el-tag size="small" type="info" effect="plain">不可变</el-tag></header>
+      <el-alert v-if="!source.scenario_id" title="该版本尚未关联场景" :closable="false" type="warning" />
       <div class="material-artifacts"><article v-for="artifact in publication.artifacts" :key="artifact.key"><strong>{{ artifact.filename }}</strong><el-button :loading="busy === artifact.key" :disabled="!!busy" @click="download(artifact)">下载文件</el-button></article></div>
-      <el-button @click="router.push(`/business-distillation/${projectId}`)">回到业务蒸馏</el-button>
-      <el-button v-if="source.scenario_id" type="primary" @click="router.push(`/scenarios/${source.scenario_id}`)">进入场景能力建设</el-button>
+      <el-button @click="openDistillation">回到业务蒸馏</el-button>
+      <el-button v-if="source.scenario_id" type="primary" @click="router.push({ name: 'scenario-detail', params: { id: source.scenario_id }, query: { stage: 'ontology' } })">进入能力建设</el-button>
       <el-button v-else @click="router.push('/scenarios')">前往场景能力</el-button>
     </template>
   </section>
@@ -26,6 +24,13 @@ const publicationId = computed(() => typeof props.source.config.publication_id =
 const publication = ref<DistillationPublication | null>(null)
 const loading = ref(false), error = ref(''), busy = ref('')
 let controller: AbortController | undefined
+function openDistillation() {
+  if (props.source.scenario_id) {
+    void router.push({ name: 'scenario-detail', params: { id: props.source.scenario_id }, query: { stage: 'distillation', distillation_id: projectId.value } })
+    return
+  }
+  void router.push({ name: 'business-distillation', params: { id: projectId.value } })
+}
 async function load() {
   controller?.abort()
   const request = new AbortController()
@@ -62,7 +67,9 @@ watch(() => props.source.id, () => { busy.value = ''; void load() }, { immediate
 onBeforeUnmount(() => controller?.abort())
 </script>
 <style scoped>
-.distillation-material p { color: var(--text-2); line-height: 1.75; }
+.distillation-material > header { display: flex; align-items: center; gap: 8px; }
+.distillation-material h3 { margin: 0; }
+.distillation-material p { color: var(--text-2); line-height: 1.6; }
 .material-artifacts { display: grid; gap: 12px; margin: 20px 0; }
 .material-artifacts article { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; flex-wrap: wrap; }
 .material-artifacts strong { overflow-wrap: anywhere; }

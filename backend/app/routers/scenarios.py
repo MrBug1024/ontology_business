@@ -725,6 +725,35 @@ def _scenario_for_request(db: Session, scenario_id: str, writable: bool = False)
     return scenario
 
 
+def _can_read_workspace_context(db: Session, scenario: BusinessScenario) -> bool:
+    """Keep workspace-private drafts out of public scenario projections."""
+    return (
+        scenario.tenant_id == tenant_service.current_tenant_id(db)
+        and permission_service.check_scenario(db, scenario, "read").allowed
+    )
+
+
+def _can_write_workspace_context(db: Session, scenario: BusinessScenario) -> bool:
+    """Only editable members may receive connector health details."""
+    return (
+        scenario.status != "retired"
+        and scenario.tenant_id == tenant_service.current_tenant_id(db)
+        and permission_service.check_scenario(db, scenario, "write").allowed
+    )
+
+
+def _scenario_source_last_error(
+    db: Session,
+    source: DataSource,
+    *,
+    can_write_workspace: bool,
+) -> str:
+    """Hide connector/vendor error text from public and read-only projections."""
+    if not can_write_workspace or source.tenant_id != tenant_service.current_tenant_id(db):
+        return ""
+    return source.last_error
+
+
 def _scenario_model_draft_out(
     row: ScenarioModelDraftResource,
     *,
@@ -2218,6 +2247,7 @@ def get_scenario(
     s = _scenario_for_request(db, scenario_id)
     definition = _runtime_definition_for_scenario(db, s, release_id=release_id)
     base = _scenario_out(s)
+    scenario_can_write = _can_write_workspace_context(db, s)
     entity_ids = {str(item) for item in definition.entities}
     relation_ids = {str(item) for item in definition.relations}
     mapping_ids = {str(item) for item in definition.mappings}
@@ -2282,7 +2312,11 @@ def get_scenario(
             type=d.type,
             config=_safe_source_config(d.config or {}),
             status=d.status,
-            last_error=d.last_error,
+            last_error=_scenario_source_last_error(
+                db,
+                d,
+                can_write_workspace=scenario_can_write,
+            ),
             created_at=d.created_at,
             file_count=file_counts.get(d.id, 0),
         )
@@ -2398,10 +2432,8 @@ def get_scenario(
     ]
     return ScenarioDetail(
         **base.model_dump(),
-        can_write=(
-            s.status != "retired"
-            and permission_service.check_scenario(db, s, "write").allowed
-        ),
+        can_write=scenario_can_write,
+        can_read_workspace_context=_can_read_workspace_context(db, s),
         entities=entities,
         relations=relations,
         data_sources=ds_out,

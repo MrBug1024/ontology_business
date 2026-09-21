@@ -43,7 +43,7 @@ export interface DistillationAttachmentDraft {
   key: string
   filename: string
   byte_size: number
-  status: 'uploading' | 'ready' | 'failed' | 'removing'
+  status: 'uploading' | 'ready' | 'bound' | 'failed' | 'removing'
   progress: number
   error: string
   attachment: DistillationAttachment | null
