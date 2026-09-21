@@ -268,13 +268,23 @@ def effective_turn_tool_keys(row: Turn) -> tuple[str, ...]:
     context = row.context if isinstance(row.context, dict) else {}
     frozen = context.get(RESOURCE_SELECTION_KEY)
     if frozen is None:
-        return distillation_conversation_tools.effective_tool_keys(None)
-    selection, _requested_llm_id, version = _selection_from_snapshot(frozen)
-    if version == 1:
-        # v1 had no per-tool selection; retain its complete registered set.
-        return distillation_conversation_tools.effective_tool_keys(None)
-    return (*distillation_conversation_tools.effective_tool_keys(selection.investigation_tool_keys),
-        *distillation_resource_service.effective_keys(frozen))
+        effective = list(distillation_conversation_tools.effective_tool_keys(None))
+    else:
+        selection, _requested_llm_id, version = _selection_from_snapshot(frozen)
+        if version == 1:
+            # v1 had no per-tool selection; retain its complete registered set.
+            effective = list(distillation_conversation_tools.effective_tool_keys(None))
+        else:
+            effective = list(distillation_conversation_tools.effective_tool_keys(selection.investigation_tool_keys))
+    if context.get("attachment_ids"):
+        # Attachment inputs are explicit invocation context. Keep their
+        # discovery and bounded reader available even when optional tools are narrowed.
+        for key in ("list_evidence", "read_attachment"):
+            if key not in effective:
+                effective.append(key)
+    if frozen is not None:
+        effective.extend(distillation_resource_service.effective_keys(frozen))
+    return tuple(effective)
 
 
 def investigation_tool_catalog(db: Session, project_id: str) -> InvestigationToolCatalogOut:

@@ -79,7 +79,7 @@ export function useDistillationConversation(projectId: Ref<string>, draftKey: Re
   }
   async function send(text: string, revision: number, attachmentIds: string[] = [], resourceSelection: DistillationResourceSelection = {}, targetProjectId = '') {
     const id = targetProjectId || projectId.value
-    if (!id || sending.value || active.value || !text.trim()) return false
+    if (!id || sending.value || active.value || (!text.trim() && !attachmentIds.length)) return false
     const epoch = generation, control = controller()
     const attachments = JSON.stringify(attachmentIds)
     const selectedResources = stableResourceSelection(resourceSelection)

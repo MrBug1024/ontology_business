@@ -94,6 +94,28 @@ def _proposal_outline(proposal: dict) -> dict:
     }
 
 
+def _attachment_context_message(row: Turn) -> str:
+    """Expose bounded attachment metadata; file text remains tool-read input."""
+    references = [
+        {
+            "id": item["id"],
+            "filename": item["filename"],
+            "media_type": item["media_type"],
+            "byte_size": item["byte_size"],
+            "content_sha256": item["content_sha256"],
+        }
+        for item in row.context.get("attachments", [])
+    ]
+    if not references:
+        return "本轮没有显式附件。"
+    return (
+        "【本轮用户附件（已与本次消息绑定）】\n"
+        "以下仅是附件元数据，附件正文没有拼入提示词。需要依据文件回答时，必须按需调用read_attachment，"
+        "使用附件id和有界offset/limit分段读取；不要根据文件名猜测，也不要声称已经读取未取得的内容。\n"
+        + json.dumps(references, ensure_ascii=False)
+    )
+
+
 def _initial_messages(db, row: Turn) -> list[dict]:
     history = db.scalars(select(Turn).where(Turn.project_id == row.project_id,
         Turn.turn_number < row.turn_number).order_by(Turn.turn_number.desc()).limit(8)).all()
@@ -139,7 +161,7 @@ def _initial_messages(db, row: Turn) -> list[dict]:
         json.dumps(_document_outline(row.context["document"]), ensure_ascii=False) +
         "\n需要字段、证据、流程或实体详情时，先调用list_evidence、read_current_document或其它有界读取工具；不要假设摘要以外的内容。"})
     messages.append({"role": "system", "content": conversations.resource_reference_message(row)})
-    messages.append({"role": "system", "content": f"本轮有 {len(row.context.get('available_attachments', []))} 个仍有效的临时附件。需要文件名或正文时先调用list_evidence，再调用read_attachment；历史消息中的其他附件可能已过期或移除。"})
+    messages.append({"role": "system", "content": _attachment_context_message(row)})
     messages.append({"role": "user", "content": "本次问题：\n" + row.message})
     return messages
 

@@ -185,6 +185,21 @@ test('attachment identity participates in retry identity and only accepted sends
   stop()
 })
 
+test('an attachment-only turn is submitted and clears the draft after acknowledgement', async () => {
+  fakeApi.list = async () => ({ turns: [], has_more: false })
+  const requests = []
+  fakeApi.send = async (project, requestId, message, revision, signal, attachments) => {
+    requests.push({ project, message, attachments })
+    return turn('attachment-turn', 'running', { message, project_id: project })
+  }
+  const { state, stop } = mount()
+  await flush()
+  assert.equal(await state.send('', 1, ['attachment-1']), true)
+  assert.deepEqual(requests[0], { project: 'p', message: '', attachments: ['attachment-1'] })
+  assert.equal(state.input.value, '')
+  stop()
+})
+
 test('resource selection participates in retry identity and reaches the API unchanged in meaning', async () => {
   fakeApi.list = async () => ({ turns: [], has_more: false })
   const requests = []

@@ -59,7 +59,7 @@
       <div v-if="!projectId || project || loading" class="distillation-studio-body" :class="`is-${mobilePane}`">
         <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :publications="publications" :publication-busy="busy" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="canEdit && !loading && !actionBusy" :can-publish="!!project && canEdit && !dirty && !actionBusy && !active && !artifactProposal" @ask="discussFinding" @publish="confirmPublish" @updated="acceptProjectUpdate" @open-publication="openMaterial" @download-publication="downloadPublication" @delete-publication="deletePublication" />
         <aside class="distillation-advisor-panel" aria-label="业务蒸馏顾问对话">
-        <DistillationConversation v-model="input" :scope-key="draftKey" :scenario-id="props.scenarioId" :turns="turns" :loading="loading || conversationLoading" :has-more="conversationHasMore" :working="!!active" :sending="sending || busy === 'save'" :cancelling="cancelling" :applying="applying" :disabled="!canEdit || loading || actionBusy" :can-apply="canEdit && !dirty && !actionBusy" :error="conversationError" :blocked-reason="blockedReason" :upload-busy="attachmentBusy" :removing-attachment="removingAttachment" :compact="embedded" :workspace-actions="embedded" :streaming="streaming" :reconnecting="reconnecting" @send="sendMessage" @cancel="cancel" @reload="reconnectConversation" @older="loadConversation(true)" @sources="openSources" @files="addAttachments" @remove-submitted="removeSubmittedAttachment" @preview="previewTurn = $event" @apply="applyTurn" @new="newConversation" @history="projectsOpen = true" @systems="openSystems">
+        <DistillationConversation v-model="input" :scope-key="draftKey" :scenario-id="props.scenarioId" :turns="turns" :loading="loading || conversationLoading" :has-more="conversationHasMore" :working="!!active" :sending="sending || busy === 'save'" :cancelling="cancelling" :applying="applying" :disabled="!canEdit || loading || actionBusy" :can-apply="canEdit && !dirty && !actionBusy" :error="conversationError" :blocked-reason="blockedReason" :upload-busy="attachmentBusy" :has-attachments="readyIds.length > 0" :removing-attachment="removingAttachment" :compact="embedded" :workspace-actions="embedded" :streaming="streaming" :reconnecting="reconnecting" @send="sendMessage" @cancel="cancel" @reload="reconnectConversation" @older="loadConversation(true)" @sources="openSources" @files="addAttachments" @remove-submitted="removeSubmittedAttachment" @preview="previewTurn = $event" @apply="applyTurn" @new="newConversation" @history="projectsOpen = true" @systems="openSystems">
             <template #attachments><DistillationAttachments :items="attachments" :error="attachmentError" :disabled="!canEdit || !!active || sending" @retry="retryAttachment" @remove="removeAttachment" @reload="loadAttachments" /></template>
           </DistillationConversation>
         </aside>
@@ -276,7 +276,8 @@ async function removeSubmittedAttachment(id: string) {
 }
 async function sendMessage(selection: DistillationResourceSelection = {}) {
   const text = input.value
-  if (!text.trim() || !canEdit.value || unsavedStageChanges.value || actionBusy.value || attachmentBlocked.value || active.value) return
+  const ids = [...readyIds.value]
+  if ((!text.trim() && !ids.length) || !canEdit.value || unsavedStageChanges.value || actionBusy.value || attachmentBlocked.value || active.value) return
   const existingProject = project.value
   let row = existingProject
   if (row && materialOnlyDirty.value) {
@@ -284,7 +285,6 @@ async function sendMessage(selection: DistillationResourceSelection = {}) {
     if (!row) return
   }
   if (!row) row = await ensureProject(text, false)
-  const ids = [...readyIds.value]
   const sent = row ? await send(text, row.revision, ids, selection, row.id) : false
   if (sent) { attachmentsSent(ids); notice.value = '' }
   if (!existingProject && row) {

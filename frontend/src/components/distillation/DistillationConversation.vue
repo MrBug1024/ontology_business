@@ -77,7 +77,7 @@
             <el-button text :disabled="disabled || working || uploadBusy" @click="$emit('sources')">引用资料库</el-button>
           </div>
           <el-button v-if="working" :loading="cancelling" @click="$emit('cancel')">停止本轮</el-button>
-          <el-button v-else native-type="submit" type="primary" :disabled="disabled || !!blockedReason || uploadBusy || !input.trim()" :loading="sending">发送<el-icon class="discovery-send-icon"><Top /></el-icon></el-button>
+          <el-button v-else native-type="submit" type="primary" :disabled="disabled || !!blockedReason || uploadBusy || (!input.trim() && !hasAttachments)" :loading="sending">发送<el-icon class="discovery-send-icon"><Top /></el-icon></el-button>
         </div>
       </form>
       <p v-if="!compact" class="discovery-composer-note">Ctrl / ⌘ + Enter 发送 · 临时附件不入资料库 · 阶段建议经核对后保存</p>
@@ -95,7 +95,7 @@ import DistillationResourceSettings from './DistillationResourceSettings.vue'
 import type { DistillationQuestion, DistillationResourceSelection, DistillationTurn } from '@/types/distillationConversation'
 import { composeClarificationAnswer, isWorking, splitAssistantMessage, TURN_STATUS_LABELS } from '@/utils/distillationConversation'
 const input = defineModel<string>({ required: true })
-const props = withDefaults(defineProps<{ turns: DistillationTurn[]; loading: boolean; hasMore: boolean; working: boolean; sending: boolean; cancelling: boolean; applying: string; disabled: boolean; canApply: boolean; error: string; blockedReason: string; uploadBusy: boolean; removingAttachment: string; scopeKey: string; scenarioId?: string; compact?: boolean; workspaceActions?: boolean; streaming?: boolean; reconnecting?: boolean }>(), { compact: false, scenarioId: '', workspaceActions: false, streaming: false, reconnecting: false })
+const props = withDefaults(defineProps<{ turns: DistillationTurn[]; loading: boolean; hasMore: boolean; working: boolean; sending: boolean; cancelling: boolean; applying: string; disabled: boolean; canApply: boolean; error: string; blockedReason: string; uploadBusy: boolean; hasAttachments: boolean; removingAttachment: string; scopeKey: string; scenarioId?: string; compact?: boolean; workspaceActions?: boolean; streaming?: boolean; reconnecting?: boolean }>(), { compact: false, scenarioId: '', workspaceActions: false, streaming: false, reconnecting: false })
 const emit = defineEmits<{ send: [selection: DistillationResourceSelection]; cancel: []; reload: []; older: []; sources: []; files: [files: File[]]; 'remove-submitted': [id: string]; preview: [turn: DistillationTurn]; apply: [turn: DistillationTurn]; new: []; history: []; systems: [] }>()
 const scrollArea = ref<HTMLElement>(), textarea = ref<HTMLTextAreaElement>()
 const filePicker = ref<HTMLInputElement>()
@@ -131,7 +131,7 @@ function selectedResourceSelection(): DistillationResourceSelection {
 }
 function submit() { emit('send', selectedResourceSelection()) }
 function filesSelected(event: Event) { const target = event.target; if (target instanceof HTMLInputElement) { emit('files', Array.from(target.files || [])); target.value = '' } }
-function sendOnShortcut(event: KeyboardEvent) { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing && !props.working && !props.sending && !props.disabled && !props.blockedReason && !props.uploadBusy && input.value.trim()) { event.preventDefault(); submit() } }
+function sendOnShortcut(event: KeyboardEvent) { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing && !props.working && !props.sending && !props.disabled && !props.blockedReason && !props.uploadBusy && (input.value.trim() || props.hasAttachments)) { event.preventDefault(); submit() } }
 function trackScroll() { const element = scrollArea.value; if (element) nearBottom.value = element.scrollHeight - element.scrollTop - element.clientHeight < 100 }
 watch(() => props.turns.map(turn => `${turn.id}:${turn.updated_at}:${turn.status}`).join('|'), async () => { if (!nearBottom.value) return; await nextTick(); const element = scrollArea.value; if (element) element.scrollTop = element.scrollHeight })
 </script>
