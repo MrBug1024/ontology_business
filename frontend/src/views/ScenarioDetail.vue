@@ -5814,6 +5814,9 @@ onBeforeUnmount(() => {
 .sd-tabs :deep(.el-tabs__nav-wrap) { min-width: 0; }
 .sd-tabs :deep(.el-tabs__content) { overflow: visible; }
 .sd-tabs :deep(.el-tab-pane) { overflow: visible; }
+.sd-page > .sd-tabs,
+.sd-tabs :deep(.el-tabs__content),
+.sd-tabs :deep(.el-tab-pane) { min-width: 0; }
 .tab-toolbar {
   flex: 0 0 auto;
   margin-bottom: 8px;

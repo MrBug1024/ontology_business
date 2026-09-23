@@ -1,5 +1,5 @@
 <template>
-  <div class="discovery-findings">
+  <div class="discovery-findings" :class="{ 'is-graph-finding': tab !== 'value' }">
     <template v-if="tab === 'value'">
       <dl v-if="valueItems.length" class="discovery-value-list discovery-value-grid"><div v-for="item in valueItems" :key="item.label"><dt>{{ item.label }}</dt><dd>{{ item.value }}</dd></div></dl>
       <p v-else class="discovery-empty-note">暂无业务价值产物</p>
@@ -7,21 +7,15 @@
     </template>
     <template v-else-if="tab === 'process'">
       <div v-if="document.as_is.nodes.length || document.to_be.nodes.length" class="discovery-segment" role="group" aria-label="选择流程"><button :aria-pressed="!targetFlow" :disabled="!document.as_is.nodes.length" @click="targetFlow = false">现状流程</button><button :aria-pressed="targetFlow" :disabled="!document.to_be.nodes.length" @click="targetFlow = true">目标流程</button></div>
-      <DistillationGraph v-if="flow.nodes.length" :title="targetFlow ? '目标流程' : '现状流程'" :nodes="flow.nodes.map(node => ({ ...node, detail: node.owner }))" :edges="flow.edges" />
-      <ol v-if="flow.nodes.length" class="discovery-canvas-list"><li v-for="node in flow.nodes" :key="node.key"><strong>{{ node.name }}</strong><p v-if="node.owner">责任人：{{ node.owner }}</p><p v-if="node.trigger">触发：{{ node.trigger }}</p><p v-if="node.inputs">输入：{{ node.inputs }}</p><p v-if="node.outcome">结果：{{ node.outcome }}</p><p v-if="node.rule">规则：{{ node.rule }}</p><p v-if="node.exceptions">例外：{{ node.exceptions }}</p><small v-if="node.evidence_refs.length">依据：{{ evidenceNames(node.evidence_refs) }}</small></li></ol>
-      <ul v-if="flow.edges.length" class="discovery-canvas-list"><li v-for="(edge, index) in flow.edges" :key="index">{{ nodeName(edge.source) }} → {{ nodeName(edge.target) }}<span v-if="edge.label"> · {{ edge.label }}</span></li></ul>
+      <DistillationGraph v-if="flow.nodes.length" variant="process" :title="targetFlow ? '目标流程' : '现状流程'" :nodes="processGraphNodes" :edges="flow.edges" />
       <p v-if="!flow.nodes.length" class="discovery-empty-note">暂无流程图谱</p>
-      <template v-if="targetFlow && document.improvements.length"><h3>改进依据</h3><article v-for="item in document.improvements" :key="item.key" class="discovery-finding-card"><strong>{{ improvementLabels[item.decision] }} · {{ existingNodeName(item.existing_node_key) }}</strong><p>{{ item.rationale }}</p><small v-if="item.expected_benefit">预期改善：{{ item.expected_benefit }}</small></article></template>
     </template>
     <template v-else-if="tab === 'entities'">
-      <DistillationGraph v-if="document.entities.length" title="业务对象关系" :nodes="document.entities" :edges="entityEdges" />
-      <dl class="discovery-value-list discovery-value-grid"><div v-for="entity in document.entities" :key="entity.key"><dt>{{ entity.name }}</dt><dd>{{ entity.description }}<p v-if="entity.identity">身份规则：{{ entity.identity }}</p><small v-if="entity.evidence_refs?.length">依据：{{ evidenceNames(entity.evidence_refs) }}</small><small v-if="entity.attributes.length">属性：{{ entity.attributes.join('、') }}</small></dd></div></dl>
-      <ul class="discovery-canvas-list"><li v-for="(relation, index) in document.relations" :key="index">{{ entityName(relation.source) }} → {{ entityName(relation.target) }} · {{ relation.label }}<p>{{ cardinalityLabels[relation.cardinality] }}</p><p v-if="relation.rationale">基数依据：{{ relation.rationale }}</p><small v-if="relation.evidence_refs?.length">证据：{{ evidenceNames(relation.evidence_refs) }}</small></li></ul>
+      <DistillationGraph v-if="document.entities.length" variant="entity" title="业务对象关系" :nodes="entityGraphNodes" :edges="entityEdges" />
       <p v-if="!document.entities.length" class="discovery-empty-note">暂无 ER 图谱</p>
     </template>
     <template v-else-if="tab === 'lineage'">
-      <DistillationGraph v-if="document.lineage.length" title="数据血缘" :nodes="document.entities" :edges="document.lineage.map(item => ({ ...item, label: item.transformation }))" />
-      <ol class="discovery-canvas-list"><li v-for="(item, index) in document.lineage" :key="index"><strong>{{ entityName(item.source) }} → {{ entityName(item.target) }}</strong><p>{{ item.transformation }}</p><small v-if="item.evidence_refs.length">依据：{{ evidenceNames(item.evidence_refs) }}</small></li></ol>
+      <DistillationGraph v-if="document.lineage.length" variant="lineage" title="数据血缘" :nodes="entityGraphNodes" :edges="lineageEdges" />
       <p v-if="!document.lineage.length" class="discovery-empty-note">暂无数据血缘</p>
     </template>
   </div>
@@ -44,13 +38,31 @@ const valueItems = computed(() => [
   { label: '建设范围', value: props.document.scope }, { label: '范围之外', value: props.document.non_goals },
 ].filter(item => item.value.trim()))
 const improvementLabels = { retain: '保留', remove: '删除', merge: '合并', replace: '替代' }
-const cardinalityLabels = { unconfirmed: '基数待核对', one_to_one: '一对一', one_to_many: '一对多', many_to_many: '多对多' }
+const entityGraphNodes = computed(() => props.document.entities.map(entity => ({
+  ...entity,
+  detail: entity.description,
+  evidenceSummary: entity.evidence_refs?.length ? `依据：${evidenceNames(entity.evidence_refs)}` : '',
+})))
 const entityEdges = computed(() => props.document.relations.map(relation => ({ ...relation,
   uncertain: relation.cardinality === 'unconfirmed',
   label: relation.cardinality === 'unconfirmed' ? `基数待核对 · ${relation.label}` : relation.label,
+  detail: relation.label,
+  evidenceSummary: relation.evidence_refs?.length ? `依据：${evidenceNames(relation.evidence_refs)}` : '',
 })))
-function entityName(key: string) { return props.document.entities.find(item => item.key === key)?.name || '待明确对象' }
-function nodeName(key: string) { return flow.value.nodes.find(item => item.key === key)?.name || '待明确环节' }
-function existingNodeName(key: string) { return props.document.as_is.nodes.find(item => item.key === key)?.name || '当前流程' }
+const lineageEdges = computed(() => props.document.lineage.map(item => ({
+  ...item,
+  label: item.transformation,
+  detail: item.transformation,
+  evidenceSummary: item.evidence_refs.length ? `依据：${evidenceNames(item.evidence_refs)}` : '',
+})))
+const processGraphNodes = computed(() => flow.value.nodes.map(node => ({
+  ...node,
+  detail: node.owner,
+  shape: /判断|决策|条件|分支|审批|校验/.test(node.name || '') ? 'decision' as const : 'process' as const,
+  evidenceSummary: node.evidence_refs.length ? `依据：${evidenceNames(node.evidence_refs)}` : '',
+  review: targetFlow.value
+    ? props.document.improvements.filter(item => item.existing_node_key === node.key).map(item => `${improvementLabels[item.decision] || item.decision}：${item.rationale}${item.expected_benefit ? `；预期改善：${item.expected_benefit}` : ''}`).join('；')
+    : '',
+})))
 function evidenceNames(keys: string[]) { return keys.map(key => props.document.evidence.find(item => item.key === key)?.title || '待核实依据').join('、') }
 </script>

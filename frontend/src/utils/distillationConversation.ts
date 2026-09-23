@@ -1,6 +1,17 @@
 import type { DistillationTurn } from '../types/distillationConversation'
 
 export function isWorking(turn: DistillationTurn | undefined | null): boolean { return turn?.status === 'queued' || turn?.status === 'running' }
+const LEGACY_CONTEXT_ERROR = '项目、权限或资料已变化，或缺少可用工具模型；请刷新并核对后重新发送。'
+const LEGACY_FAILURE_COPY: Record<string, string> = {
+  read_attachment: '本轮在读取对话附件时未完成，请检查附件状态后重试。',
+  read_library_source: '本轮在读取资料库材料时未完成，已保留已取得的调查回执；请刷新资料后重试。',
+  read_database_sample: '本轮在读取历史数据样本时未完成，已保留已取得的调查回执；请缩小样本范围或重新发送。',
+}
+export function visibleTurnError(turn: DistillationTurn): string {
+  if (turn.error !== LEGACY_CONTEXT_ERROR) return turn.error
+  const failedStep = [...turn.steps].reverse().find(step => step.status === 'failed')
+  return LEGACY_FAILURE_COPY[failedStep?.tool_name || ''] || turn.error
+}
 export interface AssistantMessagePart {
   kind: 'thinking' | 'answer'
   content: string

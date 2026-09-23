@@ -2,12 +2,13 @@ import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { distillationConversationApi as api } from '@/api/distillationConversation'
 import type { DistillationAttachment, DistillationAttachmentDraft } from '@/types/distillationConversation'
 
-export function useDistillationAttachments(projectId: Ref<string>) {
+export function useDistillationAttachments(projectId: Ref<string>, scenarioId: Ref<string> = ref('')) {
   const attachments = ref<DistillationAttachmentDraft[]>([]), loading = ref(false), error = ref('')
   const now = ref(Date.now())
   const expiryTimer = setInterval(() => { now.value = Date.now() }, 30_000)
   const files = new Map<string, File>(), controllers = new Set<AbortController>(), consumed = new Set<string>(), uncertain = new Set<string>()
   const busy = computed(() => loading.value || attachments.value.some(item => ['uploading', 'removing'].includes(item.status)))
+  const composerAttachments = computed(() => attachments.value.filter(item => item.status !== 'bound' && item.attachment?.status !== 'bound'))
   const readyIds = computed(() => attachments.value.flatMap(item => ['ready', 'bound'].includes(item.status) && item.attachment && ['ready', 'bound'].includes(item.attachment.status) && Date.parse(item.attachment.expires_at) > now.value ? [item.attachment.id] : []))
   const blocked = computed(() => busy.value || attachments.value.some(item => !['ready', 'bound'].includes(item.status) || !item.attachment || !['ready', 'bound'].includes(item.attachment.status) || Date.parse(item.attachment.expires_at) <= now.value))
   let generation = 0, listVersion = 0, disposed = false
@@ -16,15 +17,15 @@ export function useDistillationAttachments(projectId: Ref<string>) {
   function message(caught: unknown) { return caught instanceof Error ? caught.message : '附件处理失败，请重试。' }
   function restored(item: DistillationAttachment): DistillationAttachmentDraft { return { key: item.request_id, filename: item.filename, byte_size: item.byte_size, status: item.status === 'bound' ? 'bound' : 'ready', progress: 100, error: '', attachment: item } }
   async function load() {
-    if (!projectId.value) return
     const epoch = generation, version = ++listVersion, controller = control()
     loading.value = true
     try {
-      const rows = await api.attachments(projectId.value, controller.signal)
+      const rows = await api.attachments(projectId.value, controller.signal, scenarioId.value)
       if (valid(epoch, controller) && version === listVersion) {
         const serverIds = new Set(rows.map(item => item.id)), serverRequests = new Set(rows.map(item => item.request_id))
         const retained = attachments.value.filter(item => (
           !item.attachment
+          || item.attachment.project_id === null
           || ['uploading', 'removing'].includes(item.status)
           || serverIds.has(item.attachment.id)
           || serverRequests.has(item.key)
@@ -46,11 +47,11 @@ export function useDistillationAttachments(projectId: Ref<string>) {
   }
   async function upload(item: DistillationAttachmentDraft) {
     const file = files.get(item.key)
-    if (!file || !projectId.value) return
+    if (!file) return
     const epoch = generation, controller = control()
     item.status = 'uploading'; item.error = ''; item.progress = 0
     try {
-      const result = await api.upload(projectId.value, item.key, file, controller.signal, value => { if (valid(epoch, controller)) item.progress = value })
+      const result = await api.upload(projectId.value, item.key, file, controller.signal, value => { if (valid(epoch, controller)) item.progress = value }, scenarioId.value)
       if (valid(epoch, controller)) {
         attachments.value = attachments.value.filter(row => row.key === item.key || row.attachment?.id !== result.id)
         item.attachment = result; item.status = 'ready'; item.progress = 100
@@ -84,7 +85,7 @@ export function useDistillationAttachments(projectId: Ref<string>) {
   async function removeSubmitted(id: string) {
     const epoch = generation, controller = control()
     try {
-      await api.removeAttachment(projectId.value, id, controller.signal)
+      await api.removeAttachment(projectId.value, id, controller.signal, scenarioId.value)
       if (valid(epoch, controller)) {
         consumed.add(id)
         const removed = attachments.value.filter(item => item.attachment?.id === id)
@@ -107,7 +108,7 @@ export function useDistillationAttachments(projectId: Ref<string>) {
     const previousStatus = item.status
     item.status = 'removing'
     try {
-      await api.removeAttachment(projectId.value, item.attachment.id, controller.signal)
+      await api.removeAttachment(projectId.value, item.attachment.id, controller.signal, scenarioId.value)
       if (valid(epoch, controller)) { consumed.add(item.attachment.id); attachments.value = attachments.value.filter(row => row.key !== key); files.delete(key) }
     } catch (caught: unknown) { if (valid(epoch, controller)) { item.status = previousStatus; item.error = message(caught) } }
     finally { controllers.delete(controller) }
@@ -125,7 +126,21 @@ export function useDistillationAttachments(projectId: Ref<string>) {
     })
     for (const key of files.keys()) if (!attachments.value.some(item => item.key === key)) files.delete(key)
   }
-  watch(projectId, () => { generation += 1; for (const controller of controllers) controller.abort(); controllers.clear(); files.clear(); consumed.clear(); uncertain.clear(); attachments.value = []; loading.value = false; error.value = ''; void load() }, { immediate: true })
+  watch([projectId, scenarioId], ([nextProjectId, nextScenarioId], previous) => {
+    const carryingPreupload = !!previous && !previous[0] && !!nextProjectId && previous[1] === nextScenarioId
+    generation += 1
+    for (const controller of controllers) controller.abort()
+    controllers.clear()
+    consumed.clear()
+    uncertain.clear()
+    if (!carryingPreupload) {
+      files.clear()
+      attachments.value = []
+    }
+    loading.value = false
+    error.value = ''
+    void load()
+  }, { immediate: true })
   onBeforeUnmount(() => { disposed = true; generation += 1; clearInterval(expiryTimer); for (const controller of controllers) controller.abort(); files.clear() })
-  return { attachments, loading, error, busy, blocked, readyIds, load, add, remove, retry, sent, removeSubmitted }
+  return { attachments, composerAttachments, loading, error, busy, blocked, readyIds, load, add, remove, retry, sent, removeSubmitted }
 }

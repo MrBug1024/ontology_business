@@ -1,7 +1,7 @@
 <template>
   <section>
     <div class="distill-section-head"><h3>{{ title }}</h3><el-button @click="addNode">添加节点</el-button></div>
-    <DistillationGraph :title="title" :nodes="graph.nodes.map(node => ({ ...node, detail: node.owner }))" :edges="graph.edges" />
+    <DistillationGraph variant="process" :title="title" :nodes="graph.nodes.map(node => ({ ...node, detail: node.owner, shape: /判断|决策|条件|分支|审批|校验/.test(node.name || '') ? 'decision' : 'process' }))" :edges="graph.edges" />
     <el-empty v-if="!graph.nodes.length" description="按业务结果倒推必要节点，也可以先生成分析建议后核对。" />
     <article v-for="(node, index) in graph.nodes" :key="node.key" class="distill-item">
       <div class="distill-section-head"><h4>节点 {{ index + 1 }}</h4><el-button text type="danger" :aria-label="`移除节点 ${node.name || index + 1}`" @click="remove(node.key)">移除</el-button></div>

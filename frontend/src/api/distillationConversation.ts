@@ -9,6 +9,7 @@ import type {
 } from '@/types/distillationConversation'
 
 const path = (projectId: string) => `/business-distillation/${encodeURIComponent(projectId)}/conversation`
+const preuploadPath = '/business-distillation/conversation'
 const turnPath = (projectId: string, turnId: string) => `${path(projectId)}/turns/${encodeURIComponent(turnId)}`
 
 function selectionPayload(selection: DistillationResourceSelection = {}): Required<DistillationResourceSelection> {
@@ -46,14 +47,18 @@ export const distillationConversationApi = {
     },
     { signal },
   ),
-  attachments: (projectId: string, signal: AbortSignal) => http.get<DistillationAttachment[]>(`${path(projectId)}/attachments`, { signal }),
-  upload: (projectId: string, requestId: string, file: File, signal: AbortSignal, progress: (value: number) => void) => {
+  attachments: (projectId: string, signal: AbortSignal, scenarioId = '') => http.get<DistillationAttachment[]>(
+    `${projectId ? path(projectId) : preuploadPath}/attachments`,
+    { params: projectId ? undefined : { scenario_id: scenarioId || undefined }, signal },
+  ),
+  upload: (projectId: string, requestId: string, file: File, signal: AbortSignal, progress: (value: number) => void, scenarioId = '') => {
     const form = new FormData()
     form.append('file', file)
     form.append('request_id', requestId)
-    return http.post<DistillationAttachment>(`${path(projectId)}/attachments`, form, { signal, timeout: 180_000, headers: { 'Content-Type': 'multipart/form-data' }, onUploadProgress: (event: { loaded: number; total?: number }) => progress(Math.min(99, Math.round(event.loaded / (event.total || file.size || 1) * 100))) })
+    if (!projectId && scenarioId) form.append('scenario_id', scenarioId)
+    return http.post<DistillationAttachment>(`${projectId ? path(projectId) : preuploadPath}/attachments`, form, { signal, timeout: 180_000, headers: { 'Content-Type': 'multipart/form-data' }, onUploadProgress: (event: { loaded: number; total?: number }) => progress(Math.min(99, Math.round(event.loaded / (event.total || file.size || 1) * 100))) })
   },
-  removeAttachment: (projectId: string, attachmentId: string, signal: AbortSignal) => http.delete<void>(`${path(projectId)}/attachments/${encodeURIComponent(attachmentId)}`, { signal }),
+  removeAttachment: (projectId: string, attachmentId: string, signal: AbortSignal, scenarioId = '') => http.delete<void>(`${projectId ? path(projectId) : preuploadPath}/attachments/${encodeURIComponent(attachmentId)}`, { params: projectId ? undefined : { scenario_id: scenarioId || undefined }, signal }),
   get: (projectId: string, turnId: string, signal: AbortSignal) => http.get<DistillationTurn>(turnPath(projectId, turnId), { signal }),
   stream: (
     projectId: string,

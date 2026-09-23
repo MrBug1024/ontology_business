@@ -4,7 +4,7 @@
     <p class="distill-hint">描述业务含义、对象关系和数据如何产生或转化。字段相似不等于血缘成立，缺少依据时请在证据中记录限制。</p>
     <el-tabs>
       <el-tab-pane label="对象与 ER 关系" name="entities">
-        <DistillationGraph title="ER 关系图" :nodes="document.entities.map(item => ({ ...item, detail: item.description }))" :edges="document.relations" />
+        <DistillationGraph variant="entity" title="ER 关系图" :nodes="document.entities.map(item => ({ ...item, detail: item.description }))" :edges="document.relations" />
         <div class="distill-section-head"><h3>业务对象</h3><el-button @click="addEntity">添加对象</el-button></div>
         <article v-for="(item, index) in document.entities" :key="item.key" class="distill-item">
           <div class="distill-fields">
@@ -26,7 +26,7 @@
         </article>
       </el-tab-pane>
       <el-tab-pane label="数据血缘" name="lineage">
-        <DistillationGraph title="数据血缘图" :nodes="document.entities" :edges="document.lineage.map(item => ({ ...item, label: item.transformation }))" />
+        <DistillationGraph variant="lineage" title="数据血缘图" :nodes="document.entities" :edges="document.lineage.map(item => ({ ...item, label: item.transformation, detail: item.transformation }))" />
         <div class="distill-section-head"><h3>来源 → 转换 → 结果</h3><el-button :disabled="!document.entities.length" @click="document.lineage.push({ source: '', target: '', transformation: '', evidence_refs: [] })">添加血缘</el-button></div>
         <article v-for="(item, index) in document.lineage" :key="index" class="distill-item">
           <div class="distill-fields">

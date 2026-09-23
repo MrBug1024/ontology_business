@@ -10,7 +10,7 @@
     </dl>
     <p>证据 {{ document.evidence.length }} 项 · 断言 {{ document.assertions.length }} 项 · 业务对象 {{ document.entities.length }} 个</p>
     <details v-if="document.assertions.length"><summary>查看事实与推断</summary><ul><li v-for="item in document.assertions" :key="item.key"><strong>{{ ASSERTION_LABELS[item.status] }}：</strong>{{ item.statement }}</li></ul></details>
-    <DistillationGraph title="建议目标流程" :nodes="document.to_be.nodes.map(item => ({ ...item, detail: item.owner }))" :edges="document.to_be.edges" />
+    <DistillationGraph variant="process" title="建议目标流程" :nodes="document.to_be.nodes.map(item => ({ ...item, detail: item.owner }))" :edges="document.to_be.edges" />
     <details><summary>查看完整建议内容</summary>
       <h4>证据与限制</h4><ul><li v-for="item in document.evidence" :key="item.key">{{ item.title }}：{{ item.summary }}<p>覆盖：{{ item.coverage || '未说明' }}；限制：{{ item.limitations || '未说明' }}</p></li></ul>
       <h4>现状流程</h4><ul><li v-for="item in document.as_is.nodes" :key="item.key">{{ item.name }} · {{ item.owner }} · {{ item.outcome }}</li></ul>

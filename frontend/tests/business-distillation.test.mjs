@@ -218,7 +218,7 @@ test('scenario workspace fixes distillation to the current scenario while the ol
   assert.match(workspace, /useBusinessDistillation\(projectId, historyScope, props\.embedded\)/)
   assert.match(workspace, /const authorizedProjectId = computed/)
   assert.match(workspace, /useDistillationConversation\(authorizedProjectId, draftKey\)/)
-  assert.match(workspace, /useDistillationAttachments\(authorizedProjectId\)/)
+assert.match(workspace, /useDistillationAttachments\(authorizedProjectId, selectedScenario\)/)
   assert.match(workspace, /v-if="!embedded" class="discovery-sources"/)
   assert.match(workspace, /v-if="!embedded"[\s\S]*?placeholder="选择场景"/)
   assert.match(scenarioDetail, /\['postgres', 'mysql', 'sqlite3', 'dataset'\]\.includes\(source\.type\)/)

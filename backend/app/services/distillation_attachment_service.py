@@ -35,37 +35,67 @@ def list_pending(db: Session, project_id: str) -> list[AttachmentOut]:
     # inputs still requires project write access, but collaborators with read
     # access must see inputs uploaded by every member.
     project = distillation_service.project(db, project_id)
-    rows = db.scalars(select(Attachment).where(Attachment.project_id == project.id,
+    principal = permission_service.require_principal(db)
+    orphan_scope = (Attachment.project_id.is_(None)
+        & (Attachment.created_by == principal.user_id)
+        & (Attachment.scenario_id == project.scenario_id if project.scenario_id else Attachment.scenario_id.is_(None)))
+    rows = db.scalars(select(Attachment).where(
         Attachment.tenant_id == project.tenant_id,
+        or_(Attachment.project_id == project.id, orphan_scope),
         Attachment.status.in_(('ready', 'bound')), Attachment.expires_at > now()).order_by(
             Attachment.created_at, Attachment.id,
         ).limit(MAX_READY_ATTACHMENTS)).all()
     return [public_attachment(row) for row in rows]
 
 
-def persist_parsed(db: Session, project_id: str, *, request_id: str, filename: str, byte_size: int,
+def list_unbound(db: Session, scenario_id: str | None) -> list[AttachmentOut]:
+    principal = permission_service.require_principal(db)
+    distillation_service.authorize_scope(db, scenario_id, write=False)
+    scenario_scope = (or_(Attachment.scenario_id == scenario_id, Attachment.scenario_id.is_(None))
+        if scenario_id else Attachment.scenario_id.is_(None))
+    rows = db.scalars(select(Attachment).where(
+        Attachment.tenant_id == principal.tenant_id,
+        Attachment.created_by == principal.user_id,
+        Attachment.project_id.is_(None), scenario_scope,
+        Attachment.status.in_(('ready', 'bound')), Attachment.expires_at > now(),
+    ).order_by(Attachment.created_at, Attachment.id).limit(MAX_READY_ATTACHMENTS)).all()
+    return [public_attachment(row) for row in rows]
+
+
+def persist_parsed(db: Session, project_id: str | None, *, request_id: str, filename: str, byte_size: int,
                    content_sha256: str, parsed: ParsedAttachment, scenario_id: str | None) -> Attachment:
     permission_service.refresh_request_authorization(db)
-    project = distillation_service.project(db, project_id, write=True, lock=True)
     principal = permission_service.require_principal(db)
-    if project.scenario_id != scenario_id:
+    project = distillation_service.project(db, project_id, write=True, lock=True) if project_id else None
+    if project is not None and project.scenario_id != scenario_id:
         raise HTTPException(409, "上传期间会话场景已变化，请重新上传")
-    existing = db.scalar(select(Attachment).where(Attachment.project_id == project.id,
-        Attachment.created_by == principal.user_id, Attachment.request_id == request_id))
+    if project is None:
+        distillation_service.authorize_scope(db, scenario_id, write=True)
+    existing = db.scalar(select(Attachment).where(
+        Attachment.tenant_id == principal.tenant_id,
+        Attachment.created_by == principal.user_id,
+        Attachment.request_id == request_id,
+    ).with_for_update())
     if existing:
         if (existing.filename, existing.byte_size, existing.content_sha256) != (filename, byte_size, content_sha256):
             raise HTTPException(409, "同一上传标识不能用于不同文件")
         if existing.status in {"removed", "expired"} or existing.expires_at <= now():
             raise HTTPException(409, "该上传已移除或过期，请重新选择文件")
+        if project is not None and existing.project_id not in {None, project.id}:
+            raise HTTPException(409, "同一上传标识已用于其他会话")
         return existing
     if release_service.safe_snapshot_content({"filename": filename, "content": parsed.text}) != {"filename": filename, "content": parsed.text}:
         raise HTTPException(422, "附件包含疑似凭据，请先脱敏后重新上传")
+    active_scope = Attachment.project_id == project.id if project is not None else (
+        Attachment.project_id.is_(None) & (Attachment.created_by == principal.user_id)
+    )
     count = db.scalar(select(func.count()).select_from(Attachment).where(
-        Attachment.project_id == project.id, Attachment.tenant_id == project.tenant_id,
+        Attachment.tenant_id == principal.tenant_id, active_scope,
         Attachment.status.in_(("ready", "bound")), Attachment.expires_at > now()))
     if count >= MAX_READY_ATTACHMENTS:
-        raise HTTPException(409, "本项目的临时附件已达 20 份，请先移除不再使用的附件")
-    row = Attachment(tenant_id=principal.tenant_id, project_id=project.id, scenario_id=project.scenario_id,
+        raise HTTPException(409, "临时附件已达 20 份，请先移除不再使用的附件")
+    row = Attachment(tenant_id=principal.tenant_id, project_id=project.id if project else None,
+        scenario_id=project.scenario_id if project else scenario_id,
         created_by=principal.user_id, request_id=request_id, filename=filename,
         media_type=parsed.media_type, byte_size=byte_size, content_sha256=content_sha256,
         parsed_text=parsed.text, expires_at=now() + ATTACHMENT_TTL)
@@ -74,9 +104,15 @@ def persist_parsed(db: Session, project_id: str, *, request_id: str, filename: s
     return row
 
 
-def upload(db: Session, project_id: str, file: UploadFile, request_id: str) -> Attachment:
-    project = distillation_service.project(db, project_id, write=True)
-    scenario_id = project.scenario_id
+def upload(db: Session, project_id: str | None, file: UploadFile, request_id: str,
+           scenario_id: str | None = None) -> Attachment:
+    project = distillation_service.project(db, project_id, write=True) if project_id else None
+    if project is not None:
+        if scenario_id is not None and scenario_id != project.scenario_id:
+            raise HTTPException(409, "上传期间会话场景已变化，请重新上传")
+        scenario_id = project.scenario_id
+    else:
+        distillation_service.authorize_scope(db, scenario_id, write=True)
     try:
         filename = datasource_service.validate_bucket_filename(file.filename or "attachment.txt")
         if len(filename) > 255 or release_service.safe_snapshot_content({"filename": filename}) != {"filename": filename}:
@@ -112,14 +148,20 @@ def bind(db: Session, turn: Turn, attachment_ids: list[str]) -> list[dict]:
             (Attachment.status == "bound") & (Attachment.expires_at > now()),
         ),
         Attachment.tenant_id == turn.tenant_id,
-        Attachment.project_id == turn.project_id,
-        Attachment.scenario_id == turn.context["scenario_id"],
+        or_(Attachment.project_id == turn.project_id,
+            Attachment.project_id.is_(None) & (Attachment.created_by == turn.created_by)),
         ).order_by(Attachment.id).with_for_update()))
     if not set(attachment_ids).issubset({row.id for row in rows}):
         raise HTTPException(404, "临时附件不存在或不属于当前会话")
     for row in rows:
-        if row.scenario_id != turn.context["scenario_id"] or row.status not in {"ready", "bound"} or row.expires_at <= now():
+        if (row.project_id not in {None, turn.project_id}
+                or row.scenario_id not in {None, turn.context["scenario_id"]}
+                or row.status not in {"ready", "bound"} or row.expires_at <= now()
+                or (row.project_id is None and row.created_by != turn.created_by)):
             raise HTTPException(409, "临时附件已失效，请移除后重新上传")
+        if row.project_id is None:
+            row.project_id = turn.project_id
+            row.scenario_id = turn.context["scenario_id"]
         db.add(Link(turn_id=turn.id, attachment_id=row.id, tenant_id=turn.tenant_id,
             project_id=turn.project_id, user_id=turn.created_by))
         row.status = "bound"
@@ -179,13 +221,32 @@ def cleanup_invalid_turns(db: Session, *, limit: int = 50) -> int:
 
 def remove(db: Session, project_id: str, attachment_id: str) -> None:
     project = distillation_service.project(db, project_id, write=True, lock=True)
+    principal = permission_service.require_principal(db)
+    orphan_scope = (Attachment.project_id.is_(None)
+        & (Attachment.created_by == principal.user_id)
+        & (Attachment.scenario_id == project.scenario_id if project.scenario_id else Attachment.scenario_id.is_(None)))
     row = db.scalar(select(Attachment).where(Attachment.id == attachment_id,
-        Attachment.project_id == project.id, Attachment.tenant_id == project.tenant_id).with_for_update())
+        Attachment.tenant_id == project.tenant_id,
+        or_(Attachment.project_id == project.id, orphan_scope),
+    ).with_for_update())
     if row is None:
         raise HTTPException(404, "临时附件不存在")
     _invalidate(db, row, "removed")
     db.flush()
     cleanup_invalid_turns(db)
+
+
+def remove_unbound(db: Session, attachment_id: str, scenario_id: str | None) -> None:
+    principal = permission_service.require_principal(db)
+    distillation_service.authorize_scope(db, scenario_id, write=True)
+    row = db.scalar(select(Attachment).where(
+        Attachment.id == attachment_id, Attachment.tenant_id == principal.tenant_id,
+        Attachment.created_by == principal.user_id, Attachment.project_id.is_(None),
+    ).with_for_update())
+    if row is None or row.scenario_id not in {None, scenario_id}:
+        raise HTTPException(404, "临时附件不存在")
+    _invalidate(db, row, "removed")
+    db.flush()
 
 
 def cleanup_expired(db: Session, *, limit: int = 50) -> int:

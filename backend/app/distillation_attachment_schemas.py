@@ -11,7 +11,7 @@ from .distillation_schemas import ClosedModel, ResourceId
 
 class AttachmentOut(ClosedModel):
     id: ResourceId
-    project_id: ResourceId
+    project_id: ResourceId | None
     request_id: Annotated[str, Field(min_length=1, max_length=64)]
     filename: Annotated[str, Field(max_length=255)]
     media_type: Annotated[str, Field(max_length=150)]

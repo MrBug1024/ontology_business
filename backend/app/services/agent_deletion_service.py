@@ -33,6 +33,7 @@ from ..models import (
 )
 from . import (
     agent_deletion_reference_service,
+    catalog_service,
     datasource_service,
     object_deletion_service,
     template_catalog_service,
@@ -90,6 +91,7 @@ class AgentCleanupResult:
     data_sources_deleted: int = 0
     data_sources_detached: int = 0
     validation_datasets_retired: int = 0
+    validation_versions_retired: int = 0
     validation_jobs_cancelled: int = 0
     validation_dataset_files_deleted: int = 0
     validation_dataset_files_protected: int = 0
@@ -202,7 +204,6 @@ def _lock_validation_fragments(
             )
             .order_by(DatasetFragment.id)
             .execution_options(populate_existing=True)
-            .with_for_update()
         ).all()
     )
 
@@ -249,7 +250,6 @@ def _mark_validation_datasets_deleted(
     agent: Agent,
     now: datetime,
     result: AgentCleanupResult,
-    versions: list[DatasetVersion] | None = None,
 ) -> None:
     """Retire generated packages while retaining non-secret audit identity."""
     for dataset in datasets:
@@ -267,10 +267,6 @@ def _mark_validation_datasets_deleted(
         dataset.name = "已删除验证附件数据源"
         dataset.description = ""
         dataset.labels = labels
-    for version in versions or ():
-        # Dataset versions are immutable inputs once published, but retirement
-        # is the durable tombstone needed when their owning Agent disappears.
-        version.status = "retired"
     result.validation_datasets_retired += len(datasets)
 
 
@@ -284,10 +280,11 @@ def _cleanup_validation_dataset_files(
     owned_asset_ids: set[str],
     owned_run_ids: set[str],
     result: AgentCleanupResult,
-) -> None:
+) -> set[str]:
     file_ids = {str(item.bucket_file_id) for item in fragments if item.bucket_file_id}
     if not file_ids:
-        return
+        return set()
+    deleted_file_ids: set[str] = set()
     files = _lock_files(db, file_ids=file_ids, tenant_id=agent.tenant_id)
     for file in files:
         if not file.bucket_name or not file.object_key:
@@ -322,9 +319,11 @@ def _cleanup_validation_dataset_files(
                 db, source, [file.id]
             )
             db.execute(delete(BucketFile).where(BucketFile.id == file.id))
+            deleted_file_ids.add(str(file.id))
             result.validation_dataset_files_deleted += 1
         except (ValueError, template_catalog_service.TemplateCatalogError):
             result.validation_dataset_files_protected += 1
+    return deleted_file_ids
 
 
 def _cancel_upload_runs(
@@ -567,7 +566,6 @@ def cleanup_agent_owned_records(
                 )
                 .order_by(DatasetVersion.id)
                 .execution_options(populate_existing=True)
-                .with_for_update()
             ).all()
         )
         if validation_dataset_ids
@@ -591,7 +589,12 @@ def cleanup_agent_owned_records(
         agent=locked_agent,
         now=now,
         result=result,
-        versions=validation_versions,
+    )
+    result.validation_versions_retired = catalog_service.retire_validation_dataset_versions(
+        db,
+        tenant_id=locked_agent.tenant_id,
+        agent_id=str(locked_agent.id),
+        dataset_ids=validation_dataset_ids,
     )
     db.flush()
 
@@ -636,7 +639,6 @@ def cleanup_agent_owned_records(
                 )
                 .order_by(DataAssetVersion.asset_id, DataAssetVersion.version_number)
                 .execution_options(populate_existing=True)
-                .with_for_update()
             ).all()
         )
         if owned_asset_ids
@@ -681,7 +683,7 @@ def cleanup_agent_owned_records(
     # ManagedUploadRun has RESTRICT FKs to its source/file/version columns.
     # Flush the fencing update before the physical BucketFile deletion path.
     db.flush()
-    _cleanup_validation_dataset_files(
+    validation_deleted_file_ids = _cleanup_validation_dataset_files(
         db,
         agent=locked_agent,
         fragments=validation_fragments,
@@ -693,7 +695,7 @@ def cleanup_agent_owned_records(
     )
     _cleanup_files(
         db,
-        files=files,
+        files=[item for item in files if str(item.id) not in validation_deleted_file_ids],
         source_by_id=source_by_id,
         protected_ids=protected_ids,
         result=result,

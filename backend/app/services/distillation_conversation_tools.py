@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -73,6 +73,24 @@ class ProposalArguments(ClosedModel):
     document: DistillationDocument
 
 
+class LineageInferenceArguments(ClosedModel):
+    evidence_keys: list[str] = Field(min_length=2, max_length=6)
+
+    @model_validator(mode="after")
+    def unique_evidence_keys(self):
+        if len(set(self.evidence_keys)) != len(self.evidence_keys):
+            raise ValueError("血缘推导资料不能重复")
+        return self
+
+
+class LandscapeArguments(ClosedModel):
+    """Bounds for automatic discovery; source IDs are intentionally omitted."""
+
+    max_sources: int = Field(default=5, ge=1, le=5)
+    max_tables_per_source: int = Field(default=8, ge=1, le=8)
+    max_samples: int = Field(default=12, ge=1, le=12)
+
+
 _TOOLS = {
     "list_evidence": (EmptyArguments, "查看调查来源", "列出当前证据、对话中仍可用的临时附件和目标系统；还可用list_library_sources查找授权资料库。"),
     "read_evidence": (EvidenceArguments, "阅读选定资料", "按已有 evidence_key 读取有界文件内容或数据库结构。未执行业务行查询和记录匹配。"),
@@ -90,6 +108,8 @@ _TOOLS.update(distillation_browser_tools.TOOLS)
 _TOOLS.update({
     "read_database_sample": (DatabaseSampleArguments, "读取历史数据样本", "读取真实业务行。数据库省略 table_key 可发现表字段；Excel 文件必须传 bucket_file_id，单工作表直接返回样本，多表返回目录供选择。可指定返回的字段引用和筛选条件。只读、有界，不接受 SQL、物理路径或凭据。"),
     "compare_database_samples": (CompareSamplesArguments, "核对样本关联", "对实际读取的两份样本执行单键/复合键精确匹配，返回重复键、多匹配、未匹配和排除记录。只证明该样本，不能代表全量唯一性或业务因果。"),
+    "discover_data_landscape": (LandscapeArguments, "自动探查数据关系", "在当前场景和工作区共享资料的已授权范围内，自动发现资料、结构、代表性样本和跨表关系候选。只读、有界，服务端不接受物理路径、SQL 或凭据，不把候选自动写入正式模型。"),
+    "infer_data_lineage": (LineageInferenceArguments, "推导样本血缘候选", "对至少两份已实际读取的有界样本执行精确值包含率分析，输出可解释的字段关联候选、重复键风险和限制；不自动写入正式血缘。"),
     "record_human_statement": (EmptyArguments, "引用专家陈述", "将本轮真实用户消息登记为可追溯的访谈证据，返回 evidence_key。只表示专家陈述，尚未独立核实；不自动登记所有消息。"),
 })
 
@@ -162,6 +182,7 @@ class ToolResult:
     proposal: DistillationDocument | None = None
     source: WebsiteObservation | None = None
     library_read: distillation_library_service.LibraryRead | None = None
+    library_reads: list[distillation_library_service.LibraryRead] = field(default_factory=list)
     resource_keys: dict[str, list[str]] | None = None
     mcp_read: MCPMaterialRead | None = None
     interview_source: Evidence | None = None
@@ -209,6 +230,40 @@ def execute(db: Session, name: str, arguments: dict, document: DistillationDocum
     payload = _TOOLS[name][0].model_validate(arguments)
     if name in distillation_browser_tools.TOOLS:
         return distillation_browser_tools.execute(db, name, payload, document, turn, browser)
+    evidence = [*document.evidence, *observations]
+    if isinstance(payload, LineageInferenceArguments):
+        from . import distillation_lineage_service
+
+        selected = []
+        for key in payload.evidence_keys:
+            item = next((candidate for candidate in evidence if candidate.key == key and candidate.library_read), None)
+            if item is None:
+                raise ValueError("血缘推导只能使用本项目实际读取并有回执的样本")
+            content = distillation_library_service.resolve_read(db, item, scenario_id)["content"]
+            selected.append({"evidence_key": item.key, "content": content})
+        content = distillation_lineage_service.infer_lineage_candidates(selected)
+        candidate_count = len(content["candidates"])
+        skipped_count = len(content["skipped_sources"])
+        return ToolResult(content, f"已对 {len(selected)} 份样本完成血缘候选分析，发现 {candidate_count} 条候选；跳过 {skipped_count} 份无行样本资料。")
+    if isinstance(payload, LandscapeArguments):
+        from . import distillation_landscape_service
+
+        content, reads = distillation_landscape_service.discover(
+            db, scenario_id,
+            document=document,
+            max_sources=payload.max_sources,
+            max_tables_per_source=payload.max_tables_per_source,
+            max_samples=payload.max_samples,
+        )
+        candidate_count = len(content["relationship_candidates"])
+        return ToolResult(
+            content,
+            f"已自动探查 {len(content['sources'])} 个授权资料范围，发现 {candidate_count} 条关系候选；未确定的方向和基数仍需核对。",
+            library_reads=[
+                distillation_library_service.LibraryRead(read.evidence, read.identity, read.content)
+                for read in reads
+            ],
+        )
     if isinstance(payload, (DatabaseSampleArguments, CompareSamplesArguments)):
         from . import distillation_sample_service
 

@@ -20,6 +20,7 @@ from ..services.auth_service import get_tenant_db
 
 
 router = APIRouter(prefix="/business-distillation/{project_id}/conversation", tags=["business-distillation"])
+preupload_router = APIRouter(prefix="/business-distillation/conversation", tags=["business-distillation"])
 
 
 @router.get("", response_model=ConversationPage)
@@ -136,5 +137,36 @@ def list_attachments(project_id: str, db: Session = Depends(get_tenant_db)):
 @router.delete("/attachments/{attachment_id}", status_code=204)
 def remove_attachment(project_id: str, attachment_id: str, db: Session = Depends(get_tenant_db)):
     attachments.remove(db, project_id, attachment_id)
+    db.commit()
+    return Response(status_code=204)
+
+
+@preupload_router.post("/attachments", response_model=AttachmentOut, status_code=201)
+def upload_preproject_attachment(
+    request_id: Annotated[str, Form(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")],
+    scenario_id: str | None = Form(None, max_length=32),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_tenant_db),
+):
+    row = attachments.upload(db, None, file, request_id, scenario_id)
+    db.commit()
+    return attachments.public_attachment(row)
+
+
+@preupload_router.get("/attachments", response_model=list[AttachmentOut])
+def list_preproject_attachments(
+    scenario_id: str | None = Query(None, max_length=32),
+    db: Session = Depends(get_tenant_db),
+):
+    return attachments.list_unbound(db, scenario_id)
+
+
+@preupload_router.delete("/attachments/{attachment_id}", status_code=204)
+def remove_preproject_attachment(
+    attachment_id: str,
+    scenario_id: str | None = Query(None, max_length=32),
+    db: Session = Depends(get_tenant_db),
+):
+    attachments.remove_unbound(db, attachment_id, scenario_id)
     db.commit()
     return Response(status_code=204)

@@ -272,7 +272,7 @@ app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=16384,
     paths={f"{settings.api_prefix}/auth/{action}" for action in (
         "login", "register", "verify-email", "resend-code", "forgot-password", "reset-password")})
 app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=MAX_ATTACHMENT_BYTES + UPLOAD_MULTIPART_OVERHEAD_BYTES,
-    paths=(), path_patterns=(rf"{re.escape(settings.api_prefix)}/business-distillation/[^/]+/conversation/attachments",))
+    paths=(), path_patterns=(rf"{re.escape(settings.api_prefix)}/business-distillation(?:/[^/]+)?/conversation/attachments",))
 app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=MAX_SQLITE_BYTES + UPLOAD_MULTIPART_OVERHEAD_BYTES,
     paths=(), path_patterns=(rf"{re.escape(settings.api_prefix)}/data-sources/[^/]+/sqlite-file",))
 
@@ -310,6 +310,7 @@ app.include_router(data_sources.router, prefix=settings.api_prefix)
 app.include_router(catalog.router, prefix=settings.api_prefix)
 app.include_router(business_distillation.router, prefix=settings.api_prefix)
 app.include_router(distillation_conversation.router, prefix=settings.api_prefix)
+app.include_router(distillation_conversation.preupload_router, prefix=settings.api_prefix)
 app.include_router(distillation_access.router, prefix=settings.api_prefix)
 app.include_router(catalog.scenario_router, prefix=settings.api_prefix)
 app.include_router(managed_uploads.router, prefix=settings.api_prefix)

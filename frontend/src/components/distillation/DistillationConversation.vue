@@ -29,7 +29,7 @@
           <DistillationLiveActivity :turn="turn" />
           <details v-if="turn.steps.length" class="discovery-tool-steps">
             <summary>查证过程 · {{ turn.steps.length }} 项</summary>
-            <ol><li v-for="step in turn.steps" :key="step.id"><div><strong>{{ step.title }}</strong><span>{{ stepStatus[step.status] }}</span></div><p v-if="step.summary">{{ step.summary }}</p><p v-if="step.library">资料库依据：{{ step.library.title }} · {{ new Date(step.library.retrieved_at).toLocaleString() }}</p><p v-if="step.mcp">MCP 资料依据：{{ step.mcp.title }} · {{ new Date(step.mcp.retrieved_at).toLocaleString() }}</p><p v-if="step.mcp?.summary">{{ step.mcp.summary }}</p><DistillationSourceObservation v-if="step.source" :source="step.source" /></li></ol>
+            <ol><li v-for="step in turn.steps" :key="step.id"><div><strong>{{ step.title }}</strong><span>{{ stepStatus[step.status] }}</span></div><p v-if="step.summary">{{ step.summary }}</p><p v-for="library in (step.libraries?.length ? step.libraries : step.library ? [step.library] : [])" :key="library.evidence_key">资料库依据：{{ library.title }} · {{ new Date(library.retrieved_at).toLocaleString() }}</p><p v-if="step.mcp">MCP 资料依据：{{ step.mcp.title }} · {{ new Date(step.mcp.retrieved_at).toLocaleString() }}</p><p v-if="step.mcp?.summary">{{ step.mcp.summary }}</p><DistillationSourceObservation v-if="step.source" :source="step.source" /></li></ol>
           </details>
           <template v-for="(part, index) in splitAssistantMessage(turn.assistant_message)" :key="`${turn.id}:${index}`">
             <details v-if="part.kind === 'thinking'" class="discovery-thinking" :open="part.streaming && isWorking(turn)">
@@ -43,7 +43,7 @@
           <p v-if="isWorking(turn) && !turn.assistant_message" class="discovery-muted" role="status">{{ turn.steps[turn.steps.length - 1]?.title || '正在梳理问题与可用依据…' }}</p>
           <div v-if="turn.error" class="discovery-error-recovery" role="alert">
             <strong>本轮调查未完成</strong>
-            <p>{{ turn.error }}</p>
+            <p>{{ visibleTurnError(turn) }}</p>
             <small>已提交的问题和已取得的调查回执都会保留；可直接重试，或先补充模型、资料与调查范围。</small>
             <el-button v-if="['failed', 'cancelled'].includes(turn.status) && turn.id === latestId" text type="primary" :disabled="disabled || working" @click="choose(turn.message)">编辑后重试</el-button>
           </div>
@@ -93,7 +93,7 @@ import DistillationLiveActivity from './DistillationLiveActivity.vue'
 import DistillationSourceObservation from './DistillationSourceObservation.vue'
 import DistillationResourceSettings from './DistillationResourceSettings.vue'
 import type { DistillationQuestion, DistillationResourceSelection, DistillationTurn } from '@/types/distillationConversation'
-import { composeClarificationAnswer, isWorking, splitAssistantMessage, TURN_STATUS_LABELS } from '@/utils/distillationConversation'
+import { composeClarificationAnswer, isWorking, splitAssistantMessage, TURN_STATUS_LABELS, visibleTurnError } from '@/utils/distillationConversation'
 const input = defineModel<string>({ required: true })
 const props = withDefaults(defineProps<{ turns: DistillationTurn[]; loading: boolean; hasMore: boolean; working: boolean; sending: boolean; cancelling: boolean; applying: string; disabled: boolean; canApply: boolean; error: string; blockedReason: string; uploadBusy: boolean; hasAttachments: boolean; removingAttachment: string; scopeKey: string; scenarioId?: string; compact?: boolean; workspaceActions?: boolean; streaming?: boolean; reconnecting?: boolean }>(), { compact: false, scenarioId: '', workspaceActions: false, streaming: false, reconnecting: false })
 const emit = defineEmits<{ send: [selection: DistillationResourceSelection]; cancel: []; reload: []; older: []; sources: []; files: [files: File[]]; 'remove-submitted': [id: string]; preview: [turn: DistillationTurn]; apply: [turn: DistillationTurn]; new: []; history: []; systems: [] }>()

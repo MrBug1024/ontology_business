@@ -176,7 +176,9 @@ def resolve_read(db: Session, evidence: Evidence, scenario_id: str | None) -> di
     if project is None or (project.scenario_id is not None and project.scenario_id != scenario_id):
         raise HTTPException(404, "资料调查回执不存在")
     distillation_service.authorize_scope(db, project.scenario_id)
-    record = next((item for item in row.context.get("library_reads", []) if item["step_id"] == reference.step_id), None)
+    record = next((item for item in row.context.get("library_reads", [])
+        if item["step_id"] == reference.step_id
+        and Evidence.model_validate(item["evidence"]).key == evidence.key), None)
     if record is None or identity_hash(record["identity"]) != reference.identity_sha256:
         raise HTTPException(422, "资料调查回执无效")
     original = Evidence.model_validate(record["evidence"])

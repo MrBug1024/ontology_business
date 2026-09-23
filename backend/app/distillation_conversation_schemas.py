@@ -18,6 +18,8 @@ InvestigationToolKey = Literal[
     "read_target_system",
     "read_database_sample",
     "compare_database_samples",
+    "discover_data_landscape",
+    "infer_data_lineage",
     "record_human_statement",
     "open_business_system",
     "inspect_business_page",
@@ -42,7 +44,7 @@ class ResourceSelection(ClosedModel):
     mcp_ids: list[Annotated[str, Field(min_length=1, max_length=32)]] = Field(default_factory=list, max_length=20)
     investigation_tool_keys: list[InvestigationToolKey] | None = Field(
         default=None,
-        max_length=20,
+        max_length=24,
         description="未传时使用默认全部可选内置调查工具；显式空数组仅保留人工澄清与阶段建议。",
     )
 
@@ -73,14 +75,14 @@ class InvestigationToolOut(ClosedModel):
 
 class InvestigationToolCatalogOut(ClosedModel):
     default_tool_keys: list[InvestigationToolKey] = Field(
-        max_length=20,
+        max_length=24,
         description="省略 investigation_tool_keys 时启用的可选工具。",
     )
     always_available_tool_keys: list[InvestigationToolKey] = Field(
-        max_length=20,
+        max_length=24,
         description="始终保留的人工澄清与阶段建议工具；显式空数组不会移除它们。",
     )
-    tools: list[InvestigationToolOut] = Field(max_length=20)
+    tools: list[InvestigationToolOut] = Field(max_length=24)
 
 
 class TurnCreate(RevisionRequest):
@@ -161,6 +163,7 @@ class ToolStep(ClosedModel):
     completed_at: datetime | None = None
     source: WebsiteObservation | None = None
     library: LibraryReadReceipt | None = None
+    libraries: list[LibraryReadReceipt] = Field(default_factory=list, max_length=6)
     mcp: MCPReadReceipt | None = None
 
 

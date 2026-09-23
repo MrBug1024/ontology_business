@@ -365,6 +365,12 @@ def enqueue(db: Session, project_id: str, payload: TurnCreate) -> Turn:
     if db.scalar(select(Turn.id).where(Turn.project_id == project.id, Turn.status.in_(ACTIVE_STATUSES)).limit(1)):
         raise HTTPException(409, "本项目仍有调查正在进行，请等待完成或先取消")
     document = DistillationDocument.model_validate(project.document)
+    # A deleted conversation can leave the project document with an orphaned
+    # library receipt. New turns must use an explicitly downgraded observation
+    # instead of failing, or guessing a live replacement, on every next turn.
+    document = distillation_service.repair_orphaned_conversation_receipts(
+        db, document, scenario_id=project.scenario_id,
+    )
     distillation_service.validate_document(db, document, project.scenario_id)
     identity = capture_evidence_identity(db, document, project.scenario_id)
     _selected_llm, resource_selection = resolve_resource_selection(db, payload.resource_selection)

@@ -48,6 +48,8 @@ SYSTEM_PROMPT = (
     "遇到业务取舍、证据缺口、关联歧义时调用ask_human，最多3问，说明原因并给出可选方向，然后等待人工回答。"
     "严禁代替人回答自己的问题，严禁在提出澄清后自行继续作出业务决定。人下一轮回答后再推进。"
     "从历史结果逆向输入、知识依据和过程；明确单键/复合键、多行匹配、缺失链路，未执行匹配不能宣称验证通过。"
+    "当用户的问题涉及资料结构、表间关系、对象关系或数据血缘时，优先调用discover_data_landscape，让服务端在当前已授权范围内自动枚举资料、抽取代表性样本并分析候选；不要先要求用户逐个提供资料库、表或字段。"
+    "当已经实际读取至少两份有界业务样本且需要补充分析数据血缘时，再调用infer_data_lineage；它只返回基于精确值包含率的候选和限制。没有值证据的字段名相似不会成为候选，候选也不能直接写成已确认事实。"
     "优先围绕少量高价值核心流程调查，不能把菜单数量当业务价值。先和专家选一个真实结果，再追溯对应输入和每步输出。"
     "用historical_cases记录成对案例的范围、输入/结果/过程/规则引用、关联依据、每步动作及差异；不得用泛化描述伪造案例。"
     "流程节点补充触发、输入、规则、例外；ER补充逻辑身份、关系基数理由和证据。数据库物理结构不是业务对象定义。"
@@ -131,6 +133,7 @@ def _initial_messages(db, row: Turn) -> list[dict]:
                 _proposal_outline(previous.proposal), ensure_ascii=False)
         traces = [{"tool": step["tool_name"], "status": step["status"], "summary": step["summary"],
             "evidence_key": step["mcp"]["evidence_key"] if step.get("mcp") else "web_" + step["id"][:20] if step.get("source") else None,
+            "library_evidence_keys": [item.get("evidence_key") for item in step.get("libraries", [])],
             "mcp": step.get("mcp"),
             "source": {key: value for key, value in step["source"].items() if key != "text"} if step.get("source") else None}
             for step in previous.steps[-10:]]
@@ -281,25 +284,35 @@ def _complete_step(lease, session_factory, step_id, result):
                     raise ValueError("Investigation authorization session missing")
                 current_grant(authorization_db, row.project_id, target)
         receipt = None
+        receipts = []
         mcp_receipt = None
         if result.interview_source:
             row.context = {**row.context, "human_statement_evidence": result.interview_source.model_dump()}
         if result.resource_keys:
             row.context = {**row.context, "mcp_resource_keys": {
                 **row.context.get("mcp_resource_keys", {}), **result.resource_keys}}
-        if result.library_read:
-            reading = result.library_read
-            identity = distillation_library_service.identity_hash(reading.identity)
-            evidence = reading.evidence.model_copy(update={"library_read": LibraryReadReference(
-                turn_id=row.id, step_id=step_id, identity_sha256=identity)})
-            record = {"step_id": step_id, "evidence": evidence.model_dump(), "identity": reading.identity, "content": reading.content}
+        readings = list(result.library_reads)
+        if result.library_read is not None:
+            readings.insert(0, result.library_read)
+        if readings:
+            if len(row.context.get("library_reads", [])) + len(readings) > distillation_library_service.MAX_LIBRARY_READS:
+                raise ValueError("本轮资料读取已达边界，请在下一轮继续")
             context = dict(row.context)
-            context["library_reads"] = [*context.get("library_reads", []), record]
+            library_records = list(context.get("library_reads", []))
+            for reading in readings:
+                identity = distillation_library_service.identity_hash(reading.identity)
+                evidence = reading.evidence.model_copy(update={"library_read": LibraryReadReference(
+                    turn_id=row.id, step_id=step_id, identity_sha256=identity)})
+                library_records.append({"step_id": step_id, "evidence": evidence.model_dump(),
+                    "identity": reading.identity, "content": reading.content})
+                receipts.append(LibraryReadReceipt(data_source_id=evidence.data_source_id,
+                    bucket_file_id=evidence.bucket_file_id, evidence_key=evidence.key,
+                    title=evidence.title, identity_sha256=identity, retrieved_at=leases.now()).model_dump(mode="json"))
+            context["library_reads"] = library_records
             if len(json.dumps(context, ensure_ascii=False).encode()) > MAX_CHECKPOINT_BYTES:
                 raise ValueError("Investigation material context limit reached")
             row.context = context
-            receipt = LibraryReadReceipt(data_source_id=evidence.data_source_id, bucket_file_id=evidence.bucket_file_id,
-                evidence_key=evidence.key, title=evidence.title, identity_sha256=identity, retrieved_at=leases.now()).model_dump(mode="json")
+            receipt = receipts[0] if len(receipts) == 1 else None
         if result.mcp_read:
             if len(row.context.get("mcp_reads", [])) >= mcp_evidence.MAX_MCP_READS:
                 raise ValueError("MCP observation limit reached")
@@ -310,7 +323,8 @@ def _complete_step(lease, session_factory, step_id, result):
             row.context = context
         row.steps = [{**step, "status": "failed" if result.content.get("status") == "blocked" else "succeeded", "summary": result.summary[:4000],
             "completed_at": leases.now().isoformat(),
-            "source": result.source.model_dump(mode="json") if result.source else None, "library": receipt, "mcp": mcp_receipt}
+            "source": result.source.model_dump(mode="json") if result.source else None, "library": receipt,
+            "libraries": receipts, "mcp": mcp_receipt}
             if step["id"] == step_id else step for step in row.steps]
     _save(lease, session_factory, mutate)
 
@@ -508,6 +522,30 @@ def execute_claim(lease: leases.Lease, session_factory) -> None:
         _finish(lease, session_factory, "succeeded", message=response.get("visible_content") or content)
 
 
+def _failure_message(exc: Exception) -> str:
+    """Map controlled boundary failures to actionable, non-sensitive UI text."""
+    if isinstance(exc, mcp_resource_service.MCPResourceError):
+        return str(exc)
+    if not isinstance(exc, HTTPException):
+        return "本轮调查未完成，原成果已保留。请检查模型、资料和调查范围后重试。"
+    detail = exc.detail if isinstance(exc.detail, str) else ""
+    if exc.status_code in {401, 403}:
+        return "当前会话没有可用的项目或调查资源权限，请刷新权限后重试。"
+    if "临时附件" in detail or "附件" in detail:
+        return "本轮使用的临时附件已被移除或已过期，请重新上传后再发送。"
+    if "所选模型" in detail or "调查工具" in detail or "MCP资料连接" in detail:
+        return "本轮选择的模型、技能方法、MCP资料连接或调查工具已不可用，请刷新后重新选择。"
+    if "读取期间" in detail or "资料已更新" in detail or "旧建议" in detail:
+        return "读取资料期间来源发生变化，本轮没有把旧内容当作事实，请重新选择资料后重试。"
+    if "已变化" in detail or "基线" in detail or "调查范围" in detail or "场景描述" in detail:
+        return "项目、场景或调查资料已变化，本轮调查已停止，请刷新后重新发送。"
+    if exc.status_code == 404:
+        return "本轮引用的资料、附件或授权资源已不存在，请刷新后重新选择。"
+    if exc.status_code == 422:
+        return "资料或工具返回的内容超出本轮调查边界，请缩小范围或重新选择后重试。"
+    return "本轮调查未完成，原成果已保留。请检查模型、资料和调查范围后重试。"
+
+
 def process_next_turn(*, session_factory=None) -> bool:
     factory = session_factory or SessionLocal
     distillation_attachment_service.cleanup_tick(session_factory=factory)
@@ -521,11 +559,7 @@ def process_next_turn(*, session_factory=None) -> bool:
     except leases.LeaseLost:
         pass  # A cancellation or a newer generation owns the durable result.
     except Exception as exc:  # Worker/model/tool boundary: never expose raw errors or source content.
-        error = "本轮调查未完成，原成果已保留。请检查模型、资料和调查范围后重试。"
-        if isinstance(exc, HTTPException) and exc.status_code in {401, 403, 404, 409}:
-            error = "项目、权限或资料已变化，或缺少可用工具模型；请刷新并核对后重新发送。"
-        if isinstance(exc, mcp_resource_service.MCPResourceError):
-            error = str(exc)
+        error = _failure_message(exc)
         # Record code locations only: exception messages/locals can contain
         # provider output, business records or credentials.
         locations = [(frame.name, frame.lineno) for frame in traceback.extract_tb(exc.__traceback__)[-4:]]

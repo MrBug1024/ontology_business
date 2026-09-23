@@ -11,7 +11,7 @@
         {{ item.name }}<span v-if="item.key === 'questions' && document.open_questions.length" class="discovery-tab-count">{{ document.open_questions.length }}</span>
       </button>
     </div>
-    <div :id="`${canvasId}-panel-${tab}`" class="discovery-canvas-content" role="tabpanel" :aria-labelledby="`${canvasId}-tab-${tab}`" tabindex="0" :aria-busy="loading">
+    <div :id="`${canvasId}-panel-${tab}`" class="discovery-canvas-content" :class="{ 'is-graph-tab': tab === 'entities' || tab === 'process' || tab === 'lineage' }" role="tabpanel" :aria-labelledby="`${canvasId}-tab-${tab}`" tabindex="0" :aria-busy="loading">
       <p v-if="loading" class="discovery-muted" role="status">正在恢复阶段结论…</p>
       <template v-else>
         <DistillationEvidenceFindings v-if="tab === 'evidence'" :document="document" />

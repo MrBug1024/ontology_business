@@ -22,14 +22,14 @@ class DistillationAttachment(Base):
         # ``created_by`` remains an audit/idempotency field only.
         UniqueConstraint("id", "project_id", "tenant_id", "created_by", name="uq_distillation_attachment_owner"),
         UniqueConstraint("id", "project_id", "tenant_id", name="uq_distillation_attachment_scope"),
-        UniqueConstraint("project_id", "created_by", "request_id", name="uq_distillation_attachment_request"),
+        UniqueConstraint("tenant_id", "created_by", "request_id", name="uq_distillation_attachment_request"),
         CheckConstraint("status IN ('ready','bound','removed','expired')", name="ck_distillation_attachment_status"),
         CheckConstraint("byte_size > 0 AND byte_size <= 10485760 AND char_length(parsed_text) <= 200000", name="ck_distillation_attachment_size"),
         CheckConstraint("status IN ('ready','bound') OR parsed_text = ''", name="ck_distillation_attachment_expiry_content"),
     )
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
     tenant_id: Mapped[str] = mapped_column(String(32), index=True)
-    project_id: Mapped[str] = mapped_column(String(32), index=True)
+    project_id: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
     scenario_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     request_id: Mapped[str] = mapped_column(String(64))

@@ -27,8 +27,8 @@
 .distill-source-guide p { color: var(--text-2); margin-bottom: 0; }
 .distill-source-guide .el-button { margin: 0; }
 .distill-link-row { display: grid; grid-template-columns: 1fr 1fr 1.2fr auto; align-items: center; gap: 12px; }
-.distill-graph { border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 8px; margin: 20px 0; color: var(--text-2); max-height: 450px; overflow: auto; }
-.distill-graph svg { display: block; width: 100%; min-width: 480px; }
+.distill-graph { margin: 20px 0; }
+.distill-graph svg { display: block; width: 100%; }
 .distill-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 .distill-summary-grid dt { color: var(--text-2); font-size: 13px; }
 .distill-summary-grid dd { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }

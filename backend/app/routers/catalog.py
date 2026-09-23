@@ -20,6 +20,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from ..approval_models import WorkflowApprovalEvidence
 from ..catalog_schemas import (
     CatalogManagedUploadMetadata,
     CatalogManagedUploadOut,
@@ -71,7 +72,6 @@ from ..models import (
 )
 from ..config import get_settings
 from ..services import (
-    agent_deletion_reference_service,
     agent_scope_access_service,
     catalog_ingestion_service,
     catalog_service,
@@ -457,7 +457,6 @@ def _asset_deletion_dataset_scope(
             DatasetVersionAsset.asset_version_id.in_(version_ids),
             DatasetVersionAsset.tenant_id == asset.tenant_id,
         )
-        .with_for_update()
     ).all()
     datasets: set[str] = set()
     dataset_versions: set[str] = set()
@@ -520,7 +519,6 @@ def _retire_owned_validation_dataset_children(
                 DatasetVersion.dataset_id.in_(sorted(dataset_ids)),
             )
             .execution_options(populate_existing=True)
-            .with_for_update()
         ).all()
     )
     jobs = list(
@@ -537,10 +535,12 @@ def _retire_owned_validation_dataset_children(
         ).all()
     )
     now = datetime.now(timezone.utc)
-    for version in versions:
-        # A package whose source asset was explicitly deleted is no longer a
-        # selectable immutable version.  Keep the row for audit/FK history.
-        version.status = "retired"
+    retired_version_count = catalog_service.retire_validation_dataset_versions(
+        db,
+        tenant_id=tenant_id,
+        agent_id=str(agent_id),
+        dataset_ids=dataset_ids,
+    )
     for run in jobs:
         run.status = "cancelled"
         run.error = "所属附件数据源已删除，验证数据包任务已取消"
@@ -564,7 +564,7 @@ def _retire_owned_validation_dataset_children(
         dataset.labels = labels
     return {
         "validation_datasets_retired": len(datasets),
-        "validation_versions_retired": len(versions),
+        "validation_versions_retired": retired_version_count,
         "validation_jobs_cancelled": len(jobs),
     }
 
@@ -683,7 +683,15 @@ def _assert_scoped_asset_file_references(
     allowed_dataset_version_ids: set[str],
     owned_run_ids: set[str],
 ) -> None:
-    """Reuse the Agent cleanup proof for the security-definer detach call."""
+    """Reject only physical references the asset-delete path cannot detach.
+
+    Invocation and ingestion history may retain the immutable asset version.
+    ``detach_platform_catalog_references_for_deletion`` clears its physical
+    file pointer before the file is removed, so those history rows are not an
+    independent claim on the object.  Agent deletion uses the stricter
+    ``generated_file_has_external_reference`` policy because it may retain
+    protected files while removing the Agent itself.
+    """
 
     file_ids = {str(item.id) for item in files}
     if file_ids:
@@ -714,16 +722,46 @@ def _assert_scoped_asset_file_references(
         ):
             raise catalog_service.CatalogError(_ASSET_DELETE_REFERENCE_CONFLICT)
 
+        shared_asset_ref = db.scalar(
+            select(DataAssetVersion.id)
+            .join(DataAsset, DataAsset.id == DataAssetVersion.asset_id)
+            .where(
+                DataAssetVersion.tenant_id == asset.tenant_id,
+                DataAssetVersion.bucket_file_id.in_(sorted(file_ids)),
+                or_(
+                    DataAssetVersion.asset_id != asset.id,
+                    DataAsset.owner_agent_id != agent.id,
+                ),
+            )
+            .limit(1)
+        )
+        if shared_asset_ref is not None:
+            raise catalog_service.CatalogError(_ASSET_DELETE_REFERENCE_CONFLICT)
+
+        approval_file_ref = db.scalar(
+            select(WorkflowApprovalEvidence.id)
+            .where(
+                WorkflowApprovalEvidence.tenant_id == asset.tenant_id,
+                WorkflowApprovalEvidence.bucket_file_id.in_(sorted(file_ids)),
+            )
+            .limit(1)
+        )
+        if approval_file_ref is not None:
+            raise catalog_service.CatalogError(_ASSET_DELETE_REFERENCE_CONFLICT)
+
     for item in files:
-        if agent_deletion_reference_service.generated_file_has_external_reference(
-            db,
-            file=item,
-            agent=agent,
-            owned_dataset_ids=allowed_dataset_ids,
-            owned_dataset_version_ids=allowed_dataset_version_ids,
-            owned_asset_ids={str(asset.id)},
-            owned_run_ids=owned_run_ids,
-        ):
+        duplicate_file_ref = db.scalar(
+            select(BucketFile.id)
+            .where(
+                BucketFile.id != item.id,
+                BucketFile.storage_provider == item.storage_provider,
+                BucketFile.bucket_name == item.bucket_name,
+                BucketFile.object_key == item.object_key,
+                BucketFile.object_version_id == item.object_version_id,
+            )
+            .limit(1)
+        )
+        if duplicate_file_ref is not None:
             raise catalog_service.CatalogError(_ASSET_DELETE_REFERENCE_CONFLICT)
 
 
@@ -835,7 +873,6 @@ def delete_asset(
                 DataAssetVersion.tenant_id == asset.tenant_id,
             )
             .order_by(DataAssetVersion.version_number)
-            .with_for_update()
         ).all()
     )
     try:

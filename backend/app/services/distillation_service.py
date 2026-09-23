@@ -133,6 +133,89 @@ def validate_document(db: Session, document: DistillationDocument, scenario_id: 
                     raise HTTPException(404, "证据文件不存在")
 
 
+ORPHANED_CONVERSATION_RECEIPT_NOTICE = "原对话回执所属会话已删除，当前内容不能作为已核实资料；请重新调查。"
+ORPHANED_LIBRARY_RECEIPT_NOTICE = "原资料调查回执所属会话已删除，当前内容不能作为已核实资料；请重新读取资料。"
+
+
+def _append_notice(value: str, notice: str, maximum: int = 4000) -> str:
+    if notice in value:
+        return value
+    separator = "；" if value else ""
+    return (value + separator + notice)[:maximum]
+
+
+def repair_orphaned_conversation_receipts(
+    db: Session,
+    document: DistillationDocument,
+    *,
+    scenario_id: str | None = None,
+    invalid_turn_ids: set[str] | None = None,
+) -> DistillationDocument:
+    """Downgrade receipts whose conversation history is gone, never replace them with live reads."""
+    from ..distillation_conversation_models import DistillationConversationTurn
+
+    references = {
+        reference.turn_id
+        for evidence in document.evidence
+        for reference in (
+            evidence.investigation_source,
+            evidence.library_read,
+            evidence.mcp_read,
+            evidence.interview,
+        )
+        if reference is not None
+    }
+    if not references:
+        return document
+    principal = permission_service.require_principal(db)
+    valid_turns = select(DistillationConversationTurn.id).join(
+        DistillationProject,
+        DistillationProject.id == DistillationConversationTurn.project_id,
+    ).where(
+        DistillationConversationTurn.id.in_(references),
+        DistillationConversationTurn.tenant_id == principal.tenant_id,
+        DistillationProject.tenant_id == principal.tenant_id,
+        DistillationProject.scenario_id == scenario_id,
+    )
+    existing = set(db.scalars(valid_turns).all())
+    orphaned = references.difference(existing).union(references.intersection(invalid_turn_ids or set()))
+    if not orphaned:
+        return document
+
+    orphaned_keys = {
+        evidence.key
+        for evidence in document.evidence
+        if any(reference is not None and reference.turn_id in orphaned for reference in (
+            evidence.investigation_source,
+            evidence.library_read,
+            evidence.mcp_read,
+            evidence.interview,
+        ))
+    }
+    evidence = [
+        item.model_copy(update={
+            "kind": "observation",
+            "data_source_id": None,
+            "bucket_file_id": None,
+            "investigation_source": None,
+            "library_read": None,
+            "mcp_read": None,
+            "interview": None,
+            "summary": _append_notice(item.summary, ORPHANED_LIBRARY_RECEIPT_NOTICE
+                if item.library_read is not None else ORPHANED_CONVERSATION_RECEIPT_NOTICE),
+            "limitations": _append_notice(item.limitations, ORPHANED_LIBRARY_RECEIPT_NOTICE
+                if item.library_read is not None else ORPHANED_CONVERSATION_RECEIPT_NOTICE),
+        }) if item.key in orphaned_keys else item
+        for item in document.evidence
+    ]
+    assertions = [
+        item.model_copy(update={"status": "inference"})
+        if item.status == "fact" and set(item.evidence_refs).intersection(orphaned_keys) else item
+        for item in document.assertions
+    ]
+    return document.model_copy(update={"evidence": evidence, "assertions": assertions})
+
+
 def create_project(db: Session, payload: ProjectCreate) -> DistillationProject:
     principal = permission_service.require_principal(db)
     authorize_scope(db, payload.scenario_id, write=True)
@@ -154,6 +237,14 @@ def create_project(db: Session, payload: ProjectCreate) -> DistillationProject:
                 raise HTTPException(409, "场景业务蒸馏基线已变化，请保留当前草稿并刷新后合并")
             if payload.expected_scenario_revision is None:
                 document = DistillationDocument.model_validate(state.document)
+    document = repair_orphaned_conversation_receipts(db, document, scenario_id=payload.scenario_id)
+    if (payload.scenario_id and state is not None and payload.expected_scenario_revision is None
+            and document.model_dump() != state.document):
+        state.document = document.model_dump()
+        state.revision += 1
+        state.updated_at = datetime.now(timezone.utc)
+        state.updated_by = principal.user_id
+        db.flush()
     validate_document(db, document, payload.scenario_id)
     if payload.scenario_id and payload.expected_scenario_revision is not None and state is not None:
         state.document = document.model_dump()
@@ -200,19 +291,20 @@ def update_project(db: Session, project_id: str, payload: ProjectUpdate) -> Dist
             db.flush()
         elif scenario_state_row.document != row.document:
             raise HTTPException(409, "场景业务蒸馏基线已变化，请刷新会话后合并")
-    validate_document(db, payload.document, payload.scenario_id)
+    document = repair_orphaned_conversation_receipts(db, payload.document, scenario_id=payload.scenario_id)
+    validate_document(db, document, payload.scenario_id)
     if release_service.safe_snapshot_content({"name": payload.name}) != {"name": payload.name}:
         raise HTTPException(422, "项目名称不能包含凭据")
     result = db.execute(update(DistillationProject).where(
         DistillationProject.id == row.id, DistillationProject.tenant_id == row.tenant_id,
         DistillationProject.revision == payload.expected_revision,
-    ).values(name=payload.name, scenario_id=payload.scenario_id, document=payload.document.model_dump(),
+    ).values(name=payload.name, scenario_id=payload.scenario_id, document=document.model_dump(),
              revision=payload.expected_revision + 1, updated_at=datetime.now(timezone.utc),
              updated_by=permission_service.require_principal(db).user_id).execution_options(synchronize_session=False))
     if result.rowcount != 1:
         raise HTTPException(409, "项目已被更新，请保留当前草稿并刷新后合并")
     if scenario_state_row is not None:
-        scenario_state_row.document = payload.document.model_dump()
+        scenario_state_row.document = document.model_dump()
         scenario_state_row.revision += 1
         scenario_state_row.updated_at = datetime.now(timezone.utc)
         scenario_state_row.updated_by = permission_service.require_principal(db).user_id
@@ -450,6 +542,26 @@ def delete_project(db: Session, project_id: str) -> None:
         DistillationConversationTurn.status.in_(("queued", "running")),
     ).limit(1)):
         raise HTTPException(409, "会话调查仍在进行，完成或取消后再删除")
+    if row.scenario_id:
+        state = db.scalar(select(DistillationScenarioState).where(
+            DistillationScenarioState.scenario_id == row.scenario_id,
+            DistillationScenarioState.tenant_id == row.tenant_id,
+        ).with_for_update())
+        if state is not None:
+            turn_ids = set(db.scalars(select(DistillationConversationTurn.id).where(
+                DistillationConversationTurn.project_id == row.id,
+                DistillationConversationTurn.tenant_id == row.tenant_id,
+            )).all())
+            document = repair_orphaned_conversation_receipts(
+                db, DistillationDocument.model_validate(state.document), scenario_id=row.scenario_id,
+                invalid_turn_ids=turn_ids,
+            )
+            if document.model_dump() != state.document:
+                state.document = document.model_dump()
+                state.revision += 1
+                state.updated_at = datetime.now(timezone.utc)
+                state.updated_by = permission_service.require_principal(db).user_id
+                db.flush()
     publications = list(db.scalars(select(DistillationPublication).where(
         DistillationPublication.project_id == row.id,
         DistillationPublication.tenant_id == row.tenant_id,

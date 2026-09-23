@@ -25,7 +25,14 @@ class Settings(BaseSettings):
 
     # API
     api_prefix: str = "/api"
-    cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    # Vite may use the next local port when the default port is occupied. Keep
+    # that explicit loopback origin available for cookie-protected mutations.
+    cors_origins: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ]
 
     # Storage. The control plane has one supported database backend.
     database_url: str = ""

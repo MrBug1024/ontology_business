@@ -370,7 +370,6 @@ def _detach_distillation_sources(db: Session, scenario: BusinessScenario) -> Non
             DistillationPublication.scenario_id == scenario.id,
             DistillationPublication.tenant_id == scenario.tenant_id,
         )
-        .with_for_update()
     ))
     for publication in publications:
         distillation_service.detach_publication_data_source(db, publication)
@@ -428,7 +427,6 @@ def _delete_distillation_history(db: Session, scenario: BusinessScenario) -> Non
             DistillationPublication.scenario_id == scenario.id,
             DistillationPublication.tenant_id == scenario.tenant_id,
         )
-        .with_for_update()
     ))
     for publication in publications:
         distillation_service.delete_publication_record(db, publication)

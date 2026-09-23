@@ -7,7 +7,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Iterable, Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session, selectinload
 
 from ..catalog_schemas import (
@@ -108,6 +109,78 @@ def _actor(db: Session) -> str | None:
 
 def _tenant(db: Session) -> str:
     return tenant_service.current_tenant_id(db)
+
+
+def retire_validation_dataset_versions(
+    db: Session,
+    *,
+    tenant_id: str,
+    agent_id: str,
+    dataset_ids: set[str] | list[str] | tuple[str, ...],
+) -> int:
+    """Retire Agent-owned validation versions through the governed DB boundary.
+
+    Dataset versions are immutable to the runtime role. The PostgreSQL path
+    therefore uses a tenant- and Agent-scoped SECURITY DEFINER function; the
+    SQLite path keeps the local test lifecycle equivalent.
+    """
+
+    normalized_ids = sorted({str(value) for value in dataset_ids if str(value)})
+    if not normalized_ids:
+        return 0
+    if db.get_bind().dialect.name == "postgresql":
+        try:
+            return int(
+                db.scalar(
+                    text(
+                        "SELECT public.retire_validation_dataset_versions("
+                        ":tenant_id, :agent_id, CAST(:dataset_ids AS varchar[]))"
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "agent_id": agent_id,
+                        "dataset_ids": normalized_ids,
+                    },
+                )
+                or 0
+            )
+        except ProgrammingError as exc:
+            raise CatalogError(
+                "数据库尚未完成验证数据集退役迁移，请先升级数据库并重启后端"
+            ) from exc
+
+    datasets = list(
+        db.scalars(
+            select(LogicalDataset).where(
+                LogicalDataset.id.in_(normalized_ids),
+                LogicalDataset.tenant_id == tenant_id,
+                LogicalDataset.usage_plane == "invocation_input",
+            )
+        ).all()
+    )
+    if any(
+        not (
+            isinstance(dataset.labels, dict)
+            and dataset.labels.get("catalog_purpose") == "validation_dataset"
+            and str(dataset.labels.get("owner_agent_id") or "") == str(agent_id)
+        )
+        for dataset in datasets
+    ) or {str(dataset.id) for dataset in datasets} != set(normalized_ids):
+        raise CatalogError("验证数据集归属校验失败")
+    versions = list(
+        db.scalars(
+            select(DatasetVersion).where(
+                DatasetVersion.tenant_id == tenant_id,
+                DatasetVersion.dataset_id.in_(normalized_ids),
+            )
+        ).all()
+    )
+    changed = 0
+    for version in versions:
+        if version.status != "retired":
+            version.status = "retired"
+            changed += 1
+    return changed
 
 
 def external_upload_source_id(tenant_id: str) -> str:

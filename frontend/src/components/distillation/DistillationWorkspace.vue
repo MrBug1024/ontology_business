@@ -60,7 +60,7 @@
         <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :publications="publications" :publication-busy="busy" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="canEdit && !loading && !actionBusy" :can-publish="!!project && canEdit && !dirty && !actionBusy && !active && !artifactProposal" @ask="discussFinding" @publish="confirmPublish" @updated="acceptProjectUpdate" @open-publication="openMaterial" @download-publication="downloadPublication" @delete-publication="deletePublication" />
         <aside class="distillation-advisor-panel" aria-label="业务蒸馏顾问对话">
         <DistillationConversation v-model="input" :scope-key="draftKey" :scenario-id="props.scenarioId" :turns="turns" :loading="loading || conversationLoading" :has-more="conversationHasMore" :working="!!active" :sending="sending || busy === 'save'" :cancelling="cancelling" :applying="applying" :disabled="!canEdit || loading || actionBusy" :can-apply="canEdit && !dirty && !actionBusy" :error="conversationError" :blocked-reason="blockedReason" :upload-busy="attachmentBusy" :has-attachments="readyIds.length > 0" :removing-attachment="removingAttachment" :compact="embedded" :workspace-actions="embedded" :streaming="streaming" :reconnecting="reconnecting" @send="sendMessage" @cancel="cancel" @reload="reconnectConversation" @older="loadConversation(true)" @sources="openSources" @files="addAttachments" @remove-submitted="removeSubmittedAttachment" @preview="previewTurn = $event" @apply="applyTurn" @new="newConversation" @history="projectsOpen = true" @systems="openSystems">
-            <template #attachments><DistillationAttachments :items="attachments" :error="attachmentError" :disabled="!canEdit || !!active || sending" @retry="retryAttachment" @remove="removeAttachment" @reload="loadAttachments" /></template>
+            <template #attachments><DistillationAttachments :items="composerAttachments" :error="attachmentError" :disabled="!canEdit || !!active || sending" @retry="retryAttachment" @remove="removeAttachment" @reload="loadAttachments" /></template>
           </DistillationConversation>
         </aside>
       </div>
@@ -161,7 +161,7 @@ const authorizedProjectId = computed(() => {
   return row.id
 })
 const { turns, input, error: conversationError, loading: conversationLoading, sending, applying, cancelling, hasMore: conversationHasMore, streaming, reconnecting, active, load: loadConversation, send, cancel, apply } = useDistillationConversation(authorizedProjectId, draftKey)
-const { attachments, error: attachmentError, busy: attachmentBusy, blocked: attachmentBlocked, readyIds, add: uploadAttachments, retry: retryAttachment, remove: removeAttachment, sent: attachmentsSent, load: loadAttachments, removeSubmitted } = useDistillationAttachments(authorizedProjectId)
+const { attachments, composerAttachments, error: attachmentError, busy: attachmentBusy, blocked: attachmentBlocked, readyIds, add: uploadAttachments, retry: retryAttachment, remove: removeAttachment, sent: attachmentsSent, load: loadAttachments, removeSubmitted } = useDistillationAttachments(authorizedProjectId, selectedScenario)
 const artifactProposal = computed(() => project.value ? latestArtifactProposal(turns.value, project.value.id, project.value.revision) : undefined)
 const canCreate = computed(() => props.embedded ? props.canWrite : auth.user?.workspace_role !== 'viewer')
 const canEdit = computed(() => project.value ? project.value.can_write : !projectId.value && canCreate.value)
@@ -173,7 +173,7 @@ const materialOnlyDirty = computed(() => dirty.value && isMaterialReferenceOnlyC
 const unsavedStageChanges = computed(() => dirty.value && !materialOnlyDirty.value)
 const blockedReason = computed(() => unsavedStageChanges.value ? '请先保存阶段结论，再发送新的调查问题。' : attachmentBlocked.value ? '请等待附件就绪，或重试、移除未就绪附件。' : '')
 const projectsOpen = ref(false), sourcesOpen = ref(false), systemsOpen = ref(false)
-const mobilePane = ref<'findings' | 'conversation'>('conversation')
+const mobilePane = ref<'findings' | 'conversation'>('findings')
 const publishDialog = ref(false)
 let publicationOwner: { id: string; revision: number } | undefined
 const scenarioPickerKey = ref(0), copyDialog = ref(false), copyScenarioId = ref(''), previewTurn = ref<DistillationTurn | null>(null)
@@ -264,7 +264,7 @@ async function openSystems() {
   if ((!canEdit.value && !project.value) || actionBusy.value || active.value || loading.value) return
   if (project.value || await ensureProject(input.value || '业务系统调查')) systemsOpen.value = true
 }
-async function addAttachments(files: File[]) { if (files.length && !actionBusy.value && !attachmentBusy.value && !active.value && canEdit.value && await ensureProject(input.value || files[0]?.name || '新的会话')) await uploadAttachments(files) }
+async function addAttachments(files: File[]) { if (files.length && !actionBusy.value && !attachmentBusy.value && !active.value && canEdit.value) await uploadAttachments(files) }
 async function saveReferences() { if (await saveDraft()) sourcesOpen.value = false }
 async function removeSubmittedAttachment(id: string) {
   if (!canEdit.value || actionBusy.value) return

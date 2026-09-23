@@ -3,7 +3,7 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 import { createRenderer, h, nextTick, ref } from 'vue'
-import { composeClarificationAnswer, conversationTitle, mergeTurns, latestArtifactProposal, splitAssistantMessage } from '../src/utils/distillationConversation.ts'
+import { composeClarificationAnswer, conversationTitle, mergeTurns, latestArtifactProposal, splitAssistantMessage, visibleTurnError } from '../src/utils/distillationConversation.ts'
 
 const now = '2026-09-18T02:00:00Z'
 function turn(id, status = 'waiting', overrides = {}) { return { id, project_id: 'p', turn_number: 1, request_id: 'request', status, base_revision: 1, message: 'question', assistant_message: 'Please clarify', steps: [], questions: [], proposal: null, applied_revision: null, error: '', created_at: now, updated_at: now, completed_at: null, ...overrides } }
@@ -33,6 +33,13 @@ test('model thinking remains a live collapsible section while the answer streams
     { kind: 'thinking', content: '先核对结果来源', streaming: false },
     { kind: 'answer', content: '\n\n结论需要继续澄清输入与结果的一对多关系。', streaming: false },
   ])
+})
+
+test('legacy investigation errors get a tool-specific recovery message without changing new errors', () => {
+  const legacy = turn('legacy', 'failed', { error: '项目、权限或资料已变化，或缺少可用工具模型；请刷新并核对后重新发送。', steps: [{ id: 'step', tool_name: 'read_database_sample', title: '读取历史数据样本', status: 'failed', summary: '', started_at: now, completed_at: now }] })
+  const current = turn('current', 'failed', { error: '本轮使用的临时附件已被移除或已过期，请重新上传后再发送。' })
+  assert.match(visibleTurnError(legacy), /读取历史数据样本时未完成/)
+  assert.equal(visibleTurnError(current), current.error)
 })
 
 test('an empty conversation history does not read status from an absent turn', async () => {
