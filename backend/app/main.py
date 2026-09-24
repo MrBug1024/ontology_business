@@ -8,7 +8,6 @@ import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
@@ -59,7 +58,11 @@ from .services import (
     invitation_delivery_service,
     system_account_service,
 )
-from .services.auth_request_security import CookieOriginMiddleware, allowed_cookie_origins
+from .services.auth_request_security import (
+    CookieOriginMiddleware,
+    LocalDevelopmentCORSMiddleware,
+    allowed_cookie_origins,
+)
 from .services.distillation_attachment_parser import MAX_ATTACHMENT_BYTES
 from .services.library_sqlite_adapter import MAX_SQLITE_BYTES
 from .routers import distillation_access, distillation_conversation
@@ -295,8 +298,9 @@ app.add_middleware(
     },
 )
 app.add_middleware(
-    CORSMiddleware,
+    LocalDevelopmentCORSMiddleware,
     allow_origins=sorted(allowed_cookie_origins(settings)),
+    allow_local_development_origins=settings.runtime_environment == "dev",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

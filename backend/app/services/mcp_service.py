@@ -124,29 +124,16 @@ def _request_headers(cfg: MCPConfig) -> dict[str, str]:
     return headers
 
 
-def _allowed_private_host(hostname: str) -> bool:
-    allowed = {
-        value.strip().rstrip(".").casefold()
-        for value in get_settings().mcp_private_host_allowlist.split(",")
-        if value.strip()
-    }
-    return hostname.rstrip(".").casefold() in allowed
-
-
 def _assert_safe_remote_target(url: str) -> _PinnedTarget:
-    """Resolve once, validate every answer and return one immutable target."""
+    """Resolve once and return one immutable target for any reachable address."""
     parsed = urlsplit(str(url or "").strip())
     settings = get_settings()
     allowed_schemes = {"https", "http"} if settings.allow_insecure_mcp_http else {"https"}
     if parsed.scheme not in allowed_schemes or not parsed.hostname:
-        raise ValueError("远程 MCP 仅允许公网 HTTPS 目标")
+        raise ValueError("远程 MCP 仅支持已启用的 HTTP 或 HTTPS 地址")
     if parsed.username or parsed.password:
         raise ValueError("MCP URL 不能包含用户凭据")
     hostname = parsed.hostname.rstrip(".").casefold()
-    allow_private = _allowed_private_host(hostname)
-    if hostname == "localhost" or hostname.endswith(".localhost"):
-        if not allow_private:
-            raise ValueError("远程 MCP 不允许访问本机或内网主机")
     try:
         normalized_url = httpx.URL(str(url or "").strip())
         ascii_hostname = normalized_url.raw_host.decode("ascii")
@@ -159,8 +146,6 @@ def _assert_safe_remote_target(url: str) -> _PinnedTarget:
     except ValueError:
         literal = None
     if literal is not None:
-        if not allow_private and not literal.is_global:
-            raise ValueError("远程 MCP 不允许访问本机、私网、链路本地或保留地址")
         return _PinnedTarget(
             scheme=parsed.scheme,
             hostname=ascii_hostname,
@@ -177,9 +162,9 @@ def _assert_safe_remote_target(url: str) -> _PinnedTarget:
                 seen.add(str(address))
                 resolved.append(address)
     except (OSError, ValueError) as exc:
-        raise ValueError("远程 MCP 目标主机无法安全解析") from exc
-    if not resolved or (not allow_private and any(not address.is_global for address in resolved)):
-        raise ValueError("远程 MCP 目标解析到本机、私网、链路本地或保留地址")
+        raise ValueError("远程 MCP 目标主机无法解析") from exc
+    if not resolved:
+        raise ValueError("远程 MCP 目标主机无法解析")
     return _PinnedTarget(
         scheme=parsed.scheme,
         hostname=ascii_hostname,

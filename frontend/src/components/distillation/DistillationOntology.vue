@@ -44,9 +44,10 @@
 <script setup lang="ts">
 import type { DistillationDocument } from '@/types/businessDistillation'
 import { linesOf } from '@/utils/businessDistillation'
+import { createClientRequestId } from '@/utils/clientRequestId'
 import DistillationGraph from './DistillationGraph.vue'
 const document = defineModel<DistillationDocument>({ required: true })
-function addEntity() { document.value.entities.push({ key: `entity_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`, name: '', description: '', attributes: [] }) }
+function addEntity() { document.value.entities.push({ key: `entity_${createClientRequestId().replace(/-/g, '').slice(0, 16)}`, name: '', description: '', attributes: [] }) }
 function removeEntity(key: string) {
   document.value.entities = document.value.entities.filter(item => item.key !== key)
   document.value.relations = document.value.relations.filter(item => item.source !== key && item.target !== key)

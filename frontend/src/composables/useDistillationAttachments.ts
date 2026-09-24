@@ -1,5 +1,6 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { distillationConversationApi as api } from '@/api/distillationConversation'
+import { createClientRequestId } from '@/utils/clientRequestId'
 import type { DistillationAttachment, DistillationAttachmentDraft } from '@/types/distillationConversation'
 
 export function useDistillationAttachments(projectId: Ref<string>, scenarioId: Ref<string> = ref('')) {
@@ -74,7 +75,7 @@ export function useDistillationAttachments(projectId: Ref<string>, scenarioId: R
     if (composerCount + selected.length > 5) { error.value = '每轮最多添加 5 份临时附件，请先移除部分附件。'; return }
     for (const file of selected) {
       if (disposed || epoch !== generation) break
-      const item: DistillationAttachmentDraft = { key: crypto.randomUUID(), filename: file.name, byte_size: file.size, status: 'failed', progress: 0, error: '', attachment: null }
+      const item: DistillationAttachmentDraft = { key: createClientRequestId(), filename: file.name, byte_size: file.size, status: 'failed', progress: 0, error: '', attachment: null }
       attachments.value.push(item)
       files.set(item.key, file)
       const state = attachments.value[attachments.value.length - 1]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 from datetime import timedelta
 from urllib.parse import urlsplit
 
@@ -11,11 +12,46 @@ from fastapi.routing import APIRoute
 from sqlalchemy import case, delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
+from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 
 from ..access_models import AuthRateLimit, now
 from ..config import get_settings
 from ..database import get_db
+
+
+def _is_development_hostname(hostname: str) -> bool:
+    normalized = hostname.rstrip(".").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return True
+
+
+def is_local_development_origin(value: str) -> bool:
+    """Whether an origin uses localhost or a literal IP in development.
+
+    Development frontends are often opened through a host IP that is not known
+    to the API ahead of time.  Ports and IP ranges are intentionally not fixed;
+    production deployments still use explicit configured origins.
+    """
+    normalized = _origin(value)
+    if not normalized:
+        return False
+    hostname = urlsplit(normalized).hostname
+    return bool(hostname and _is_development_hostname(hostname))
+
+
+def is_allowed_cookie_origin(settings, value: str, request: Request | None = None) -> bool:
+    normalized = _origin(value)
+    if not normalized:
+        return False
+    if normalized in allowed_cookie_origins(settings, request):
+        return True
+    return settings.runtime_environment == "dev" and is_local_development_origin(normalized)
 
 
 class SensitiveAuthRoute(APIRoute):
@@ -29,6 +65,19 @@ class SensitiveAuthRoute(APIRoute):
                 # which can be a password or verification code on these routes.
                 return JSONResponse({"detail": "输入格式不正确，请检查邮箱、密码和验证码"}, status_code=422)
         return handle
+
+
+class LocalDevelopmentCORSMiddleware(CORSMiddleware):
+    """Add variable-port IP origins to CORS only in development."""
+
+    def __init__(self, app, *, allow_local_development_origins: bool = False, **kwargs):
+        self.allow_local_development_origins = allow_local_development_origins
+        super().__init__(app, **kwargs)
+
+    def is_allowed_origin(self, origin: str) -> bool:
+        return super().is_allowed_origin(origin) or (
+            self.allow_local_development_origins and is_local_development_origin(origin)
+        )
 
 
 def consume_limit(db: Session, subject: str, *, maximum: int, seconds: int) -> None:
@@ -92,7 +141,8 @@ def allowed_cookie_origins(settings, request: Request | None = None) -> set[str]
     valid client origins; treating the public URL as a replacement for CORS
     origins caused local login to fail after a deployment setting was added.
     The request base URL is trusted only for the in-process ``testserver``
-    fixture; real loopback client origins must still be explicitly configured.
+    fixture.  Development IP origins are handled separately by
+    ``is_allowed_cookie_origin`` because their port and address vary.
     """
     expected = {_origin(settings.public_app_url)}
     expected.update(_origin(origin) for origin in settings.cors_origins)
@@ -115,8 +165,7 @@ class CookieOriginMiddleware:
             settings = get_settings()
             if request.cookies.get(settings.auth_cookie_name):
                 source = request.headers.get("origin") or request.headers.get("referer", "")
-                expected = allowed_cookie_origins(settings, request)
-                if not _origin(source) or _origin(source) not in expected:
+                if not is_allowed_cookie_origin(settings, source, request):
                     await JSONResponse({"detail": "请求来源无效，请从平台页面重新操作"}, status_code=403)(scope, receive, send)
                     return
         await self.app(scope, receive, send)

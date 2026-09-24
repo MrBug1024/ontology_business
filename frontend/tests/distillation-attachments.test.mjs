@@ -11,8 +11,9 @@ globalThis.__attachmentTestApi = fakeApi
 const encode = source => `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 const source = ts.transpileModule(readFileSync(new URL('../src/composables/useDistillationAttachments.ts', import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText
 const vueUrl = new URL('../node_modules/vue/dist/vue.runtime.esm-bundler.js', import.meta.url).href
+const requestIdUrl = `data:text/javascript;base64,${Buffer.from(ts.transpileModule(readFileSync(new URL('../src/utils/clientRequestId.ts', import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText).toString('base64')}`
 const apiUrl = encode('export const distillationConversationApi = globalThis.__attachmentTestApi')
-const { useDistillationAttachments } = await import(encode(source.replace("from 'vue'", `from '${vueUrl}'`).replace("from '@/api/distillationConversation'", `from '${apiUrl}'`)))
+const { useDistillationAttachments } = await import(encode(source.replace("from 'vue'", `from '${vueUrl}'`).replace("from '@/api/distillationConversation'", `from '${apiUrl}'`).replace("from '@/utils/clientRequestId'", `from '${requestIdUrl}'`)))
 const renderer = createRenderer({ createElement: () => ({}), createText: () => ({}), createComment: () => ({}), insert() {}, remove() {}, setText() {}, setElementText() {}, patchProp() {}, parentNode: () => null, nextSibling: () => null })
 function mount() { const id = ref('p'); let state; const app = renderer.createApp({ setup() { state = useDistillationAttachments(id); return () => h('div') } }); app.mount({}); return { id, state, stop: () => app.unmount() } }
 async function flush() { await nextTick(); await new Promise(resolve => setImmediate(resolve)); await nextTick() }

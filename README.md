@@ -57,7 +57,7 @@ MySQL 调查连接要求受信 TLS，并由部署者通过 `LIBRARY_MYSQL_ALLOWE
 
 浏览器调查由部署显式启用：安装依赖后运行 `python -m playwright install chromium`，设置 `DISTILLATION_BROWSER_ENABLED=true`；`DISTILLATION_BROWSER_MAX_SESSIONS` 限制每个 worker 进程的浏览器数量（默认 2）。使用独立的、低权限应用运行账号，保持 Chromium sandbox。网站授权与现有工作流负载密钥环采用不同加密域，缺少密钥时拒绝保存。
 
-浏览器网络只访问配置的同源路径，复用现有 HTTPS/私网白名单及 DNS 固定传输；内网 HTTP 还需部署设置 `ALLOW_INSECURE_MCP_HTTP=true` 和精确 `MCP_PRIVATE_HOST_ALLOWLIST`。所有浏览器 HTTP 经受控传输，无自动重定向；POST 只允许当前登录操作的表单地址/授权登录接口及明确声明的只读查询接口。图片、媒体、下载、WebSocket、服务工作线程和跨站请求不用于调查。验证码、多域 SSO、需执行副作用的页面明确交给专家协调，不宣称可以无人值守登录任何系统。会话仅本轮有效，取消/权限变化拒绝继续；登录中断不自动重放。
+浏览器网络只访问配置的同源路径，复用浏览器适配器自身的 HTTPS/私网白名单及 DNS 固定传输；所有浏览器 HTTP 经受控传输，无自动重定向；POST 只允许当前登录操作的表单地址/授权登录接口及明确声明的只读查询接口。图片、媒体、下载、WebSocket、服务工作线程和跨站请求不用于调查。验证码、多域 SSO、需执行副作用的页面明确交给专家协调，不宣称可以无人值守登录任何系统。会话仅本轮有效，取消/权限变化拒绝继续；登录中断不自动重放。
 
 受信方法位于 `backend/skills/business-discovery/SKILL.md`。它指导 Agent 从历史结果逆向输入、规则与过程，核对复合身份和反例，并通过问答澄清，不生成固定行业结论。`review_business` 返回方法，浏览器/样本/文件工具返回实际观察，`record_human_statement` 显式引用本轮陈述，`ask_human` 暂停等待，`propose_document` 形成待采用产物。接口、数据样本与访问凭据不会变成正式能力的运行绑定。
 
@@ -240,14 +240,13 @@ OCR_API_KEY=你的密钥
 确认服务数量、传输类型以及重名处理策略（报错、跳过或替换）后再原子写入；保存不会自动连接外部服务，
 请再使用卡片上的「测试连接」。编辑已有密钥时留空表示保留，删除整行才表示移除。
 
-远程 MCP 默认只允许公网 HTTPS，拒绝 URL 凭据、明显的凭据查询参数、本机/私网/链路本地地址和自动重定向；
-连接时会固定到已校验的 DNS 解析结果，同时保留原始 Host 与 TLS SNI，避免连接阶段再次解析到未授权地址。
+远程 MCP 允许可连通的 IP 和域名，包括本机、私网、链路本地及保留地址；仍拒绝 URL 凭据、明显的凭据查询参数和自动重定向。
+默认只允许 HTTPS，连接时会固定到一次 DNS 解析结果，同时保留原始 Host 与 TLS SNI；需要 HTTP 时由部署配置显式开启。
 stdio 会在 API 宿主机启动进程，因此默认关闭；仅可信的单租户、低权限沙箱部署可在 `backend/.env` 中显式设置：
 
 ```ini
 ALLOW_MCP_STDIO=false
 ALLOW_INSECURE_MCP_HTTP=false
-MCP_PRIVATE_HOST_ALLOWLIST=
 DISTILLATION_BROWSER_ENABLED=false
 DISTILLATION_BROWSER_MAX_SESSIONS=2
 # 业务蒸馏调查使用的 AI 模型调用超时，不是“蒸馏模型”配置。

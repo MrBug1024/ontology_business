@@ -58,7 +58,7 @@ def test_worker_explains_attachment_context_conflict_without_exposing_boundary_d
 def test_worker_explains_frozen_resource_conflict():
     error = _failure_message(HTTPException(409, conversation.RESOURCE_UNAVAILABLE_MESSAGE))
 
-    assert error == "本轮选择的模型、技能方法、MCP资料连接或调查工具已不可用，请刷新后重新选择。"
+    assert error == "本轮选择的模型、技能方法、MCP能力连接或调查工具已不可用，请刷新后重新选择。"
 
 
 def test_binding_adopts_owned_preproject_attachment(monkeypatch):

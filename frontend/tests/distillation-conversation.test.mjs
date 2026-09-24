@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 import { createRenderer, h, nextTick, ref } from 'vue'
 import { composeClarificationAnswer, conversationTitle, mergeTurns, latestArtifactProposal, splitAssistantMessage, visibleTurnError } from '../src/utils/distillationConversation.ts'
+import { createClientRequestId } from '../src/utils/clientRequestId.ts'
 
 const now = '2026-09-18T02:00:00Z'
 function turn(id, status = 'waiting', overrides = {}) { return { id, project_id: 'p', turn_number: 1, request_id: 'request', status, base_revision: 1, message: 'question', assistant_message: 'Please clarify', steps: [], questions: [], proposal: null, applied_revision: null, error: '', created_at: now, updated_at: now, completed_at: null, ...overrides } }
@@ -14,8 +15,9 @@ const encode = source => `data:text/javascript;base64,${Buffer.from(source).toSt
 const transpile = path => ts.transpileModule(readFileSync(new URL(path, import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText
 const vueUrl = new URL('../node_modules/vue/dist/vue.runtime.esm-bundler.js', import.meta.url).href
 const utilityUrl = encode(transpile('../src/utils/distillationConversation.ts'))
+const requestIdUrl = encode(transpile('../src/utils/clientRequestId.ts'))
 const apiUrl = encode('export const distillationConversationApi = globalThis.__distillationConversationApi')
-const { useDistillationConversation } = await import(encode(transpile('../src/composables/useDistillationConversation.ts').replace("from 'vue'", `from '${vueUrl}'`).replace("from '@/api/distillationConversation'", `from '${apiUrl}'`).replace("from '@/utils/distillationConversation'", `from '${utilityUrl}'`)))
+const { useDistillationConversation } = await import(encode(transpile('../src/composables/useDistillationConversation.ts').replace("from 'vue'", `from '${vueUrl}'`).replace("from '@/api/distillationConversation'", `from '${apiUrl}'`).replace("from '@/utils/distillationConversation'", `from '${utilityUrl}'`).replace("from '@/utils/clientRequestId'", `from '${requestIdUrl}'`)))
 const renderer = createRenderer({ createElement: () => ({}), createText: () => ({}), createComment: () => ({}), insert() {}, remove() {}, setText() {}, setElementText() {}, patchProp() {}, parentNode: () => null, nextSibling: () => null })
 function mount(id = 'p') { const projectId = ref(id); let state; const app = renderer.createApp({ setup() { state = useDistillationConversation(projectId); return () => h('div') } }); app.mount({}); return { state, projectId, stop: () => app.unmount() } }
 async function flush() { await nextTick(); await new Promise(resolve => setImmediate(resolve)); await nextTick() }
@@ -25,13 +27,32 @@ test('first sentence becomes a short project title without requiring a form', ()
   assert.equal(conversationTitle('x'.repeat(70)).length, 36)
 })
 
+test('client request ids work when insecure IP pages do not expose randomUUID', () => {
+  let seed = 0
+  const source = {
+    getRandomValues(bytes) {
+      bytes.fill(seed++)
+      return bytes
+    },
+  }
+  const first = createClientRequestId(source)
+  const second = createClientRequestId(source)
+  assert.match(first, /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/)
+  assert.notEqual(first, second)
+})
+
 test('model thinking remains a live collapsible section while the answer streams', () => {
   const live = splitAssistantMessage('<think>先核对结果来源\n正在追')
   assert.deepEqual(live, [{ kind: 'thinking', content: '先核对结果来源\n正在追', streaming: true }])
-  const completed = splitAssistantMessage('<think>先核对结果来源<\\think>\n\n结论需要继续澄清输入与结果的一对多关系。')
+  const completed = splitAssistantMessage('<think>先核对结果来源</think>\n\n结论需要继续澄清输入与结果的一对多关系。')
   assert.deepEqual(completed, [
     { kind: 'thinking', content: '先核对结果来源', streaming: false },
     { kind: 'answer', content: '\n\n结论需要继续澄清输入与结果的一对多关系。', streaming: false },
+  ])
+  const legacy = splitAssistantMessage('<think>兼容历史结束标记<\\think>\n\n仍然保留正文。')
+  assert.deepEqual(legacy, [
+    { kind: 'thinking', content: '兼容历史结束标记', streaming: false },
+    { kind: 'answer', content: '\n\n仍然保留正文。', streaming: false },
   ])
 })
 
@@ -275,6 +296,27 @@ test('only current unadopted server proposals appear on the artifact canvas', ()
   assert.equal(latestArtifactProposal([stale, foreign, adopted, candidate], 'p', 1).id, 'candidate')
   assert.equal(latestArtifactProposal([candidate], 'p', 2), undefined)
   assert.equal(latestArtifactProposal([candidate], 'another', 1), undefined)
+})
+
+test('distillation resource settings stay in a dialog and retain selection while it is reopened', () => {
+  const source = readFileSync(new URL('../src/components/distillation/DistillationResourceSettings.vue', import.meta.url), 'utf8')
+  const conversation = readFileSync(new URL('../src/components/distillation/DistillationConversation.vue', import.meta.url), 'utf8')
+  assert.match(source, /<el-dialog v-model="open"[^>]*@open="load"[^>]*@close="cancelLoad"/)
+  assert.doesNotMatch(source, /el-popover/)
+  assert.match(source, /@click="open = true"/)
+  assert.match(conversation, /const resourceSelection = ref<DistillationResourceSelection>\(\{ llm_config_id: null, skill_ids: \[\], mcp_ids: \[\] \}\)/)
+  assert.match(conversation, /<DistillationResourceSettings v-model="resourceSelection"/)
+  assert.match(source, /defineModel<DistillationResourceSelection>\(\{ required: true \}\)/)
+  assert.match(source, /function cancelLoad\(\)[\s\S]*?loading\.value = false/)
+})
+
+test('distillation composer sends on Enter and keeps Shift+Enter for multiline input', () => {
+  const source = readFileSync(new URL('../src/components/distillation/DistillationConversation.vue', import.meta.url), 'utf8')
+  assert.match(source, /@keydown="sendOnShortcut"/)
+  assert.match(source, /event\.key !== 'Enter' \|\| event\.shiftKey \|\| event\.isComposing/)
+  assert.match(source, /event\.preventDefault\(\)\s+submit\(\)/)
+  assert.match(source, /Enter 发送 · Shift \+ Enter 换行/)
+  assert.doesNotMatch(source, /event\.key === 'Enter' && \(event\.ctrlKey \|\| event\.metaKey\)/)
 })
 
 test('a proposal produced by a running turn is visible before the model round finishes', () => {

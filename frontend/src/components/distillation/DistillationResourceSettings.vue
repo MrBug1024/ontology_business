@@ -1,25 +1,27 @@
 <template>
-  <el-popover placement="top-start" :width="380" trigger="click" @show="load">
-    <template #reference><el-button text circle :disabled="disabled" aria-label="设置业务蒸馏 AI" title="设置业务蒸馏 AI"><el-icon><Setting /></el-icon></el-button></template>
+  <el-button text circle :disabled="disabled" aria-label="设置业务蒸馏 AI" title="设置业务蒸馏 AI" @click="open = true"><el-icon><Setting /></el-icon></el-button>
+  <el-dialog v-model="open" title="业务蒸馏 AI 配置" width="min(560px, calc(100vw - 28px))" append-to-body :close-on-click-modal="false" @open="load" @close="cancelLoad">
     <section class="resource-settings" aria-label="业务蒸馏 AI 配置">
       <header><strong>业务蒸馏 AI</strong><el-button text :loading="loading" @click="load">刷新配置</el-button></header>
-      <p>选择本次调查使用的模型、方法和资料工具。</p>
+      <p>选择本次调查使用的模型、受信方法和能力连接。附件、资料库与授权业务系统才是业务输入资料。</p>
       <el-alert v-if="error" :title="error" type="error" :closable="false" />
       <el-alert v-if="unavailable" title="部分已选配置已停用或无权使用，请重新选择后发送。" type="warning" :closable="false" />
       <label for="distillation-resource-llm">AI 模型</label>
       <el-select id="distillation-resource-llm" v-model="selection.llm_config_id" clearable :disabled="loading || disabled" placeholder="自动选择可用模型"><el-option v-for="item in options.models" :key="item.id" :value="item.id" :label="item.name" /></el-select>
       <p v-if="!loading && loaded && !options.models.length">暂无可用模型，请在平台设置中添加支持工具调用的模型。</p>
-      <label for="distillation-resource-tools">调查工具</label>
+      <label for="distillation-resource-tools">调查能力</label>
       <el-select id="distillation-resource-tools" :model-value="selection.investigation_tool_keys ?? options.investigation_tools.default_tool_keys" multiple collapse-tags collapse-tags-tooltip :disabled="loading || disabled" placeholder="仅对话澄清与提出建议" @update:model-value="selectTools"><el-option v-for="item in selectableTools" :key="item.key" :value="item.key" :label="item.title" :title="item.description" /></el-select>
       <el-button text size="small" :disabled="disabled" @click="selection.investigation_tool_keys = null">恢复默认调查工具</el-button>
-      <label for="distillation-resource-skills">技能 · 方法指导</label>
+      <label for="distillation-resource-skills">Skill · 方法能力</label>
       <el-select id="distillation-resource-skills" v-model="selection.skill_ids" multiple collapse-tags collapse-tags-tooltip :disabled="loading || disabled" placeholder="选择已配置的受信技能"><el-option v-for="item in options.skills" :key="item.id" :value="item.id" :label="item.name" :title="item.description" /></el-select>
-      <label for="distillation-resource-mcps">MCP · 只读资料</label>
-      <el-select id="distillation-resource-mcps" v-model="selection.mcp_ids" multiple collapse-tags collapse-tags-tooltip :disabled="loading || disabled" placeholder="选择已配置的资料连接"><el-option v-for="item in options.mcps" :key="item.id" :value="item.id" :label="item.name" /></el-select>
-      <p>AI 可阅读所选技能的方法说明，并查找、读取 MCP 提供的资料。发现歧义时会向你提问；结论由你决定是否采用。</p>
+      <label for="distillation-resource-mcps">MCP · 能力连接</label>
+      <p v-if="jevCapability">Jev 决策能力：自动启用 · {{ jevCapability.name }}。它只返回结构化判断信号，不作为业务资料或证据。</p>
+      <p v-else>尚未配置受信 Jev 决策能力，本轮不会伪造决策结果。</p>
+      <el-select id="distillation-resource-mcps" v-model="selection.mcp_ids" multiple collapse-tags collapse-tags-tooltip :disabled="loading || disabled" placeholder="选择其它受信 MCP 能力"><el-option v-for="item in selectableMcps" :key="item.id" :value="item.id" :label="item.name" /></el-select>
+      <p>Skill、MCP 和调查工具只提供方法、契约或执行能力，不会自动变成业务输入资料；结论仍由 AI 分析并由你决定是否采用。</p>
       <el-button text type="primary" @click="openSettings">打开平台设置</el-button>
     </section>
-  </el-popover>
+  </el-dialog>
 </template>
 
 <script setup lang="ts">
@@ -30,11 +32,13 @@ import { distillationConversationApi } from '@/api/distillationConversation'
 import type { DistillationResourceOptions, DistillationResourceSelection, InvestigationToolKey } from '@/types/distillationConversation'
 const props = defineProps<{ disabled: boolean; scopeKey: string; scenarioId?: string }>()
 const selection = defineModel<DistillationResourceSelection>({ required: true })
-const route = useRoute(), router = useRouter()
+const route = useRoute(), router = useRouter(), open = ref(false)
 const emptyOptions = (): DistillationResourceOptions => ({ models: [], skills: [], mcps: [], investigation_tools: { default_tool_keys: [], always_available_tool_keys: [], tools: [] } })
 const options = ref(emptyOptions()), loading = ref(false), loaded = ref(false), error = ref('')
 let controller: AbortController | undefined
 const selectableTools = computed(() => options.value.investigation_tools.tools.filter(item => item.selectable))
+const jevCapability = computed(() => options.value.mcps.find(item => item.name.trim().toLowerCase() === 'jev_decide'))
+const selectableMcps = computed(() => options.value.mcps.filter(item => item !== jevCapability.value))
 const unavailable = computed(() => loaded.value && (
   !!selection.value.llm_config_id && !options.value.models.some(item => item.id === selection.value.llm_config_id)
   || (selection.value.skill_ids || []).some(id => !options.value.skills.some(item => item.id === id))
@@ -42,8 +46,13 @@ const unavailable = computed(() => loaded.value && (
 ))
 function selectTools(value: InvestigationToolKey[]) { selection.value.investigation_tool_keys = [...value] }
 function openSettings() { void router.push({ path: route.path, query: { ...route.query, platform_settings: 'llm' }, hash: route.hash }) }
-async function load() {
+function cancelLoad() {
   controller?.abort()
+  controller = undefined
+  loading.value = false
+}
+async function load() {
+  cancelLoad()
   const current = new AbortController()
   controller = current
   loading.value = true; error.value = ''
@@ -55,7 +64,7 @@ async function load() {
   } finally { if (controller === current) { loading.value = false; controller = undefined } }
 }
 watch(() => [props.scopeKey, props.scenarioId], () => {
-  controller?.abort(); controller = undefined
+  cancelLoad(); open.value = false
   options.value = emptyOptions(); loaded.value = false; loading.value = false; error.value = ''
   selection.value = { llm_config_id: null, skill_ids: [], mcp_ids: [], investigation_tool_keys: null }
 })

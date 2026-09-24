@@ -17,6 +17,7 @@ import { computed, ref } from 'vue'
 import type { DataSource } from '@/types'
 import type { DistillationDocument } from '@/types/businessDistillation'
 import { removeEvidence } from '@/utils/businessDistillation'
+import { createClientRequestId } from '@/utils/clientRequestId'
 const document = defineModel<DistillationDocument>({ required: true })
 const props = withDefaults(defineProps<{
   materials: DataSource[]
@@ -33,6 +34,6 @@ const visible = computed(() => props.materials.filter(item => item.name.toLocale
 function toggle(source: DataSource) {
   if (!source.id) return
   if (selected.value.has(source.id)) { for (const item of [...document.value.evidence]) if (item.kind === 'material' && item.data_source_id === source.id) removeEvidence(document.value, item.key); return }
-  document.value.evidence.push({ key: `library_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`, title: source.name, kind: 'material', role: 'reference', data_source_id: source.id, bucket_file_id: null, summary: '', coverage: '', limitations: '' })
+  document.value.evidence.push({ key: `library_${createClientRequestId().replace(/-/g, '').slice(0, 16)}`, title: source.name, kind: 'material', role: 'reference', data_source_id: source.id, bucket_file_id: null, summary: '', coverage: '', limitations: '' })
 }
 </script>

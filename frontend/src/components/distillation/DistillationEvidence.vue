@@ -34,13 +34,14 @@ import { businessDistillationApi } from '@/api/businessDistillation'
 import type { BucketFile, DataSource } from '@/types'
 import type { DistillationDocument, DistillationEvidence } from '@/types/businessDistillation'
 import { ASSERTION_LABELS, removeEvidence } from '@/utils/businessDistillation'
+import { createClientRequestId } from '@/utils/clientRequestId'
 const document = defineModel<DistillationDocument>({ required: true })
 const props = defineProps<{ materials: DataSource[] }>()
 const filesBySource = reactive<Record<string, BucketFile[]>>({})
 const loadingSources = reactive(new Set<string>())
 const fileError = ref('')
 const controller = new AbortController()
-const key = (prefix: string) => `${prefix}_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`
+const key = (prefix: string) => `${prefix}_${createClientRequestId().replace(/-/g, '').slice(0, 16)}`
 function addEvidence() {
   document.value.evidence.push({ key: key('evidence'), title: '', kind: 'observation', role: 'reference', data_source_id: null, bucket_file_id: null, summary: '', coverage: '', limitations: '' })
 }

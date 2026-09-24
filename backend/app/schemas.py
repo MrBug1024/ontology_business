@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-import ipaddress
 import json
 import math
 import re
@@ -1219,21 +1218,6 @@ class MCPConfigIn(BaseModel):
                 raise ValueError("远程 MCP 默认只允许 HTTPS；受控开发环境需由部署配置显式开启 HTTP")
             if parsed.username or parsed.password:
                 raise ValueError("MCP url 不能包含用户凭据，请改用 headers")
-            hostname = parsed.hostname.rstrip(".").casefold()
-            allowlist = {
-                value.strip().rstrip(".").casefold()
-                for value in settings.mcp_private_host_allowlist.split(",")
-                if value.strip()
-            }
-            if hostname not in allowlist:
-                if hostname == "localhost" or hostname.endswith(".localhost"):
-                    raise ValueError("MCP url 不允许访问本机或内网主机")
-                try:
-                    literal = ipaddress.ip_address(hostname)
-                except ValueError:
-                    literal = None
-                if literal is not None and not literal.is_global:
-                    raise ValueError("MCP url 不允许访问本机、私网、链路本地或保留地址")
             sensitive_query_keys = []
             for key, _value in parse_qsl(parsed.query, keep_blank_values=True):
                 collapsed = "".join(char for char in key.casefold() if char.isalnum())

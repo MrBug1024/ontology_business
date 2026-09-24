@@ -79,6 +79,7 @@ from ..services import (
     catalog_service,
     content_retrieval_service,
     doc_parser,
+    distillation_capability_service,
     datasource_service,
     llm_service,
     mapping_refresh_service,
@@ -8006,7 +8007,10 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
     sources = [*sources, *managed_sources]
     attachments = [*attachments, *managed_attachments]
     rag_context, rag_sources = _authorized_rag_context(db, scenario, payload.message)
-    sources = [*sources, *rag_sources, *assistant_resource_context_service.sources(modeling_references)]
+    # Skill methods and MCP tool catalogs stay in the independent capability
+    # context. They are not business evidence and must not enter source
+    # citations or downstream modeling material.
+    sources = [*sources, *rag_sources]
     context = {
         "request_id": effective_request_id,
         "page": payload.page,
@@ -8070,6 +8074,15 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
     user_id = str(db.info.get("user_id") or "")
     db.commit()
 
+    jev_receipt = distillation_capability_service.advisor_signal(
+        db, payload.message, _scenario_context(db, scenario)[:8_000]
+    )
+    if jev_receipt is not None:
+        context = {**context, "jev_decision": jev_receipt.model_dump(mode="json")}
+        user_message.context = context
+        db.commit()
+    jev_context = distillation_capability_service.advisor_prompt(jev_receipt)
+
     llm = _llm(db)
     history = _history_messages(
         db,
@@ -8101,6 +8114,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     else ""
                 )
                 + capability_context
+                + jev_context
                 + (f"\n\n{attachment_text}" if attachment_text else "")
                 + (f"\n\n{rag_context}" if rag_context else "")
             ),
@@ -9020,7 +9034,10 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     legacy_attachments = attachments
     attachments = [*attachments, *managed_attachments]
     rag_context, rag_sources = _authorized_rag_context(db, scenario, payload.message)
-    sources = [*sources, *rag_sources, *assistant_resource_context_service.sources(modeling_references)]
+    # Keep capability references separate from business sources. The selected
+    # methods and MCP contracts are persisted in context and prompt the model,
+    # but they cannot become evidence or modeling input by projection.
+    sources = [*sources, *rag_sources]
     context = {
         "request_id": effective_request_id,
         "page": payload.page,
@@ -9105,6 +9122,14 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
     # transaction while waiting on the provider.
     db.commit()
     _assert_assistant_request_worker_lease(db)
+    jev_receipt = distillation_capability_service.advisor_signal(
+        db, payload.message, _scenario_context(db, scenario)[:8_000]
+    )
+    if jev_receipt is not None:
+        context = {**context, "jev_decision": jev_receipt.model_dump(mode="json")}
+        user_message.context = context
+        db.commit()
+    jev_context = distillation_capability_service.advisor_prompt(jev_receipt)
     suggestions = (
         ["创建业务场景草稿", "说明建模所需资料"]
         if not scenario
@@ -9404,6 +9429,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                                 else ""
                             )
                             + capability_context
+                            + jev_context
                             + (f"\n\n{attachment_text}" if attachment_text else "")
                             + (f"\n\n{rag_context}" if rag_context else "")
                         ),

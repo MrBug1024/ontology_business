@@ -38,9 +38,10 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { businessDistillationApi as api, type SystemAccessStatus, type SystemAccessInput } from '@/api/businessDistillation'
 import type { DistillationProject, DistillationTargetSystem } from '@/types/businessDistillation'
+import { createClientRequestId } from '@/utils/clientRequestId'
 const props = defineProps<{ project: DistillationProject; canEdit: boolean; dirty: boolean }>()
 const emit = defineEmits<{ updated: [project: DistillationProject] }>()
-function emptyTarget(): DistillationTargetSystem { return { key: `system_${crypto.randomUUID().replace(/-/g, '')}`, name: '', base_url: '', purpose: '业务流程与历史数据调查', allowed_paths: ['/'], notes: '', access_mode: 'authorized_readonly', enabled: true, browser: { entry_path: '/', login_paths: [], readonly_post_paths: [] } } }
+function emptyTarget(): DistillationTargetSystem { return { key: `system_${createClientRequestId().replace(/-/g, '')}`, name: '', base_url: '', purpose: '业务流程与历史数据调查', allowed_paths: ['/'], notes: '', access_mode: 'authorized_readonly', enabled: true, browser: { entry_path: '/', login_paths: [], readonly_post_paths: [] } } }
 function defaultExpiry() { const date = new Date(Date.now() + 7 * 86400_000); return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16) }
 const targetDraft = ref(emptyTarget()), website = ref(''), paths = ref('/'), loginPaths = ref(''), queryPaths = ref('')
 const access = ref<SystemAccessStatus[]>([]), error = ref(''), busy = ref(false), loading = ref(false), editorOpen = ref(false)

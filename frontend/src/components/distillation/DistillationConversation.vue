@@ -29,7 +29,7 @@
           <DistillationLiveActivity :turn="turn" />
           <details v-if="turn.steps.length" class="discovery-tool-steps">
             <summary>查证过程 · {{ turn.steps.length }} 项</summary>
-            <ol><li v-for="step in turn.steps" :key="step.id"><div><strong>{{ step.title }}</strong><span>{{ stepStatus[step.status] }}</span></div><p v-if="step.summary">{{ step.summary }}</p><p v-for="library in (step.libraries?.length ? step.libraries : step.library ? [step.library] : [])" :key="library.evidence_key">资料库依据：{{ library.title }} · {{ new Date(library.retrieved_at).toLocaleString() }}</p><p v-if="step.mcp">MCP 资料依据：{{ step.mcp.title }} · {{ new Date(step.mcp.retrieved_at).toLocaleString() }}</p><p v-if="step.mcp?.summary">{{ step.mcp.summary }}</p><DistillationSourceObservation v-if="step.source" :source="step.source" /></li></ol>
+            <ol><li v-for="step in turn.steps" :key="step.id"><div><strong>{{ step.title }}</strong><span>{{ stepStatus[step.status] }}</span></div><p v-if="step.summary">{{ step.summary }}</p><p v-for="library in (step.libraries?.length ? step.libraries : step.library ? [step.library] : [])" :key="library.evidence_key">资料库依据：{{ library.title }} · {{ new Date(library.retrieved_at).toLocaleString() }}</p><p v-if="step.capability">Jev 决策能力回执：{{ step.capability.model }} · {{ step.capability.result_count }} 项 · {{ step.capability.results.length ? `最低置信度 ${Math.min(...step.capability.results.map(result => result.confidence)).toFixed(2)}` : '未形成可验证结果' }}</p><p v-if="step.mcp">历史 MCP 资料回执（兼容旧会话）：{{ step.mcp.title }} · {{ new Date(step.mcp.retrieved_at).toLocaleString() }}</p><p v-if="step.mcp?.summary">{{ step.mcp.summary }}</p><DistillationSourceObservation v-if="step.source" :source="step.source" /></li></ol>
           </details>
           <template v-for="(part, index) in splitAssistantMessage(turn.assistant_message)" :key="`${turn.id}:${index}`">
             <details v-if="part.kind === 'thinking'" class="discovery-thinking" :open="part.streaming && isWorking(turn)">
@@ -80,7 +80,7 @@
           <el-button v-else native-type="submit" type="primary" :disabled="disabled || !!blockedReason || uploadBusy || (!input.trim() && !hasAttachments)" :loading="sending">发送<el-icon class="discovery-send-icon"><Top /></el-icon></el-button>
         </div>
       </form>
-      <p v-if="!compact" class="discovery-composer-note">Ctrl / ⌘ + Enter 发送 · 临时附件不入资料库 · 阶段建议经核对后保存</p>
+      <p v-if="!compact" class="discovery-composer-note">Enter 发送 · Shift + Enter 换行 · 临时附件不入资料库 · 阶段建议经核对后保存</p>
     </div>
   </section>
 </template>
@@ -131,7 +131,13 @@ function selectedResourceSelection(): DistillationResourceSelection {
 }
 function submit() { emit('send', selectedResourceSelection()) }
 function filesSelected(event: Event) { const target = event.target; if (target instanceof HTMLInputElement) { emit('files', Array.from(target.files || [])); target.value = '' } }
-function sendOnShortcut(event: KeyboardEvent) { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing && !props.working && !props.sending && !props.disabled && !props.blockedReason && !props.uploadBusy && (input.value.trim() || props.hasAttachments)) { event.preventDefault(); submit() } }
+function sendOnShortcut(event: KeyboardEvent) {
+  if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return
+  if (props.working || props.sending || props.disabled || props.blockedReason || props.uploadBusy) return
+  if (!input.value.trim() && !props.hasAttachments) return
+  event.preventDefault()
+  submit()
+}
 function trackScroll() { const element = scrollArea.value; if (element) nearBottom.value = element.scrollHeight - element.scrollTop - element.clientHeight < 100 }
 watch(() => props.turns.map(turn => `${turn.id}:${turn.updated_at}:${turn.status}`).join('|'), async () => { if (!nearBottom.value) return; await nextTick(); const element = scrollArea.value; if (element) element.scrollTop = element.scrollHeight })
 </script>

@@ -141,7 +141,15 @@
               </div>
             </section>
             <div class="message-bubble" :class="{ user: message.role === 'user' }">
-              <SafeMarkdown v-if="message.role === 'assistant'" :content="assistantMessageContent(message)" />
+              <template v-if="message.role === 'assistant'">
+                <template v-for="(part, partIndex) in assistantMessageParts(message)" :key="`${message.id || index}:part:${partIndex}`">
+                  <details v-if="part.kind === 'thinking'" class="assistant-thinking-details" :open="part.streaming && message.streaming">
+                    <summary>AI 思考过程<span v-if="part.streaming && message.streaming">生成中…</span></summary>
+                    <SafeMarkdown :content="part.content" />
+                  </details>
+                  <div v-else class="assistant-answer"><SafeMarkdown :content="part.content" /></div>
+                </template>
+              </template>
               <span v-if="message.role === 'assistant' && message.streaming" class="stream-cursor" aria-hidden="true">▍</span>
               <div v-else-if="message.role !== 'assistant'" class="user-content">{{ message.content }}</div>
             </div>
@@ -481,6 +489,11 @@
               </button>
             </div>
 
+            <div v-if="capabilitiesOf(message).length" class="message-capabilities" aria-label="本轮使用能力">
+              <span class="sources-label">本轮使用能力</span>
+              <span v-for="capability in capabilitiesOf(message)" :key="capability" class="capability-chip">{{ capability }}</span>
+            </div>
+
             <details v-if="hasAssistantEvidence(message) && proposalOf(message)?.kind !== 'scenario_model'" class="answer-evidence">
               <summary><span><el-icon aria-hidden="true"><DocumentChecked /></el-icon>查看回答依据</span><small>置信度 {{ confidencePercent(message.evidence?.confidence) }}</small></summary>
               <div class="evidence-meta-grid">
@@ -601,6 +614,7 @@ import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import ModelingAdvisorSettings from '@/components/assistant/ModelingAdvisorSettings.vue'
 import { emptyModelingAdvisorSelection } from '@/composables/useModelingAdvisorResources'
 import { assistantSourceDisplay } from '@/utils/assistantSourceDisplay'
+import { splitAssistantMessage } from '@/utils/distillationConversation'
 import {
   clearCompilationJobBookmark,
   clearPendingCompilationJobBookmark,
@@ -917,6 +931,10 @@ function assistantMessageContent(message: AssistantMessage) {
   // proves zero writes, do not expose older free-form completion prose that
   // can contradict that structured result.
   return modelRunSummaryMessage(proposal)
+}
+
+function assistantMessageParts(message: AssistantMessage) {
+  return splitAssistantMessage(assistantMessageContent(message))
 }
 
 function proposalStatusType(proposal: AssistantProposal | null): 'primary' | 'success' | 'warning' | 'info' {
@@ -1244,6 +1262,25 @@ function sourcesOf(message: AssistantMessage): AssistantSource[] {
   return message.sources?.length
     ? message.sources
     : (Array.isArray(message.attachments) ? message.attachments : []) as AssistantSource[]
+}
+
+function capabilitiesOf(message: AssistantMessage): string[] {
+  const context = message.context
+  if (!context || typeof context !== 'object') return []
+  const labels: string[] = []
+  const references = context.modeling_references
+  if (references && typeof references === 'object' && Array.isArray(references.references)) {
+    for (const reference of references.references) {
+      if (!reference || typeof reference !== 'object') continue
+      const record = reference as Record<string, unknown>
+      const name = typeof record.name === 'string' ? record.name : ''
+      const kind = record.kind === 'skill_method' ? 'Skill 方法' : record.kind === 'mcp_tool_catalog' ? 'MCP 工具契约' : '能力契约'
+      if (name) labels.push(`${kind} · ${name}`)
+    }
+  }
+  const jev = context.jev_decision
+  if (jev && typeof jev === 'object') labels.push('Jev 决策能力')
+  return [...new Set(labels)]
 }
 
 function hasAssistantEvidence(message: AssistantMessage) {
@@ -3275,6 +3312,11 @@ onBeforeUnmount(() => {
 .message-bubble { padding: 10px 12px; border: 1px solid var(--border); border-radius: 13px 13px 13px 4px; background: var(--surface); box-shadow: var(--shadow-xs); }
 .assistant-message.assistant .message-bubble { padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
 .message-bubble.user { border-color: var(--border-strong); border-radius: 13px 13px 4px 13px; color: var(--primary-600); background: var(--primary-soft); white-space: pre-wrap; }
+.assistant-thinking-details { margin: 10px 0; padding: 9px 12px; border: 1px dashed var(--border-strong); border-radius: 8px; background: var(--surface-2); color: var(--text-2); font-size: 11.5px; }
+.assistant-thinking-details summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; cursor: pointer; color: var(--text-2); }
+.assistant-thinking-details[open] summary { margin-bottom: 6px; }
+.assistant-thinking-details summary span { color: var(--primary); font-size: 10px; }
+.assistant-answer { min-width: 0; }
 .user-content { line-height: 1.65; font-size: 13px; }
 .stream-cursor { display: inline-block; margin-left: 2px; color: var(--primary); animation: stream-cursor-blink 900ms steps(2, jump-none) infinite; }
 @keyframes stream-cursor-blink { 50% { opacity: 0; } }
@@ -3420,6 +3462,8 @@ onBeforeUnmount(() => {
 .source-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
 .source-copy strong { overflow: hidden; color: var(--text-2); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
 .source-copy small { color: var(--text-3); font-size: 9.5px; }
+.message-capabilities { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 8px; }
+.capability-chip { padding: 2px 6px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-2); background: var(--surface-2); font-size: 9.5px; }
 .question-list { display: flex; flex-direction: column; gap: 7px; margin-top: 8px; }
 .question-card { display: flex; flex-direction: column; gap: 4px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; color: var(--text-2); background: var(--surface-2); font-size: 11.5px; line-height: 1.5; }
 .question-card b { color: var(--text); }

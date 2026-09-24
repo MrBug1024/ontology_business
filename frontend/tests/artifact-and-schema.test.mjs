@@ -468,6 +468,17 @@ test('global assistant keeps work records in the conversation instead of stackin
   assert.doesNotMatch(source, /class="assistant-trace"/)
 })
 
+test('global assistant renders think blocks as collapsible safe markdown', () => {
+  const source = readFileSync(
+    new URL('../src/components/GlobalAssistant.vue', import.meta.url),
+    'utf8',
+  )
+  assert.match(source, /splitAssistantMessage/)
+  assert.match(source, /class="assistant-thinking-details"/)
+  assert.match(source, /<summary>AI 思考过程<span v-if="part\.streaming && message\.streaming">生成中…<\/span><\/summary>/)
+  assert.match(source, /<SafeMarkdown :content="part\.content" \/>/)
+})
+
 test('scenario modelling uses one assistant event stream instead of browser status polling', () => {
   const source = readFileSync(
     new URL('../src/components/GlobalAssistant.vue', import.meta.url),
@@ -572,7 +583,7 @@ test('zero-write scenario model finals stay neutral and suppress false apply cop
     source.indexOf('function modelNextAction'),
   )
 
-  assert.match(template, /:content="assistantMessageContent\(message\)"/)
+  assert.match(template, /assistantMessageParts\(message\)/)
   assert.doesNotMatch(template, /全部任务已完成/)
   assert.match(template, /modelRunStatusType\(proposalOf\(message\)\)/)
   assert.match(template, /modelRunSummaryTitle\(proposalOf\(message\)\)/)
@@ -609,7 +620,7 @@ test('zero-write scenario model finals stay neutral and suppress false apply cop
   assert.equal(statusType({ summary: { final: true, status: 'completed', remaining_issue_count: 0 }, persisted: true, drafts: 0, partial: 0 }), 'success')
 
   const contentStart = source.indexOf('function assistantMessageContent')
-  const contentEnd = source.indexOf('\nfunction proposalStatusType', contentStart)
+  const contentEnd = source.indexOf('\nfunction assistantMessageParts', contentStart)
   const contentSource = source.slice(contentStart, contentEnd)
   const contentBody = contentSource.slice(contentSource.indexOf('{') + 1, contentSource.lastIndexOf('}'))
   const displayContent = Function(

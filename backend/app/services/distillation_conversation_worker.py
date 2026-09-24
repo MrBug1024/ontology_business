@@ -17,7 +17,7 @@ from ..database import SessionLocal
 from ..distillation_conversation_models import DistillationConversationTurn as Turn
 from ..distillation_schemas import DistillationDocument, Evidence, LibraryReadReference
 from ..distillation_conversation_schemas import LibraryReadReceipt
-from . import distillation_conversation_service as conversations, distillation_service, llm_service, release_service
+from . import distillation_capability_service, distillation_conversation_service as conversations, distillation_service, llm_service, release_service
 from . import distillation_conversation_lease as leases, distillation_conversation_tools as tools
 from . import distillation_attachment_service, distillation_library_service
 from . import distillation_resource_service, mcp_resource_service
@@ -36,7 +36,7 @@ STREAM_FLUSH_SECONDS = 0.35
 SYSTEM_PROMPT = (
     "你是与人持续协作的业务蒸馏顾问。先明确受益者、核心痛点、真实结果和成功标准，允许质疑无价值需求。"
     "这是对话，不是一次性填表或黑盒生成。没有资料时先交流价值问题；不要捏造业务事实。"
-    "根据需要主动调用受信调查工具和review_business技能；只能读取人工配置的资料和目标页面。"
+    "根据需要主动调用受信调查工具和review_business技能；只能读取人工配置的业务资料和目标页面。MCP与Skill是能力契约，不是业务输入资料。"
     "先区分两类任务：已有业务要从真实结果和证据逆向核对输入、流程、ER、规则、痛点与缺口；新想法要检验受益者、假设、可行性、边界和最小价值闭环，再推导目标流程与ER。"
     "每轮先用简短中文说明当前理解、已核实事实和下一步；再按需调查，不要把底层调用日志当业务进展。"
     "资料不足或方向不明时先提出少量阻断性问题；不要为了显得完整而生成大而全草案。"
@@ -135,6 +135,7 @@ def _initial_messages(db, row: Turn) -> list[dict]:
             "evidence_key": step["mcp"]["evidence_key"] if step.get("mcp") else "web_" + step["id"][:20] if step.get("source") else None,
             "library_evidence_keys": [item.get("evidence_key") for item in step.get("libraries", [])],
             "mcp": step.get("mcp"),
+            "capability": step.get("capability"),
             "source": {key: value for key, value in step["source"].items() if key != "text"} if step.get("source") else None}
             for step in previous.steps[-10:]]
         if traces:
@@ -215,7 +216,9 @@ def _finish(lease, session_factory, status: str, *, message="", questions=None, 
     def mutate(row):
         if step_id and result:
             row.steps = [{**step, "status": "succeeded", "summary": result.summary[:4000],
-                "completed_at": leases.now().isoformat()} if step["id"] == step_id else step for step in row.steps]
+                "completed_at": leases.now().isoformat(),
+                "capability": result.capability_receipt.model_dump(mode="json") if result.capability_receipt else step.get("capability")}
+                if step["id"] == step_id else step for step in row.steps]
         row.status, row.assistant_message, row.error = status, message, error
         row.questions = [item.model_dump() for item in questions or []]
         row.proposal = proposal.model_dump() if proposal is not None else None
@@ -258,13 +261,13 @@ def _final_visible_output(prefix: str, message: str) -> str:
 
 def _start_step(lease, session_factory, name: str) -> str:
     step_id = uuid.uuid4().hex
-    title = tools.tool_title(name)
+    title = distillation_capability_service.tool_title(name) if name in distillation_capability_service.TOOL_KEYS else tools.tool_title(name)
     def mutate(row):
         if len(row.steps) >= MAX_TOOL_STEPS:
             raise ValueError("Investigation tool limit reached")
         row.steps = [*row.steps, {"id": step_id, "tool_name": name, "title": title,
             "status": "running", "summary": "正在调查…", "started_at": leases.now().isoformat(),
-            "completed_at": None, "source": None}]
+            "completed_at": None, "source": None, "capability": None}]
     _save(lease, session_factory, mutate)
     return step_id
 
@@ -286,6 +289,7 @@ def _complete_step(lease, session_factory, step_id, result):
         receipt = None
         receipts = []
         mcp_receipt = None
+        capability_receipt = result.capability_receipt.model_dump(mode="json") if result.capability_receipt else None
         if result.interview_source:
             row.context = {**row.context, "human_statement_evidence": result.interview_source.model_dump()}
         if result.resource_keys:
@@ -324,7 +328,7 @@ def _complete_step(lease, session_factory, step_id, result):
         row.steps = [{**step, "status": "failed" if result.content.get("status") == "blocked" else "succeeded", "summary": result.summary[:4000],
             "completed_at": leases.now().isoformat(),
             "source": result.source.model_dump(mode="json") if result.source else None, "library": receipt,
-            "libraries": receipts, "mcp": mcp_receipt}
+            "libraries": receipts, "mcp": mcp_receipt, "capability": capability_receipt}
             if step["id"] == step_id else step for step in row.steps]
     _save(lease, session_factory, mutate)
 
@@ -340,8 +344,10 @@ def _model_call(lease, session_factory, messages, visible_prefix: str = ""):
         row.model_calls += 1
         cfg = conversations.ensure_turn_resource_selection(db, row)
         allowed_tool_keys = conversations.effective_turn_tool_keys(row)
-        definitions = [*tools.definitions(allowed_tool_keys),
-            *distillation_resource_service.definitions(row.context.get("resource_selection", {}))]
+        static_tool_keys = tuple(key for key in allowed_tool_keys if key not in distillation_capability_service.TOOL_KEYS)
+        definitions = [*tools.definitions(static_tool_keys),
+            *distillation_resource_service.definitions(row.context.get("resource_selection", {})),
+            *distillation_capability_service.definitions(row.context.get("resource_selection", {}))]
         if row.model_calls == leases.MAX_MODEL_CALLS:
             definitions = tools.definitions(tools.ALWAYS_AVAILABLE_TOOL_KEYS)
             messages = [*messages, {"role": "system", "content":
@@ -398,7 +404,10 @@ def _execute_tool_call(lease, session_factory, call: dict, browser):
         row = leases.owned(db, lease)
         conversations.ensure_turn_resource_selection(db, row)
         allowed_tool_keys = conversations.effective_turn_tool_keys(row)
-        tools.require_allowed(name, allowed_tool_keys)
+        if name in distillation_capability_service.TOOL_KEYS:
+            distillation_capability_service.require_allowed(name, row.context.get("resource_selection", {}))
+        else:
+            tools.require_allowed(name, allowed_tool_keys)
         db.commit()
     step_id = _start_step(lease, session_factory, name)
     with session_factory() as db:
@@ -441,7 +450,10 @@ def _execute_tool_round(lease, session_factory, state: dict[str, Any], browser) 
     wire_calls = []
     for call in calls:
         function = call.get("function", {})
-        tools.tool_title(function.get("name", ""))
+        if function.get("name") in distillation_capability_service.TOOL_KEYS:
+            distillation_capability_service.tool_title(function.get("name", ""))
+        else:
+            tools.tool_title(function.get("name", ""))
         if not isinstance(function.get("arguments"), dict) or not isinstance(call.get("id"), str) or len(call["id"]) > 128:
             raise ValueError("Invalid tool call")
         wire_calls.append({"id": call["id"], "type": "function", "function": {
@@ -474,6 +486,8 @@ def _execute_tool_round(lease, session_factory, state: dict[str, Any], browser) 
             content_result["evidence_key"] = "web_" + step_id[:20]
         if result.mcp_read:
             content_result["evidence_key"] = "mcp_" + step_id[:20]
+        if result.capability_receipt:
+            content_result["capability_receipt"] = result.capability_receipt.model_dump(mode="json")
         messages.append({"role": "tool", "tool_call_id": call["id"],
             "content": json.dumps(content_result, ensure_ascii=False)})
     _checkpoint(lease, session_factory, messages)
@@ -533,8 +547,8 @@ def _failure_message(exc: Exception) -> str:
         return "当前会话没有可用的项目或调查资源权限，请刷新权限后重试。"
     if "临时附件" in detail or "附件" in detail:
         return "本轮使用的临时附件已被移除或已过期，请重新上传后再发送。"
-    if "所选模型" in detail or "调查工具" in detail or "MCP资料连接" in detail:
-        return "本轮选择的模型、技能方法、MCP资料连接或调查工具已不可用，请刷新后重新选择。"
+    if "所选模型" in detail or "调查工具" in detail or "MCP能力连接" in detail:
+        return "本轮选择的模型、技能方法、MCP能力连接或调查工具已不可用，请刷新后重新选择。"
     if "读取期间" in detail or "资料已更新" in detail or "旧建议" in detail:
         return "读取资料期间来源发生变化，本轮没有把旧内容当作事实，请重新选择资料后重试。"
     if "已变化" in detail or "基线" in detail or "调查范围" in detail or "场景描述" in detail:

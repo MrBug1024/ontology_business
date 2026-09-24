@@ -1,6 +1,7 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { distillationConversationApi as api } from '@/api/distillationConversation'
 import { isWorking, mergeTurns } from '@/utils/distillationConversation'
+import { createClientRequestId } from '@/utils/clientRequestId'
 import type { DistillationResourceSelection, DistillationTurn } from '@/types/distillationConversation'
 
 function stableResourceSelection(selection: DistillationResourceSelection = {}) {
@@ -85,7 +86,7 @@ export function useDistillationConversation(projectId: Ref<string>, draftKey: Re
     const selectedResources = stableResourceSelection(resourceSelection)
     const resources = JSON.stringify(selectedResources)
     const request = pending?.project === id && pending.message === text && pending.revision === revision && pending.attachments === attachments && pending.resources === resources
-      ? pending : { project: id, message: text, revision, attachments, resources, id: crypto.randomUUID() }
+      ? pending : { project: id, message: text, revision, attachments, resources, id: createClientRequestId() }
     pending = request
     sending.value = true
     error.value = ''

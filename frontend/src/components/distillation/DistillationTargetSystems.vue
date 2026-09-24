@@ -32,10 +32,11 @@
 <script setup lang="ts">
 import type { DistillationDocument } from '@/types/businessDistillation'
 import { linesOf } from '@/utils/businessDistillation'
+import { createClientRequestId } from '@/utils/clientRequestId'
 const document = defineModel<DistillationDocument>({ required: true })
 function addTarget() {
   document.value.target_systems.push({
-    key: `system_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+    key: `system_${createClientRequestId().replace(/-/g, '').slice(0, 16)}`,
     name: '', base_url: '', purpose: '', allowed_paths: ['/'], notes: '',
     access_mode: 'anonymous_readonly', enabled: true,
   })

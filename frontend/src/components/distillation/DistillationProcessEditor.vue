@@ -24,10 +24,11 @@
 <script setup lang="ts">
 import type { DistillationEvidence, ProcessGraph } from '@/types/businessDistillation'
 import { removeProcessNode } from '@/utils/businessDistillation'
+import { createClientRequestId } from '@/utils/clientRequestId'
 import DistillationGraph from './DistillationGraph.vue'
 const graph = defineModel<ProcessGraph>({ required: true })
 defineProps<{ title: string; evidence: DistillationEvidence[] }>()
 const emit = defineEmits<{ remove: [key: string] }>()
-function addNode() { graph.value.nodes.push({ key: `node_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`, name: '', owner: '', outcome: '', evidence_refs: [] }) }
+function addNode() { graph.value.nodes.push({ key: `node_${createClientRequestId().replace(/-/g, '').slice(0, 16)}`, name: '', owner: '', outcome: '', evidence_refs: [] }) }
 function remove(key: string) { graph.value = removeProcessNode(graph.value, key); emit('remove', key) }
 </script>

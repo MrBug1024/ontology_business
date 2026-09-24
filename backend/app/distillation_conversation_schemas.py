@@ -37,7 +37,7 @@ InvestigationToolKey = Literal[
 
 
 class ResourceSelection(ClosedModel):
-    """Bounded selection of model, skill methods and read-only MCP resources."""
+    """Bounded selection of AI model, trusted methods, and capability connections."""
 
     llm_config_id: Annotated[str, Field(min_length=1, max_length=32)] | None = None
     skill_ids: list[Annotated[str, Field(min_length=1, max_length=32)]] = Field(default_factory=list, max_length=20)
@@ -153,6 +153,57 @@ class MCPReadReceipt(ClosedModel):
     read_only: Literal[True] = True
 
 
+class JevDecisionQuestion(ClosedModel):
+    type: Literal["choice", "score", "yes_no"]
+    question: Annotated[str, Field(min_length=1, max_length=4000)]
+    options: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_options(self):
+        if self.type in {"choice", "score"}:
+            if self.options is None or len(self.options) < 2 or len(set(self.options)) != len(self.options):
+                raise ValueError("Jev 选择题和评分题必须提供至少两个不重复选项")
+        elif self.options is not None:
+            raise ValueError("Jev 判断题不能提供选项")
+        return self
+
+
+class JevDecisionArguments(ClosedModel):
+    situation: Annotated[str, StringConstraints(strip_whitespace=True), Field(min_length=1, max_length=16_000)]
+    questions: list[JevDecisionQuestion] = Field(min_length=1, max_length=12)
+
+
+class JevDecisionResult(ClosedModel):
+    type: Literal["choice", "score", "yes_no"]
+    choice: str | None = Field(default=None, max_length=300)
+    choice_index: int | None = Field(default=None, ge=0, le=7)
+    score: float | None = None
+    true_probability: float | None = Field(default=None, ge=0, le=1)
+    probabilities: dict[Annotated[str, Field(min_length=1, max_length=300)], float] = Field(default_factory=dict, max_length=8)
+    confidence: float = Field(ge=0, le=1)
+
+
+class JevDecisionReceipt(ClosedModel):
+    capability: Literal["jev_decide"] = "jev_decide"
+    mcp_id: Annotated[str, Field(min_length=1, max_length=32)]
+    connector_revision: Annotated[int, Field(ge=1)]
+    model: Annotated[str, Field(min_length=1, max_length=200)]
+    input_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    output_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    result_count: int = Field(ge=0, le=12)
+    results: list[JevDecisionResult] = Field(default_factory=list, max_length=12)
+    executed_at: datetime
+    status: Literal["succeeded", "blocked", "failed"]
+
+    @model_validator(mode="after")
+    def validate_result_count(self):
+        if self.result_count != len(self.results):
+            raise ValueError("Jev 回执的结果数量不一致")
+        if self.status == "succeeded" and not self.results:
+            raise ValueError("成功的 Jev 回执必须包含结果")
+        return self
+
+
 class ToolStep(ClosedModel):
     id: Annotated[str, Field(max_length=32)]
     tool_name: Annotated[str, Field(max_length=64)]
@@ -165,6 +216,7 @@ class ToolStep(ClosedModel):
     library: LibraryReadReceipt | None = None
     libraries: list[LibraryReadReceipt] = Field(default_factory=list, max_length=6)
     mcp: MCPReadReceipt | None = None
+    capability: JevDecisionReceipt | None = None
 
 
 class TurnOut(ClosedModel):

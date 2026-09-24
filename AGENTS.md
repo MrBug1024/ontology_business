@@ -277,7 +277,7 @@ Domain contract 不依赖 FastAPI、ORM、具体 Provider 或外部 SDK；Provid
 - 真实 password/API key/token/header/env/key ring/连接 URL/明文 workflow input 不进入 repr、日志、错误、prompt、snapshot、Receipt、fixture、URL、localStorage 或普通前端状态。安全测试可使用不可复用的 synthetic/ephemeral 值；缺少部署加密 key 时 fail closed。
 - 受治理契约声明为 side-effecting、并对外部系统/业务事实产生不可逆或高风险影响的 Action/Workflow 执行 `preview -> server confirmation -> execute`；确认绑定 tenant、principal、correlation、input hash、Definition、Deployment 与 expiry。
 - 上述能力使用持久幂等键和 DB unique/CAS；结果未知进入 reconciliation/indeterminate，禁止盲重放。审计、lease/checkpoint 和内部状态推进不要求用户确认，但仍需认证、事务和适用幂等。
-- 外部 HTTP/MCP 保持 HTTPS、SSRF、DNS pinning、私网 allowlist、无自动重定向；stdio、任意脚本、不安全 HTTP 默认关闭且只能由部署配置开启。
+- 外部 HTTP/MCP 保持 HTTPS（不安全 HTTP 仅由部署配置开启）、DNS pinning、超时边界和无自动重定向；远程 MCP 不按公网/私网、loopback、链路本地或保留地址分类拒绝可连通的 IP/域名。stdio、任意脚本默认关闭且只能由部署配置开启。
 - Agent/connector SQL 仅允许策略支持的单条、参数化、只读查询，并受 Schema allowlist、行数和超时限制。
 - 上传校验权限、声明/实际字节、格式、解压上限、TTL 与内容身份；客户端扩展名/MIME/UI 校验不是安全边界。
 - Skill 只允许受信内置包，禁止租户/数据库/LLM 文本变成任意代码。运行时包目录只读，工作文件限批准的 workspace/tmp；修改执行器需路径 containment、环境 allowlist、低权限隔离、超时、输出/CPU/内存上限，密钥不进命令行/stdout/stderr。

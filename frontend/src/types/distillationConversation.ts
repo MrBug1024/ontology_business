@@ -15,7 +15,7 @@ export interface DistillationResourceOption {
   source?: string
   transport?: string
   description?: string
-  mode?: 'instructions' | 'resources'
+  mode?: 'instructions' | 'capability' | 'resources'
 }
 export interface DistillationResourceOptions {
   models: DistillationResourceOption[]
@@ -73,6 +73,26 @@ export interface DistillationToolStep {
   library?: { data_source_id: string; bucket_file_id: string | null; evidence_key: string; title: string; identity_sha256: string; retrieved_at: string } | null
   libraries?: { data_source_id: string; bucket_file_id: string | null; evidence_key: string; title: string; identity_sha256: string; retrieved_at: string }[]
   mcp?: { mcp_id: string; evidence_key: string; title: string; summary: string; content_sha256: string; identity_sha256: string; retrieved_at: string; read_only: true } | null
+  capability?: {
+    capability: 'jev_decide'
+    mcp_id: string
+    connector_revision: number
+    model: string
+    input_sha256: string
+    output_sha256: string
+    result_count: number
+    results: {
+      type: 'choice' | 'score' | 'yes_no'
+      choice?: string | null
+      choice_index?: number | null
+      score?: number | null
+      true_probability?: number | null
+      probabilities: Record<string, number>
+      confidence: number
+    }[]
+    executed_at: string
+    status: 'succeeded' | 'blocked' | 'failed'
+  } | null
 }
 export interface DistillationQuestion { id: string; title: string; question: string; reason: string; options: string[] }
 export interface DistillationTurn {

@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 from sqlalchemy.orm import Session
 
-from ..distillation_conversation_schemas import ClarificationQuestion, MCPMaterialRead, WebsiteObservation
+from ..distillation_conversation_schemas import ClarificationQuestion, JevDecisionReceipt, MCPMaterialRead, WebsiteObservation
 from ..distillation_sample_schemas import DatabaseSampleArguments, CompareSamplesArguments
 from ..distillation_schemas import ClosedModel, DistillationDocument, Evidence, InvestigationSource
 from . import distillation_analysis_service, distillation_target_service
@@ -161,6 +161,10 @@ def definitions(allowed_tool_keys: Collection[str] | None = None) -> list[dict]:
 
 
 def tool_title(name: str) -> str:
+    from . import distillation_capability_service
+
+    if name in distillation_capability_service.TOOL_KEYS:
+        return distillation_capability_service.tool_title(name)
     if name in distillation_resource_service.TOOL_KEYS:
         return distillation_resource_service.tool_title(name)
     if name not in _TOOLS:
@@ -185,6 +189,7 @@ class ToolResult:
     library_reads: list[distillation_library_service.LibraryRead] = field(default_factory=list)
     resource_keys: dict[str, list[str]] | None = None
     mcp_read: MCPMaterialRead | None = None
+    capability_receipt: JevDecisionReceipt | None = None
     interview_source: Evidence | None = None
 
 
@@ -220,6 +225,12 @@ def execute(db: Session, name: str, arguments: dict, document: DistillationDocum
     tool_title(name)
     if allowed_tool_keys is not None:
         require_allowed(name, allowed_tool_keys)
+    from . import distillation_capability_service
+
+    if name in distillation_capability_service.TOOL_KEYS:
+        snapshot = turn.context.get("resource_selection", {}) if turn is not None else {}
+        distillation_capability_service.require_allowed(name, snapshot)
+        return distillation_capability_service.execute(db, arguments, turn)
     if name in distillation_resource_service.TOOL_KEYS:
         return distillation_resource_service.execute(db, name, arguments, turn)
     if name == "propose_document" and isinstance(arguments.get("document"), dict):

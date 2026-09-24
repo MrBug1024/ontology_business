@@ -27,7 +27,7 @@ class InvestigationMCPOut(ClosedModel):
     id: str = Field(max_length=32)
     name: str = Field(max_length=200)
     transport: Literal["sse", "streamable_http", "http"]
-    mode: Literal["resources"] = "resources"
+    mode: Literal["capability"] = "capability"
 
 
 class InvestigationResourceCatalogOut(ClosedModel):

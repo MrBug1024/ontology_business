@@ -69,6 +69,8 @@ def validate_selected(skills: list[Skill], mcps: list[MCPConfig]) -> None:
 def effective_keys(snapshot: dict) -> tuple[str, ...]:
     if snapshot.get("version", 0) < 3:
         return ()
+    if snapshot.get("version", 0) >= 4:
+        return ("read_selected_skill",) if snapshot.get("skills") else ()
     return tuple(key for key in _TOOLS if snapshot.get("skills" if key == "read_selected_skill" else "mcps"))
 
 
@@ -119,6 +121,8 @@ def execute(db, name: str, arguments: dict, turn):
 
     if turn is None:
         raise ValueError("调查资源必须属于当前对话轮次")
+    if int(turn.context.get("resource_selection", {}).get("version", 0) or 0) >= 4 and name != "read_selected_skill":
+        raise ValueError("MCP 是能力连接，不作为业务资料读取")
     permission_service.require_principal(db)
     payload = _TOOLS[name][0].model_validate(arguments)
     if isinstance(payload, SkillArguments):
@@ -186,7 +190,7 @@ def resource_catalog(db: Session, scenario_id: str | None = None) -> Investigati
         "models": [{"id": cfg.id, "name": cfg.name, "model": cfg.model,
             "capabilities": sorted(llm_service.capabilities_of(cfg))} for cfg in llm_service.routable_configs(db, "tool")[:200]],
         "skills": available_skills,
-        "mcps": [{"id": cfg.id, "name": cfg.name, "transport": cfg.transport, "mode": "resources"} for cfg in mcps],
+        "mcps": [{"id": cfg.id, "name": cfg.name, "transport": cfg.transport, "mode": "capability"} for cfg in mcps],
         "investigation_tools": {"default_tool_keys": list(tools.selectable_tool_keys()),
             "always_available_tool_keys": sorted(tools.ALWAYS_AVAILABLE_TOOL_KEYS), "tools": tools.catalog()},
     }))

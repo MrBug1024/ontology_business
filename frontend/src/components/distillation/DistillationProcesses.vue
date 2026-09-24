@@ -24,9 +24,10 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import type { DistillationDocument } from '@/types/businessDistillation'
+import { createClientRequestId } from '@/utils/clientRequestId'
 import DistillationProcessEditor from './DistillationProcessEditor.vue'
 const document = defineModel<DistillationDocument>({ required: true })
 const tab = ref('as_is')
-function addImprovement() { document.value.improvements.push({ key: `review_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`, existing_node_key: '', decision: 'retain', rationale: '', expected_benefit: '' }) }
+function addImprovement() { document.value.improvements.push({ key: `review_${createClientRequestId().replace(/-/g, '').slice(0, 16)}`, existing_node_key: '', decision: 'retain', rationale: '', expected_benefit: '' }) }
 function removeImprovement(key: string) { document.value.improvements = document.value.improvements.filter(item => item.existing_node_key !== key) }
 </script>

@@ -20,14 +20,14 @@
         </div>
       </section>
       <section class="tool-group" aria-labelledby="mcp-resource-title">
-        <h3 id="mcp-resource-title">业务蒸馏 · MCP 资料连接</h3>
-        <p class="group-description">AI 可查找并读取已选 MCP 的资料，用于调查、核对和追问。</p>
-        <el-empty v-if="!resources.mcps.length" description="尚无可用于业务蒸馏的 MCP 资料连接" :image-size="64" />
+        <h3 id="mcp-resource-title">平台 MCP 能力</h3>
+        <p class="group-description">MCP 为 AI 提供受信工具契约和执行能力，不会被当作业务输入资料。Jev 决策能力可在蒸馏与智能顾问中自动协同。</p>
+        <el-empty v-if="!resources.mcps.length" description="尚未配置可用的 MCP 能力" :image-size="64" />
         <div v-else class="connector-list">
           <article v-for="connector in resources.mcps" :key="connector.id" class="connector-entry">
             <el-icon aria-hidden="true"><Connection /></el-icon>
             <div><strong>{{ connector.name }}</strong><span>{{ connector.description || '在业务蒸馏对话中选择后使用' }}</span></div>
-            <el-tag size="small" effect="plain">{{ connector.mode === 'resources' ? '只读资料' : '资料连接' }}</el-tag>
+            <el-tag size="small" effect="plain">{{ connector.name.trim().toLowerCase() === 'jev_decide' ? '自动决策能力' : '受信能力' }}</el-tag>
           </article>
         </div>
       </section>

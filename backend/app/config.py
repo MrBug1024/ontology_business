@@ -1,6 +1,7 @@
 """Application configuration loaded from environment / .env file."""
 from __future__ import annotations
 
+import ipaddress
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -179,10 +180,9 @@ class Settings(BaseSettings):
     # Tenant-supplied stdio commands execute on the API host, so they remain
     # disabled unless a trusted single-tenant deployment opts in explicitly.
     allow_mcp_stdio: bool = False
-    # Remote MCP defaults to public HTTPS.  Controlled development deployments
-    # may opt into HTTP and explicitly allow exact/private host names.
+    # Remote MCP defaults to HTTPS.  Controlled deployments may opt into HTTP;
+    # remote targets are allowed to use any reachable IP address or hostname.
     allow_insecure_mcp_http: bool = False
-    mcp_private_host_allowlist: str = ""
     distillation_browser_enabled: bool = False
     distillation_browser_max_sessions: int = Field(default=2, ge=1, le=8)
     # Timeout for the AI model used by business discovery; this is not a model
@@ -220,9 +220,13 @@ class Settings(BaseSettings):
         value = self.public_app_url.strip().rstrip("/")
         if value:
             url = urlsplit(value)
-            local = url.hostname in {"localhost", "127.0.0.1", "::1"}
+            try:
+                is_ip = bool(url.hostname and ipaddress.ip_address(url.hostname))
+            except ValueError:
+                is_ip = False
+            local = url.hostname == "localhost" or is_ip
             if (url.scheme != "https" and not (url.scheme == "http" and local)) or not url.netloc:
-                raise ValueError("PUBLIC_APP_URL 必须为 HTTPS 平台地址，本地开发可使用 loopback HTTP")
+                raise ValueError("PUBLIC_APP_URL 必须为 HTTPS 平台地址，开发环境可使用 IP HTTP")
             if url.username or url.password or url.query or url.fragment or url.path not in {"", "/"}:
                 raise ValueError("PUBLIC_APP_URL 只接受平台 origin，不含路径、凭据或查询参数")
             if not local and not self.auth_cookie_secure:
