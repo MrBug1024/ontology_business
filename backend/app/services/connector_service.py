@@ -428,7 +428,11 @@ def _resolve_connector(
     connector = db.get(_model_for_kind(normalized_kind), value)
     if connector is None:
         raise ConnectorBindingConflictError("绑定的连接器已不存在")
-    if str(getattr(connector, "tenant_id", "") or "") != str(scenario.tenant_id or ""):
+    same_tenant = str(getattr(connector, "tenant_id", "") or "") == str(scenario.tenant_id or "")
+    shared_runtime_connector = normalized_kind in {"mcp", "llm"} and bool(
+        getattr(connector, "is_public", False)
+    )
+    if not same_tenant and not shared_runtime_connector:
         raise ConnectorBindingConflictError("连接器必须属于当前租户")
     if normalized_kind == "data_source" and getattr(connector, "type", "") not in {"postgres", "dataset", "file_bucket"}:
         raise ConnectorBindingConflictError("该资料只用于建模理解，不能作为可执行连接器绑定")
@@ -524,8 +528,12 @@ def list_catalog(db: Session, scenario: BusinessScenario) -> list[dict[str, Any]
             or_(DataSource.scenario_id.is_(None), DataSource.scenario_id == scenario.id),
         )
     ).scalars().all()
-    mcps = db.execute(select(MCPConfig).where(MCPConfig.tenant_id == tenant_id)).scalars().all()
-    llms = db.execute(select(LLMConfig).where(LLMConfig.tenant_id == tenant_id)).scalars().all()
+    mcps = db.execute(select(MCPConfig).where(
+        or_(MCPConfig.tenant_id == tenant_id, MCPConfig.is_public.is_(True))
+    )).scalars().all()
+    llms = db.execute(select(LLMConfig).where(
+        or_(LLMConfig.tenant_id == tenant_id, LLMConfig.is_public.is_(True))
+    )).scalars().all()
     result = [connector_summary(item, "data_source") for item in sources]
     result.extend(connector_summary(item, "mcp") for item in mcps)
     result.extend(connector_summary(item, "llm") for item in llms)

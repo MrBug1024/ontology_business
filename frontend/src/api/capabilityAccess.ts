@@ -20,4 +20,5 @@ export const capabilityAccessApi = {
     expires_in_days: number
   }) => http.post<IntegrationKeyCreated>('/developer/api-keys', payload),
   revokeKey: (keyId: string) => http.delete<IntegrationKey>(`/developer/api-keys/${keyId}`),
+  deleteUnboundKey: (keyId: string) => http.delete<IntegrationKey>(`/developer/api-keys/${keyId}`),
 }

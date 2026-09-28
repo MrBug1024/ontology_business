@@ -35,11 +35,10 @@
             <div><strong>界面主题</strong><span>应用于整个平台</span></div>
             <el-switch :model-value="theme === 'dark'" active-text="深色" inactive-text="浅色" aria-label="深色主题" @change="emit('toggle-theme')" />
           </div>
-          <p class="settings-note">模型、技能与 MCP 在当前工作区内共享，切换工作区后使用对应配置。模板附件可在资料库中管理。</p>
+          <p class="settings-note">模型与 MCP 默认只在当前工作区可用；系统超级管理员可开启跨工作区共享，共享配置对其他工作区只读。模板附件可在资料库中管理。</p>
         </section>
       </el-tab-pane>
       <el-tab-pane label="AI 模型" name="llm" lazy><ModelSettingsPanel /></el-tab-pane>
-      <el-tab-pane label="工具" name="tools" lazy><ToolSettingsPanel @configure-mcp="emit('tab-change', 'mcp')" /></el-tab-pane>
       <el-tab-pane label="技能" name="skills" lazy><SkillSettingsPanel /></el-tab-pane>
       <el-tab-pane label="MCP" name="mcp" lazy><McpSettingsPanel /></el-tab-pane>
     </el-tabs>
@@ -53,7 +52,6 @@ import { useAuthStore } from '@/stores/auth'
 import { platformSettingsTabFromQuery, type PlatformSettingsTab } from '@/utils/platformSettings'
 
 const ModelSettingsPanel = defineAsyncComponent(() => import('./ModelSettingsPanel.vue'))
-const ToolSettingsPanel = defineAsyncComponent(() => import('./ToolSettingsPanel.vue'))
 const SkillSettingsPanel = defineAsyncComponent(() => import('./SkillSettingsPanel.vue'))
 const McpSettingsPanel = defineAsyncComponent(() => import('./McpSettingsPanel.vue'))
 

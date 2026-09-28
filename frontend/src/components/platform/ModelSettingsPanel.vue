@@ -13,7 +13,7 @@
       v-if="!canManage"
       class="model-alert"
       type="info"
-      title="当前账户为只读：可查看模型、路由、使用情况与评测，不能修改配置或测试连接。"
+      title="当前账户为只读：可查看模型与路由；仅所属配置可查看使用情况与评测，不能修改配置或测试连接。"
       show-icon
       :closable="false"
     />
@@ -23,7 +23,7 @@
         <span class="eyebrow">CAPABILITY ROUTING</span>
         <h3 id="route-title">当前路由</h3>
       </div>
-      <button v-for="item in capabilityRoutes" :key="item.capability" type="button" class="route-card" @click="selectCapability(item.capability)">
+      <button v-for="item in capabilityRoutes" :key="item.capability" type="button" class="route-card" :disabled="!item.config?.is_owned" @click="selectCapability(item.capability)">
         <span class="route-icon"><el-icon><component :is="capabilityIcon(item.capability)" /></el-icon></span>
         <span class="route-copy"><small>{{ capabilityLabel(item.capability) }}</small><b>{{ item.config?.name || '未配置' }}</b><em>{{ item.config ? `优先级 ${item.config.routing_priority ?? 100}` : '需要启用可用模型' }}</em></span>
       </button>
@@ -38,6 +38,7 @@
           <div class="model-name"><strong>{{ config.name }}</strong><span class="mono">{{ config.model || '未填写模型标识' }}</span></div>
           <div class="card-tags">
             <el-tag v-if="config.is_default" size="small" type="success" effect="light">默认</el-tag>
+            <el-tag v-if="config.is_public" size="small" type="warning" effect="plain">跨工作区共享</el-tag>
             <el-tag size="small" :type="config.enabled === false ? 'info' : 'primary'" effect="plain">{{ config.enabled === false ? '已停用' : '已启用' }}</el-tag>
           </div>
         </header>
@@ -52,10 +53,10 @@
           <div class="wide"><dt>预算</dt><dd>{{ budgetText(config) }}</dd></div>
         </dl>
         <footer class="model-actions">
-          <el-button size="small" plain @click="openOperations(config)"><el-icon><DataAnalysis /></el-icon> 使用与评测</el-button>
-          <el-button v-if="canManage" size="small" plain :loading="config._testing" @click="test(config)"><el-icon><Link /></el-icon> 测试</el-button>
-          <el-button v-if="canManage" size="small" text type="primary" @click="openEdit(config)"><el-icon><Edit /></el-icon> 编辑</el-button>
-          <el-button v-if="canManage" size="small" text type="danger" @click="remove(config)"><el-icon><Delete /></el-icon> 删除</el-button>
+          <el-button v-if="config.is_owned" size="small" plain @click="openOperations(config)"><el-icon><DataAnalysis /></el-icon> 使用与评测</el-button>
+          <el-button v-if="canManage && config.is_owned" size="small" plain :loading="config._testing" @click="test(config)"><el-icon><Link /></el-icon> 测试</el-button>
+          <el-button v-if="canManage && config.is_owned" size="small" text type="primary" @click="openEdit(config)"><el-icon><Edit /></el-icon> 编辑</el-button>
+          <el-button v-if="canManage && config.is_owned" size="small" text type="danger" @click="remove(config)"><el-icon><Delete /></el-icon> 删除</el-button>
         </footer>
       </article>
       <div v-if="!loading && !llms.length" class="empty-state card">
@@ -84,6 +85,10 @@
             <el-form-item label="路由优先级（数字越小越优先）"><el-input-number v-model="form.routing_priority" :min="0" :max="10000" :step="10" style="width:100%" /></el-form-item>
             <el-form-item label="启用状态"><el-switch v-model="form.enabled" active-text="已启用" inactive-text="已停用" /></el-form-item>
             <el-form-item label="设为默认（需具备对话能力）"><el-switch v-model="form.is_default" /></el-form-item>
+            <el-form-item v-if="canShareAcrossWorkspaces" label="允许其他工作区使用">
+              <el-switch v-model="form.is_public" />
+              <span class="field-help">其他工作区可使用此模型，但不能修改、测试或查看调用明细。</span>
+            </el-form-item>
           </div>
         </section>
         <section class="form-section" aria-labelledby="runtime-title">
@@ -166,6 +171,7 @@ const capabilities: Capability[] = ['chat', 'embedding', 'vision', 'tool']
 const providers = ['openai', 'deepseek', 'dashscope', 'ollama', 'vllm', 'openai_compatible']
 const auth = useAuthStore()
 const canManage = computed(() => auth.user?.can_manage === true)
+const canShareAcrossWorkspaces = computed(() => auth.user?.system_role === 'superadmin')
 const llms = ref<ConfigCard[]>([])
 const loading = ref(false)
 const saving = ref(false)
@@ -187,10 +193,10 @@ const evaluationSaving = ref(false)
 const evaluationForm = ref<Partial<LLMEvaluation>>(newEvaluation())
 
 function newForm(): Partial<LLMConfig> {
-  return { provider: 'openai_compatible', base_url: '', api_key: '', model: '', temperature: 0.2, max_tokens: 4096, is_default: false, capabilities: ['chat', 'tool'], enabled: true, routing_priority: 100, input_cost_per_million: 0, output_cost_per_million: 0, budget_limit: 0, cost_currency: 'USD' }
+  return { provider: 'openai_compatible', base_url: '', api_key: '', model: '', temperature: 0.2, max_tokens: 4096, is_default: false, is_public: false, capabilities: ['chat', 'tool'], enabled: true, routing_priority: 100, input_cost_per_million: 0, output_cost_per_million: 0, budget_limit: 0, cost_currency: 'USD' }
 }
 function newEvaluation(): Partial<LLMEvaluation> { return { name: '基础评测', capability: 'chat', passed: true, score: 0, latency_ms: 0, input_tokens: 0, output_tokens: 0, estimated_cost: 0, notes: '' } }
-function capabilityLabel(value: string) { return ({ chat: '对话', embedding: '向量', vision: '视觉', tool: '工具' } as Record<string, string>)[value] || value }
+function capabilityLabel(value: string) { return ({ chat: '对话', embedding: '向量', vision: '视觉', tool: '工具调用' } as Record<string, string>)[value] || value }
 function capabilityIcon(value: string) { return ({ chat: 'ChatDotRound', embedding: 'Connection', vision: 'View', tool: 'Tools' } as Record<string, string>)[value] || 'Cpu' }
 function costRate(value?: number) { return `${Number(value || 0).toFixed(4)}` }
 function money(value?: number, currency = 'USD') { return `${currency || 'USD'} ${Number(value || 0).toFixed(4)}` }
@@ -211,25 +217,30 @@ async function load() {
   try { llms.value = await api.listLLM(); await loadRoutes() } catch (cause: any) { error.value = cause?.message || '模型配置加载失败' } finally { loading.value = false }
 }
 function openCreate() { if (canManage.value) { form.value = newForm(); dialogVisible.value = true } }
-function openEdit(config: LLMConfig) { if (canManage.value) { form.value = { ...newForm(), ...config, api_key: '' }; dialogVisible.value = true } }
-function selectCapability(capability: Capability) { const config = capabilityRoutes.value.find((item) => item.capability === capability)?.config; if (config) openOperations(config) }
+function openEdit(config: LLMConfig) { if (canManage.value && config.is_owned) { form.value = { ...newForm(), ...config, api_key: '' }; dialogVisible.value = true } }
+function selectCapability(capability: Capability) { const config = capabilityRoutes.value.find((item) => item.capability === capability)?.config; if (config?.is_owned) openOperations(config) }
+function requestPayload(config: Partial<LLMConfig>) {
+  const { id: _id, is_owned: _isOwned, created_at: _createdAt, updated_at: _updatedAt, ...payload } = config
+  return payload
+}
 async function save() {
   if (!canManage.value) return
   if (!form.value.name || !form.value.base_url || !form.value.model) return ElMessage.warning('请填写名称、Base URL 和模型标识')
   if (!form.value.id && !form.value.api_key) return ElMessage.warning('新建模型配置时请填写 API Key')
   if (!form.value.capabilities?.length) return ElMessage.warning('至少选择一种模型能力')
   saving.value = true
-  try { if (form.value.id) await api.updateLLM(form.value.id, form.value); else await api.createLLM(form.value); ElMessage.success('模型配置已保存'); dialogVisible.value = false; await load() } catch (cause: any) { ElMessage.error(cause?.message || '保存失败') } finally { saving.value = false }
+  try { const payload = requestPayload(form.value); if (form.value.id) await api.updateLLM(form.value.id, payload); else await api.createLLM(payload); ElMessage.success('模型配置已保存'); dialogVisible.value = false; await load() } catch (cause: any) { ElMessage.error(cause?.message || '保存失败') } finally { saving.value = false }
 }
-async function test(config: ConfigCard) { if (!canManage.value) return; config._testing = true; try { const result: any = await api.testLLM(config.id!); ElMessage.success(result.message || '连接成功'); await load() } catch (cause: any) { ElMessage.error(`连接失败：${cause?.message || '未知错误'}`) } finally { config._testing = false } }
-async function remove(config: LLMConfig) { if (!canManage.value) return; try { await ElMessageBox.confirm(`删除模型配置「${config.name}」？其历史 trace 和评测也将一并删除。`, '确认删除', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }); await api.deleteLLM(config.id!); ElMessage.success('已删除'); await load() } catch (cause: any) { if (cause !== 'cancel' && cause !== 'close') ElMessage.error(cause?.message || '删除失败') } }
+async function test(config: ConfigCard) { if (!canManage.value || !config.is_owned) return; config._testing = true; try { const result: any = await api.testLLM(config.id!); ElMessage.success(result.message || '连接成功'); await load() } catch (cause: any) { ElMessage.error(`连接失败：${cause?.message || '未知错误'}`) } finally { config._testing = false } }
+async function remove(config: LLMConfig) { if (!canManage.value || !config.is_owned) return; try { await ElMessageBox.confirm(`删除模型配置「${config.name}」？其历史 trace 和评测也将一并删除。`, '确认删除', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }); await api.deleteLLM(config.id!); ElMessage.success('已删除'); await load() } catch (cause: any) { if (cause !== 'cancel' && cause !== 'close') ElMessage.error(cause?.message || '删除失败') } }
 async function openOperations(config: LLMConfig) {
+  if (!config.is_owned) return
   activeConfig.value = config; operationsVisible.value = true; operationsLoading.value = true; operationsError.value = ''; operationsTab.value = 'traces'
   try { const [nextUsage, nextTraces, nextEvaluations, nextEvaluationSummary] = await Promise.all([api.getLLMUsageSummary(config.id!), api.listLLMTraces(config.id!), api.listLLMEvaluations(config.id!), api.getLLMEvaluationSummary(config.id!)]); usage.value = nextUsage; traces.value = nextTraces; evaluations.value = nextEvaluations; evaluationSummary.value = nextEvaluationSummary } catch (cause: any) { operationsError.value = cause?.message || '使用与评测数据加载失败' } finally { operationsLoading.value = false }
 }
 async function saveEvaluation() {
-  if (!canManage.value) return
-  if (!activeConfig.value?.id || !evaluationForm.value.name) return ElMessage.warning('请填写评测名称')
+  if (!canManage.value || !activeConfig.value?.is_owned) return
+  if (!activeConfig.value.id || !evaluationForm.value.name) return ElMessage.warning('请填写评测名称')
   evaluationSaving.value = true
   try { await api.createLLMEvaluation(activeConfig.value.id, evaluationForm.value); ElMessage.success('评测已记录'); evaluationDialog.value = false; evaluationForm.value = newEvaluation(); await openOperations(activeConfig.value) } catch (cause: any) { ElMessage.error(cause?.message || '评测保存失败') } finally { evaluationSaving.value = false }
 }
@@ -248,6 +259,7 @@ onMounted(load)
 .route-card { display: flex; align-items: center; gap: 10px; padding: 12px; color: var(--text); cursor: pointer; text-align: left; transition: transform var(--dur) var(--ease), border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }.route-card:hover { transform: translateY(-2px); border-color: var(--border-strong); box-shadow: var(--shadow-sm); }.route-card:focus-visible, .model-actions :deep(button:focus-visible) { outline: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); outline-offset: 3px; }
 .route-icon, .model-icon { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; border-radius: 11px; background: var(--primary-soft); color: var(--primary); }.route-icon { width: 34px; height: 34px; }.route-copy { display: flex; min-width: 0; flex-direction: column; gap: 2px; }.route-copy small, .route-copy em { overflow: hidden; color: var(--text-3); font-size: 10px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }.route-copy b { overflow: hidden; color: var(--text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .model-alert { margin-bottom: 12px; }
+.field-help { display: block; color: var(--text-3); font-size: 12px; line-height: 1.5; }
 .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr)); gap: 14px; }.card { border: 1px solid var(--border); border-radius: 15px; background: var(--surface); box-shadow: var(--shadow-xs); }.model-card { display: flex; flex-direction: column; min-height: 292px; padding: 16px; transition: transform var(--dur) var(--ease), border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }.model-card:hover { transform: translateY(-2px); border-color: var(--border-strong); box-shadow: var(--shadow-sm); }.model-card.disabled { opacity: .72; }.model-card-head { display: flex; align-items: flex-start; gap: 10px; }.model-icon { width: 40px; height: 40px; }.model-name { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }.model-name strong { overflow: hidden; color: var(--text); font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }.model-name span { overflow: hidden; color: var(--text-3); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }.card-tags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }.capability-tags { display: flex; min-height: 27px; flex-wrap: wrap; gap: 5px; margin: 14px 0 10px; }.model-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin: 0; padding: 12px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }.model-meta div { min-width: 0; }.model-meta .wide { grid-column: 1 / -1; }.model-meta dt { color: var(--text-3); font-size: 10px; }.model-meta dd { margin: 3px 0 0; overflow: hidden; color: var(--text-2); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }.model-actions { display: flex; flex-wrap: wrap; gap: 2px; margin-top: auto; padding-top: 10px; }
 .empty-state { grid-column: 1 / -1; min-height: 220px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; padding: 24px; color: var(--text-3); text-align: center; }.empty-state strong { color: var(--text-2); font-size: 14px; }.empty-state span { max-width: 440px; font-size: 12px; line-height: 1.55; }
 .model-form :deep(.el-form-item) { margin-bottom: 15px; }.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }.form-full { grid-column: 1 / -1; }.form-section { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }.form-section h3 { margin: 4px 0 11px; color: var(--text); font-size: 15px; }.capability-checks { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-bottom: 16px; }.compact { align-items: end; }.compact :deep(.el-form-item) { margin-bottom: 8px; }

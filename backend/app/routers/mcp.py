@@ -23,6 +23,7 @@ from ..schemas import (
     Msg,
 )
 from ..services import connector_service, mcp_service, permission_service, tenant_service
+from ..services import system_account_service
 from ..services.auth_service import get_tenant_db
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
@@ -169,7 +170,7 @@ def _commit_or_name_conflict(
         raise
 
 
-def _out(c: MCPConfig) -> MCPConfigOut:
+def _out(c: MCPConfig, db: Session) -> MCPConfigOut:
     transport = "streamable_http" if c.transport == "http" else c.transport
     if transport == "stdio":
         command, args = _public_stdio_fields(c.command, c.args)
@@ -180,6 +181,8 @@ def _out(c: MCPConfig) -> MCPConfigOut:
     return MCPConfigOut(
         id=c.id,
         name=c.name,
+        is_public=bool(c.is_public),
+        is_owned=c.tenant_id == tenant_service.current_tenant_id(db),
         transport=transport,
         command=command,
         args=args,
@@ -193,19 +196,22 @@ def _out(c: MCPConfig) -> MCPConfigOut:
 
 @router.get("", response_model=list[MCPConfigOut])
 def list_mcp(db: Session = Depends(get_tenant_db)):
-    return [_out(c) for c in db.execute(select(MCPConfig).where(tenant_service.visible_clause(MCPConfig, db))).scalars().all()]
+    return [_out(c, db) for c in db.execute(select(MCPConfig).where(tenant_service.visible_clause(MCPConfig, db))).scalars().all()]
 
 
 @router.post("", response_model=MCPConfigOut)
 def create_mcp(payload: MCPConfigIn, db: Session = Depends(get_tenant_db)):
     permission_service.require_tenant_permission(db, "manage")
+    if payload.is_public:
+        principal = permission_service.require_principal(db)
+        system_account_service.require_superadmin(db, principal.user_id)
     _assert_transport_policy(payload)
     _assert_unique_name(db, payload.name)
     c = MCPConfig(tenant_id=tenant_service.current_tenant_id(db), **payload.model_dump())
     db.add(c)
     _commit_or_name_conflict(db, [payload.name])
     db.refresh(c)
-    return _out(c)
+    return _out(c, db)
 
 
 @router.post("/import", response_model=MCPImportResultOut)
@@ -276,7 +282,9 @@ def import_standard_mcp(
             if dry_run:
                 continue
             current = matches[0]
-            for key, value in config.model_dump().items():
+            values = config.model_dump()
+            values["is_public"] = current.is_public
+            for key, value in values.items():
                 setattr(current, key, value)
             connector_service.invalidate_connector_bindings(db, "mcp", current.id)
             touched.append(current)
@@ -308,7 +316,7 @@ def import_standard_mcp(
         replaced=replaced,
         skipped=skipped,
         items=items,
-        configs=[] if dry_run else [_out(current) for current in touched],
+        configs=[] if dry_run else [_out(current, db) for current in touched],
     )
 
 
@@ -317,6 +325,9 @@ def update_mcp(mcp_id: str, payload: MCPConfigIn, db: Session = Depends(get_tena
     permission_service.require_tenant_permission(db, "manage")
     _assert_transport_policy(payload)
     c = tenant_service.require_owned(db, MCPConfig, mcp_id, "MCP 不存在")
+    if payload.is_public != bool(c.is_public):
+        principal = permission_service.require_principal(db)
+        system_account_service.require_superadmin(db, principal.user_id)
     _assert_unique_name(db, payload.name, exclude_id=c.id)
     values = payload.model_dump()
     if (
@@ -334,7 +345,7 @@ def update_mcp(mcp_id: str, payload: MCPConfigIn, db: Session = Depends(get_tena
     connector_service.invalidate_connector_bindings(db, "mcp", c.id)
     _commit_or_name_conflict(db, [payload.name], exclude_ids={c.id})
     db.refresh(c)
-    return _out(c)
+    return _out(c, db)
 
 
 @router.delete("/{mcp_id}", response_model=Msg)
@@ -366,8 +377,8 @@ def test_mcp(mcp_id: str, db: Session = Depends(get_tenant_db)):
 
 @router.get("/{mcp_id}/tools", response_model=list[MCPToolInfo])
 def mcp_tools(mcp_id: str, db: Session = Depends(get_tenant_db)):
-    permission_service.require_tenant_permission(db, "manage")
-    c = tenant_service.require_owned(db, MCPConfig, mcp_id, "MCP 不存在")
+    permission_service.require_tenant_permission(db, "read")
+    c = tenant_service.require_visible(db, MCPConfig, mcp_id, "MCP 不存在")
     if not c.enabled:
         raise HTTPException(409, "MCP 当前已停用")
     if c.transport == "stdio" and not get_settings().allow_mcp_stdio:

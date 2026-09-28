@@ -3,7 +3,7 @@
     <div class="page-header">
       <div>
         <h2>MCP</h2>
-        <div class="sub">配置可供 AI 对话和工作流选择的 MCP 连接与工具。</div>
+        <div class="sub">配置供 AI 对话、建模顾问和工作流接入的外部 MCP 服务；平台内置工具无需配置。跨工作区共享由系统超级管理员开启。</div>
       </div>
       <div class="page-actions">
         <template v-if="canManage">
@@ -19,7 +19,7 @@
       v-if="!canManage"
       class="readonly-notice"
       type="info"
-      title="当前账户为只读：可查看 MCP 配置，不能新建、修改、测试或查看远端工具。"
+      title="当前账户为只读：共享 MCP 可被本工作区使用并查看远端工具目录，不能修改配置或测试连接。"
       show-icon
       :closable="false"
     />
@@ -33,19 +33,20 @@
               <div class="mc-name">{{ m.name }}</div>
               <el-tag size="small" type="info" effect="light">{{ transportLabel(m.transport) }}</el-tag>
             </div>
-            <el-switch v-if="canManage" :model-value="!!m.enabled" aria-label="启用 MCP" @change="(value: string | number | boolean) => toggle(m, value === true)" />
+            <el-switch v-if="canManage && m.is_owned" :model-value="!!m.enabled" aria-label="启用 MCP" @change="(value: string | number | boolean) => toggle(m, value === true)" />
             <el-tag v-else size="small" :type="m.enabled ? 'success' : 'info'" effect="light">{{ m.enabled ? '已启用' : '已停用' }}</el-tag>
           </div>
           <div class="muted mono mc-cmd" :title="displayEndpoint(m)">{{ displayEndpoint(m) }}</div>
+          <el-tag v-if="m.is_public" size="small" type="warning" effect="plain">跨工作区共享</el-tag>
           <div v-if="m.transport !== 'stdio' && Object.keys(m.headers || {}).length" class="credential-summary">
             <el-icon aria-hidden="true"><Lock /></el-icon>
             已配置 {{ Object.keys(m.headers || {}).length }} 个请求头
           </div>
-          <div v-if="canManage" class="mc-actions">
-            <el-button size="small" plain :loading="m._testing" @click="test(m)"><el-icon><Link /></el-icon> 测试</el-button>
-            <el-button size="small" type="primary" plain @click="showTools(m)"><el-icon><Tools /></el-icon> 工具</el-button>
-            <el-button size="small" text type="primary" @click="openEdit(m)"><el-icon><Edit /></el-icon> 编辑</el-button>
-            <el-button size="small" text type="danger" @click="remove(m)"><el-icon><Delete /></el-icon> 删除</el-button>
+          <div v-if="(canManage && m.is_owned) || m.is_public" class="mc-actions">
+            <el-button v-if="canManage && m.is_owned" size="small" plain :loading="m._testing" @click="test(m)"><el-icon><Link /></el-icon> 测试</el-button>
+            <el-button v-if="canManage || m.is_public" size="small" type="primary" plain @click="showTools(m)"><el-icon><Tools /></el-icon> 查看远端工具</el-button>
+            <el-button v-if="canManage && m.is_owned" size="small" text type="primary" @click="openEdit(m)"><el-icon><Edit /></el-icon> 编辑</el-button>
+            <el-button v-if="canManage && m.is_owned" size="small" text type="danger" @click="remove(m)"><el-icon><Delete /></el-icon> 删除</el-button>
           </div>
         </div>
       </el-col>
@@ -115,6 +116,10 @@
           </el-form-item>
         </template>
         <el-form-item label="启用"><el-switch v-model="form.enabled" /></el-form-item>
+        <el-form-item v-if="canShareAcrossWorkspaces" label="允许其他工作区使用">
+          <el-switch v-model="form.is_public" />
+          <span class="field-help">其他工作区可使用此 MCP 并查看远端工具目录，但不能修改或测试连接。</span>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dlg = false">取消</el-button>
@@ -182,7 +187,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog append-to-body v-if="canManage" v-model="toolsDlg" :title="'MCP 工具：' + (curMcp?.name || '')" width="min(680px, 94vw)" top="6vh">
+    <el-dialog append-to-body v-model="toolsDlg" :title="'远端 MCP 工具目录：' + (curMcp?.name || '')" width="min(680px, 94vw)" top="6vh">
       <el-table :data="tools" size="small" v-loading="loadingTools">
         <el-table-column prop="name" label="工具名" min-width="160">
           <template #default="{ row }"><span class="mono">{{ row.name }}</span></template>
@@ -213,10 +218,12 @@ type MCPForm = {
   env: Record<string, string>
   headers: Record<string, string>
   enabled: boolean
+  is_public: boolean
 }
 
 const auth = useAuthStore()
 const canManage = computed(() => auth.user?.can_manage === true)
+const canShareAcrossWorkspaces = computed(() => auth.user?.system_role === 'superadmin')
 const mcps = ref<(MCPConfig & { _testing?: boolean })[]>([])
 const dlg = ref(false)
 const saving = ref(false)
@@ -241,7 +248,7 @@ const tools = ref<MCPTool[]>([])
 const loadingTools = ref(false)
 
 function emptyForm(): MCPForm {
-  return { name: '', transport: 'streamable_http', command: '', args: [], url: '', env: {}, headers: {}, enabled: true }
+  return { name: '', transport: 'streamable_http', command: '', args: [], url: '', env: {}, headers: {}, enabled: true, is_public: false }
 }
 
 function configPayload(source: Partial<MCPForm | MCPConfig>, enabled = source.enabled !== false) {
@@ -255,6 +262,7 @@ function configPayload(source: Partial<MCPForm | MCPConfig>, enabled = source.en
     env: transport === 'stdio' ? Object.fromEntries(Object.entries(source.env || {}).map(([key, value]) => [key, String(value)])) : {},
     headers: transport === 'stdio' ? {} : Object.fromEntries(Object.entries(source.headers || {}).map(([key, value]) => [key, String(value)])),
     enabled,
+    is_public: source.is_public === true,
   }
 }
 
@@ -294,6 +302,7 @@ function openEdit(m: MCPConfig) {
     env: { ...(m.env || {}) },
     headers: { ...(m.headers || {}) },
     enabled: m.enabled !== false,
+    is_public: m.is_public === true,
   }
   dlg.value = true
 }
@@ -375,7 +384,7 @@ async function save() {
 }
 
 async function toggle(m: MCPConfig, enabled: boolean) {
-  if (!canManage.value || !m.id) return
+  if (!canManage.value || !m.is_owned || !m.id) return
   try {
     await api.updateMCP(m.id, configPayload(m, enabled))
     m.enabled = enabled
@@ -385,7 +394,7 @@ async function toggle(m: MCPConfig, enabled: boolean) {
 }
 
 async function test(m: MCPConfig & { _testing?: boolean }) {
-  if (!canManage.value || !m.id) return
+  if (!canManage.value || !m.is_owned || !m.id) return
   m._testing = true
   try {
     const result: any = await api.testMCP(m.id)
@@ -399,7 +408,7 @@ async function test(m: MCPConfig & { _testing?: boolean }) {
 }
 
 async function showTools(m: MCPConfig) {
-  if (!canManage.value || !m.id) return
+  if ((!canManage.value && !m.is_public) || !m.id) return
   curMcp.value = m
   tools.value = []
   toolsDlg.value = true
@@ -414,7 +423,7 @@ async function showTools(m: MCPConfig) {
 }
 
 async function remove(m: MCPConfig) {
-  if (!canManage.value || !m.id) return
+  if (!canManage.value || !m.is_owned || !m.id) return
   try {
     await ElMessageBox.confirm(`删除 MCP「${m.name}」？`, '确认', { type: 'warning' })
     await api.deleteMCP(m.id)

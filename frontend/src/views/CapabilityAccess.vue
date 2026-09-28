@@ -130,12 +130,19 @@
             <el-table-column label="操作" width="90" fixed="right">
               <template #default="{ row }">
                 <el-button
-                  v-if="row.status === 'active'"
+                  v-if="row.scenario_id && row.status === 'active'"
                   text
                   type="danger"
                   :aria-label="`撤销密钥 ${row.name}`"
                   @click="revokeKey(row)"
                 ><el-icon><Delete /></el-icon>撤销</el-button>
+                <el-button
+                  v-else-if="!row.scenario_id"
+                  text
+                  type="danger"
+                  :aria-label="`删除未绑定场景的密钥 ${row.name}`"
+                  @click="deleteUnboundKey(row)"
+                ><el-icon><Delete /></el-icon>删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -390,6 +397,20 @@ async function revokeKey(key: IntegrationKey) {
     ElMessage.success('密钥已撤销')
   } catch (error: unknown) {
     if (error !== 'cancel' && error !== 'close') ElMessage.error(error instanceof Error ? error.message : '撤销失败')
+  }
+}
+
+async function deleteUnboundKey(key: IntegrationKey) {
+  try {
+    await ElMessageBox.confirm(`删除未绑定场景的历史密钥“${key.name}”？记录将从列表移除，审计记录会保留。`, '删除未绑定密钥', {
+      type: 'warning',
+      confirmButtonText: '确认删除',
+    })
+    await capabilityAccessApi.deleteUnboundKey(key.id)
+    await loadKeys()
+    ElMessage.success('未绑定密钥已从列表移除')
+  } catch (error: unknown) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error instanceof Error ? error.message : '删除失败')
   }
 }
 

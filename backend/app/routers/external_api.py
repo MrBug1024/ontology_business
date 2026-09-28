@@ -89,10 +89,10 @@ def create_api_key(
 
 @management_router.delete("/{key_id}", response_model=ExternalApiKeyOut)
 def revoke_api_key(key_id: str, db: Session = Depends(get_tenant_db)) -> ExternalApiKeyOut:
-    """Revoke immediately; historical metadata remains available for audit."""
+    """Revoke bound keys or hide unbound historical keys with an audit event."""
     principal = _management_principal(db)
     try:
-        key = external_api_service.revoke_key(
+        key, _action = external_api_service.remove_key(
             db,
             tenant_id=principal.tenant_id,
             key_id=key_id,

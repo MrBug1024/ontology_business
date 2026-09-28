@@ -1141,6 +1141,8 @@ export interface LLMConfig {
   temperature: number
   max_tokens: number
   is_default?: boolean
+  is_public?: boolean
+  is_owned?: boolean
   capabilities?: Array<'chat' | 'embedding' | 'vision' | 'tool' | string>
   enabled?: boolean
   routing_priority?: number
@@ -1248,6 +1250,8 @@ export interface Skill {
 export interface MCPConfig {
   id?: string
   name: string
+  is_public?: boolean
+  is_owned?: boolean
   transport: string
   command?: string
   args?: string[]

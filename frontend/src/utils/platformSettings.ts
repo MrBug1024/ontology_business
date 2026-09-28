@@ -1,6 +1,6 @@
 import type { LocationQuery, LocationQueryRaw } from 'vue-router'
 
-export const PLATFORM_SETTINGS_TABS = ['general', 'llm', 'tools', 'skills', 'mcp'] as const
+export const PLATFORM_SETTINGS_TABS = ['general', 'llm', 'skills', 'mcp'] as const
 export type PlatformSettingsTab = (typeof PLATFORM_SETTINGS_TABS)[number]
 
 export function platformSettingsTabFromQuery(value: unknown): PlatformSettingsTab | null {

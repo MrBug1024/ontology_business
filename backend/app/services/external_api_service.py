@@ -150,32 +150,60 @@ def issue_key(
 def list_keys(db: Session, tenant_id: str) -> list[ExternalApiKey]:
     return db.execute(
         select(ExternalApiKey)
-        .where(ExternalApiKey.tenant_id == tenant_id)
+        .where(ExternalApiKey.tenant_id == tenant_id, ExternalApiKey.deleted_at.is_(None))
         .order_by(ExternalApiKey.created_at.desc(), ExternalApiKey.id.desc())
     ).scalars().all()
 
 
-def revoke_key(
+def remove_key(
     db: Session,
     *,
     tenant_id: str,
     key_id: str,
     revoked_by_user_id: str,
-) -> ExternalApiKey | None:
+) -> tuple[ExternalApiKey | None, str | None]:
     key = db.execute(
         select(ExternalApiKey).where(
             ExternalApiKey.id == key_id,
             ExternalApiKey.tenant_id == tenant_id,
-        )
+            ExternalApiKey.deleted_at.is_(None),
+        ).with_for_update()
     ).scalars().first()
     if not key:
-        return None
+        return None, None
+    actor = db.get(User, revoked_by_user_id)
+    if not actor or actor.status != "active":
+        raise ExternalApiKeyError("API key 操作者不是当前组织的有效用户")
+    if not _active_member(db, tenant_id, revoked_by_user_id):
+        raise ExternalApiKeyError("API key 操作者没有有效组织成员身份")
+    if key.scenario_id is None:
+        if key.status != "revoked":
+            key.status = "revoked"
+            key.revoked_at = utc_now()
+            key.revoked_by_user_id = revoked_by_user_id
+            db.add(
+                ExternalApiKeyAuditEvent(
+                    api_key_id=key.id,
+                    tenant_id=tenant_id,
+                    subject_user_id=key.user_id,
+                    actor_user_id=revoked_by_user_id,
+                    event_type="revoked",
+                    details={"reason": "unbound_scenario_key_removed"},
+                )
+            )
+        key.deleted_at = utc_now()
+        db.add(
+            ExternalApiKeyAuditEvent(
+                api_key_id=key.id,
+                tenant_id=tenant_id,
+                subject_user_id=key.user_id,
+                actor_user_id=revoked_by_user_id,
+                event_type="deleted",
+                details={"reason": "unbound_scenario_key_removed", "key_id": key.id},
+            )
+        )
+        return key, "deleted"
     if key.status != "revoked":
-        revoker = db.get(User, revoked_by_user_id)
-        if not revoker or revoker.status != "active":
-            raise ExternalApiKeyError("API key 撤销者不是当前组织的有效用户")
-        if not _active_member(db, tenant_id, revoked_by_user_id):
-            raise ExternalApiKeyError("API key 撤销者没有有效组织成员身份")
         key.status = "revoked"
         key.revoked_at = utc_now()
         key.revoked_by_user_id = revoked_by_user_id
@@ -189,7 +217,7 @@ def revoke_key(
                 details={},
             )
         )
-    return key
+    return key, "revoked"
 
 
 def _invalid_key() -> HTTPException:

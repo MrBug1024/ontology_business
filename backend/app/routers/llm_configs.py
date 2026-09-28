@@ -21,6 +21,7 @@ from ..schemas import (
     Msg,
 )
 from ..services import connector_service, llm_service, permission_service, tenant_service
+from ..services import system_account_service
 from ..services.auth_service import get_tenant_db
 
 router = APIRouter(prefix="/llm-configs", tags=["llm-configs"])
@@ -28,7 +29,7 @@ router = APIRouter(prefix="/llm-configs", tags=["llm-configs"])
 Capability = Literal["chat", "embedding", "vision", "tool"]
 
 
-def _out(c: LLMConfig) -> LLMConfigOut:
+def _out(c: LLMConfig, db: Session) -> LLMConfigOut:
     """显式构造输出，确保任何路径都不会回传 api_key。"""
     return LLMConfigOut(
         id=c.id,
@@ -51,6 +52,8 @@ def _out(c: LLMConfig) -> LLMConfigOut:
         output_cost_per_million=c.output_cost_per_million,
         budget_limit=c.budget_limit,
         cost_currency=c.cost_currency or "USD",
+        is_public=bool(c.is_public),
+        is_owned=c.tenant_id == tenant_service.current_tenant_id(db),
         created_at=c.created_at,
         updated_at=c.updated_at,
     )
@@ -118,7 +121,7 @@ def list_llm(db: Session = Depends(get_tenant_db)):
         .where(tenant_service.visible_clause(LLMConfig, db))
         .order_by(LLMConfig.routing_priority.asc(), LLMConfig.is_default.desc(), LLMConfig.name.asc())
     )
-    return [_out(c) for c in db.execute(stmt).scalars().all()]
+    return [_out(c, db) for c in db.execute(stmt).scalars().all()]
 
 
 @router.get("/resolve", response_model=LLMRouteOut)
@@ -132,14 +135,17 @@ def resolve_llm(
         raise HTTPException(404, f"没有可用的 {capability} 模型")
     return LLMRouteOut(
         capability=capability,
-        selected=_out(candidates[0]),
-        candidates=[_out(config) for config in candidates],
+        selected=_out(candidates[0], db),
+        candidates=[_out(config, db) for config in candidates],
     )
 
 
 @router.post("", response_model=LLMConfigOut)
 def create_llm(payload: LLMConfigIn, db: Session = Depends(get_tenant_db)):
     permission_service.require_tenant_permission(db, "manage")
+    if payload.is_public:
+        principal = permission_service.require_principal(db)
+        system_account_service.require_superadmin(db, principal.user_id)
     _validate_default(payload)
     if payload.is_default:
         for c in db.execute(
@@ -150,14 +156,17 @@ def create_llm(payload: LLMConfigIn, db: Session = Depends(get_tenant_db)):
     db.add(c)
     db.commit()
     db.refresh(c)
-    return _out(c)
+    return _out(c, db)
 
 
 @router.put("/{cfg_id}", response_model=LLMConfigOut)
 def update_llm(cfg_id: str, payload: LLMConfigIn, db: Session = Depends(get_tenant_db)):
     permission_service.require_tenant_permission(db, "manage")
-    _validate_default(payload)
     c = tenant_service.require_owned(db, LLMConfig, cfg_id, "配置不存在")
+    if payload.is_public != bool(c.is_public):
+        principal = permission_service.require_principal(db)
+        system_account_service.require_superadmin(db, principal.user_id)
+    _validate_default(payload)
     if payload.is_default:
         for other in db.execute(
             select(LLMConfig).where(LLMConfig.tenant_id == tenant_service.current_tenant_id(db))
@@ -171,7 +180,7 @@ def update_llm(cfg_id: str, payload: LLMConfigIn, db: Session = Depends(get_tena
     connector_service.invalidate_connector_bindings(db, "llm", c.id)
     db.commit()
     db.refresh(c)
-    return _out(c)
+    return _out(c, db)
 
 
 @router.get("/{cfg_id}/traces", response_model=list[LLMTraceOut])

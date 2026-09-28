@@ -2084,7 +2084,7 @@ def _exec_mcp(
         raise PolicyViolation("MCP Action 缺少受治理的下游幂等契约")
     from ..models import MCPConfig
 
-    mcp = mcp or db.get(MCPConfig, mcp_id)
+    mcp = mcp or tenant_service.get_visible(db, MCPConfig, mcp_id)
     if not mcp:
         raise ValueError(f"MCP 不存在: {mcp_id}")
     if require_idempotency:

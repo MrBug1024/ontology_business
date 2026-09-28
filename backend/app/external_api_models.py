@@ -80,6 +80,7 @@ class ExternalApiKey(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
 
 
@@ -130,7 +131,7 @@ class ExternalApiKeyAuditEvent(Base):
     actor_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
     )
-    # issued / revoked.  There is intentionally no update/delete management
+    # issued / revoked / deleted. There is intentionally no audit management
     # route for audit events.
     event_type: Mapped[str] = mapped_column(String(20), nullable=False)
     details: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)

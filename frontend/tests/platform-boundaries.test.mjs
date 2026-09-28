@@ -243,18 +243,12 @@ test('settings manage resources inside the modal and keep nested editors above i
   assert.match(dialog, /v-if="modelValue"/)
 })
 
-test('global tool settings separate governed tools from skill methods', () => {
-  const tools = readFileSync(new URL('../src/components/platform/ToolSettingsPanel.vue', import.meta.url), 'utf8')
-  assert.match(tools, /distillationConversationApi\.resources\(request\.signal\)/)
-  assert.match(tools, /工具 \/ 技能边界/)
-  assert.match(tools, /工具是平台统一执行的小颗粒能力/)
-  assert.match(tools, /受信方法包/)
-  assert.doesNotMatch(tools, /resources\.investigation_tools\.tools/)
-  assert.match(tools, /平台 MCP 能力/)
-  assert.match(tools, /connector\.name\.trim\(\)\.toLowerCase\(\) === 'jev_decide'/)
-  assert.match(tools, /不会被当作业务输入资料/)
-  assert.doesNotMatch(tools, /api\.mcpTools|tools\/call/)
-  assert.match(tools, /onBeforeUnmount\(\(\) => \{ controller\?\.abort\(\)/)
+test('platform capability tools stay fixed in core MCP instead of a settings panel', () => {
+  const dialog = readFileSync(new URL('../src/components/platform/PlatformSettingsDialog.vue', import.meta.url), 'utf8')
+  const coreMcp = readFileSync(new URL('../../backend/app/agent_mcp_server.py', import.meta.url), 'utf8')
+  assert.doesNotMatch(dialog, /ToolSettingsPanel|label="工具"|name="tools"/)
+  assert.match(coreMcp, /@mcp_server\.tool\([\s\S]*?name="list_capabilities"/)
+  assert.match(coreMcp, /@mcp_server\.tool\([\s\S]*?name="invoke_capability"/)
 })
 
 test('artifact templates stay manageable inside the library after the legacy route redirect', () => {

@@ -954,6 +954,7 @@ class LLMConfigIn(BaseModel):
     temperature: float = Field(default=0.2, ge=0, le=2)
     max_tokens: int = Field(default=4096, ge=1, le=131_072)
     is_default: bool = False
+    is_public: bool = False
     capabilities: list[str] = Field(default_factory=lambda: ["chat", "tool"], max_length=4)
     enabled: bool = True
     # 数字越小越优先；同优先级时默认模型优先。
@@ -987,6 +988,7 @@ class LLMConfigIn(BaseModel):
 
 class LLMConfigOut(LLMConfigIn):
     id: str
+    is_owned: bool = False
     # 禁止 ORM 直接序列化时意外暴露服务端密钥。
     api_key: str = Field(default="", repr=False)
     created_at: datetime
@@ -1149,6 +1151,7 @@ class MCPConfigIn(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
     enabled: bool = True
+    is_public: bool = False
 
     @field_validator("name")
     @classmethod
@@ -1341,6 +1344,8 @@ class MCPImportResultOut(BaseModel):
 class MCPConfigOut(BaseModel):
     id: str
     name: str
+    is_public: bool = False
+    is_owned: bool = False
     transport: str = "stdio"
     command: str = ""
     args: list[str] = Field(default_factory=list)
