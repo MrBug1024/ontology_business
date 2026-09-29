@@ -45,15 +45,15 @@
     />
 
     <el-tabs v-model="tab" class="sd-tabs">
-      <el-tab-pane name="distillation" lazy>
-        <template #label><span class="scenario-context-tab"><el-icon><Compass /></el-icon>业务蒸馏</span></template>
-        <DistillationWorkspace v-if="detail.can_read_workspace_context" :key="`distillation:${scenarioId}`" embedded :scenario-id="scenarioId" :can-write="canWrite" />
-        <el-empty v-else description="业务蒸馏记录仅对场景成员开放" :image-size="64" />
+      <el-tab-pane name="materials" lazy>
+        <template #label><span class="scenario-context-tab"><el-icon><Coin /></el-icon>场景资料</span></template>
+        <DataSources :key="`materials:${scenarioId}`" embedded :scenario-id="scenarioId" :can-write="canWrite" :show-templates="detail.can_read_workspace_context" />
       </el-tab-pane>
 
-      <el-tab-pane name="materials" lazy>
-        <template #label><span class="scenario-context-tab scenario-context-tab-end"><el-icon><Coin /></el-icon>场景资料</span></template>
-        <DataSources :key="`materials:${scenarioId}`" embedded :scenario-id="scenarioId" :can-write="canWrite" :show-templates="detail.can_read_workspace_context" />
+      <el-tab-pane name="distillation" lazy>
+        <template #label><span class="scenario-context-tab scenario-context-tab-end"><el-icon><Compass /></el-icon>业务蒸馏</span></template>
+        <DistillationWorkspace v-if="detail.can_read_workspace_context" :key="`distillation:${scenarioId}`" embedded :scenario-id="scenarioId" :can-write="canWrite" />
+        <el-empty v-else description="业务蒸馏记录仅对场景成员开放" :image-size="64" />
       </el-tab-pane>
 
       <!-- ═══════════ 本体 ═══════════ -->
@@ -268,6 +268,8 @@
           :scenario-id="sid"
           :can-write="canWrite"
           :entities="detail.entities"
+          :candidates="scenarioDraftsOf('semantic_mapping')"
+          @review-candidates="tab = 'candidates'"
         />
 
         <section class="mapping-section" aria-labelledby="object-mapping-heading">
@@ -1478,6 +1480,7 @@ import { safeInternalReturnPath } from '@/utils/navigation'
 import { normalizeScenarioStage } from '@/utils/scenarioStages'
 import {
   captureFunctionContractSchemas,
+  candidateFunctionRuntime,
   createProviderRuntimeConfig,
   functionRuntimeConfigForSave,
   providerConfigValidationError,
@@ -1666,7 +1669,7 @@ function scenarioDraftRow(item: ScenarioModelDraftResource): InlineScenarioDraft
     input_schema: cloneForForm(payload.input_schema || {}),
     output_schema: cloneForForm(payload.output_schema || {}),
     payload_schema: cloneForForm(payload.payload_schema || {}),
-    runtime_kind: 'contract',
+    ...candidateFunctionRuntime(payload),
     executor_type: String(payload.executor_type || 'unbound'),
     status: 'draft',
     enabled: false,
@@ -4078,14 +4081,14 @@ async function startEditingScenarioDraft(item: ScenarioModelDraftResource) {
       visibility: payload.visibility === 'tenant' ? 'tenant' : 'scenario',
       input_schema: cloneForForm(payload.input_schema || emptyFunctionSchema()),
       output_schema: cloneForForm(payload.output_schema || emptyFunctionSchema()),
-      // A promoted AI draft starts as a non-runnable declaration. The user can
-      // explicitly select a governed built-in runtime after reviewing it.
-      runtime_kind: 'contract',
-      runtime_config: {},
+      ...candidateFunctionRuntime(payload),
     }
     functionRuntimeKindBeforeChange = functionForm.value.runtime_kind
     functionContractSchemaSnapshot = null
     functionDlg.value = true
+    if (functionForm.value.runtime_kind === 'provider') {
+      await Promise.all([loadFunctionProviderManifests(), loadSemanticMappings()])
+    }
     return
   }
   if (item.resource_kind === 'action') {

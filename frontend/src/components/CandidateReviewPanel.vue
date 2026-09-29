@@ -108,7 +108,7 @@
           @click="revalidateAll"
         >
           <el-icon aria-hidden="true"><CircleCheck /></el-icon>
-          一键确定性校验（{{ revalidationCandidates.length }}）
+          一键确定性校验当前页（{{ revalidationCandidates.length }}）
         </el-button>
         <el-checkbox
           :model-value="allVisibleEligibleSelected"
@@ -116,12 +116,12 @@
           :disabled="!canWrite || !visibleEligibleCandidates.length || operationBusy"
           @change="toggleVisibleEligible"
         >
-          选择当前可晋级项
+          选择当前页可晋级项
         </el-checkbox>
         <el-button
           type="primary"
           :loading="batchPromoting"
-          :disabled="!canWrite || !selectedCount || (operationBusy && !batchPromoting)"
+          :disabled="!canWrite || !selectedCount || selectedCount > 200 || (operationBusy && !batchPromoting)"
           @click="promoteSelected"
         >
           <el-icon aria-hidden="true"><Top /></el-icon>
@@ -131,12 +131,22 @@
     </div>
 
     <div class="result-context" role="status" aria-live="polite" aria-atomic="true">
-      当前显示 {{ visibleCandidates.length }} 项；已选择 {{ selectedCount }} 项。
+      筛选结果 {{ visibleCandidates.length }} 项；当前页 {{ pagedCandidates.length }} 项；已选择 {{ selectedCount }} 项（每批最多 200 项）。
     </div>
+
+    <el-pagination
+      v-if="visibleCandidates.length > CANDIDATE_PAGE_SIZE"
+      v-model:current-page="currentPage"
+      :page-size="CANDIDATE_PAGE_SIZE"
+      :total="visibleCandidates.length"
+      :disabled="operationBusy"
+      layout="prev, pager, next"
+      aria-label="候选评审分页"
+    />
 
     <div v-loading="loading" class="candidate-list" data-testid="candidate-review-list">
       <article
-        v-for="candidate in visibleCandidates"
+        v-for="candidate in pagedCandidates"
         :id="candidateDomId(candidate.id)"
         :key="candidate.id"
         :ref="(element) => setCandidateRef(candidate.id, element)"
@@ -267,6 +277,7 @@ import {
   candidateLifecycleLabel,
   candidateOriginLabel,
   candidatePromotionRequest,
+  candidateRevalidationSelection,
   candidateValidationLabel,
   type CandidateApiFailure,
 } from '@/utils/candidateGovernance'
@@ -292,6 +303,8 @@ const emit = defineEmits<{
 }>()
 
 const query = ref('')
+const CANDIDATE_PAGE_SIZE = 25
+const currentPage = ref(1)
 const kindFilter = ref('')
 const originFilter = ref<ScenarioModelCandidateOrigin | ''>('')
 const selectedIds = ref(new Set<string>())
@@ -317,10 +330,11 @@ const visibleCandidates = computed(() => {
     && (!needle || `${item.title || ''} ${item.resource_key}`.toLocaleLowerCase().includes(needle))
   ))
 })
-const visibleEligibleCandidates = computed(() => visibleCandidates.value.filter((item) => item.promotion_eligible === true))
-const revalidationCandidates = computed(() => props.candidates.filter((item) => (
-  !['formalized', 'resolved', 'superseded'].includes(item.lifecycle_status)
-)))
+const pagedCandidates = computed(() => visibleCandidates.value.slice(
+  (currentPage.value - 1) * CANDIDATE_PAGE_SIZE, currentPage.value * CANDIDATE_PAGE_SIZE,
+))
+const visibleEligibleCandidates = computed(() => pagedCandidates.value.filter((item) => item.promotion_eligible === true))
+const revalidationCandidates = computed(() => candidateRevalidationSelection(pagedCandidates.value))
 const selectedCount = computed(() => selectedIds.value.size)
 const allVisibleEligibleSelected = computed(() => (
   visibleEligibleCandidates.value.length > 0
@@ -334,6 +348,11 @@ const failureTargetCandidates = computed(() => props.candidates.filter((item) =>
 const operationBusy = computed(() => (
   props.loading || batchRevalidating.value || batchPromoting.value || revalidatingIds.value.size > 0 || promotingIds.value.size > 0
 ))
+
+watch([query, kindFilter, originFilter], () => { currentPage.value = 1 })
+watch(() => visibleCandidates.value.length, (count) => {
+  currentPage.value = Math.min(currentPage.value, Math.max(1, Math.ceil(count / CANDIDATE_PAGE_SIZE)))
+})
 
 watch(() => props.candidates.map((item) => `${item.id}:${item.revision}:${item.promotion_eligible}`).join('|'), () => {
   const eligibleIds = new Set(props.candidates.filter((item) => item.promotion_eligible === true).map((item) => item.id))
@@ -375,10 +394,19 @@ function toggleVisibleEligible(selected: boolean | string | number) {
 }
 
 function firstFailureDraftId(blocker: ScenarioModelCandidateBlocker): string {
-  return (blocker.draft_ids || []).find((id) => candidateRefs.has(id)) || ''
+  return (blocker.draft_ids || []).find((id) => props.candidates.some((item) => item.id === id)) || ''
 }
 
 async function focusCandidate(id: string) {
+  if (!visibleCandidates.value.some((item) => item.id === id)) {
+    query.value = ''
+    kindFilter.value = ''
+    originFilter.value = ''
+    await nextTick()
+  }
+  const index = visibleCandidates.value.findIndex((item) => item.id === id)
+  if (index < 0) return
+  currentPage.value = Math.floor(index / CANDIDATE_PAGE_SIZE) + 1
   await nextTick()
   const target = candidateRefs.get(id)
   const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true

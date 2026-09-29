@@ -142,6 +142,8 @@
           <p v-else class="approval-readonly-hint" role="status">当前账号仅可查看审批上下文，没有审批权限。</p>
         </section>
 
+        <WorkflowRunOutcome :status="selectedTask.status" :result="selectedTask.result" />
+
         <section class="detail-grid" aria-label="任务信息">
           <div><span>触发来源</span><b>{{ triggerSourceLabel(selectedTask.trigger_source) }}</b></div>
           <div><span>定义依据</span><b>{{ selectedTask.definition_source === 'release' ? '已固定的场景定义' : '当前场景定义' }}</b></div>
@@ -152,15 +154,18 @@
           <div><span>完成时间</span><b>{{ formatDate(selectedTask.completed_at) || '—' }}</b></div>
         </section>
 
-        <section class="detail-section">
-          <h4>输入参数</h4>
-          <StructuredValueViewer :value="selectedTask.input_params" empty-text="无需输入参数" />
-        </section>
-        <section v-if="selectedTask.result && Object.keys(selectedTask.result).length" class="detail-section">
-          <WorkflowArtifactDownloads :result="selectedTask.result" />
-          <h4>执行结果</h4>
-          <StructuredValueViewer :value="selectedTask.result" empty-text="暂无执行结果" />
-        </section>
+        <WorkflowArtifactDownloads v-if="selectedTask.result" :result="selectedTask.result" />
+        <details class="detail-section">
+          <summary>查看输入摘要与执行明细</summary>
+          <section class="detail-section">
+            <h4>输入参数</h4>
+            <StructuredValueViewer :value="selectedTask.input_params" empty-text="无需输入参数" />
+          </section>
+          <section v-if="selectedTask.result && Object.keys(selectedTask.result).length" class="detail-section">
+            <h4>执行结果</h4>
+            <StructuredValueViewer :value="selectedTask.result" empty-text="暂无执行结果" />
+          </section>
+        </details>
 
         <footer v-if="canCancel(selectedTask) || canRetry(selectedTask)" class="task-detail-footer">
           <el-button v-if="canCancel(selectedTask)" type="danger" plain :loading="cancellingTaskId === selectedTask.id" @click="cancelTask(selectedTask)">取消任务</el-button>
@@ -180,6 +185,7 @@ import type { Scenario, WorkflowApproval, WorkflowRun } from '@/types'
 import StructuredValueViewer from '@/components/StructuredValueViewer.vue'
 import WorkflowArtifactDownloads from '@/components/WorkflowArtifactDownloads.vue'
 import WorkflowApprovalReply from '@/components/workflow/WorkflowApprovalReply.vue'
+import WorkflowRunOutcome from '@/components/workflow/WorkflowRunOutcome.vue'
 
 type StatusTagType = 'success' | 'warning' | 'danger' | 'info' | 'primary' | ''
 type StatusMeta = { label: string; type: StatusTagType; description: string }

@@ -239,7 +239,7 @@
                     <div class="model-task-title"><strong>{{ currentModelTask(proposalOf(message))?.title }}</strong><small>{{ modelTaskOutputCount(currentModelTask(proposalOf(message))) }} 项资源 · {{ currentModelTask(proposalOf(message))?.description }}</small></div>
                     <el-tag size="small" effect="plain" :type="modelTaskStatusType(currentModelTask(proposalOf(message)))">{{ modelTaskStatusLabel(currentModelTask(proposalOf(message))) }}</el-tag>
                   </div>
-                  <p v-if="currentModelTask(proposalOf(message))?.status === 'blocked'">草稿已准备完成，确认后会将本任务写入对应画布或模块。</p>
+                  <p v-if="currentModelTask(proposalOf(message))?.status === 'blocked'">候选仍有校验问题。需先修正定义；只有服务端确认可应用的部分才能写入。</p>
                   <p v-else-if="currentModelTask(proposalOf(message))?.status === 'awaiting_generation'">前置任务已处理。原始资料和已确认定义会保留；由你决定何时开始生成本任务。</p>
                   <p v-else-if="currentModelTask(proposalOf(message))?.status === 'waiting'">正在等待前一项任务完成。</p>
                   <div v-if="blockedModelProposalId !== proposalOf(message)?.proposal_id && isActiveModelRun(message) && modelNextAction(proposalOf(message))?.type === 'confirm_task'" class="model-task-actions">
@@ -261,7 +261,7 @@
                       <el-tag size="small" effect="plain" :type="modelTaskStatusType(task)">{{ modelTaskStatusLabel(task) }}</el-tag>
                     </div>
                     <div v-if="task.status === 'blocked' && task.issues?.length" class="model-task-blocker">
-                      <strong>草稿已落位：</strong><span>确认后会把本任务定义写入对应画布或模块。</span>
+                      <strong>候选待修正：</strong><span>校验问题已保留，未通过的定义不能写入正式模型。</span>
                       <small>{{ taskIssueCount(task) }} 项待补全内容只在助手最终汇总中展示。</small>
                     </div>
                     <div v-else-if="['drafted_with_gaps', 'deferred', 'skipped'].includes(task.status) && task.issues?.length" class="model-task-blocker">
@@ -287,6 +287,7 @@
                 </div>
                 <div v-if="!modelExecutionSummary(proposalOf(message))?.final && modelExecutionSummary(proposalOf(message))?.current_task_title" class="model-run-waiting" aria-live="polite">
                   <template v-if="modelNextAction(proposalOf(message))?.type === 'generate_task'">当前停留在「{{ modelExecutionSummary(proposalOf(message))?.current_task_title }}」；前置任务已处理，等待你开始生成。</template>
+                  <template v-else-if="modelNeedsCorrection(proposalOf(message))">当前任务存在校验问题，请修正定义后重新校验。</template>
                   <template v-else>当前停留在「{{ modelExecutionSummary(proposalOf(message))?.current_task_title }}」等待确认；确认后会写入本任务并继续下一项。</template>
                 </div>
                 <section v-if="isModelPlanExpanded(message, index) && modelExecutionSummary(proposalOf(message))?.final" class="model-run-summary" :class="`is-${modelRunStatusType(proposalOf(message))}`" aria-live="polite">
@@ -392,7 +393,7 @@
                       <div><dt>函数 / 操作</dt><dd>{{ (proposalOf(message)?.payload?.functions?.length || 0) + (proposalOf(message)?.payload?.actions?.length || 0) }}</dd></div>
                       <div><dt>规则 / 事件</dt><dd>{{ (proposalOf(message)?.payload?.rules?.length || 0) + (proposalOf(message)?.payload?.events?.length || 0) }}</dd></div>
                       <div><dt>工作流</dt><dd>{{ proposalOf(message)?.payload?.workflows?.length || 0 }}</dd></div>
-                      <div><dt>数据映射</dt><dd>{{ proposalOf(message)?.payload?.mappings?.length || 0 }}</dd></div>
+                      <div><dt>数据映射</dt><dd>{{ (proposalOf(message)?.payload?.mappings?.length || 0) + (proposalOf(message)?.payload?.semantic_mappings?.length || 0) }}</dd></div>
                     </dl>
                     <div class="coverage-summary">
                       <span>全文 {{ proposalOf(message)?.payload?.coverage_summary?.total || 0 }} 段</span>
@@ -447,7 +448,7 @@
                     </div>
                   </section>
                   <el-alert
-                    v-else
+                    v-else-if="decisionGateOf(proposalOf(message))?.safe_to_formalize === true && proposalOf(message)?.changes?.length"
                     title="所有引用、冲突与来源段落已通过预检；确认后将在同一事务中应用，任一失败都会整体回滚。"
                     type="success"
                     :closable="false"
@@ -550,6 +551,7 @@
           <el-icon aria-hidden="true"><Clock /></el-icon>
           <span v-if="modelTaskRecoveryBusy"><strong>当前任务已提交，正在恢复最新进度</strong>系统会持续读取持久化任务计划；不会重复应用，也不需要你手工刷新或重开会话。</span>
           <span v-else-if="modelTaskRecoveryFailure"><strong>当前计划的持久化状态已无法访问</strong>{{ modelTaskRecoveryFailure }} 你仍可在下方发起新的建模轮次；系统不会继续重复提交旧任务。</span>
+          <span v-else-if="activeModelRunMessage && modelNeedsCorrection(proposalOf(activeModelRunMessage))"><strong>当前定义仍需修正</strong>服务端校验尚未通过。可在下方说明修正要求，已有候选和问题会保留。</span>
           <span v-else><strong>当前持续任务停在确认点</strong>确认后会把本任务定义写入场景并继续；你也可以直接在下方说明修正、新增或删除要求，助手会基于已保存草稿开启下一轮优化。</span>
         </div>
         <div v-if="attachments.length" class="attachment-strip" aria-label="待发送附件">
@@ -628,6 +630,7 @@ import {
 } from '@/utils/assistantCompilationRecovery'
 import { compilationRetryDraft, retryAttachmentsForMessage } from '@/utils/assistantRetry'
 import { groupScenarioModelIssues, scenarioModelIssueLabel } from '@/utils/assistantProposalGroups'
+import { compilationFailureSummary, decisionGatePresentation, modelTaskNeedsCorrection } from '@/utils/assistantModelOutcome'
 import { useAssistantManagedUploads } from '@/composables/useAssistantManagedUploads'
 import { useAssistantRequestRuns } from '@/composables/useAssistantRequestRuns'
 
@@ -895,6 +898,8 @@ function modelRunSummaryMessage(proposal: AssistantProposal | null) {
   const summary = modelExecutionSummary(proposal)
   if (!summary) return ''
   if (!modelRunFinishedWithoutPersistedWrites(proposal)) return summary.message
+  const serviceFailure = compilationFailureSummary(proposal?.payload?.unresolved)
+  if (serviceFailure) return serviceFailure
   const draftCount = modelDraftOnlyTaskCount(proposal)
   const sourceCount = Number(proposal?.payload?.coverage_summary?.total || 0)
   const taskTitles = modelTasks(proposal)
@@ -934,7 +939,7 @@ function assistantMessageContent(message: AssistantMessage) {
 }
 
 function assistantMessageParts(message: AssistantMessage) {
-  return splitAssistantMessage(assistantMessageContent(message))
+  return splitAssistantMessage(assistantMessageContent(message), message.streaming)
 }
 
 function proposalStatusType(proposal: AssistantProposal | null): 'primary' | 'success' | 'warning' | 'info' {
@@ -959,6 +964,7 @@ function proposalStatusLabel(proposal: AssistantProposal | null) {
     if (modelExecutionSummary(proposal)?.final) {
       return modelRunStatusType(proposal) === 'success' ? '已完成并写入' : '已推进，存在待补全'
     }
+    if (modelNeedsCorrection(proposal)) return '定义待修正'
     return proposal.status === 'in_progress' ? '计划进行中 · 等待确认' : '待确认'
   }
   return ['applied', 'completed'].includes(proposal.status || '')
@@ -1041,7 +1047,7 @@ function modelTaskStatusLabel(task?: AssistantModelTask) {
   return ({
     empty: '无此类变更',
     ready: '等待确认',
-    blocked: '有缺口，等待确认',
+    blocked: '定义待修正',
     waiting: '等待当前任务',
     awaiting_generation: '等待开始生成',
     applied: '已应用',
@@ -1171,7 +1177,7 @@ function proposalOperationType(operation: string) {
 
 function proposalResourceLabel(resource: string) {
   return ({
-    scenario: '业务场景', entity: '对象类型', property: '属性', relation: '关系类型', mapping: '数据映射', mapping_field: '映射字段', data_mapping: '数据映射',
+    scenario: '业务场景', entity: '对象类型', property: '属性', relation: '关系类型', mapping: '数据映射', mapping_field: '映射字段', data_mapping: '数据映射', semantic_mapping: '资料语义映射',
     function: '函数', action: '操作', rule: '规则', event: '事件', workflow: '工作流', workflow_node: '工作流节点', workflow_edge: '工作流连线',
   } as Record<string, string>)[resource] || resource
 }
@@ -1183,7 +1189,7 @@ function compoundReviewGroups(proposal: AssistantProposal | null) {
     ['entities', '对象类型'], ['relations', '关系类型'], ['functions', '函数'],
     ['actions', '操作'], ['rules', '规则'], ['events', '事件'],
     ['workflows', '工作流'], ['mappings', '对象数据映射'],
-    ['relation_mappings', '关系数据映射'],
+    ['relation_mappings', '关系数据映射'], ['semantic_mappings', '资料语义映射'],
   ].map(([key, label]) => ({ key, label, items: Array.isArray(payload[key]) ? payload[key] : [] }))
     .filter((group) => group.items.length)
 }
@@ -1238,6 +1244,7 @@ function compoundResourceSummary(section: string, item: any) {
   if (section === 'events') return `载荷：${schemaFieldNames(item.payload_schema)}；来源：${item.trigger_source || '待确认'}`
   if (section === 'workflows') return `${item.trigger_type || 'manual'} 触发；${item.nodes?.length || 0} 个节点，${item.edges?.length || 0} 条连线；保存后为停用草稿`
   if (section === 'mappings') return `${compoundReferenceLabel(item.entity)} ← ${item.table_name || '待确认表'}；${Object.keys(item.column_map || {}).length} 个字段映射`
+  if (section === 'semantic_mappings') return `${item.existing_id ? '追加并保留原有对应' : '新增对象映射'}；${Array.isArray(item.fields) ? item.fields.length : 0} 个字段对应；可在数据映射页逐字段审阅`
   if (section === 'relation_mappings') return `${item.mode || '待确认模式'}；关联两端对象映射与关系定义`
   return item.description || '待审核业务定义'
 }
@@ -1456,12 +1463,17 @@ function currentModelTask(proposal: AssistantProposal | null) {
     || tasks.find((task) => ['ready', 'blocked', 'awaiting_generation'].includes(task.status))
 }
 
+function modelNeedsCorrection(proposal: AssistantProposal | null) {
+  return modelTaskNeedsCorrection(currentModelTask(proposal), modelNextAction(proposal))
+}
+
 function modelPlanSummary(proposal: AssistantProposal | null) {
   const summary = modelExecutionSummary(proposal)
   if (summary?.final) return '已完成的任务、草稿和待补全项仍可随时查看。'
   if (modelNextAction(proposal)?.type === 'generate_task' && summary?.current_task_title) {
     return `前置任务已处理，等待你开始生成「${summary.current_task_title}」。`
   }
+  if (modelNeedsCorrection(proposal)) return '当前定义未通过服务端校验，请先修正候选。'
   if (summary?.current_task_title) return `当前停在「${summary.current_task_title}」，等待你的确认。`
   return '按依赖顺序执行；需要写入时会明确向你确认。'
 }
@@ -2493,21 +2505,15 @@ function decisionGateOf(proposal: AssistantProposal | null): AssistantDecisionGa
 }
 
 function decisionGateModeLabel(gate: AssistantDecisionGate | null) {
-  if (gate?.mode === 'clarify') return '先对齐问题'
-  if (gate?.mode === 'candidate_review') return '人工审核'
-  return '可直接建设'
+  return decisionGatePresentation(gate).label
 }
 
 function decisionGateType(gate: AssistantDecisionGate | null): 'success' | 'warning' | 'info' {
-  if (gate?.mode === 'clarify') return 'warning'
-  if (gate?.mode === 'candidate_review') return 'info'
-  return 'success'
+  return decisionGatePresentation(gate).type
 }
 
 function decisionGateLabel(gate: AssistantDecisionGate | null) {
-  if (gate?.mode === 'clarify') return '发现影响业务含义的关键歧义'
-  if (gate?.mode === 'candidate_review') return '发现副作用或外部事实风险'
-  return '证据覆盖和确定性校验已通过'
+  return decisionGatePresentation(gate).title
 }
 
 async function submitCompilationGuidance(content: string) {

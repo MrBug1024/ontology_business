@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from typing import AsyncIterator
+from starlette.concurrency import run_in_threadpool
 
 from fastapi import UploadFile
 
@@ -34,7 +34,7 @@ class StagedUpload:
             pass
 
 
-async def stage_upload(
+def stage_upload_sync(
     upload: UploadFile,
     *,
     max_bytes: int,
@@ -56,7 +56,7 @@ async def stage_upload(
     try:
         with os.fdopen(descriptor, "wb") as handle:
             while True:
-                chunk = await upload.read(min(chunk_size, limit - written + 1))
+                chunk = upload.file.read(min(chunk_size, limit - written + 1))
                 if not chunk:
                     break
                 written += len(chunk)
@@ -84,4 +84,13 @@ async def stage_upload(
             pass
         raise
     finally:
-        await upload.close()
+        upload.file.close()
+
+
+async def stage_upload(
+    upload: UploadFile, *, max_bytes: int, chunk_bytes: int,
+) -> StagedUpload:
+    """Keep disk writes/hash work off the event loop, with the same intake contract."""
+    return await run_in_threadpool(
+        stage_upload_sync, upload, max_bytes=max_bytes, chunk_bytes=chunk_bytes,
+    )

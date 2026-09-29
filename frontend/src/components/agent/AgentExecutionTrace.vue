@@ -16,7 +16,7 @@
       </ol>
       <section v-if="analysis.length" class="analysis-notes" aria-label="分析说明">
         <h4>分析说明</h4>
-        <SafeMarkdown v-for="note in analysis" :key="note.revision" :content="note.text" />
+        <AssistantMessageContent v-for="note in analysis" :key="note.revision" :content="note.text" />
       </section>
       <ol v-if="steps.length" class="step-list" aria-label="工具执行步骤">
         <li v-for="(step, index) in steps" :key="step.step_key">
@@ -51,7 +51,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { MoreFilled, Operation, Refresh } from '@element-plus/icons-vue'
-import SafeMarkdown from '@/components/SafeMarkdown.vue'
+import AssistantMessageContent from '@/components/AssistantMessageContent.vue'
 import AgentCapabilityReceipt from './AgentCapabilityReceipt.vue'
 import { useAgentExecutionTrace } from '@/composables/useAgentExecutionTrace'
 import { executionAnalysis, executionNeedsAttention, executionPhases, executionStatusLabel, executionSteps, executionToolLabel } from '@/utils/agentExecutionTrace'

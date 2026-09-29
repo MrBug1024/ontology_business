@@ -112,8 +112,9 @@ _CAPABILITY_TOOL_CONFIG: dict[AssistantCapability, dict[str, Any]] = {
     },
     "compile_scenario_model": {
         "scope": "scenario_model",
+        "scopes": ["ontology", "mapping", "capabilities", "workflow", "scenario_model"],
         "goals": ["create", "continue_work"],
-        "description": "理解附件和上下文，建设跨本体、实例、映射、能力、规则事件和工作流的场景模型草稿。",
+        "description": "理解附件和上下文，按用户本轮明确的主题生成或继续场景模型草稿；只建函数、操作、规则或事件时 scope=capabilities，完整跨阶段建设才选 scenario_model。",
     },
     "preview_governed_action": {
         "scope": "capabilities",
@@ -138,6 +139,9 @@ def _capability_tools() -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        **({"scope": {"type": "string", "enum": config["scopes"],
+                            "description": "本轮明确要求产出的主题。只建函数选 capabilities；已有资料和背景提到其他阶段不扩大范围。"}}
+                           if "scopes" in config else {}),
                         "goal": {
                             "type": "string",
                             "enum": config["goals"],
@@ -152,12 +156,14 @@ def _capability_tools() -> list[dict[str, Any]]:
                             "description": "一句可向用户展示的选择原因，不包含隐藏推理。",
                         },
                     },
-                    "required": ["goal", "confidence", "reason"],
+                    "required": ["goal", "confidence", "reason"] + (["scope"] if "scopes" in config else []),
                     "additionalProperties": False,
                 },
             },
         }
         for name, config in _CAPABILITY_TOOL_CONFIG.items()
+        # Keep historical calls parseable; new authoring uses one scoped tool.
+        if name not in {"draft_ontology", "draft_mapping", "draft_workflow"}
     ]
 
 
@@ -180,6 +186,11 @@ def _decision_from_capability_call(response: dict[str, Any]) -> AssistantSemanti
     # that valid semantic selection instead of discarding it and accidentally
     # turning an explicit modelling request into ordinary chat.
     arguments = arguments if isinstance(arguments, dict) else {}
+    scope = config["scope"]
+    if "scopes" in config:
+        scope = arguments.get("scope")
+        if scope not in config["scopes"]:
+            raise ValueError("语义规划模型必须选择有效的建模主题")
     goal = str(arguments.get("goal") or config["goals"][0])
     if goal not in config["goals"]:
         goal = config["goals"][0]
@@ -188,7 +199,7 @@ def _decision_from_capability_call(response: dict[str, Any]) -> AssistantSemanti
         confidence = "high"
     return AssistantSemanticDecision(
         goal=goal,
-        scope=config["scope"],
+        scope=scope,
         confidence=confidence,
         reason=str(arguments.get("reason") or f"已选择{_CAPABILITY_LABELS[name]}能力。")[:500],
     )
@@ -277,6 +288,23 @@ class _RouteState(TypedDict, total=False):
     intent: str
     policy_note: str
     branch: Literal["answer", "draft", "preview", "guidance"]
+
+
+def unexecuted_authoring_notice(plan: AssistantRoutePlan) -> str:
+    """A blocked authoring route must not narrate an imaginary construction."""
+    if plan.intent == "chat" and plan.decision.goal in {"create", "continue_work", "update", "delete"}:
+        return (
+            "本轮尚未启动建模，也没有生成或保存新的候选。"
+            f"{plan.policy_note}"
+            "请明确本轮要生成或修正的场景草稿范围，再继续建设。"
+        )
+    return ""
+
+
+def initial_model_task_scope(plan: AssistantRoutePlan) -> str:
+    """Route each authoring scope through the same durable compiler."""
+    return {"ontology": "ontology", "mapping": "mapping", "workflow": "workflows",
+            "capabilities": "capabilities"}.get(plan.decision.scope, "ontology")
 
 
 def _fallback_decision(state: _RouteState | None = None) -> AssistantSemanticDecision:
@@ -401,9 +429,9 @@ def _govern(state: _RouteState) -> dict[str, Any]:
 
     intent_by_scope = {
         "scenario": "scenario",
-        "ontology": "ontology",
-        "mapping": "mapping",
-        "workflow": "workflow",
+        "ontology": "scenario_model",
+        "mapping": "scenario_model",
+        "workflow": "scenario_model",
         "capabilities": "scenario_model",
         "scenario_model": "scenario_model",
     }
@@ -502,6 +530,7 @@ _ROUTER_SYSTEM_PROMPT = """你是业务本体平台的请求语义规划器。�
 - preview_action 表示用户明确要求检查一个操作的参数、权限和影响；apply_change 表示要求确认或应用已有提案。
 - UI 偏好范围只帮助判断 scope，绝不证明用户要求创建。
 - 无法可靠判断时选择 clarify；不要为了完成任务而猜测创建意图。
+- confidence 只衡量是否理解用户的目标和范围，不衡量资料完备程度、实现难度或上轮模型是否失败。明确要求生成或修正活动候选并指明范围时应选 high；具体业务缺口交给建模校验处理。
 
 scope 只描述主题：capabilities 包含函数、操作、规则和事件；scenario_model 表示跨多个资源域的完整建模。
 reason 必须是一句简短、可向用户展示且不包含隐藏推理的说明。"""

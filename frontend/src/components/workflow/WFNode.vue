@@ -35,6 +35,7 @@ const META: Record<string, { icon: string; color: string; label: string }> = {
   script: { icon: 'Document', color: 'var(--info)', label: '脚本' },
 }
 const meta = computed(() => META[props.type] || META.action)
+const selectNode = inject<(id: string) => void>('selectWorkflowNode')
 
 const sub = computed(() => {
   const d = props.data || {}
@@ -70,10 +71,10 @@ const sub = computed(() => {
     <Handle v-if="type !== 'start'" type="target" :position="Position.Left" class="wf-h" />
     <div class="wf-node-head">
       <span class="wf-node-ico" aria-hidden="true" :style="{ background: `color-mix(in srgb, ${meta.color} 12%, transparent)`, color: meta.color }"><el-icon :size="15"><component :is="meta.icon" /></el-icon></span>
-      <div class="wf-node-tt">
+      <button type="button" class="wf-node-tt nodrag" :aria-label="`配置节点：${data.name || meta.label}`" @click.stop="selectNode?.(id)">
         <b>{{ data.name || meta.label }}</b>
         <small>{{ sub }}</small>
-      </div>
+      </button>
     </div>
     <!-- 普通节点：右侧单一出口 -->
     <Handle v-if="type !== 'end' && type !== 'rule'" type="source" :position="Position.Right" class="wf-h" />
@@ -121,10 +122,17 @@ const sub = computed(() => {
   font-weight: 800;
 }
 .wf-node-tt {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
   display: flex;
   flex-direction: column;
   min-width: 0;
 }
+.wf-node-tt:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; border-radius: 3px; }
 .wf-node-tt b {
   font-size: 12.5px;
   color: var(--text);

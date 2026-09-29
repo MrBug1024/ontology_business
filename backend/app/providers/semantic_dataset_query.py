@@ -170,13 +170,15 @@ def _require_query_property_access(
     catalog: Sequence[Mapping[str, Any]],
     *,
     allow_input_references: bool,
-) -> None:
+) -> set[str]:
     """Reject property references outside the caller-filtered semantic catalog."""
 
     if allow_input_references and _is_input_reference(query):
-        return
+        return set()
     if not isinstance(query, Mapping):
         raise SemanticDatasetQueryProviderError("semantic query is invalid")
+
+    referenced_entities: set[str] = set()
 
     def entity_entry(selector: Any) -> Mapping[str, Any] | None:
         if allow_input_references and _is_input_reference(selector):
@@ -213,6 +215,7 @@ def _require_query_property_access(
             raise SemanticDatasetQueryProviderError(
                 "semantic query references an unavailable entity or property"
             )
+        referenced_entities.add(str(candidates[0]["entity_id"]))
         return candidates[0]
 
     def require_property(entry: Mapping[str, Any] | None, value: Any) -> None:
@@ -279,6 +282,7 @@ def _require_query_property_access(
                 require_property(entry, property_name)
             if collection_name == "aggregations":
                 require_filters(entry, item.get("filters"))
+    return referenced_entities
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,7 +299,14 @@ class SemanticDatasetQueryProvider:
         return {
             "capability_kind": self.capability_kind,
             "display_name": "本体对象集查询",
-            "description": "基于本次调用提供的受管数据版本执行有界、只读的语义查询。",
+            "description": (
+                "基于本次调用提供的受管数据版本执行有界、只读的语义查询。"
+                "需要且仅接受一个 DatasetVersion 输入；多表应包含在同一受管数据包中。"
+                "输入端口使用 dataset 或 structured、cardinality=one、per_invocation，"
+                "binding_kinds=[dataset_version,dataset_head]。"
+                "字段兼容性由所选语义映射与本次数据包的 Schema 校验；"
+                "无需在端口 schema_document 中重复定义查询参数或所有本体字段。"
+            ),
             "config_schema": {
                 "type": "object",
                 "properties": {
@@ -991,7 +1002,7 @@ class SemanticDatasetQueryProvider:
             if query_template is not None
             else dict(request.inputs)
         )
-        _require_query_property_access(
+        referenced_entities = _require_query_property_access(
             query_args,
             catalog,
             allow_input_references=False,
@@ -1012,7 +1023,11 @@ class SemanticDatasetQueryProvider:
         query_definition, mappings = self._semantic_mappings(
             definition=definition,
             deployment=deployment,
-            mapping_ids=binding.mapping_ids,
+            mapping_ids=tuple(
+                mapping_id for mapping_id in binding.mapping_ids
+                if str(definition.semantic_mapping_contracts[mapping_id]["entity_id"])
+                in referenced_entities
+            ),
             runtime_version=version,
             runtime_schema=runtime_schema,
             source=source,

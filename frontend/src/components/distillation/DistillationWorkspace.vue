@@ -57,7 +57,7 @@
         <button type="button" :aria-pressed="mobilePane === 'conversation'" @click="mobilePane = 'conversation'">业务蒸馏 AI</button>
       </div>
       <div v-if="!projectId || project || loading" class="distillation-studio-body" :class="`is-${mobilePane}`">
-        <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :publications="publications" :publication-busy="busy" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="canEdit && !loading && !actionBusy" :can-publish="!!project && canEdit && !dirty && !actionBusy && !active && !artifactProposal" @ask="discussFinding" @publish="confirmPublish" @updated="acceptProjectUpdate" @open-publication="openMaterial" @download-publication="downloadPublication" @delete-publication="deletePublication" />
+        <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :publications="publications" :publication-busy="busy" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="canEdit && !loading && !actionBusy" :can-publish="canEdit && !loading && (!!project || scenarioRevision !== null) && !dirty && !actionBusy && !active && !artifactProposal" @ask="discussFinding" @publish="confirmPublish" @updated="acceptProjectUpdate" @open-publication="openMaterial" @download-publication="downloadPublication" @delete-publication="deletePublication" />
         <aside class="distillation-advisor-panel" aria-label="业务蒸馏顾问对话">
         <DistillationConversation v-model="input" :scope-key="draftKey" :scenario-id="props.scenarioId" :turns="turns" :loading="loading || conversationLoading" :has-more="conversationHasMore" :working="!!active" :sending="sending || busy === 'save'" :cancelling="cancelling" :applying="applying" :disabled="!canEdit || loading || actionBusy" :can-apply="canEdit && !dirty && !actionBusy" :error="conversationError" :blocked-reason="blockedReason" :upload-busy="attachmentBusy" :has-attachments="readyIds.length > 0" :removing-attachment="removingAttachment" :compact="embedded" :workspace-actions="embedded" :streaming="streaming" :reconnecting="reconnecting" @send="sendMessage" @cancel="cancel" @reload="reconnectConversation" @older="loadConversation(true)" @sources="openSources" @files="addAttachments" @remove-submitted="removeSubmittedAttachment" @preview="previewTurn = $event" @apply="applyTurn" @new="newConversation" @history="projectsOpen = true" @systems="openSystems">
             <template #attachments><DistillationAttachments :items="composerAttachments" :error="attachmentError" :disabled="!canEdit || !!active || sending" @retry="retryAttachment" @remove="removeAttachment" @reload="loadAttachments" /></template>
@@ -152,7 +152,7 @@ const draftKey = computed(() => projectId.value || `new:${historyScope.value}`)
 const {
   projects, project, draft, baseline, scenarios, materials, publications, error, notice, loading, listing, busy,
   offset, hasMore, dirty, materialOffset, materialHasMore, materialLoading, materialPageSize,
-  list, load, save, publish, download, refreshOptions, previousMaterialPage, nextMaterialPage, copyToScenario, remove, removePublication,
+  list, load, save, publish, publishScenario, scenarioRevision, download, refreshOptions, previousMaterialPage, nextMaterialPage, copyToScenario, remove, removePublication,
 } = useBusinessDistillation(projectId, historyScope, props.embedded)
 const authorizedProjectId = computed(() => {
   const row = project.value
@@ -303,13 +303,22 @@ async function copyProject() {
   if (row) { copyDialog.value = false; await changeWorkspace(scenarioLocation(copyScenarioId.value, row.id), true) }
 }
 function confirmPublish() {
-  if (!project.value || dirty.value || actionBusy.value || active.value) return
-  publicationOwner = { id: project.value.id, revision: project.value.revision }
+  if (dirty.value || actionBusy.value || active.value) return
+  if (!project.value && (!selectedScenario.value || scenarioRevision.value === null)) return
+  publicationOwner = project.value
+    ? { id: project.value.id, revision: project.value.revision }
+    : { id: selectedScenario.value, revision: scenarioRevision.value as number }
   error.value = ''
   publishDialog.value = true
 }
 async function publishDecision(decision: ReturnType<typeof handoffDecision>) {
-  if (actionBusy.value || active.value || !publicationOwner || project.value?.id !== publicationOwner.id || project.value?.revision !== publicationOwner.revision) return
+  if (actionBusy.value || active.value || !publicationOwner) return
+  if (!project.value) {
+    if (selectedScenario.value !== publicationOwner.id || scenarioRevision.value !== publicationOwner.revision) return
+    if (await publishScenario(decision)) { publishDialog.value = false; publicationOwner = undefined }
+    return
+  }
+  if (project.value.id !== publicationOwner.id || project.value.revision !== publicationOwner.revision) return
   const owner = { ...publicationOwner }
   const document = draft.value.document
   const previous = { decision: document.decision, decision_reason: document.decision_reason }

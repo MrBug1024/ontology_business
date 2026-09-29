@@ -523,11 +523,11 @@ export const api = {
     }
     return waitForValidationDatasetJob(job.id, options)
   },
-  listLogicalDatasets: (usagePlane?: CatalogUsagePlane, scenarioId?: string) => http.get<LogicalDataset[]>('/catalog/datasets', {
-    params: { usage_plane: usagePlane, scenario_id: scenarioId },
+  listLogicalDatasets: (usagePlane?: CatalogUsagePlane, scenarioId?: string, signal?: AbortSignal) => http.get<LogicalDataset[]>('/catalog/datasets', {
+    params: { usage_plane: usagePlane, scenario_id: scenarioId }, signal,
   }),
-  listDatasetSchemas: (datasetId: string) =>
-    http.get<DatasetSchema[]>(`/catalog/datasets/${datasetId}/schemas`),
+  listDatasetSchemas: (datasetId: string, signal?: AbortSignal) =>
+    http.get<DatasetSchema[]>(`/catalog/datasets/${datasetId}/schemas`, { signal }),
   listDatasetHeads: (datasetId: string) => http.get<DatasetHead[]>(`/catalog/datasets/${datasetId}/heads`),
   listDatasetVersions: (datasetId: string) => http.get<DatasetVersion[]>(`/catalog/datasets/${datasetId}/versions`),
   listScenarioDatasetBindings: (scenarioId: string) =>
@@ -539,8 +539,8 @@ export const api = {
     http.post<ScenarioDatasetBinding>(`/scenarios/${scenarioId}/dataset-bindings`, d),
   deleteScenarioDatasetBinding: (scenarioId: string, bindingId: string) =>
     http.delete<{ message: string }>(`/scenarios/${scenarioId}/dataset-bindings/${bindingId}`),
-  listSemanticMappings: (scenarioId: string) =>
-    http.get<SemanticMapping[]>(`/scenarios/${scenarioId}/semantic-mappings`),
+  listSemanticMappings: (scenarioId: string, signal?: AbortSignal) =>
+    http.get<SemanticMapping[]>(`/scenarios/${scenarioId}/semantic-mappings`, { signal }),
   createSemanticMapping: (scenarioId: string, d: SemanticMappingCreate) =>
     http.post<SemanticMapping>(`/scenarios/${scenarioId}/semantic-mappings`, d),
 

@@ -87,7 +87,7 @@ export function executionPhases(events: AgentTurnEvent[]) {
   }))
 }
 
-/** Only public assistant text preceding a tool call; never private model reasoning. */
+/** Model content emitted before a tool call; the message renderer separates think blocks. */
 export function executionAnalysis(events: AgentTurnEvent[]) {
   let text = ''
   let offset = 0

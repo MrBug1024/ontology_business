@@ -122,7 +122,9 @@ def _relation_matches(contract: _RelationContract, table: Mapping[str, Any]) -> 
         matched_columns.add(selected)
     if not contract.allow_additional_fields and set(columns) != matched_columns:
         return False
-    return int(table["row_count"]) >= contract.minimum_data_rows
+    # A sample proves a lower bound, never an exact total. Higher minimums
+    # must be verified after the full input has been materialized.
+    return table["observed_row_count"] >= contract.minimum_data_rows
 
 
 def _relation_assignments(

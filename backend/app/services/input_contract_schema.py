@@ -364,11 +364,20 @@ def _profile_tables(profile: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
         raw_rows = raw_table.get(
             "record_count", raw_table.get("sample_row_count", 0)
         )
-        if isinstance(raw_rows, bool) or not isinstance(raw_rows, int) or raw_rows < 0:
+        unknown_total = (
+            raw_rows is None
+            and raw_table.get("record_count_exact") is False
+            and raw_table.get("sample_truncated") is True
+        )
+        if not unknown_total and (isinstance(raw_rows, bool) or not isinstance(raw_rows, int) or raw_rows < 0):
             raise InputContractError(
                 "invalid_observed_profile", "Observed row count is invalid"
             )
-        tables.append({"columns": columns, "row_count": raw_rows})
+        sample_rows = raw_table.get("sample_row_count", 0)
+        if unknown_total and (isinstance(sample_rows, bool) or not isinstance(sample_rows, int) or sample_rows < 0):
+            raise InputContractError("invalid_observed_profile", "Observed sample count is invalid")
+        tables.append({"columns": columns, "row_count": raw_rows,
+                       "observed_row_count": sample_rows if unknown_total else raw_rows})
     return tuple(tables)
 
 

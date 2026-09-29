@@ -55,6 +55,7 @@ from . import (
     tenant_service,
     workflow_payload_service,
     workflow_ontology_contract,
+    workflow_authoring_data,
 )
 from .policies import PolicyViolation, validate_action_params, validate_workflow_graph
 
@@ -152,6 +153,10 @@ def _definition_resource(
 def validate_workflow_definition(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:
     """后端统一校验工作流 DAG；前端校验只是交互提示，不能作为安全边界。"""
     validate_workflow_graph(nodes, edges)
+    try:
+        workflow_authoring_data.validate_templates(nodes, edges)
+    except ValueError as exc:
+        raise PolicyViolation(str(exc)) from exc
     unsafe_types = sorted(
         {
             str(node.get("type") or "")
@@ -2170,7 +2175,7 @@ def _exec_script(cfg: dict, params: dict) -> Any:
 # ──────────────────────────────────────────────
 # 模板变量：{{params.x}} / {{n1.result}} / {{n1.output}}
 # ──────────────────────────────────────────────
-_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
+_VAR_RE = workflow_authoring_data.VARIABLE_PATTERN
 
 
 def _wrap_out(out: Any) -> dict[str, Any]:

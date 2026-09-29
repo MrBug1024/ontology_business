@@ -1,6 +1,7 @@
 import { http } from '@/api'
 import type { BucketFile, DataSourceCatalog, Scenario } from '@/types'
 import type { DistillationDraft, DistillationProject, DistillationProposal, DistillationPublication, DistillationScenarioState, DistillationTargetSystem } from '@/types/businessDistillation'
+import type { handoffDecision } from '@/utils/distillationHandoff'
 
 const root = '/business-distillation'
 const projectPath = (id: string) => `${root}/${encodeURIComponent(id)}`
@@ -26,6 +27,8 @@ export const businessDistillationApi = {
     http.post<DistillationProposal>(`${projectPath(id)}/analyze`, { expected_revision: expectedRevision, instructions }, { signal, timeout: 180_000 }),
   publish: (id: string, expectedRevision: number, signal: AbortSignal) =>
     http.post<DistillationPublication>(`${projectPath(id)}/publish`, { expected_revision: expectedRevision }, { signal }),
+  publishScenario: (scenarioId: string, expectedRevision: number, decision: ReturnType<typeof handoffDecision>, signal: AbortSignal) =>
+    http.post<DistillationPublication>(`${root}/scenario/${encodeURIComponent(scenarioId)}/publish`, { expected_revision: expectedRevision, ...decision }, { signal }),
   publications: (id: string, signal: AbortSignal) =>
     http.get<DistillationPublication[]>(`${projectPath(id)}/publications`, { signal }),
   scenarioPublications: (scenarioId: string, signal: AbortSignal) =>

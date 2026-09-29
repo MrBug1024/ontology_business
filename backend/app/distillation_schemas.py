@@ -214,6 +214,11 @@ class RevisionRequest(ClosedModel):
     expected_revision: int = Field(ge=1)
 
 
+class ScenarioPublishRequest(RevisionRequest):
+    decision: Literal["continue", "adjust", "stop"]
+    decision_reason: Annotated[str, Field(min_length=1, max_length=4000)]
+
+
 class ProjectUpdate(ProjectCreate, RevisionRequest):
     pass
 

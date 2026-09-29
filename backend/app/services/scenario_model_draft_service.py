@@ -51,6 +51,7 @@ RESOURCE_KINDS = frozenset({
     "instance",
     "mapping",
     "conceptual_mapping",
+    "semantic_mapping",
     "relation_mapping",
     "function",
     "action",
@@ -71,7 +72,7 @@ AUTO_REPAIR_AMBIGUITY_ISSUE_CODE = "AUTO_REPAIR_DATA_SOURCE_AMBIGUOUS"
 AUTO_REPAIR_BINDING_ISSUE_CODE = "AUTO_REPAIRED_DATA_SOURCE_BINDING"
 _FORMAL_SECTIONS = (
     "entities", "relations", "functions", "actions", "rules", "events",
-    "workflows", "mappings", "relation_mappings",
+    "workflows", "mappings", "relation_mappings", "semantic_mappings",
 )
 
 _KIND_ALIASES = {
@@ -85,6 +86,7 @@ _KIND_ALIASES = {
     "instances": "instance",
     "mappings": "mapping",
     "conceptual_mappings": "conceptual_mapping",
+    "semantic_mappings": "semantic_mapping",
     "relation_mappings": "relation_mapping",
     "functions": "function",
     "actions": "action",
@@ -100,6 +102,7 @@ _SECTION_KINDS = {
     "instances": "instance",
     "mappings": "mapping",
     "conceptual_mappings": "conceptual_mapping",
+    "semantic_mappings": "semantic_mapping",
     "relation_mappings": "relation_mapping",
     "functions": "function",
     "actions": "action",
@@ -114,6 +117,7 @@ _DEFAULT_TASK_IDS = {
     "instance": "instances",
     "mapping": "mapping",
     "conceptual_mapping": "mapping",
+    "semantic_mapping": "mapping",
     "relation_mapping": "mapping",
     "function": "capabilities",
     "action": "capabilities",
@@ -361,7 +365,7 @@ def _expand_properties(candidate: dict[str, Any]) -> list[dict[str, Any]]:
         )
         property_payload = {
             **_json_copy(raw_property, {}),
-            "entity_ref": entity_key,
+            "entity_ref": str(entity_payload.get("existing_id") or entity_key),
         }
         result.append({
             "resource_kind": "property",
@@ -1413,6 +1417,11 @@ def active_working_draft_context(
 
     candidates: list[tuple[ScenarioModelDraftResource, dict[str, Any], str]] = []
     for row in by_identity.values():
+        # Untouched property sidecars duplicate their entity definition and
+        # can crowd every parent out of the bounded context. User edits must
+        # remain independent, since they may differ from the parent snapshot.
+        if row.resource_kind == "property" and row.revision == 0:
+            continue
         payload = release_service.safe_snapshot_content(_payload_dict(row.payload))
         source_payload = release_service.safe_snapshot_content(
             _payload_dict(row.source_payload)

@@ -42,10 +42,14 @@ from ..models import (
 )
 from . import (
     assistant_capability_modeling_service,
+    candidate_identity_recovery,
+    candidate_identity_projection,
     catalog_service,
+    provider_schema_authoring,
     release_service,
     scenario_model_compiler,
     scenario_model_draft_service,
+    semantic_mapping_authoring,
 )
 from .policies import PolicyViolation
 
@@ -58,6 +62,7 @@ FORMAL_RESOURCE_KINDS = frozenset({
     "relation",
     "mapping",
     "relation_mapping",
+    "semantic_mapping",
     "function",
     "action",
     "rule",
@@ -86,6 +91,7 @@ _SECTION_BY_KIND = {
     "workflow": "workflows",
     "mapping": "mappings",
     "relation_mapping": "relation_mappings",
+    "semantic_mapping": "semantic_mappings",
 }
 _DEFAULT_TASK_BY_KIND = {
     "entity": "ontology",
@@ -93,6 +99,7 @@ _DEFAULT_TASK_BY_KIND = {
     "relation": "ontology",
     "mapping": "mapping",
     "relation_mapping": "mapping",
+    "semantic_mapping": "mapping",
     "function": "capabilities",
     "action": "capabilities",
     "rule": "rules",
@@ -565,6 +572,8 @@ def _canonical_item(
         )
         if normalized_relation_type:
             item["relation_type"] = normalized_relation_type
+        if "constraints" in item:
+            item["constraints"] = candidate_identity_projection.optional_relation_constraints(item["constraints"])
         item["source"] = _reference(
             item.get("source"),
             item.get("source_entity_id") or item.get("source_ref"),
@@ -590,6 +599,7 @@ def _canonical_item(
         )
     elif kind == "function":
         _required_name(row, item)
+        item = provider_schema_authoring.materialize_schemas(item)
         # Raw compiler candidates may omit optional Function fields even
         # though their normalized peer received governed defaults. Preserve
         # explicit invalid edits for validation, but fill true omissions.
@@ -757,6 +767,8 @@ def _canonical_item(
             ))
         item["status"] = "draft"
         item["enabled"] = False
+    elif kind == "semantic_mapping":
+        item = {**item, **semantic_mapping_authoring.normalize(item)}
     elif kind == "mapping":
         item["entity"] = _reference(
             item.get("entity"),
@@ -1099,7 +1111,7 @@ def _build_compound_payload(
         for section in (
             "entities", "relations", "functions", "actions", "rules",
             "events", "workflows", "mappings", "relation_mappings",
-            "instances", "conceptual_mappings",
+            "instances", "conceptual_mappings", "semantic_mappings",
         )
     }
     for key in sorted(items_by_key):
@@ -1481,6 +1493,7 @@ def revalidate_candidate(
         raise CandidateRevisionConflict("候选定义 revision 已变化，请刷新后重试")
     if row.draft_status not in OPEN_LIFECYCLE_STATUSES:
         raise CandidateRevisionConflict("候选定义生命周期已关闭")
+    candidate_identity_recovery.recover_legacy_identities(db, [row])
     evaluation = evaluate_candidates(db, scenario, [row])
     row.validation_issues = _bounded_issues([
         *evaluation.blockers, *evaluation.warnings,
@@ -1542,6 +1555,7 @@ def revalidate_candidates(
         if row.draft_status not in OPEN_LIFECYCLE_STATUSES:
             raise CandidateRevisionConflict("候选定义生命周期已关闭")
 
+    candidate_identity_recovery.recover_legacy_identities(db, rows)
     ordered_rows = sorted(rows, key=lambda row: (
         str(row.resource_kind or ""), str(row.resource_key or ""), row.id
     ))
@@ -1916,6 +1930,9 @@ def promote_candidates(
         if isinstance(apply_result.get("resource_ids"), dict)
         else {}
     )
+    for item in compiler_payload.get("semantic_mappings") or []:
+        if item["key"] in compiler_ids:
+            ids_by_key[item["key"]] = compiler_ids[item["key"]]
     port_ids_by_draft: dict[str, str] = {}
     port_counts: dict[str, int] = defaultdict(int)
     for row in ordered_rows:

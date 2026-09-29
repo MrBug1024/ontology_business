@@ -98,6 +98,10 @@ export function candidatePromotionRequest(
   return { items }
 }
 
+export function candidateRevalidationSelection(candidates: ScenarioModelDraftResource[]): ScenarioModelDraftResource[] {
+  return candidates.filter((item) => !['formalized', 'resolved', 'superseded'].includes(item.lifecycle_status))
+}
+
 export function candidateOriginLabel(value: ScenarioModelCandidateOrigin): string {
   return ({ assistant: '智能顾问', manual: '人工创建', imported: '外部导入', unknown: '来源未知' })[value]
 }

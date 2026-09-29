@@ -1,6 +1,7 @@
 <template>
   <div class="workflow-approval-reply">
     <p v-if="approval.requires_evidence" class="evidence-required">本次同意需附佐证文件</p>
+    <p class="reply-format">第一行填写“同意”或“驳回”；需要说明时，按 Shift + Enter 换行后填写备注。</p>
     <AgentInvocationComposer ref="composer" require-ready-attachments :busy="busy" placeholder="同意或驳回" @submit="submit" @stop="cancel" />
     <p v-if="error" role="alert">{{ error }}</p>
   </div>
@@ -66,5 +67,5 @@ onBeforeUnmount(cancel)
 <style scoped>
 .workflow-approval-reply { min-width: 0; }
 .workflow-approval-reply > p { font-size: 13px; color: var(--el-color-danger); overflow-wrap: anywhere; }
-.workflow-approval-reply .evidence-required { color: var(--text-2); }
+.workflow-approval-reply .evidence-required, .workflow-approval-reply .reply-format { color: var(--text-2); }
 </style>

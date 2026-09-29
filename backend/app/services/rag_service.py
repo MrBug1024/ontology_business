@@ -7,23 +7,26 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Iterable
 
+from fastapi import HTTPException
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models import BucketFile, DataSource, DocumentChunk, DocumentIndexJob, LLMConfig
-from . import datasource_service, llm_service, tenant_service
+from . import datasource_service, document_job_access, document_job_parsing, llm_service, permission_service, tenant_service
 
 
 EMBEDDING_MODEL = "local-semantic-hash-192-v2"
 EMBEDDING_DIMENSIONS = 192
 INDEX_VERSION = "rag-chunks-v2"
+logger = logging.getLogger(__name__)
 CHUNK_SIZE = 760
 CHUNK_OVERLAP = 140
 MAX_CHUNKS_PER_FILE = 5_000
@@ -207,7 +210,17 @@ def _index_is_current(file: BucketFile) -> bool:
     )
 
 
-def index_file(db: Session, file: BucketFile, *, force: bool = False) -> dict[str, Any]:
+def prepare_file_index(db: Session, text: str) -> tuple:
+    spans = chunk_spans(text)
+    partial = len(spans) > MAX_CHUNKS_PER_FILE
+    spans = spans[:MAX_CHUNKS_PER_FILE]
+    vectors, embedding_model = _embed_for_index(db, [body for _start, _end, body in spans])
+    if len(vectors) != len(spans):
+        raise RuntimeError("Embedding 返回数量与文档分块不一致")
+    return spans, partial, vectors, embedding_model
+
+
+def index_file(db: Session, file: BucketFile, *, force: bool = False, prepared: tuple | None = None) -> dict[str, Any]:
     """按内容哈希增量建立一个文件的分块向量索引。
 
     不提交事务，由文档 worker 或显式管理入口决定何时提交。
@@ -226,15 +239,7 @@ def index_file(db: Session, file: BucketFile, *, force: bool = False) -> dict[st
         return {"file_id": file.id, "status": "indexed", "indexed": False, "chunk_count": file.chunk_count}
 
     try:
-        spans = chunk_spans(text)
-        partial = len(spans) > MAX_CHUNKS_PER_FILE
-        spans = spans[:MAX_CHUNKS_PER_FILE]
-        vectors, embedding_model = _embed_for_index(
-            db,
-            [chunk_text for _start, _end, chunk_text in spans],
-        )
-        if len(vectors) != len(spans):
-            raise RuntimeError("Embedding 返回数量与文档分块不一致")
+        spans, partial, vectors, embedding_model = prepared or prepare_file_index(db, text)
         db.execute(delete(DocumentChunk).where(DocumentChunk.bucket_file_id == file.id))
         for ordinal, ((char_start, char_end, chunk_text), vector) in enumerate(zip(spans, vectors)):
             db.add(
@@ -306,6 +311,8 @@ def enqueue_document_index(
     """将一个文件的解析/索引持久化入队；相同文件只保留一个活跃任务。"""
     source = _require_owned_file(db, file)
     tenant_id = tenant_service.current_tenant_id(db)
+    principal = permission_service.require_principal(db)
+    document_job_access.require_source_write(db, source.id, file=file)
     active_key = _document_active_key(file.id)
     active = db.execute(
         select(DocumentIndexJob)
@@ -327,6 +334,7 @@ def enqueue_document_index(
         tenant_id=tenant_id,
         data_source_id=source.id,
         bucket_file_id=file.id,
+        requested_by_user_id=principal.user_id,
         parse_document=parse_document,
         force=force,
         active_key=active_key,
@@ -405,10 +413,23 @@ def _retry_document_job(
     status: str,
     error: str,
     now: datetime,
+    terminal: bool = False,
+    expected_started_at: datetime | None = None,
 ) -> None:
     """按有限指数退避重试文件处理；终态同时反映到文件索引状态。"""
+    if expected_started_at is not None:
+        job_id = job.id
+        db.rollback()
+        job = db.scalar(select(DocumentIndexJob).where(
+            DocumentIndexJob.id == job_id, DocumentIndexJob.status == "running",
+            DocumentIndexJob.started_at == expected_started_at,
+        ).with_for_update().execution_options(populate_existing=True))
+        if job is None:
+            db.rollback()
+            return
+        file = db.get(BucketFile, job.bucket_file_id)
     job.error = error
-    if job.attempt < job.max_attempts:
+    if not terminal and job.attempt < job.max_attempts:
         delay = min(DOCUMENT_JOB_RETRY_SECONDS * (2 ** max(0, job.attempt - 1)), 300)
         job.status = "retry_waiting"
         job.available_at = now + timedelta(seconds=delay)
@@ -433,6 +454,7 @@ def expire_stale_document_index_jobs(db: Session, *, now: datetime | None = None
     now = now or utc_now()
     jobs = db.execute(
         select(DocumentIndexJob).where(DocumentIndexJob.status == "running")
+        .order_by(DocumentIndexJob.started_at).limit(16).with_for_update(skip_locked=True)
     ).scalars().all()
     for job in jobs:
         started_at = _aware(job.started_at)
@@ -447,6 +469,7 @@ def expire_stale_document_index_jobs(db: Session, *, now: datetime | None = None
                     status="timed_out",
                     error="文档处理超过配置的超时限制",
                     now=now,
+                    expected_started_at=started_at,
                 )
             finally:
                 if original_tenant_id is None:
@@ -500,15 +523,19 @@ def process_document_index_jobs(
         if not job:
             continue
         original_tenant_id = db.info.get("tenant_id")
+        original_user_id = db.info.get("user_id")
         db.info["tenant_id"] = job.tenant_id
+        db.info["user_id"] = job.requested_by_user_id
         file: BucketFile | None = None
         try:
+            document_job_access.restore_job_principal(db, job)
             file = db.get(BucketFile, job.bucket_file_id)
             if not file or file.data_source_id != job.data_source_id:
                 raise RuntimeError("待处理文件不存在或不属于目标资料库")
             source = db.get(DataSource, job.data_source_id)
             if not source or source.type != "file_bucket":
                 raise RuntimeError("待处理文件所属资料库不存在")
+            source = document_job_access.require_source_write(db, source.id, file=file)
             # Snapshot only the storage contract so no SQLAlchemy attribute
             # access re-opens a transaction during remote object I/O.
             file_storage = SimpleNamespace(
@@ -532,31 +559,42 @@ def process_document_index_jobs(
                 scenario_id=source.scenario_id,
                 type=source.type,
                 config=dict(source.config or {}),
+                resource_scope=source.resource_scope,
             )
+            parse_requested = job.parse_document
+            existing_text = file.parsed_text or ""
             # 完成读取后立即释放事务，再执行可能耗时的文件解析。
             db.commit()
 
             parsed: dict[str, Any] | None = None
-            if job.parse_document:
-                from . import doc_parser
+            if parse_requested:
+                parsed = document_job_parsing.parse_document(source_storage, file_storage)
+            index_text = (parsed.get("text") or "") if parsed is not None else existing_text
+            prepared_index = prepare_file_index(db, index_text)
+            db.commit()
 
-                content, _size, _mime = datasource_service.read_bucket_file(
-                    file_storage,
-                    source_storage,
-                )
-                parsed = doc_parser.parse_bytes(content, file_storage.filename)
-
+            owned = db.scalar(select(DocumentIndexJob).where(
+                DocumentIndexJob.id == job_id, DocumentIndexJob.status == "running",
+                DocumentIndexJob.started_at == claimed_at,
+            ).with_for_update().execution_options(populate_existing=True))
+            if owned is None:
+                db.rollback()
+                continue
             file = db.get(BucketFile, job.bucket_file_id)
             if not file:
                 raise RuntimeError("待处理文件已删除")
+            source = document_job_access.require_source_write(db, job.data_source_id, file=file)
             if parsed is not None:
                 file.status = "parsed" if parsed.get("status") == "success" else "error"
                 file.parsed_text = parsed.get("text", "") or ""
                 file.error = "" if file.status == "parsed" else str(parsed.get("message") or "文档解析失败")
+                document_job_parsing.materialize_profile(db, source, file, parsed)
+            elif (file.parsed_text or "") != index_text:
+                raise RuntimeError("文件文本已更新，请重新建立索引")
             if file.status != "parsed" or not (file.parsed_text or "").strip():
                 raise RuntimeError(file.error or "文件未能解析为可检索文本")
 
-            result = index_file(db, file, force=job.force)
+            result = index_file(db, file, force=job.force, prepared=prepared_index)
             if result.get("status") not in {"indexed", "partial"}:
                 raise RuntimeError(str(result.get("error") or "建立检索索引失败"))
             finished_at = utc_now()
@@ -569,6 +607,7 @@ def process_document_index_jobs(
                     status="timed_out",
                     error="文档处理超过配置的超时限制",
                     now=finished_at,
+                    expected_started_at=claimed_at,
                 )
             else:
                 job.status = "succeeded"
@@ -577,20 +616,37 @@ def process_document_index_jobs(
                 job.completed_at = finished_at
                 job.next_retry_at = None
                 db.commit()
+        except HTTPException:
+            db.rollback()
+            owned = db.scalar(select(DocumentIndexJob).where(
+                DocumentIndexJob.id == job_id, DocumentIndexJob.status == "running",
+                DocumentIndexJob.started_at == claimed_at,
+            ).with_for_update().execution_options(populate_existing=True))
+            if owned is not None:
+                _retry_document_job(db, owned, db.get(BucketFile, owned.bucket_file_id),
+                    status="failed", error="文档任务发起人身份或资料权限已失效，请重新发起。",
+                    now=utc_now(), terminal=True)
         except Exception as exc:  # noqa: BLE001
+            logger.warning("Document job %s failed (%s)", job_id, type(exc).__name__)
             _retry_document_job(
                 db,
                 job,
                 file,
                 status="failed",
-                error=str(exc),
+                error="文档准备失败，请查看任务状态并重试；若持续失败请联系管理员。",
                 now=utc_now(),
+                expected_started_at=claimed_at,
             )
         finally:
             if original_tenant_id is None:
                 db.info.pop("tenant_id", None)
             else:
                 db.info["tenant_id"] = original_tenant_id
+            if original_user_id is None:
+                db.info.pop("user_id", None)
+            else:
+                db.info["user_id"] = original_user_id
+            permission_service.refresh_request_authorization(db)
         db.expire_all()
         current = db.get(DocumentIndexJob, job_id)
         if current:

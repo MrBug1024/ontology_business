@@ -826,6 +826,7 @@ def compilation_plan(
     document_count: int,
     source_count: int,
     total_characters: int,
+    task_scope: str = "",
 ) -> list[dict[str, Any]]:
     """Return the user-facing work plan for one compound modelling request."""
     source_label = (
@@ -833,6 +834,11 @@ def compilation_plan(
         if document_count
         else f"{source_count} 个来源段落"
     )
+    scope_title = {
+        "ontology": "建设本体模型", "instances": "建设实例数据",
+        "mapping": "建设数据映射", "capabilities": "建设业务能力",
+        "rules": "建设规则与事件", "workflows": "建设工作流",
+    }.get(task_scope, "建设本体模型")
     return [
         {
             "id": "analyze",
@@ -848,8 +854,8 @@ def compilation_plan(
         },
         {
             "id": "ontology",
-            "title": "建设本体模型",
-            "detail": "识别对象、属性、关系和约束。",
+            "title": scope_title,
+            "detail": f"根据来源完成{scope_title}，校验具体定义与依赖。",
             "status": "pending",
         },
         {
@@ -1424,6 +1430,10 @@ def record_progress(
     if existing is None:
         existing = {"id": step_id, "title": title, "detail": "待开始", "status": "pending"}
         steps.append(existing)
+    # The plan already resolved the requested modeling scope; a generic stage
+    # callback must not turn a function task back into an ontology task.
+    if step_id == "ontology":
+        title = str(existing["title"])
     existing.update({
         "title": title[:160],
         "detail": detail[:500],

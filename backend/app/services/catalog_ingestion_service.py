@@ -41,6 +41,7 @@ from . import (
     object_deletion_service,
     permission_service,
     tenant_service,
+    tabular_profile_sampling,
 )
 
 
@@ -602,7 +603,8 @@ def _table_contract(
         "name": str(name)[:300] or "table",
         "columns": columns,
         "sample_row_count": len(rows),
-        "record_count": len(rows) if record_count is None else record_count,
+        "record_count": record_count if truncated else len(rows) if record_count is None else record_count,
+        "record_count_exact": record_count is not None or not truncated,
         "sample_truncated": truncated,
     }
 
@@ -643,20 +645,13 @@ def _csv_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
     if delimiter is None:
         raise catalog_service.CatalogError("CSV/TSV 文件缺少可识别的表头")
     reader = csv.reader(StringIO(text, newline=""), delimiter=delimiter)
-    header: list[Any] | None = None
-    rows: list[list[Any]] = []
-    record_count = 0
-    for row in reader:
-        if not any(str(value).strip() for value in row):
-            continue
-        if header is None:
-            header = list(row)
-            continue
-        record_count += 1
-        if len(rows) < MAX_PROFILE_ROWS:
-            rows.append(list(row))
-    if header is None:
+    detected = tabular_profile_sampling.sample_rows(
+        reader, sample_limit=MAX_PROFILE_ROWS, column_limit=MAX_PROFILE_COLUMNS,
+        header_search_rows=1, has_value=lambda value: bool(str(value).strip()),
+    )
+    if detected is None:
         raise catalog_service.CatalogError("CSV/TSV 文件为空")
+    header_index, header, rows, truncated, record_count = detected
     return {
         "format": PROFILE_FORMAT,
         "category": "table",
@@ -668,10 +663,10 @@ def _csv_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
                     "data",
                     header,
                     rows,
-                    truncated=record_count > len(rows),
+                    truncated=truncated,
                     record_count=record_count,
                 ),
-                "header_row_index": 0,
+                "header_row_index": header_index,
                 "delimiter": delimiter,
             }
         ],
@@ -680,55 +675,20 @@ def _csv_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
 
 def _sheet_profile_rows(
     values: Iterable[Iterable[Any]],
-) -> tuple[int, list[Any], list[list[Any]], bool, int] | None:
+) -> tuple[int, list[Any], list[list[Any]], bool, int | None] | None:
     """Detect a header after optional title rows, then retain a bounded sample."""
-    buffered: list[tuple[int, list[Any]]] = []
-    iterator = iter(values)
-    for raw_index, raw in enumerate(iterator):
-        row = list(raw)
-        if any(_logical_type(value) is not None for value in row):
-            buffered.append((raw_index, row))
-        if len(buffered) >= 25:
-            break
-    if not buffered:
-        return None
-    header_position = max(
-        range(len(buffered)),
-        key=lambda index: sum(
-            _logical_type(value) is not None for value in buffered[index][1]
-        ),
-    )
-    header_index, header = buffered[header_position]
-    rows = [row for _index, row in buffered[header_position + 1 :]]
-    record_count = len(rows)
-    for raw in iterator:
-        row = list(raw)
-        if not any(_logical_type(value) is not None for value in row):
-            continue
-        record_count += 1
-        if len(rows) < MAX_PROFILE_ROWS:
-            rows.append(row)
-    sampled_rows = rows[:MAX_PROFILE_ROWS]
-    return (
-        header_index,
-        header,
-        sampled_rows,
-        record_count > len(sampled_rows),
-        record_count,
+    return tabular_profile_sampling.sample_rows(
+        values, sample_limit=MAX_PROFILE_ROWS, column_limit=MAX_PROFILE_COLUMNS,
+        header_search_rows=25, has_value=lambda value: _logical_type(value) is not None,
     )
 
 
 def _xlsx_profile(content: bytes, spec: FormatSpec) -> dict[str, Any]:
-    from openpyxl import load_workbook
+    from .excel_profile_reader import load_profile_workbook
 
     try:
-        workbook = load_workbook(
-            BytesIO(content),
-            read_only=True,
-            data_only=True,
-            keep_links=False,
-            keep_vba=False,
-        )
+        workbook = load_profile_workbook(BytesIO(content), row_limit=MAX_PROFILE_ROWS + 26,
+                                        column_limit=MAX_PROFILE_COLUMNS)
     except Exception as exc:  # noqa: BLE001 - parser details are intentionally hidden.
         raise catalog_service.CatalogError("Excel 文件解析失败") from exc
     tables: list[dict[str, Any]] = []
@@ -889,24 +849,18 @@ def _csv_profile_path(path: Path, spec: FormatSpec) -> dict[str, Any]:
     delimiter = _delimiter_from_text(sample, spec.media_type)
     if delimiter is None:
         raise catalog_service.CatalogError("CSV/TSV 文件缺少可识别的表头")
-    header: list[Any] | None = None
-    rows: list[list[Any]] = []
-    record_count = 0
     try:
         with path.open("r", encoding=encoding, newline="") as handle:
-            for row in csv.reader(handle, delimiter=delimiter):
-                if not any(str(value).strip() for value in row):
-                    continue
-                if header is None:
-                    header = list(row)
-                    continue
-                record_count += 1
-                if len(rows) < MAX_PROFILE_ROWS:
-                    rows.append(list(row))
+            detected = tabular_profile_sampling.sample_rows(
+                csv.reader(handle, delimiter=delimiter), sample_limit=MAX_PROFILE_ROWS,
+                column_limit=MAX_PROFILE_COLUMNS, header_search_rows=1,
+                has_value=lambda value: bool(str(value).strip()),
+            )
     except UnicodeDecodeError as exc:
         raise catalog_service.CatalogError("CSV/TSV 文件编码无效") from exc
-    if header is None:
+    if detected is None:
         raise catalog_service.CatalogError("CSV/TSV 文件为空")
+    header_index, header, rows, truncated, record_count = detected
     return {
         "format": PROFILE_FORMAT,
         "category": "table",
@@ -918,10 +872,10 @@ def _csv_profile_path(path: Path, spec: FormatSpec) -> dict[str, Any]:
                     "data",
                     header,
                     rows,
-                    truncated=record_count > len(rows),
+                    truncated=truncated,
                     record_count=record_count,
                 ),
-                "header_row_index": 0,
+                "header_row_index": header_index,
                 "delimiter": delimiter,
             }
         ],
@@ -929,17 +883,12 @@ def _csv_profile_path(path: Path, spec: FormatSpec) -> dict[str, Any]:
 
 
 def _xlsx_profile_path(path: Path, spec: FormatSpec) -> dict[str, Any]:
-    from openpyxl import load_workbook
+    from .excel_profile_reader import load_profile_workbook
 
     try:
         with path.open("rb") as source:
-            workbook = load_workbook(
-                source,
-                read_only=True,
-                data_only=True,
-                keep_links=False,
-                keep_vba=False,
-            )
+            workbook = load_profile_workbook(source, row_limit=MAX_PROFILE_ROWS + 26,
+                                            column_limit=MAX_PROFILE_COLUMNS)
             tables: list[dict[str, Any]] = []
             try:
                 for sheet in workbook.worksheets:
@@ -1100,6 +1049,12 @@ def build_profile_path(
         profile, label="文件结构 profile", maximum=128_000
     )
     return spec.media_type, profile
+
+
+def is_tabular_candidate_filename(filename: str) -> bool:
+    """Choose a fast-path candidate; the content detector still verifies it."""
+    spec = _FORMAT_SPECS.get(Path(filename).suffix.lower())
+    return bool(spec and spec.category == "table")
 
 
 def build_tabular_profile_path(

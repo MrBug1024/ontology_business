@@ -70,6 +70,8 @@ from ..services import (
     assistant_research_service,
     assistant_resource_context_service,
     modeling_reference_contract,
+    model_task_scope,
+    scenario_model_response_service,
     assistant_compilation_job_service,
     assistant_request_run_service,
     assistant_compilation_stream_service,
@@ -1232,6 +1234,7 @@ _SCENARIO_MODEL_RESOURCE_SECTIONS = (
     "mappings",
     "relation_mappings",
     "conceptual_mappings",
+    "semantic_mappings",
 )
 
 
@@ -4321,6 +4324,7 @@ def _finalize_compilation_success(
         # deterministic gate decides whether the result can be treated as a
         # formal working-model change, needs clarification, or must remain in
         # candidate review. It never publishes or bypasses confirmation.
+        data = model_task_scope.bind_request_scope(data, context.get("routing") or {})
         data = assistant_decision_gate.attach_decision_gate(data)
         inert_salvage = _is_inert_compilation_salvage(data)
         proposal = _build_proposal("scenario_model", data, scenario)
@@ -5052,7 +5056,8 @@ def _run_compilation_job_in_background(
                         )
             except assistant_compilation_job_service.CompilationLeaseLost:
                 raise
-            except Exception:  # noqa: BLE001 - unexpected compiler failures still yield drafts.
+            except Exception as exc:  # noqa: BLE001 - unexpected compiler failures still yield drafts.
+                scenario_model_response_service.log_failure(logger, exc, job_id=job_id)
                 worker_db.rollback()
                 data = _unavailable_worker_draft(
                     compiler_message=compiler_message,
@@ -5060,7 +5065,7 @@ def _run_compilation_job_in_background(
                     prepared_context=prepared_context,
                     on_progress=record_compilation_stage,
                     code="COMPILER_EXECUTION_INTERRUPTED",
-                    message="结构化编译执行中断；系统已基于冻结来源建立分阶段占位草稿，正式模型保持不变。",
+                    message="结构化编译执行中断，本轮未生成有效定义；原始来源和已有具体候选已保留，可恢复服务后重试。",
                 )
         deferred_guidance: list[dict[str, Any]] = []
         if not close_compilation_guidance_window():
@@ -5096,8 +5101,11 @@ def _run_compilation_job_in_background(
             scenario_model_compiler._model_task_definition(task_scope)
             if task_scope else None
         )
-        gate_mode = str((data.get("decision_gate") or {}).get("mode") or "")
-        if gate_mode == "clarify":
+        decision_gate = data.get("decision_gate") or {}
+        gate_mode = str(decision_gate.get("mode") or "")
+        if set(decision_gate.get("reason_codes") or []) & {"COMPILATION_UNAVAILABLE", "CANDIDATE_VALIDATION_FAILED"}:
+            reply = str(decision_gate["explanation"])
+        elif gate_mode == "clarify":
             reply = (
                 "我已完成资料分析，但发现会影响业务含义的关键歧义。"
                 "请先回答建模决策卡中的问题；相关资源会保持为可追溯草稿，"
@@ -5111,7 +5119,7 @@ def _run_compilation_job_in_background(
         else:
             reply = (
                 f"「{task_definition['title']}」的资料和证据校验已完成，可在确认后直接建设正式工作模型；"
-                "后续任务尚未生成，内容身份、有界引用片段和已确认定义会保留，等待你继续。"
+                "本轮候选、来源引用和已有定义已保留，可在建模产物中审核。"
                 if task_definition is not None
                 else "资料和证据校验已完成；安全资源可在确认后直接建设正式工作模型，"
                 "高风险或不完整资源仍会保留在候选区并要求人工审核。"
@@ -5150,13 +5158,13 @@ def _run_compilation_job_in_background(
                 on_progress=record_compilation_stage,
                 code="DRAFT_MATERIALIZATION_INTERRUPTED",
                 message=(
-                    "生成结果未能完整写入草稿区；系统已改为保存来源绑定的"
-                    "分阶段占位草稿，正式模型保持不变。"
+                    "生成结果未能完整写入草稿区；来源和已有具体候选已保留，"
+                    "请恢复服务后重试。"
                 ),
             )
             reply = (
-                "模型结果写入草稿区时发生问题；已建立 6 类来源绑定占位草稿，"
-                "可直接修改并继续任务。"
+                "模型结果写入草稿区时发生问题；本轮未完成定义保存，"
+                "来源和已有具体候选已保留，可恢复服务后重试。"
             )
             _finalize_compilation_success(data=data, reply=reply, **finalize_kwargs)
     except assistant_compilation_job_service.CompilationLeaseLost:
@@ -6416,10 +6424,7 @@ def _route_fallback_public_notice() -> str:
 def _route_fallback_notice(
     route_plan: assistant_orchestrator.AssistantRoutePlan,
 ) -> str:
-    # A failed semantic provider is recoverable. The LangGraph route plan has
-    # already selected either a context-safe continuation or ordinary chat;
-    # stopping here would discard a valid document-driven modelling request.
-    return ""
+    return assistant_orchestrator.unexecuted_authoring_notice(route_plan)
 
 
 def _read_only_chat_contract() -> str:
@@ -8481,6 +8486,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     document_count=len(source_bundle_preview["documents"]),
                     source_count=len(source_bundle_preview["paragraphs"]),
                     total_characters=int(source_bundle_preview["total_characters"]),
+                    task_scope=assistant_orchestrator.initial_model_task_scope(route_plan),
                 )
                 for item in plan:
                     if item["id"] == "analyze":
@@ -8488,7 +8494,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                         item["detail"] = f"已检索 {len(source_bundle_preview['paragraphs'])} 个可引用来源片段。"
                     elif item["id"] == "plan":
                         item["status"] = "done"
-                        item["detail"] = "已拆解为资料分析、计划和 6 个连续建模任务。"
+                        item["detail"] = "已按本轮建设范围制定资料分析和建模计划。"
                 yield progress({
                     "id": "analyze",
                     "title": "分析业务资料",
@@ -8498,13 +8504,13 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                 yield progress({
                     "id": "plan",
                     "title": "制定建模任务",
-                    "detail": "已拆解为本体、实例、映射、业务能力、规则事件和工作流任务。",
+                    "detail": "已按本轮建设范围制定任务；资源依赖仍由服务端逐项校验。",
                     "status": "done",
                 })
                 yield progress({
-                    "id": "ontology",
-                    "title": "建设本体模型",
-                    "detail": "完整建模任务已排队，将先识别对象、属性、关系和约束，再继续映射、能力、规则事件和工作流。",
+                    "id": assistant_orchestrator.initial_model_task_scope(route_plan),
+                    "title": "生成当前阶段草稿",
+                    "detail": "建模任务已排队，将按本次请求的阶段读取完整资料并校验定义。",
                     "status": "running",
                 })
                 compilation_settings = get_settings()
@@ -8512,7 +8518,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
                     "llm_call_budget": compilation_settings.scenario_model_max_llm_calls,
                     "request_timeout": compilation_settings.scenario_model_llm_timeout,
                     "assistant_scope_key": scope_key,
-                    "task_scope": "",
+                    "task_scope": assistant_orchestrator.initial_model_task_scope(route_plan),
                 }
                 identity = assistant_compilation_job_service.build_compilation_identity(
                     tenant_id=tenant_id,
@@ -9232,6 +9238,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 document_count=len(source_bundle_preview["documents"]),
                 source_count=len(source_bundle_preview["paragraphs"]),
                 total_characters=int(source_bundle_preview["total_characters"]),
+                task_scope=assistant_orchestrator.initial_model_task_scope(route_plan),
             )
             for item in plan:
                 if item["id"] in {"analyze", "plan"}:
@@ -9241,7 +9248,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
                 "llm_call_budget": compilation_settings.scenario_model_max_llm_calls,
                 "request_timeout": compilation_settings.scenario_model_llm_timeout,
                 "assistant_scope_key": thread.scope_key,
-                "task_scope": "",
+                "task_scope": assistant_orchestrator.initial_model_task_scope(route_plan),
             }
             identity = assistant_compilation_job_service.build_compilation_identity(
                 tenant_id=_tenant(db),

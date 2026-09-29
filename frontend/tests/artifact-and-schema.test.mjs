@@ -33,6 +33,9 @@ import {
 } from '../src/utils/relationMappings.ts'
 import { cloneAgentCapabilityScope, emptyAgentCapabilityScope } from '../src/utils/agentCapabilities.ts'
 import { buildSchemaFromFields, flattenSchemaFields } from '../src/utils/schemaBuilder.ts'
+import { workflowBusinessOutputs, workflowResultRows, workflowResultSchema } from '../src/utils/workflowResult.ts'
+import { semanticMappingCandidateRows } from '../src/utils/semanticMappingCandidates.ts'
+import { workflowStatusSelection } from '../src/utils/workflowStatus.ts'
 import { migrateManagedUploadRunEntry } from '../src/utils/managedUploadIdentity.ts'
 import {
   INPUT_CONTRACT_KEY,
@@ -53,6 +56,47 @@ import {
   templatePathsToSchema,
   templateUnavailableReason,
 } from '../src/utils/templates.ts'
+
+test('business output requires a successful run and end node, preserving falsy values', () => {
+  const result = { steps: [
+    { type: 'llm', status: 'success', result: 'intermediate' },
+    { type: 'end', name: 'Summary', status: 'success', result: { total: 0, accepted: false } },
+    { type: 'end', status: 'failed', result: 'invalid' },
+    { type: 'end', status: 'success', result: null },
+  ] }
+  assert.deepEqual(workflowBusinessOutputs('succeeded', result), [
+    { name: 'Summary', value: { total: 0, accepted: false } }, { name: '结束节点', value: null },
+  ])
+  for (const status of ['running', 'failed', 'awaiting_approval']) {
+    assert.deepEqual(workflowBusinessOutputs(status, result), [])
+  }
+  assert.deepEqual(workflowBusinessOutputs('succeeded', null), [])
+  assert.deepEqual(workflowBusinessOutputs('succeeded', { steps: [null, {}] }), [])
+})
+
+test('explicit workflow status selection activates both required runtime flags', () => {
+  assert.deepEqual(workflowStatusSelection('active'), { status: 'active', enabled: true })
+  assert.deepEqual(workflowStatusSelection('draft'), { status: 'draft', enabled: false })
+  assert.deepEqual(workflowStatusSelection('disabled'), { status: 'disabled', enabled: false })
+  assert.equal(workflowStatusSelection(undefined), null)
+  assert.equal(workflowStatusSelection('unknown'), null)
+})
+
+test('workflow result inspection preserves nested arrays, types and source contracts', () => {
+  const value = { entries: [{ count: 2, accepted: false, source: '{{organize.parsed.source}}' }], missing: null }
+  const original = structuredClone(value)
+  assert.deepEqual(workflowResultRows(value), [
+    { path: 'entries[0].count', value: '2' }, { path: 'entries[0].accepted', value: 'false' },
+    { path: 'entries[0].source', value: '{{organize.parsed.source}}' }, { path: 'missing', value: '空值' },
+  ])
+  assert.deepEqual(value, original)
+  assert.equal(workflowResultRows(Array.from({ length: 1000 }, (_, i) => i)).length, 64)
+  const schema = { type: 'object', properties: { entries: { type: 'array' } } }
+  const config = { ontology_contract: { output_node_id: 'end', output_schema: schema } }
+  assert.deepEqual(workflowResultSchema(config, 'end'), schema)
+  assert.deepEqual(workflowResultSchema(config, 'other'), {})
+  assert.deepEqual(workflowResultSchema(null, 'end'), {})
+})
 
 function memoryStorage() {
   const values = new Map()
@@ -149,8 +193,11 @@ test('semantic mapping editor authors directly from scenario-scoped modeling sch
     'utf8',
   )
 
-  assert.match(panel, /api\.listLogicalDatasets\('modeling_material', props\.scenarioId\)/)
-  assert.match(panel, /api\.listDatasetSchemas\(datasetId\)/)
+  assert.match(panel, /const scenarioId = props\.scenarioId/)
+  assert.match(panel, /api\.listLogicalDatasets\('modeling_material', scenarioId, loadController\.signal\)/)
+  assert.match(panel, /generation !== loadGeneration/)
+  assert.match(panel, /loadController\.abort\(\)/)
+  assert.match(panel, /api\.listDatasetSchemas\(datasetId, loadController\.signal\)/)
   assert.match(panel, /dataset_schema_id: schema\.id/)
   assert.doesNotMatch(panel, /api\.listDatasetVersions/)
   assert.doesNotMatch(panel, /api\.createScenarioDatasetBinding/)
@@ -295,7 +342,10 @@ test('action confirmation keeps original parameters when the preview is compacte
     new URL('../src/views/AgentChat.vue', import.meta.url),
     'utf8',
   )
-  assert.match(source, /<SafeMarkdown v-if="m.role === 'assistant' && m.content" :content="m.content"/)
+  assert.match(source, /<AssistantMessageContent v-if="m.role === 'assistant' && m.content" :content="m.content" :streaming="m.streaming"/)
+  const contentSource = readFileSync(new URL('../src/components/AssistantMessageContent.vue', import.meta.url), 'utf8')
+  assert.match(contentSource, /<SafeMarkdown[^>]*:content="part.content"/)
+  assert.doesNotMatch(contentSource, /v-html/)
   assert.doesNotMatch(source, /confirmActionPreview|confirmAgentPreview|openConfirmationTask/)
   assert.doesNotMatch(source, /params:\s*plan\.parameters\s*\|\|\s*\{\}/)
 })
@@ -1485,4 +1535,24 @@ test('workflow editor delegates workflow design to the scenario advisor', () => 
   assert.match(source, /询问智能业务顾问/)
   assert.doesNotMatch(source, /generateWorkflow/)
   assert.doesNotMatch(source, /AI 生成工作流/)
+})
+
+
+test('Catalog mapping candidates show verified field names and preserve server eligibility', () => {
+  const entities = [{ id: 'entity', name: '对象', properties: [{ id: 'property', name: '编号' }] }]
+  const schemas = [{ id: 'schema', relations: [{ id: 'relation', display_name: '资料表', fields: [{ id: 'field', source_name: '标识列' }] }] }]
+  const candidate = { id: 'candidate', resource_kind: 'semantic_mapping', promotion_eligible: false,
+    payload: { entity_id: 'entity', dataset_schema_id: 'schema', dataset_relation_id: 'relation', existing_id: 'mapping',
+      fields: [{ ontology_property_id: 'property', dataset_field_id: 'field', is_required: false }] } }
+  const [row] = semanticMappingCandidateRows([candidate], entities, schemas)
+  assert.equal(row.operation, '补齐已有映射')
+  assert.equal(row.entity, '对象')
+  assert.equal(row.source, '资料表')
+  assert.equal(row.eligible, false)
+  assert.deepEqual(row.fields, [{ property: '编号', source: '标识列', required: false }])
+  assert.equal(scenarioDraftStage('semantic_mapping'), 'mappings')
+  const [unknown] = semanticMappingCandidateRows([{ ...candidate, payload: { fields: [null] } }], [], [])
+  assert.equal(unknown.fields[0].property, '待核对属性')
+  assert.equal(unknown.eligible, false)
+  assert.equal(semanticMappingCandidateRows(Array(100).fill(candidate), entities, schemas).length, 25)
 })

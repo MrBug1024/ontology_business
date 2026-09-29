@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import json
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -14,6 +16,60 @@ from .distillation_artifact_service import HANDOFF_GUIDANCE
 
 
 CITATION_FIELDS = frozenset({"kind", "data_source_id", "publication_id", "file_content_hash"})
+MAX_STRUCTURED_UNIT_CHARS = 8_000
+
+
+def _compilation_units(content: str) -> list[str] | None:
+    """Keep JSON values intact so field lists retain their owning object."""
+    try:
+        document = json.loads(content)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    units: list[str] = []
+
+    def append(path: list[str | int], value: object) -> bool:
+        encoded = json.dumps({"source_path": path, "value": value},
+                             ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        if len(encoded) <= MAX_STRUCTURED_UNIT_CHARS:
+            units.append(encoded)
+            return True
+        if isinstance(value, dict):
+            return all(append([*path, key], child) for key, child in value.items())
+        if isinstance(value, list):
+            return all(append([*path, index], child) for index, child in enumerate(value))
+        return False
+
+    try:
+        if all(append([key], value) for key, value in document.items()):
+            return units
+    except (ValueError, RecursionError):
+        pass
+    # Oversized scalar text still uses the lossless ordinary paragraph path.
+    return None
+
+
+def complete_compilation_documents(documents: list[dict], *, max_chars: int) -> list[dict]:
+    """Read complete frozen handoffs, without applying conversational top-k retrieval."""
+    result = []
+    total = 0
+    for document in documents:
+        content = document.get("parsed_text")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("业务蒸馏交接缺少完整结构化契约")
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if content_hash != document.get("content_hash"):
+            raise ValueError("业务蒸馏交接内容身份不一致")
+        total += len(content)
+        if total > max_chars:
+            raise ValueError("业务蒸馏交接超过单次编译总量上限，请按业务域拆分")
+        result.append({**document, "characters": len(content), "parsed_text_hash": content_hash,
+            "compilation_units": _compilation_units(content),
+            "chunk_count": 1, "retrieved_passage_count": 1, "retrieved_characters": len(content),
+            "retrieval_complete": True, "passages": [{"text": content, "char_start": 0,
+                                                       "char_end": len(content)}]})
+    return result
 
 
 def normalize_citation(source: dict) -> dict:

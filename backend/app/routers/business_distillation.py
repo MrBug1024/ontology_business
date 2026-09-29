@@ -13,10 +13,10 @@ from ..distillation_resource_schemas import InvestigationResourceCatalogOut
 from ..models import AuthorizationGrant
 from ..distillation_schemas import (
     AnalysisOut, AnalyzeRequest, ArtifactOut, DistillationDocument, ProjectCreate,
-    ProjectOut, ProjectUpdate, PublicationOut, RevisionRequest, ScenarioStateOut,
+    ProjectOut, ProjectUpdate, PublicationOut, RevisionRequest, ScenarioStateOut, ScenarioPublishRequest,
 )
 from ..services import distillation_analysis_service, distillation_service, permission_service
-from ..services import distillation_resource_service
+from ..services import distillation_resource_service, distillation_publication_service
 from ..services.auth_service import get_tenant_db
 
 
@@ -62,6 +62,13 @@ def list_scenario_publications(scenario_id: str, limit: int = Query(50, ge=1, le
     return [_publication_out(row) for row in distillation_service.list_scenario_publications(
         db, scenario_id, limit=limit, offset=offset,
     )]
+
+
+@router.post("/scenario/{scenario_id}/publish", response_model=PublicationOut)
+def publish_scenario(scenario_id: str, payload: ScenarioPublishRequest, db: Session = Depends(get_tenant_db)):
+    row = distillation_publication_service.publish_scenario(db, scenario_id, payload)
+    db.commit()
+    return _publication_out(row)
 
 
 @router.get("/scenario/{scenario_id}/publications/{publication_id}", response_model=PublicationOut)

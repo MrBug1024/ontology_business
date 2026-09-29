@@ -76,6 +76,8 @@
       </el-table-column>
     </el-table>
 
+    <SemanticMappingCandidates :candidates="candidates || []" :entities="entities" :schemas="Object.values(schemasByDataset).flat()" @review="emit('review-candidates')" />
+
     <el-dialog v-model="mappingDialog" title="添加对象语义映射" width="min(760px, calc(100vw - 32px))" @closed="resetMappingForm">
       <el-form label-position="top" @submit.prevent>
         <div v-if="mappingError" class="form-error-summary" role="alert" tabindex="-1">{{ mappingError }}</div>
@@ -147,14 +149,16 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
+import SemanticMappingCandidates from '@/components/SemanticMappingCandidates.vue'
 import type {
   DatasetRelation,
   DatasetSchema,
   Entity,
   LogicalDataset,
+  ScenarioModelDraftResource,
   SemanticMapping,
 } from '@/types'
 
@@ -162,8 +166,14 @@ const props = defineProps<{
   scenarioId: string
   canWrite: boolean
   entities: Entity[]
+  candidates?: ScenarioModelDraftResource[]
 }>()
 
+const emit = defineEmits<{ 'review-candidates': [] }>()
+let loadGeneration = 0
+let disposed = false
+let loadController = new AbortController()
+let contextRequests = 0
 const datasets = ref<LogicalDataset[]>([])
 const mappings = ref<SemanticMapping[]>([])
 const schemasByDataset = ref<Record<string, DatasetSchema[]>>({})
@@ -184,30 +194,49 @@ const selectedRelation = computed<DatasetRelation | undefined>(() => selectedSch
 
 async function ensureDatasetContext(datasetId: string) {
   if (!datasetId || schemasByDataset.value[datasetId]) return
+  const generation = loadGeneration
+  const scenarioId = props.scenarioId
+  contextRequests++
   contextLoading.value = true
   try {
-    const schemas = await api.listDatasetSchemas(datasetId)
+    const schemas = await api.listDatasetSchemas(datasetId, loadController.signal)
+    if (disposed || generation !== loadGeneration || scenarioId !== props.scenarioId) return
     schemasByDataset.value = { ...schemasByDataset.value, [datasetId]: schemas }
   } finally {
-    contextLoading.value = false
+    if (!disposed && generation === loadGeneration) {
+      contextRequests--
+      contextLoading.value = contextRequests > 0
+    }
   }
 }
 
 async function loadAll() {
+  const generation = ++loadGeneration
+  loadController.abort()
+  loadController = new AbortController()
+  contextRequests = 0
+  contextLoading.value = false
+  const scenarioId = props.scenarioId
   loading.value = true
   error.value = ''
   try {
     const [datasetRows, mappingRows] = await Promise.all([
-      api.listLogicalDatasets('modeling_material', props.scenarioId),
-      api.listSemanticMappings(props.scenarioId),
+      api.listLogicalDatasets('modeling_material', scenarioId, loadController.signal),
+      api.listSemanticMappings(scenarioId, loadController.signal),
     ])
+    if (disposed || generation !== loadGeneration || scenarioId !== props.scenarioId) return
     datasets.value = datasetRows.filter((item) => item.usage_plane === 'modeling_material' && item.lifecycle_status === 'active')
     mappings.value = mappingRows
-    await Promise.all([...new Set(mappingRows.map((item) => item.dataset_id))].map(ensureDatasetContext))
-  } catch (reason: any) {
-    error.value = reason?.message || '无法读取 Catalog 语义映射'
+    const ids = props.candidates?.length ? datasets.value.map(item => item.id) : mappingRows.map(item => item.dataset_id)
+    const datasetIds = [...new Set(ids)]
+    for (let start = 0; start < datasetIds.length; start += 5) {
+      if (disposed || generation !== loadGeneration) return
+      await Promise.all(datasetIds.slice(start, start + 5).map(ensureDatasetContext))
+    }
+  } catch (reason: unknown) {
+    if (!disposed && generation === loadGeneration) error.value = reason instanceof Error ? reason.message : '无法读取 Catalog 语义映射'
   } finally {
-    loading.value = false
+    if (!disposed && generation === loadGeneration) loading.value = false
   }
 }
 
@@ -230,7 +259,15 @@ async function onMappingDatasetChange(datasetId: string) {
   mappingForm.value.schema_id = ''
   mappingForm.value.relation_id = ''
   mappingForm.value.field_map = {}
-  await ensureDatasetContext(datasetId)
+  try {
+    await ensureDatasetContext(datasetId)
+  } catch (reason: unknown) {
+    if (!disposed && mappingForm.value.dataset_id === datasetId) {
+      mappingError.value = reason instanceof Error ? reason.message : '无法读取资料结构，请重试'
+    }
+    return
+  }
+  if (disposed || mappingForm.value.dataset_id !== datasetId) return
   const schemas = schemasByDataset.value[datasetId] || []
   const latest = [...schemas].sort((left, right) => right.schema_version - left.schema_version)[0]
   mappingForm.value.schema_id = latest?.id || ''
@@ -285,8 +322,8 @@ async function saveMapping() {
     mappingDialog.value = false
     ElMessage.success('对象语义映射已创建并激活')
     await loadAll()
-  } catch (reason: any) {
-    mappingError.value = reason?.message || '对象语义映射创建失败'
+  } catch (reason: unknown) {
+    mappingError.value = reason instanceof Error ? reason.message : '对象语义映射创建失败'
   } finally {
     saving.value = false
   }
@@ -323,6 +360,16 @@ function datasetFieldName(schemaId: string, fieldId: string) {
   return fieldId
 }
 
+watch(() => props.candidates?.map(item => `${item.id}:${item.revision}`).join(','), () => { void loadAll() })
+watch(() => props.scenarioId, () => {
+  datasets.value = []
+  mappings.value = []
+  schemasByDataset.value = {}
+  mappingDialog.value = false
+  resetMappingForm()
+  void loadAll()
+})
+onBeforeUnmount(() => { disposed = true; loadGeneration++; loadController.abort() })
 onMounted(loadAll)
 </script>
 

@@ -518,6 +518,9 @@ def chat_stream(
     max_retries: int | None = None,
     operation: str = "chat_stream",
     before_provider_call: Callable[[], None] | None = None,
+    include_finish_reason: bool = False,
+    total_timeout: float | None = None,
+    max_output_chars: int | None = None,
 ) -> Iterator[dict[str, Any]]:
     """流式对话；在完整结束、异常或取消后都写入一次脱敏 trace。"""
     started_at = time.perf_counter()
@@ -528,6 +531,10 @@ def chat_stream(
     status = "succeeded"
     error: Any = ""
     provider_started = False
+    client = None
+    stream = None
+    finish_reason = None
+    output_chars = 0
     trace_capability = "tool" if tools else "chat"
     try:
         _ensure_callable(cfg, tools=bool(tools))
@@ -553,12 +560,18 @@ def chat_stream(
         provider_started = True
         stream = client.chat.completions.create(**kwargs)
         for chunk in stream:
+            if total_timeout is not None and time.perf_counter() - started_at > total_timeout:
+                raise TimeoutError("模型结构生成超过总时限")
             if getattr(chunk, "usage", None) is not None:
                 usage = chunk.usage
             if not chunk.choices:
                 continue
+            finish_reason = chunk.choices[0].finish_reason or finish_reason
             delta = chunk.choices[0].delta
             if delta.content:
+                output_chars += len(delta.content)
+                if max_output_chars is not None and output_chars > max_output_chars:
+                    raise LLMRuntimeError("模型结构输出超过受控大小")
                 content_parts.append(delta.content)
                 yield {"type": "token", "content": delta.content}
             if delta.tool_calls:
@@ -589,6 +602,10 @@ def chat_stream(
                     }
                 )
             yield {"type": "tool_calls", "tool_calls": tool_calls}
+        if include_finish_reason:
+            if finish_reason is None:
+                raise LLMRuntimeError("模型连接在完整结构返回前结束，请重试")
+            yield {"type": "finish", "finish_reason": finish_reason}
     except GeneratorExit:
         status = "cancelled"
         raise
@@ -597,6 +614,15 @@ def chat_stream(
         error = exc
         raise
     finally:
+        for resource in (stream, client):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception as cleanup_error:
+                    # Transport cleanup must not hide the original failure or skip its audit.
+                    logging.getLogger(__name__).warning(
+                        "LLM transport cleanup failed (%s)", type(cleanup_error).__name__
+                    )
         output_text = "".join(content_parts)
         if tc_acc:
             # 仅用于估算工具调用输出 token，不会进入 trace 持久化字段。

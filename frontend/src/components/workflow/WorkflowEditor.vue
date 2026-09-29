@@ -11,10 +11,12 @@ import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import WFNode from './WFNode.vue'
 import WorkflowApprovalPolicyFields from './WorkflowApprovalPolicyFields.vue'
+import WorkflowResultFields from './WorkflowResultFields.vue'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import { api } from '@/api'
 import type { WorkflowRun } from '@/types'
 import { cloneForForm } from '@/utils/clone'
+import { workflowStatusSelection } from '@/utils/workflowStatus'
 import '@vue-flow/core/dist/style.css'
 import '@vue-flow/core/dist/theme-default.css'
 import '@vue-flow/controls/dist/style.css'
@@ -82,6 +84,7 @@ const nodes = ref<any[]>([])
 const edges = ref<any[]>([])
 const graph = ref<{ nodes: any[]; edges: any[] }>({ nodes: [], edges: [] })
 const selectedId = ref('')
+provide('selectWorkflowNode', (id: string) => { selectedId.value = id })
 const { screenToFlowCoordinate, fitView, addEdges, onConnect } = useVueFlow()
 
 const selNode = computed(() => nodes.value.find((n) => n.id === selectedId.value) || null)
@@ -441,6 +444,11 @@ function askAdvisor() {
   emit('ask-advisor', WORKFLOW_ADVISOR_PROMPT)
 }
 
+function changeStatus(value: unknown) {
+  const selected = workflowStatusSelection(value)
+  if (selected) wf.value = { ...wf.value, ...selected }
+}
+
 const wf = computed({
   get: () => {
     const workflow = props.modelValue || {}
@@ -464,7 +472,7 @@ const wf = computed({
       <el-button size="small" text @click="emit('close')"><el-icon><ArrowLeft /></el-icon> 返回</el-button>
       <el-input v-model="wf.name" size="small" class="wfe-name" placeholder="工作流名称，如：数据检查与通知流程" />
       <el-input v-model="wf.description" size="small" class="wfe-desc" placeholder="描述（可选）" />
-      <el-select v-model="wf.status" size="small" class="wfe-status" aria-label="工作流状态">
+      <el-select v-model="wf.status" size="small" class="wfe-status" aria-label="工作流状态" @change="changeStatus">
         <el-option label="草稿" value="draft" />
         <el-option label="启用" value="active" />
         <el-option label="停用" value="disabled" />
@@ -664,6 +672,7 @@ const wf = computed({
           </template>
 
           <template v-if="selNode.type === 'end'">
+            <WorkflowResultFields v-model:output="selNode.data.output" :trigger-config="wf.trigger_config" :node-id="selNode.id" />
             <div class="wfe-field">
               <label>结束摘要（支持变量）</label>
           <el-input v-model="selNode.data.summary" type="textarea" :rows="3" placeholder="如：流程完成，共处理 {{n2.result.matched}} 条记录" />

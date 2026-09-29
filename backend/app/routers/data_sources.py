@@ -835,7 +835,7 @@ def list_files(
 
 
 @router.post("/{ds_id}/files", response_model=list[BucketFileOut])
-async def upload_files(
+def upload_files(
     ds_id: str,
     files: list[UploadFile] = File(...),
     agent_id: str | None = Query(default=None, min_length=1, max_length=32),
@@ -857,7 +857,7 @@ async def upload_files(
         filename = uf.filename or "file"
         content_type = uf.content_type
         try:
-            staged = await upload_staging_service.stage_upload(
+            staged = upload_staging_service.stage_upload_sync(
                 uf,
                 max_bytes=int(settings.catalog_max_upload_bytes),
                 chunk_bytes=int(settings.upload_stream_chunk_bytes),

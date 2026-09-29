@@ -85,21 +85,21 @@ test('scenario lifecycle toggle binds stable values instead of display labels', 
   assert.doesNotMatch(toggle, /<el-radio-button\s+label=/)
 })
 
-test('scenario workspace starts with distillation and keeps all twelve stages in order', () => {
+test('scenario workspace starts with materials before distillation and keeps all twelve stages', () => {
   const detailSource = readFileSync(new URL('../src/views/ScenarioDetail.vue', import.meta.url), 'utf8')
   const scenariosSource = readFileSync(new URL('../src/views/Scenarios.vue', import.meta.url), 'utf8')
   const appSource = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
   const stages = [...detailSource.matchAll(/<el-tab-pane\b[^>]*\bname="([^"]+)"/g)].map((match) => match[1])
 
   assert.deepEqual(stages, [
-    'distillation', 'materials', 'ontology', 'instances', 'mappings', 'functions',
+    'materials', 'distillation', 'ontology', 'instances', 'mappings', 'functions',
     'actions', 'rules', 'events', 'workflows', 'capability-inputs', 'candidates',
   ])
   assert.match(detailSource, /<el-tab-pane name="distillation"[\s\S]*?业务蒸馏/)
   assert.match(detailSource, /<el-tab-pane name="materials"[\s\S]*?场景资料/)
   assert.match(detailSource, /normalizeScenarioStage\(route\.query\.stage\)/)
   assert.match(detailSource, /function goToDataSources\(\)[\s\S]*?stage: 'materials'/)
-  assert.match(scenariosSource, /query:\s*\{ stage: 'distillation' \}/)
+  assert.match(scenariosSource, /query:\s*\{ stage: 'materials' \}/)
   assert.match(appSource, /normalizeScenarioStage\(route\.query\.stage\)/)
   assert.match(appSource, /!\['distillation', 'materials'\]\.includes\(scenarioStage\.value\)/)
   assert.match(appSource, /<GlobalAssistant v-if="showGlobalAssistant"/)
@@ -118,7 +118,7 @@ test('scenario stage normalization gives navigation and the global advisor one f
   assert.equal(SCENARIO_STAGES.length, 12)
   assert.equal(normalizeScenarioStage('ontology'), 'ontology')
   for (const value of [undefined, null, '', 'unknown', ['invalid', 'ontology'], {}]) {
-    assert.equal(normalizeScenarioStage(value), 'distillation')
+    assert.equal(normalizeScenarioStage(value), 'materials')
   }
 })
 

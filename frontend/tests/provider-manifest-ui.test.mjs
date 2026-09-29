@@ -30,6 +30,20 @@ test('generic scenario view delegates Provider identity and config rendering', (
   assert.doesNotMatch(scenarioDetail, /provider_config\.semantic_mapping_ids/)
 })
 
+test('opening an AI candidate preserves its reviewed runtime and copies editable config', async () => {
+  const { candidateFunctionRuntime } = await loadProviderUtilities()
+  const payload = { runtime_kind: 'provider', runtime_config: {
+    provider_key: 'test.query', provider_version: '1.0.0', provider_config: { references: ['logical-map'] },
+  } }
+  const form = candidateFunctionRuntime(payload)
+  assert.deepEqual(form, payload)
+  form.runtime_config.provider_config.references.push('another')
+  assert.deepEqual(payload.runtime_config.provider_config.references, ['logical-map'])
+  assert.deepEqual(candidateFunctionRuntime({}), { runtime_kind: 'contract', runtime_config: {} })
+  assert.match(scenarioDetail, /\.\.\.candidateFunctionRuntime\(payload\)/)
+  assert.doesNotMatch(scenarioDetail, /A promoted AI draft starts as a non-runnable declaration/)
+})
+
 test('generic Provider editor renders only trusted manifest controls', () => {
   const editor = fs.readFileSync(editorPath, 'utf8')
   assert.match(editor, /config_schema/)

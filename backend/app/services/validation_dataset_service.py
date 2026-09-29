@@ -743,7 +743,7 @@ def _lock_validation_publication_scope(
             raise ValidationDatasetError("验证数据集归属校验失败")
         if dataset.lifecycle_status != "active":
             raise ValidationDatasetError("验证数据集已被删除，不能继续生成")
-        _assert_validation_dataset_versions_reusable(db, dataset, lock=True)
+        _assert_validation_dataset_versions_reusable(db, dataset)
 
     if job_id is not None or lease_token is not None:
         _assert_validation_job_lease_for_publication(
@@ -789,6 +789,8 @@ def _lock_validation_publication_scope(
     if {str(item.id) for item in assets} != asset_ids:
         raise ValidationDatasetError("验证资料已被删除或 Agent 已删除")
 
+    # Parent locks fence deletion. Immutable versions have SELECT/INSERT only;
+    # FOR UPDATE would require privileges the runtime deliberately does not have.
     current_versions = list(
         db.scalars(
             select(DataAssetVersion)
@@ -799,7 +801,6 @@ def _lock_validation_publication_scope(
                 DataAssetVersion.bucket_file_id.is_not(None),
             )
             .execution_options(populate_existing=True)
-            .with_for_update()
         ).all()
     )
     if {str(item.id) for item in current_versions} != expected_ids:
@@ -849,18 +850,14 @@ def _assert_validation_dataset_row(
 def _assert_validation_dataset_versions_reusable(
     db: Session,
     dataset: LogicalDataset,
-    *,
-    lock: bool = False,
 ) -> None:
-    """A tombstoned immutable package version must never be resurrected."""
+    """Reject tombstones; write callers fence retirement on LogicalDataset."""
 
     statement = select(DatasetVersion.id).where(
         DatasetVersion.tenant_id == dataset.tenant_id,
         DatasetVersion.dataset_id == dataset.id,
         DatasetVersion.status == "retired",
     )
-    if lock:
-        statement = statement.with_for_update()
     if db.scalar(statement.limit(1)) is not None:
         raise ValidationDatasetError("验证数据集版本已被删除，不能继续使用")
 
@@ -1014,7 +1011,7 @@ def enqueue_validation_dataset_job(
         db.flush()
     else:
         _assert_validation_dataset_row(dataset, agent_id=agent_id)
-        _assert_validation_dataset_versions_reusable(db, dataset, lock=True)
+        _assert_validation_dataset_versions_reusable(db, dataset)
     ready_version = db.scalar(
         select(DatasetVersion)
         .where(

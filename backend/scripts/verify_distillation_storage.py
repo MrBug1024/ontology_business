@@ -29,7 +29,7 @@ def verify_attachment_contract(connection: Any) -> dict[str, Any]:
         "uq_distillation_attachment_scope": ("distillation_attachments", "u",
             "UNIQUE (id, project_id, tenant_id)"),
         "uq_distillation_attachment_request": ("distillation_attachments", "u",
-            "UNIQUE (project_id, created_by, request_id)"),
+            "UNIQUE (tenant_id, created_by, request_id)"),
         "fk_distillation_turn_attachment_turn_scope": ("distillation_turn_attachments", "f",
             "FOREIGN KEY (turn_id, project_id, tenant_id) REFERENCES distillation_conversation_turns(id, project_id, tenant_id) ON DELETE RESTRICT"),
         "fk_distillation_turn_attachment_input_scope": ("distillation_turn_attachments", "f",

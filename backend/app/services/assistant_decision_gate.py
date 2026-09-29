@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .scenario_model_quality_service import is_generated_contract_issue
+
 
 _RESOURCE_SECTIONS = (
     "entities",
@@ -17,12 +19,18 @@ _RESOURCE_SECTIONS = (
     "mappings",
     "relation_mappings",
     "conceptual_mappings",
+    "semantic_mappings",
     "functions",
     "actions",
     "rules",
     "events",
     "workflows",
 )
+
+_SERVICE_FAILURE_CODES = frozenset({
+    "LLM_NOT_CONFIGURED", "COMPILER_PROVIDER_REQUEST_FAILED", "COMPILER_PROVIDER_UNAVAILABLE",
+    "COMPILER_EXECUTION_INTERRUPTED",
+})
 
 
 def _rows(payload: dict[str, Any], section: str) -> list[dict[str, Any]]:
@@ -68,6 +76,8 @@ def build_decision_gate(payload: dict[str, Any]) -> dict[str, Any]:
     issues = _issues(payload)
     coverage = _coverage(payload)
     blocking = [item for item in issues if item.get("blocking", True) is not False]
+    service_failures = [item for item in blocking
+                        if str(item.get("code") or "").upper() in _SERVICE_FAILURE_CODES]
     ambiguous_coverage = [item for item in coverage if str(item.get("status") or "").casefold() == "ambiguous"]
     modeled_coverage = [item for item in coverage if str(item.get("status") or "").casefold() == "modeled"]
     resource_counts = {
@@ -75,7 +85,41 @@ def build_decision_gate(payload: dict[str, Any]) -> dict[str, Any]:
         for section in _RESOURCE_SECTIONS
         if _rows(payload, section)
     }
+    # Transport failure cannot establish any business ambiguity. It remains
+    # blocked, with a service recovery reason instead of fabricated questions.
+    if service_failures and not resource_counts:
+        return {
+            "version": "decision-gate.v1", "mode": "candidate_review",
+            "reason_codes": ["COMPILATION_UNAVAILABLE"], "blocking_question_count": 0,
+            "blocking_issue_count": len(blocking), "ambiguous_coverage_count": 0,
+            "missing_evidence_resource_count": 0, "resource_counts": {}, "risk_codes": [],
+            "questions": [], "safe_to_formalize": False, "human_review_required": True,
+            "explanation": "模型服务未完成建设，尚不能判断资料覆盖与业务定义；恢复模型服务后可基于原资料重试。",
+        }
+    if (blocking and not ambiguous_coverage and all(
+        str(item.get("code") or "").upper() == "BASELINE_CHANGED_DURING_COMPILATION"
+        for item in blocking
+    )):
+        return {
+            "version": "decision-gate.v1", "mode": "candidate_review",
+            "reason_codes": ["SCENARIO_CONTEXT_CHANGED"], "blocking_question_count": 0,
+            "blocking_issue_count": len(blocking), "ambiguous_coverage_count": 0,
+            "missing_evidence_resource_count": 0, "resource_counts": resource_counts,
+            "risk_codes": [], "questions": [], "safe_to_formalize": False,
+            "human_review_required": True,
+            "explanation": "编译期间场景定义发生变化，候选已保留；请按当前定义重新校验并审阅候选，原编译结果不能直接写入。",
+        }
     risk_codes = _risk_codes(payload)
+    if blocking and all(is_generated_contract_issue(item) for item in blocking):
+        return {
+            "version": "decision-gate.v1", "mode": "candidate_review",
+            "reason_codes": ["CANDIDATE_VALIDATION_FAILED"], "blocking_question_count": 0,
+            "blocking_issue_count": len(blocking), "ambiguous_coverage_count": len(ambiguous_coverage),
+            "missing_evidence_resource_count": 0, "resource_counts": resource_counts,
+            "risk_codes": risk_codes, "questions": [], "safe_to_formalize": False,
+            "human_review_required": True,
+            "explanation": "顾问生成的定义仍有校验问题，已保留具体候选及修正要求；需要修正定义后重试，不能当作已建设完成或要求用户重新解释业务。",
+        }
     missing_evidence_resources = [
         f"{section}:{item.get('key') or item.get('name') or 'unnamed'}"
         for section in _RESOURCE_SECTIONS

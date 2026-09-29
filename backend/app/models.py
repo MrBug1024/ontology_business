@@ -1142,6 +1142,10 @@ class DocumentIndexJob(Base):
     bucket_file_id: Mapped[str] = mapped_column(
         ForeignKey("bucket_files.id", ondelete="CASCADE"), index=True, nullable=False
     )
+    requested_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", name="fk_document_index_jobs_requested_by_user", ondelete="SET NULL"),
+        index=True, nullable=True,
+    )
     # True: 从存储文件重新解析后索引；False: 使用当前 parsed_text 重建索引。
     parse_document: Mapped[bool] = mapped_column(Boolean, default=True)
     force: Mapped[bool] = mapped_column(Boolean, default=False)

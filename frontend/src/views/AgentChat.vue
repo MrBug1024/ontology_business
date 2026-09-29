@@ -69,7 +69,7 @@
               :active="m.streaming" :status-label="m.status" :tool-calls="m.tool_calls || []"
               :receipt-owners="receiptOwners" @updating="followReceipt"
             />
-            <SafeMarkdown v-if="m.role === 'assistant' && m.content" :content="m.content" />
+            <AssistantMessageContent v-if="m.role === 'assistant' && m.content" :content="m.content" :streaming="m.streaming" />
             <div v-else-if="m.content" class="user-message">{{ m.content }}</div>
             <MessageInputAttachments v-if="m.role === 'user'" :snapshot="m.input_snapshot" />
             <!-- 状态提示 -->
@@ -182,6 +182,7 @@ import type {
 } from '@/types'
 import AgentInvocationComposer from '@/components/AgentInvocationComposer.vue'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
+import AssistantMessageContent from '@/components/AssistantMessageContent.vue'
 import MessageInputAttachments from '@/components/agent/MessageInputAttachments.vue'
 import AgentExecutionTrace from '@/components/agent/AgentExecutionTrace.vue'
 import { capabilityInvocationId } from '@/utils/agentCapabilityReceipt'

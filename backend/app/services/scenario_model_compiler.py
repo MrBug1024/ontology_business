@@ -42,6 +42,7 @@ from ..models import (
 from ..schemas import EntityIn, PropertyIn, RelationDataMappingIn
 from . import (
     assistant_capability_modeling_service,
+    candidate_identity_projection,
     content_retrieval_service,
     connector_service,
     datasource_service,
@@ -53,9 +54,16 @@ from . import (
     operations_service,
     permission_service,
     provider_definition_service,
+    provider_schema_authoring,
     release_service,
     scenario_model_draft_service,
+    scenario_model_quality_service,
+    scenario_model_response_service,
+    semantic_mapping_authoring,
+    semantic_mapping_authoring_context,
     tenant_service,
+    workflow_authoring_data,
+    workflow_authoring_contract,
     workflow_service,
 )
 from .policies import PolicyViolation
@@ -65,7 +73,7 @@ SCHEMA_VERSION = "scenario_model.v1"
 # This version participates in the persistent assistant execution fingerprint.
 # Bump it whenever extraction/prompt semantics change in a way that should
 # permit recompiling otherwise identical inputs.
-COMPILER_VERSION = "scenario_model.compiler.v24"
+COMPILER_VERSION = "scenario_model.compiler.v48"
 MAX_SOURCE_CHARS = 100_000
 MAX_EXISTING_CATALOG_CHARS = 60_000
 MAX_MAPPING_CATALOG_CHARS = 60_000
@@ -91,6 +99,7 @@ _RESOURCE_SECTIONS = (
     "workflows",
     "mappings",
     "relation_mappings",
+    "semantic_mappings",
 )
 # These sections are deliberately draft-only.  They preserve useful document
 # interpretation even when the current runtime schema cannot safely persist it
@@ -159,6 +168,7 @@ _RESOURCE_KEY_PREFIXES = {
     "workflows": "workflow",
     "mappings": "mapping",
     "relation_mappings": "relation_mapping",
+    "semantic_mappings": "semantic_mapping",
     "instances": "instance",
     "conceptual_mappings": "conceptual_mapping",
 }
@@ -949,33 +959,6 @@ def _is_pure_compilation_control(message: str) -> bool:
         "基于当前staging草稿修正", "基于当前workingdraft修正",
     }:
         return True
-    if (
-        any(term in normalized for term in (
-            "草稿", "staging", "workingdraft", "当前模型", "现有模型", "已修改模型",
-        ))
-        and any(term in normalized for term in (
-            "继续", "完善", "优化", "修正", "修改", "校验", "验证", "编译",
-            "建模", "往下做", "接着做", "补全", "迭代",
-        ))
-    ):
-        return True
-    continuation_actions = (
-        "继续", "完善", "优化", "修正", "修改", "校验", "验证", "编译",
-        "建模", "往下做", "接着做", "补全", "迭代", "做完", "完成",
-    )
-    if (
-        any(term in normalized for term in continuation_actions)
-        and (
-            any(term in normalized for term in (
-                "场景模型", "业务模型", "模型", "本体", "对象类型", "映射", "函数",
-                "操作", "规则", "事件", "工作流", "流程", "建模任务",
-            ))
-            or any(term in normalized for term in (
-                "刚才的修改", "我的修改", "上述修改", "前面的修改", "已做的修改",
-            ))
-        )
-    ):
-        return True
     return bool(_PURE_COMPILATION_CONTROL_PATTERN.fullmatch(normalized))
 
 
@@ -999,8 +982,9 @@ def build_source_bundle(
     documents: Iterable[dict[str, Any]],
     *,
     has_working_drafts: bool = False,
+    complete_handoffs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build provenance from bounded retrieval results, never raw documents."""
+    """Freeze bounded attachment retrieval and complete governed handoff provenance."""
     document_list = content_retrieval_service.bounded_documents(
         list(documents),
         query=message,
@@ -1010,6 +994,10 @@ def build_source_bundle(
         # assistant attachment adapter stamps invocation_input explicitly.
         default_usage_plane="modeling_material",
     )
+    from .distillation_handoff_service import complete_compilation_documents
+    handoff_documents = complete_compilation_documents(complete_handoffs or [], max_chars=MAX_SOURCE_CHARS)
+    handoff_ids = {str(item.get("id") or "") for item in handoff_documents}
+    document_list.extend(handoff_documents)
     sources: list[dict[str, Any]] = []
     paragraphs: list[dict[str, str]] = []
     seen_source_ids: set[str] = set()
@@ -1044,8 +1032,11 @@ def build_source_bundle(
             == assistant_capability_modeling_service.MODELING_MATERIAL_USAGE_PLANE
         )
         units: list[str] = []
-        for passage in passages:
-            for paragraph in _paragraphs(str(passage.get("text") or "")):
+        structured_units = document.get("compilation_units") if source_id in handoff_ids else None
+        for passage_index, passage in enumerate(passages):
+            passage_units = (structured_units if structured_units and passage_index == 0
+                             else _paragraphs(str(passage.get("text") or "")))
+            for paragraph in passage_units:
                 units.append(paragraph)
                 paragraphs.append({
                     "ref": f"{source_id}:p{len(units):04d}",
@@ -1053,6 +1044,7 @@ def build_source_bundle(
                     "source_kind": "attachment",
                     "usage_plane": usage_plane,
                     "metadata_authoritative": metadata_authoritative,
+                    "structured_handoff": bool(structured_units),
                     "citation_id": _text(
                         passage.get("citation_id"), maximum=40
                     ),
@@ -1192,6 +1184,7 @@ def _mapping_catalog(
                 "type": source.type,
                 "tables": safe_tables,
             })
+    catalog.extend(semantic_mapping_authoring_context.catalog(db, scenario))
     return catalog, columns
 
 
@@ -1215,8 +1208,13 @@ def prepare_compilation_context(
     )
     from . import distillation_handoff_service, distillation_service
 
-    distillation_documents = distillation_service.modeling_documents(db, scenario.id)
+    distillation_documents = distillation_service.modeling_documents(db, scenario.id, for_compilation=True)
     distillation_handoff_service.require_compilation_decision(distillation_documents)
+    if distillation_documents:
+        # A prior AI response is not new business evidence. Regenerate from
+        # the complete human handoff, while retaining explicit user edits and
+        # their revision fences. Persistent candidates remain untouched.
+        working_drafts = [item for item in working_drafts if int(item.get("revision") or 0) > 0]
     mapping_canonical = json.dumps(
         mapping_catalog,
         ensure_ascii=False,
@@ -1318,7 +1316,7 @@ def _append_working_draft_sources(
             "filename": f"场景 working draft：{_text(item.get('title') or item.get('resource_key'), maximum=300)}",
             "source_kind": "working_draft",
             "metadata_authoritative": metadata_authoritative,
-            "semantic_role": "user_corrected_working_state",
+            "semantic_role": "user_corrected_working_state" if revision > 0 else "generated_candidate",
             "draft_id": draft_id,
             "proposal_id": _text(item.get("proposal_id"), maximum=64),
             "task_id": _text(item.get("task_id"), maximum=80),
@@ -1359,8 +1357,9 @@ def prepare_source_bundle_preview(
         raise ValueError("编译映射/working draft 上下文指纹不一致，拒绝使用非冻结输入")
     source_bundle = build_source_bundle(
         message,
-        [*documents, *distillation_documents],
+        documents,
         has_working_drafts=bool(working_drafts),
+        complete_handoffs=distillation_documents,
     )
     _append_working_draft_sources(source_bundle, working_drafts)
     return source_bundle
@@ -1421,6 +1420,8 @@ def _existing_catalog(
                 ),
                 "properties": [
                     {
+                        "id": prop.id,
+                        "api_name": prop.api_name,
                         "name": prop.name,
                         "data_type": prop.data_type,
                         "is_key": bool(prop.is_key),
@@ -1428,6 +1429,8 @@ def _existing_catalog(
                         "is_required": bool(prop.is_required),
                         "is_enum": bool(prop.is_enum),
                         "enum_values": prop.enum_values or [],
+                        "constraints": prop.constraints or {},
+                        "is_sensitive": bool(prop.is_sensitive),
                     }
                     for prop in entity.properties
                     if readable_property(prop)
@@ -1584,7 +1587,7 @@ _PROMPT = """你是业务本体文档编译器。只输出一个 JSON 对象，�
 2. 每个资源必须有稳定 key、evidence_refs（引用给定段落 ref）和 0~1 confidence。
 3. coverage 必须逐条覆盖所有段落，status 只能是 modeled/context/irrelevant/ambiguous，并给 reason；ambiguous 只阻止受影响的定义，安全资源仍可按任务边界继续建设。
 4. 对象类型使用行业通用名称；每个非抽象对象必须有且仅有一个 is_key=true 的主键属性和一个 is_title=true 的标题属性，二者可以是同一属性。关系基数只能 1:1、1:N、N:1、N:M；文档仅说明普通关联而没有任何基数限制时，用不施加隐式上限的 N:M。关系的 symmetric（对称）、transitive（传递）、irreflexive（反自反）、asymmetric（非对称）、antisymmetric（反对称）、acyclic（无环）和源/目标最小最大基数必须写入 relation.constraints，绝不能建模为 record rule。布尔约束只有在来源明确支持为真时才输出 JSON true；未明确时省略，不能根据关系名称猜测，也不要填充无意义的 false 默认值。基数必须输出大于等于 0 的 JSON 整数，无上限最大基数必须省略或写 null，不能写 N、many、* 或字符串数字。普通关系本来就能从源端和目标端双向遍历，不要为“反向查看”臆造逆关系；只有文档明确给出两个不同命名谓词或 inverseOf 时，才用 inverse_relation_ref 引用另一关系。查询型对称/传递/逆关系不会物化边。
-5. 函数只定义输入/输出 JSON Schema，不生成代码、URL、SQL 或运行配置。所有 Schema 的 type 只能是 object/array/string/number/integer/boolean/null；日期用 type=string+format=date，日期时间用 type=string+format=date-time，decimal/float 使用 type=number。
+5. 函数定义输入/输出 JSON Schema，并依据下方受信函数运行契约选择有证据支持的运行实现；不生成代码、URL 或 SQL。所有 Schema 的 type 只能是 object/array/string/number/integer/boolean/null；日期用 type=string+format=date，日期时间用 type=string+format=date-time，decimal/float 使用 type=number。
 6. 操作只描述输入、前置条件、后置效果，不生成执行器配置；平台会将其保存为停用的“待绑定”操作。
 7. 规则 condition 只允许 and/or/not 与比较操作 > >= < <= == != in not_in contains not_contains is_null is_not_null；每个叶子必须明确 op。字面量比较叶子必须且只能包含 field、op、value；字段对字段比较叶子必须且只能包含 field、op、value_field；判空叶子必须且只能包含 field、op；逻辑组合节点必须包含 op、conditions。value 与 value_field 必须且只能出现一个。field 和 value_field 都必须是 entity_ref 所指对象类型上已定义的直接属性；任何字段运算或偏移表达式必须先建模为函数或计算结果，关联对象上的字段必须通过关系查询或函数取得，绝不能把表达式或跨对象路径伪装成属性名。不得把另一个字段名塞进字符串 value，不得用 type/expression/自然语言代替 op；无法形成完整结构时仍输出规则候选并把 condition 中已知的合法部分保留下来，未知部分留空，同时写入 unresolved。类等价、类互斥、继承属于当前 P0 尚未承载的类公理，必须写入 unresolved；关系基数及关系特性必须进入 relation.constraints；两类都绝不能输出为对象记录规则。severity 只能是 info/warning/critical，未说明时省略并由平台默认为 info。
 8. 工作流允许 start/end/action/rule/llm/event/approval 节点；action/rule/event 节点用 resource_ref 引用同次生成 key、已有 ID 或唯一名称，llm 节点必须有受控 prompt。引用缺失、分支不全或资源尚未定义时，仍输出已知节点、边和引用文本作为工作流候选，并在 unresolved 逐项说明，不得因为无法正式运行而省略整个工作流。可正式应用的工作流必须是一个开始、一个结束、无环且所有路径可达结束；每个规则节点必须明确给出 label=true 和 label=false 两条分支，缺少分支目标时写入 unresolved，不得猜测。scheduled 目前只支持 trigger_config.interval_seconds（不支持 cron）；event 必须用 trigger_config.event_ref 引用事件。事件触发已经由 trigger_config 表示，不得再用 event 节点表示“收到触发事件”；event 节点只表示发布新的下游事件，禁止发布与本工作流触发事件相同的事件。approval 节点可配置 timeout_seconds 和 on_timeout(reject/timeout)。
@@ -1593,11 +1596,11 @@ _PROMPT = """你是业务本体文档编译器。只输出一个 JSON 对象，�
 11. instances 只提取来源明确给出的具体业务对象记录，不得编造样例数据。每条用 entity_ref 指向对象类型、values 保存来源明确给出的属性值；对象类型引用、主键或必填值缺失时仍保留实例候选并写 unresolved。实例是待用户核对的草稿，不会因生成而直接进入运行态。
 
 JSON 顶层字段固定为：
-schema_version, entities, relations, instances, functions, actions, rules, events, workflows, mappings, relation_mappings, conceptual_mappings, unresolved, coverage。
+schema_version, entities, relations, instances, functions, actions, rules, events, workflows, mappings, relation_mappings, conceptual_mappings, semantic_mappings, unresolved, coverage。
 entities: [{key,name,description,is_abstract,state_property,properties:[{name,data_type,description,is_key,is_title,is_required,is_enum,enum_values,default_value,constraints,is_sensitive}],evidence_refs,confidence}]
 relations: [{key,name,source_ref,target_ref,relation_type,constraints:{symmetric,transitive,irreflexive,asymmetric,antisymmetric,acyclic,source_min_cardinality,source_max_cardinality,target_min_cardinality,target_max_cardinality},inverse_relation_ref,description,evidence_refs,confidence}]
 instances: [{key,entity_ref,display_name,values,evidence_refs,confidence}]
-functions: [{key,name,description,input_schema,output_schema,tags,managed_data_ports:[{port_key,name,description,direction,role,media_kind,schema_document,is_required,cardinality,binding_policy,binding_kinds,evidence_kind,evidence_refs,confidence}],evidence_refs,confidence}]
+functions: [{key,name,description,input_schema,output_schema,schema_source,tags,runtime_kind,runtime_config,managed_data_ports:[{port_key,name,description,direction,role,media_kind,schema_document,is_required,cardinality,binding_policy,binding_kinds,evidence_kind,evidence_refs,confidence}],evidence_refs,confidence}]
 actions: [{key,name,entity_ref,description,input_schema,precondition,postcondition,managed_data_ports:[{port_key,name,description,direction,role,media_kind,schema_document,is_required,cardinality,binding_policy,binding_kinds,evidence_kind,evidence_refs,confidence}],evidence_refs,confidence}]
 rules: [{key,name,entity_ref,description,condition,action_on_match,trigger_action_refs,severity,evidence_refs,confidence}]
 events: [{key,name,description,payload_schema,trigger_source,evidence_refs,confidence}]
@@ -1630,8 +1633,8 @@ _ONTOLOGY_STAGE_PROMPT = """
 4. coverage 必须逐条覆盖全部来源 ref，status 只能是 modeled/context/irrelevant/ambiguous；change_keys 只能引用本次 entities 或 relations 的 key。不能因当前阶段尚未处理后续能力而漏掉覆盖。
 
 JSON 顶层字段固定为：
-schema_version, entities, relations, instances, functions, actions, rules, events, workflows, mappings, relation_mappings, conceptual_mappings, unresolved, coverage。
-本阶段只有 entities 和 relations 可以非空；instances、functions、actions、rules、events、workflows、mappings、relation_mappings、conceptual_mappings 必须输出空数组 []。不得把后续阶段的业务事实塞入 unresolved。
+schema_version, entities, relations, instances, functions, actions, rules, events, workflows, mappings, relation_mappings, conceptual_mappings, semantic_mappings, unresolved, coverage。
+本阶段只有 entities 和 relations 可以非空；instances、functions、actions、rules、events、workflows、mappings、relation_mappings、conceptual_mappings、semantic_mappings 必须输出空数组 []。不得把后续阶段的业务事实塞入 unresolved。
 entities: [{key,name,description,is_abstract,state_property,properties:[{name,data_type,description,is_key,is_title,is_required,is_enum,enum_values,default_value,constraints,is_sensitive}],evidence_refs,confidence}]
 relations: [{key,name,source_ref,target_ref,relation_type,constraints:{symmetric,transitive,irreflexive,asymmetric,antisymmetric,acyclic,source_min_cardinality,source_max_cardinality,target_min_cardinality,target_max_cardinality},inverse_relation_ref,description,evidence_refs,confidence}]
 unresolved: [{code,message,source_refs,blocking}]
@@ -1647,7 +1650,7 @@ _STAGED_TASK_BASE_PROMPT = """
 2. 只有 usage_plane=modeling_material 的附件与本次用户描述是正式建模证据；其他附件仅是本轮解释上下文，不得生成可晋级的 Schema、端口或映射。只有用户明确表示“修正、改为、替换、删除、以此为准”时才覆盖旧口径；没有明确覆盖意图的冲突必须写 unresolved，不能自行选边。
 3. 每个候选必须有稳定 key、evidence_refs 和 0~1 confidence。缺失信息时保留有证据支持的候选，并在 unresolved 写清缺口；不得臆造字段、值、引用、数据源、表、列或执行配置。
 4. 必须逐条输出全部来源 ref 的 coverage，status 只能是 modeled/context/irrelevant/ambiguous。当前阶段不处理的内容标记 context，并说明“保留到后续任务”；不能因此漏段、报错或伪装为已完成。
-5. 只能输出一个 JSON 对象，不输出 Markdown。顶层字段固定为：schema_version, entities, relations, instances, functions, actions, rules, events, workflows, mappings, relation_mappings, conceptual_mappings, unresolved, coverage。未获允许的资源字段必须是空数组 []。
+5. 只能输出一个 JSON 对象，不输出 Markdown。顶层字段固定为：schema_version, entities, relations, instances, functions, actions, rules, events, workflows, mappings, relation_mappings, conceptual_mappings, semantic_mappings, unresolved, coverage。未获允许的资源字段必须是空数组 []。
 """
 
 
@@ -1664,7 +1667,7 @@ coverage: [{source_ref,status,reason,change_keys}]
     "mapping": """
 当前只建设“数据映射”阶段。
 - mappings 只能使用“可用数据源表结构”中真实的 data_source_id、表名和列名；不得猜测物理库表或字段。
-- 没有已配置数据源，但用户描述或 modeling_material 明确说明逻辑来源、表/文件或字段对应时，输出 conceptual_mappings，并用 blocking=false 的 MAPPING_DEFERRED_NO_DATA_SOURCE 说明物理绑定延期。非建模附件不能成为映射来源。
+- 同时缺少已配置数据源和 Catalog semantic_schema，但用户描述或 modeling_material 明确说明逻辑来源、表/文件或字段对应时，输出 conceptual_mappings，并用 blocking=false 的 MAPPING_DEFERRED_NO_DATA_SOURCE 说明物理绑定延期。非建模附件不能成为映射来源。
 - relation_mappings 只能引用已确认或本次 mappings 的映射，以及已确认关系；mode 只能是 source_fk、target_fk、join_table。端点或物理字段不完整时保留逻辑关系映射候选，不伪造绑定。
 mappings: [{key,entity_ref,data_source_ref,table_name,column_map,evidence_refs,confidence}]
 relation_mappings: [{key,relation_ref,source_mapping_ref,target_mapping_ref,mode,foreign_key_column,join_data_source_ref,join_table_name,source_key_column,target_key_column,evidence_refs,confidence}]
@@ -1674,13 +1677,13 @@ coverage: [{source_ref,status,reason,change_keys}]
 """,
     "capabilities": """
 当前只建设“业务能力”阶段。
-- functions 只定义输入/输出 JSON Schema；type 只能是 object/array/string/number/integer/boolean/null。不得生成代码、URL、SQL 或运行配置。
+- functions 定义输入/输出 JSON Schema，并根据下方受信函数运行契约选择有证据支持的 runtime_kind/runtime_config；type 只能是 object/array/string/number/integer/boolean/null。不得生成代码、URL 或 SQL。
 - input_schema/output_schema 描述每次调用需要提交和返回的逻辑内容；从用户明确文本或 modeling_material 交互需求建模时不要求存在 DataSource。invocation_input、generated_output 及验证资料不能成为 Schema、端口或固定运行绑定来源。
 - 普通文本和 JSON 参数只属于 input_schema/output_schema。仅当来源明确要求版本化数据、文档/附件、reference/rules 或 connector 依赖时，才在对应 Function/Action/Workflow 上声明 managed_data_ports；端口 evidence_kind 只能是 versioned_data、document_attachment、reference、rules、connector，且必须引用该能力已有的 evidence_refs。不得填写任何资源 ID、表名、路径或连接信息。
 - 同一业务输入可由上传数据集或远程数据库二选一提供时，声明单个 structured 端口，并同时列出 dataset_version、dataset_head、connector_binding；同一数据包的多张关联表只使用一个端口。
 - actions 只描述输入、前置条件、后置效果；entity_ref 必须引用已确认对象。不得发明执行器、自动发布或未在资料中出现的业务能力。
 - 函数、操作引用不完整时保留有证据的候选并写 unresolved；操作默认待绑定、停用。
-functions: [{key,name,description,input_schema,output_schema,tags,managed_data_ports:[{port_key,name,description,direction,role,media_kind,schema_document,is_required,cardinality,binding_policy,binding_kinds,evidence_kind,evidence_refs,confidence}],evidence_refs,confidence}]
+functions: [{key,name,description,input_schema,output_schema,schema_source,tags,runtime_kind,runtime_config,managed_data_ports:[{port_key,name,description,direction,role,media_kind,schema_document,is_required,cardinality,binding_policy,binding_kinds,evidence_kind,evidence_refs,confidence}],evidence_refs,confidence}]
 actions: [{key,name,entity_ref,description,input_schema,precondition,postcondition,managed_data_ports:[{port_key,name,description,direction,role,media_kind,schema_document,is_required,cardinality,binding_policy,binding_kinds,evidence_kind,evidence_refs,confidence}],evidence_refs,confidence}]
 unresolved: [{code,message,source_refs,blocking}]
 coverage: [{source_ref,status,reason,change_keys}]
@@ -1778,6 +1781,13 @@ def _compiler_prompt(
         )
     else:
         task_instruction = _text(raw_message, maximum=12_000)
+    # Every chunk needs the same task boundary, even when the request's
+    # evidence paragraph belongs to another chunk. It is not a new citation.
+    task_instruction += (
+        "\n本次用户要求（用于限定建设范围；其中业务事实仍须引用下方实际来源）：\n"
+        + _text(raw_message, maximum=12_000)
+        + "\n只建设本次明确要求的资源；其余来源保留 context 覆盖，不扩展为本轮建设目标。"
+    )
     existing_catalog = json.dumps(
         _existing_catalog(scenario, db),
         ensure_ascii=False,
@@ -1803,6 +1813,21 @@ def _compiler_prompt(
         (_staged_task_prompt(task_scope) if task_scope else _PROMPT)
         + chunk_instruction
         + _task_scope_instruction(task_scope)
+        + f'\n输出协议：schema_version 必须精确为 "{SCHEMA_VERSION}"。\n'
+        + "对象 properties 的 data_type 使用 string/number/integer/boolean/date/datetime/object/array/null；"
+        "日期类型不要写额外 format 字段。属性 constraints 必须为对象，无约束写 {}，不能写 [] 或 null。"
+        "JSON Schema 中的日期才使用 type=string 与 format=date/date-time。"
+        "已有属性的类型、主键、必填和枚举以当前场景目录为准，不得为补全描述而改变这些结构。"
+        "已有 float 是平台支持的属性类型，必须保留，不需要向用户提出数据库转换问题。"
+        "业务唯一标识可用于本体 is_key；源文件没有物理数据库主键约束不等于缺少业务标识，不要求数据库 DDL。"
+        "来源列出的属性必须逐项保留，不得只挑核心字段；字段数描述与实际列表不一致时保留完整列表并指出具体差异。"
+        "复用已有对象时 name 必须精确采用当前场景对象名，不能改用其来源表名重新新建对象。"
+        "已有且完全不变的属性可以不重复输出，服务端会保留它们；source_entity_bindings 仍需对应全部来源属性，"
+        "并明确指向已有或本次新增属性。新增属性必须给出完整定义。"
+        "模板的输出字段和流程步骤不等于已发生的业务实例。不要从小样本推断永久唯一性或基数约束。\n"
+        "已有属性的 is_title、is_sensitive 和 constraints 也必须保持。属性本身不得添加 evidence_refs/confidence，引用写在所属对象上。"
+        "revision=0 的 working_draft 是未编辑的模型候选，不是用户确认或新业务事实；其中缺失字段和编译错误不构成业务歧义。"
+        "所有 working_draft 内嵌的旧 source_refs/evidence_refs 只作历史记录，不得复制为本次引用。\n"
         + "\n当前场景：\n"
         + existing_catalog
         + "\n可用数据源表结构：\n"
@@ -1813,7 +1838,25 @@ def _compiler_prompt(
         + "\n待逐段编译的业务语义来源（附件只包含服务端按需返回的有界片段；"
         "只能引用给出的 ref，不得声称读取或覆盖未返回的原始内容）：\n"
         + json.dumps(paragraphs, ensure_ascii=False, separators=(",", ":"))
+        + "\n本轮 evidence_refs/coverage.source_ref 唯一允许的引用地址如下。"
+        "文档内容内的 evidence.key、evidence_refs 等业务证据编号不是这些地址；"
+        "引用它们的事实时，必须填写承载该内容的外层段落 ref：\n"
+        + json.dumps([item["ref"] for item in paragraphs], ensure_ascii=False)
     )
+    if task_scope in {"", "ontology"} and any(item.get("structured_handoff") for item in paragraphs):
+        from .distillation_model_coverage import COVERAGE_GUIDANCE
+        prompt += COVERAGE_GUIDANCE
+    if task_scope in {"", "mapping"}:
+        prompt += semantic_mapping_authoring.AUTHORING_GUIDANCE
+    if task_scope in {"", "capabilities"}:
+        from .function_authoring_context import compiler_runtime_context
+        prompt += compiler_runtime_context(db, scenario)
+    if task_scope in {"", "capabilities", "workflows"}:
+        from .managed_port_authoring import authoring_context
+        prompt += authoring_context()
+    if task_scope in {"", "workflows"}:
+        prompt += workflow_authoring_data.AUTHORING_GUIDANCE
+        prompt += workflow_authoring_contract.AUTHORING_GUIDANCE
     if len(prompt) > MAX_COMPILER_PROMPT_CHARS:
         raise ValueError(
             f"完整编译提示共 {len(prompt)} 个字符，超过单次 "
@@ -1886,6 +1929,7 @@ def _validate_raw_contract(raw: Any) -> dict[str, Any]:
                 for section in _DRAFT_ONLY_RESOURCE_SECTIONS
             },
         }
+    raw = {"semantic_mappings": [], **raw}
     for section in (*_MODEL_OUTPUT_RESOURCE_SECTIONS, "unresolved", "coverage"):
         if not isinstance(raw.get(section), list):
             raise _CompilerContractInvalid(f"复合业务模型字段 {section} 必须是数组")
@@ -2151,7 +2195,7 @@ def _chat_raw_model(
     best_salvage_score = -1
     for attempt_index in range(attempts):
         try:
-            response = llm_service.chat(
+            response = scenario_model_response_service.chat(
                 llm,
                 [
                     {"role": "system", "content": "你只输出符合给定闭合契约的合法 JSON。"},
@@ -2171,6 +2215,8 @@ def _chat_raw_model(
                     if call_budget is not None else None
                 ),
             )
+        except CompilationCallBudgetExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001 - only known transient failures retry.
             # A provider timeout may already have consumed the full request
             # deadline; retrying it synchronously can multiply latency by
@@ -2191,7 +2237,7 @@ def _chat_raw_model(
             raise _CompilerOutputTruncated("分块编译输出达到 token 上限")
         extracted: Any = None
         try:
-            extracted = ontology_service._extract_json(response.get("content", ""))
+            extracted = scenario_model_response_service.extract_model_output(response.get("content", ""))
             if allowed_refs is not None:
                 extracted = _canonicalize_chunk_schema_version(extracted)
             raw = _validate_raw_contract(extracted)
@@ -2199,6 +2245,20 @@ def _chat_raw_model(
                 _validate_chunk_source_scope(raw, allowed_refs=allowed_refs)
             return raw
         except Exception as exc:  # noqa: BLE001 - retry malformed model output.
+            if isinstance(exc, _ChunkSourceScopeViolation):
+                # A rejected response never enters salvage or a checkpoint.
+                # Give the provider bounded corrective feedback, then validate
+                # the replacement against the exact same source boundary.
+                revised_prompt = scenario_model_quality_service.feedback_prompt(
+                    prompt, extracted,
+                    [{"code": "invalid_source_scope", "message": str(exc)[:1000],
+                      "allowed_refs": sorted(allowed_refs or ())}],
+                    limit=MAX_COMPILER_PROMPT_CHARS,
+                )
+                if attempt_index + 1 < attempts and revised_prompt is not None:
+                    prompt = revised_prompt
+                    continue
+                raise
             # Provenance scope is a security boundary, not a recoverable JSON
             # shape problem. Never erase foreign refs and continue as though
             # the chunk were an ordinary inert draft.
@@ -2238,12 +2298,17 @@ def _chat_raw_model(
                     "分块编译返回了在末尾截断的超长 JSON"
                 ) from exc
             last_error = exc
+            prompt = scenario_model_quality_service.feedback_prompt(
+                prompt, extracted,
+                [{"code": "compiler_contract_error", "message": str(exc)[:1000]}],
+                limit=MAX_COMPILER_PROMPT_CHARS,
+            ) or prompt
     if best_salvage_raw is not None and allowed_refs is not None:
         return _coerce_contract_for_draft_salvage(
             best_salvage_raw,
             valid_sources=allowed_refs,
         )
-    raise ValueError(f"复合业务模型连续 {attempts} 次输出无效：{last_error}")
+    raise _CompilerContractInvalid(f"复合业务模型连续 {attempts} 次输出无效：{last_error}")
 
 
 def _missing_fragment(value: Any) -> bool:
@@ -2419,6 +2484,8 @@ def _merge_resource_fragment(
     ] | None = None,
 ) -> None:
     if section == "entities":
+        from .distillation_model_coverage import align_binding_fragments
+        align_binding_fragments(target, incoming)
         _canonicalize_merged_entity_enum_flags(target, incoming)
         _canonicalize_merged_entity_property_types(target, incoming)
     elif section == "relations":
@@ -2747,7 +2814,7 @@ def _merge_chunk_models(models: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 name = str(item.get("name") or "").strip()
                 key_match = by_key.get(key) if key else None
                 has_semantic_name = section not in {
-                    "mappings", "relation_mappings", "conceptual_mappings"
+                    "mappings", "relation_mappings", "conceptual_mappings", "semantic_mappings"
                 }
                 name_match = by_name.get(name) if name and has_semantic_name else None
                 if key_match is not None and name_match is not None and key_match is not name_match:
@@ -2984,7 +3051,8 @@ def _mark_staged_task_result(payload: dict[str, Any], task_scope: str) -> dict[s
         if isinstance(existing, dict)
         else []
     )
-    if task_scope not in generated:
+    has_candidates = any(result.get(section) for section in (*_MODEL_OUTPUT_RESOURCE_SECTIONS, "draft_candidates"))
+    if task_scope not in generated and (has_candidates or not result.get("unresolved")):
         generated.append(task_scope)
     result["generation"] = {
         "mode": "staged",
@@ -3474,6 +3542,13 @@ def _compile_scenario_model_in_chunks(
                 )
 
     if not contract_salvaged:
+        normalized = scenario_model_quality_service.repair_compilation(
+            db, scenario, _restrict_raw_to_task_scope(_merge_chunk_models(chunk_models), task_scope),
+            normalized, message=message, llm=llm, source_bundle=source_bundle,
+            mapping_catalog=mapping_catalog, columns=columns, call_budget=call_budget,
+            request_timeout=request_timeout, on_progress=on_progress, task_scope=task_scope,
+            modeling_reference_context=modeling_reference_context,
+        )
         try:
             if not any(
                 item.get("blocking", True)
@@ -3495,9 +3570,9 @@ def _compile_scenario_model_in_chunks(
         _notify_progress(
             on_progress,
             "mapping",
-            f"已整理 {len(normalized.get('mappings') or [])} 条数据映射和 {len(normalized.get('relation_mappings') or [])} 条关系映射。",
+            f"已整理 {(len(normalized.get('mappings') or []) + len(normalized.get('semantic_mappings') or []))} 条数据映射和 {len(normalized.get('relation_mappings') or [])} 条关系映射。",
             "done",
-            f"已整理 {len(normalized.get('mappings') or []) + len(normalized.get('relation_mappings') or [])} 条数据映射。",
+            f"已整理 {(len(normalized.get('mappings') or []) + len(normalized.get('semantic_mappings') or [])) + len(normalized.get('relation_mappings') or [])} 条数据映射。",
         )
         _notify_progress(on_progress, "rules", "正在校验规则、事件、工作流及跨资源引用。", "running")
         _notify_progress(
@@ -3581,15 +3656,13 @@ def compile_scenario_model(
         on_progress,
         "plan",
         (
-            f"已保留完整任务计划，本轮只生成“{stage_definition['title']}”，"
-            "其余任务会在确认后继续。"
+            f"本轮生成“{stage_definition['title']}”，并校验其引用的已有定义。"
             if stage_definition is not None
             else "已拆解为本体、实例、映射、业务能力、规则事件和工作流任务，开始逐项执行。"
         ),
         "done",
         (
-            f"已开始第 {next(index for index, item in enumerate(_MODEL_TASK_DEFINITIONS, 1) if item['id'] == task_scope)}/"
-            f"{len(_MODEL_TASK_DEFINITIONS)} 项：{stage_definition['title']}。"
+            f"已开始本轮任务：{stage_definition['title']}。"
             if stage_definition is not None
             else "已生成 6 个连续建模任务，后续会在会话中逐项推进并在需要时等待确认。"
         ),
@@ -3600,7 +3673,7 @@ def compile_scenario_model(
             on_progress=on_progress,
             code="LLM_NOT_CONFIGURED",
             message=(
-                "当前没有可用的 AI 模型；系统已根据来源建立分阶段占位草稿，"
+                "当前没有可用的 AI 模型；本轮未生成任何模型定义，"
                 "正式模型保持零写入。"
             ),
         ), task_scope)
@@ -3644,7 +3717,7 @@ def compile_scenario_model(
     )
     for attempt_index in range(3):
         try:
-            response = llm_service.chat(
+            response = scenario_model_response_service.chat(
                 llm,
                 [
                     {"role": "system", "content": "你只输出符合给定闭合契约的合法 JSON。"},
@@ -3664,6 +3737,8 @@ def compile_scenario_model(
                     if call_budget is not None else None
                 ),
             )
+        except CompilationCallBudgetExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001 - bounded transport recovery only.
             if _is_provider_timeout(exc):
                 return _compile_scenario_model_in_chunks(
@@ -3687,8 +3762,8 @@ def compile_scenario_model(
                     on_progress=on_progress,
                     code="COMPILER_PROVIDER_REQUEST_FAILED",
                     message=(
-                        "模型服务拒绝了结构化编译请求；系统已保留分阶段占位草稿，"
-                        "等待修正模型配置或继续人工编辑。"
+                        "模型服务拒绝了结构化编译请求；本轮没有生成可用定义，"
+                        "请修正模型配置后重试。"
                     ),
                 ), task_scope)
             last_error = exc
@@ -3699,8 +3774,8 @@ def compile_scenario_model(
                 on_progress=on_progress,
                 code="COMPILER_PROVIDER_UNAVAILABLE",
                 message=(
-                    "模型服务连接连续失败；系统已保留分阶段占位草稿，"
-                    "服务恢复后可基于这些草稿继续。"
+                    "模型服务连接连续失败；本轮没有生成可用定义，"
+                    "服务恢复后可基于原始资料重试。"
                 ),
             ), task_scope)
         if _response_finish_reason(response) == "length":
@@ -3722,7 +3797,7 @@ def compile_scenario_model(
         raw: Any = None
         try:
             raw = _restrict_raw_to_task_scope(
-                ontology_service._extract_json(response.get("content", "")),
+                scenario_model_response_service.extract_model_output(response.get("content", "")),
                 task_scope,
             )
             normalized = normalize_scenario_model(
@@ -3733,25 +3808,24 @@ def compile_scenario_model(
                 mapping_catalog=mapping_catalog,
                 columns_by_table=columns,
             )
+            normalized = scenario_model_quality_service.repair_compilation(
+                db, scenario, raw, normalized, message=message, llm=llm,
+                source_bundle=source_bundle, mapping_catalog=mapping_catalog, columns=columns,
+                call_budget=call_budget, request_timeout=request_timeout, on_progress=on_progress,
+                task_scope=task_scope, modeling_reference_context=modeling_reference_context,
+            )
             ontology_detail = (
-                f"已完成本体模型：对象 {len(normalized.get('entities') or [])} 个，"
-                f"关系 {len(normalized.get('relations') or [])} 个。"
-                if task_scope == "ontology"
-                else f"本体与业务能力已完成：对象 {len(normalized.get('entities') or [])} 个，"
+                f"已生成“{stage_definition['title']}”候选 "
+                f"{sum(len(normalized.get(section) or []) for section in stage_definition['sections'])} 项，正在校验。"
+                if stage_definition is not None
+                else f"已识别本体与业务能力候选：对象 {len(normalized.get('entities') or [])} 个，"
                 f"关系 {len(normalized.get('relations') or [])} 个，函数/操作 "
                 f"{len(normalized.get('functions') or []) + len(normalized.get('actions') or [])} 个。"
             )
             _notify_progress(
                 on_progress,
                 "ontology",
-                (
-                    f"已识别 {len(normalized.get('entities') or [])} 个对象、"
-                    f"{len(normalized.get('relations') or [])} 个关系。"
-                    if task_scope == "ontology"
-                    else f"已识别 {len(normalized.get('entities') or [])} 个对象、"
-                    f"{len(normalized.get('relations') or [])} 个关系和 "
-                    f"{len(normalized.get('functions') or []) + len(normalized.get('actions') or [])} 个业务能力。"
-                ),
+                ontology_detail,
                 "done",
                 ontology_detail,
             )
@@ -3759,9 +3833,9 @@ def compile_scenario_model(
                 _notify_progress(
                     on_progress,
                     "mapping",
-                    f"已整理 {len(normalized.get('mappings') or [])} 条数据映射和 {len(normalized.get('relation_mappings') or [])} 条关系映射。",
+                    f"已整理 {(len(normalized.get('mappings') or []) + len(normalized.get('semantic_mappings') or []))} 条数据映射和 {len(normalized.get('relation_mappings') or [])} 条关系映射。",
                     "done",
-                    f"数据映射已完成：共 {len(normalized.get('mappings') or []) + len(normalized.get('relation_mappings') or [])} 条。",
+                    f"数据映射已完成：共 {(len(normalized.get('mappings') or []) + len(normalized.get('semantic_mappings') or [])) + len(normalized.get('relation_mappings') or [])} 条。",
                 )
                 _notify_progress(on_progress, "rules", "正在校验规则、事件、工作流及跨资源引用。", "running")
             if not any(
@@ -3798,12 +3872,19 @@ def compile_scenario_model(
                 "已将本轮结构校验通过的业务定义同步到场景页面。",
             )
             return _mark_staged_task_result(normalized, task_scope)
+        except CompilationCallBudgetExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001 - retry malformed model output.
             score = _contract_salvage_score(raw)
             if isinstance(raw, dict) and score > best_salvage_score:
                 best_salvage_raw = copy.deepcopy(raw)
                 best_salvage_score = score
             last_error = exc
+            prompt = scenario_model_quality_service.feedback_prompt(
+                prompt, raw,
+                [{"code": "compiler_contract_error", "message": str(exc)[:1000]}],
+                limit=MAX_COMPILER_PROMPT_CHARS,
+            ) or prompt
     if best_salvage_raw is not None:
         salvaged = _inert_contract_salvage_payload(
             _restrict_raw_to_task_scope(best_salvage_raw, task_scope),
@@ -3821,9 +3902,9 @@ def compile_scenario_model(
             _notify_progress(
                 on_progress,
                 "mapping",
-                "模型结构校验未通过；已保留可识别映射并建立可编辑映射占位草稿。",
+                "模型结构校验未通过；仅保留实际生成的具体映射供修复。",
                 "done",
-                "数据映射阶段已形成停用草稿，不会因结构问题留在空白或 pending 状态。",
+                "未生成的映射保持未完成；不会用空白占位表示已建设。",
             )
             _notify_progress(
                 on_progress,
@@ -3845,7 +3926,7 @@ def compile_scenario_model(
             "已将可识别的停用候选同步到场景页面，等待继续修正。",
         )
         return _mark_staged_task_result(salvaged, task_scope)
-    raise ValueError(f"复合业务模型连续三次编译失败：{last_error}")
+    raise ValueError("复合业务模型连续三次未返回有效结构") from last_error
 
 
 def _meta(
@@ -3870,7 +3951,7 @@ def _meta(
             "source_refs": [],
             "blocking": True,
         })
-    if not evidence:
+    if not evidence and not invalid:
         unresolved.append({
             "code": "missing_evidence",
             "message": f"{key} 没有可核验的来源段落",
@@ -3913,9 +3994,10 @@ def _issue(
         candidate["affected_change_keys"] = affected
     if resolution_hint:
         candidate["resolution_hint"] = str(resolution_hint)
-    signature = (candidate["code"], candidate["message"], tuple(candidate["source_refs"]))
+    signature = (candidate["code"], candidate["message"], tuple(candidate["source_refs"]), tuple(affected))
     existing = {
-        (item.get("code"), item.get("message"), tuple(item.get("source_refs") or []))
+        (item.get("code"), item.get("message"), tuple(item.get("source_refs") or []),
+         tuple(item.get("affected_change_keys") or []))
         for item in unresolved
     }
     if signature not in existing:
@@ -4006,6 +4088,10 @@ def _issue_affected_resource_keys(
     whole change set.  This deliberately skips too much rather than risking a
     partially persisted invalid dependency.
     """
+    # This code is emitted only by the deterministic Catalog validator. Raw
+    # model issues are wrapped as document_reported_issue and cannot narrow it.
+    if issue.get("code") == "invalid_semantic_mapping" and issue.get("affected_change_keys"):
+        return {str(key) for key in issue["affected_change_keys"]}
     source_refs = {
         str(value) for value in (issue.get("source_refs") or []) if str(value)
     }
@@ -4072,6 +4158,7 @@ _DRAFT_RESOURCE_KIND_BY_SECTION = {
     "workflows": "workflow",
     "mappings": "mapping",
     "relation_mappings": "relation_mapping",
+    "semantic_mappings": "semantic_mapping",
     "conceptual_mappings": "conceptual_mapping",
 }
 _DRAFT_TASK_BY_SECTION = {
@@ -4081,6 +4168,7 @@ _DRAFT_TASK_BY_SECTION = {
     "mappings": "mapping",
     "relation_mappings": "mapping",
     "conceptual_mappings": "mapping",
+    "semantic_mappings": "mapping",
     "functions": "capabilities",
     "actions": "capabilities",
     "rules": "rules",
@@ -4167,6 +4255,7 @@ def _build_draft_candidates(
             source_matches = bool(
                 issue.get("code")
                 != assistant_capability_modeling_service.NON_MODELING_METADATA_ISSUE_CODE
+                and not (issue.get("code") == "invalid_semantic_mapping" and affected)
                 and evidence.intersection(issue_sources)
             )
             is_global = not affected and not issue_sources
@@ -4293,7 +4382,9 @@ def _build_draft_candidates(
                     or resource_key,
                     maximum=300,
                 ),
-                "payload": release_service.safe_snapshot_content(copy.deepcopy(item)),
+                "payload": release_service.safe_snapshot_content(
+                    candidate_identity_projection.project_identity(section, item, normalized)
+                ),
                 "evidence_refs": evidence_refs,
                 "validation_issues": validation_issues[:100],
                 "validation_status": validation_status,
@@ -4393,129 +4484,6 @@ def _build_draft_candidates(
     return candidates
 
 
-def _empty_contract_placeholder_candidates(
-    *,
-    valid_sources: set[str],
-    contract_issue: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Create editable stage anchors when no provider candidate is recoverable."""
-    evidence_refs = sorted(valid_sources)
-    digest = hashlib.sha256(
-        "\n".join(evidence_refs).encode("utf-8")
-    ).hexdigest()[:12]
-    issue = _public_draft_issue(contract_issue)
-    empty_issue = {
-        "code": "COMPILER_NO_RECOVERABLE_CANDIDATE",
-        "message": "模型没有返回可识别定义；已按来源建立可编辑占位草稿，任务不会以空白结果结束。",
-        "source_refs": evidence_refs,
-        "blocking": True,
-        "resolution_hint": "请直接补充草稿字段，或让助手基于当前占位草稿和原附件继续生成具体定义。",
-        "affected_change_keys": [],
-    }
-    definitions = (
-        (
-            "entity",
-            f"entity.draft_placeholder.{digest}",
-            "ontology",
-            "待补充业务对象",
-            {
-                "key": f"entity.draft_placeholder.{digest}",
-                "name": "待补充业务对象",
-                "description": "请根据原始附件和业务描述补充对象、属性与关系。",
-                "properties": [],
-            },
-        ),
-        (
-            "instance",
-            f"instance.draft_placeholder.{digest}",
-            "instances",
-            "待补充对象实例",
-            {
-                "key": f"instance.draft_placeholder.{digest}",
-                "name": "待补充对象实例",
-                "entity_ref": "",
-                "values": {},
-            },
-        ),
-        (
-            "conceptual_mapping",
-            f"conceptual_mapping.draft_placeholder.{digest}",
-            "mapping",
-            "待补充逻辑数据映射",
-            {
-                "key": f"conceptual_mapping.draft_placeholder.{digest}",
-                "mapping_kind": "entity",
-                "entity_ref": "",
-                "source_label": "待根据附件确认的数据来源",
-                "table_name": "",
-                "column_map": {},
-                "binding_requirements": ["补充逻辑来源和字段对应关系"],
-            },
-        ),
-        (
-            "function",
-            f"function.draft_placeholder.{digest}",
-            "capabilities",
-            "待补充业务能力",
-            {
-                "key": f"function.draft_placeholder.{digest}",
-                "name": "待补充业务能力",
-                "description": "请根据原始附件补充输入、输出和执行语义。",
-                "input_schema": {},
-                "output_schema": {},
-            },
-        ),
-        (
-            "rule",
-            f"rule.draft_placeholder.{digest}",
-            "rules",
-            "待补充业务规则",
-            {
-                "key": f"rule.draft_placeholder.{digest}",
-                "name": "待补充业务规则",
-                "entity_ref": "",
-                "condition": {},
-                "severity": "warning",
-            },
-        ),
-        (
-            "workflow",
-            f"workflow.draft_placeholder.{digest}",
-            "workflows",
-            "待补充业务流程",
-            {
-                "key": f"workflow.draft_placeholder.{digest}",
-                "name": "待补充业务流程",
-                "description": "请根据原始附件补充触发条件、节点、分支和审批。",
-                "nodes": [],
-                "edges": [],
-            },
-        ),
-    )
-    return [
-        {
-            "resource_kind": kind,
-            "resource_key": key,
-            "task_id": task_id,
-            "display_name": display_name,
-            "payload": {
-                **payload,
-                "evidence_refs": evidence_refs,
-                "confidence": 0.0,
-            },
-            "evidence_refs": evidence_refs,
-            "validation_issues": [issue, copy.deepcopy(empty_issue)],
-            "validation_status": "blocked",
-            "formal_candidate": False,
-            "promotion_eligible": False,
-            "activation_status": "inactive",
-            "enabled": False,
-            "publishable": False,
-        }
-        for kind, key, task_id, display_name, payload in definitions
-    ]
-
-
 def _inert_contract_salvage_payload(
     raw: dict[str, Any],
     *,
@@ -4559,11 +4527,6 @@ def _inert_contract_salvage_payload(
         issues=[issue],
         valid_sources=valid_sources,
     )
-    if not candidates:
-        candidates = _empty_contract_placeholder_candidates(
-            valid_sources=valid_sources,
-            contract_issue=issue,
-        )
     coverage = [
         {
             "source_ref": source_ref,
@@ -4630,10 +4593,14 @@ def _unavailable_compilation_result(
         "source_refs": source_refs,
         "affected_change_keys": [],
         "resolution_hint": (
-            "可先直接修改占位草稿；检查或恢复 AI 模型配置后，再让助手基于当前草稿继续。"
+            "检查或恢复 AI 模型配置后，基于原始资料重新生成；已有具体草稿保持可编辑。"
         ),
     }
     result["unresolved"] = [copy.deepcopy(issue)]
+    result["coverage"] = []
+    result["coverage_summary"] = {
+        "total": len(source_refs), "modeled": 0, "context": 0, "irrelevant": 0, "ambiguous": 0,
+    }
     for candidate in result.get("draft_candidates") or []:
         if not isinstance(candidate, dict):
             continue
@@ -4652,32 +4619,8 @@ def _unavailable_compilation_result(
         "formal_change_count": 0,
     }
     _notify_progress(
-        on_progress,
-        "ontology",
-        "模型服务当前不可用，已建立本体、实例、映射、能力、规则和工作流占位草稿。",
-        "done",
-        "已保存 6 个分阶段占位草稿，未生成正式模型变更。",
-    )
-    _notify_progress(
-        on_progress,
-        "mapping",
-        "已建立可编辑的逻辑数据映射占位草稿，等待补充实际数据源绑定。",
-        "done",
-        "映射阶段草稿已保存；缺少数据源只阻止启用，不阻止继续建模。",
-    )
-    _notify_progress(
-        on_progress,
-        "rules",
-        "已记录模型服务问题；全部占位草稿保持停用并可编辑。",
-        "done",
-        "基础设施阻塞已记录，现有草稿不会被丢弃。",
-    )
-    _notify_progress(
-        on_progress,
-        "review",
-        "已形成可编辑的分阶段草稿起点。",
-        "done",
-        "正式变更为 0 项；任务将以带待处理项的草稿总结完成。",
+        on_progress, "review", "模型服务未能完成建设，请修复配置或重试。", "error",
+        "本轮未生成可用定义；原始资料和已有具体草稿保留，不创建空白模型。",
     )
     return result
 
@@ -4825,7 +4768,7 @@ _MODEL_TASK_DEFINITIONS: tuple[dict[str, Any], ...] = (
         "id": "mapping",
         "title": "整理数据映射",
         "description": "先建立逻辑字段对应；有数据源时再绑定真实表和字段。",
-        "sections": ("mappings", "relation_mappings", "conceptual_mappings"),
+        "sections": ("mappings", "relation_mappings", "conceptual_mappings", "semantic_mappings"),
         "depends_on": ("ontology",),
     },
     {
@@ -4900,7 +4843,17 @@ def build_model_task_plan(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if _model_task_definition(str(value).strip()) is not None
     }
     tasks: list[dict[str, Any]] = []
+    requested = generation.get("requested_task_ids") if isinstance(generation, dict) else None
+    task_ids = {item["id"] for item in _MODEL_TASK_DEFINITIONS}
+    if requested is not None:
+        if not isinstance(requested, list) or not requested or any(
+            not isinstance(value, str) or value not in task_ids for value in requested
+        ):
+            raise ValueError("建模任务请求范围无效")
+        task_ids = set(requested)
     for order, definition in enumerate(_MODEL_TASK_DEFINITIONS, 1):
+        if definition["id"] not in task_ids:
+            continue
         task_is_generated = not staged_generation or definition["id"] in generated_task_ids
         sections = set(definition["sections"])
         resource_keys = {
@@ -4996,7 +4949,7 @@ def build_model_task_plan(payload: dict[str, Any]) -> list[dict[str, Any]]:
             "title": definition["title"],
             "description": definition["description"],
             "sections": list(definition["sections"]),
-            "depends_on": list(definition["depends_on"]),
+            "depends_on": [dependency for dependency in definition["depends_on"] if dependency in task_ids],
             "status": status,
             "generation_status": "generated" if task_is_generated else "pending",
             "change_keys": change_keys,
@@ -6389,6 +6342,7 @@ def _relation_mapping_plan(
 
 def _function_definition(item: dict[str, Any]) -> dict[str, Any]:
     """Strip compiler provenance before the closed function validator."""
+    item = provider_schema_authoring.materialize_schemas(item)
     normalized = function_definition_service.normalize_definition({
         field: item.get(field)
         for field in (
@@ -6460,6 +6414,7 @@ def normalize_scenario_model(
                 for section in _DRAFT_ONLY_RESOURCE_SECTIONS
             },
         }
+    raw = {"semantic_mappings": [], **raw}
     for section in (*_MODEL_OUTPUT_RESOURCE_SECTIONS, "unresolved", "coverage"):
         if not isinstance(raw.get(section), list):
             raise ValueError(f"复合业务模型字段 {section} 必须是数组")
@@ -7220,15 +7175,16 @@ def normalize_scenario_model(
             unresolved=unresolved,
         )
         try:
-            definition = function_definition_service.normalize_definition({
+            authored = provider_schema_authoring.materialize_schemas(value)
+            definition = _function_definition({
                 "name": _text(value.get("name"), maximum=200),
                 "description": _text(value.get("description")),
-                "input_schema": _object_schema(value.get("input_schema")),
-                "output_schema": _object_schema(value.get("output_schema")),
+                "input_schema": _object_schema(authored.get("input_schema")),
+                "output_schema": _object_schema(authored.get("output_schema")),
                 "tags": value.get("tags") or [],
                 "visibility": "scenario",
-                "runtime_kind": "contract",
-                "runtime_config": {},
+                "runtime_kind": value.get("runtime_kind", "contract"),
+                "runtime_config": value.get("runtime_config", {}),
             })
         except Exception as exc:  # noqa: BLE001
             _issue(unresolved, "invalid_function", f"函数契约 {key} 无效：{exc}", source_refs=meta["evidence_refs"])
@@ -7446,6 +7402,14 @@ def normalize_scenario_model(
                 unsupported_nodes.append((node_id, node_type))
             node_data = raw_node.get("data") if isinstance(raw_node.get("data"), dict) else {}
             safe_data = {"label": _text(node_data.get("label") or raw_node.get("name") or node_id, maximum=300)}
+            try:
+                execution_data = workflow_authoring_data.execution_data(node_type, node_data)
+                if release_service.safe_snapshot_content(execution_data) != execution_data:
+                    raise ValueError("节点执行数据不得包含凭据，请使用受信连接绑定")
+                safe_data.update(execution_data)
+            except ValueError as exc:
+                _issue(unresolved, "invalid_workflow_data", f"工作流 {key} 的节点 {node_id}：{exc}",
+                       source_refs=meta["evidence_refs"], affected_change_keys=[key])
             if node_type in resources:
                 generated, existing, id_key = resources[node_type]
                 token = _workflow_reference_token(raw_node, node_type)
@@ -7610,7 +7574,7 @@ def normalize_scenario_model(
             if raw_trigger_config.get("cron") or raw_trigger_config.get("timezone"):
                 raise PolicyViolation("当前运行时不支持 cron/timezone，请改用 interval_seconds")
             allowed_raw_fields = {
-                "max_attempts", "timeout_seconds", "retry_backoff_seconds",
+                "max_attempts", "timeout_seconds", "retry_backoff_seconds", "ontology_contract",
             }
             if trigger_type == "scheduled":
                 allowed_raw_fields.add("interval_seconds")
@@ -7623,6 +7587,8 @@ def normalize_scenario_model(
                 )
             policy = operations_service.runtime_policy(raw_trigger_config)
             trigger_config.update(policy)
+            if "ontology_contract" in raw_trigger_config:
+                trigger_config["ontology_contract"] = copy.deepcopy(raw_trigger_config["ontology_contract"])
             if trigger_type == "scheduled":
                 trigger_config["interval_seconds"] = raw_trigger_config.get("interval_seconds")
             elif trigger_type == "event":
@@ -7655,6 +7621,11 @@ def normalize_scenario_model(
                 f"工作流 {key} 的触发配置无效：{exc}",
                 source_refs=meta["evidence_refs"],
             )
+        try:
+            workflow_authoring_contract.validate(scenario, nodes, trigger_config, db=db)
+        except (ValueError, PolicyViolation) as exc:
+            _issue(unresolved, "invalid_workflow_contract", f"工作流 {key} 的业务契约无效：{exc}",
+                   source_refs=meta["evidence_refs"])
         workflows.append({
             **meta,
             "name": _text(value.get("name") or key, maximum=200),
@@ -7673,7 +7644,7 @@ def normalize_scenario_model(
     columns_by_table = columns_by_table or {}
     data_sources = [
         type("CatalogSource", (), {"id": item["data_source_id"], "name": item["data_source_name"]})()
-        for item in mapping_catalog
+        for item in mapping_catalog if item.get("data_source_id")
     ]
     mappings: list[dict[str, Any]] = []
     for index, value in enumerate(raw.get("mappings") or [], 1):
@@ -7965,6 +7936,19 @@ def normalize_scenario_model(
                 "对象映射身份将被替换，必须在同一复合变更中重新配置受影响的关系映射",
             )
 
+    semantic_mappings = []
+    for index, value in enumerate(raw.get("semantic_mappings") or [], 1):
+        key = _text(value.get("key") or f"semantic_mapping:{index}", maximum=200)
+        meta = _meta(value, key=key, valid_sources=valid_sources, unresolved=unresolved)
+        try:
+            normalized_mapping = semantic_mapping_authoring.normalize(value)
+            if db is not None:
+                semantic_mapping_authoring.validate(db, scenario, normalized_mapping)
+            semantic_mappings.append({**normalized_mapping, **meta})
+        except (ValueError, PolicyViolation) as exc:
+            _issue(unresolved, "invalid_semantic_mapping", str(exc),
+                source_refs=meta["evidence_refs"], affected_change_keys=[key])
+
     sections = {
         "entities": entities,
         "relations": relations,
@@ -7975,7 +7959,11 @@ def normalize_scenario_model(
         "workflows": workflows,
         "mappings": mappings,
         "relation_mappings": relation_mappings,
+        "semantic_mappings": semantic_mappings,
     }
+    from .distillation_model_coverage import validate_entity_coverage
+    unresolved.extend(validate_entity_coverage(raw, entities, source_bundle,
+        {entity.name: {prop.name for prop in entity.properties} for entity in scenario.entities}))
     metadata_source_policy = (
         assistant_capability_modeling_service.metadata_source_policy(source_bundle)
     )
@@ -7987,7 +7975,7 @@ def normalize_scenario_model(
                 "actions",
                 "workflows",
                 "mappings",
-                "relation_mappings",
+                "relation_mappings", "semantic_mappings",
             )
             for item in sections[section]
             if str(item.get("key") or "")
@@ -8178,11 +8166,14 @@ def normalize_scenario_model(
         "actions": "action", "rules": "rule", "events": "event",
         "workflows": "workflow", "mappings": "mapping",
         "relation_mappings": "relation_mapping",
+        "semantic_mappings": "semantic_mapping",
     }
     for section, items in sections.items():
         for item in items:
             if section == "entities":
                 operation = item.get("operation") or ("update" if item.get("existing_id") else "add")
+            elif section == "semantic_mappings":
+                operation = item["operation"]
             elif section == "relations":
                 operation = item.get("operation") or ("skip" if item.get("existing_id") else "add")
             elif section == "mappings":
@@ -8905,6 +8896,8 @@ def preflight_scenario_model(
         for item in (payload.get("changes") or [])
     ):
         raise PolicyViolation("复合业务模型没有可应用的变更")
+    for item in payload.get("semantic_mappings") or []:
+        semantic_mapping_authoring.validate(db, scenario, item)
     for item in payload.get("functions") or []:
         _function_definition(item)
     for item in payload.get("actions") or []:
@@ -8923,7 +8916,7 @@ def preflight_scenario_model(
         trigger_type = item.get("trigger_type")
         if trigger_type not in {"manual", "scheduled", "event"}:
             raise PolicyViolation("复合模型包含不受支持的工作流触发类型")
-        allowed_config = {"max_attempts", "timeout_seconds", "retry_backoff_seconds"}
+        allowed_config = {"max_attempts", "timeout_seconds", "retry_backoff_seconds", "ontology_contract"}
         if trigger_type == "scheduled":
             allowed_config.add("interval_seconds")
         if set((item.get("trigger_config") or {}).keys()) - allowed_config:
@@ -8932,6 +8925,7 @@ def preflight_scenario_model(
         if trigger_type == "event":
             trigger_config["event_id"] = _reference_token(item.get("trigger_event") or {})
         operations_service.validate_trigger_config(trigger_type, trigger_config)
+        workflow_authoring_contract.validate(scenario, item.get("nodes") or [], trigger_config, db=db)
     _validate_event_feedback_graph(scenario, payload.get("workflows") or [])
 
     existing_entities = {entity.id: entity for entity in scenario.entities}
@@ -9794,6 +9788,11 @@ def _apply_scenario_model_mutations(
         )
         db.delete(duplicate)
         counts["mappings_deleted"] += 1
+    db.flush()
+    for item in payload.get("semantic_mappings") or []:
+        mapping = semantic_mapping_authoring.apply(db, scenario, item)
+        created[item["key"]] = mapping.id
+        counts["semantic_mappings_updated" if item.get("existing_id") else "semantic_mappings_added"] += 1
     db.flush()
     persisted_change_keys = [
         str(change.get("change_id") or "")

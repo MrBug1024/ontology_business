@@ -56,6 +56,9 @@
         <!-- 节点 -->
         <g v-for="n in nodes" :key="n.id" :transform="`translate(${n.x},${n.y})`"
           class="gnode" :class="{ selected: focusNodeId === n.id, connected: connectedNodeIds.has(n.id) && focusNodeId !== n.id, dimmed: hasFocus && !connectedNodeIds.has(n.id) }"
+          role="button" tabindex="0" :aria-label="`${n.meta?.aiDraft ? '候选' : '正式'} ${n.label}`"
+          :aria-pressed="focusNodeId === n.id"
+          @keydown.enter.stop.prevent="selectNode(n)" @keydown.space.stop.prevent="selectNode(n)"
           @mousedown.stop="onNodeMouseDown($event, n)">
           <!-- 光晕 -->
           <circle v-if="mode === 'instance'" :r="(n.size || 16) + 12" fill="url(#gc-glow)" />
@@ -315,6 +318,11 @@ function onMove(e: MouseEvent) {
   }
 }
 
+function selectNode(node: LayoutNode) {
+  localSelectedId.value = node.id
+  emit('select', node)
+}
+
 function onUp(e: MouseEvent) {
   window.removeEventListener('mousemove', onMove)
   window.removeEventListener('mouseup', onUp)
@@ -322,8 +330,7 @@ function onUp(e: MouseEvent) {
     drag.node.fx = null
     drag.node.fy = null
     if (!drag.moved) {
-      localSelectedId.value = drag.node.id
-      emit('select', drag.node)
+      selectNode(drag.node)
     }
     drag = null
   } else if (pan) {

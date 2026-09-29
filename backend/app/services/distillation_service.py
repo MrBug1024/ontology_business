@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import uuid
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -18,7 +16,6 @@ from ..distillation_models import (
 from ..distillation_schemas import DistillationDocument, ProjectCreate, ProjectUpdate
 from ..models import BucketFile, BusinessScenario, DataSource
 from . import permission_service, release_service
-from .distillation_artifact_service import generate_artifacts
 
 
 def authorize_scope(db: Session, scenario_id: str | None, *, write: bool = False) -> None:
@@ -71,7 +68,7 @@ def scenario_state(
     query = select(DistillationScenarioState).where(
         DistillationScenarioState.scenario_id == scenario_id,
         DistillationScenarioState.tenant_id == principal.tenant_id,
-    )
+    ).execution_options(populate_existing=True)
     if lock:
         query = query.with_for_update()
     row = db.scalar(query)
@@ -323,32 +320,11 @@ def publish(db: Session, project_id: str, expected_revision: int) -> Distillatio
     ))
     if existing is not None:
         return existing
-    document = DistillationDocument.model_validate(row.document)
-    validate_document(db, document, row.scenario_id)
-    from .distillation_evidence_service import capture_evidence_identity
+    from .distillation_publication_service import create_publication
 
-    evidence_identity = capture_evidence_identity(db, document, row.scenario_id)
-    if not all((document.beneficiary, document.pain, document.desired_outcome,
-                document.success_metric, document.decision_reason)) or document.decision == "undecided":
-        raise HTTPException(422, "交接前请填写受益者、痛点、期望结果、成功标准和人工决策理由")
-    publication_id, source_id = uuid.uuid4().hex, uuid.uuid4().hex
-    source = DataSource(id=source_id, tenant_id=row.tenant_id, scenario_id=row.scenario_id,
-        name=f"{row.name[:160]} · 业务蒸馏 v{row.revision}", type="distillation", resource_scope="modeling",
-        config={"distillation_project_id": row.id, "publication_id": publication_id, "project_revision": row.revision},
-        status="ok", is_public=False)
-    db.add(source)
-    db.flush()
-    artifacts = generate_artifacts(row.name, row.revision, document)
-    provenance = json.dumps(evidence_identity, ensure_ascii=False, sort_keys=True, indent=2)
-    artifacts.append({"key": "provenance", "filename": "evidence-provenance.json", "mime": "application/json",
-                      "content": provenance, "sha256": hashlib.sha256(provenance.encode("utf-8")).hexdigest()})
-    publication = DistillationPublication(id=publication_id, tenant_id=row.tenant_id,
-        project_id=row.id, scenario_id=row.scenario_id, project_revision=row.revision, data_source_id=source_id,
-        document=document.model_dump(), artifacts=artifacts,
-        created_by=permission_service.require_principal(db).user_id)
-    db.add(publication)
-    db.flush()
-    return publication
+    return create_publication(db, tenant_id=row.tenant_id, scenario_id=row.scenario_id,
+        project_id=row.id, revision=row.revision, name=row.name,
+        document=DistillationDocument.model_validate(row.document))
 
 
 def list_scenario_publications(
@@ -597,7 +573,7 @@ def artifact_content(publication: DistillationPublication, artifact_key: str) ->
     raise HTTPException(404, "交接文件不存在")
 
 
-def modeling_documents(db: Session, scenario_id: str) -> list[dict]:
+def modeling_documents(db: Session, scenario_id: str, *, for_compilation: bool = False) -> list[dict]:
     """Only explicitly scenario-bound handoffs are injected into its advisor."""
     principal = permission_service.require_principal(db)
     authorize_scope(db, scenario_id)
@@ -619,7 +595,7 @@ def modeling_documents(db: Session, scenario_id: str) -> list[dict]:
         raise HTTPException(422, "业务蒸馏交接资料超过单次 20 个项目，请缩小场景资料范围")
     documents = []
     for publication, source in rows:
-        artifact = artifact_content(publication, "brief")
+        artifact = artifact_content(publication, "contract" if for_compilation else "brief")
         documents.append({"id": f"distillation:{publication.id}", "filename": source.name,
             "status": "parsed", "parsed_text": artifact["content"], "usage_plane": "modeling_material",
             "semantic_role": "business_distillation_handoff", "data_source_id": source.id,

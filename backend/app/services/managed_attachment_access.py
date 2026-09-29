@@ -377,7 +377,10 @@ def validate_attachments(
                     # Agent deletion and upload publication lock the parent
                     # asset before its immutable versions.  Re-read the
                     # version after that parent fence so this path cannot
-                    # retain the inverse Version -> Asset lock order.
+                    # retain the inverse Version -> Asset lock order. The
+                    # immutable version must remain a plain SELECT: runtime
+                    # roles intentionally lack UPDATE (also required by PG
+                    # for SELECT FOR UPDATE). The parent is the delete fence.
                     version = db.scalar(
                         select(DataAssetVersion)
                         .where(
@@ -387,7 +390,6 @@ def validate_attachments(
                             DataAssetVersion.status == "ready",
                         )
                         .execution_options(populate_existing=True)
-                        .with_for_update()
                     )
             if (
                 version is None

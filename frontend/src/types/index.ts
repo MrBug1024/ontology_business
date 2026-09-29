@@ -636,6 +636,7 @@ export type ScenarioModelDraftResourceKind =
   | 'instance'
   | 'mapping'
   | 'conceptual_mapping'
+  | 'semantic_mapping'
   | 'relation_mapping'
   | 'function'
   | 'action'

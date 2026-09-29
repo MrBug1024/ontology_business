@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Sequence
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
@@ -25,6 +26,7 @@ from . import input_contract_validator
 
 
 CONTRACT_VERSION = 1
+MAPPED_FIELDS_CONTRACT_VERSION = 2
 _MAX_FIELDS = 512
 _MAX_ALIASES = 64
 _CONTENT_KEYS = {"version", "relations", "allow_additional_relations"}
@@ -206,7 +208,7 @@ def normalize_contract(raw: Any) -> dict[str, Any]:
             "semantic mapping contract contains unsupported fields"
         )
     version = raw.get("contract_version")
-    if version != CONTRACT_VERSION:
+    if isinstance(version, bool) or version not in {CONTRACT_VERSION, MAPPED_FIELDS_CONTRACT_VERSION}:
         raise SemanticMappingContractError("semantic mapping contract version is unsupported")
 
     schema_document = _canonical_content_schema(
@@ -284,7 +286,7 @@ def normalize_contract(raw: Any) -> dict[str, Any]:
             "semantic mapping contract has no readable input fields"
         )
     return {
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": version,
         "id": _required_text(raw.get("id"), "semantic mapping id", maximum=32),
         "entity_id": _required_text(raw.get("entity_id"), "entity id", maximum=32),
         "mapping_key": _required_text(raw.get("mapping_key"), "mapping key", maximum=180),
@@ -299,16 +301,28 @@ def normalize_contract(raw: Any) -> dict[str, Any]:
     }
 
 
+def _authored_fields(mapping: SemanticMapping) -> list[Any]:
+    """Use explicit mapped fields, never unrelated sample columns as requirements."""
+    relation = mapping.dataset_relation
+    if relation is None:
+        raise SemanticMappingContractError("semantic mapping relation is unavailable")
+    referenced = {str(item.dataset_field_id) for item in mapping.field_mappings or ()}
+    fields = sorted(
+        (item for item in relation.fields or () if str(item.id) in referenced),
+        key=lambda item: (int(item.ordinal or 0), str(item.id or "")),
+    )
+    if referenced != {str(item.id) for item in fields}:
+        raise SemanticMappingContractError("semantic field mapping is outside the authored logical relation")
+    return fields
+
+
 def contract_from_mapping(mapping: SemanticMapping) -> dict[str, Any]:
     """Project an authorized authoring row into its runtime-safe definition."""
 
     relation = mapping.dataset_relation
     if relation is None:
         raise SemanticMappingContractError("semantic mapping relation is unavailable")
-    ordered_fields = sorted(
-        tuple(relation.fields or ()),
-        key=lambda item: (int(item.ordinal or 0), str(item.id or "")),
-    )
+    ordered_fields = _authored_fields(mapping)
     field_indexes = {str(field.id): index for index, field in enumerate(ordered_fields)}
     mapped_fields: list[dict[str, Any]] = []
     for field_mapping in sorted(
@@ -331,13 +345,13 @@ def contract_from_mapping(mapping: SemanticMapping) -> dict[str, Any]:
         )
     try:
         content_contract = input_contract_validator.build_tabular_content_contract(
-            [relation]
+            [SimpleNamespace(fields=ordered_fields)]
         )
     except input_contract_validator.InputContractError as exc:
         raise SemanticMappingContractError(exc.message) from exc
     return normalize_contract(
         {
-            "contract_version": CONTRACT_VERSION,
+            "contract_version": MAPPED_FIELDS_CONTRACT_VERSION,
             "id": str(mapping.id),
             "entity_id": str(mapping.entity_id),
             "mapping_key": str(mapping.mapping_key or ""),
@@ -467,10 +481,7 @@ def normalize_relation_contract(raw: Any) -> dict[str, Any]:
 
 
 def _relation_field_index(mapping: SemanticMapping, field_id: str) -> int:
-    fields = sorted(
-        tuple(mapping.dataset_relation.fields or ()),
-        key=lambda item: (int(item.ordinal or 0), str(item.id or "")),
-    )
+    fields = _authored_fields(mapping)
     for index, field in enumerate(fields):
         if str(field.id) == str(field_id):
             return index

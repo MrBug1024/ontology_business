@@ -6,6 +6,7 @@ import {
   candidateApiFailure,
   candidateFailureDraftIds,
   candidatePromotionRequest,
+  candidateRevalidationSelection,
   normalizeCandidateBlockers,
 } from '../src/utils/candidateGovernance.ts'
 import { normalizeScenarioModelDrafts, scenarioDraftStage } from '../src/utils/scenarioModelDrafts.ts'
@@ -115,6 +116,16 @@ test('atomic promotion failures expose structured blockers and focus targets', (
   }) })
   assert.equal(serialized.code, 'candidate_revision_conflict')
   assert.deepEqual(candidateFailureDraftIds(serialized), ['candidate-1'])
+})
+
+test('revalidation uses only the filtered open candidates and keeps expected revisions', () => {
+  const rows = normalizeScenarioModelDrafts([
+    rawCandidate({ id: 'visible', revision: 7 }),
+    rawCandidate({ id: 'closed', lifecycle_status: 'superseded' }),
+    rawCandidate({ id: 'hidden' }),
+  ])
+  const filtered = rows.filter((row) => row.id !== 'hidden')
+  assert.deepEqual(candidateRevalidationSelection(filtered).map((row) => [row.id, row.revision]), [['visible', 7]])
 })
 
 test('candidate review exposes every governed action without client-side activation', () => {

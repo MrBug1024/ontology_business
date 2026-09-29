@@ -213,7 +213,13 @@ def execute(db: Session, arguments: dict, turn):
 def advisor_signal(db: Session, message: str, scenario_summary: str = "") -> JevDecisionReceipt | None:
     """Use Jev as a bounded signal for the advisor, never as a source citation."""
     try:
-        situation = _safe_situation((scenario_summary + "\n" if scenario_summary else "") + message[:MAX_ADVISOR_SITUATION])
+        # Reserve space for the current request; previously an 8K scenario
+        # summary plus a 12K message exceeded the limit and silently skipped Jev.
+        request = message[:MAX_ADVISOR_SITUATION]
+        remaining = MAX_ADVISOR_SITUATION - len(request) - 1
+        situation = _safe_situation(
+            (scenario_summary[:remaining] + "\n" if scenario_summary and remaining > 0 else "") + request
+        )
         cfg = resolve_jev_config(db)
         if cfg is None:
             return None

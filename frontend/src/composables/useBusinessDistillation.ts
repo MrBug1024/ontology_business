@@ -1,6 +1,7 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { businessDistillationApi as api } from '@/api/businessDistillation'
 import { draftOf } from '@/utils/businessDistillation'
+import type { handoffDecision } from '@/utils/distillationHandoff'
 import type { DataSource, Scenario } from '@/types'
 import type { DistillationArtifact, DistillationProject, DistillationProposal, DistillationPublication, DistillationScenarioState } from '@/types/businessDistillation'
 
@@ -200,6 +201,21 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
     return result
   }
 
+  async function publishScenario(decision: ReturnType<typeof handoffDecision>) {
+    const scenarioId = draft.value.scenario_id, revision = scenarioRevision.value
+    if (project.value || dirty.value || revision === null || !scenarioId) return null
+    const result = await run('publish', signal => api.publishScenario(
+      scenarioId, revision, decision, signal))
+    if (result) {
+      Object.assign(draft.value.document, decision)
+      baseline.value = JSON.parse(JSON.stringify(draft.value)) as typeof draft.value
+      scenarioRevision.value = result.project_revision
+      publications.value = [result, ...publications.value.filter(item => item.id !== result.id)]
+      notice.value = '阶段成果已保存到资料库，可供智能业务顾问建设场景。'
+    }
+    return result
+  }
+
   async function download(publication: DistillationPublication, artifact: DistillationArtifact) {
     const result = await run('download', signal => publication.project_id
       ? api.artifact(publication.project_id, publication.id, artifact.key, signal)
@@ -290,6 +306,6 @@ export function useBusinessDistillation(projectId: Ref<string>, historyScope: Re
   })
   return { projects, project, draft, baseline, scenarioRevision, scenarios, materials, publications, proposal, error, notice, loading, listing,
     busy, offset, hasMore, dirty, materialOffset, materialHasMore, materialLoading, materialPageSize,
-    list, load, save, analyze, applyProposal, publish, download, removePublication, cancelAnalysis, refreshOptions, remove,
+    list, load, save, analyze, applyProposal, publish, publishScenario, download, removePublication, cancelAnalysis, refreshOptions, remove,
     previousMaterialPage, nextMaterialPage, copyToScenario }
 }

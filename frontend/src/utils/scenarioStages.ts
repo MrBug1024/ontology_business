@@ -1,6 +1,6 @@
 export const SCENARIO_STAGES = [
-  'distillation',
   'materials',
+  'distillation',
   'ontology',
   'instances',
   'mappings',
@@ -21,5 +21,5 @@ export function normalizeScenarioStage(value: unknown): ScenarioStage {
   const candidate = Array.isArray(value) ? value[0] : value
   return typeof candidate === 'string' && SCENARIO_STAGE_NAMES.has(candidate)
     ? candidate as ScenarioStage
-    : 'distillation'
+    : 'materials'
 }

@@ -55,6 +55,13 @@ export function functionRuntimeConfigForSave(
     : cloneObject(objectValue(runtimeConfig))
 }
 
+export function candidateFunctionRuntime(payload: JsonObject): { runtime_kind: string; runtime_config: JsonObject } {
+  return {
+    runtime_kind: typeof payload.runtime_kind === 'string' && payload.runtime_kind ? payload.runtime_kind : 'contract',
+    runtime_config: cloneObject(objectValue(payload.runtime_config)),
+  }
+}
+
 export function providerManifestIdentity(
   providerKey: unknown,
   providerVersion: unknown,

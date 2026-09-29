@@ -726,7 +726,7 @@ class ScenarioModelDraftResourceOut(BaseModel):
     task_id: str = ""
     resource_kind: Literal[
         "entity", "property", "relation", "instance", "mapping",
-        "conceptual_mapping", "relation_mapping", "function", "action",
+        "conceptual_mapping", "relation_mapping", "semantic_mapping", "function", "action",
         "rule", "event", "workflow", "capability_port",
     ]
     resource_key: str
@@ -789,7 +789,7 @@ class ScenarioModelCandidateCreate(BaseModel):
 
     resource_kind: Literal[
         "entity", "property", "relation", "instance", "mapping",
-        "conceptual_mapping", "relation_mapping", "function", "action",
+        "conceptual_mapping", "relation_mapping", "semantic_mapping", "function", "action",
         "rule", "event", "workflow", "capability_port",
     ]
     resource_key: str = Field(min_length=1, max_length=500)

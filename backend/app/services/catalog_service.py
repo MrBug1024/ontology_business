@@ -1283,7 +1283,6 @@ def create_dataset_version(
                 )
                 .order_by(DataAssetVersion.asset_id, DataAssetVersion.id)
                 .execution_options(populate_existing=True)
-                .with_for_update()
             ).all()
         )
         if len(assets) != len(asset_ids):
@@ -1708,11 +1707,11 @@ def delete_capability_port(db: Session, scenario_id: str, port_id: str) -> None:
     db.flush()
 
 
-def create_semantic_mapping(
+def validate_semantic_mapping(
     db: Session,
     scenario_id: str,
     payload: SemanticMappingCreate,
-) -> SemanticMapping:
+) -> tuple[BusinessScenario, DatasetSchema, DatasetRelation, ScenarioDatasetBinding | None]:
     scenario = tenant_service.require_scenario(db, scenario_id, writable=True)
     permission_service.require_scenario_permission(db, scenario, "write")
     # A semantic mapping is Definition-plane metadata.  Its authority is the
@@ -1784,16 +1783,29 @@ def create_semantic_mapping(
         ).all()
     } if field_ids else {}
     if len(properties) != len(set(property_ids)):
-        raise CatalogError("字段映射包含不属于对象类型的属性")
+        positions = [str(index) for index, item in enumerate(payload.fields, 1)
+                     if item.ontology_property_id not in properties][:10]
+        raise CatalogError("字段映射包含不属于对象类型的属性（第" + "、".join(positions) + "项）；只能引用当前对象的正式属性")
     if len(fields) != len(set(field_ids)):
-        raise CatalogError("字段映射包含不属于数据关系的字段")
+        positions = [str(index) for index, item in enumerate(payload.fields, 1)
+                     if item.dataset_field_id not in fields][:10]
+        raise CatalogError("字段映射包含不属于数据关系的字段（第" + "、".join(positions) + "项）；只能引用当前建模关系中的字段")
     if len(property_ids) != len(set(property_ids)):
         raise CatalogError("同一对象属性不能重复映射")
+    return scenario, schema, relation, binding
+
+
+def create_semantic_mapping(
+    db: Session,
+    scenario_id: str,
+    payload: SemanticMappingCreate,
+) -> SemanticMapping:
+    scenario, schema, relation, binding = validate_semantic_mapping(db, scenario_id, payload)
     mapping = SemanticMapping(
         tenant_id=_tenant(db),
         dataset_id=schema.dataset_id,
         scenario_id=scenario.id,
-        entity_id=entity.id,
+        entity_id=payload.entity_id,
         scenario_dataset_binding_id=binding.id if binding is not None else None,
         dataset_schema_id=schema.id,
         dataset_relation_id=relation.id,
@@ -1820,7 +1832,7 @@ def create_semantic_mapping(
                 dataset_id=schema.dataset_id,
                 dataset_schema_id=schema.id,
                 dataset_relation_id=relation.id,
-                ontology_entity_id=entity.id,
+                ontology_entity_id=payload.entity_id,
                 semantic_mapping_id=mapping.id,
                 ontology_property_id=item.ontology_property_id,
                 dataset_field_id=item.dataset_field_id,

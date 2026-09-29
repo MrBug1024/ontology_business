@@ -187,6 +187,28 @@ test('new conversations inherit the chosen scenario without becoming an unsaved 
   stop()
 })
 
+test('retained scenario products publish without creating a conversation and preserve CAS', async () => {
+  const calls = []
+  const previous = fakeApi.publishScenario
+  const publication = { id: 'published', scenario_id: 'retained', project_id: null, project_revision: 2, artifacts: [] }
+  fakeApi.publishScenario = async (...args) => { calls.push(args); return publication }
+  const { state, stop } = mount('', 'retained', true)
+  try {
+    await flush()
+    const decision = { decision: 'continue', decision_reason: 'Reviewed retained evidence' }
+    assert.deepEqual(await state.publishScenario(decision), publication)
+    assert.deepEqual(calls[0].slice(0, 3), ['retained', 1, decision])
+    assert.equal(state.project.value, null)
+    assert.equal(state.scenarioRevision.value, 2)
+    assert.equal(state.dirty.value, false)
+    assert.equal(state.publications.value[0].id, publication.id)
+    fakeApi.publishScenario = async () => { throw Object.assign(new Error('版本冲突'), { status: 409 }) }
+    assert.equal(await state.publishScenario(decision), null)
+    assert.equal(state.draft.value.document.decision_reason, decision.decision_reason)
+    assert.match(state.error.value, /草稿已保留/)
+  } finally { stop(); fakeApi.publishScenario = previous }
+})
+
 test('scenario history is filtered on the server, and the default history is the unscoped project list', async () => {
   const old = deferred(); const scopes = []; let oldSignal
   fakeApi.list = async (offset, signal, scope) => { scopes.push(scope); if (scope === 'a') { oldSignal = signal; return old.promise }; return [row(scope)] }

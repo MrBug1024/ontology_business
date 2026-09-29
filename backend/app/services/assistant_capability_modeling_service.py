@@ -30,6 +30,7 @@ METADATA_GOVERNED_RESOURCE_KINDS = frozenset({
     "mapping",
     "relation_mapping",
     "conceptual_mapping",
+    "semantic_mapping",
     "capability_port",
 })
 

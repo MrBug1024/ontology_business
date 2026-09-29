@@ -7,7 +7,9 @@
           <strong>{{ item.filename }}</strong>
           <small v-if="item.status === 'registering'">正在登记附件</small>
           <small v-else-if="item.status === 'uploading'">正在上传 {{ item.progress }}%，可立即发送</small>
-          <small v-else-if="item.status === 'processing'">已接收，正在后台准备</small>
+          <small v-else-if="item.status === 'processing'">
+            {{ item.uploadRunStatus === 'stored' ? '文件已保存，等待解析' : '正在识别文件结构' }} · {{ formatSize(item.size) }}
+          </small>
           <small v-else-if="item.status === 'ready'">
             {{ item.persistent ? '附件数据源' : '仅本次' }} · {{ formatSize(item.size) }}
           </small>

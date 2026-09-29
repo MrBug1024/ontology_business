@@ -17,7 +17,13 @@ export interface AssistantMessagePart {
   content: string
   streaming: boolean
 }
-export function splitAssistantMessage(content: string): AssistantMessagePart[] {
+function withoutPartialTag(content: string, tags: string[]): string {
+  const start = content.lastIndexOf('<')
+  if (start < 0) return content
+  const suffix = content.slice(start).toLowerCase()
+  return tags.some(tag => tag.startsWith(suffix) && tag !== suffix) ? content.slice(0, start) : content
+}
+export function splitAssistantMessage(content: string, streaming = false): AssistantMessagePart[] {
   const parts: AssistantMessagePart[] = []
   const opening = /<think>/ig
   const closing = /(?:<\/think>|<\\think>)/ig
@@ -34,13 +40,13 @@ export function splitAssistantMessage(content: string): AssistantMessagePart[] {
       cursor = end.index + end[0].length
       opening.lastIndex = cursor
     } else {
-      const thought = content.slice(match.index + match[0].length)
-      if (thought.trim()) parts.push({ kind: 'thinking', content: thought, streaming: true })
+      const thought = withoutPartialTag(content.slice(match.index + match[0].length), ['</think>', '<\\think>'])
+      parts.push({ kind: 'thinking', content: thought, streaming: true })
       cursor = content.length
       break
     }
   }
-  const remainder = content.slice(cursor)
+  const remainder = streaming ? withoutPartialTag(content.slice(cursor), ['<think>']) : content.slice(cursor)
   if (remainder.trim()) parts.push({ kind: 'answer', content: remainder, streaming: false })
   return parts
 }

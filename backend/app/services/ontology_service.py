@@ -204,6 +204,14 @@ def allocate_resource_api_name(
         explicit = bool(requested_value)
 
     def conflict(api_name: str) -> bool:
+        # Runtime sessions disable autoflush. Names queued in this transaction
+        # must be reserved before the next resource is allocated.
+        if any(isinstance(item, model)
+               and getattr(item, scope_field, None) == scope_id
+               and getattr(item, "api_name", None) == api_name
+               and (not resource_id or getattr(item, "id", None) != resource_id)
+               for item in db.new):
+            return True
         statement = select(model.id).where(
             getattr(model, scope_field) == scope_id,
             model.api_name == api_name,

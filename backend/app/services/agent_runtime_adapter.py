@@ -63,6 +63,7 @@ from .capability_contracts import (
 from .capability_invoker import CapabilityInvocationError
 from .agent_prompt_policy import AUTHORITATIVE_DECISION_PROMPT, CAPABILITY_CONSUMER_PROMPT
 from .agent_receipt_summary import output_summary
+from .llm_public_response import PublicResponseText
 
 
 _CAPABILITY_CATEGORY_BY_KIND = {
@@ -1801,6 +1802,8 @@ class CapabilityAgentRuntime:
         tool_call_counts: defaultdict[str, int] = defaultdict(int)
         for _round in range(max_rounds):
             content_parts: list[str] = []
+            answer_parts: list[str] = []
+            public_text = PublicResponseText()
             tool_calls: list[dict[str, Any]] = []
             if before_llm_call is not None:
                 before_llm_call()
@@ -1814,13 +1817,19 @@ class CapabilityAgentRuntime:
                 db=self.db,
             ):
                 if event["type"] == "token":
-                    content_parts.append(event["content"])
-                    yield {"type": "token", "data": event["content"]}
+                    text = event["content"]
+                    answer_parts.append(public_text.feed(text))
+                    content_parts.append(text)
+                    yield {"type": "token", "data": text}
                 elif event["type"] == "tool_calls":
                     tool_calls = event["tool_calls"]
+            answer_parts.append(public_text.finish())
             content = "".join(content_parts)
+            # Keep provider think blocks for the chat renderer, but do not treat
+            # reasoning alone as a completed answer or replay it to tool rounds.
+            answer = "".join(answer_parts)
             if not tool_calls:
-                if not content.strip():
+                if not answer.strip():
                     raise AgentRuntimeAdapterError(
                         "empty_model_response",
                         "模型未返回可显示的回答。请重试；如已有能力执行记录，请先核对其结果。",
@@ -1832,7 +1841,7 @@ class CapabilityAgentRuntime:
             messages.append(
                 {
                     "role": "assistant",
-                    "content": content or None,
+                    "content": answer or None,
                     "tool_calls": [
                         {
                             "id": call["id"],
@@ -1984,7 +1993,7 @@ def require_complete_runtime_context(context: Any) -> None:
     if "attachments_not_supported" in issue_codes:
         raise AgentRuntimeAdapterError(
             "runtime_input_contract_unsatisfied",
-            "上传内容未满足所选能力的基础输入契约",
+            "当前 Agent 没有可接收本次附件的就绪能力；请先完成场景的能力输入定义，并在验证 Agent 中选择对应能力。附件可保留复用，无需重新上传。",
         )
     if "requested_capability_unavailable" in issue_codes:
         raise AgentRuntimeAdapterError(

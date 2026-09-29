@@ -19,12 +19,16 @@ export interface ScenarioModelIssueGroup {
 }
 
 const ISSUE_LABELS: Record<string, string> = {
+  llm_not_configured: '模型尚未配置',
+  compiler_provider_request_failed: '模型请求失败',
+  compiler_provider_unavailable: '模型服务不可用',
   uncategorized: '未分类预检问题',
   unknown_rule_field: '规则字段未定义',
   missing_reference: '引用对象不存在',
   invalid_modeled_coverage: '建模覆盖证据不足',
   invalid_rule_condition: '规则条件不受支持',
   invalid_entity: '对象类型定义无效',
+  invalid_semantic_mapping: '语义映射定义无效',
   chunk_resource_conflict: '分段资源冲突',
   inconsistent_source_coverage: '来源覆盖不一致',
   missing_primary_key: '缺少主键',
