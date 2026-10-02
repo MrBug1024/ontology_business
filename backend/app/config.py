@@ -29,8 +29,8 @@ class Settings(BaseSettings):
     # Vite may use the next local port when the default port is occupied. Keep
     # that explicit loopback origin available for cookie-protected mutations.
     cors_origins: list[str] = [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
+        "http://localhost:3099",
+        "http://127.0.0.1:3099",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
     ]

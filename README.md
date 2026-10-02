@@ -84,7 +84,7 @@ npm --prefix .\frontend run build
 
 部署步骤：
 
-1. 在受控部署环境设置 `PUBLIC_APP_URL` 为实际前端 HTTPS origin，同时设置 `AUTH_COOKIE_SECURE=true`，配置现有 `MAIL_*` SMTP 参数。本地开发可设置 `PUBLIC_APP_URL=http://127.0.0.1:5173`。
+1. 在受控部署环境设置 `PUBLIC_APP_URL` 为实际前端 HTTPS origin，同时设置 `AUTH_COOKIE_SECURE=true`，配置现有 `MAIL_*` SMTP 参数。本地开发可设置 `PUBLIC_APP_URL=http://127.0.0.1:3099，`。
 2. 明确选择首位系统管理员的邮箱，设置 `BOOTSTRAP_SUPERADMIN_EMAIL`。该账户须完成邮箱验证；启动、验证完成或登录时执行持久一次性 bootstrap，随后应移除该配置。后续提权降权通过账户页完成，不按注册顺序猜测管理员。
 3. 用迁移角色执行 `python -m alembic -c backend/alembic.ini -x use_admin=1 upgrade head`，再发布后端和前端。本次升级撤销旧版浏览器会话和验证码，用户须重新登录，未完成验证者可重新发送验证码。
 4. 运行 `python backend/scripts/verify_postgresql_runtime.py` 检查实际部署的 Schema、权限及依赖。此命令只读，不创建业务 fixture。
@@ -144,7 +144,7 @@ project-root
     │   ├── types/             # 领域类型
     │   ├── styles/            # 全局样式
     │   └── views/             # Scenarios / ScenarioDetail / DataSources / Agents / AgentChat / Tasks / Skills / MCP / LLMConfigs
-    ├── vite.config.ts         # 端口 5173，/api 代理到 127.0.0.1:8000
+    ├── vite.config.ts         # 端口 3099，/api 代理到 127.0.0.1:8000
     └── package.json
 ```
 
@@ -190,12 +190,12 @@ npm --prefix .\frontend ci
 # 若 npm 11 拦截了 postinstall 脚本：
 npm --prefix .\frontend approve-scripts esbuild vue-demi
 
-# 启动开发服务器（端口 5173），显式保持 /api 与后端端口一致
+# 启动开发服务器（端口 3099），显式保持 /api 与后端端口一致
 $env:VITE_API_PROXY_TARGET='http://127.0.0.1:8000'
 npm --prefix .\frontend run dev
 ```
 
-> 打开浏览器访问：http://127.0.0.1:5173
+> 打开浏览器访问：http://127.0.0.1:3099
 
 ## 配置说明
 

@@ -110,7 +110,7 @@ Python 3.12.0：`D:/miniconda3/envs/ontology_platform_env/python.exe`；Node v24
 
 此节使用用户真实工作区、项目 PostgreSQL/MinIO、已有资料和已配置真实模型，不使用脚本模型或合成账户。
 
-- 项目数据库已正常升级到实际 single head `20260919_40`。真实应用启动完成 PostgreSQL、MinIO 及生命周期检查；前端为现有 5173、后端 8001。修复期间发现另一个 `--reload` 实例占用同端口并消费队列，已停止该重复实例，保留单一验收后端。
+- 项目数据库已正常升级到实际 single head `20260919_40`。真实应用启动完成 PostgreSQL、MinIO 及生命周期检查；前端为现有 3099、后端 8001。修复期间发现另一个 `--reload` 实例占用同端口并消费队列，已停止该重复实例，保留单一验收后端。
 - Python 3.12 环境已正式安装 Playwright 1.63.0 和默认路径 Chromium，启用浏览器调查。部署仅放行用户指定的内网目标主机；账号密码经独立授权配置加密保存，没有进入源码、fixture 或对话。
 - `verify_postgresql_runtime.py` 对真实部署通过：schema current，运行角色无 Schema CREATE/危险角色标志，MinIO/Redis healthy。`verify_alembic_roundtrip.py` 在其自建隔离数据库完成往返，旧权限预期与既有迁移契约已同步。
 - 真实网站调查项目第 6 轮：实际 `open_business_system → login_business_system → inspect_business_page` 成功。登录接口先被范围限制拦截，按实际观察补齐 `/api/auth/login` 后登录成功；页面回执展示“零号.奇点工坊 / 蒸馏工作台 / 业务场景 / 表格与字段 / 流程与图谱 / AI 协作对话”。授权到期保持 2026-09-20 23:59；没有提交目标系统业务数据。该参考平台页面只证明网站调查能力，不作为医保业务事实依据。
@@ -123,12 +123,12 @@ Python 3.12.0：`D:/miniconda3/envs/ontology_platform_env/python.exe`；Node v24
 
 ### 可复查的真实页面
 
-- [真实资料蒸馏项目与图谱](http://127.0.0.1:5173/business-distillation/a38278173b124f8987b2f9b92d5f5e70)
-- [真实网站登录与调查回执](http://127.0.0.1:5173/business-distillation/20b4c2455e1f4267ad747044b78a7234)
-- [版本 3 的七份交接文件](http://127.0.0.1:5173/data-sources?source_id=1b8b3bbc953c43dba785995498c7c3a8)
-- [场景建设顾问](http://127.0.0.1:5173/scenarios/72b1c291859d4291aa3f7f8cabde83f8?stage=ontology)
+- [真实资料蒸馏项目与图谱](http://127.0.0.1:3099/business-distillation/a38278173b124f8987b2f9b92d5f5e70)
+- [真实网站登录与调查回执](http://127.0.0.1:3099/business-distillation/20b4c2455e1f4267ad747044b78a7234)
+- [版本 3 的七份交接文件](http://127.0.0.1:3099/data-sources?source_id=1b8b3bbc953c43dba785995498c7c3a8)
+- [场景建设顾问](http://127.0.0.1:3099/scenarios/72b1c291859d4291aa3f7f8cabde83f8?stage=ontology)
 
-这些页面仍要求项目的真实会话与工作区权限；链接不包含凭据。前后端在本机 5173 / 8001 保持运行。
+这些页面仍要求项目的真实会话与工作区权限；链接不包含凭据。前后端在本机 3099 / 8001 保持运行。
 
 ### 最终回归记录
 
