@@ -5,9 +5,9 @@ import json
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -405,7 +405,10 @@ def _agent_readiness_missing(
     """
     mode = str(getattr(agent, "runtime_binding_mode", "legacy") or "legacy")
     if mode in agent_readiness_service.CAPABILITY_MODES:
-        readiness = agent_readiness_service.compute_agent_readiness(db, agent)
+        definition = getattr(runtime_context, "runtime_definition", None)
+        readiness = agent_readiness_service.compute_agent_readiness(
+            db, agent, release_id=getattr(definition, "release_id", None),
+        )
         return [
             str(item.get("label") or "")
             for item in readiness["validation"]["missing"]
@@ -762,7 +765,7 @@ def _model_history(
     return _bounded_model_history(history_groups)
 
 
-def _out(a: Agent, db: Session) -> AgentOut:
+def _out(a: Agent, db: Session, *, release_id: str | None = None) -> AgentOut:
     scenario = tenant_service.get_visible(db, BusinessScenario, a.scenario_id) if a.scenario_id else None
     llm = tenant_service.get_visible(db, LLMConfig, a.llm_config_id) if a.llm_config_id else None
     definition = None
@@ -771,9 +774,9 @@ def _out(a: Agent, db: Session) -> AgentOut:
         definition_error = "尚未绑定业务场景"
     else:
         try:
-            definition = runtime_definition_service.resolve_authoring(
-                db,
-                scenario,
+            definition = (
+                runtime_definition_service.resolve_active(db, scenario, release_id=release_id)
+                if release_id else runtime_definition_service.resolve_authoring(db, scenario)
             )
         except (runtime_definition_service.RuntimeDefinitionError, ValueError) as exc:
             definition_error = str(exc) or "当前环境运行定义不可用"
@@ -797,7 +800,7 @@ def _out(a: Agent, db: Session) -> AgentOut:
             a.capability_scope,
             legacy_default=False,
         )
-    readiness = agent_readiness_service.compute_agent_readiness(db, a)
+    readiness = agent_readiness_service.compute_agent_readiness(db, a, release_id=release_id)
     runtime_connections = [
         _runtime_connection_out(source)
         for source in _agent_runtime_sources(db, a)
@@ -949,6 +952,7 @@ def get_agent_capability_catalog(
 def get_agent_runtime_capabilities(
     agent_id: str,
     db: Session = Depends(get_tenant_db),
+    release_id: Annotated[str | None, Query(min_length=1, max_length=32)] = None,
 ) -> list[dict[str, Any]]:
     """Return logical capability contracts without physical binding details."""
 
@@ -958,6 +962,7 @@ def get_agent_runtime_capabilities(
             db,
             agent,
             LLMConfig(name="能力契约发现"),
+            release_id=release_id,
         )
     except agent_runtime_adapter.AgentRuntimeAdapterError as exc:
         raise HTTPException(
@@ -1030,9 +1035,13 @@ def create_agent(payload: AgentIn, db: Session = Depends(get_tenant_db)):
 
 
 @router.get("/{agent_id}", response_model=AgentOut)
-def get_agent(agent_id: str, db: Session = Depends(get_tenant_db)):
+def get_agent(
+    agent_id: str,
+    db: Session = Depends(get_tenant_db),
+    release_id: Annotated[str | None, Query(min_length=1, max_length=32)] = None,
+):
     a = _agent(db, agent_id)
-    return _out(a, db)
+    return _out(a, db, release_id=release_id)
 
 
 @router.put("/{agent_id}", response_model=AgentOut)

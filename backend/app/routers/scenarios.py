@@ -1976,7 +1976,12 @@ def revalidate_scenario_model_candidates_batch(
     db.commit()
     for row in rows:
         db.refresh(row)
-    return ScenarioModelCandidateBatchRevalidationOut(**result)
+    return ScenarioModelCandidateBatchRevalidationOut(
+        revalidated_count=result["revalidated_count"],
+        eligible_count=result["eligible_count"],
+        blocked_count=result["blocked_count"],
+        eligible_draft_ids=result["eligible_draft_ids"],
+    )
 
 
 def _promote_scenario_model_candidates(
@@ -4525,7 +4530,7 @@ def create_workflow(scenario_id: str, payload: WorkflowIn, db: Session = Depends
     )
     if payload.nodes:
         try:
-            workflow_service.validate_workflow_definition(payload.nodes, payload.edges)
+            workflow_service.validate_workflow_definition(payload.nodes, payload.edges, trigger_config=payload.trigger_config)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(400, f"工作流校验失败: {exc}") from exc
     w = OntologyWorkflow(scenario_id=scenario_id, **payload.model_dump())
@@ -4562,7 +4567,7 @@ def update_workflow(workflow_id: str, payload: WorkflowIn, db: Session = Depends
     )
     if payload.nodes:
         try:
-            workflow_service.validate_workflow_definition(payload.nodes, payload.edges)
+            workflow_service.validate_workflow_definition(payload.nodes, payload.edges, trigger_config=payload.trigger_config)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(400, f"工作流校验失败: {exc}") from exc
     for k, v in payload.model_dump().items():

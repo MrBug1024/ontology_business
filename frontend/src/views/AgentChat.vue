@@ -35,6 +35,11 @@
 
     <!-- 右侧：对话区 -->
     <div class="chat-main">
+      <AgentReleaseSelector v-if="validationScenarioId" :scenario-id="validationScenarioId" :model-value="selectedReleaseId" :disabled="conversationNavigationLocked || currentTurnActive || currentTurnPending" @update:model-value="selectRelease" />
+      <el-alert v-if="targetError" :title="targetError" type="error" :closable="false" show-icon>
+        <el-button :loading="targetLoading" @click="loadAgent(false)">重试验证目标</el-button>
+      </el-alert>
+      <p v-if="targetLoading" role="status" class="validation-notice">正在校验本次验证目标…</p>
       <el-alert
         v-if="agent && !agentValidationReady"
         class="validation-notice"
@@ -154,6 +159,7 @@
           ref="composerRef"
           :agent-id="agent?.id || ''"
           :conversation-id="curConv?.id || ''"
+          :input-scope-key="selectedReleaseId"
           :scope-required="true"
           :disabled="!agentValidationReady || conversationLoading || currentTurnPending"
           :busy="currentTurnActive && !conversationLoading"
@@ -175,12 +181,15 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import type {
   Agent,
+  AgentChatRequest,
   AgentRuntimeCapability,
   ChatMessage,
   Conversation,
   RagCitation,
 } from '@/types'
 import AgentInvocationComposer from '@/components/AgentInvocationComposer.vue'
+import AgentReleaseSelector from '@/components/agent/AgentReleaseSelector.vue'
+import { createAgentValidationLoader } from '@/utils/agentValidationTarget'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import AssistantMessageContent from '@/components/AssistantMessageContent.vue'
 import MessageInputAttachments from '@/components/agent/MessageInputAttachments.vue'
@@ -198,6 +207,11 @@ import {
 const route = useRoute()
 const router = useRouter()
 const agent = ref<Agent | null>(null)
+const targetLoading = ref(false)
+const targetError = ref('')
+const targetLoader = createAgentValidationLoader(api)
+const selectedReleaseId = computed(() => queryValue(route.query.release_id))
+const validationScenarioId = computed(() => agent.value?.scenario_id || queryValue(route.query.scenario_id))
 const runtimeCapabilities = ref<AgentRuntimeCapability[]>([])
 const conversations = ref<Conversation[]>([])
 const curConv = ref<Conversation | null>(null)
@@ -240,7 +254,7 @@ const suggestions = [
 const validationReadiness = computed(() => agent.value
   ? normalizeAgentReadiness(agent.value).validation
   : { ready: false, missing: [] })
-const agentValidationReady = computed(() => validationReadiness.value.ready)
+const agentValidationReady = computed(() => !targetLoading.value && !targetError.value && validationReadiness.value.ready)
 const validationMissingText = computed(() => {
   const labels = validationReadiness.value.missing.map((issue) => issue.label)
   return labels.length ? `尚缺：${labels.join('、')}` : '服务端尚未确认验证就绪状态'
@@ -472,7 +486,7 @@ const {
   recoverActiveTurns,
   recoverConversationTurns,
   resetTurnScope,
-  send,
+  send: sendTurn,
   canRetryTurn,
   retryTurn,
   canCancelTurn,
@@ -495,14 +509,29 @@ const {
   followProgress: followReceipt,
 })
 
-async function loadAgent() {
+function send(payload: AgentChatRequest) {
+  return sendTurn({ ...payload, release_id: selectedReleaseId.value || undefined })
+}
+
+function selectRelease(releaseId: string) {
+  if (conversationNavigationLocked.value || currentTurnActive.value || currentTurnPending.value) return
+  void router.replace({ query: { ...route.query, release_id: releaseId || undefined } })
+}
+
+async function loadAgent(recoverActive = true) {
   const requestedId = String(route.params.id || '')
+  const releaseId = selectedReleaseId.value
   const requestId = ++agentLoadRequest
-  const [loadedAgent, loadedCapabilities] = await Promise.all([
-    api.getAgent(requestedId),
-    api.getAgentRuntimeCapabilities(requestedId),
-  ])
+  targetLoading.value = true
+  targetError.value = ''
+  const target = await targetLoader.load(requestedId, releaseId)
   if (viewDisposed || requestId !== agentLoadRequest || String(route.params.id || '') !== requestedId) return
+  if (!target || releaseId !== selectedReleaseId.value) return
+  targetLoading.value = false
+  targetError.value = target.error
+  if (!target.agent) { runtimeCapabilities.value = []; return }
+  const loadedAgent = target.agent
+  const loadedCapabilities = target.capabilities
   const agentScenarioId = loadedAgent.scenario_id || ''
   if (agentScenarioId && queryValue(route.query.scenario_id) !== agentScenarioId) {
     await router.replace({
@@ -514,7 +543,8 @@ async function loadAgent() {
   }
   agent.value = loadedAgent
   runtimeCapabilities.value = loadedCapabilities
-  void loadConvs(true)
+  if (recoverActive) void loadConvs(true)
+  else void loadConvs()
 }
 
 function requestErrorMessage(error: any, fallback: string) {
@@ -685,8 +715,16 @@ watch(() => route.params.id, (nextId, previousId) => {
   messages.value = []
   void loadAgent()
 })
+watch(selectedReleaseId, () => {
+  resetTurnScope()
+  conversationLoadRequest += 1
+  curConv.value = null
+  messages.value = []
+  void loadAgent(false)
+})
 onBeforeUnmount(() => {
   viewDisposed = true
+  targetLoader.dispose()
   agentLoadRequest += 1
   conversationLoadRequest += 1
   document.getElementById('main-content')?.classList.remove('agent-chat-active')

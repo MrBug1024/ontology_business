@@ -45,6 +45,7 @@
       @keydown.enter.exact.prevent="submitDraft"
     />
 
+    <AgentFixedInputs v-model:enabled="fixedInputsEnabled" v-model:source="fixedInputSource" :disabled="disabled || busy" :error="fixedInputResult.error" />
     <div class="composer-actions">
       <div class="composer-tools">
         <el-segmented
@@ -75,7 +76,7 @@
       </div>
       <div class="submit-actions">
         <el-button v-if="busy" @click="$emit('stop')"><el-icon><VideoPause /></el-icon>停止</el-button>
-        <el-button v-else type="primary" :disabled="disabled || submissionBlocked || (!message.trim() && !submittableAttachments.length)" @click="submitDraft">
+        <el-button v-else type="primary" :disabled="disabled || submissionBlocked || Boolean(fixedInputResult.error) || (!message.trim() && !submittableAttachments.length)" @click="submitDraft">
           <el-icon><Promotion /></el-icon>发送
         </el-button>
       </div>
@@ -121,6 +122,8 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
+import AgentFixedInputs from '@/components/agent/AgentFixedInputs.vue'
+import { parseFixedBusinessInputs } from '@/utils/agentFixedInputs'
 import type { AgentChatRequest, CatalogAsset, CatalogAssetVersion, ManagedUploadRun } from '@/types'
 import {
   AGENT_INVOCATION_FILE_ACCEPT,
@@ -160,6 +163,7 @@ type SavedAsset = {
 const props = withDefaults(defineProps<{
   agentId?: string
   conversationId?: string
+  inputScopeKey?: string
   /** AgentChat must wait for a verified Agent scope before reading/uploads. */
   scopeRequired?: boolean
   disabled?: boolean
@@ -184,6 +188,9 @@ const emit = defineEmits<{
 }>()
 
 const message = ref('')
+const fixedInputsEnabled = ref(false)
+const fixedInputSource = ref('')
+const fixedInputResult = computed(() => parseFixedBusinessInputs(fixedInputsEnabled.value, fixedInputSource.value))
 const attachments = ref<ChatAttachmentDraft[]>([])
 const uploadError = ref('')
 const messageInputRef = ref()
@@ -586,11 +593,13 @@ function invocationIdempotencyKey() {
 
 async function submitDraft() {
   if (props.disabled || props.busy || submissionBlocked.value || !hasAttachmentScope()) return
+  if (fixedInputResult.value.error) return
   const text = message.value.trim()
   if (!text && !submittableAttachments.value.length) return
   uploadError.value = ''
   emit('submit', {
     message: text,
+    ...(fixedInputResult.value.inputs ? { inputs: fixedInputResult.value.inputs } : {}),
     conversation_id: props.conversationId || '',
     idempotency_key: invocationIdempotencyKey(),
     attachments: submittableAttachments.value.map((item) => (
@@ -610,6 +619,8 @@ async function submitDraft() {
 
 function clearAfterAccepted() {
   message.value = ''
+  fixedInputsEnabled.value = false
+  fixedInputSource.value = ''
   attachments.value = []
   uploadError.value = ''
   void nextTick(() => messageInputRef.value?.focus?.())
@@ -630,6 +641,11 @@ function formatSize(bytes: number) {
 function formatDate(value: string) {
   return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : ''
 }
+
+watch(() => [props.agentId, props.conversationId, props.inputScopeKey], () => {
+  fixedInputsEnabled.value = false
+  fixedInputSource.value = ''
+})
 
 watch(() => [props.agentId, props.scopeRequired] as const, ([agentId, scopeRequired], [previousAgentId]) => {
   const nextScope = String(agentId || '').trim()

@@ -52,7 +52,7 @@
 
       <el-tab-pane name="distillation" lazy>
         <template #label><span class="scenario-context-tab scenario-context-tab-end"><el-icon><Compass /></el-icon>业务蒸馏</span></template>
-        <DistillationWorkspace v-if="detail.can_read_workspace_context" :key="`distillation:${scenarioId}`" embedded :scenario-id="scenarioId" :can-write="canWrite" />
+        <DistillationWorkspace v-if="detail.can_read_workspace_context" :key="`distillation:${scenarioId}`" embedded :scenario-id="scenarioId" :can-write="canWrite" :show-scenario-context="detail.can_read_workspace_context" />
         <el-empty v-else description="业务蒸馏记录仅对场景成员开放" :image-size="64" />
       </el-tab-pane>
 
@@ -1475,6 +1475,8 @@ import CapabilityPortsPanel from '@/components/CapabilityPortsPanel.vue'
 import SemanticMappingsPanel from '@/components/SemanticMappingsPanel.vue'
 import WorkflowEditor from '@/components/workflow/WorkflowEditor.vue'
 import DistillationWorkspace from '@/components/distillation/DistillationWorkspace.vue'
+import ScenarioBusinessContextPanel from '@/components/ScenarioBusinessContextPanel.vue'
+import { openScenarioModelingAdvisor } from '@/utils/scenarioAdvisorEvents'
 import DataSources from '@/views/DataSources.vue'
 import { safeInternalReturnPath } from '@/utils/navigation'
 import { normalizeScenarioStage } from '@/utils/scenarioStages'
@@ -4375,9 +4377,7 @@ function goToTemplates() {
 }
 function askWorkflowAdvisor(prompt: string) {
   if (!canWrite.value) return
-  window.dispatchEvent(new CustomEvent('open-scenario-modeling-advisor', {
-    detail: { scenario_id: sid, prompt },
-  }))
+  openScenarioModelingAdvisor({ scenario_id: sid, prompt })
 }
 function onAssistantApplied(event: Event) {
   const detail = (event as CustomEvent<{ scenario_id?: string }>).detail || {}

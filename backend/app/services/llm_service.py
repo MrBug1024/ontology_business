@@ -22,6 +22,7 @@ from . import tenant_service
 
 
 SUPPORTED_CAPABILITIES = frozenset({"chat", "embedding", "vision", "tool"})
+MAX_BOUNDED_STREAM_TOOL_CALLS = 64
 _DEFAULT_CAPABILITIES = ("chat", "tool")
 _SENSITIVE_KEY_NAMES = {
     "api_key",
@@ -576,6 +577,17 @@ def chat_stream(
                 yield {"type": "token", "content": delta.content}
             if delta.tool_calls:
                 for tc in delta.tool_calls:
+                    if max_output_chars is not None:
+                        function = tc.function
+                        fragments = (tc.id or "", (function.name or "") if function else "",
+                                     (function.arguments or "") if function else "")
+                        output_chars += sum(len(fragment) for fragment in fragments)
+                        # Count an envelope even for empty fragments, and reject
+                        # before retaining a new slot or concatenating arguments.
+                        output_chars += 1
+                        if (output_chars > max_output_chars
+                                or (tc.index not in tc_acc and len(tc_acc) >= MAX_BOUNDED_STREAM_TOOL_CALLS)):
+                            raise LLMRuntimeError("模型结构输出超过受控大小")
                     slot = tc_acc.setdefault(
                         tc.index,
                         {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},

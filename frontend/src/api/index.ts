@@ -5,6 +5,7 @@ import type {
   Agent,
   AgentCapabilityCatalog,
   AssistantAttachment,
+  ConstructionResolution,
   AssistantCompilationJobResult,
   AssistantCompilationJobStatus,
   AssistantCompilationGuidanceResult,
@@ -109,12 +110,19 @@ const instance = axios.create({ baseURL: '/api', timeout: 120000, withCredential
 
 instance.interceptors.response.use(
   (r) => r.data,
-  (err) => {
+  async (err) => {
     if (err.response?.status === 401 && !String(err.config?.url || '').startsWith('/auth') && window.location.pathname !== '/login') {
       window.location.assign('/login')
     }
-    const msg = err.response?.data?.detail || err.message || '请求失败'
-    const error = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg)) as Error & {
+    let responseBody: unknown = err.response?.data
+    if (responseBody instanceof Blob && responseBody.size <= 1024 * 1024) {
+      try { responseBody = JSON.parse(await responseBody.text()) } catch { responseBody = undefined }
+    }
+    const detail = responseBody && typeof responseBody === 'object' && 'detail' in responseBody ? responseBody.detail : undefined
+    const msg = detail || err.message || '请求失败'
+    const displayMessage = msg && typeof msg === 'object' && 'message' in msg && typeof msg.message === 'string'
+      ? msg.message : typeof msg === 'string' ? msg : JSON.stringify(msg)
+    const error = new Error(displayMessage) as Error & {
       status?: number
       detail?: unknown
     }
@@ -680,9 +688,10 @@ export const api = {
 
   // Agent
   listAgents: async () => (await http.get<Agent[]>('/agents')).map(withNormalizedAgentReadiness),
-  getAgent: async (id: string) => withNormalizedAgentReadiness(await http.get<Agent>(`/agents/${id}`)),
-  getAgentRuntimeCapabilities: (id: string) =>
-    http.get<AgentRuntimeCapability[]>(`/agents/${id}/runtime-capabilities`),
+  getAgent: async (id: string, releaseId?: string, signal?: AbortSignal) =>
+    withNormalizedAgentReadiness(await http.get<Agent>(`/agents/${id}`, { params: { release_id: releaseId }, signal })),
+  getAgentRuntimeCapabilities: (id: string, releaseId?: string, signal?: AbortSignal) =>
+    http.get<AgentRuntimeCapability[]>(`/agents/${id}/runtime-capabilities`, { params: { release_id: releaseId }, signal }),
   getAgentCapabilityCatalog: (scenarioId: string) => http.get<AgentCapabilityCatalog>(`/agents/capability-catalog/${scenarioId}`),
   createAgent: async (d: Partial<Agent>) => withNormalizedAgentReadiness(await http.post<Agent>('/agents', agentWritePayload(d))),
   updateAgent: async (id: string, d: Partial<Agent>) => withNormalizedAgentReadiness(await http.put<Agent>(`/agents/${id}`, agentWritePayload(d))),
@@ -895,6 +904,7 @@ function streamAssistantEvents(
 export function streamAssistantChat(
   payload: {
     message: string
+    construction_resolution?: ConstructionResolution
     request_id?: string
     thread_id?: string
     scenario_id?: string

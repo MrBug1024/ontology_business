@@ -48,7 +48,10 @@ const router = createRouter({
     { path: '/templates', name: 'templates', redirect: (to) => ({ name: 'data-sources', query: { ...to.query, library_tab: 'templates' } }), meta: { title: '资料库' } },
     { path: '/agents', name: 'agents', component: () => import('@/views/Agents.vue'), meta: { title: '验证中心' } },
     { path: '/agents/:id/chat', name: 'agent-chat', component: () => import('@/views/AgentChat.vue'), meta: { title: '能力验证' } },
-    { path: '/access', name: 'capability-access', component: () => import('@/views/CapabilityAccess.vue'), meta: { title: '发布与接入' } },
+    { path: '/plugin-studio', name: 'plugin-development', component: () => import('@/views/PluginDevelopment.vue'), meta: { title: '插件开发', focusWorkspace: true } },
+    { path: '/access', name: 'capability-access', component: () => import('@/views/CapabilityAccess.vue'), meta: { title: '发布中心' } },
+    { path: '/plugin-studio/:releaseId', name: 'plugin-coding-studio', component: () => import('@/views/PluginCodingStudio.vue'), meta: { title: '插件工作台', focusWorkspace: true } },
+    { path: '/plugin-studio/:pathMatch(.*)*', redirect: (to) => ({ name: 'plugin-development', params: {}, query: to.query }) },
     { path: '/tasks', name: 'tasks', component: () => import('@/views/Tasks.vue'), meta: { title: '运行治理' } },
     { path: '/llm', name: 'llm', redirect: legacyPlatformSettingsRedirect('llm') },
     {

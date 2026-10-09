@@ -1,0 +1,12 @@
+{
+  "read_only": true,
+  "business_data_changed": false,
+  "verified_scenarios": 1,
+  "material_count": 1,
+  "authorized_directory_passed": true,
+  "stale_frozen_metadata_rejected_409": true,
+  "orm_writes": 0,
+  "warm_query_count": 3,
+  "elapsed_ms": 15.503,
+  "rolled_back": true
+}

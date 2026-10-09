@@ -1,0 +1,24 @@
+{
+  "business_data_modified": false,
+  "expected_state": "withdrawn",
+  "source": {
+    "marketplace": {
+      "status": 404
+    },
+    "installer": {
+      "status": 404
+    }
+  },
+  "immutable_artifacts": [
+    {
+      "version": "1.0.0",
+      "sha256": "d858ef36cc8e55b6f5b7e2ea994d0a0671684a49568338ab6f20ce76cb784bf1",
+      "bytes": 9963
+    },
+    {
+      "version": "1.1.0",
+      "sha256": "12d6adc93ed16cc301a3516a0e9d5055787be3d1f9cc9485af7ead5d25aef15c",
+      "bytes": 13666
+    }
+  ]
+}

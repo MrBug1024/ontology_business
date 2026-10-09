@@ -1496,6 +1496,7 @@ export interface AgentChatAttachment {
 
 export interface AgentChatRequest {
   message: string
+  release_id?: string
   conversation_id?: string
   inputs?: Record<string, unknown>
   managed_inputs?: AgentManagedInput[]
@@ -1843,10 +1844,35 @@ export interface AssistantDecisionGate {
     source_refs?: string[]
     affected_change_keys?: string[]
     resolution_hint?: string
+    question_id?: string
+    completion_condition?: string
+    next_options?: string[]
   }>
   safe_to_formalize?: boolean
   human_review_required?: boolean
   explanation?: string
+}
+
+export interface ConstructionResolution {
+  proposal_id: string
+  expected_revision: number
+  action: 'clarify' | 'replan'
+  answers: { question_id: string; answer: string }[]
+  rationale: string
+}
+
+export interface ConstructionDelivery {
+  version: 'construction-delivery.v1'
+  definition_count: number
+  validated_definition_count: number
+  blocked_definition_count: number
+  implementation_required_count: number
+  missing_requirement_count: number
+  definition_complete: boolean
+  business_acceptance: 'not_verified'
+  questions: NonNullable<AssistantDecisionGate['questions']>
+  repair_summary?: { attempt_count: number; accepted_count: number; initial_blocker_count: number; remaining_blocker_count: number; stop_reason: string } | null
+  next_step: string
 }
 
 export interface AssistantActionPreview {

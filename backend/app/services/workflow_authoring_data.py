@@ -6,6 +6,10 @@ import json
 import math
 import re
 
+from pydantic import ValidationError
+
+from ..channel_interaction_schemas import ApprovalAudience
+
 
 VARIABLE_PATTERN = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
 MAX_NODE_DATA_BYTES = 32_768
@@ -13,7 +17,8 @@ MAX_NODE_DATA_DEPTH = 20
 MAX_NODE_DATA_VALUES = 4_096
 EXECUTION_FIELDS = {
     "action": ("params",), "rule": ("record",), "event": ("payload",),
-    "end": ("output", "summary"), "approval": ("instructions",),
+    "end": ("output", "summary"),
+    "approval": ("instructions", *ApprovalAudience.model_fields),
 }
 TEMPLATE_FIELDS = {**EXECUTION_FIELDS, "llm": ("prompt",), "approval": ()}
 
@@ -39,6 +44,12 @@ def _validate_json(value: object, *, depth: int = 0, budget: list[int]) -> None:
 def execution_data(node_type: str, data: dict) -> dict:
     """Keep supported runtime values intact; reject invalid data instead of coercing it."""
     result = {key: data[key] for key in EXECUTION_FIELDS.get(node_type, ()) if key in data}
+    if node_type == 'approval':
+        policy = {key: result[key] for key in ApprovalAudience.model_fields if key in result}
+        try:
+            ApprovalAudience.model_validate(policy)
+        except ValidationError:
+            raise ValueError('审批人员、角色或证据要求配置无效') from None
     _validate_json(result, budget=[MAX_NODE_DATA_VALUES])
     if len(json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")) > MAX_NODE_DATA_BYTES:
         raise ValueError("节点执行数据超过字节上限")
@@ -131,6 +142,8 @@ end.output 是真实业务输出（支持结构化对象/数组及模板），en
 模板使用 {{params.field}} 引用本次输入，使用 {{upstream_node.field}} 引用每条到达路径都会执行的上游节点。
 llm 节点输出包含 result（文本）和 parsed（解析 JSON），例如 end.output={{summarize.parsed}}。
 approval.instructions 是静态复核说明，不展开模板；服务端暂停并记录批准或拒绝，批准后输出只含 node_id。
+approval.data 可声明 approver_user_ids、approver_roles 和 requires_evidence；必须完整保留来源明确的审批权限与证据要求。
+approver_roles 仅支持 owner/admin/operator/viewer，approver_user_ids 只引用明确的有效人员身份，requires_evidence 必须是 JSON 布尔值。
 不得虚构审批节点返回复核表单、意见或业务判定；需要这些内容时将其作为明确的本次输入或记录尚缺的能力。
 end.output 必须引用实际输入或上游结果，不得用“自动生成编号”“复核时间”“总数”等说明性占位词冒充真实运行值。
 不存在 input 这个模板根；不允许引用自身、后续节点或只在另一分支执行的节点，不支持模板内代码/表达式。

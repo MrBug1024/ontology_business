@@ -45,7 +45,33 @@ export interface ProcessImprovement {
   rationale: string
   expected_benefit: string
 }
-export interface DistillationEntity { key: string; name: string; description: string; attributes: string[]; identity?: string; evidence_refs?: string[] }
+export interface DistillationPropertyContract {
+  attribute: string
+  data_type: 'string' | 'text' | 'integer' | 'float' | 'number' | 'boolean' | 'date' | 'datetime' | 'json'
+  is_required: boolean
+  is_key: boolean
+  description?: string
+  constraints: Record<string, string | number | boolean>
+  enum_values: string[]
+}
+export interface DistillationEntity {
+  key: string
+  name: string
+  description: string
+  attributes: string[]
+  identity?: string
+  evidence_refs?: string[]
+  is_abstract?: boolean
+  property_contracts?: DistillationPropertyContract[]
+}
+export interface DistillationConstructionQuality {
+  version: 'distillation-construction-quality.v1'
+  entity_count: number
+  complete_entity_keys: string[]
+  complete_entity_count: number
+  construction_complete: boolean
+  issues: { entity_key: string; name: string; missing: string[]; next_step: string }[]
+}
 export interface DistillationRelation {
   source: string
   target: string

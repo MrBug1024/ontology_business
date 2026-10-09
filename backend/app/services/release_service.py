@@ -1435,7 +1435,9 @@ def normalize_snapshot_content(content: Any) -> dict:
                 raise ReleaseValidationError(str(exc)) from exc
         if workflow["nodes"]:
             try:
-                validate_workflow_graph(workflow["nodes"], workflow["edges"])
+                from .workflow_ontology_contract import declared_output_nodes
+                validate_workflow_graph(workflow["nodes"], workflow["edges"],
+                    output_node_ids=declared_output_nodes(workflow.get('trigger_config')))
             except Exception as exc:  # noqa: BLE001
                 raise ReleaseValidationError(f"工作流图校验失败: {exc}") from exc
 

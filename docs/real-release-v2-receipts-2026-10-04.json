@@ -1,0 +1,528 @@
+[
+  {
+    "invocation_id": "c053bb7a3a6347faa8c4dcefaa299129",
+    "created_at": "2026-10-04T12:08:15.010043+00:00",
+    "receipt_status": "succeeded",
+    "workflow_status": "succeeded",
+    "definition_hash": "830a447e29b1393610b446fcc821f4b3423ba7fbde6d2d1df4aa3cb2a7731ae7",
+    "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+    "input_hash": "0cf98681fee4ed470e01b6a076ac2a7143aadab8db7e3949ac0193ae517a6471",
+    "structured_input_hash": "3948b6f6b06f4c46d88b8a3161d3fa499b2cf4188f342c1a764846176cf1052f",
+    "synthetic_input": {
+      "record": {
+        "applicant_id": "APP-001",
+        "description": "一般问题",
+        "priority": "normal",
+        "request_id": "V2-NORMAL-001",
+        "service_type_id": "ST-001",
+        "title": "普通咨询"
+      }
+    },
+    "result": {
+      "log_id": "4ddfcb44e07845c8afce84b9ddf36c0e",
+      "status": "success",
+      "steps": [
+        {
+          "node": "start",
+          "name": "开始",
+          "type": "start",
+          "status": "success",
+          "result": {
+            "input_summary": {
+              "contract": "workflow-run-input-summary/v1",
+              "redacted": true,
+              "payload_available": true,
+              "payload_present": true,
+              "field_count": 1,
+              "value_type_counts": {
+                "object": 1
+              }
+            }
+          }
+        },
+        {
+          "node": "route_rule",
+          "name": "高优先级分流规则",
+          "type": "rule",
+          "status": "not_matched",
+          "result": {
+            "rule_id": "455af88599e44bb6a305c0e41d2b7102",
+            "rule_name": "高优先级分流规则",
+            "matched": false,
+            "severity": "info",
+            "action_on_match": "",
+            "trigger_action_ids": [],
+            "trigger_actions": [],
+            "side_effects_executed": false
+          }
+        },
+        {
+          "node": "end_standard",
+          "name": "常规结束",
+          "type": "end",
+          "result": {
+            "request_id": "V2-NORMAL-001",
+            "route": "standard",
+            "reason": "valid_low_or_normal_priority"
+          },
+          "contract_validation": "passed",
+          "status": "success"
+        }
+      ],
+      "connector_audit": [],
+      "error": "",
+      "duration_ms": 2
+    },
+    "error": ""
+  },
+  {
+    "invocation_id": "1a997eab2c2c468682091254903c413a",
+    "created_at": "2026-10-04T12:08:15.258134+00:00",
+    "receipt_status": "succeeded",
+    "workflow_status": "succeeded",
+    "definition_hash": "830a447e29b1393610b446fcc821f4b3423ba7fbde6d2d1df4aa3cb2a7731ae7",
+    "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+    "input_hash": "0acdb2cd17e027493a00fb1542cd818463f25f9cc777996db9efc84d7f0dc99b",
+    "structured_input_hash": "61f71f132869740bd5dcaa66951ea6fa7f25a1469b985a7112aecb19ab62079b",
+    "synthetic_input": {
+      "record": {
+        "applicant_id": "APP-002",
+        "description": "紧急问题",
+        "priority": "high",
+        "request_id": "V2-HIGH-001",
+        "service_type_id": "ST-001",
+        "title": "加急咨询"
+      }
+    },
+    "result": {
+      "log_id": "b3d1875e26b440949146c8c6811e321a",
+      "status": "success",
+      "steps": [
+        {
+          "node": "start",
+          "name": "开始",
+          "type": "start",
+          "status": "success",
+          "result": {
+            "input_summary": {
+              "contract": "workflow-run-input-summary/v1",
+              "redacted": true,
+              "payload_available": true,
+              "payload_present": true,
+              "field_count": 1,
+              "value_type_counts": {
+                "object": 1
+              }
+            }
+          }
+        },
+        {
+          "node": "route_rule",
+          "name": "高优先级分流规则",
+          "type": "rule",
+          "status": "matched",
+          "result": {
+            "rule_id": "455af88599e44bb6a305c0e41d2b7102",
+            "rule_name": "高优先级分流规则",
+            "matched": true,
+            "severity": "info",
+            "action_on_match": "route=expedited",
+            "trigger_action_ids": [],
+            "trigger_actions": [],
+            "side_effects_executed": false
+          }
+        },
+        {
+          "node": "end_expedited",
+          "name": "加急结束",
+          "type": "end",
+          "result": {
+            "request_id": "V2-HIGH-001",
+            "route": "expedited",
+            "reason": "valid_high_priority"
+          },
+          "contract_validation": "passed",
+          "status": "success"
+        }
+      ],
+      "connector_audit": [],
+      "error": "",
+      "duration_ms": 4
+    },
+    "error": ""
+  },
+  {
+    "invocation_id": "0e3b81da612c4e8fbf942feccfe5e7b1",
+    "created_at": "2026-10-04T12:08:15.495633+00:00",
+    "receipt_status": "succeeded",
+    "workflow_status": "succeeded",
+    "definition_hash": "830a447e29b1393610b446fcc821f4b3423ba7fbde6d2d1df4aa3cb2a7731ae7",
+    "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+    "input_hash": "3b84b188a57c2e2a27e3a2b8e8361ba1a17d2cede9c837cb4953c223390f42b3",
+    "structured_input_hash": "c291589f219b2a42d4b3b9144c7600cd10b2fd500cac7954bacb7f74c7cac9c9",
+    "synthetic_input": {
+      "record": {
+        "applicant_id": "APP-003",
+        "description": "可以等待",
+        "priority": "low",
+        "request_id": "V2-LOW-001",
+        "service_type_id": "ST-001",
+        "title": "低优先级咨询"
+      }
+    },
+    "result": {
+      "log_id": "238293e8e2d747bf84a476f5fa0a48fb",
+      "status": "success",
+      "steps": [
+        {
+          "node": "start",
+          "name": "开始",
+          "type": "start",
+          "status": "success",
+          "result": {
+            "input_summary": {
+              "contract": "workflow-run-input-summary/v1",
+              "redacted": true,
+              "payload_available": true,
+              "payload_present": true,
+              "field_count": 1,
+              "value_type_counts": {
+                "object": 1
+              }
+            }
+          }
+        },
+        {
+          "node": "route_rule",
+          "name": "高优先级分流规则",
+          "type": "rule",
+          "status": "not_matched",
+          "result": {
+            "rule_id": "455af88599e44bb6a305c0e41d2b7102",
+            "rule_name": "高优先级分流规则",
+            "matched": false,
+            "severity": "info",
+            "action_on_match": "",
+            "trigger_action_ids": [],
+            "trigger_actions": [],
+            "side_effects_executed": false
+          }
+        },
+        {
+          "node": "end_standard",
+          "name": "常规结束",
+          "type": "end",
+          "result": {
+            "request_id": "V2-LOW-001",
+            "route": "standard",
+            "reason": "valid_low_or_normal_priority"
+          },
+          "contract_validation": "passed",
+          "status": "success"
+        }
+      ],
+      "connector_audit": [],
+      "error": "",
+      "duration_ms": 4
+    },
+    "error": ""
+  },
+  {
+    "invocation_id": "8e2b26196eb74082997636ee08cfc787",
+    "created_at": "2026-10-04T12:08:15.637052+00:00",
+    "receipt_status": "succeeded",
+    "workflow_status": "failed",
+    "definition_hash": "830a447e29b1393610b446fcc821f4b3423ba7fbde6d2d1df4aa3cb2a7731ae7",
+    "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+    "input_hash": "6842d9e6b2c9298243be04aa78cf1777ac55ff2760ed2bd174edebc3e8bcc062",
+    "structured_input_hash": "1d33d15419dae66d59fa2defadbe5eb7fe95dbedb1c56216f7d45a686d66e604",
+    "synthetic_input": {
+      "record": {
+        "applicant_id": "APP-004",
+        "description": "拒绝枚举外值",
+        "priority": "urgent",
+        "request_id": "V2-INVALID-001",
+        "service_type_id": "ST-001",
+        "title": "非法优先级"
+      }
+    },
+    "result": {
+      "log_id": "fd00185986964e2a9282a32811b9ead8",
+      "status": "failed",
+      "steps": [],
+      "connector_audit": [],
+      "error": "规则输入属性“priority”不符合所选对象契约（enum）",
+      "duration_ms": 2
+    },
+    "error": "规则输入属性“priority”不符合所选对象契约（enum）"
+  },
+  {
+    "invocation_id": "cd16b9eedf1346b7a98e24731dea04e5",
+    "created_at": "2026-10-04T12:08:16.040944+00:00",
+    "receipt_status": "succeeded",
+    "workflow_status": "succeeded",
+    "definition_hash": "830a447e29b1393610b446fcc821f4b3423ba7fbde6d2d1df4aa3cb2a7731ae7",
+    "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+    "input_hash": "7ea894c279f052715275d9d7ba5658a1eebdc852ef7b00e5a9c298824cb21522",
+    "structured_input_hash": "40ba1702a28b5563af1bdc556e22a3d0e13915896be13bac88d9a693114a3ab7",
+    "synthetic_input": {
+      "record": {
+        "applicant_id": "APP-001",
+        "description": "缺申请人编号",
+        "priority": "normal",
+        "request_id": "V2-MISSING-001",
+        "service_type_id": "ST-001",
+        "title": "不完整申请"
+      }
+    },
+    "result": {
+      "log_id": "2dbabaa0a2b246418c90d68e69b3eee1",
+      "status": "success",
+      "steps": [
+        {
+          "node": "start",
+          "name": "开始",
+          "type": "start",
+          "status": "success",
+          "result": {
+            "input_summary": {
+              "contract": "workflow-run-input-summary/v1",
+              "redacted": true,
+              "payload_available": true,
+              "payload_present": true,
+              "field_count": 1,
+              "value_type_counts": {
+                "object": 1
+              }
+            }
+          }
+        },
+        {
+          "node": "route_rule",
+          "name": "高优先级分流规则",
+          "type": "rule",
+          "status": "not_matched",
+          "result": {
+            "rule_id": "455af88599e44bb6a305c0e41d2b7102",
+            "rule_name": "高优先级分流规则",
+            "matched": false,
+            "severity": "info",
+            "action_on_match": "",
+            "trigger_action_ids": [],
+            "trigger_actions": [],
+            "side_effects_executed": false
+          }
+        },
+        {
+          "node": "end_standard",
+          "name": "常规结束",
+          "type": "end",
+          "result": {
+            "request_id": "V2-MISSING-001",
+            "route": "standard",
+            "reason": "valid_low_or_normal_priority"
+          },
+          "contract_validation": "passed",
+          "status": "success"
+        }
+      ],
+      "connector_audit": [],
+      "error": "",
+      "duration_ms": 3
+    },
+    "error": ""
+  },
+  {
+    "invocation_id": "b7594730db8445a0bca8a92e92a87d64",
+    "created_at": "2026-10-04T12:11:50.133251+00:00",
+    "receipt_status": "succeeded",
+    "workflow_status": "succeeded",
+    "definition_hash": "830a447e29b1393610b446fcc821f4b3423ba7fbde6d2d1df4aa3cb2a7731ae7",
+    "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+    "input_hash": "7f483a68badcc92228b59359752a0a3488aa9e8250bef4d9c3a54e1e0918f953",
+    "structured_input_hash": "6881c0daecf9f9fdca61a2fee30f95eff3a6223d8867e0e7b03f9efd9dda09ee",
+    "synthetic_input": {
+      "record": {
+        "entity_service_request_applicant_id": "",
+        "entity_service_request_description": "本轮故意不提供申请人编号",
+        "entity_service_request_priority": "normal",
+        "entity_service_request_request_id": "V2-ISOLATED-MISSING-001",
+        "entity_service_request_service_type_id": "ST-001",
+        "entity_service_request_title": "不完整申请"
+      }
+    },
+    "result": {
+      "log_id": "63ece9598a324936ae866c9c105d5d9a",
+      "status": "success",
+      "steps": [
+        {
+          "node": "start",
+          "name": "开始",
+          "type": "start",
+          "status": "success",
+          "result": {
+            "input_summary": {
+              "contract": "workflow-run-input-summary/v1",
+              "redacted": true,
+              "payload_available": true,
+              "payload_present": true,
+              "field_count": 1,
+              "value_type_counts": {
+                "object": 1
+              }
+            }
+          }
+        },
+        {
+          "node": "route_rule",
+          "name": "高优先级分流规则",
+          "type": "rule",
+          "status": "not_matched",
+          "result": {
+            "rule_id": "455af88599e44bb6a305c0e41d2b7102",
+            "rule_name": "高优先级分流规则",
+            "matched": false,
+            "severity": "info",
+            "action_on_match": "",
+            "trigger_action_ids": [],
+            "trigger_actions": [],
+            "side_effects_executed": false
+          }
+        },
+        {
+          "node": "end_standard",
+          "name": "常规结束",
+          "type": "end",
+          "result": {
+            "request_id": "V2-ISOLATED-MISSING-001",
+            "route": "standard",
+            "reason": "valid_low_or_normal_priority"
+          },
+          "contract_validation": "passed",
+          "status": "success"
+        }
+      ],
+      "connector_audit": [],
+      "error": "",
+      "duration_ms": 6
+    },
+    "error": ""
+  },
+  {
+    "invocation_id": "0dfec054425245e3ab114e7db62c70b4",
+    "created_at": "2026-10-04T12:12:11.331059+00:00",
+    "receipt_status": "succeeded",
+    "workflow_status": null,
+    "definition_hash": "830a447e29b1393610b446fcc821f4b3423ba7fbde6d2d1df4aa3cb2a7731ae7",
+    "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+    "input_hash": "35c7e1bae9bbde6857d4725e4ab2d0805747779a1d48694ddbcfb545c6b9fb3f",
+    "structured_input_hash": "f15eeefc32f71a68b431a1e141027b88e5f0978d5227fd10e06a4ff420110372",
+    "synthetic_input": {},
+    "result": {},
+    "error": ""
+  },
+  {
+    "invocation_id": "a74e4675039c41b3ac7921f4f72d351f",
+    "created_at": "2026-10-04T12:21:53.991712+00:00",
+    "receipt_status": "succeeded",
+    "workflow_status": "failed",
+    "definition_hash": "830a447e29b1393610b446fcc821f4b3423ba7fbde6d2d1df4aa3cb2a7731ae7",
+    "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+    "input_hash": "e741541584ab1d088d6a7bc30dcd7f8533b4cac3c48b159c115d1e9c1e7a24aa",
+    "structured_input_hash": "fc7a6f5cd3d94e8390e864353c98f2e874814a498b6be8c57e55c970329d34db",
+    "synthetic_input": {
+      "record": {
+        "description": "原样缺少申请人编号",
+        "priority": "normal",
+        "request_id": "V2-FIXED-MISSING-001",
+        "service_type_id": "ST-001",
+        "title": "不完整申请"
+      }
+    },
+    "result": {
+      "log_id": "9cafd2f89cd649e998409ffc4920b7b6",
+      "status": "failed",
+      "steps": [],
+      "connector_audit": [],
+      "error": "规则输入缺少必填属性：applicant_id",
+      "duration_ms": 38
+    },
+    "error": "规则输入缺少必填属性：applicant_id"
+  },
+  {
+    "invocation_id": "350338252e424d80ad6a22ee22279afc",
+    "created_at": "2026-10-04T12:28:25.171122+00:00",
+    "receipt_status": "succeeded",
+    "workflow_status": "succeeded",
+    "definition_hash": "830a447e29b1393610b446fcc821f4b3423ba7fbde6d2d1df4aa3cb2a7731ae7",
+    "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+    "input_hash": "e7453cb13960354b5199a45c6230c6aa97e24db4b6691bc7315322f7f0c2a5f6",
+    "structured_input_hash": "abc51fe182ab46dcbd2b22d9c2885c9b636bb0c2647217ce564b8bff526c2ee7",
+    "synthetic_input": {
+      "record": {
+        "applicant_id": "APP-SUPPLIED-001",
+        "description": "补充申请人后的正常优先级申请",
+        "priority": "normal",
+        "request_id": "V2-FIXED-MISSING-001",
+        "service_type_id": "SVC-001",
+        "title": "合成验收申请"
+      }
+    },
+    "result": {
+      "log_id": "25351aaa33864c059ca8b1abd71c94ca",
+      "status": "success",
+      "steps": [
+        {
+          "node": "start",
+          "name": "开始",
+          "type": "start",
+          "status": "success",
+          "result": {
+            "input_summary": {
+              "contract": "workflow-run-input-summary/v1",
+              "redacted": true,
+              "payload_available": true,
+              "payload_present": true,
+              "field_count": 1,
+              "value_type_counts": {
+                "object": 1
+              }
+            }
+          }
+        },
+        {
+          "node": "route_rule",
+          "name": "高优先级分流规则",
+          "type": "rule",
+          "status": "not_matched",
+          "result": {
+            "rule_id": "455af88599e44bb6a305c0e41d2b7102",
+            "rule_name": "高优先级分流规则",
+            "matched": false,
+            "severity": "info",
+            "action_on_match": "",
+            "trigger_action_ids": [],
+            "trigger_actions": [],
+            "side_effects_executed": false
+          }
+        },
+        {
+          "node": "end_standard",
+          "name": "常规结束",
+          "type": "end",
+          "result": {
+            "request_id": "V2-FIXED-MISSING-001",
+            "route": "standard",
+            "reason": "valid_low_or_normal_priority"
+          },
+          "contract_validation": "passed",
+          "status": "success"
+        }
+      ],
+      "connector_audit": [],
+      "error": "",
+      "duration_ms": 6
+    },
+    "error": ""
+  }
+]

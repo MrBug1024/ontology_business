@@ -230,3 +230,45 @@ test('scene-scoped distillation citations stay inside the scene workspace', asyn
     query: { stage: 'materials', source_id: 'source' },
   }])
 })
+
+const advisorOpenFunction = advisorSource.slice(advisorSource.indexOf('function onScenarioModelingAdvisor('), advisorSource.indexOf('\nwatch(() => storageKey.value'))
+const advisorOpenHarness = ts.transpileModule(`
+  export function createAdvisorOpening(draft = '', scenarioId = 'scene-a') {
+    const input = { value: draft }, context = { value: { scenario_id: scenarioId } }
+    const openings = [], submissions = []
+    const openAssistant = async () => { openings.push('opened') }
+    const send = text => { submissions.push(text) }
+    ${advisorOpenFunction}
+    return { onScenarioModelingAdvisor, input, openings, submissions }
+  }
+`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText
+const { createAdvisorOpening } = await import(encode(advisorOpenHarness))
+
+test('continuing scenario construction opens the advisor and preserves an unsent draft verbatim', () => {
+  const draft = '  请先确认我的业务边界\n这些约束还没有发送。  '
+  const advisor = createAdvisorOpening(draft)
+  advisor.onScenarioModelingAdvisor({ detail: { scenario_id: 'scene-a', prompt: '请结合当前场景认知规划能力建设。' } })
+  assert.equal(advisor.input.value, draft)
+  assert.deepEqual(advisor.openings, ['opened'])
+  assert.deepEqual(advisor.submissions, [])
+})
+
+test('continuing construction prefills only blank advisor inputs without submitting them', () => {
+  for (const draft of ['', ' \n\t ']) {
+    const advisor = createAdvisorOpening(draft)
+    advisor.onScenarioModelingAdvisor({ detail: { scenario_id: 'scene-a', prompt: '  请结合当前场景认知规划能力建设。  ' } })
+    assert.equal(advisor.input.value, '请结合当前场景认知规划能力建设。')
+    assert.deepEqual(advisor.openings, ['opened'])
+    assert.deepEqual(advisor.submissions, [])
+  }
+})
+
+test('advisor opening ignores a missing or different scenario without changing the draft', () => {
+  const advisor = createAdvisorOpening('尚未发送的输入')
+  for (const detail of [{ prompt: '新提示' }, { scenario_id: 'scene-b', prompt: '新提示' }]) {
+    advisor.onScenarioModelingAdvisor({ detail })
+  }
+  assert.equal(advisor.input.value, '尚未发送的输入')
+  assert.deepEqual(advisor.openings, [])
+  assert.deepEqual(advisor.submissions, [])
+})

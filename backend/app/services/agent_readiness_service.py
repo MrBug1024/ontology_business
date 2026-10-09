@@ -256,9 +256,18 @@ def compute_agent_readiness(
         else:
             try:
                 permission_service.require_scenario_permission(db, scenario, "read")
-                definition = runtime_definition_service.resolve_authoring(
-                    db, scenario
-                )
+                if release_id:
+                    try:
+                        definition = runtime_definition_service.resolve_active(db, scenario, release_id=release_id)
+                    except ValueError:
+                        # Preserve the public release-axis reason while also
+                        # blocking validation of an unavailable pinned target.
+                        release_issues.append(_issue(
+                            "active_release_required", "指定发布不存在或尚未启用", "release-governance",
+                        ))
+                        raise
+                else:
+                    definition = runtime_definition_service.resolve_authoring(db, scenario)
                 agent_capability_service.validate_scope(
                     db,
                     agent_capability_service.normalize_scope(
@@ -271,7 +280,7 @@ def compute_agent_readiness(
                 definition_issues.append(
                     _issue(
                         "definition_invalid",
-                        str(exc)[:300] or "能力定义不可用",
+                        "指定发布不可用或无权验证" if release_id else (str(exc)[:300] or "能力定义不可用"),
                         "scenario-definition",
                     )
                 )
@@ -289,9 +298,10 @@ def compute_agent_readiness(
         )
 
     if scenario is None or definition_issues:
-        release_issues.extend(definition_issues or [
-            _issue("definition_required", "需要有效能力定义", "scenario-definition")
-        ])
+        if not release_issues:
+            release_issues.extend(definition_issues or [
+                _issue("definition_required", "需要有效能力定义", "scenario-definition")
+            ])
     elif release_id is None:
         try:
             release_service.capture_snapshot_content(db, scenario)
@@ -305,18 +315,7 @@ def compute_agent_readiness(
                 )
             )
     else:
-        try:
-            target_definition = runtime_definition_service.resolve_active(
-                db, scenario, release_id=release_id,
-            )
-        except Exception:
-            release_issues.append(
-                _issue(
-                    "active_release_required",
-                    "指定发布不存在或尚未启用",
-                    "release-governance",
-                )
-            )
+        target_definition = definition
 
     if release_issues:
         runtime_issues.extend(release_issues)

@@ -1,0 +1,21 @@
+{
+  "purpose": "installation_protocol_smoke_only",
+  "business_execution_tested": false,
+  "artifact_sha256": "922c0ac91503974fd51c7e8061fbf4649cce150f114c031680ec34e5d0d9b6bd",
+  "reproducible": true,
+  "stdio_initialize": "passed",
+  "tools": [
+    "get_scenario_receipt",
+    "invoke_scenario_capability",
+    "list_scenario_capabilities",
+    "read_scenario_approval",
+    "reply_scenario_interaction"
+  ],
+  "candidate_origin": "synthetic",
+  "reviewed_source_packaged": true,
+  "marketplace_emitted": true,
+  "host_version": "Claude Code 2.1.208",
+  "plugin_manifest_validation": "passed",
+  "marketplace_manifest_validation": "passed",
+  "external_published": false
+}

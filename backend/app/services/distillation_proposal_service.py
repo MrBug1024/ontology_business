@@ -4,10 +4,11 @@ from __future__ import annotations
 from copy import deepcopy
 
 from ..distillation_schemas import DistillationDocument, Evidence
+from .construction_content_preservation import preserve_omitted
 
 
 def normalize_proposal(raw: dict, original: DistillationDocument, *, observations: list[Evidence] | None = None) -> DistillationDocument:
-    proposed = deepcopy(raw)
+    proposed = preserve_omitted(original.model_dump(), deepcopy(raw))
     for key in ("decision", "decision_reason", "target_systems"):
         proposed[key] = original.model_dump()[key]
     # Only a trusted tool's durable observation may add evidence. Model-provided

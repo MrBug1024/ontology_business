@@ -1,0 +1,19 @@
+{
+  "origin": "real_model_with_automatic_repairs_and_manual_review",
+  "version": "1.1.0",
+  "stdio_initialize": "passed",
+  "tools": [
+    "get_scenario_receipt",
+    "invoke_scenario_capability",
+    "list_scenario_capabilities",
+    "read_scenario_approval",
+    "reply_scenario_interaction"
+  ],
+  "business_execution_tested": false,
+  "external_published": false,
+  "host_version": "Claude Code 2.1.208",
+  "plugin_manifest_validation": "passed",
+  "marketplace_manifest_validation": "passed",
+  "actual_installation": "passed",
+  "configuration_scope": "isolated_task_directory"
+}

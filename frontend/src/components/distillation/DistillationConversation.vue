@@ -58,6 +58,7 @@
             <div><strong>{{ turn.applied_revision ? '已采用的阶段结论' : isWorking(turn) ? '阶段建议生成中' : '阶段建议已整理' }}</strong><p>{{ turn.proposal.assertions.length }} 项事实与推断 · {{ turn.proposal.to_be.nodes.length }} 个目标流程节点 · {{ turn.proposal.open_questions.length }} 个待确认问题</p></div>
             <div class="distill-actions"><el-button @click="$emit('preview', turn)">查看阶段建议</el-button><el-button v-if="!turn.applied_revision" type="primary" plain :loading="applying === turn.id" :disabled="!canApply || working || !!applying" @click="$emit('apply', turn)">确认采用</el-button><span v-else class="discovery-muted">已保存 · 版本 {{ turn.applied_revision }}</span></div>
           </div>
+          <DistillationConstructionSummary v-if="turn.construction_quality" :quality="turn.construction_quality" />
         </div>
       </article>
     </div>
@@ -86,6 +87,7 @@
 </template>
 
 <script setup lang="ts">
+import DistillationConstructionSummary from './DistillationConstructionSummary.vue'
 import { computed, nextTick, ref, watch } from 'vue'
 import { Paperclip, Top } from '@element-plus/icons-vue'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'

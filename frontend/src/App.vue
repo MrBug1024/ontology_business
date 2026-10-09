@@ -1,6 +1,6 @@
 <template>
   <router-view v-if="route.meta.public" />
-  <el-container v-else class="app-shell">
+  <el-container v-else class="app-shell" :class="{ 'focus-workspace': route.meta.focusWorkspace }">
     <a class="skip-link" href="#main-content">跳到主要内容</a>
 
     <button
@@ -11,7 +11,7 @@
       @click="sidebarOpen = false"
     />
 
-    <el-aside class="sidebar" :class="{ open: sidebarOpen }" width="224px">
+    <el-aside v-if="!route.meta.focusWorkspace || sidebarOpen" class="sidebar" :class="{ open: sidebarOpen }" width="224px">
       <div class="brand">
         <div class="brand-logo" aria-hidden="true">
           <svg viewBox="0 0 32 32" width="22" height="22">
@@ -49,7 +49,8 @@
         >
           <el-menu-item index="/scenarios"><el-icon aria-hidden="true"><OfficeBuilding /></el-icon><span>场景能力</span></el-menu-item>
           <el-menu-item index="/agents"><el-icon aria-hidden="true"><Cpu /></el-icon><span>验证中心</span></el-menu-item>
-          <el-menu-item index="/access"><el-icon aria-hidden="true"><Connection /></el-icon><span>发布与接入</span></el-menu-item>
+          <el-menu-item index="/plugin-studio" :route="{ name: 'plugin-development' }"><el-icon aria-hidden="true"><Box /></el-icon><span>插件开发</span></el-menu-item>
+          <el-menu-item index="/access"><el-icon aria-hidden="true"><Connection /></el-icon><span>发布中心</span></el-menu-item>
         </el-menu>
 
         <div class="nav-label">运行控制</div>
@@ -163,6 +164,7 @@ const platformSettingsOpen = computed({
 const activeRoute = computed(() => {
   if (route.path.startsWith('/scenarios')) return '/scenarios'
   if (route.path.startsWith('/agents')) return '/agents'
+  if (route.path.startsWith('/plugin-studio')) return '/plugin-studio'
   if (route.path.startsWith('/access')) return '/access'
   return route.path
 })
@@ -246,6 +248,10 @@ onBeforeUnmount(() => window.removeEventListener('ontology-theme-change', syncTh
 .main-area { min-width: 0; height: 100%; min-height: 0; padding: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; background: transparent; }
 .main-area.navigation-open { overflow: hidden; }
 .route-viewport { position: relative; min-width: 0; }
+.focus-workspace .route-viewport { height: calc(100dvh - 64px); }
+.focus-workspace .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 30; }
+.focus-workspace .sidebar-scrim { display: block; position: fixed; inset: 0; z-index: 29; border: 0; background: rgba(8, 19, 28, .45); }
+.focus-workspace .menu-button { display: inline-flex; }
 .main-area.assistant-launcher-safe > .route-viewport { padding-bottom: max(96px, env(safe-area-inset-bottom)); }
 .topbar { position: sticky; top: 0; z-index: 20; display: flex; height: 64px; flex: 0 0 auto; align-items: center; justify-content: space-between; padding: 0 26px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 94%, transparent); backdrop-filter: blur(12px); }
 .topbar-leading, .crumb, .top-actions, .user-trigger { display: flex; align-items: center; }
@@ -268,6 +274,7 @@ onBeforeUnmount(() => window.removeEventListener('ontology-theme-change', syncTh
   .sidebar-scrim { position: fixed; inset: 0; z-index: 29; display: block; border: 0; background: rgba(8, 19, 28, .45); }
   .sidebar-close, .menu-button { display: inline-flex; }
   .topbar { height: 60px; padding: 0 12px; }
+  .focus-workspace .route-viewport { height: calc(100dvh - 60px); }
   .crumb > span, .crumb > .el-icon, .user-name { display: none; }
 }
 @media (max-width: 560px) {

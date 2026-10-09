@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.responses import Response
 from sqlalchemy import exists, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..distillation_models import DistillationProject, DistillationPublication
 from ..distillation_resource_schemas import InvestigationResourceCatalogOut
+from ..scenario_discovery_context_schemas import ScenarioDiscoveryContextOut
 from ..models import AuthorizationGrant
 from ..distillation_schemas import (
     AnalysisOut, AnalyzeRequest, ArtifactOut, DistillationDocument, ProjectCreate,
@@ -17,6 +18,7 @@ from ..distillation_schemas import (
 )
 from ..services import distillation_analysis_service, distillation_service, permission_service
 from ..services import distillation_resource_service, distillation_publication_service
+from ..services import scenario_discovery_context
 from ..services.auth_service import get_tenant_db
 
 
@@ -54,6 +56,11 @@ def get_scenario_state(scenario_id: str, db: Session = Depends(get_tenant_db)):
             document=DistillationDocument(), updated_at=datetime.now(timezone.utc))
     return ScenarioStateOut(scenario_id=row.scenario_id, revision=row.revision,
         document=DistillationDocument.model_validate(row.document), updated_at=row.updated_at)
+
+
+@router.get("/scenario/{scenario_id}/context", response_model=ScenarioDiscoveryContextOut)
+def get_scenario_context(scenario_id: str = Path(min_length=1, max_length=32), db: Session = Depends(get_tenant_db)):
+    return scenario_discovery_context.context_for_scenario(db, scenario_id)
 
 
 @router.get("/scenario/{scenario_id}/publications", response_model=list[PublicationOut])

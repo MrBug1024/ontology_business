@@ -68,8 +68,10 @@ async def _read(cfg: MCPConfig, uri: str) -> dict:
         return {"text": "\n".join(parts), "read_only": True}
 
 
-def _run(coro):
+def _run(coro, *, timeout_seconds: float | None = None):
     timeout = max(5.0, float(get_settings().mcp_operation_timeout_seconds))
+    if timeout_seconds is not None:
+        timeout = min(timeout, max(0.001, timeout_seconds))
     try:
         return mcp_service._run(asyncio.wait_for(coro, timeout=timeout))
     except Exception as exc:
@@ -78,9 +80,9 @@ def _run(coro):
         raise MCPResourceError("MCP 资料读取失败；请确认服务支持只读资源协议并检查连接配置") from exc
 
 
-def list_resources(cfg: MCPConfig) -> dict:
-    return _run(_list(cfg))
+def list_resources(cfg: MCPConfig, *, timeout_seconds: float | None = None) -> dict:
+    return _run(_list(cfg), timeout_seconds=timeout_seconds)
 
 
-def read_resource(cfg: MCPConfig, uri: str) -> dict:
-    return _run(_read(cfg, uri))
+def read_resource(cfg: MCPConfig, uri: str, *, timeout_seconds: float | None = None) -> dict:
+    return _run(_read(cfg, uri), timeout_seconds=timeout_seconds)

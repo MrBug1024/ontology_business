@@ -96,6 +96,10 @@ test('workflow result inspection preserves nested arrays, types and source contr
   assert.deepEqual(workflowResultSchema(config, 'end'), schema)
   assert.deepEqual(workflowResultSchema(config, 'other'), {})
   assert.deepEqual(workflowResultSchema(null, 'end'), {})
+  const branched = { ontology_contract: { output_node_ids: ['left', 'right'], output_schema: schema } }
+  assert.deepEqual(workflowResultSchema(branched, 'left'), schema)
+  assert.deepEqual(workflowResultSchema(branched, 'right'), schema)
+  assert.deepEqual(workflowResultSchema(branched, 'other'), {})
 })
 
 function memoryStorage() {

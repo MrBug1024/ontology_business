@@ -8,6 +8,7 @@ from pydantic import Field, StringConstraints, model_validator
 
 from .distillation_attachment_schemas import AttachmentOut
 from .distillation_schemas import ClosedModel, DistillationDocument, RevisionRequest
+from .distillation_construction_schemas import DistillationConstructionQuality
 
 
 InvestigationToolKey = Literal[
@@ -231,6 +232,7 @@ class TurnOut(ClosedModel):
     steps: list[ToolStep] = Field(max_length=40)
     questions: list[ClarificationQuestion] = Field(max_length=3)
     proposal: DistillationDocument | None
+    construction_quality: DistillationConstructionQuality | None = None
     applied_revision: int | None
     error: Annotated[str, Field(max_length=500)]
     created_at: datetime

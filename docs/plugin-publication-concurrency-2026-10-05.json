@@ -1,0 +1,27 @@
+{
+  "passed": true,
+  "alembic_head": "20260928_52",
+  "concurrent_create": true,
+  "single_worker_generation": true,
+  "durable_files": true,
+  "stale_edit_rejected": true,
+  "running_lease_revoked": true,
+  "private_marketplace_export": true,
+  "foreign_owner_rejected": true,
+  "delivered_version_immutable": true,
+  "explicit_new_version": true,
+  "concurrent_version_delivery": true,
+  "full_schema_in_model_prompt": true,
+  "plan_without_files_rejected": true,
+  "durable_public_conversation": true,
+  "public_event_round_identity": true,
+  "conversation_foreign_owner_rejected": true,
+  "release_context_foreign_tenant_rejected": true,
+  "conversation_read": {
+    "query_count": 1,
+    "returned_turns": 1,
+    "elapsed_ms": 3.438
+  },
+  "model_stream": "synthetic",
+  "business_acceptance": "synthetic"
+}

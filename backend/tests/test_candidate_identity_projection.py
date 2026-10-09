@@ -104,3 +104,40 @@ def test_optional_null_constraints_pass_same_formal_relation_validator():
     for invalid in ({'unknown': None}, {'symmetric': 'false'}, {'source_min_cardinality': -1}):
         with pytest.raises(ValueError):
             normalize_relation_constraints(optional_relation_constraints(invalid))
+
+
+def test_valid_relation_aliases_survive_candidate_formal_preflight():
+    from app.services.candidate_identity_projection import project_identity
+    from app.services.ontology_service import normalize_relation_constraints
+    raw = {'relation_type': 'association', 'constraints': {
+        'symmetric': None, 'source_max_cardinality': 'N', 'target_max_cardinality': '1'}}
+    normalized = {'relation_type': 'N:M', 'constraints': {'target_max_cardinality': 1}}
+    candidate = project_identity('relations', raw, normalized)
+    assert candidate['relation_type'] == 'N:M'
+    assert normalize_relation_constraints(candidate['constraints'],
+        relation_type=candidate['relation_type']) == {'target_max_cardinality': 1}
+    assert raw['constraints']['source_max_cardinality'] == 'N'
+
+
+def test_relation_projection_preserves_invalid_constraints_for_repair():
+    from app.services.candidate_identity_projection import project_identity
+    raw = {'relation_type': '1:N', 'constraints': {'unknown': 'N'}}
+    assert project_identity('relations', raw, {'constraints': {}})['constraints'] == raw['constraints']
+
+
+def test_rule_retains_resolved_entity_and_preserves_invalid_condition():
+    from app.services.candidate_identity_projection import project_identity
+    raw = {'entity_ref': 'Display name', 'condition': {'wrong': True}}
+    peer = {'entity': {'kind': 'existing', 'id': 'owned-id'}, 'condition': {}}
+    result = project_identity('rules', raw, peer)
+    assert result['entity'] == peer['entity']
+    assert result['condition'] == raw['condition']
+
+
+def test_workflow_retains_node_identity_without_replacing_execution_data():
+    from app.services.candidate_identity_projection import project_identity
+    raw = {'nodes': [{'id': 'check', 'type': 'rule', 'data': {'rule_id': 'Display name', 'record': 'invalid'}}]}
+    peer = {'nodes': [{'id': 'check', 'type': 'rule', 'data': {'resource': {'kind': 'existing', 'id': 'owned-rule'}}}]}
+    result = project_identity('workflows', raw, peer)
+    assert result['nodes'][0]['data']['resource'] == peer['nodes'][0]['data']['resource']
+    assert result['nodes'][0]['data']['record'] == 'invalid'

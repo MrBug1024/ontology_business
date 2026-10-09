@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .distillation_target_schemas import TargetSystem
 from .distillation_discovery_schemas import HistoricalCase
+from .distillation_construction_schemas import PropertyRequirement
 
 
 Text = Annotated[str, Field(max_length=4000)]
@@ -119,6 +120,17 @@ class Entity(ClosedModel):
     attributes: list[Label] = Field(default_factory=list, max_length=60)
     identity: Text = ""
     evidence_refs: Refs = Field(default_factory=list)
+    property_contracts: list[PropertyRequirement] = Field(default_factory=list, max_length=60)
+    is_abstract: bool = False
+
+    @model_validator(mode="after")
+    def validate_property_contracts(self) -> Self:
+        attributes = [item.attribute for item in self.property_contracts]
+        if len(attributes) != len(set(attributes)):
+            raise ValueError("属性建设要求不能重复")
+        if not set(attributes).issubset(self.attributes):
+            raise ValueError("属性建设要求必须对应业务属性原文")
+        return self
 
 
 class Relation(ClosedModel):

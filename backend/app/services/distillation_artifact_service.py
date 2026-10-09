@@ -70,7 +70,13 @@ def lineage_diagram(document: DistillationDocument) -> str:
 
 
 def modeling_brief(name: str, revision: int, document: DistillationDocument) -> str:
+    from .distillation_construction_quality import evaluate_document
+
     lines = [f"# {_markdown(name)}：业务蒸馏交接", f"\n文档版本：{revision}\n", HANDOFF_GUIDANCE]
+    quality = evaluate_document(document)
+    lines.append(f"\n建设交接：{quality['complete_entity_count']}/{quality['entity_count']} 个对象具备结构化建设要求。")
+    for gap in quality["issues"]:
+        lines.append(f"- {_markdown(gap['name'])} 尚缺：{'、'.join(gap['missing'])}。{gap['next_step']}")
     for title, value in (
         ("受益者", document.beneficiary), ("核心痛点", document.pain),
         ("期望业务结果", document.desired_outcome), ("成功标准", document.success_metric),

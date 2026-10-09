@@ -1,0 +1,28 @@
+{
+  "business_data_modified": false,
+  "expected_state": "published",
+  "source": {
+    "marketplace": {
+      "status": 200,
+      "sha256": "6fb2c9789112e942b4e6d830c116fd0daf99bbb005c74c8da71119fb40540f82",
+      "bytes": 16263
+    },
+    "installer": {
+      "status": 200,
+      "sha256": "8f4f905885dc539997264955f45aba02f93ac4b1adb6f21db8ca424e35a7b258",
+      "bytes": 14124
+    }
+  },
+  "immutable_artifacts": [
+    {
+      "version": "1.0.0",
+      "sha256": "d858ef36cc8e55b6f5b7e2ea994d0a0671684a49568338ab6f20ce76cb784bf1",
+      "bytes": 9963
+    },
+    {
+      "version": "1.1.0",
+      "sha256": "12d6adc93ed16cc301a3516a0e9d5055787be3d1f9cc9485af7ead5d25aef15c",
+      "bytes": 13666
+    }
+  ]
+}

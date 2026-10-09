@@ -30,6 +30,9 @@ def validate_record(rule: Any, record: dict, entity: Any, fields: list[str]) -> 
     error = next(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(values), None)
     if error is not None:
         path = ".".join(str(part) for part in error.absolute_path)
+        if error.validator == 'required':
+            missing = [field for field in fields if field not in values]
+            raise PolicyViolation('规则输入缺少必填属性：' + '、'.join(missing[:32]))
         raise PolicyViolation(f"规则输入{('属性“' + path + '”') if path else ''}不符合所选对象契约（{error.validator}）")
     for prop in getattr(entity, "properties", []) or []:
         for field in {prop.name, prop.api_name or prop.name} & set(values):

@@ -15,6 +15,7 @@ from .config import get_settings
 from .business_query_contract import BusinessQueryContractMiddleware
 from .database import engine, init_db
 from .request_body_limit import RequestBodyLimitMiddleware
+from .plugin_coding_schemas import MAX_CODING_BODY_BYTES
 from . import agent_mcp_server
 from .routers import (
     agent_mcp,
@@ -40,6 +41,9 @@ from .routers import (
     platform_migrations,
     scenarios,
     scenario_releases,
+    scenario_packages,
+    plugin_coding,
+    plugin_publications,
     skills,
     templates,
     workspace_access,
@@ -271,6 +275,11 @@ settings = get_settings()
 app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=lifespan)
 app.add_middleware(BusinessQueryContractMiddleware, api_prefix=settings.api_prefix)
 app.add_middleware(CookieOriginMiddleware)
+app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=MAX_CODING_BODY_BYTES,
+    paths=(), path_patterns=(rf"{re.escape(settings.api_prefix)}/scenario-releases/[a-f0-9]{{32}}/(?:plugin-workspaces|plugin-drafts)",
+        rf"{re.escape(settings.api_prefix)}/plugin-workspaces/[a-f0-9]{{32}}/(?:revisions|artifact|review|settings)"))
+app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=16384,
+    paths=(), path_patterns=(rf"{re.escape(settings.api_prefix)}/plugin-artifacts/[a-f0-9]{{32}}/publication",))
 app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=16384,
     paths={f"{settings.api_prefix}/auth/{action}" for action in (
         "login", "register", "verify-email", "resend-code", "forgot-password", "reset-password")})
@@ -337,6 +346,9 @@ app.include_router(channel_interactions.browser_router, prefix=settings.api_pref
 app.include_router(external_invocation_artifacts.router, prefix=settings.api_prefix)
 app.include_router(capability_access.router, prefix=settings.api_prefix)
 app.include_router(scenario_releases.router, prefix=settings.api_prefix)
+app.include_router(scenario_packages.router, prefix=settings.api_prefix)
+app.include_router(plugin_coding.router, prefix=settings.api_prefix)
+app.include_router(plugin_publications.router, prefix=settings.api_prefix)
 app.include_router(agent_mcp.router, prefix=settings.api_prefix)
 app.include_router(agent_turns.router, prefix=settings.api_prefix)
 app.include_router(agent_capability_confirmations.router, prefix=settings.api_prefix)

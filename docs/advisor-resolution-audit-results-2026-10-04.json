@@ -1,0 +1,284 @@
+{
+  "probe_contract": "advisor-resolution-loop-audit/v1",
+  "python_version": "3.12.0",
+  "source_sha256": {
+    "backend/app/services/scenario_model_quality_service.py": "06b08f1ef9826b4993bd1287098f45fc2decfbb74d51d04bef242e72a95ae519",
+    "backend/app/services/assistant_decision_gate.py": "51f18279282442c90f28a4d06e85f1fbb91d11fcb66b545452cfc86e60cf5e58",
+    "backend/app/services/scenario_model_compiler.py": "7446fdd9510ed3330b82f4ac4ecc96f31b7b596e20fcbd44b3dc0f5e779032ed",
+    "backend/app/routers/assistant.py": "617cade4c0c37d502f293761b4884e473121028a3a6578a071ee9cba9f0cfc2c",
+    "backend/app/services/scenario_model_draft_service.py": "f652f641817014faae785acd184f5ffa2cf41ad3982092d7dc6b9e1baf5622e6",
+    "frontend/src/views/ScenarioDetail.vue": "5bb30c68a52681b23cad69b0594fc8e0cfbdde6abf5d9bc1d51816475f73d632"
+  },
+  "diagnostic_sha256": {
+    "backend/scripts/audit_advisor_resolution_loop.py": "d7714d3cea784b4af449e85554cfb2986cfc4248a74b86f6b04e2ef741af5873",
+    "backend/scripts/audit_ai_construction_quality.py": "bf1545b67f90228bbadff3f4909f59fba8e2a9c7312d50630f9de01084c1a608"
+  },
+  "observations": {
+    "repair_routes": {
+      "structural_repair_positive_control": {
+        "initial": {
+          "normalized_entity_count": 10,
+          "blocking_codes": {
+            "missing_primary_key": 1,
+            "missing_title_property": 1
+          },
+          "entity_candidate_statuses": {
+            "ready": 9,
+            "blocked": 1
+          },
+          "promotion_eligible_entity_count": 9,
+          "safe_change_count": 18,
+          "blocked_change_count": 1
+        },
+        "after": {
+          "normalized_entity_count": 10,
+          "blocking_codes": {},
+          "entity_candidate_statuses": {
+            "ready": 10
+          },
+          "promotion_eligible_entity_count": 10,
+          "safe_change_count": 20,
+          "blocked_change_count": 0
+        },
+        "proposed_direct_compile": {
+          "normalized_entity_count": 10,
+          "blocking_codes": {},
+          "entity_candidate_statuses": {
+            "ready": 10
+          },
+          "promotion_eligible_entity_count": 10,
+          "safe_change_count": 20,
+          "blocked_change_count": 0
+        },
+        "generation_calls": 1,
+        "repair_normalization_calls": 1,
+        "new_result_selected": true,
+        "decision_gate": {
+          "version": "decision-gate.v1",
+          "mode": "formalize",
+          "reason_codes": [
+            "EVIDENCE_BACKED_AND_VALIDATED"
+          ],
+          "blocking_question_count": 0,
+          "blocking_issue_count": 0,
+          "ambiguous_coverage_count": 0,
+          "missing_evidence_resource_count": 0,
+          "evidence_coverage": {
+            "total": 10,
+            "modeled": 10,
+            "ambiguous": 0,
+            "context": 0,
+            "irrelevant": 0,
+            "modeled_ratio": 1.0
+          },
+          "resource_counts": {
+            "entities": 10
+          },
+          "risk_codes": [],
+          "questions": [],
+          "safe_to_formalize": true,
+          "human_review_required": false,
+          "explanation": "已完成证据覆盖和确定性校验；安全资源可在用户确认后进入正式工作模型。"
+        }
+      },
+      "unchanged_failure_after_two_attempts": {
+        "initial": {
+          "normalized_entity_count": 10,
+          "blocking_codes": {
+            "missing_primary_key": 1,
+            "missing_title_property": 1
+          },
+          "entity_candidate_statuses": {
+            "ready": 9,
+            "blocked": 1
+          },
+          "promotion_eligible_entity_count": 9,
+          "safe_change_count": 18,
+          "blocked_change_count": 1
+        },
+        "after": {
+          "normalized_entity_count": 10,
+          "blocking_codes": {
+            "missing_primary_key": 1,
+            "missing_title_property": 1
+          },
+          "entity_candidate_statuses": {
+            "ready": 9,
+            "blocked": 1
+          },
+          "promotion_eligible_entity_count": 9,
+          "safe_change_count": 18,
+          "blocked_change_count": 1
+        },
+        "proposed_direct_compile": {
+          "normalized_entity_count": 10,
+          "blocking_codes": {
+            "missing_primary_key": 1,
+            "missing_title_property": 1
+          },
+          "entity_candidate_statuses": {
+            "ready": 9,
+            "blocked": 1
+          },
+          "promotion_eligible_entity_count": 9,
+          "safe_change_count": 18,
+          "blocked_change_count": 1
+        },
+        "generation_calls": 2,
+        "repair_normalization_calls": 2,
+        "new_result_selected": false,
+        "decision_gate": {
+          "version": "decision-gate.v1",
+          "mode": "candidate_review",
+          "reason_codes": [
+            "CANDIDATE_VALIDATION_FAILED"
+          ],
+          "blocking_question_count": 0,
+          "blocking_issue_count": 2,
+          "ambiguous_coverage_count": 0,
+          "missing_evidence_resource_count": 0,
+          "resource_counts": {
+            "entities": 10
+          },
+          "risk_codes": [],
+          "questions": [],
+          "safe_to_formalize": false,
+          "human_review_required": true,
+          "explanation": "顾问生成的定义仍有校验问题，已保留具体候选及修正要求；需要修正定义后重试，不能当作已建设完成或要求用户重新解释业务。"
+        }
+      },
+      "revised_nine_object_plan_in_repair_lane": {
+        "initial": {
+          "normalized_entity_count": 10,
+          "blocking_codes": {
+            "missing_primary_key": 1,
+            "missing_title_property": 1
+          },
+          "entity_candidate_statuses": {
+            "ready": 9,
+            "blocked": 1
+          },
+          "promotion_eligible_entity_count": 9,
+          "safe_change_count": 18,
+          "blocked_change_count": 1
+        },
+        "after": {
+          "normalized_entity_count": 10,
+          "blocking_codes": {
+            "missing_primary_key": 1,
+            "missing_title_property": 1
+          },
+          "entity_candidate_statuses": {
+            "ready": 9,
+            "blocked": 1
+          },
+          "promotion_eligible_entity_count": 9,
+          "safe_change_count": 18,
+          "blocked_change_count": 1
+        },
+        "proposed_direct_compile": {
+          "normalized_entity_count": 9,
+          "blocking_codes": {},
+          "entity_candidate_statuses": {
+            "ready": 9
+          },
+          "promotion_eligible_entity_count": 9,
+          "safe_change_count": 18,
+          "blocked_change_count": 0
+        },
+        "generation_calls": 2,
+        "repair_normalization_calls": 0,
+        "new_result_selected": false,
+        "decision_gate": {
+          "version": "decision-gate.v1",
+          "mode": "candidate_review",
+          "reason_codes": [
+            "CANDIDATE_VALIDATION_FAILED"
+          ],
+          "blocking_question_count": 0,
+          "blocking_issue_count": 2,
+          "ambiguous_coverage_count": 0,
+          "missing_evidence_resource_count": 0,
+          "resource_counts": {
+            "entities": 10
+          },
+          "risk_codes": [],
+          "questions": [],
+          "safe_to_formalize": false,
+          "human_review_required": true,
+          "explanation": "顾问生成的定义仍有校验问题，已保留具体候选及修正要求；需要修正定义后重试，不能当作已建设完成或要求用户重新解释业务。"
+        }
+      }
+    },
+    "clarification_contract": {
+      "gate": {
+        "version": "decision-gate.v1",
+        "mode": "clarify",
+        "reason_codes": [
+          "BLOCKING_AMBIGUITY"
+        ],
+        "blocking_question_count": 2,
+        "blocking_issue_count": 1,
+        "ambiguous_coverage_count": 1,
+        "missing_evidence_resource_count": 0,
+        "evidence_coverage": {
+          "total": 1,
+          "modeled": 0,
+          "ambiguous": 1,
+          "context": 0,
+          "irrelevant": 0,
+          "modeled_ratio": 0.0
+        },
+        "resource_counts": {
+          "entities": 1
+        },
+        "risk_codes": [],
+        "questions": [
+          {
+            "code": "document_reported_issue",
+            "message": "The source does not establish object identity",
+            "source_refs": [
+              "doc:p1"
+            ],
+            "affected_change_keys": [
+              "record"
+            ],
+            "resolution_hint": "Provide the business identity basis and an example"
+          },
+          {
+            "code": "DOCUMENT_AMBIGUITY",
+            "message": "The source does not establish object identity",
+            "source_refs": [],
+            "affected_change_keys": [],
+            "resolution_hint": "请补充业务规则、枚举或对象关系的明确说明。"
+          }
+        ],
+        "safe_to_formalize": false,
+        "human_review_required": true,
+        "explanation": "存在影响业务含义的未决问题；先回答问题再继续正式建模。"
+      },
+      "question_field_names": [
+        "affected_change_keys",
+        "code",
+        "message",
+        "resolution_hint",
+        "source_refs"
+      ],
+      "proposed_resolution_fields_absent_here": [
+        "acceptance_criteria",
+        "alternatives",
+        "answer_evaluation",
+        "requested_evidence",
+        "resolution_id",
+        "stop_reason"
+      ],
+      "interpretation": "This gate returns clarification text; it does not itself define an answer-resolution contract."
+    }
+  },
+  "limits": [
+    "Replies and alternative plans are synthetic; no actual model behavior is measured.",
+    "A structurally valid revised plan does not prove business validity or user authorization.",
+    "Question-field observations apply to this decision gate, not every platform component.",
+    "No PostgreSQL, browser, formal promotion, release or plugin was exercised."
+  ]
+}

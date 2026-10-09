@@ -33,6 +33,7 @@ class WorkflowOntologyContract(BaseModel):
     entity_ids: list[Annotated[str, Field(min_length=1, max_length=32)]] = Field(default_factory=list, max_length=64)
     input_bindings: list[OntologyInputBinding] = Field(default_factory=list, max_length=32)
     output_node_id: str = Field(default="", max_length=100)
+    output_node_ids: list[Annotated[str, Field(min_length=1, max_length=100)]] = Field(default_factory=list, max_length=32)
     output_schema: dict[str, Any] = Field(default_factory=dict)
 
 

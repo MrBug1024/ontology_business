@@ -73,7 +73,7 @@ SCHEMA_VERSION = "scenario_model.v1"
 # This version participates in the persistent assistant execution fingerprint.
 # Bump it whenever extraction/prompt semantics change in a way that should
 # permit recompiling otherwise identical inputs.
-COMPILER_VERSION = "scenario_model.compiler.v48"
+COMPILER_VERSION = "scenario_model.compiler.v50"
 MAX_SOURCE_CHARS = 100_000
 MAX_EXISTING_CATALOG_CHARS = 60_000
 MAX_MAPPING_CATALOG_CHARS = 60_000
@@ -1845,7 +1845,8 @@ def _compiler_prompt(
     )
     if task_scope in {"", "ontology"} and any(item.get("structured_handoff") for item in paragraphs):
         from .distillation_model_coverage import COVERAGE_GUIDANCE
-        prompt += COVERAGE_GUIDANCE
+        from .construction_source_requirements import GUIDANCE
+        prompt += COVERAGE_GUIDANCE + GUIDANCE
     if task_scope in {"", "mapping"}:
         prompt += semantic_mapping_authoring.AUTHORING_GUIDANCE
     if task_scope in {"", "capabilities"}:
@@ -3093,6 +3094,7 @@ def _chunk_checkpoint_payload(
             source_bundle=source_bundle,
             mapping_catalog=mapping_catalog,
             columns_by_table=columns,
+            task_scope=task_scope,
         )
         return _mark_staged_task_result(normalized, task_scope)
     except Exception:  # noqa: BLE001 - live checkpoints must remain inert and recoverable.
@@ -3533,6 +3535,7 @@ def _compile_scenario_model_in_chunks(
                     source_bundle=source_bundle,
                     mapping_catalog=mapping_catalog,
                     columns_by_table=columns,
+                    task_scope=task_scope,
                 )
             except Exception:  # noqa: BLE001 - retain parseable candidates as inert drafts.
                 contract_salvaged = True
@@ -3807,6 +3810,7 @@ def compile_scenario_model(
                 source_bundle=source_bundle,
                 mapping_catalog=mapping_catalog,
                 columns_by_table=columns,
+                task_scope=task_scope,
             )
             normalized = scenario_model_quality_service.repair_compilation(
                 db, scenario, raw, normalized, message=message, llm=llm,
@@ -3950,6 +3954,7 @@ def _meta(
             "message": f"{key} 引用了不存在的来源段落：{'、'.join(invalid)}",
             "source_refs": [],
             "blocking": True,
+            "affected_change_keys": [key],
         })
     if not evidence and not invalid:
         unresolved.append({
@@ -3957,6 +3962,8 @@ def _meta(
             "message": f"{key} 没有可核验的来源段落",
             "source_refs": [],
             "blocking": True,
+            "affected_change_keys": [key],
+            "resolution_owner": "advisor" if valid_sources else "business_expert",
         })
     confidence = raw.get("confidence", 0)
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
@@ -4088,9 +4095,9 @@ def _issue_affected_resource_keys(
     whole change set.  This deliberately skips too much rather than risking a
     partially persisted invalid dependency.
     """
-    # This code is emitted only by the deterministic Catalog validator. Raw
+    # Explicit attribution is emitted by deterministic server validators. Raw
     # model issues are wrapped as document_reported_issue and cannot narrow it.
-    if issue.get("code") == "invalid_semantic_mapping" and issue.get("affected_change_keys"):
+    if issue.get("code") != "document_reported_issue" and issue.get("affected_change_keys"):
         return {str(key) for key in issue["affected_change_keys"]}
     source_refs = {
         str(value) for value in (issue.get("source_refs") or []) if str(value)
@@ -4141,8 +4148,18 @@ def _applyability_for_scenario_model(
     for raw_issue in (payload.get("unresolved") or []):
         issue = dict(raw_issue)
         affected = _issue_affected_resource_keys(payload, issue, resources)
+        if issue.get("blocking", True):
+            # Candidate eligibility and partial application must agree on the
+            # complete dependency closure, including indirect consumers.
+            expanded = True
+            while expanded:
+                expanded = False
+                for key, resource in resources.items():
+                    if key not in affected and _generated_reference_keys(resource).intersection(affected):
+                        affected.add(key)
+                        expanded = True
         issue["affected_change_keys"] = sorted(affected)
-        issue["resolution_hint"] = _issue_resolution_hint(issue)
+        issue["resolution_hint"] = issue.get("resolution_hint") or _issue_resolution_hint(issue)
         annotated.append(issue)
     return safe, blocked, annotated
 
@@ -4253,6 +4270,8 @@ def _build_draft_candidates(
                 for key in affected
             )
             source_matches = bool(
+                not affected
+                and
                 issue.get("code")
                 != assistant_capability_modeling_service.NON_MODELING_METADATA_ISSUE_CODE
                 and not (issue.get("code") == "invalid_semantic_mapping" and affected)
@@ -6394,6 +6413,7 @@ def normalize_scenario_model(
     source_bundle: dict[str, Any],
     mapping_catalog: list[dict[str, Any]] | None = None,
     columns_by_table: dict[tuple[str, str], set[str]] | None = None,
+    task_scope: str = "",
 ) -> dict[str, Any]:
     """Turn untrusted model JSON into the only persistable compound shape."""
     if not isinstance(raw, dict):
@@ -6496,16 +6516,16 @@ def normalize_scenario_model(
         name = _text(value.get("name"), maximum=200)
         meta = _meta(value, key=key, valid_sources=valid_sources, unresolved=unresolved)
         if not name:
-            _issue(unresolved, "missing_name", f"{key} 缺少对象类型名称", source_refs=meta["evidence_refs"])
+            _issue(unresolved, "missing_name", f"{key} 缺少对象类型名称", source_refs=meta["evidence_refs"], affected_change_keys=[key])
             continue
         if key in seen_keys or name in seen_names:
-            _issue(unresolved, "duplicate_generated_resource", f"对象类型 key 或名称重复：{key}/{name}", source_refs=meta["evidence_refs"])
+            _issue(unresolved, "duplicate_generated_resource", f"对象类型 key 或名称重复：{key}/{name}", source_refs=meta["evidence_refs"], affected_change_keys=[key])
             continue
         seen_keys.add(key)
         seen_names.add(name)
         matches = existing_entities_by_name.get(name, [])
         if len(matches) > 1:
-            _issue(unresolved, "ambiguous_existing_resource", f"已有对象类型名称不唯一：{name}", source_refs=meta["evidence_refs"])
+            _issue(unresolved, "ambiguous_existing_resource", f"已有对象类型名称不唯一：{name}", source_refs=meta["evidence_refs"], affected_change_keys=[key])
         existing = matches[0] if len(matches) == 1 else None
         existing_id = existing.id if existing else ""
         if existing is not None:
@@ -6526,7 +6546,7 @@ def normalize_scenario_model(
                     unresolved,
                     "immutable_api_name",
                     f"对象类型“{name}”的 api_name 创建后不能修改",
-                    source_refs=meta["evidence_refs"],
+                    source_refs=meta["evidence_refs"], affected_change_keys=[key],
                 )
         else:
             try:
@@ -6542,7 +6562,7 @@ def normalize_scenario_model(
                     unresolved,
                     "duplicate_api_name",
                     f"对象类型“{name}”的 api_name 无效：{exc}",
-                    source_refs=meta["evidence_refs"],
+                    source_refs=meta["evidence_refs"], affected_change_keys=[key],
                 )
                 entity_api_name = ontology_service.normalize_api_name(
                     display_name=name, prefix="entity", stable_key=key
@@ -6580,7 +6600,7 @@ def normalize_scenario_model(
                     unresolved,
                     "invalid_property",
                     f"对象类型“{name}”的第 {property_index} 个属性不是对象",
-                    source_refs=meta["evidence_refs"],
+                    source_refs=meta["evidence_refs"], affected_change_keys=[key],
                 )
                 continue
             normalized_property = copy.deepcopy(raw_property)
@@ -6613,7 +6633,7 @@ def normalize_scenario_model(
                         unresolved,
                         "immutable_api_name",
                         f"对象类型“{name}”的属性“{property_name}”不能修改 api_name",
-                        source_refs=meta["evidence_refs"],
+                        source_refs=meta["evidence_refs"], affected_change_keys=[key],
                     )
             else:
                 try:
@@ -6629,7 +6649,7 @@ def normalize_scenario_model(
                         unresolved,
                         "duplicate_api_name",
                         f"对象类型“{name}”的属性“{property_name}”api_name 无效：{exc}",
-                        source_refs=meta["evidence_refs"],
+                        source_refs=meta["evidence_refs"], affected_change_keys=[key],
                     )
                     property_api_name = ontology_service.normalize_api_name(
                         display_name=property_name,
@@ -6651,7 +6671,7 @@ def normalize_scenario_model(
                     unresolved,
                     "invalid_property_constraints",
                     f"对象类型“{name}”的属性“{property_name}”约束无效：{exc}",
-                    source_refs=meta["evidence_refs"],
+                    source_refs=meta["evidence_refs"], affected_change_keys=[key],
                 )
                 # Keep the rest of the entity inspectable while the explicit
                 # blocker prevents an unsafe apply.
@@ -6666,7 +6686,7 @@ def normalize_scenario_model(
                     unresolved,
                     "invalid_property",
                     f"对象类型“{name}”的属性“{property_name}”无效：{exc}",
-                    source_refs=meta["evidence_refs"],
+                    source_refs=meta["evidence_refs"], affected_change_keys=[key],
                 )
         entity_validation_error = ""
         try:
@@ -6682,7 +6702,7 @@ def normalize_scenario_model(
                 "properties": normalized_properties,
             })
         except Exception as exc:  # noqa: BLE001
-            _issue(unresolved, "invalid_entity", f"对象类型“{name}”无效：{exc}", source_refs=meta["evidence_refs"])
+            _issue(unresolved, "invalid_entity", f"对象类型“{name}”无效：{exc}", source_refs=meta["evidence_refs"], affected_change_keys=[key])
             definition = {
                 "name": name,
                 "api_name": entity_api_name,
@@ -6708,7 +6728,7 @@ def normalize_scenario_model(
                     unresolved,
                     "invalid_entity",
                     f"对象类型“{name}”无效：{exc}",
-                    source_refs=meta["evidence_refs"],
+                    source_refs=meta["evidence_refs"], affected_change_keys=[key],
                 )
             definition = entity_input.model_dump()
             definition["state_property"] = state_property
@@ -6762,7 +6782,7 @@ def normalize_scenario_model(
                         unresolved,
                         "existing_property_conflict",
                         f"对象类型“{name}”的属性“{prop['name']}”与已有定义冲突",
-                        source_refs=meta["evidence_refs"],
+                        source_refs=meta["evidence_refs"], affected_change_keys=[key],
                     )
                 metadata_changed = any(
                     current_definition[field] != prop.get(field)
@@ -6794,14 +6814,14 @@ def normalize_scenario_model(
                 unresolved,
                 "multiple_primary_keys",
                 f"对象类型“{name}”合并已有定义后包含 {key_count} 个主键属性",
-                source_refs=meta["evidence_refs"],
+                source_refs=meta["evidence_refs"], affected_change_keys=[key],
             )
         if (
             not definition["is_abstract"]
             and key_count == 0
             and not invalid_property_names
         ):
-            _issue(unresolved, "missing_primary_key", f"对象类型“{name}”必须明确一个主键属性", source_refs=meta["evidence_refs"])
+            _issue(unresolved, "missing_primary_key", f"对象类型“{name}”必须明确一个主键属性", source_refs=meta["evidence_refs"], affected_change_keys=[key])
         title_count = sum(
             bool(prop.get("is_title")) for prop in combined_properties.values()
         )
@@ -6810,7 +6830,7 @@ def normalize_scenario_model(
                 unresolved,
                 "multiple_title_properties",
                 f"对象类型“{name}”合并已有定义后包含 {title_count} 个标题属性",
-                source_refs=meta["evidence_refs"],
+                source_refs=meta["evidence_refs"], affected_change_keys=[key],
             )
         if not definition["is_abstract"] and title_count == 0 and key_count == 1:
             key_name = next(
@@ -6845,7 +6865,7 @@ def normalize_scenario_model(
                 unresolved,
                 "title_fallback_to_primary_key",
                 f"对象类型“{name}”未提供标题属性，已确定性使用唯一主键“{key_name}”作为标题",
-                source_refs=meta["evidence_refs"],
+                source_refs=meta["evidence_refs"], affected_change_keys=[key],
                 blocking=False,
             )
             title_count = 1
@@ -6858,7 +6878,7 @@ def normalize_scenario_model(
                 unresolved,
                 "missing_title_property",
                 f"对象类型“{name}”必须明确一个标题属性",
-                source_refs=meta["evidence_refs"],
+                source_refs=meta["evidence_refs"], affected_change_keys=[key],
             )
         try:
             combined_input = EntityIn.model_validate({
@@ -6894,7 +6914,7 @@ def normalize_scenario_model(
                     unresolved,
                     "invalid_combined_entity",
                     f"对象类型“{name}”与已有定义合并后无效：{exc}",
-                    source_refs=meta["evidence_refs"],
+                    source_refs=meta["evidence_refs"], affected_change_keys=[key],
                 )
         entity_fields_changed = bool(existing) and any(
             getattr(existing, field) != definition[field]
@@ -7531,7 +7551,7 @@ def normalize_scenario_model(
             )
         elif not unsupported_nodes:
             try:
-                workflow_service.validate_workflow_definition(nodes, edges)
+                workflow_service.validate_workflow_definition(nodes, edges, trigger_config=value.get('trigger_config'))
             except Exception as exc:  # noqa: BLE001
                 branch_gaps = _workflow_rule_branch_gaps(nodes, edges)
                 if branch_gaps and "规则节点" in str(exc):
@@ -7964,6 +7984,13 @@ def normalize_scenario_model(
     from .distillation_model_coverage import validate_entity_coverage
     unresolved.extend(validate_entity_coverage(raw, entities, source_bundle,
         {entity.name: {prop.name for prop in entity.properties} for entity in scenario.entities}))
+    from .construction_source_requirements import validate_requirements
+    unresolved.extend(validate_requirements(raw, entities, source_bundle, task_scope=task_scope,
+        existing_properties={item.id: {prop.name: _property_definition(prop) for prop in item.properties}
+            for item in scenario.entities}))
+    from .construction_relation_requirements import validate_relation_requirements
+    unresolved.extend(validate_relation_requirements(raw, entities, relations, source_bundle,
+        task_scope=task_scope))
     metadata_source_policy = (
         assistant_capability_modeling_service.metadata_source_policy(source_bundle)
     )
@@ -8911,7 +8938,7 @@ def preflight_scenario_model(
     for item in payload.get("workflows") or []:
         if item.get("status") != "draft" or item.get("enabled") is not False:
             raise PolicyViolation("候选工作流必须先保持草稿且停用")
-        workflow_service.validate_workflow_definition(item.get("nodes") or [], item.get("edges") or [])
+        workflow_service.validate_workflow_definition(item.get("nodes") or [], item.get("edges") or [], trigger_config=item.get('trigger_config'))
         operations_service.validate_approval_nodes(item.get("nodes") or [], [])
         trigger_type = item.get("trigger_type")
         if trigger_type not in {"manual", "scheduled", "event"}:
@@ -9557,7 +9584,7 @@ def _apply_scenario_model_mutations(
                 data[id_keys[node["type"]]] = _resolved_id(data.pop("resource", None), created)
             node["data"] = data
             nodes.append(node)
-        workflow_service.validate_workflow_definition(nodes, item.get("edges") or [])
+        workflow_service.validate_workflow_definition(nodes, item.get("edges") or [], trigger_config=item.get('trigger_config'))
         workflow_service.validate_workflow_references(db, scenario.id, steps=[], nodes=nodes)
         operations_service.validate_approval_nodes(nodes, [])
         trigger_config = dict(item.get("trigger_config") or {})

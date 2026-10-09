@@ -10,8 +10,10 @@
           <div class="distill-fields">
             <el-form-item :label="`对象 ${index + 1} 名称`"><el-input v-model="item.name" maxlength="200" /></el-form-item>
             <el-form-item label="业务含义"><el-input v-model="item.description" type="textarea" :rows="2" maxlength="4000" /></el-form-item>
-            <el-form-item label="业务属性（每行一项）"><el-input :model-value="item.attributes.join('\n')" type="textarea" :rows="3" maxlength="4000" @update:model-value="(value: string) => item.attributes = linesOf(value)" /></el-form-item>
+            <el-form-item label="业务属性（每行一项）"><el-input :model-value="item.attributes.join('\n')" type="textarea" :rows="3" maxlength="4000" @update:model-value="(value: string) => updateAttributes(index, value)" /></el-form-item>
           </div>
+          <el-form-item label="对象依据"><el-select v-model="item.evidence_refs" multiple><el-option v-for="source in document.evidence" :key="source.key" :label="source.title || '未命名证据'" :value="source.key" /></el-select></el-form-item>
+          <DistillationPropertyContracts v-model="document.entities[index]" />
           <el-button text type="danger" :aria-label="`移除对象 ${item.name || index + 1}`" @click="removeEntity(item.key)">移除对象</el-button>
         </article>
         <div class="distill-section-head"><h3>对象关系</h3><el-button :disabled="!document.entities.length" @click="document.relations.push({ source: '', target: '', label: '', cardinality: 'unconfirmed' })">添加关系</el-button></div>
@@ -46,7 +48,14 @@ import type { DistillationDocument } from '@/types/businessDistillation'
 import { linesOf } from '@/utils/businessDistillation'
 import { createClientRequestId } from '@/utils/clientRequestId'
 import DistillationGraph from './DistillationGraph.vue'
+import DistillationPropertyContracts from './DistillationPropertyContracts.vue'
 const document = defineModel<DistillationDocument>({ required: true })
+function updateAttributes(index: number, value: string) {
+  const entity = document.value.entities[index]
+  if (!entity) return
+  entity.attributes = linesOf(value)
+  entity.property_contracts = entity.property_contracts?.filter(item => entity.attributes.includes(item.attribute))
+}
 function addEntity() { document.value.entities.push({ key: `entity_${createClientRequestId().replace(/-/g, '').slice(0, 16)}`, name: '', description: '', attributes: [] }) }
 function removeEntity(key: string) {
   document.value.entities = document.value.entities.filter(item => item.key !== key)

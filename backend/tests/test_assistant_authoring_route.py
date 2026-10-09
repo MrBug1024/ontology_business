@@ -27,6 +27,24 @@ def test_new_tool_discovery_has_one_authoring_route_and_legacy_calls_still_resol
     assert initial_model_task_scope(route_assistant_decision(legacy)) == 'mapping'
 
 
+def test_rule_and_workflow_request_keeps_both_tasks_and_starts_with_rule():
+    from app.services.model_task_scope import bind_request_scope
+    decision = _decision_from_capability_call({'tool_calls': [{'function': {
+        'name': 'compile_scenario_model', 'arguments': {'goal': 'create',
+        'scope': 'scenario_model', 'task_ids': ['workflows', 'rules'],
+        'confidence': 'high', 'reason': 'Create rule then dependent workflow'}}}]})
+    plan = route_assistant_decision(decision)
+    assert initial_model_task_scope(plan) == 'rules'
+    assert bind_request_scope({}, plan.public_context())['generation']['requested_task_ids'] == ['rules', 'workflows']
+
+
+def test_rules_have_a_real_compilation_scope():
+    plan = route_assistant_decision(AssistantSemanticDecision(goal='create', scope='rules',
+        confidence='high', reason='Create a rule'))
+    assert plan.intent == 'scenario_model'
+    assert initial_model_task_scope(plan) == 'rules'
+
+
 @pytest.mark.parametrize('scope', [None, 'general', 'execute', ''])
 def test_model_tool_missing_or_invalid_scope_does_not_default_to_ontology(scope):
     with pytest.raises(ValueError, match='建模主题'):
@@ -67,3 +85,12 @@ def test_compiler_route_preserves_readonly_and_scope_boundaries():
         plan = route_assistant_decision(AssistantSemanticDecision(goal=goal, scope='ontology',
             confidence=confidence, reason='synthetic'), mode=mode, preferred_scope=preferred)
         assert plan.intent == 'chat'
+
+
+@pytest.mark.parametrize('scope,task', [('workflow', 'workflows'), ('ontology', 'ontology'), ('mapping', 'mapping')])
+def test_explicit_scenario_model_resolution_accepts_declared_subscope(scope, task):
+    plan = route_assistant_decision(AssistantSemanticDecision(goal='create', scope=scope,
+        confidence='high', reason='Refine only the explicitly selected task'),
+        mode='draft', preferred_scope='scenario_model')
+    assert plan.intent == 'scenario_model'
+    assert initial_model_task_scope(plan) == task

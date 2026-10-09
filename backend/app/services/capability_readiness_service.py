@@ -361,7 +361,9 @@ def _workflow_readiness(
         reasons.append("工作流没有可执行节点")
     if nodes:
         try:
-            validate_workflow_graph(nodes, list(getattr(workflow, "edges", []) or []))
+            from .workflow_ontology_contract import declared_output_nodes
+            validate_workflow_graph(nodes, list(getattr(workflow, "edges", []) or []),
+                output_node_ids=declared_output_nodes(getattr(workflow, 'trigger_config', {})))
         except Exception as exc:  # noqa: BLE001
             reasons.append(f"工作流图无效：{exc}")
     if definition is not None:

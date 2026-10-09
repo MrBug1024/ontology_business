@@ -10,6 +10,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from .channel_interaction_schemas import EvidenceReference
+from .construction_schemas import ConstructionResolution
 from .ontology_semantics_schemas import InstanceIntegrity, StatePolicy
 
 
@@ -1889,6 +1890,7 @@ class AssistantChatRequest(BaseModel):
     # from the message/attachment content prevents a historical terminal job
     # from swallowing a later user request with identical wording.
     request_id: str | None = Field(default=None, min_length=1, max_length=128)
+    construction_resolution: "ConstructionResolution | None" = None
     thread_id: str | None = Field(default=None, min_length=1, max_length=64)
     scenario_id: str | None = Field(default=None, min_length=1, max_length=64)
     page: str = Field(default="", max_length=200)
@@ -1956,6 +1958,15 @@ class AssistantChatRequest(BaseModel):
         return value
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def validate_construction_resolution(self):
+        if self.construction_resolution and (
+            not self.request_id or not self.thread_id or not self.scenario_id
+            or self.mode != 'draft' or self.draft_kind != 'scenario_model'
+        ):
+            raise ValueError('建设补充必须是关联场景和会话的明确建设请求')
+        return self
 
 
 class AssistantRequestRunOut(BaseModel):

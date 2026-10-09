@@ -80,6 +80,8 @@ from ..services import (
     catalog_ingestion_service,
     catalog_service,
     content_retrieval_service,
+    construction_resolution_service,
+    compilation_failure_diagnostics,
     doc_parser,
     distillation_capability_service,
     datasource_service,
@@ -545,6 +547,11 @@ def _scenario_context(db: Session, scenario: BusinessScenario | None) -> str:
         f"业务场景：{short(scenario.name, 200)}",
         f"场景说明：{short(scenario.description, 1_000) or '暂无'}",
     ]
+    from ..services import scenario_discovery_context
+
+    discovery_context = scenario_discovery_context.advisor_context(db, scenario)
+    if discovery_context:
+        lines.append(discovery_context)
     if scenario.industry:
         lines.append(f"所属行业：{short(scenario.industry, 200)}")
     lines.append(
@@ -4376,9 +4383,11 @@ def _finalize_compilation_success(
             )
             proposal_payload = proposal.get("payload")
             if isinstance(proposal_payload, dict):
-                proposal_payload["candidate_governance"] = copy.deepcopy(
-                    governance_summary
-                )
+                from ..services.construction_delivery_service import apply_governance
+                proposal['payload'] = assistant_decision_gate.attach_decision_gate(
+                    apply_governance(proposal_payload, governance_summary))
+                if governance_summary.get('blocked_count'):
+                    reply = proposal['payload']['decision_gate']['explanation']
         if continuation_proposal_id:
             scenario_model_draft_service.discard_pristine_live_checkpoints(
                 finish_db,
@@ -5150,7 +5159,11 @@ def _run_compilation_job_in_background(
             _finalize_compilation_success(data=data, reply=reply, **finalize_kwargs)
         except assistant_compilation_job_service.CompilationLeaseLost:
             raise
-        except Exception:  # noqa: BLE001 - salvage a persistable editing surface.
+        except Exception as exc:  # noqa: BLE001 - salvage a persistable editing surface.
+            compilation_failure_diagnostics.record_failure(
+                tenant_id=tenant_id, user_id=user_id, job_id=job_id,
+                lease_token=lease_token, lease_attempt=lease_attempt, error=exc,
+            )
             data = _unavailable_worker_draft(
                 compiler_message=compiler_message,
                 compiler_documents=compiler_documents,
@@ -6091,6 +6104,8 @@ def _accept_attachment_backed_request(
     legacy_attachments = _safe_attachment_ids(
         db, payload.attachment_ids, thread_id=thread_id, consume=False
     )
+    from ..services.construction_resolution_service import prepare_resolution
+    resolved_message = prepare_resolution(db, payload)
     upload_meta = [
         {
             "id": run.id,
@@ -6124,6 +6139,8 @@ def _accept_attachment_backed_request(
         "assistant_request_run_id": run_id,
         "assistant_request_status": "waiting_upload",
         "assistant_request_revision": 1,
+        "construction_resolution": payload.construction_resolution.model_dump(mode="json")
+            if payload.construction_resolution else None,
     }
     user_message_id = _assistant_request_message_id(
         "user",
@@ -6167,7 +6184,8 @@ def _accept_attachment_backed_request(
             user_message_id=user_message_id,
             assistant_message_id=assistant_message_id,
             payload_document=payload.model_copy(
-                update={"thread_id": thread_id, "request_id": request_id}
+                update={"thread_id": thread_id, "request_id": request_id,
+                    "message": resolved_message, "construction_resolution": None}
             ).model_dump(mode="json"),
             upload_run_ids=list(payload.upload_run_ids),
         )
@@ -7884,6 +7902,11 @@ def execute_assistant_request_run(
 ) -> None:
     """Restore the original principal and execute one fenced durable send."""
 
+    if payload_document.get('kind') == 'scenario-plugin-coding.v1':
+        from ..services.plugin_coding_worker import execute
+        execute(payload_document, tenant_id, user_id, run_id, lease_token, lease_generation)
+        return
+
     worker_db = SessionLocal()
     worker_db.info.update({
         "tenant_id": tenant_id,
@@ -7932,6 +7955,7 @@ def stream_chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+    payload = construction_resolution_service.prepare_request(db, payload)
     scenario = _scenario(db, payload.scenario_id, require_active=True)
     _configure_assistant_runtime(db, payload)
     modeling_references = _assistant_capability_context(db, payload)
@@ -8962,6 +8986,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_tenant_db)):
             thread_id=run["thread_id"],
             reply="消息已接收；后台将在附件准备完成后继续处理。",
         )
+    payload = construction_resolution_service.prepare_request(db, payload)
     scenario = _scenario(db, payload.scenario_id, require_active=True)
     _configure_assistant_runtime(db, payload)
     modeling_references = _assistant_capability_context(db, payload)

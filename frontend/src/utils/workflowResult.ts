@@ -7,7 +7,8 @@ function objectValue(value: unknown): value is Record<string, unknown> {
 export function workflowResultSchema(config: unknown, nodeId: string): Record<string, unknown> {
   if (!objectValue(config) || !objectValue(config.ontology_contract)) return {}
   const contract = config.ontology_contract
-  return contract.output_node_id === nodeId && objectValue(contract.output_schema) ? contract.output_schema : {}
+  const declared = contract.output_node_id === nodeId || Array.isArray(contract.output_node_ids) && contract.output_node_ids.includes(nodeId)
+  return declared && objectValue(contract.output_schema) ? contract.output_schema : {}
 }
 
 /** Only server-confirmed successful end nodes are final business results. */

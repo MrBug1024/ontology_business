@@ -263,6 +263,7 @@ import { api } from '@/api'
 import { allAgentCapabilityScope, cloneAgentCapabilityScope, emptyAgentCapabilityScope } from '@/utils/agentCapabilities'
 import { normalizeAgentReadiness } from '@/utils/agentReadiness'
 import { filterAgentsByScenario, scenarioIdFromQuery } from '@/utils/agentValidationView'
+import { forwardedValidationRelease } from '@/utils/agentValidationTarget'
 import type {
   Agent,
   AgentCapabilityCatalog,
@@ -503,6 +504,7 @@ function openAgentChat(agent: Agent) {
     params: { id: agent.id },
     query: {
       scenario_id: agent.scenario_id || scenarioScope.value || undefined,
+      release_id: forwardedValidationRelease(route.query.release_id, agent.scenario_id || scenarioScope.value, scenarioScope.value),
       return_to: route.fullPath,
     },
   })

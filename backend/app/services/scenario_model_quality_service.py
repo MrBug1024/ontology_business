@@ -5,6 +5,8 @@ import copy
 import json
 from typing import Any, Callable
 
+from .construction_repair_integrity import preserves_nested_contract
+
 
 MAX_REPAIR_ATTEMPTS = 2
 MAX_FEEDBACK_CHARS = 60_000
@@ -19,6 +21,9 @@ class RepairOutputInvalid(ValueError):
 # original resolution path; another model guess cannot resolve them.
 REPAIRABLE_CODES = frozenset({
     "incomplete_source_attributes",
+    "source_property_contract_mismatch", "missing_source_entity",
+    "source_relation_contract_mismatch", "missing_source_relation",
+    "formal_preflight_failed", "candidate_revalidation_required",
     "invalid_entity", "missing_primary_key", "multiple_primary_keys",
     "missing_title_property", "multiple_title_properties", "missing_reference",
     "invalid_relation_constraints", "invalid_relation_constraint_endpoints",
@@ -36,7 +41,7 @@ REPAIRABLE_REPORTED_CODES = frozenset({"CHUNK_RESOURCE_CONFLICT", "FORMAL_PREFLI
 
 
 def _repairable(issue: dict[str, Any]) -> bool:
-    return issue.get("code") in REPAIRABLE_CODES or (
+    return (issue.get("code") == "missing_evidence" and issue.get("resolution_owner") == "advisor") or issue.get("code") in REPAIRABLE_CODES or (
         issue.get("code") == "document_reported_issue"
         and str(issue.get("reported_code") or "").upper() in REPAIRABLE_REPORTED_CODES
     )
@@ -123,15 +128,25 @@ def repair_candidates(
     required_keys = _identities(raw)
     required_workflow_inputs = _workflow_inputs(raw)
     protected_issues = _protected_issues(result)
+    attempted = 0
+    accepted = 0
+    summary = {"attempt_count": 0, "accepted_count": 0,
+        "initial_blocker_count": len(_blocking(result)), "remaining_blocker_count": len(_blocking(result)),
+        "stop_reason": "not_required"}
+    def finish(value, reason):
+        value["repair_summary"] = {**summary, "attempt_count": attempted, "accepted_count": accepted,
+            "remaining_blocker_count": len(_blocking(value)), "stop_reason": reason}
+        return value
     for attempt in range(MAX_REPAIR_ATTEMPTS):
         issues = _blocking(best)
         if not any(_repairable(item) for item in issues):
-            break
+            return finish(best, "validated" if not issues else "business_information_required")
         revised_prompt = feedback_prompt(prompt, current_raw, issues, limit=prompt_limit)
         if revised_prompt is None:
-            break
+            return finish(best, "feedback_limit")
         if on_attempt:
             on_attempt(attempt + 1, len(issues))
+        attempted += 1
         # Budget, lease and transport exceptions must propagate to the durable
         # owner. They cannot be converted into a misleading successful repair.
         try:
@@ -145,7 +160,7 @@ def repair_candidates(
                 "message": "本次自动修复未返回完整有效的结构；已保留上次校验结果及原有阻塞项。",
                 "source_refs": [],
             })
-            return retained
+            return finish(retained, "incomplete_repair_output")
         if not isinstance(candidate, dict) or not required_keys.issubset(_identities(candidate)):
             continue
         candidate_inputs = _workflow_inputs(candidate)
@@ -156,6 +171,8 @@ def repair_candidates(
             evaluated = normalize(candidate)
         except ValueError:
             continue
+        if not preserves_nested_contract(best, evaluated):
+            continue
         candidate_fields = _mapping_fields(evaluated)
         if any(not fields.issubset(candidate_fields.get(key, set()))
                for key, fields in _mapping_fields(best).items()):
@@ -163,7 +180,8 @@ def repair_candidates(
         if protected_issues.issubset(_protected_issues(evaluated)) and len(_blocking(evaluated)) < len(issues):
             current_raw = candidate
             best = evaluated
-    return best
+            accepted += 1
+    return finish(best, "validated" if not _blocking(best) else "no_progress" if not accepted else "attempt_limit")
 
 
 def repair_compilation(db, scenario, raw, normalized, *, message, llm, source_bundle,
@@ -191,7 +209,7 @@ def repair_compilation(db, scenario, raw, normalized, *, message, llm, source_bu
     def normalize(candidate):
         evaluated = compiler.normalize_scenario_model(db, scenario, candidate,
             source_bundle=source_bundle, mapping_catalog=mapping_catalog,
-            columns_by_table=columns)
+            columns_by_table=columns, task_scope=task_scope)
         if not _blocking(evaluated):
             compiler.preflight_scenario_model(db, scenario, evaluated, inspect_mappings=False)
         return evaluated

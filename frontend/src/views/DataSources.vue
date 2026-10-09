@@ -268,6 +268,7 @@ import type {
   TableInfo,
 } from '@/types'
 import { dataSourceLocationLabel } from '@/utils/dataSources'
+import { notifyScenarioDiscoveryContextChanged } from '@/utils/scenarioAdvisorEvents'
 import DistillationMaterialPanel from '@/components/distillation/DistillationMaterialPanel.vue'
 import LibraryEditorDialog from '@/components/library/LibraryEditorDialog.vue'
 import Templates from '@/views/Templates.vue'
@@ -571,6 +572,7 @@ function onFilePick(f: UploadFile) {
 }
 async function doUpload() {
   if (!canWrite.value || !selected.value?.can_write) return
+  const changedScenarioId = selected.value.scenario_id || routeScenarioId.value
   const pending = uploadList.value.filter((item) => item.raw)
   if (!pending.length) return
   uploading.value = true
@@ -591,6 +593,7 @@ async function doUpload() {
       }
     }
     uploadList.value = uploadList.value.filter((item) => !completed.has(item.uid))
+    if (completed.size) notifyScenarioDiscoveryContextChanged(changedScenarioId)
     await loadFiles()
     if (uploadFailures.value.length) {
       const succeeded = completed.size
@@ -717,6 +720,7 @@ function viewCitation(citation: RagCitation) {
   void viewText({ id: citation.file_id, filename: citation.filename } as BucketFile)
 }
 async function removeFile(f: BucketFile) {
+  const changedScenarioId = selected.value?.scenario_id || routeScenarioId.value
   try {
     await ElMessageBox.confirm(
       `删除文件「${f.filename}」？数据库中的对象删除记录会保留，MinIO 文件将在清理任务中删除。`,
@@ -724,6 +728,7 @@ async function removeFile(f: BucketFile) {
       { type: 'warning', confirmButtonText: '删除文件', cancelButtonText: '取消' },
     )
     await api.deleteFile(f.id)
+    notifyScenarioDiscoveryContextChanged(changedScenarioId)
     ElMessage.success('已删除')
     await loadFiles()
   } catch (e: any) {
@@ -742,6 +747,9 @@ function openEdit(ds: DataSource) {
   dlg.value = true
 }
 async function onLibrarySaved(saved: DataSource) {
+  for (const id of new Set([editingSource.value?.scenario_id, saved.scenario_id, routeScenarioId.value])) {
+    if (id) notifyScenarioDiscoveryContextChanged(id)
+  }
   ElMessage.success('资料库已保存')
   if (saved.id) {
     if (props.embedded && !editingSource.value?.id) catalogOffset.value = 0
@@ -764,6 +772,7 @@ async function remove(ds: DataSource) {
       cancelButtonText: '取消',
     })
     const result: any = await api.deleteDataSource(ds.id!)
+    notifyScenarioDiscoveryContextChanged(ds.scenario_id || routeScenarioId.value)
     clearSelection()
     ElMessage.success(result?.message || '已删除')
     await load()

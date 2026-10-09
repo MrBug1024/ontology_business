@@ -2,9 +2,9 @@
   <div class="page access-page">
     <header class="page-header">
       <div>
-        <h1>发布与接入</h1>
+        <h1>发布中心</h1><p class="sub">选择已完成的插件版本，准备第三方安装与集成。</p>
       </div>
-      <el-button v-if="manifest" plain @click="downloadManifest">
+      <el-button v-if="manifest && activeTab === 'manifest'" plain @click="downloadManifest">
         <el-icon><Download /></el-icon>导出清单
       </el-button>
     </header>
@@ -19,7 +19,7 @@
     </section>
 
     <el-alert
-      v-if="manifestError && activeTab !== 'releases'"
+      v-if="manifestError && ['adapters', 'manifest'].includes(activeTab)"
       ref="manifestErrorRef"
       class="manifest-error"
       type="warning"
@@ -29,7 +29,7 @@
       tabindex="-1"
     />
 
-    <section v-if="manifest && activeTab !== 'releases'" class="deployment-band" aria-label="当前发布定义">
+    <section v-if="manifest && ['adapters', 'manifest'].includes(activeTab)" class="deployment-band" aria-label="当前发布定义">
       <div>
         <span>定义来源</span>
         <strong>{{ manifest.deployment.definition_source === 'release' ? '已发布快照' : '开发中定义' }}</strong>
@@ -54,16 +54,16 @@
     </section>
 
     <el-tabs v-model="activeTab" class="access-tabs">
-      <el-tab-pane label="场景发布" name="releases">
-        <ScenarioReleaseList :scenario-id="scenarioId" :scenarios="scenarios" :can-manage="canManage" @select="selectRelease" @changed="releaseChanged" />
+      <el-tab-pane label="插件发布" name="plugins">
+        <PluginPublishing :scenario-id="scenarioId" :artifact-id="queryText(route.query.artifact)" @select="selectPlugin" />
       </el-tab-pane>
-      <el-tab-pane label="接入配置" name="adapters">
+      <el-tab-pane label="MCP 设置" name="adapters">
         <div v-loading="loadingManifest" class="adapter-grid">
-          <article v-for="adapter in manifest?.adapters || []" :key="adapter.protocol" class="adapter-panel">
+          <article v-for="adapter in mcpAdapters" :key="adapter.protocol" class="adapter-panel">
             <header>
-              <span class="adapter-icon"><el-icon><component :is="adapter.protocol === 'rest' ? 'Link' : 'Connection'" /></el-icon></span>
+              <span class="adapter-icon"><el-icon><component :is="'Connection'" /></el-icon></span>
               <div>
-                <h2>{{ adapter.protocol === 'rest' ? 'REST API v2' : 'Capability MCP' }}</h2>
+                <h2>{{ '插件 MCP 连接' }}</h2>
                 <span>仅允许访问“{{ manifest?.scenario.name }}”，请使用该场景的集成密钥</span>
               </div>
               <el-tag size="small" :type="manifestReady ? 'success' : 'warning'">{{ manifestReady ? '可接入' : '需检查' }}</el-tag>
@@ -90,12 +90,12 @@
         </div>
       </el-tab-pane>
 
-      <el-tab-pane label="集成密钥" name="keys">
+      <el-tab-pane label="插件凭据" name="keys">
         <section class="keys-section" v-loading="loadingKeys">
           <header class="section-toolbar">
             <div>
-              <h2>Integration API keys</h2>
-              <span>每个密钥只允许访问其绑定场景，REST 与 MCP 使用相同边界</span>
+              <h2>插件访问凭据</h2>
+              <span>每个凭据只允许访问绑定场景，由插件通过 MCP 使用</span>
             </div>
             <el-button v-if="canManage" type="primary" @click="openCreateKey">
               <el-icon><Plus /></el-icon>新建密钥
@@ -149,7 +149,7 @@
         </section>
       </el-tab-pane>
 
-      <el-tab-pane label="Manifest 检查" name="manifest">
+      <el-tab-pane label="能力检查" name="manifest">
         <div v-loading="loadingManifest" class="manifest-tab">
           <section v-if="manifest" class="manifest-section">
           <div class="check-list" aria-label="清单安全检查">
@@ -163,7 +163,7 @@
             <el-table-column prop="name" label="能力" min-width="180" />
             <el-table-column prop="kind" label="类型" width="110" />
             <el-table-column label="输入端口" min-width="180">
-              <template #default="{ row }">{{ row.data_ports.map((port: any) => port.key).join(' · ') || '无数据端口' }}</template>
+              <template #default="{ row }">{{ dataPortLabels(row.data_ports) }}</template>
             </el-table-column>
             <el-table-column label="副作用" width="100">
               <template #default="{ row }">{{ row.side_effect ? '是' : '否' }}</template>
@@ -223,8 +223,8 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import ScenarioReleaseList from '@/components/ScenarioReleaseList.vue'
-import type { ScenarioRelease } from '@/types/scenarioRelease'
+import PluginPublishing from '@/components/plugin-coding/PluginPublishing.vue'
+import type { PluginArtifact } from '@/types/pluginArtifact'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
@@ -252,7 +252,11 @@ const manifestError = ref('')
 const manifestErrorRef = ref()
 const loadingScenarios = ref(false)
 const loadingManifest = ref(false)
-const activeTab = ref('releases')
+const activeTab = computed({
+  get: () => ['plugins', 'adapters', 'keys', 'manifest'].includes(queryText(route.query.tab)) ? queryText(route.query.tab) : 'plugins',
+  set: (value: string) => { void router.replace({ query: { ...route.query, tab: value === 'plugins' ? undefined : value } }) },
+})
+const mcpAdapters = computed(() => manifest.value?.adapters.filter(item => item.protocol === 'mcp') || [])
 const keys = ref<IntegrationKey[]>([])
 const loadingKeys = ref(false)
 const createKeyVisible = ref(false)
@@ -282,6 +286,9 @@ const visibleKeys = computed(() => scenarioId.value ? keys.value.filter((key) =>
 
 function scenarioName(id: string | null) {
   return id ? scenarios.value.find((item) => item.id === id)?.name || '场景不可用' : '未绑定（需重新签发）'
+}
+function dataPortLabels(ports: CapabilityAccessManifest['capabilities'][number]['data_ports']) {
+  return ports.map(port => port.key).join(' · ') || '无数据端口'
 }
 const manifestReady = computed(() => Boolean(manifest.value?.checks.every((check) => check.passed)))
 const secretMcpConfig = computed(() => {
@@ -388,7 +395,7 @@ async function createKey() {
 
 async function revokeKey(key: IntegrationKey) {
   try {
-    await ElMessageBox.confirm(`撤销“${key.name}”后，使用该密钥的 REST 与 MCP 调用会立即失败。`, '撤销集成密钥', {
+    await ElMessageBox.confirm(`撤销“${key.name}”后，使用该凭据的插件与 MCP 调用会立即失败。`, '撤销集成密钥', {
       type: 'warning',
       confirmButtonText: '确认撤销',
     })
@@ -414,13 +421,8 @@ async function deleteUnboundKey(key: IntegrationKey) {
   }
 }
 
-async function selectRelease(release: ScenarioRelease) {
-  await router.push({ query: { scenario_id: release.scenario_id, release_id: release.id } })
-  activeTab.value = 'adapters'
-}
-
-function releaseChanged(release: ScenarioRelease) {
-  if (release.id === releaseId.value) void loadManifest()
+function selectPlugin(value: PluginArtifact) {
+  void router.push({ query: { scenario_id: value.scenario_id, release_id: value.release_id, artifact: value.id } })
 }
 
 function clearSecret() {
@@ -435,9 +437,6 @@ function absoluteUrl(value: string) {
 function adapterSnippet(protocol: 'rest' | 'mcp') {
   const adapter = manifest.value?.adapters.find((item) => item.protocol === protocol)
   if (!adapter) return ''
-  if (protocol === 'rest') {
-    return `curl -H "X-API-Key: <integration-key>" "${absoluteUrl(adapter.discovery || adapter.endpoint)}"`
-  }
   return JSON.stringify({
     mcpServers: {
       'ontology-capabilities': {
@@ -491,7 +490,6 @@ function formatDate(value?: string | null) {
 }
 
 watch([scenarioId, releaseId], () => {
-  if (releaseId.value) activeTab.value = 'adapters'
   void loadManifest()
 })
 

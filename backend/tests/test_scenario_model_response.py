@@ -72,6 +72,35 @@ def test_cancelling_stream_closes_transport_and_records_cancellation(monkeypatch
     assert traces[0]['status'] == 'cancelled'
 
 
+@pytest.mark.parametrize('field', ['id', 'name', 'arguments'])
+def test_native_tool_fragments_share_the_output_bound_before_accumulation(monkeypatch, field):
+    tool = SimpleNamespace(index=0, id='call', function=SimpleNamespace(name='inspect', arguments='{}'))
+    if field == 'id':
+        tool.id = 'x' * 101
+    else:
+        setattr(tool.function, field, 'x' * 101)
+    chunk = _chunk()
+    chunk.choices[0].delta.tool_calls = [tool]
+    closed, traces = _stream(monkeypatch, [chunk])
+    with pytest.raises(llm_service.LLMRuntimeError, match='受控大小'):
+        list(llm_service.chat_stream(SimpleNamespace(model='synthetic', max_tokens=100, temperature=0), [],
+                                    tools=[{'type': 'function'}], max_output_chars=100))
+    assert closed == ['stream', 'client']
+    assert traces[0]['status'] == 'failed'
+
+
+def test_text_and_native_arguments_cannot_use_separate_output_budgets(monkeypatch):
+    chunk = _chunk()
+    chunk.choices[0].delta.tool_calls = [SimpleNamespace(index=0, id='c',
+        function=SimpleNamespace(name='f', arguments='x' * 30))]
+    closed, traces = _stream(monkeypatch, [_chunk('x' * 20), chunk])
+    with pytest.raises(llm_service.LLMRuntimeError):
+        list(llm_service.chat_stream(SimpleNamespace(model='synthetic', max_tokens=100, temperature=0), [],
+                                    tools=[{'type': 'function'}], max_output_chars=40))
+    assert closed == ['stream', 'client']
+    assert traces[0]['status'] == 'failed'
+
+
 def test_stream_cleanup_failure_still_closes_client_and_records_original_failure(monkeypatch):
     closed, traces = _stream(monkeypatch, [_chunk('partial')], fail_close=True)
     with pytest.raises(llm_service.LLMRuntimeError):

@@ -1,0 +1,273 @@
+{
+  "protocol": "real_rest_and_installed_stdio_mcp",
+  "scenarios": [
+    {
+      "scenario_id": "7295ab77a9dd4b8cbb8827fb8aef6fb5",
+      "release_id": "339b9ec22c8945419b95573317d7ceb6",
+      "artifact_id": "aa87a60e413ccdbd2c80376de1f97162",
+      "installation": "actual_isolated_host_installation",
+      "verified_tls": true,
+      "rest": [
+        {
+          "role": "success",
+          "kind": "rule",
+          "invocation_id": "552651a23068450c806806f784d9f11b",
+          "status": "succeeded",
+          "definition_hash": "5c4e84ae31a2f24006fdc51562cdba66655d86034652d57c7afa7074a9f97751",
+          "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+          "output": {
+            "action_on_match": "",
+            "matched": true,
+            "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+            "rule_name": "办公采购通过",
+            "severity": "warning",
+            "side_effects_executed": false,
+            "trigger_action_ids": [],
+            "trigger_actions": []
+          },
+          "error_code": null
+        },
+        {
+          "role": "boundary",
+          "kind": "rule",
+          "invocation_id": "172fcaf76fc4417ba5f074967c844b39",
+          "status": "succeeded",
+          "definition_hash": "5c4e84ae31a2f24006fdc51562cdba66655d86034652d57c7afa7074a9f97751",
+          "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+          "output": {
+            "action_on_match": "",
+            "matched": true,
+            "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+            "rule_name": "办公采购通过",
+            "severity": "warning",
+            "side_effects_executed": false,
+            "trigger_action_ids": [],
+            "trigger_actions": []
+          },
+          "error_code": null
+        },
+        {
+          "role": "failure",
+          "kind": "rule",
+          "invocation_id": "b411a3727f3e4e48950d786e6f4b5d9e",
+          "status": "succeeded",
+          "definition_hash": "5c4e84ae31a2f24006fdc51562cdba66655d86034652d57c7afa7074a9f97751",
+          "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+          "output": {
+            "action_on_match": "",
+            "matched": false,
+            "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+            "rule_name": "办公采购通过",
+            "severity": "warning",
+            "side_effects_executed": false,
+            "trigger_action_ids": [],
+            "trigger_actions": []
+          },
+          "error_code": null
+        },
+        {
+          "role": "incomplete",
+          "kind": "rule",
+          "invocation_id": "5fab97f1f66144dfbf0f2829955ad7c0",
+          "status": "succeeded",
+          "definition_hash": "5c4e84ae31a2f24006fdc51562cdba66655d86034652d57c7afa7074a9f97751",
+          "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+          "output": {
+            "action_on_match": "",
+            "matched": false,
+            "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+            "rule_name": "办公采购通过",
+            "severity": "warning",
+            "side_effects_executed": false,
+            "trigger_action_ids": [],
+            "trigger_actions": []
+          },
+          "error_code": null
+        }
+      ],
+      "credential_revoked": true,
+      "cross_scenario_rejected": true,
+      "changed_input_rejected": 409,
+      "invalid_schema_rejected": 422,
+      "stale_definition_rejected": true,
+      "plugin": {
+        "cases": [
+          {
+            "role": "success",
+            "kind": "rule",
+            "invocation_id": "092b001f1e0e4b3aa42aec00276bbf27",
+            "status": "succeeded",
+            "definition_hash": "5c4e84ae31a2f24006fdc51562cdba66655d86034652d57c7afa7074a9f97751",
+            "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+            "output": {
+              "action_on_match": "",
+              "matched": true,
+              "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+              "rule_name": "办公采购通过",
+              "severity": "warning",
+              "side_effects_executed": false,
+              "trigger_action_ids": [],
+              "trigger_actions": []
+            },
+            "error_code": null,
+            "approval_replied": false
+          },
+          {
+            "role": "boundary",
+            "kind": "rule",
+            "invocation_id": "a4a06e468ff146e08b09e04edce2d122",
+            "status": "succeeded",
+            "definition_hash": "5c4e84ae31a2f24006fdc51562cdba66655d86034652d57c7afa7074a9f97751",
+            "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+            "output": {
+              "action_on_match": "",
+              "matched": true,
+              "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+              "rule_name": "办公采购通过",
+              "severity": "warning",
+              "side_effects_executed": false,
+              "trigger_action_ids": [],
+              "trigger_actions": []
+            },
+            "error_code": null,
+            "approval_replied": false
+          },
+          {
+            "role": "failure",
+            "kind": "rule",
+            "invocation_id": "f56739eadaaf4a45b74372b01faf2ef9",
+            "status": "succeeded",
+            "definition_hash": "5c4e84ae31a2f24006fdc51562cdba66655d86034652d57c7afa7074a9f97751",
+            "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+            "output": {
+              "action_on_match": "",
+              "matched": false,
+              "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+              "rule_name": "办公采购通过",
+              "severity": "warning",
+              "side_effects_executed": false,
+              "trigger_action_ids": [],
+              "trigger_actions": []
+            },
+            "error_code": null,
+            "approval_replied": false
+          },
+          {
+            "role": "incomplete",
+            "kind": "rule",
+            "invocation_id": "0fa56cd0cadf4586ab3424754f4a0082",
+            "status": "succeeded",
+            "definition_hash": "5c4e84ae31a2f24006fdc51562cdba66655d86034652d57c7afa7074a9f97751",
+            "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+            "output": {
+              "action_on_match": "",
+              "matched": false,
+              "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+              "rule_name": "办公采购通过",
+              "severity": "warning",
+              "side_effects_executed": false,
+              "trigger_action_ids": [],
+              "trigger_actions": []
+            },
+            "error_code": null,
+            "approval_replied": false
+          }
+        ],
+        "rest_to_mcp_same_invocation": true,
+        "discovery": true,
+        "unpackaged_capability_rejected": true
+      },
+      "installed_client": {
+        "module": "scripts.check_purchase",
+        "function": "check_purchase",
+        "cases": [
+          {
+            "role": "success",
+            "receipts": [
+              {
+                "invocation_id": "7df4cee9600e447b8cf71fa948ef37a0",
+                "kind": "rule",
+                "status": "succeeded",
+                "output": {
+                  "action_on_match": "",
+                  "matched": true,
+                  "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+                  "rule_name": "办公采购通过",
+                  "severity": "warning",
+                  "side_effects_executed": false,
+                  "trigger_action_ids": [],
+                  "trigger_actions": []
+                }
+              }
+            ],
+            "no_unreported_invocations": true
+          },
+          {
+            "role": "boundary",
+            "receipts": [
+              {
+                "invocation_id": "825271411eca4db39f2d4aab4ab5af64",
+                "kind": "rule",
+                "status": "succeeded",
+                "output": {
+                  "action_on_match": "",
+                  "matched": true,
+                  "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+                  "rule_name": "办公采购通过",
+                  "severity": "warning",
+                  "side_effects_executed": false,
+                  "trigger_action_ids": [],
+                  "trigger_actions": []
+                }
+              }
+            ],
+            "no_unreported_invocations": true
+          },
+          {
+            "role": "failure",
+            "receipts": [
+              {
+                "invocation_id": "f11e892679a741f18470050b195ca5f7",
+                "kind": "rule",
+                "status": "succeeded",
+                "output": {
+                  "action_on_match": "",
+                  "matched": false,
+                  "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+                  "rule_name": "办公采购通过",
+                  "severity": "warning",
+                  "side_effects_executed": false,
+                  "trigger_action_ids": [],
+                  "trigger_actions": []
+                }
+              }
+            ],
+            "no_unreported_invocations": true
+          },
+          {
+            "role": "incomplete",
+            "receipts": [
+              {
+                "invocation_id": "4d496848d50943ec8a4368bfe92cb40a",
+                "kind": "rule",
+                "status": "succeeded",
+                "output": {
+                  "action_on_match": "",
+                  "matched": false,
+                  "rule_id": "eebd6a0e02544d4ab453e09f089ca9c4",
+                  "rule_name": "办公采购通过",
+                  "severity": "warning",
+                  "side_effects_executed": false,
+                  "trigger_action_ids": [],
+                  "trigger_actions": []
+                }
+              }
+            ],
+            "no_unreported_invocations": true
+          }
+        ],
+        "actual_installed_source_executed": true
+      }
+    }
+  ]
+}

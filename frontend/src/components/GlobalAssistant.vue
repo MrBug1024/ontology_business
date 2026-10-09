@@ -218,6 +218,14 @@
                   </ul>
                 </div>
               </section>
+              <ConstructionDeliveryPanel
+                v-if="proposalOf(message)?.kind === 'scenario_model'"
+                :delivery="constructionDeliveryOf(proposalOf(message))"
+                :proposal-id="proposalOf(message)?.proposal_id || ''"
+                :revision="proposalOf(message)?.run_revision || 1"
+                :busy="loading || compilationBusy || modelTaskRecoveryBusy || !isActiveModelRun(message)"
+                @resolve="resolveConstruction"
+              />
               <section
                 v-if="modelTasks(proposalOf(message)).length && Boolean(expandedProposal[index])"
                 class="model-task-plan"
@@ -612,6 +620,8 @@ import { api, streamAssistantChat, streamAssistantCompilationJob } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 import type { AssistantActionPreview, AssistantAttachment, AssistantCompilationActivity, AssistantCompilationJobStatus, AssistantCompilationLiveness, AssistantCompilationStep, AssistantDecisionGate, AssistantMessage, AssistantModelExecutionSummary, AssistantModelNextAction, AssistantModelTask, AssistantProposal, AssistantProposalApplyResult, AssistantQuestion, AssistantRequestRun, AssistantSource, AssistantThread, AssistantThought } from '@/types'
 import SafeMarkdown from '@/components/SafeMarkdown.vue'
+import ConstructionDeliveryPanel from '@/components/ConstructionDeliveryPanel.vue'
+import type { ConstructionDelivery, ConstructionResolution } from '@/types'
 import KeyValueEditor from '@/components/KeyValueEditor.vue'
 import ModelingAdvisorSettings from '@/components/assistant/ModelingAdvisorSettings.vue'
 import { emptyModelingAdvisorSelection } from '@/composables/useModelingAdvisorResources'
@@ -633,6 +643,7 @@ import { groupScenarioModelIssues, scenarioModelIssueLabel } from '@/utils/assis
 import { compilationFailureSummary, decisionGatePresentation, modelTaskNeedsCorrection } from '@/utils/assistantModelOutcome'
 import { useAssistantManagedUploads } from '@/composables/useAssistantManagedUploads'
 import { useAssistantRequestRuns } from '@/composables/useAssistantRequestRuns'
+import { OPEN_SCENARIO_MODELING_ADVISOR_EVENT, type OpenScenarioModelingAdvisorDetail } from '@/utils/scenarioAdvisorEvents'
 
 interface AssistantContext {
   page?: string
@@ -2560,7 +2571,21 @@ async function submitCompilationGuidance(content: string) {
   }
 }
 
+function constructionDeliveryOf(proposal: AssistantProposal | null): ConstructionDelivery | undefined {
+  const value: unknown = proposal?.payload?.construction_delivery
+  return value && typeof value === 'object' && 'version' in value && value.version === 'construction-delivery.v1'
+    ? value as ConstructionDelivery : undefined
+}
+
+function resolveConstruction(instruction: ConstructionResolution) {
+  submitAssistantMessage(instruction.action === 'replan' ? '请根据我填写的原因与取舍重新规划场景建设。' : '请根据本次补充继续完善建设，并重新校验阻塞和依赖。', instruction)
+}
+
 function send(text?: string) {
+  submitAssistantMessage(text)
+}
+
+function submitAssistantMessage(text?: string, resolution?: ConstructionResolution) {
   const providedContent = text !== undefined ? text : input.value.trim()
   const content = (providedContent || (
     attachments.value.length
@@ -2595,6 +2620,7 @@ function send(text?: string) {
   streamController = streamAssistantChat(
     {
       message: content,
+      construction_resolution: resolution,
       request_id: typeof crypto?.randomUUID === 'function'
         ? crypto.randomUUID()
         : `assistant-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -2610,8 +2636,8 @@ function send(text?: string) {
       mcp_ids: [...assistantConfig.value.mcp_ids],
       // Route by the LangGraph/LLM semantic planner. The client only sends
       // the user's intent and context; it does not select a hidden task mode.
-      mode: 'ask',
-      draft_kind: 'auto',
+      ...(resolution ? { mode: 'draft' as const, draft_kind: 'scenario_model' as const }
+        : { mode: 'ask' as const, draft_kind: 'auto' as const }),
     },
     (event) => {
       if (generation !== streamGeneration || componentDisposed) return
@@ -3102,10 +3128,10 @@ function onSelection(event: Event) {
 }
 
 function onScenarioModelingAdvisor(event: Event) {
-  const detail = (event as CustomEvent<{ scenario_id?: string; prompt?: string }>).detail || {}
+  const detail = (event as CustomEvent<OpenScenarioModelingAdvisorDetail>).detail || {}
   if (!detail.scenario_id || detail.scenario_id !== context.value.scenario_id) return
   const prompt = String(detail.prompt || '').trim()
-  if (prompt) input.value = prompt
+  if (prompt && !input.value.trim()) input.value = prompt
   void openAssistant()
 }
 
@@ -3136,7 +3162,7 @@ watch(showLauncher, (show) => {
 
 onMounted(() => {
   window.addEventListener('ontology-selection-change', onSelection)
-  window.addEventListener('open-scenario-modeling-advisor', onScenarioModelingAdvisor)
+  window.addEventListener(OPEN_SCENARIO_MODELING_ADVISOR_EVENT, onScenarioModelingAdvisor)
   document.addEventListener('visibilitychange', onCompilationVisibilityChange)
 })
 onBeforeUnmount(() => {
@@ -3147,7 +3173,7 @@ onBeforeUnmount(() => {
   clearCompilationStream()
   clearModelTaskRecovery()
   window.removeEventListener('ontology-selection-change', onSelection)
-  window.removeEventListener('open-scenario-modeling-advisor', onScenarioModelingAdvisor)
+  window.removeEventListener(OPEN_SCENARIO_MODELING_ADVISOR_EVENT, onScenarioModelingAdvisor)
   document.removeEventListener('visibilitychange', onCompilationVisibilityChange)
 })
 </script>

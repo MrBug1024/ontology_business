@@ -24,6 +24,7 @@
     </aside>
 
     <section class="discovery-main" aria-label="业务蒸馏工作区">
+      <ScenarioBusinessContextPanel v-if="props.embedded && props.scenarioId && props.showScenarioContext" compact :scenario-id="props.scenarioId" />
       <header v-if="!embedded" class="discovery-toolbar">
         <div class="discovery-toolbar-title">
           <el-button text circle :aria-expanded="projectsOpen" aria-label="打开会话列表" @click="projectsOpen = !projectsOpen"><el-icon><Menu /></el-icon></el-button>
@@ -135,12 +136,14 @@ import DistillationLibraryPicker from '@/components/distillation/DistillationLib
 import DistillationAttachments from '@/components/distillation/DistillationAttachments.vue'
 import DistillationSummary from '@/components/distillation/DistillationSummary.vue'
 import DistillationPublishDecisionDialog from '@/components/distillation/DistillationPublishDecisionDialog.vue'
+import ScenarioBusinessContextPanel from '@/components/ScenarioBusinessContextPanel.vue'
 import type { handoffDecision } from '@/utils/distillationHandoff'
+import { notifyScenarioDiscoveryContextChanged } from '@/utils/scenarioAdvisorEvents'
 import '@/styles/distillation.css'
 import '@/styles/distillation-workspace.css'
 
-const props = withDefaults(defineProps<{ scenarioId?: string; canWrite?: boolean; embedded?: boolean }>(), {
-  scenarioId: '', canWrite: false, embedded: false,
+const props = withDefaults(defineProps<{ scenarioId?: string; canWrite?: boolean; embedded?: boolean; showScenarioContext?: boolean }>(), {
+  scenarioId: '', canWrite: false, embedded: false, showScenarioContext: false,
 })
 const route = useRoute(), router = useRouter(), auth = useAuthStore()
 function queryValue(value: unknown) { return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : '' }
@@ -373,6 +376,9 @@ watch(project, row => {
   if (props.embedded) return
   historyScope.value = row.scenario_id || 'shared'
   if (row.scenario_id) void changeWorkspace(scenarioLocation(row.scenario_id, row.id), true)
+})
+watch([() => project.value?.revision, scenarioRevision, publications], () => {
+  notifyScenarioDiscoveryContextChanged(props.scenarioId || project.value?.scenario_id || selectedScenario.value)
 })
 watch(() => [projectId.value, route.query.scenario_id, route.query.shared], () => {
   historyScope.value = routeScope()

@@ -20,6 +20,13 @@ export default defineConfig({
         target: apiTarget,
         changeOrigin: true,
       },
+      '/mcp': {
+        target: apiTarget,
+        changeOrigin: true,
+        // Preserve the legacy settings page for ordinary browser navigation.
+        // MCP clients advertise JSON/SSE and must reach the protocol server.
+        bypass: (request) => request.headers.accept?.includes('text/html') ? '/index.html' : undefined,
+      },
     },
   },
 })

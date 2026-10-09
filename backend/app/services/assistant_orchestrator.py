@@ -36,6 +36,7 @@ AssistantScope = Literal[
     "ontology",
     "mapping",
     "capabilities",
+    "rules",
     "workflow",
     "scenario_model",
 ]
@@ -112,9 +113,9 @@ _CAPABILITY_TOOL_CONFIG: dict[AssistantCapability, dict[str, Any]] = {
     },
     "compile_scenario_model": {
         "scope": "scenario_model",
-        "scopes": ["ontology", "mapping", "capabilities", "workflow", "scenario_model"],
+        "scopes": ["ontology", "mapping", "capabilities", "rules", "workflow", "scenario_model"],
         "goals": ["create", "continue_work"],
-        "description": "理解附件和上下文，按用户本轮明确的主题生成或继续场景模型草稿；只建函数、操作、规则或事件时 scope=capabilities，完整跨阶段建设才选 scenario_model。",
+        "description": "理解附件和上下文，按用户本轮明确的主题生成或继续场景模型草稿；函数/操作选 capabilities，规则/事件选 rules；明确多个主题时选 scenario_model 并用 task_ids 列出需要的任务。背景资料不扩大范围。",
     },
     "preview_governed_action": {
         "scope": "capabilities",
@@ -140,7 +141,10 @@ def _capability_tools() -> list[dict[str, Any]]:
                     "type": "object",
                     "properties": {
                         **({"scope": {"type": "string", "enum": config["scopes"],
-                            "description": "本轮明确要求产出的主题。只建函数选 capabilities；已有资料和背景提到其他阶段不扩大范围。"}}
+                            "description": "本轮明确要求产出的主题。只建函数选 capabilities，规则选 rules；多主题用 scenario_model 加 task_ids。"},
+                            "task_ids": {"type": "array", "maxItems": 6, "uniqueItems": True,
+                                "items": {"type": "string", "enum": ["ontology", "instances", "mapping", "capabilities", "rules", "workflows"]},
+                                "description": "只列本轮明确需要建设的任务；例如规则与工作流为 rules、workflows；完整全阶段可省略。"}}
                            if "scopes" in config else {}),
                         "goal": {
                             "type": "string",
@@ -200,6 +204,7 @@ def _decision_from_capability_call(response: dict[str, Any]) -> AssistantSemanti
     return AssistantSemanticDecision(
         goal=goal,
         scope=scope,
+        task_ids=arguments.get('task_ids', []),
         confidence=confidence,
         reason=str(arguments.get("reason") or f"已选择{_CAPABILITY_LABELS[name]}能力。")[:500],
     )
@@ -226,6 +231,13 @@ class AssistantSemanticDecision(BaseModel):
     reason: str = Field(
         description="One short user-safe explanation of the interpreted goal."
     )
+    task_ids: list[Literal['ontology', 'instances', 'mapping', 'capabilities', 'rules', 'workflows']] = Field(default_factory=list, max_length=6)
+
+    @model_validator(mode='after')
+    def validate_tasks(self):
+        from .model_task_scope import requested_tasks
+        self.task_ids = requested_tasks({'scope': self.scope, 'task_ids': self.task_ids})
+        return self
 
     model_config = ConfigDict(extra="forbid")
 
@@ -265,6 +277,7 @@ class AssistantRoutePlan(BaseModel):
             "intent": self.intent,
             "goal": self.decision.goal,
             "scope": self.decision.scope,
+            "task_ids": self.decision.task_ids,
             "confidence": self.decision.confidence,
             "source": self.source,
             "recovered": self.source == "model_fallback",
@@ -303,7 +316,9 @@ def unexecuted_authoring_notice(plan: AssistantRoutePlan) -> str:
 
 def initial_model_task_scope(plan: AssistantRoutePlan) -> str:
     """Route each authoring scope through the same durable compiler."""
-    return {"ontology": "ontology", "mapping": "mapping", "workflow": "workflows",
+    if plan.decision.task_ids:
+        return plan.decision.task_ids[0]
+    return {"ontology": "ontology", "mapping": "mapping", "rules": "rules", "workflow": "workflows",
             "capabilities": "capabilities"}.get(plan.decision.scope, "ontology")
 
 
@@ -418,7 +433,7 @@ def _govern(state: _RouteState) -> dict[str, Any]:
             "ontology": {"ontology"},
             "mapping": {"mapping"},
             "workflow": {"workflow"},
-            "scenario_model": {"scenario_model", "capabilities"},
+            "scenario_model": set(_CAPABILITY_TOOL_CONFIG["compile_scenario_model"]["scopes"]),
         }.get(preferred_scope, set())
         if decision.scope not in compatible_scopes:
             return {
@@ -433,6 +448,7 @@ def _govern(state: _RouteState) -> dict[str, Any]:
         "mapping": "scenario_model",
         "workflow": "scenario_model",
         "capabilities": "scenario_model",
+        "rules": "scenario_model",
         "scenario_model": "scenario_model",
     }
     intent = intent_by_scope.get(decision.scope)
@@ -532,7 +548,8 @@ _ROUTER_SYSTEM_PROMPT = """你是业务本体平台的请求语义规划器。�
 - 无法可靠判断时选择 clarify；不要为了完成任务而猜测创建意图。
 - confidence 只衡量是否理解用户的目标和范围，不衡量资料完备程度、实现难度或上轮模型是否失败。明确要求生成或修正活动候选并指明范围时应选 high；具体业务缺口交给建模校验处理。
 
-scope 只描述主题：capabilities 包含函数、操作、规则和事件；scenario_model 表示跨多个资源域的完整建模。
+scope 只描述主题：capabilities 包含函数和操作；rules 包含规则和事件；多个主题选择 scenario_model，并用 task_ids 列出明确要求的任务。
+规则加工作流必须保留 rules 与 workflows 两项，不能仅选择 workflow 丢失规则；不要把背景中出现的其他主题加入任务。
 reason 必须是一句简短、可向用户展示且不包含隐藏推理的说明。"""
 
 

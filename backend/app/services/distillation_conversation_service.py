@@ -335,7 +335,11 @@ def resource_reference_message(row: Turn) -> str:
 
 
 def public_turn(row: Turn, *, statuses: dict[str, str] | None = None) -> TurnOut:
-    values = {name: getattr(row, name) for name in TurnOut.model_fields if name != "attachments"}
+    from .distillation_construction_quality import evaluate_document
+
+    values = {name: getattr(row, name) for name in TurnOut.model_fields
+              if name not in {"attachments", "construction_quality"}}
+    values["construction_quality"] = evaluate_document(DistillationDocument.model_validate(row.proposal)) if row.proposal else None
     values["attachments"] = [{**item, "status": (statuses or {}).get(item["id"],
         "expired" if datetime.fromisoformat(item["expires_at"]) <= attachments.now() else item["status"])}
         for item in row.context.get("attachments", [])]
@@ -389,6 +393,7 @@ def enqueue(db: Session, project_id: str, payload: TurnCreate) -> Turn:
     identity = capture_evidence_identity(db, document, project.scenario_id)
     _selected_llm, resource_selection = resolve_resource_selection(db, payload.resource_selection)
     scenario_context: dict | None = None
+    discovery_context: dict | None = None
     if project.scenario_id:
         state = distillation_service.scenario_state(db, project.scenario_id, write=True, lock=True)
         if state is None or state.document != project.document:
@@ -412,12 +417,16 @@ def enqueue(db: Session, project_id: str, payload: TurnCreate) -> Turn:
                 for publication in publications
             ],
         }
+        from . import scenario_discovery_context
+
+        discovery_context = scenario_discovery_context.context_for_scenario(db, project.scenario_id).model_dump()
     previous_number = db.scalar(select(func.max(Turn.turn_number)).where(Turn.project_id == project.id)) or 0
     row = Turn(tenant_id=project.tenant_id, project_id=project.id,
         created_by=permission_service.require_principal(db).user_id,
         turn_number=previous_number + 1, request_id=payload.request_id, input_hash=fingerprint,
         base_revision=project.revision, message=payload.message,
         context={"document": document.model_dump(), "evidence_identity": identity, "scenario_baseline": scenario_context,
+            "scenario_discovery": discovery_context,
             "scenario_id": project.scenario_id, RESOURCE_SELECTION_KEY: resource_selection}, checkpoint=[])
     db.add(row)
     db.flush()
@@ -447,6 +456,12 @@ def assert_current_context(db: Session, row: Turn) -> None:
     distillation_service.assert_revision(project, row.base_revision)
     if project.scenario_id != row.context["scenario_id"]:
         raise HTTPException(409, "项目调查范围已变化，请重新发送问题")
+    if row.context.get("scenario_discovery") is not None:
+        from . import scenario_discovery_context
+
+        scenario_discovery_context.assert_frozen_material_directory(
+            db, project.scenario_id, row.context["scenario_discovery"],
+        )
     baseline = row.context.get("scenario_baseline")
     if project.scenario_id:
         state = distillation_service.scenario_state(db, project.scenario_id, write=True)

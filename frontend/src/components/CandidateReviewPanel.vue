@@ -88,6 +88,11 @@
 
     <div class="review-toolbar">
       <div class="review-filters" aria-label="候选定义筛选">
+        <el-select v-model="qualityFilter" aria-label="按交付质量筛选">
+          <el-option label="可采用定义" value="ready" />
+          <el-option label="待补充或内部修复稿" value="blocked" />
+          <el-option label="全部候选" value="all" />
+        </el-select>
         <el-input v-model="query" clearable placeholder="搜索名称或资源键" aria-label="搜索候选名称或资源键">
           <template #prefix><el-icon aria-hidden="true"><Search /></el-icon></template>
         </el-input>
@@ -306,6 +311,7 @@ const query = ref('')
 const CANDIDATE_PAGE_SIZE = 25
 const currentPage = ref(1)
 const kindFilter = ref('')
+const qualityFilter = ref<'ready' | 'blocked' | 'all'>('ready')
 const originFilter = ref<ScenarioModelCandidateOrigin | ''>('')
 const selectedIds = ref(new Set<string>())
 const revalidatingIds = ref(new Set<string>())
@@ -326,6 +332,7 @@ const visibleCandidates = computed(() => {
   const needle = query.value.trim().toLocaleLowerCase()
   return props.candidates.filter((item) => (
     (!kindFilter.value || item.resource_kind === kindFilter.value)
+    && (qualityFilter.value === 'all' || (item.promotion_eligible === true) === (qualityFilter.value === 'ready'))
     && (!originFilter.value || item.source_origin === originFilter.value)
     && (!needle || `${item.title || ''} ${item.resource_key}`.toLocaleLowerCase().includes(needle))
   ))
@@ -349,7 +356,7 @@ const operationBusy = computed(() => (
   props.loading || batchRevalidating.value || batchPromoting.value || revalidatingIds.value.size > 0 || promotingIds.value.size > 0
 ))
 
-watch([query, kindFilter, originFilter], () => { currentPage.value = 1 })
+watch([query, kindFilter, originFilter, qualityFilter], () => { currentPage.value = 1 })
 watch(() => visibleCandidates.value.length, (count) => {
   currentPage.value = Math.min(currentPage.value, Math.max(1, Math.ceil(count / CANDIDATE_PAGE_SIZE)))
 })
@@ -402,6 +409,7 @@ async function focusCandidate(id: string) {
     query.value = ''
     kindFilter.value = ''
     originFilter.value = ''
+    qualityFilter.value = 'all'
     await nextTick()
   }
   const index = visibleCandidates.value.findIndex((item) => item.id === id)

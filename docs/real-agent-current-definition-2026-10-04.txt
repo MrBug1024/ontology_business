@@ -1,0 +1,88 @@
+mrbug 的工作区
+能力验证
+M
+mrbug
+真实验收-申请分流验证
+真实验收-服务申请分流-20261004
+新建验证会话
+实际验证当前定义，调用服务申请分流工作流并查询任务到终态。本次 inputs={"record":{
+请实际调用当前场景能力处理这个合成输入：{"request_id":"REQ-001","title
+本次验证使用
+当前定义（用于建设验证）
+
+构建插件前，请选择该发布，分别运行并核对成功、边界和失败处理案例。历史回执仍属于原调用版本。
+
+刷新发布
+暂无可选择的发布
+实际验证当前定义，调用服务申请分流工作流并查询任务到终态。本次 inputs={"record":{"request_id":"CURRENT-NORMAL-001","title":"普通咨询","description":"一般性问题","priority":"normal","applicant_id":"APP-001","service_type_id":"ST-001"}}。期望标准分流，只展示真实工具结果、运行状态与结构化输出；排队不是完成。
+分析与执行对话已完成 · 2 次工具调用，1 项需核对
+接收请求
+19:42:44
+校验输入契约
+19:42:44
+规划处理步骤
+19:42:44
+回答完成
+19:43:01
+分析说明
+AI 思考过程
+
+调用服务申请分流工作流，输入标准 normal 优先级记录：
+
+AI 思考过程
+
+工作流已排队（execution_key: 6d9b1d666c30478cac18e7368f31d29c），状态为 running。需读取实际任务直到终态，先检查当前完整能力列表：
+
+1
+服务申请分流工作流
+执行失败
+19:42:49 至 19:42:49
+查看业务回执
+执行标识与错误码
+2
+查询可用能力
+已返回
+19:42:53 至 19:42:53
+AI 思考过程
+
+工具集现状：当前可用的两个能力（rule + workflow）均不包含任务状态查询接口。
+
+调用结果（队列回执，非终态）
+字段	值
+状态	running（服务端已接收并排队）
+执行密钥	6d9b1d666c30478cac18e7368f31d29c
+任务路径	/tasks?task=6d9b1d666c30478cac18e7368f31d29c
+definition_hash	b18d02f0960fdd7833e66a4604326ee922ad18ae525ee3f8784cf2637f0f3f03
+deployment_fingerprint	bf1b713318a441f5076089e95c0a2349d80f7e84432ea57774333864a838cf7a
+data_context_fingerprint	fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7
+验证结论
+
+服务申请分流工作流已被成功调用并进入队列，status: &quot;queued&quot; + execution_key 已由服务端返回。
+
+无法读取终态——当前工具集中没有任务查询或结果回执读取能力，无法满足「读取实际任务直到终态」的要求。
+
+task_url 是服务端返回的路径信息，不是可调用的工具接口。
+
+等待说明：按系统约束，排队不等于完成，需等待服务端任务完成后通过其他渠道或工具获取最终结构化输出。
+
+已修复旧 worker 与终态读取工具，请使用本轮新输入重新执行完整工作流；不要重复旧失败任务。inputs={"record":{"request_id":"CURRENT-NORMAL-002","title":"普通咨询","description":"一般性问题","priority":"normal","applicant_id":"APP-001","service_type_id":"ST-001"}}。调用后用 get_capability_receipt 读取真实终态；只报告实际业务输出。
+分析与执行对话已完成 · 3 次工具调用，1 项需核对
+AI 思考过程
+终态结果
+字段	值
+status	succeeded
+route	standard
+reason	valid_low_or_normal_priority
+request_id	CURRENT-NORMAL-002
+severity	info
+high_priority_match	false
+side_effects_executed	false
+
+执行摘要：输入 priority: &quot;normal&quot; 不匹配高优先级规则，触发常规结束节点。分流结论：standard（标准路由），进入常规队列。
+
+保存复用
+仅本次
+上传
+附件数据源
+Enter 发送 · Shift + Enter 换行
+发送

@@ -367,6 +367,10 @@ def _expand_properties(candidate: dict[str, Any]) -> list[dict[str, Any]]:
             **_json_copy(raw_property, {}),
             "entity_ref": str(entity_payload.get("existing_id") or entity_key),
         }
+        property_payload['_construction_requirements'] = [
+            requirement for requirement in entity_payload.get('_construction_requirements', [])
+            if requirement.get('property_name') == raw_property.get('name')
+        ]
         result.append({
             "resource_kind": "property",
             "resource_key": f"{entity_key}:property:{property_name}",
@@ -1116,6 +1120,9 @@ def materialize_draft_resources(
             consumed_draft_revisions=consumed_revisions,
         )
 
+    # SessionLocal disables autoflush. Persist pending lineage closures before
+    # the next SQL predicate can select a closed object using its old DB status.
+    db.flush()
     rows = list(db.scalars(
         select(ScenarioModelDraftResource).where(
             ScenarioModelDraftResource.tenant_id == tenant_id,

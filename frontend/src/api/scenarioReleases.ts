@@ -2,6 +2,8 @@ import { http } from '@/api'
 import type { ReleaseAction, ScenarioRelease, ScenarioReleasePage } from '@/types/scenarioRelease'
 
 export const scenarioReleasesApi = {
+  get: (releaseId: string, signal: AbortSignal) =>
+    http.get<ScenarioRelease>(`/scenario-releases/${releaseId}`, { signal }),
   list: (scenarioId: string, offset: number, signal: AbortSignal) =>
     http.get<ScenarioReleasePage>('/scenario-releases', {
       params: { scenario_id: scenarioId || undefined, offset, limit: 50 }, signal,

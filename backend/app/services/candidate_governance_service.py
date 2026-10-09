@@ -650,6 +650,9 @@ def _canonical_item(
         item["enabled"] = False
     elif kind == "rule":
         _required_name(row, item)
+        item["severity"] = scenario_model_compiler._normalize_rule_severity(
+            item.get("severity")
+        )
         item["entity"] = _reference(
             item.get("entity"),
             item.get("entity_id") or item.get("entity_ref"),
@@ -1118,6 +1121,37 @@ def _build_compound_payload(
         item = items_by_key[key]
         item["evidence_refs"] = sorted(set(evidence_by_key[key]))
         sections[item_section[key]].append(item)
+
+    # Revalidation must not forget the source contract after an editable draft
+    # is persisted. source_payload is server-owned; edited payload cannot erase
+    # these requirements or replace them with a weaker contract.
+    from .construction_source_requirements import preserved_requirement_issues
+    from .construction_relation_requirements import relation_requirement_issues
+    requirement_blockers = []
+    for row in rows:
+        original = row.source_payload if isinstance(row.source_payload, dict) else {}
+        item = items_by_key.get(row_resource_keys.get(row.id), {})
+        for requirement in original.get('_construction_relation_requirements', []):
+            resolved = {**requirement, **{side: _reference(None,
+                requirement[side].get('key') or requirement[side].get('id'),
+                kind='entity', indexes=reference_indexes) for side in ('source', 'target')}}
+            for issue in relation_requirement_issues([resolved], item):
+                requirement_blockers.append({**issue, 'draft_ids': [row.id], 'resource_keys': [row.resource_key]})
+        requirements = original.get('_construction_requirements', [])
+        if not requirements:
+            continue
+        item = items_by_key.get(row_resource_keys.get(row.id), {})
+        properties = item.get('properties', [])
+        existing_id = str(item.get('existing_id') or '')
+        existing_entity = db.get(OntologyEntity, existing_id) if existing_id else None
+        if existing_entity:
+            combined = {prop.name: scenario_model_compiler._property_definition(prop) for prop in existing_entity.properties}
+            combined.update({prop['name']: prop for prop in properties})
+            properties = list(combined.values())
+        for issue in preserved_requirement_issues(requirements, properties):
+            requirement_blockers.append({**issue, 'draft_ids': [row.id], 'resource_keys': [row.resource_key]})
+    if requirement_blockers:
+        raise CandidatePromotionBlocked(_bounded_issues(requirement_blockers))
 
     for section in (
         "entities", "relations", "functions", "actions", "rules", "events",
@@ -1643,6 +1677,9 @@ def revalidate_candidates(
         "eligible_count": len(eligible_ids),
         "blocked_count": len(ordered_rows) - len(eligible_ids),
         "eligible_draft_ids": eligible_ids,
+        "candidate_results": [{"resource_key": row.resource_key,
+            "promotion_eligible": evaluations[row.id].eligible,
+            "validation_issues": row.validation_issues} for row in ordered_rows],
     }
 
 

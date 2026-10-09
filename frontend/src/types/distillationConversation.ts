@@ -1,4 +1,4 @@
-import type { DistillationDocument } from './businessDistillation'
+import type { DistillationDocument, DistillationConstructionQuality } from './businessDistillation'
 
 export type ConversationStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | 'cancelled' | 'failed'
 export interface DistillationResourceSelection {
@@ -96,6 +96,7 @@ export interface DistillationToolStep {
 }
 export interface DistillationQuestion { id: string; title: string; question: string; reason: string; options: string[] }
 export interface DistillationTurn {
+  construction_quality?: DistillationConstructionQuality | null
   id: string
   project_id: string
   turn_number: number

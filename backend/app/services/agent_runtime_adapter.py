@@ -40,6 +40,7 @@ from ..models import (
 from . import (
     agent_capability_confirmation_payload,
     agent_capability_service,
+    agent_receipt_reader,
     capability_application_service,
     capability_delivery_service,
     input_contract_validator,
@@ -1144,6 +1145,7 @@ class CapabilityAgentRuntime:
                     "additionalProperties": False,
                 },
             ),
+            agent_receipt_reader.tool_definition(),
         ]
 
     def _attachment_overrides(
@@ -1495,6 +1497,13 @@ class CapabilityAgentRuntime:
     def execute_tool(self, name: str, args: Mapping[str, Any]) -> str:
         if name == _CAPABILITY_TOOL_LIST:
             return json.dumps(self.public_catalog(), ensure_ascii=False, sort_keys=True)
+        if name == agent_receipt_reader.TOOL_NAME:
+            try:
+                document = self._read_scoped_receipt(args)
+                return json.dumps(self._model_receipt(document), ensure_ascii=False, sort_keys=True)
+            except capability_application_service.CapabilityApplicationError as exc:
+                self.db.rollback()
+                return _safe_error(exc.code.upper(), exc.message)
         if name != _CAPABILITY_TOOL_INVOKE:
             return _safe_error(
                 "UNKNOWN_TOOL",
@@ -1601,6 +1610,10 @@ class CapabilityAgentRuntime:
                 retryable=True,
             )
 
+    def _read_scoped_receipt(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        return agent_receipt_reader.read(self.db, self._actor(), agent_id=self.agent.id,
+            scenario_id=self.scenario.id, capability_refs=self._capability_by_ref, args=args)
+
     def _model_receipt(self, document: Mapping[str, Any]) -> dict[str, Any]:
         reference = document.get("capability")
         capability = (
@@ -1624,17 +1637,15 @@ class CapabilityAgentRuntime:
         parsed = _parse_result(raw_result)
         if name == _CAPABILITY_TOOL_LIST:
             return parsed == self.public_catalog()
-        if name != _CAPABILITY_TOOL_INVOKE or not isinstance(parsed, Mapping):
+        if name not in (_CAPABILITY_TOOL_INVOKE, agent_receipt_reader.TOOL_NAME) or not isinstance(parsed, Mapping):
             return False
         invocation_id = str(parsed.get("invocation_id") or "")
         if not invocation_id:
             return False
         try:
-            current = capability_application_service.get_receipt(
-                self.db,
-                self._actor(),
-                invocation_id,
-            )
+            current = (self._read_scoped_receipt({'invocation_id': invocation_id})
+                if name == agent_receipt_reader.TOOL_NAME else
+                capability_application_service.get_receipt(self.db, self._actor(), invocation_id))
         except capability_application_service.CapabilityApplicationError:
             return False
         normalized = json.loads(canonical_json(parsed))
@@ -1662,17 +1673,15 @@ class CapabilityAgentRuntime:
             if parsed != self.public_catalog():
                 return None
             return json.dumps(parsed, ensure_ascii=False, sort_keys=True)
-        if name != _CAPABILITY_TOOL_INVOKE or not isinstance(parsed, Mapping):
+        if name not in (_CAPABILITY_TOOL_INVOKE, agent_receipt_reader.TOOL_NAME) or not isinstance(parsed, Mapping):
             return None
         invocation_id = str(parsed.get("invocation_id") or "")
         if not invocation_id:
             return None
         try:
-            current = capability_application_service.get_receipt(
-                self.db,
-                self._actor(),
-                invocation_id,
-            )
+            current = (self._read_scoped_receipt({'invocation_id': invocation_id})
+                if name == agent_receipt_reader.TOOL_NAME else
+                capability_application_service.get_receipt(self.db, self._actor(), invocation_id))
         except capability_application_service.CapabilityApplicationError:
             return None
         normalized = json.loads(canonical_json(parsed))
@@ -1871,7 +1880,7 @@ class CapabilityAgentRuntime:
                     sort_keys=True,
                     separators=(",", ":"),
                 )
-                if tool_call_counts[signature]:
+                if tool_call_counts[signature] and name != agent_receipt_reader.TOOL_NAME:
                     result = _safe_error(
                         "DUPLICATE_TOOL_CALL",
                         "The same capability call already completed in this turn",

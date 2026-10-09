@@ -194,6 +194,10 @@ class Settings(BaseSettings):
     agent_mcp_public_url: str = ""
     agent_mcp_allowed_hosts: str = "localhost,localhost:*,127.0.0.1,127.0.0.1:*,testserver"
 
+    # Explicit installation origin; never infer an external URL from Host.
+    plugin_public_base_url: str = Field(default="", max_length=2048)
+    plugin_allow_local_http: bool = False
+
     # Infrastructure configuration only; never a business data, permission,
     # connection, queue or release selector. Deployments use separate services.
     runtime_environment: Literal["dev", "staging", "prod"] = "dev"
@@ -214,6 +218,28 @@ class Settings(BaseSettings):
     mail_ssl_tls: bool = True
     mail_use_credentials: bool = True
     mail_timeout_seconds: int = 20
+
+    @model_validator(mode="after")
+    def validate_plugin_public_base_url(self) -> "Settings":
+        value = self.plugin_public_base_url.strip().rstrip("/")
+        if value:
+            url = urlsplit(value)
+            try:
+                local = url.hostname == "localhost" or bool(url.hostname and ipaddress.ip_address(url.hostname).is_loopback)
+            except ValueError:
+                local = False
+            try:
+                port_valid = url.port is None or 1 <= url.port <= 65535
+            except ValueError:
+                port_valid = False
+            if (not url.hostname or not port_valid or url.username or url.password or url.query or url.fragment
+                    or any(ord(char) < 32 or ord(char) == 127 for char in value)
+                    or "\\" in value or any(part in {".", ".."} for part in url.path.split("/"))):
+                raise ValueError("PLUGIN_PUBLIC_BASE_URL 不得包含凭据、查询、片段或无效路径")
+            if url.scheme != "https" and not (url.scheme == "http" and local and self.plugin_allow_local_http):
+                raise ValueError("插件安装源必须使用 HTTPS；仅显式开启本机 HTTP 后允许 loopback 试装")
+        self.plugin_public_base_url = value
+        return self
 
     @model_validator(mode="after")
     def validate_public_app_url(self) -> "Settings":

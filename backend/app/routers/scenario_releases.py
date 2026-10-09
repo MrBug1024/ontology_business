@@ -1,7 +1,7 @@
 """Authenticated HTTP commands for manually managed scenario releases."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -51,6 +51,20 @@ def list_releases(
                if permission_service.check_scenario(db, scenario, "read").allowed],
         limit=limit, offset=offset, has_more=len(rows) > limit,
     )
+
+
+@router.get("/{release_id}", response_model=ScenarioReleaseOut)
+def get_release(release_id: str = Path(pattern=r'^[a-f0-9]{32}$'), db: Session = Depends(get_tenant_db)) -> ScenarioReleaseOut:
+    principal = permission_service.require_principal(db)
+    permission_service.require_tenant_permission(db, "read")
+    release = db.scalar(select(OntologyRelease).where(
+        OntologyRelease.id == release_id, OntologyRelease.tenant_id == principal.tenant_id,
+        OntologyRelease.deleted_at.is_(None),
+    ))
+    if release is None:
+        raise HTTPException(status_code=404, detail="发布不存在")
+    scenario, _ = release_service._scenario_for_read(db, release.scenario_id)
+    return _out(db, release, scenario)
 
 
 @router.post("", response_model=ScenarioReleaseOut, status_code=status.HTTP_201_CREATED)

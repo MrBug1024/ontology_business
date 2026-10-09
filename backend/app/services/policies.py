@@ -439,7 +439,7 @@ def validate_action_params(schema: Any, params: Any) -> dict[str, Any]:
     return normalized
 
 
-def validate_workflow_graph(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:
+def validate_workflow_graph(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], *, output_node_ids: list[str] | None = None) -> None:
     """校验工作流 DAG 的节点、连线、可达性和分支完整性。"""
     if not nodes:
         raise PolicyViolation("工作流至少需要一个节点")
@@ -451,7 +451,9 @@ def validate_workflow_graph(nodes: list[dict[str, Any]], edges: list[dict[str, A
     ends = [nid for nid, n in node_map.items() if n.get("type") == "end"]
     if len(starts) != 1:
         raise PolicyViolation("工作流必须且只能有一个开始节点")
-    if len(ends) != 1:
+    if output_node_ids and (not ends or set(output_node_ids) != set(ends)):
+        raise PolicyViolation('多分支输出声明必须对应全部结束节点')
+    if len(ends) != 1 and not output_node_ids:
         raise PolicyViolation("工作流必须且只能有一个结束节点")
 
     outgoing: dict[str, list[tuple[str, str]]] = defaultdict(list)

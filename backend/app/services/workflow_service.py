@@ -150,9 +150,9 @@ def _definition_resource(
     return resource
 
 
-def validate_workflow_definition(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:
+def validate_workflow_definition(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], *, trigger_config: dict | None = None) -> None:
     """后端统一校验工作流 DAG；前端校验只是交互提示，不能作为安全边界。"""
-    validate_workflow_graph(nodes, edges)
+    validate_workflow_graph(nodes, edges, output_node_ids=workflow_ontology_contract.declared_output_nodes(trigger_config))
     try:
         workflow_authoring_data.validate_templates(nodes, edges)
     except ValueError as exc:
@@ -2254,6 +2254,7 @@ def execute_workflow(
     if not workflow_permission.allowed:
         raise PolicyViolation("没有执行该工作流的权限")
     workflow_ontology_contract.validate_inputs(workflow, runtime_definition, params, db=db)
+    params = workflow_ontology_contract.runtime_params(workflow, runtime_definition, params)
     start = time.time()
     provenance = _runtime_provenance(runtime_definition)
     workflow_permission_summary = {
@@ -2287,7 +2288,7 @@ def execute_workflow(
     try:
         _check_deadline(deadline_at)
         if workflow.nodes:
-            validate_workflow_definition(workflow.nodes, workflow.edges or [])
+            validate_workflow_definition(workflow.nodes, workflow.edges or [], trigger_config=workflow.trigger_config)
         if workflow.nodes:
             step_results = _execute_dag(
                 db,
@@ -3025,7 +3026,7 @@ def generate_workflow(
             data["nodes"] = nodes
             data["edges"] = edges
 
-            validate_workflow_definition(nodes, edges)
+            validate_workflow_definition(nodes, edges, trigger_config=data.get('trigger_config'))
             canonicalize_workflow_references(
                 db,
                 scenario.id,

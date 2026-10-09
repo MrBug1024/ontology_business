@@ -1,0 +1,18 @@
+{
+  "read_only": true,
+  "reviewed_versions": [
+    {
+      "version": "1.0.0",
+      "artifact_sha256": "cf28a4d23e8529640b82bfd9a6b6b6a41f9e0a1e4fc933b350ec35918f48d92c",
+      "bytes": 10715,
+      "marketplace_bytes": 13063
+    }
+  ],
+  "catalog": {
+    "query_count": 3,
+    "elapsed_ms": 2140.578
+  },
+  "identity_conflict_rejected": true,
+  "foreign_tenant_rejected": true,
+  "anonymous_rejected": true
+}

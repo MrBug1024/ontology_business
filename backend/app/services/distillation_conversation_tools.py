@@ -71,6 +71,7 @@ class AskArguments(ClosedModel):
 class ProposalArguments(ClosedModel):
     message: str = Field(min_length=1, max_length=4000)
     document: DistillationDocument
+    delivery_mode: Literal["exploration", "construction"] = "exploration"
 
 
 class LineageInferenceArguments(ClosedModel):
@@ -321,10 +322,11 @@ def execute(db: Session, name: str, arguments: dict, document: DistillationDocum
     if name == "read_current_document":
         return ToolResult({"document": document.model_dump()}, "已读取当前保存的业务认知。")
     if isinstance(payload, ReviewArguments):
+        from .distillation_construction_quality import evaluate_document
         missing = [key for key in ("beneficiary", "pain", "desired_outcome", "success_metric") if not getattr(document, key)]
         return ToolResult({"skill": "business_discovery", "version": "2", "focus": payload.focus,
             "instructions": discovery_skill(), "steps": _REVIEW_METHODS[payload.focus], "missing_value_fields": missing,
-            "requires_human": True}, "已应用业务审查步骤，结论仍需证据和人工核对。")
+            "requires_human": True, "construction_quality": evaluate_document(document)}, "已应用业务审查步骤，结论仍需证据和人工核对。")
     if isinstance(payload, EvidenceArguments):
         selected = next((item for item in [*document.evidence, *observations] if item.key == payload.evidence_key), None)
         if selected is None:
@@ -374,7 +376,14 @@ def execute(db: Session, name: str, arguments: dict, document: DistillationDocum
         return ToolResult({"waiting_for_human": True}, "已提出澄清问题，等待你的回答。",
             message=payload.message, questions=payload.questions)
     if isinstance(payload, ProposalArguments):
+        from .distillation_construction_quality import evaluate_document
+
         proposal = normalize_proposal(payload.document.model_dump(), document, observations=observations)
+        quality = evaluate_document(proposal)
+        if payload.delivery_mode == "construction" and not quality["construction_complete"]:
+            return ToolResult({"proposal_ready": False, "construction_quality": quality,
+                "next_step": "修复可确定的定义；必要事实不足则请求具体补充，不能宣称建设交接已完成。"},
+                "建设交接尚不完整，已返回逐对象缺口，继续调查或修复。")
         return ToolResult({"proposal_ready": True}, "已准备成果建议，等待你明确采用。",
             message=payload.message, proposal=proposal)
     raise ValueError("不支持的调查工具参数")

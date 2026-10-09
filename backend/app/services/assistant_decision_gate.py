@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .construction_delivery_service import question_contract, build_delivery
 from .scenario_model_quality_service import is_generated_contract_issue
 
 
@@ -120,24 +121,35 @@ def build_decision_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "human_review_required": True,
             "explanation": "顾问生成的定义仍有校验问题，已保留具体候选及修正要求；需要修正定义后重试，不能当作已建设完成或要求用户重新解释业务。",
         }
+    advisor_owned_citations = {str(key) for issue in blocking
+        if issue.get('code') == 'missing_evidence' and is_generated_contract_issue(issue)
+        for key in issue.get('affected_change_keys', [])}
     missing_evidence_resources = [
         f"{section}:{item.get('key') or item.get('name') or 'unnamed'}"
         for section in _RESOURCE_SECTIONS
         for item in _rows(payload, section)
-        if not isinstance(item.get("evidence_refs"), list) or not any(
+        if str(item.get('key') or '') not in advisor_owned_citations
+        and (not isinstance(item.get("evidence_refs"), list) or not any(
             str(value).strip() for value in (item.get("evidence_refs") or [])
-        )
+        ))
     ]
     question_items: list[dict[str, Any]] = []
-    seen: set[tuple[str, tuple[str, ...]]] = set()
-    for item in blocking + ambiguous_coverage:
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    question_refs: set[str] = set()
+    business_issues = [issue for issue in blocking if not is_generated_contract_issue(issue)]
+    for index, item in enumerate(business_issues + ambiguous_coverage):
         code = str(item.get("code") or "DOCUMENT_AMBIGUITY")[:100]
         message = str(item.get("message") or item.get("reason") or "资料存在需要确认的业务含义")[:500]
         refs = tuple(str(value) for value in (item.get("source_refs") or []) if str(value))[:8]
-        key = ("source", refs) if refs else (code, (message,))
+        # Distinct business facts can be missing in the same paragraph. Only
+        # suppress the generic coverage ambiguity already explained by an issue.
+        if index >= len(business_issues) and refs and set(refs).issubset(question_refs):
+            continue
+        key = (code, message, refs)
         if key in seen:
             continue
         seen.add(key)
+        question_refs.update(refs)
         question_items.append({
             "code": code,
             "message": message,
@@ -190,7 +202,7 @@ def build_decision_gate(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "resource_counts": resource_counts,
         "risk_codes": risk_codes,
-        "questions": question_items[:12],
+        "questions": [question_contract(item) for item in question_items[:12]],
         "safe_to_formalize": mode == "formalize",
         "human_review_required": mode != "formalize",
         "explanation": (
@@ -207,4 +219,5 @@ def attach_decision_gate(payload: dict[str, Any]) -> dict[str, Any]:
     """Attach the gate without mutating the compiler-owned input."""
     result = dict(payload)
     result["decision_gate"] = build_decision_gate(result)
+    result["construction_delivery"] = build_delivery(result)
     return result

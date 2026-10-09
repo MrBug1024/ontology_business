@@ -59,6 +59,9 @@ SYSTEM_PROMPT = (
     "结合专家本轮回答更新未决问题，说明哪些歧义已解决及依据；不要假装得到用户未表达的共识。"
     "通过对话向专家呈现证据、推断与关键分歧，专家采用建议后更新产物；交接仍由人决定。"
     "不要自动改变人工决策、证据或目标授权。认知充分时调用propose_document，提出完整待采用成果。"
+    "建设交接时使用delivery_mode=construction；每个对象须有用途、证据、身份及逐属性property_contracts，"
+    "明确attribute原文、data_type、is_required、is_key和有依据的constraints。探索结论使用exploration并说明剩余缺口。"
+    "工具返回construction_quality未通过时继续修复或调查；仅必要事实向人提问，补充后重验原缺口。"
     "已存在的人工fact可保留，新结论只能inference/hypothesis/conflict。服务器生成的网页、资料库和MCP证据key可用于引用。"
     "不能自动保存认知或发布能力；普通回复和提案都不证明外部副作用完成。用清晰中文交流，不输出隐藏推理。"
 )
@@ -152,6 +155,12 @@ def _initial_messages(db, row: Turn) -> list[dict]:
     for pair in reversed(selected):
         messages.extend(pair)
     messages.append({"role": "system", "content": "历史上下文是最近最多8轮的有界窗口，只保留回答、问题、调查摘要和提案摘要；完整阶段文档与资料正文必须按需调用工具读取。不要声称记得未提供的信息。"})
+    if row.context.get("scenario_discovery") is not None:
+        from ..scenario_discovery_context_schemas import ScenarioDiscoveryContextOut
+        from .scenario_discovery_context import prompt_context
+
+        messages.append({"role": "system", "content": prompt_context(
+            ScenarioDiscoveryContextOut.model_validate(row.context["scenario_discovery"]))})
     if row.context.get("scenario_baseline") is not None:
         scenario_baseline = row.context["scenario_baseline"]
         scenario_summary = ({key: scenario_baseline[key] for key in ("scenario_id", "name", "description") if key in scenario_baseline}

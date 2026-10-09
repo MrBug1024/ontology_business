@@ -1,15 +1,15 @@
 <template>
-  <section class="release-list" aria-label="场景发布">
+  <section class="release-list" aria-label="插件开发能力版本">
     <header class="release-toolbar">
-      <h2>场景发布</h2>
+      <h2>能力版本与开发任务</h2>
       <div>
         <el-button circle :disabled="loading" aria-label="刷新发布列表" title="刷新发布列表" @click="load"><el-icon><Refresh /></el-icon></el-button>
-        <el-button v-if="canManage" type="primary" @click="openCreate"><el-icon><Plus /></el-icon>创建发布</el-button>
+        <el-button v-if="canManage" type="primary" @click="openCreate"><el-icon><Plus /></el-icon>准备能力版本</el-button>
       </div>
     </header>
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
-    <el-table v-loading="loading" :data="releases" empty-text="暂无人工创建的发布">
-      <el-table-column prop="name" label="发布名称" min-width="200" />
+    <el-table v-loading="loading" :data="releases" empty-text="暂无固定能力版本，请先准备一个版本">
+      <el-table-column prop="name" label="能力版本" min-width="200" />
       <el-table-column prop="scenario_name" label="业务场景" min-width="180" />
       <el-table-column label="状态" width="120">
         <template #default="{ row }"><el-tag :type="row.enabled ? 'success' : 'info'">{{ statusText(row) }}</el-tag></template>
@@ -21,9 +21,10 @@
       </el-table-column>
       <el-table-column label="创建时间" min-width="175"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
       <el-table-column prop="created_by_name" label="创建人" min-width="100" />
-      <el-table-column label="操作" width="172" fixed="right">
+      <el-table-column label="操作" width="244" fixed="right">
         <template #default="{ row }">
-          <el-button text :disabled="!row.enabled || Boolean(busyId)" @click="$emit('select', row)">接入配置</el-button>
+          <el-button v-if="row.can_manage" text :disabled="Boolean(busyId) || row.status === 'retired'" @click="$emit('select', row)">进入开发</el-button>
+          <el-button text :disabled="!row.enabled || Boolean(busyId)" @click="router.push({ name: 'agents', query: { scenario_id: row.scenario_id, release_id: row.id } })">验证能力</el-button>
           <el-button v-if="row.can_manage && row.status !== 'retired'" text type="warning" :disabled="Boolean(busyId)" @click="confirmChange(row, 'retire')">退役</el-button>
           <el-button v-if="row.can_manage && row.status === 'retired'" text type="danger" :disabled="Boolean(busyId)" @click="confirmChange(row, 'delete')"><el-icon><Delete /></el-icon>删除</el-button>
         </template>
@@ -34,7 +35,8 @@
       <span>{{ offset / 50 + 1 }}</span>
       <el-button circle :disabled="loading || !hasMore" aria-label="下一页" title="下一页" @click="page(50)"><el-icon><ArrowRight /></el-icon></el-button>
     </footer>
-    <el-dialog v-model="creatingVisible" title="创建场景发布" width="min(560px, 94vw)" :close-on-click-modal="!creating" :close-on-press-escape="!creating" :show-close="!creating">
+    <el-dialog v-model="creatingVisible" title="准备固定能力版本" width="min(560px, 94vw)" :close-on-click-modal="!creating" :close-on-press-escape="!creating" :show-close="!creating">
+      <p>保存当前场景能力的不可变版本，用于验证和插件封装。创建后需人工启用；插件的交付在开发、审阅完成后进行。</p>
       <el-alert v-if="createError" :title="createError" type="error" :closable="false" show-icon />
       <el-form label-position="top" @submit.prevent="create">
         <el-form-item label="业务场景" required>
@@ -48,12 +50,12 @@
           <div><dt>业务操作</dt><dd>{{ selectedScenario.action_count ?? 0 }}</dd></div>
           <div><dt>工作流</dt><dd>{{ selectedScenario.workflow_count ?? 0 }}</dd></div>
         </dl>
-        <el-form-item label="发布名称" required><el-input v-model="form.name" maxlength="160" aria-label="发布名称" /></el-form-item>
-        <el-form-item label="发布说明"><el-input v-model="form.notes" type="textarea" :rows="3" maxlength="8000" aria-label="发布说明" /></el-form-item>
+        <el-form-item label="版本名称" required><el-input v-model="form.name" maxlength="160" aria-label="能力版本名称" /></el-form-item>
+        <el-form-item label="版本说明"><el-input v-model="form.notes" type="textarea" :rows="3" maxlength="8000" aria-label="能力版本说明" /></el-form-item>
       </el-form>
       <template #footer>
         <el-button :disabled="creating" @click="creatingVisible = false">取消</el-button>
-        <el-button type="primary" :loading="creating" @click="create">确认创建发布</el-button>
+        <el-button type="primary" :loading="creating" @click="create">确认固定版本</el-button>
       </template>
     </el-dialog>
   </section>
@@ -62,6 +64,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref, toRef } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRouter } from 'vue-router'
 import { ArrowLeft, ArrowRight, Delete, Plus, Refresh } from '@element-plus/icons-vue'
 import { scenarioReleasesApi } from '@/api/scenarioReleases'
 import { useScenarioReleases } from '@/composables/useScenarioReleases'
@@ -72,6 +75,7 @@ const props = defineProps<{ scenarioId: string; scenarios: Scenario[]; canManage
 const emit = defineEmits<{ select: [release: ScenarioRelease]; changed: [release: ScenarioRelease] }>()
 const { releases, loading, error, offset, hasMore, busyId, load, change } = useScenarioReleases(toRef(props, 'scenarioId'))
 const creatingVisible = ref(false)
+const router = useRouter()
 const creating = ref(false)
 const createError = ref('')
 const form = reactive({ scenario_id: '', name: '', notes: '' })
@@ -84,7 +88,7 @@ function statusText(release: ScenarioRelease) {
   return release.enabled ? '已启用' : '已停用'
 }
 function formatDate(value: string) { return new Date(value).toLocaleString('zh-CN', { hour12: false }) }
-function suggestName() { form.name = `${props.scenarios.find(item => item.id === form.scenario_id)?.name || ''}发布` }
+function suggestName() { form.name = `${props.scenarios.find(item => item.id === form.scenario_id)?.name || ''}能力版本` }
 function openCreate() {
   form.scenario_id = props.scenarioId
   form.name = ''
@@ -95,14 +99,14 @@ function openCreate() {
 }
 async function create() {
   if (creating.value) return
-  if (!form.scenario_id || !form.name.trim()) { createError.value = '请选择业务场景并填写发布名称'; return }
+  if (!form.scenario_id || !form.name.trim()) { createError.value = '请选择业务场景并填写版本名称'; return }
   creating.value = true
   createError.value = ''
   try {
     const created = await scenarioReleasesApi.create({ ...form, name: form.name.trim(), confirmed: true })
     if (disposed) return
     creatingVisible.value = false
-    ElMessage.success('发布已创建，当前为停用状态')
+    ElMessage.success('能力版本已固定，当前为停用状态')
     await load()
     emit('changed', created)
   } catch (caught: unknown) {

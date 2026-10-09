@@ -1,20 +1,27 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { mountPlatformNavigation } from './helpers/plugin-navigation-harness.mjs'
 
-test('access center uses one server manifest for REST and MCP', () => {
+test('publishing selects reviewed plugins and only exposes MCP configuration', () => {
   const view = readFileSync(new URL('../src/views/CapabilityAccess.vue', import.meta.url), 'utf8')
   const api = readFileSync(new URL('../src/api/capabilityAccess.ts', import.meta.url), 'utf8')
 
   assert.match(api, /\/developer\/capability-access\/\$\{scenarioId\}\/manifest/)
   assert.match(api, /params: \{ release_id: releaseId \}, signal/)
   assert.match(view, /manifest\.deployment\.definition_hash/)
-  assert.match(view, /protocol === 'rest'/)
+  assert.doesNotMatch(view, /protocol === 'rest'|REST API|curl -H/)
+  assert.match(view, /adapters\.filter\(item => item\.protocol === 'mcp'\)/)
+  assert.match(view, /PluginPublishing :scenario-id="scenarioId" :artifact-id=/)
   assert.match(view, /protocol === 'mcp'/)
   assert.match(view, /adapter\.managed_input_upload/)
   assert.match(view, /adapter\.optional_scopes/)
   assert.match(view, /value="assets:write"/)
-  assert.match(view, /ScenarioReleaseList/)
+  assert.doesNotMatch(view, /ScenarioReleaseList/)
+  const development = readFileSync(new URL('../src/views/PluginDevelopment.vue', import.meta.url), 'utf8')
+  assert.doesNotMatch(development, /ScenarioReleaseList/)
+  assert.match(development, /PluginBuildSetup/)
+  assert.match(development, /pluginCodingApi.tasks/)
   const releases = readFileSync(new URL('../src/api/scenarioReleases.ts', import.meta.url), 'utf8')
   assert.match(releases, /scenario-releases/)
   assert.match(releases, /expected_revision/)
@@ -30,7 +37,7 @@ test('navigation starts from scenarios while legacy material and distillation ro
   const router = readFileSync(new URL('../src/router/index.ts', import.meta.url), 'utf8')
   const nav = app.slice(app.indexOf('<nav class="side-nav"'), app.indexOf('</nav>'))
 
-  for (const label of ['场景能力', '验证中心', '发布与接入', '运行治理']) {
+  for (const label of ['场景能力', '验证中心', '插件开发', '发布中心', '运行治理']) {
     assert.match(nav, new RegExp(label))
   }
   assert.doesNotMatch(nav, /index="\/(?:data-sources|business-distillation)"/)
@@ -38,7 +45,42 @@ test('navigation starts from scenarios while legacy material and distillation ro
     assert.match(router, new RegExp(`path: '${path.replace('/', '\\/')}`))
   }
   assert.ok(nav.indexOf('index="/scenarios"') < nav.indexOf('index="/agents"'))
-  assert.ok(nav.indexOf('index="/agents"') < nav.indexOf('index="/access"'))
+  assert.ok(nav.indexOf('index="/agents"') < nav.indexOf('index="/plugin-studio"'))
+  assert.ok(nav.indexOf('index="/plugin-studio"') < nav.indexOf('index="/access"'))
+  assert.match(router, /path: '\/plugin-studio', name: 'plugin-development'/)
+  assert.match(router, /path: '\/plugin-studio\/:releaseId'/)
+})
+
+test('clicking the real plugin menu opens the plugin development route and page', async () => {
+  const view = await mountPlatformNavigation()
+  try {
+    assert.equal(view.router.currentRoute.value.name, 'scenarios')
+    await view.clickMenu('插件开发')
+    assert.equal(view.router.currentRoute.value.path, '/plugin-studio')
+    assert.equal(view.router.currentRoute.value.name, 'plugin-development')
+    assert.equal(view.router.currentRoute.value.meta.focusWorkspace, true)
+    assert.ok(view.find(target => target.props['data-page'] === 'PluginDevelopment'))
+  } finally { view.stop() }
+})
+
+test('an unknown plugin URL stays in plugin development instead of becoming a scenario page', async () => {
+  const view = await mountPlatformNavigation('/plugin-studio/missing/nested?scenario_id=synthetic-scene')
+  try {
+    assert.equal(view.router.currentRoute.value.path, '/plugin-studio')
+    assert.equal(view.router.currentRoute.value.name, 'plugin-development')
+    assert.equal(view.router.currentRoute.value.query.scenario_id, 'synthetic-scene')
+    assert.ok(view.find(target => target.props['data-page'] === 'PluginDevelopment'))
+  } finally { view.stop() }
+})
+
+test('the plugin fallback preserves existing release and workspace deep links', async () => {
+  const view = await mountPlatformNavigation('/plugin-studio/synthetic-release?workspace=synthetic-workspace')
+  try {
+    assert.equal(view.router.currentRoute.value.name, 'plugin-coding-studio')
+    assert.equal(view.router.currentRoute.value.params.releaseId, 'synthetic-release')
+    assert.equal(view.router.currentRoute.value.query.workspace, 'synthetic-workspace')
+    assert.ok(view.find(target => target.props['data-page'] === 'PluginCodingStudio'))
+  } finally { view.stop() }
 })
 
 test('access center keeps loading feedback around manifests without flashing empty states', () => {

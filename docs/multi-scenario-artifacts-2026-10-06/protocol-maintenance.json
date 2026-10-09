@@ -1,0 +1,772 @@
+{
+  "protocol": "real_rest_and_installed_stdio_mcp",
+  "scenarios": [
+    {
+      "scenario_id": "5fc174b649b344078ea195b3a9e394eb",
+      "release_id": "9ce9f445471145e9a60899e66fa2a772",
+      "artifact_id": "8877881fd706c5b0e5b7cf367931e02d",
+      "installation": "actual_isolated_host_installation",
+      "verified_tls": true,
+      "rest": [
+        {
+          "role": "success",
+          "kind": "workflow",
+          "invocation_id": "12815fd078a044b0bb99748084b54a0a",
+          "status": "succeeded",
+          "definition_hash": "2e1821c2d4257b20f8a4d0a3466552ec7214202e3e8f6d5dba2c4c6832fe862f",
+          "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+          "output": {
+            "created": true,
+            "execution_key": "61962702c2a645909f082f4979b5c15c",
+            "result": {
+              "connector_audit": [],
+              "duration_ms": 15,
+              "error": "",
+              "log_id": "d6c1194e3d034e2ca0fdc38d6ec6450b",
+              "status": "success",
+              "steps": [
+                {
+                  "name": "",
+                  "node": "start",
+                  "result": {
+                    "input_summary": {
+                      "contract": "workflow-run-input-summary/v1",
+                      "field_count": 1,
+                      "payload_available": true,
+                      "payload_present": true,
+                      "redacted": true,
+                      "value_type_counts": {
+                        "object": 1
+                      }
+                    }
+                  },
+                  "status": "success",
+                  "type": "start"
+                },
+                {
+                  "name": "",
+                  "node": "rule_low_amount",
+                  "result": {
+                    "action_on_match": "",
+                    "matched": true,
+                    "rule_id": "f02770066c994dba916151d7c91e9f96",
+                    "rule_name": "低额规则",
+                    "severity": "info",
+                    "side_effects_executed": false,
+                    "trigger_action_ids": [],
+                    "trigger_actions": []
+                  },
+                  "status": "matched",
+                  "type": "rule"
+                },
+                {
+                  "contract_validation": "passed",
+                  "name": "",
+                  "node": "end_auto",
+                  "result": {
+                    "decision": "auto_approved",
+                    "estimated_amount": 50,
+                    "reason": "金额不超过自动通过上限"
+                  },
+                  "status": "success",
+                  "type": "end"
+                }
+              ]
+            },
+            "status": "succeeded",
+            "task_url": "/tasks?task=61962702c2a645909f082f4979b5c15c",
+            "workflow_run_id": "61962702c2a645909f082f4979b5c15c"
+          },
+          "error_code": null
+        },
+        {
+          "role": "boundary",
+          "kind": "workflow",
+          "invocation_id": "b59874566ba64a5b97f1313467c41afb",
+          "status": "succeeded",
+          "definition_hash": "2e1821c2d4257b20f8a4d0a3466552ec7214202e3e8f6d5dba2c4c6832fe862f",
+          "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+          "output": {
+            "created": true,
+            "execution_key": "6de0f8e8832648dda3f3ea381acab516",
+            "result": {
+              "connector_audit": [],
+              "duration_ms": 6,
+              "error": "",
+              "log_id": "7267c8ff9b9448ba83f67f6142930c19",
+              "status": "success",
+              "steps": [
+                {
+                  "name": "",
+                  "node": "start",
+                  "result": {
+                    "input_summary": {
+                      "contract": "workflow-run-input-summary/v1",
+                      "field_count": 1,
+                      "payload_available": true,
+                      "payload_present": true,
+                      "redacted": true,
+                      "value_type_counts": {
+                        "object": 1
+                      }
+                    }
+                  },
+                  "status": "success",
+                  "type": "start"
+                },
+                {
+                  "name": "",
+                  "node": "rule_low_amount",
+                  "result": {
+                    "action_on_match": "",
+                    "matched": true,
+                    "rule_id": "f02770066c994dba916151d7c91e9f96",
+                    "rule_name": "低额规则",
+                    "severity": "info",
+                    "side_effects_executed": false,
+                    "trigger_action_ids": [],
+                    "trigger_actions": []
+                  },
+                  "status": "matched",
+                  "type": "rule"
+                },
+                {
+                  "contract_validation": "passed",
+                  "name": "",
+                  "node": "end_auto",
+                  "result": {
+                    "decision": "auto_approved",
+                    "estimated_amount": 100,
+                    "reason": "金额不超过自动通过上限"
+                  },
+                  "status": "success",
+                  "type": "end"
+                }
+              ]
+            },
+            "status": "succeeded",
+            "task_url": "/tasks?task=6de0f8e8832648dda3f3ea381acab516",
+            "workflow_run_id": "6de0f8e8832648dda3f3ea381acab516"
+          },
+          "error_code": null
+        },
+        {
+          "role": "over_budget",
+          "kind": "workflow",
+          "invocation_id": "8bea32ae305a412a99e554e72d4cfd51",
+          "status": "succeeded",
+          "definition_hash": "2e1821c2d4257b20f8a4d0a3466552ec7214202e3e8f6d5dba2c4c6832fe862f",
+          "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+          "output": {
+            "created": true,
+            "execution_key": "a44197cab2ec45de980d1328953dcb88",
+            "result": {
+              "connector_audit": [],
+              "duration_ms": 14,
+              "error": "",
+              "log_id": "f796244cfb4b4691b3b248f3e5e012f4",
+              "status": "success",
+              "steps": [
+                {
+                  "name": "",
+                  "node": "start",
+                  "result": {
+                    "input_summary": {
+                      "contract": "workflow-run-input-summary/v1",
+                      "field_count": 1,
+                      "payload_available": true,
+                      "payload_present": true,
+                      "redacted": true,
+                      "value_type_counts": {
+                        "object": 1
+                      }
+                    }
+                  },
+                  "status": "success",
+                  "type": "start"
+                },
+                {
+                  "name": "",
+                  "node": "rule_low_amount",
+                  "result": {
+                    "action_on_match": "",
+                    "matched": false,
+                    "rule_id": "f02770066c994dba916151d7c91e9f96",
+                    "rule_name": "低额规则",
+                    "severity": "info",
+                    "side_effects_executed": false,
+                    "trigger_action_ids": [],
+                    "trigger_actions": []
+                  },
+                  "status": "not_matched",
+                  "type": "rule"
+                },
+                {
+                  "name": "",
+                  "node": "rule_budget",
+                  "result": {
+                    "action_on_match": "",
+                    "matched": false,
+                    "rule_id": "7a0dabff6ddc42b5a750083f81670612",
+                    "rule_name": "预算规则",
+                    "severity": "info",
+                    "side_effects_executed": false,
+                    "trigger_action_ids": [],
+                    "trigger_actions": []
+                  },
+                  "status": "not_matched",
+                  "type": "rule"
+                },
+                {
+                  "contract_validation": "passed",
+                  "name": "",
+                  "node": "end_over_budget",
+                  "result": {
+                    "decision": "over_budget",
+                    "estimated_amount": 1001,
+                    "reason": "金额超过预算上限"
+                  },
+                  "status": "success",
+                  "type": "end"
+                }
+              ]
+            },
+            "status": "succeeded",
+            "task_url": "/tasks?task=a44197cab2ec45de980d1328953dcb88",
+            "workflow_run_id": "a44197cab2ec45de980d1328953dcb88"
+          },
+          "error_code": null
+        }
+      ],
+      "credential_revoked": true,
+      "cross_scenario_rejected": true,
+      "changed_input_rejected": 409,
+      "invalid_schema_rejected": 422,
+      "stale_definition_rejected": true,
+      "plugin": {
+        "cases": [
+          {
+            "role": "success",
+            "kind": "workflow",
+            "invocation_id": "73421e05a2d644e1b177ba95b491abb2",
+            "status": "succeeded",
+            "definition_hash": "2e1821c2d4257b20f8a4d0a3466552ec7214202e3e8f6d5dba2c4c6832fe862f",
+            "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+            "output": {
+              "created": true,
+              "execution_key": "294998fb5f454c569750d44a62ddb576",
+              "result": {
+                "connector_audit": [],
+                "duration_ms": 18,
+                "error": "",
+                "log_id": "419868f2d6f7429c8780dca55514b653",
+                "status": "success",
+                "steps": [
+                  {
+                    "name": "",
+                    "node": "start",
+                    "result": {
+                      "input_summary": {
+                        "contract": "workflow-run-input-summary/v1",
+                        "field_count": 1,
+                        "payload_available": true,
+                        "payload_present": true,
+                        "redacted": true,
+                        "value_type_counts": {
+                          "object": 1
+                        }
+                      }
+                    },
+                    "status": "success",
+                    "type": "start"
+                  },
+                  {
+                    "name": "",
+                    "node": "rule_low_amount",
+                    "result": {
+                      "action_on_match": "",
+                      "matched": true,
+                      "rule_id": "f02770066c994dba916151d7c91e9f96",
+                      "rule_name": "低额规则",
+                      "severity": "info",
+                      "side_effects_executed": false,
+                      "trigger_action_ids": [],
+                      "trigger_actions": []
+                    },
+                    "status": "matched",
+                    "type": "rule"
+                  },
+                  {
+                    "contract_validation": "passed",
+                    "name": "",
+                    "node": "end_auto",
+                    "result": {
+                      "decision": "auto_approved",
+                      "estimated_amount": 50,
+                      "reason": "金额不超过自动通过上限"
+                    },
+                    "status": "success",
+                    "type": "end"
+                  }
+                ]
+              },
+              "status": "succeeded",
+              "task_url": "/tasks?task=294998fb5f454c569750d44a62ddb576",
+              "workflow_run_id": "294998fb5f454c569750d44a62ddb576"
+            },
+            "error_code": null,
+            "approval_replied": false
+          },
+          {
+            "role": "boundary",
+            "kind": "workflow",
+            "invocation_id": "322afa3e9d0d4d69a38417dc212d0278",
+            "status": "succeeded",
+            "definition_hash": "2e1821c2d4257b20f8a4d0a3466552ec7214202e3e8f6d5dba2c4c6832fe862f",
+            "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+            "output": {
+              "created": true,
+              "execution_key": "2c049773edab41ebac4fba4742627f04",
+              "result": {
+                "connector_audit": [],
+                "duration_ms": 9,
+                "error": "",
+                "log_id": "0f0453de2dcd4178aeda05a4a2a979ed",
+                "status": "success",
+                "steps": [
+                  {
+                    "name": "",
+                    "node": "start",
+                    "result": {
+                      "input_summary": {
+                        "contract": "workflow-run-input-summary/v1",
+                        "field_count": 1,
+                        "payload_available": true,
+                        "payload_present": true,
+                        "redacted": true,
+                        "value_type_counts": {
+                          "object": 1
+                        }
+                      }
+                    },
+                    "status": "success",
+                    "type": "start"
+                  },
+                  {
+                    "name": "",
+                    "node": "rule_low_amount",
+                    "result": {
+                      "action_on_match": "",
+                      "matched": true,
+                      "rule_id": "f02770066c994dba916151d7c91e9f96",
+                      "rule_name": "低额规则",
+                      "severity": "info",
+                      "side_effects_executed": false,
+                      "trigger_action_ids": [],
+                      "trigger_actions": []
+                    },
+                    "status": "matched",
+                    "type": "rule"
+                  },
+                  {
+                    "contract_validation": "passed",
+                    "name": "",
+                    "node": "end_auto",
+                    "result": {
+                      "decision": "auto_approved",
+                      "estimated_amount": 100,
+                      "reason": "金额不超过自动通过上限"
+                    },
+                    "status": "success",
+                    "type": "end"
+                  }
+                ]
+              },
+              "status": "succeeded",
+              "task_url": "/tasks?task=2c049773edab41ebac4fba4742627f04",
+              "workflow_run_id": "2c049773edab41ebac4fba4742627f04"
+            },
+            "error_code": null,
+            "approval_replied": false
+          },
+          {
+            "role": "failure",
+            "kind": "workflow",
+            "invocation_id": "44aa5325965f469c8972127a8a4efd9d",
+            "status": "rejected",
+            "definition_hash": "2e1821c2d4257b20f8a4d0a3466552ec7214202e3e8f6d5dba2c4c6832fe862f",
+            "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+            "output": {
+              "created": true,
+              "execution_key": "7e0cc57b680e46a696b955f9dbd8b877",
+              "result": {
+                "connector_audit": [],
+                "duration_ms": 8,
+                "error": "",
+                "log_id": "43234789ebf5460c996a0c9c7d74ed65",
+                "status": "awaiting_approval",
+                "steps": [
+                  {
+                    "name": "",
+                    "node": "start",
+                    "result": {
+                      "input_summary": {
+                        "contract": "workflow-run-input-summary/v1",
+                        "field_count": 1,
+                        "payload_available": true,
+                        "payload_present": true,
+                        "redacted": true,
+                        "value_type_counts": {
+                          "object": 1
+                        }
+                      }
+                    },
+                    "status": "success",
+                    "type": "start"
+                  },
+                  {
+                    "name": "",
+                    "node": "rule_low_amount",
+                    "result": {
+                      "action_on_match": "",
+                      "matched": false,
+                      "rule_id": "f02770066c994dba916151d7c91e9f96",
+                      "rule_name": "低额规则",
+                      "severity": "info",
+                      "side_effects_executed": false,
+                      "trigger_action_ids": [],
+                      "trigger_actions": []
+                    },
+                    "status": "not_matched",
+                    "type": "rule"
+                  },
+                  {
+                    "name": "",
+                    "node": "rule_budget",
+                    "result": {
+                      "action_on_match": "",
+                      "matched": true,
+                      "rule_id": "7a0dabff6ddc42b5a750083f81670612",
+                      "rule_name": "预算规则",
+                      "severity": "info",
+                      "side_effects_executed": false,
+                      "trigger_action_ids": [],
+                      "trigger_actions": []
+                    },
+                    "status": "matched",
+                    "type": "rule"
+                  },
+                  {
+                    "name": "",
+                    "node": "approval_manual",
+                    "result": {
+                      "instructions": "请核对本次合成维修申请，等待明确同意或驳回。",
+                      "node_id": "approval_manual",
+                      "on_timeout": "reject",
+                      "timeout_seconds": 3600
+                    },
+                    "status": "awaiting_approval",
+                    "type": "approval"
+                  }
+                ]
+              },
+              "status": "rejected",
+              "task_url": "/tasks?task=7e0cc57b680e46a696b955f9dbd8b877",
+              "workflow_run_id": "7e0cc57b680e46a696b955f9dbd8b877"
+            },
+            "error_code": "workflow_execution_failed",
+            "approval_replied": true,
+            "closed_approval_reply_rejected": true
+          },
+          {
+            "role": "human_approved",
+            "kind": "workflow",
+            "invocation_id": "a64ca8f5ecc040c393d13884cd6753f3",
+            "status": "succeeded",
+            "definition_hash": "2e1821c2d4257b20f8a4d0a3466552ec7214202e3e8f6d5dba2c4c6832fe862f",
+            "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+            "output": {
+              "created": true,
+              "execution_key": "fa3f8fa2b9d0487a81ad48e5e699f9ac",
+              "result": {
+                "connector_audit": [],
+                "duration_ms": 6,
+                "error": "",
+                "log_id": "e9054c6866d84592a6731d721293ae88",
+                "status": "success",
+                "steps": [
+                  {
+                    "name": "",
+                    "node": "start",
+                    "result": {
+                      "input_summary": {
+                        "contract": "workflow-run-input-summary/v1",
+                        "field_count": 1,
+                        "payload_available": true,
+                        "payload_present": true,
+                        "redacted": true,
+                        "value_type_counts": {
+                          "object": 1
+                        }
+                      }
+                    },
+                    "status": "success",
+                    "type": "start"
+                  },
+                  {
+                    "name": "",
+                    "node": "rule_low_amount",
+                    "result": {
+                      "action_on_match": "",
+                      "matched": false,
+                      "rule_id": "f02770066c994dba916151d7c91e9f96",
+                      "rule_name": "低额规则",
+                      "severity": "info",
+                      "side_effects_executed": false,
+                      "trigger_action_ids": [],
+                      "trigger_actions": []
+                    },
+                    "status": "not_matched",
+                    "type": "rule"
+                  },
+                  {
+                    "name": "",
+                    "node": "rule_budget",
+                    "result": {
+                      "action_on_match": "",
+                      "matched": true,
+                      "rule_id": "7a0dabff6ddc42b5a750083f81670612",
+                      "rule_name": "预算规则",
+                      "severity": "info",
+                      "side_effects_executed": false,
+                      "trigger_action_ids": [],
+                      "trigger_actions": []
+                    },
+                    "status": "matched",
+                    "type": "rule"
+                  },
+                  {
+                    "name": "",
+                    "node": "approval_manual",
+                    "result": {
+                      "node_id": "approval_manual"
+                    },
+                    "status": "approved",
+                    "type": "approval"
+                  },
+                  {
+                    "contract_validation": "passed",
+                    "name": "",
+                    "node": "end_approved",
+                    "result": {
+                      "decision": "approved",
+                      "estimated_amount": 101,
+                      "reason": "已获得人工审批"
+                    },
+                    "status": "success",
+                    "type": "end"
+                  }
+                ]
+              },
+              "status": "succeeded",
+              "task_url": "/tasks?task=fa3f8fa2b9d0487a81ad48e5e699f9ac",
+              "workflow_run_id": "fa3f8fa2b9d0487a81ad48e5e699f9ac"
+            },
+            "error_code": null,
+            "approval_replied": true,
+            "closed_approval_reply_rejected": true
+          },
+          {
+            "role": "budget_boundary",
+            "kind": "workflow",
+            "invocation_id": "7b3d15fcbbbc4f4dadc2dd10014c387b",
+            "status": "succeeded",
+            "definition_hash": "2e1821c2d4257b20f8a4d0a3466552ec7214202e3e8f6d5dba2c4c6832fe862f",
+            "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+            "output": {
+              "created": true,
+              "execution_key": "598b82f852014e1db2622652c7209460",
+              "result": {
+                "connector_audit": [],
+                "duration_ms": 5,
+                "error": "",
+                "log_id": "de099618503043ceb6b18cdc8331b6c6",
+                "status": "success",
+                "steps": [
+                  {
+                    "name": "",
+                    "node": "start",
+                    "result": {
+                      "input_summary": {
+                        "contract": "workflow-run-input-summary/v1",
+                        "field_count": 1,
+                        "payload_available": true,
+                        "payload_present": true,
+                        "redacted": true,
+                        "value_type_counts": {
+                          "object": 1
+                        }
+                      }
+                    },
+                    "status": "success",
+                    "type": "start"
+                  },
+                  {
+                    "name": "",
+                    "node": "rule_low_amount",
+                    "result": {
+                      "action_on_match": "",
+                      "matched": false,
+                      "rule_id": "f02770066c994dba916151d7c91e9f96",
+                      "rule_name": "低额规则",
+                      "severity": "info",
+                      "side_effects_executed": false,
+                      "trigger_action_ids": [],
+                      "trigger_actions": []
+                    },
+                    "status": "not_matched",
+                    "type": "rule"
+                  },
+                  {
+                    "name": "",
+                    "node": "rule_budget",
+                    "result": {
+                      "action_on_match": "",
+                      "matched": true,
+                      "rule_id": "7a0dabff6ddc42b5a750083f81670612",
+                      "rule_name": "预算规则",
+                      "severity": "info",
+                      "side_effects_executed": false,
+                      "trigger_action_ids": [],
+                      "trigger_actions": []
+                    },
+                    "status": "matched",
+                    "type": "rule"
+                  },
+                  {
+                    "name": "",
+                    "node": "approval_manual",
+                    "result": {
+                      "node_id": "approval_manual"
+                    },
+                    "status": "approved",
+                    "type": "approval"
+                  },
+                  {
+                    "contract_validation": "passed",
+                    "name": "",
+                    "node": "end_approved",
+                    "result": {
+                      "decision": "approved",
+                      "estimated_amount": 1000,
+                      "reason": "已获得人工审批"
+                    },
+                    "status": "success",
+                    "type": "end"
+                  }
+                ]
+              },
+              "status": "succeeded",
+              "task_url": "/tasks?task=598b82f852014e1db2622652c7209460",
+              "workflow_run_id": "598b82f852014e1db2622652c7209460"
+            },
+            "error_code": null,
+            "approval_replied": true,
+            "closed_approval_reply_rejected": true
+          },
+          {
+            "role": "over_budget",
+            "kind": "workflow",
+            "invocation_id": "8a1408abd0d64163b59fe589cfd2e680",
+            "status": "succeeded",
+            "definition_hash": "2e1821c2d4257b20f8a4d0a3466552ec7214202e3e8f6d5dba2c4c6832fe862f",
+            "data_context_fingerprint": "fbc02816ae49c98be8c7e630423ff118cc0d84fb5c554dfde90c11b8007bd1b7",
+            "output": {
+              "created": true,
+              "execution_key": "de726b57f55a486fb7f58049aef30a64",
+              "result": {
+                "connector_audit": [],
+                "duration_ms": 11,
+                "error": "",
+                "log_id": "56e6294b12514e00adab706ebf61e21f",
+                "status": "success",
+                "steps": [
+                  {
+                    "name": "",
+                    "node": "start",
+                    "result": {
+                      "input_summary": {
+                        "contract": "workflow-run-input-summary/v1",
+                        "field_count": 1,
+                        "payload_available": true,
+                        "payload_present": true,
+                        "redacted": true,
+                        "value_type_counts": {
+                          "object": 1
+                        }
+                      }
+                    },
+                    "status": "success",
+                    "type": "start"
+                  },
+                  {
+                    "name": "",
+                    "node": "rule_low_amount",
+                    "result": {
+                      "action_on_match": "",
+                      "matched": false,
+                      "rule_id": "f02770066c994dba916151d7c91e9f96",
+                      "rule_name": "低额规则",
+                      "severity": "info",
+                      "side_effects_executed": false,
+                      "trigger_action_ids": [],
+                      "trigger_actions": []
+                    },
+                    "status": "not_matched",
+                    "type": "rule"
+                  },
+                  {
+                    "name": "",
+                    "node": "rule_budget",
+                    "result": {
+                      "action_on_match": "",
+                      "matched": false,
+                      "rule_id": "7a0dabff6ddc42b5a750083f81670612",
+                      "rule_name": "预算规则",
+                      "severity": "info",
+                      "side_effects_executed": false,
+                      "trigger_action_ids": [],
+                      "trigger_actions": []
+                    },
+                    "status": "not_matched",
+                    "type": "rule"
+                  },
+                  {
+                    "contract_validation": "passed",
+                    "name": "",
+                    "node": "end_over_budget",
+                    "result": {
+                      "decision": "over_budget",
+                      "estimated_amount": 1001,
+                      "reason": "金额超过预算上限"
+                    },
+                    "status": "success",
+                    "type": "end"
+                  }
+                ]
+              },
+              "status": "succeeded",
+              "task_url": "/tasks?task=de726b57f55a486fb7f58049aef30a64",
+              "workflow_run_id": "de726b57f55a486fb7f58049aef30a64"
+            },
+            "error_code": null,
+            "approval_replied": false
+          }
+        ],
+        "rest_to_mcp_same_invocation": true,
+        "discovery": true,
+        "unpackaged_capability_rejected": true
+      }
+    }
+  ]
+}

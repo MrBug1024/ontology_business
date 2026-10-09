@@ -17,6 +17,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { businessDistillationApi } from '@/api/businessDistillation'
+import { notifyScenarioDiscoveryContextChanged } from '@/utils/scenarioAdvisorEvents'
 import type { DataSource } from '@/types'
 import type { DistillationArtifact, DistillationPublication } from '@/types/businessDistillation'
 const props = defineProps<{ source: DataSource }>()
@@ -77,6 +78,7 @@ async function remove() {
   busy.value = 'delete'
   try {
     await businessDistillationApi.deleteProduct(publicationId.value, new AbortController().signal)
+    notifyScenarioDiscoveryContextChanged(props.source.scenario_id || '')
     ElMessage.success('业务蒸馏产物已删除')
     if (props.source.scenario_id) {
       await router.replace({ name: 'scenario-detail', params: { id: props.source.scenario_id }, query: { stage: 'materials' } })

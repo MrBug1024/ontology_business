@@ -1,0 +1,111 @@
+{
+  "read_only": true,
+  "explicit_account_verified": true,
+  "releases": [
+    {
+      "scenario_name": "真实验收-办公采购分流-20261006",
+      "release_id": "339b9ec22c8945419b95573317d7ceb6",
+      "scope": "release_discovery",
+      "blueprint_version": "scenario-capability-blueprint.v1",
+      "object_count": 1,
+      "relation_count": 0,
+      "capability_count": 1,
+      "dependency_count": 0,
+      "context_bytes": 12051,
+      "query_count": 20,
+      "elapsed_ms": 1476.915
+    },
+    {
+      "scenario_name": "真实验收-供应履约评分-20261006",
+      "release_id": "2cc9b32f732c4cafaaeb4f22811bf990",
+      "scope": "release_discovery",
+      "blueprint_version": "scenario-capability-blueprint.v1",
+      "object_count": 1,
+      "relation_count": 0,
+      "capability_count": 2,
+      "dependency_count": 0,
+      "context_bytes": 12667,
+      "query_count": 23,
+      "elapsed_ms": 46.92
+    },
+    {
+      "scenario_name": "真实验收-设备维修审批-20261006",
+      "release_id": "9ce9f445471145e9a60899e66fa2a772",
+      "scope": "release_discovery",
+      "blueprint_version": "scenario-capability-blueprint.v1",
+      "object_count": 1,
+      "relation_count": 0,
+      "capability_count": 3,
+      "dependency_count": 0,
+      "context_bytes": 15591,
+      "query_count": 29,
+      "elapsed_ms": 67.055
+    },
+    {
+      "scenario_name": "真实验收-办公采购分流-20261006",
+      "release_id": "339b9ec22c8945419b95573317d7ceb6",
+      "scope": "workspace_selected",
+      "blueprint_version": "scenario-capability-blueprint.v1",
+      "object_count": 1,
+      "relation_count": 0,
+      "capability_count": 1,
+      "dependency_count": 0,
+      "context_bytes": 12050,
+      "query_count": 14,
+      "elapsed_ms": 27.887,
+      "candidate_build": {
+        "profile_version": "scenario-plugin-delivery-profile.v1",
+        "artifact_sha256": "433f1a0931dc29a30e0ebf1a3e1c7b52c1f4be4fa08d89e3677569f227d40f5d",
+        "bytes": 15920,
+        "protected_reference_matches": true,
+        "checksums_verified": 8,
+        "published": false,
+        "installed": false
+      }
+    },
+    {
+      "scenario_name": "真实验收-供应履约评分-20261006",
+      "release_id": "2cc9b32f732c4cafaaeb4f22811bf990",
+      "scope": "workspace_selected",
+      "blueprint_version": "scenario-capability-blueprint.v1",
+      "object_count": 1,
+      "relation_count": 0,
+      "capability_count": 2,
+      "dependency_count": 0,
+      "context_bytes": 12665,
+      "query_count": 15,
+      "elapsed_ms": 28.23,
+      "candidate_build": {
+        "profile_version": "scenario-plugin-delivery-profile.v1",
+        "artifact_sha256": "a59d6cefbb49675241d7f9967e69c90f3328a2fe05e469cf8b5977edf8adf2f6",
+        "bytes": 16119,
+        "protected_reference_matches": true,
+        "checksums_verified": 8,
+        "published": false,
+        "installed": false
+      }
+    },
+    {
+      "scenario_name": "真实验收-设备维修审批-20261006",
+      "release_id": "9ce9f445471145e9a60899e66fa2a772",
+      "scope": "workspace_selected",
+      "blueprint_version": "scenario-capability-blueprint.v1",
+      "object_count": 1,
+      "relation_count": 0,
+      "capability_count": 1,
+      "dependency_count": 2,
+      "context_bytes": 12209,
+      "query_count": 19,
+      "elapsed_ms": 37.423,
+      "candidate_build": {
+        "profile_version": "scenario-plugin-delivery-profile.v1",
+        "artifact_sha256": "2c4a52ddd2dbb4f890df4040b350622bd85a8c2fe33b66c664019824b2b9ddd2",
+        "bytes": 16214,
+        "protected_reference_matches": true,
+        "checksums_verified": 8,
+        "published": false,
+        "installed": false
+      }
+    }
+  ]
+}

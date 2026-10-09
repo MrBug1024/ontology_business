@@ -1,0 +1,69 @@
+{
+  "version": "multi-scenario-e2e.v1",
+  "synthetic_business_only": true,
+  "publication_scope": "local_test",
+  "scenarios": [
+    {
+      "name": "办公采购分流",
+      "scenario_id": "7295ab77a9dd4b8cbb8827fb8aef6fb5",
+      "release_id": "339b9ec22c8945419b95573317d7ceb6",
+      "artifact_id": "aa87a60e413ccdbd2c80376de1f97162",
+      "publication_id": "807c5278d287598cf8a53a5815a1ce15",
+      "status": "created_modeled_released_coded_reviewed_published_installed_verified",
+      "application_invocations": 4,
+      "rest_cases": 4,
+      "installed_mcp_cases": 4,
+      "authored_client_cases": 4,
+      "authored_client_receipts": 4,
+      "closed_approval_rejections": 0,
+      "credential_revoked": true,
+      "application_report": "purchase.json",
+      "protocol_report": "protocol-purchase.json"
+    },
+    {
+      "name": "供应履约评分",
+      "scenario_id": "b3d45a76dcb84dafa9fcc17a147b4313",
+      "release_id": "2cc9b32f732c4cafaaeb4f22811bf990",
+      "artifact_id": "6ea84bd0954f61f9195ad2660639a879",
+      "publication_id": "ffc74d9a3af9f9c6985f6ed3c4372cdb",
+      "status": "created_modeled_released_coded_reviewed_published_installed_verified",
+      "application_invocations": 7,
+      "rest_cases": 6,
+      "installed_mcp_cases": 6,
+      "authored_client_cases": 4,
+      "authored_client_receipts": 7,
+      "closed_approval_rejections": 0,
+      "credential_revoked": true,
+      "application_report": "score.json",
+      "protocol_report": "protocol-score.json"
+    },
+    {
+      "name": "设备维修审批",
+      "scenario_id": "5fc174b649b344078ea195b3a9e394eb",
+      "release_id": "9ce9f445471145e9a60899e66fa2a772",
+      "artifact_id": "8877881fd706c5b0e5b7cf367931e02d",
+      "publication_id": "f9b0674199e930d12a5935867a642cac",
+      "status": "created_modeled_released_coded_reviewed_published_installed_verified",
+      "application_invocations": 6,
+      "rest_cases": 3,
+      "installed_mcp_cases": 6,
+      "authored_client_cases": 0,
+      "authored_client_receipts": 0,
+      "closed_approval_rejections": 3,
+      "credential_revoked": true,
+      "application_report": "maintenance.json",
+      "protocol_report": "protocol-maintenance.json"
+    }
+  ],
+  "verification": {
+    "backend_tests_passed": 512,
+    "frontend_tests_passed": 296,
+    "frontend_build": "passed",
+    "postgresql_runtime": "passed",
+    "isolated_postgresql_lineage": "passed",
+    "browser": "real_authenticated_iab",
+    "browser_evidence": "browser.json",
+    "action_side_effect_confirmation": "N/A: no external side-effecting Action selected"
+  },
+  "verified_distinct_invocation_ids": 57
+}

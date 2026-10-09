@@ -9,7 +9,7 @@ from app.services import workflow_authoring_data as authoring
 from app.services.policies import PolicyViolation
 
 
-def _compiled_workflow():
+def _compiled_workflow(approval_data=None):
     scenario = SimpleNamespace(id='synthetic', namespace='test', entities=[], relations=[],
         function_definitions=[], actions=[], rules=[], events=[], workflows=[], data_mappings=[], relation_data_mappings=[])
     raw = {key: [] for key in (*compiler._MODEL_OUTPUT_RESOURCE_SECTIONS, 'coverage', 'unresolved')}
@@ -24,6 +24,10 @@ def _compiled_workflow():
             {'id': 'end', 'type': 'end', 'data': {'output': {'answer': '{{summary.parsed.answer}}',
                                                           'count': '{{params.count}}'}}}],
         'edges': [{'source': 'start', 'target': 'summary'}, {'source': 'summary', 'target': 'end'}]}]
+    if approval_data is not None:
+        raw['workflows'][0]['nodes'].insert(2, {'id': 'review', 'type': 'approval', 'data': approval_data})
+        raw['workflows'][0]['edges'] = [{'source': 'start', 'target': 'summary'},
+            {'source': 'summary', 'target': 'review'}, {'source': 'review', 'target': 'end'}]
     return compiler.normalize_scenario_model(None, scenario, raw, source_bundle={
         'paragraphs': [{'ref': 'doc:p1', 'text': 'Summarize submitted text and return the answer and count.'}],
         'documents': [], 'fingerprint': 'a' * 64})
@@ -59,6 +63,27 @@ def test_supported_node_values_roundtrip_without_mutation(node_type, field, valu
     actual = authoring.execution_data(node_type, original)
     assert actual == {field: value}
     assert original[field] == value
+
+
+def test_generated_approval_preserves_the_declared_audience_and_evidence_requirement():
+    data = {'instructions': 'Review the request.', 'approver_roles': ['owner', 'admin'],
+        'approver_user_ids': ['synthetic-reviewer'], 'requires_evidence': True}
+    payload = _compiled_workflow(data)
+    assert payload['unresolved'] == []
+    approval = next(node for node in payload['workflows'][0]['nodes'] if node['type'] == 'approval')
+    assert {key: approval['data'][key] for key in data} == data
+
+
+@pytest.mark.parametrize('data', [
+    {'approver_roles': ['superadmin']},
+    {'approver_user_ids': ['x' * 33]},
+    {'requires_evidence': 'true'},
+])
+def test_invalid_generated_approval_policy_is_rejected_instead_of_silently_removed(data):
+    with pytest.raises(ValueError):
+        authoring.execution_data('approval', data)
+    payload = _compiled_workflow(data)
+    assert any(issue['code'] == 'invalid_workflow_data' for issue in payload['unresolved'])
 
 
 @pytest.mark.parametrize('value', [float('nan'), float('inf'), {'x': object()}, 'x' * 33_000],

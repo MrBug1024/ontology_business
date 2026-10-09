@@ -1,0 +1,22 @@
+{
+  "passed": true,
+  "alembic_head": "20260928_52",
+  "concurrent_publication_idempotent": true,
+  "one_durable_audit_per_revision": true,
+  "foreign_tenant_rejected": true,
+  "scenario_manage_deny_enforced": true,
+  "unpublished_anonymous_rejected": true,
+  "published_anonymous_exact_hash": true,
+  "withdrawal_blocks_public_download": true,
+  "stale_revision_rejected": true,
+  "explicit_republish": true,
+  "disabled_release_blocks_installation": true,
+  "original_artifact_unchanged": true,
+  "public_read": {
+    "query_count": 8,
+    "elapsed_ms": 13.736,
+    "returned_bytes": 8099
+  },
+  "reviewed_contents": "synthetic",
+  "business_execution_tested": false
+}
