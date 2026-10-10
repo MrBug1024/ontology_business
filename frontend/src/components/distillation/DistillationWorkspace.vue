@@ -12,7 +12,7 @@
       </div>
       <div class="discovery-project-list">
         <button v-for="row in projects" :key="row.id" type="button" :aria-current="row.id === projectId ? 'page' : undefined" @click="openProject(row.id)">
-          <span>{{ row.name }}</span><small>{{ DECISION_LABELS[row.document.decision] }}</small>
+          <span>{{ row.name }}</span>
         </button>
         <p v-if="!projects.length && !listing" class="discovery-muted">暂无会话</p>
       </div>
@@ -24,7 +24,6 @@
     </aside>
 
     <section class="discovery-main" aria-label="业务蒸馏工作区">
-      <ScenarioBusinessContextPanel v-if="props.embedded && props.scenarioId && props.showScenarioContext" compact :scenario-id="props.scenarioId" />
       <header v-if="!embedded" class="discovery-toolbar">
         <div class="discovery-toolbar-title">
           <el-button text circle :aria-expanded="projectsOpen" aria-label="打开会话列表" @click="projectsOpen = !projectsOpen"><el-icon><Menu /></el-icon></el-button>
@@ -40,8 +39,7 @@
         </div>
         <div class="distill-actions">
           <el-button :disabled="(!canEdit && !project) || actionBusy || !!active || loading" @click="openSources">引用资料</el-button>
-          <el-button v-if="publications.length" text @click="openLatestPublication">查看产物</el-button>
-          <el-button v-if="!embedded && project?.scenario_id && publications.length" text type="primary" @click="buildScenario">进入场景</el-button>
+          <el-button v-if="!embedded && project?.scenario_id" text type="primary" @click="buildScenario">进入场景</el-button>
           <el-button v-if="!embedded && project && !project.scenario_id && canEdit" text @click="copyDialog = true">复制到场景</el-button>
         </div>
       </header>
@@ -58,7 +56,7 @@
         <button type="button" :aria-pressed="mobilePane === 'conversation'" @click="mobilePane = 'conversation'">业务蒸馏 AI</button>
       </div>
       <div v-if="!projectId || project || loading" class="distillation-studio-body" :class="`is-${mobilePane}`">
-        <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :publications="publications" :publication-busy="busy" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="canEdit && !loading && !actionBusy" :can-publish="canEdit && !loading && (!!project || scenarioRevision !== null) && !dirty && !actionBusy && !active && !artifactProposal" @ask="discussFinding" @publish="confirmPublish" @updated="acceptProjectUpdate" @open-publication="openMaterial" @download-publication="downloadPublication" @delete-publication="deletePublication" />
+        <DistillationCanvas :key="draftKey" class="distillation-stage" embedded :document="artifactProposal?.proposal || draft.document" :pending="!!artifactProposal" :project="project || undefined" :project-id="projectId" :revision="project?.revision" :dirty="dirty" :loading="loading" :can-edit="canEdit && !loading && !actionBusy" @ask="discussFinding" @updated="acceptProjectUpdate" />
         <aside class="distillation-advisor-panel" aria-label="业务蒸馏顾问对话">
         <DistillationConversation v-model="input" :scope-key="draftKey" :scenario-id="props.scenarioId" :turns="turns" :loading="loading || conversationLoading" :has-more="conversationHasMore" :working="!!active" :sending="sending || busy === 'save'" :cancelling="cancelling" :applying="applying" :disabled="!canEdit || loading || actionBusy" :can-apply="canEdit && !dirty && !actionBusy" :error="conversationError" :blocked-reason="blockedReason" :upload-busy="attachmentBusy" :has-attachments="readyIds.length > 0" :removing-attachment="removingAttachment" :compact="embedded" :workspace-actions="embedded" :streaming="streaming" :reconnecting="reconnecting" @send="sendMessage" @cancel="cancel" @reload="reconnectConversation" @older="loadConversation(true)" @sources="openSources" @files="addAttachments" @remove-submitted="removeSubmittedAttachment" @preview="previewTurn = $event" @apply="applyTurn" @new="newConversation" @history="projectsOpen = true" @systems="openSystems">
             <template #attachments><DistillationAttachments :items="composerAttachments" :error="attachmentError" :disabled="!canEdit || !!active || sending" @retry="retryAttachment" @remove="removeAttachment" @reload="loadAttachments" /></template>
@@ -72,7 +70,7 @@
       <div class="discovery-project-list is-drawer">
         <article v-for="row in projects" :key="row.id" :class="{ 'is-active': row.id === projectId }">
           <button type="button" :aria-current="row.id === projectId ? 'page' : undefined" @click="openProject(row.id)">
-            <span>{{ row.name }}</span><small>{{ DECISION_LABELS[row.document.decision] }}</small>
+            <span>{{ row.name }}</span>
           </button>
           <el-button text circle :disabled="actionBusy || !props.canWrite" :aria-label="`删除会话 ${row.name}`" title="删除会话" @click="deleteProject(row)"><el-icon><Delete /></el-icon></el-button>
         </article>
@@ -89,7 +87,6 @@
     </el-drawer>
 
     <el-drawer v-model="systemsOpen" title="业务系统" size="min(540px, 96vw)"><DistillationSystemAccess v-if="systemsOpen && project" :key="project.id" :project="project" :can-edit="canEdit && !actionBusy && !active" :dirty="dirty" @updated="acceptProjectUpdate" /></el-drawer>
-    <DistillationPublishDecisionDialog v-model="publishDialog" :document="draft.document" :busy="actionBusy" :error="error" @confirm="publishDecision" />
     <el-drawer v-model="sourcesOpen" title="引用场景资料" size="min(540px, 96vw)">
       <DistillationLibraryPicker
         v-model="draft.document"
@@ -125,9 +122,9 @@ import { useAuthStore } from '@/stores/auth'
 import { useBusinessDistillation } from '@/composables/useBusinessDistillation'
 import { useDistillationConversation } from '@/composables/useDistillationConversation'
 import { useDistillationAttachments } from '@/composables/useDistillationAttachments'
-import { DECISION_LABELS, draftOf, isMaterialReferenceOnlyChange } from '@/utils/businessDistillation'
+import { draftOf, isMaterialReferenceOnlyChange } from '@/utils/businessDistillation'
 import { conversationTitle, latestArtifactProposal } from '@/utils/distillationConversation'
-import type { DistillationProject, DistillationPublication } from '@/types/businessDistillation'
+import type { DistillationProject } from '@/types/businessDistillation'
 import type { DistillationResourceSelection, DistillationTurn } from '@/types/distillationConversation'
 import DistillationConversation from '@/components/distillation/DistillationConversation.vue'
 import DistillationCanvas from '@/components/distillation/DistillationCanvas.vue'
@@ -135,15 +132,11 @@ import DistillationSystemAccess from '@/components/distillation/DistillationSyst
 import DistillationLibraryPicker from '@/components/distillation/DistillationLibraryPicker.vue'
 import DistillationAttachments from '@/components/distillation/DistillationAttachments.vue'
 import DistillationSummary from '@/components/distillation/DistillationSummary.vue'
-import DistillationPublishDecisionDialog from '@/components/distillation/DistillationPublishDecisionDialog.vue'
-import ScenarioBusinessContextPanel from '@/components/ScenarioBusinessContextPanel.vue'
-import type { handoffDecision } from '@/utils/distillationHandoff'
-import { notifyScenarioDiscoveryContextChanged } from '@/utils/scenarioAdvisorEvents'
 import '@/styles/distillation.css'
 import '@/styles/distillation-workspace.css'
 
-const props = withDefaults(defineProps<{ scenarioId?: string; canWrite?: boolean; embedded?: boolean; showScenarioContext?: boolean }>(), {
-  scenarioId: '', canWrite: false, embedded: false, showScenarioContext: false,
+const props = withDefaults(defineProps<{ scenarioId?: string; canWrite?: boolean; embedded?: boolean }>(), {
+  scenarioId: '', canWrite: false, embedded: false,
 })
 const route = useRoute(), router = useRouter(), auth = useAuthStore()
 function queryValue(value: unknown) { return Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : '' }
@@ -153,9 +146,9 @@ const historyScope = ref(routeScope())
 const selectedScenario = computed(() => historyScope.value === 'shared' ? '' : historyScope.value)
 const draftKey = computed(() => projectId.value || `new:${historyScope.value}`)
 const {
-  projects, project, draft, baseline, scenarios, materials, publications, error, notice, loading, listing, busy,
+  projects, project, draft, baseline, scenarios, materials, error, notice, loading, listing, busy,
   offset, hasMore, dirty, materialOffset, materialHasMore, materialLoading, materialPageSize,
-  list, load, save, publish, publishScenario, scenarioRevision, download, refreshOptions, previousMaterialPage, nextMaterialPage, copyToScenario, remove, removePublication,
+  list, load, save, refreshOptions, previousMaterialPage, nextMaterialPage, copyToScenario, remove,
 } = useBusinessDistillation(projectId, historyScope, props.embedded)
 const authorizedProjectId = computed(() => {
   const row = project.value
@@ -177,8 +170,6 @@ const unsavedStageChanges = computed(() => dirty.value && !materialOnlyDirty.val
 const blockedReason = computed(() => unsavedStageChanges.value ? '请先保存阶段结论，再发送新的调查问题。' : attachmentBlocked.value ? '请等待附件就绪，或重试、移除未就绪附件。' : '')
 const projectsOpen = ref(false), sourcesOpen = ref(false), systemsOpen = ref(false)
 const mobilePane = ref<'findings' | 'conversation'>('findings')
-const publishDialog = ref(false)
-let publicationOwner: { id: string; revision: number } | undefined
 const scenarioPickerKey = ref(0), copyDialog = ref(false), copyScenarioId = ref(''), previewTurn = ref<DistillationTurn | null>(null)
 let internalNavigation = false
 const hasPendingWork = computed(() => dirty.value || actionBusy.value || attachmentBusy.value || !!input.value.trim() || attachments.value.some(item => item.status !== 'bound'))
@@ -305,62 +296,6 @@ async function copyProject() {
   const row = await copyToScenario(copyScenarioId.value)
   if (row) { copyDialog.value = false; await changeWorkspace(scenarioLocation(copyScenarioId.value, row.id), true) }
 }
-function confirmPublish() {
-  if (dirty.value || actionBusy.value || active.value) return
-  if (!project.value && (!selectedScenario.value || scenarioRevision.value === null)) return
-  publicationOwner = project.value
-    ? { id: project.value.id, revision: project.value.revision }
-    : { id: selectedScenario.value, revision: scenarioRevision.value as number }
-  error.value = ''
-  publishDialog.value = true
-}
-async function publishDecision(decision: ReturnType<typeof handoffDecision>) {
-  if (actionBusy.value || active.value || !publicationOwner) return
-  if (!project.value) {
-    if (selectedScenario.value !== publicationOwner.id || scenarioRevision.value !== publicationOwner.revision) return
-    if (await publishScenario(decision)) { publishDialog.value = false; publicationOwner = undefined }
-    return
-  }
-  if (project.value.id !== publicationOwner.id || project.value.revision !== publicationOwner.revision) return
-  const owner = { ...publicationOwner }
-  const document = draft.value.document
-  const previous = { decision: document.decision, decision_reason: document.decision_reason }
-  const submitted = { ...decision }
-  Object.assign(document, submitted)
-  if (dirty.value) {
-    const row = await save()
-    if (!row) {
-      if (project.value?.id === owner.id && project.value?.revision === owner.revision && draft.value.document === document && document.decision === submitted.decision && document.decision_reason === submitted.decision_reason) Object.assign(document, previous)
-      return
-    }
-    publicationOwner = { id: row.id, revision: row.revision }
-  }
-  const result = await publish()
-  if (result) { publishDialog.value = false; publicationOwner = undefined }
-}
-function openMaterial(version: DistillationPublication) {
-  if (props.embedded) {
-    const query: LocationQueryRaw = { ...route.query, stage: 'materials', source_id: version.data_source_id, distillation_id: projectId.value }
-    delete query.materials_offset
-    void router.push({ name: 'scenario-detail', params: { id: props.scenarioId }, query })
-    return
-  }
-  void router.push({ name: 'data-sources', query: { source_id: version.data_source_id, return_to: route.fullPath } })
-}
-function openLatestPublication() { const latest = publications.value[0]; if (latest) openMaterial(latest) }
-async function downloadPublication(publication: DistillationPublication, artifact: DistillationPublication['artifacts'][number]) {
-  await download(publication, artifact)
-}
-async function deletePublication(publication: DistillationPublication) {
-  try {
-    await ElMessageBox.confirm(
-      `删除业务蒸馏产物版本 ${publication.project_revision}？资料库中的对应投影也会移除。`,
-      '删除业务蒸馏产物',
-      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
-    )
-  } catch { return }
-  await removePublication(publication)
-}
 function buildScenario() { if (project.value?.scenario_id) void router.push({ name: 'scenario-detail', params: { id: project.value.scenario_id }, query: { stage: 'ontology', return_to: route.fullPath } }) }
 async function allowLeave() {
   if (internalNavigation) return true
@@ -377,12 +312,9 @@ watch(project, row => {
   historyScope.value = row.scenario_id || 'shared'
   if (row.scenario_id) void changeWorkspace(scenarioLocation(row.scenario_id, row.id), true)
 })
-watch([() => project.value?.revision, scenarioRevision, publications], () => {
-  notifyScenarioDiscoveryContextChanged(props.scenarioId || project.value?.scenario_id || selectedScenario.value)
-})
 watch(() => [projectId.value, route.query.scenario_id, route.query.shared], () => {
   historyScope.value = routeScope()
-  previewTurn.value = null; sourcesOpen.value = false; systemsOpen.value = false; publishDialog.value = false; publicationOwner = undefined
+  previewTurn.value = null; sourcesOpen.value = false; systemsOpen.value = false
 })
 onBeforeRouteLeave(allowLeave)
 onBeforeRouteUpdate((to, from) => {

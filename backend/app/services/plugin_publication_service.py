@@ -163,6 +163,9 @@ def public_context(db: Session, identity: str):
             or publication_id(thread.tenant_id, artifact.id) != identity
             or artifact.proposal.get('artifact_hash') != document.get('artifact_hash')):
         raise HTTPException(404, NOT_AVAILABLE)
+    # Deleted snapshots stop serving public material even if a stale publication row remains.
+    if artifact.proposal.get('deleted_at') or artifact.proposal.get('retired_at'):
+        raise HTTPException(404, NOT_AVAILABLE)
     manifest = artifact.proposal.get('manifest', {})
     release = db.get(OntologyRelease, manifest.get('deployment', {}).get('release_id'))
     scenario = db.get(BusinessScenario, manifest.get('scenario', {}).get('id'))

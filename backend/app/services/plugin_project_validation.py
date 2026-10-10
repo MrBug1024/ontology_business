@@ -8,7 +8,7 @@ from .plugin_source_policy import editable_path
 
 
 def required_paths(instruction: str) -> list[str]:
-    mentioned = re.findall(r'(?:skills|scripts|examples|references)/[a-zA-Z0-9_./-]+', instruction)
+    mentioned = re.findall(r'(?:skills|scripts|examples|references|agents|commands|hooks|output-styles|lsp)/[a-zA-Z0-9_./-]+', instruction)
     return sorted(EDITABLE_PATHS | {path for path in mentioned if editable_path(path)})
 
 

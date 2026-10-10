@@ -153,18 +153,16 @@ test('a catalog from a different scene or release cannot start a coding task', a
   } finally { view.stop() }
 })
 
-test('task start refuses invalid versions, missing scope and repeated pending submissions', async () => {
+test('task start requires scope and refuses repeated pending submissions without any version input', async () => {
   resetTaskApi()
   let resolveTask
   let calls = 0
-  taskStartApi.start = () => { calls++; return new Promise(resolve => { resolveTask = resolve }) }
+  let submitted
+  taskStartApi.start = (id, body) => { calls++; submitted = body; return new Promise(resolve => { resolveTask = resolve }) }
   const view = mountTaskStart()
   try {
     await flush()
     view.state.instruction.value = 'Build plugin'
-    view.state.pluginVersion.value = '01.0.0'
-    assert.equal(await view.state.start(), null)
-    view.state.pluginVersion.value = '1.0.0'
     view.state.selected['workflow:first'] = false
     assert.equal(await view.state.start(), null)
     view.state.selected['workflow:first'] = true
@@ -173,6 +171,8 @@ test('task start refuses invalid versions, missing scope and repeated pending su
     resolveTask({ id: 'workspace' })
     await pending
     assert.equal(calls, 1)
+    assert.equal('plugin_version' in submitted, false, 'sessions never carry a plugin version')
+    assert.equal('pluginVersion' in view.state, false)
   } finally { view.stop() }
 })
 test('line review represents insertion, deletion and unchanged context with correct line numbers', () => {
@@ -245,46 +245,7 @@ test('stopping a round keeps local drafts and never claims they were persisted',
   } finally { view.stop() }
 })
 
-const contextApi = {}
-globalThis.__pluginStudioContextApi = contextApi
-const contextApiUrl = encode('export const pluginCodingApi = globalThis.__pluginStudioContextApi; export const scenarioReleasesApi = globalThis.__pluginStudioContextApi')
-const contextSource = compile('../src/composables/usePluginStudioContext.ts').replace("from 'vue'", `from '${vueUrl}'`).replace("from '@/api/pluginCoding'", `from '${contextApiUrl}'`).replace("from '@/api/scenarioReleases'", `from '${contextApiUrl}'`)
-const { usePluginStudioContext } = await import(encode(contextSource))
-function mountContext() { const id = ref('first'); let state; const app = renderer.createApp({ setup() { state = usePluginStudioContext(id); return () => h('div') } }); app.mount({}); return { id, state, stop: () => app.unmount() } }
 async function flush() { await nextTick(); await new Promise(resolve => setImmediate(resolve)); await nextTick() }
-test('release parameter change aborts old context and refuses its late response', async () => {
-  let resolveOld
-  let oldSignal
-  const delayed = new Promise(resolve => { resolveOld = resolve })
-  contextApi.get = (id, signal) => { if (id === 'first') { oldSignal = signal; return delayed }; return Promise.resolve({ id }) }
-  contextApi.recent = async () => []
-  const view = mountContext()
-  try {
-    view.id.value = 'second'
-    await flush()
-    assert.equal(oldSignal.aborted, true)
-    resolveOld({ id: 'first' })
-    await flush()
-    assert.equal(view.state.release.value.id, 'second')
-    assert.equal(view.state.loading.value, false)
-  } finally { view.stop() }
-})
-test('context retry preserves saved history and recovers from a failed read', async () => {
-  let failing = false
-  contextApi.get = async id => ({ id })
-  contextApi.recent = async () => { if (failing) throw new Error('会话暂不可读'); return [{ id: 'saved' }] }
-  const view = mountContext()
-  try {
-    await flush()
-    failing = true
-    await view.state.load()
-    assert.equal(view.state.recent.value[0].id, 'saved')
-    assert.equal(view.state.error.value, '会话暂不可读')
-    failing = false
-    await view.state.load()
-    assert.equal(view.state.error.value, '')
-  } finally { view.stop() }
-})
 
 const artifactApi = {}
 globalThis.__pluginArtifactTestApi = artifactApi

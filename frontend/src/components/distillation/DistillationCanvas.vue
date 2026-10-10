@@ -22,41 +22,19 @@
         <DistillationCases v-else-if="tab === 'cases'" :document="document" />
         <DistillationFindings v-else :document="document" :tab="tab" />
       </template>
-      <section v-if="activePublications.length" class="discovery-tab-publications" aria-label="当前分类已保存交付物">
-        <div class="discovery-tab-publications-heading"><strong>{{ activeTabName }}交付物</strong><small>每个版本可独立删除</small></div>
-        <article v-for="publication in activePublications" :key="publication.version.id" class="discovery-tab-publication-row">
-          <span>版本 {{ publication.version.project_revision }}</span>
-          <div class="discovery-tab-publication-actions">
-            <el-button text :disabled="!publication.version.data_source_id" @click="$emit('open-publication', publication.version)">查看资料</el-button>
-            <el-button v-for="artifact in publication.artifacts" :key="artifact.key" text :disabled="!!publicationBusy" @click="$emit('download-publication', publication.version, artifact)">下载 {{ artifact.filename }}</el-button>
-            <el-button v-if="canEdit" type="danger" text :disabled="!!publicationBusy" @click="$emit('delete-publication', publication.version)">删除版本</el-button>
-          </div>
-        </article>
-      </section>
     </div>
-    <footer>
-      <span class="discovery-canvas-state">{{ pending ? 'AI 产物 · 待采用' : dirty ? '资料引用有待保存的调整' : hasArtifacts ? '已保存的阶段产物' : '等待产物' }}</span>
-      <el-button type="primary" plain :disabled="!canPublish || !hasArtifacts || pending" @click="$emit('publish')">保存到资料库</el-button>
-    </footer>
   </section>
 </template>
 <script setup lang="ts">
-import { computed, nextTick, ref, useId } from 'vue'
+import { nextTick, ref, useId } from 'vue'
 import { Close } from '@element-plus/icons-vue'
-import type { DistillationArtifact, DistillationDocument, DistillationProject, DistillationPublication } from '@/types/businessDistillation'
+import type { DistillationDocument, DistillationProject } from '@/types/businessDistillation'
 import DistillationFindings from './DistillationFindings.vue'
 import DistillationEvidenceFindings from './DistillationEvidenceFindings.vue'
 import DistillationCases from './DistillationCases.vue'
 
-const props = withDefaults(defineProps<{ document: DistillationDocument; project?: DistillationProject; projectId?: string; revision?: number; dirty: boolean; canEdit: boolean; canPublish: boolean; embedded?: boolean; loading?: boolean; pending?: boolean; publications?: DistillationPublication[]; publicationBusy?: string }>(), {
-  publications: () => [], publicationBusy: '',
-})
-defineEmits<{ close: []; publish: []; ask: [message: string]; updated: [project: DistillationProject]; 'open-publication': [publication: DistillationPublication]; 'download-publication': [publication: DistillationPublication, artifact: DistillationArtifact]; 'delete-publication': [publication: DistillationPublication] }>()
-const hasArtifacts = computed(() => {
-  const document = props.document
-  return [document.beneficiary, document.pain, document.desired_outcome, document.success_metric, document.scope, document.non_goals].some(value => value.trim())
-    || [document.entities, document.as_is.nodes, document.to_be.nodes, document.assertions, document.evidence, document.historical_cases, document.lineage, document.open_questions].some(items => items.length > 0)
-})
+defineProps<{ document: DistillationDocument; project?: DistillationProject; projectId?: string; revision?: number; dirty: boolean; canEdit: boolean; embedded?: boolean; loading?: boolean; pending?: boolean }>()
+defineEmits<{ close: []; ask: [message: string]; updated: [project: DistillationProject] }>()
 const tabs = [
   { key: 'value', name: '业务价值' },
   { key: 'entities', name: 'ER' },
@@ -67,23 +45,9 @@ const tabs = [
   { key: 'questions', name: '待澄清' },
 ] as const
 type FindingTab = typeof tabs[number]['key']
-const artifactKeysByTab: Record<FindingTab, readonly string[]> = {
-  value: ['brief', 'contract'],
-  entities: ['er'],
-  process: ['as_is', 'to_be'],
-  lineage: ['lineage'],
-  cases: ['brief', 'contract'],
-  evidence: ['provenance', 'brief'],
-  questions: ['brief'],
-}
 const canvasId = `distillation-${useId()}`
 const tab = ref<FindingTab>('value')
 const tabButtons = ref<HTMLButtonElement[]>([])
-const activeTabName = computed(() => tabs.find(item => item.key === tab.value)?.name || '')
-const activePublications = computed(() => props.publications.map(version => ({
-  version,
-  artifacts: version.artifacts.filter(artifact => artifactKeysByTab[tab.value].includes(artifact.key)),
-})).filter(publication => publication.artifacts.length > 0))
 async function navigateTabs(event: KeyboardEvent, index: number) {
   let nextIndex: number
   if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length

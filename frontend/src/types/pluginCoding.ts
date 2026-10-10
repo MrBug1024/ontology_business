@@ -44,15 +44,45 @@ export interface CodingContext {
   scenario_blueprint: CodingScenarioBlueprint
   delivery_profile: CodingDeliveryProfile
 }
-export interface CodingTask { id: string; release_id: string; scenario_id: string; title: string; plugin_version: string; host: PluginHost; phase: string; created_at: string }
+export interface CodingSession {
+  id: string
+  project_id: string
+  release_id: string
+  scenario_id: string
+  title: string
+  host: PluginHost
+  phase: string
+  active: boolean
+  frozen: boolean
+  created_at: string
+}
+export interface CodingProjectSummary {
+  id: string
+  scenario_id: string
+  release_id: string
+  host: PluginHost
+  phase: CodingWorkspace['phase']
+  plugin_version: string
+  capabilities: Array<{ kind: PackageCapabilityKind; key: string; name: string }>
+  created_at: string
+}
 export interface CodingFile { path: string; content: string; previous: string; editable: boolean }
-export interface CodingWorkspace {
+export interface CodingProject {
   id: string
   release_id: string
   revision: number
+  phase: CodingWorkspace['phase']
+  files: CodingFile[]
+}
+export interface CodingWorkspace {
+  id: string
+  release_id: string
+  scenario_id: string
+  revision: number
   phase: 'draft' | 'generating' | 'ready_for_review' | 'validation_failed' | 'released'
   source_phase?: CodingWorkspace['phase']
-  plugin_version: string
+  session_id: string
+  session_title: string
   host: PluginHost
   files_hash: string
   files: CodingFile[]
@@ -73,7 +103,6 @@ export interface CodingCreate extends ScenarioPackageBuild {
   request_id: string
   llm_config_id: string
   instruction: string
-  plugin_version: string
   skill_ids?: string[]
   mcp_ids?: string[]
 }
@@ -81,15 +110,16 @@ export type CodingDraftCreate = Omit<CodingCreate, 'acceptance_cases' | 'confirm
 export interface CodingUpdate {
   expected_revision: number
   request_id: string
+  session_id: string
   action: 'generate' | 'save' | 'discuss' | 'stop'
   base_files_hash: string
   instruction: string
   files: { path: string; content: string }[]
-  plugin_version?: string
 }
 export interface CodingExport {
   expected_revision: number
   files_hash: string
   format: 'plugin' | 'marketplace'
+  plugin_version: string
   confirmed_code_review: true
 }

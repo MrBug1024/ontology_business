@@ -1,14 +1,14 @@
 <template>
   <el-drawer v-model="visible" title="审阅定版" size="min(460px, 100vw)" :close-on-click-modal="!exporting" :close-on-press-escape="!exporting" :show-close="!exporting">
-    <div class="delivery-intro"><el-icon :size="28" aria-hidden="true"><Box /></el-icon><h2>完成开发，固定这个版本</h2><p>审阅代码、差异和使用步骤后保存不可变版本。发布中心将从已定版插件中选择安装包或市场发布材料。</p></div>
+    <div class="delivery-intro"><el-icon :size="28" aria-hidden="true"><Box /></el-icon><h2>开发完成，发布快照</h2><p>审阅代码、差异和使用步骤后，为当前源码保存一份不可变的定版快照并送入发布中心。发布不影响开发中的源码：项目状态、修订与文件保持原样，发布中心的上线、下线、删除也只作用于快照。</p></div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <el-alert v-if="dirty" title="还有未保存的文件或修正意见，请先回工作台处理。" type="warning" :closable="false" />
-    <el-form label-position="top"><el-form-item label="插件版本"><el-input v-model="version" aria-label="插件交付版本" maxlength="14" :disabled="busy || exporting" /><p v-if="versionDirty && !validVersion" class="version-error">使用三段数字，例如 1.0.1，不含前导零。</p><el-button v-if="versionDirty" size="small" :disabled="!validVersion || dirty || busy || exporting" @click="emit('version', version)">保存新版本</el-button></el-form-item></el-form>
+    <el-form label-position="top"><el-form-item label="定版版本"><el-input v-model="version" aria-label="插件定版版本" maxlength="14" :disabled="busy || exporting" /><p v-if="!validVersion" class="version-error">使用三段数字，例如 1.0.1，不含前导零。</p><p class="version-hint">{{ versionHint }}</p></el-form-item></el-form>
     <div class="review-scope"><span>{{ workspace.files.filter(file => file.editable).length }} 个定制文件</span><span>{{ workspace.validation.length ? '校验尚有缺口' : '结构校验通过' }}</span></div>
     <PluginBusinessAcceptance v-if="visible && workspace.business_acceptance_required" :workspace="workspace" :disabled="exporting || busy" @change="acceptance = $event" />
-    <el-checkbox v-model="reviewed" :disabled="dirty || versionDirty || workspace.phase === 'generating'">我已审阅当前代码、差异和业务场景使用步骤</el-checkbox>
-    <div class="delivery-options"><el-button type="primary" :disabled="!canExport" :loading="exporting" @click="review">完成审阅并定版</el-button><RouterLink v-if="completed" :to="{ name: 'capability-access', query: { scenario_id: completed.scenario_id, release_id: completed.release_id, artifact: completed.id } }">到发布中心选择此版本<el-icon aria-hidden="true"><ArrowRight /></el-icon></RouterLink></div>
-    <p v-if="exporting" role="status">正在校验并保存审阅版本…</p><p v-if="completed" role="status">v{{ completed.plugin_version }} 已定版，可在发布中心交付。后续修改需要使用新版本。</p>
+    <el-checkbox v-model="reviewed" :disabled="dirty || workspace.phase === 'generating'">我已审阅当前代码、差异和业务场景使用步骤</el-checkbox>
+    <div class="delivery-options"><el-button type="primary" :disabled="!canExport" :loading="exporting" @click="review">发布快照到发布中心</el-button><RouterLink v-if="completed" :to="{ name: 'capability-access', query: { scenario_id: completed.scenario_id, release_id: completed.release_id, artifact: completed.id } }">到发布中心管理此版本<el-icon aria-hidden="true"><ArrowRight /></el-icon></RouterLink></div>
+    <p v-if="exporting" role="status">正在校验并保存定版快照…</p><p v-if="completed" role="status">v{{ completed.plugin_version }} 已进入发布中心；源码未受影响，可继续开发新版本。</p>
   </el-drawer>
 </template>
 <script setup lang="ts">
@@ -19,21 +19,30 @@ import PluginBusinessAcceptance from './PluginBusinessAcceptance.vue'
 import type { ScenarioPackageBuild } from '@/types/scenarioPackage'
 import type { CodingWorkspace } from '@/types/pluginCoding'
 import type { PluginArtifact } from '@/types/pluginArtifact'
-const props = defineProps<{ workspace: CodingWorkspace; dirty: boolean; busy: boolean }>()
-const emit = defineEmits<{ version: [version: string]; refresh: [] }>()
+const props = defineProps<{ workspace: CodingWorkspace; dirty: boolean; busy: boolean; lastPublished: string }>()
+const emit = defineEmits<{ refresh: [] }>()
 const visible = ref(false)
 const reviewed = ref(false)
-const version = ref(props.workspace.plugin_version)
+const version = ref('1.0.0')
 const exporting = ref(false)
 const error = ref('')
 const completed = ref<PluginArtifact | null>(null)
 const acceptance = ref<ScenarioPackageBuild | null>(null)
-const versionDirty = computed(() => version.value !== props.workspace.plugin_version)
+const suggested = computed(() => {
+  if (!props.lastPublished) return '1.0.0'
+  const [major, minor, patch] = props.lastPublished.split('.').map(Number)
+  if (patch < 9999) return `${major}.${minor}.${patch + 1}`
+  if (minor < 9999) return `${major}.${minor + 1}.0`
+  return `${major + 1}.0.0`
+})
 const validVersion = computed(() => /^(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})$/.test(version.value))
-const canExport = computed(() => reviewed.value && (!props.workspace.business_acceptance_required || acceptance.value !== null) && !props.dirty && !versionDirty.value && !props.busy && !exporting.value && props.workspace.phase !== 'generating' && props.workspace.run_status !== 'failed' && !props.workspace.validation.length)
+const versionHint = computed(() => props.lastPublished
+  ? `当前源码最近定版为 v${props.lastPublished}；同一版本号不能覆盖不同源码。`
+  : '这份插件源码尚未定版，通常从 1.0.0 开始。')
+const canExport = computed(() => reviewed.value && validVersion.value && (!props.workspace.business_acceptance_required || acceptance.value !== null) && !props.dirty && !props.busy && !exporting.value && props.workspace.phase !== 'generating' && props.workspace.run_status !== 'failed' && !props.workspace.validation.length)
 let controller: AbortController | undefined
 let disposed = false
-watch(() => props.workspace.plugin_version, value => { version.value = value })
+watch(suggested, (value, previous) => { if (version.value === previous || !version.value) version.value = value }, { immediate: true })
 watch(() => [props.workspace.revision, props.dirty, version.value], () => { reviewed.value = false })
 async function review() {
   if (!canExport.value) return
@@ -43,7 +52,7 @@ async function review() {
   completed.value = null
   controller = new AbortController()
   try {
-    const artifact = await pluginCodingApi.review(value.id, { expected_revision: value.revision, files_hash: value.files_hash, confirmed_code_review: true, ...(value.business_acceptance_required && acceptance.value ? { acceptance: acceptance.value } : {}) }, controller.signal)
+    const artifact = await pluginCodingApi.review(value.id, { expected_revision: value.revision, files_hash: value.files_hash, plugin_version: version.value, confirmed_code_review: true, ...(value.business_acceptance_required && acceptance.value ? { acceptance: acceptance.value } : {}) }, controller.signal)
     if (disposed) return
     completed.value = artifact
     emit('refresh')
@@ -70,6 +79,7 @@ b, small { display: block; }
 b { font-size: 14px; font-weight: 600; }
 small { font-size: 12px; margin-top: 5px; color: var(--text-2); }
 .version-error { color: var(--danger); }
+.version-hint { color: var(--text-2); }
 :deep(.el-checkbox) { height: auto; align-items: flex-start; }
 :deep(.el-checkbox__label) { white-space: normal; line-height: 1.7; }
 :deep(.el-checkbox__input) { margin-top: 5px; }

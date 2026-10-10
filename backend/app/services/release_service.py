@@ -52,6 +52,7 @@ from ..models import (
     SemanticMapping,
     WorkflowRun,
 )
+from ..release_models import ReleaseLifecycleEvent
 from . import (
     connector_service,
     function_definition_service,
@@ -2616,35 +2617,48 @@ _ACTIVE_RELEASE_RESOURCE_COLLECTIONS: dict[str, tuple[str, str]] = {
 }
 
 
-def assert_scenario_deletion_allowed(
+def retire_scenario_releases(
     db: Session,
     scenario: BusinessScenario,
-) -> None:
-    """Keep the scenario-level anchor while a formal release is active."""
-    active_release = db.execute(
-        select(OntologyRelease.id)
-        .where(
-            OntologyRelease.scenario_id == scenario.id,
-            OntologyRelease.status == "released",
-        )
-        .with_for_update()
-        .limit(1)
-    ).scalar_one_or_none()
-    if active_release is not None:
-        raise ReleaseConflictError("不能删除仍被有效发布引用的业务场景")
+    *,
+    actor_id: str | None,
+) -> list[OntologyRelease]:
+    """Cascade scenario retirement onto its not-yet-retired releases.
 
-
-def assert_scenario_retirement_allowed(
-    db: Session,
-    scenario: BusinessScenario,
-) -> None:
-    """Require formal releases to be retired before scenario retirement."""
-    try:
-        assert_scenario_deletion_allowed(db, scenario)
-    except ReleaseConflictError as exc:
-        raise ReleaseConflictError(
-            "不能退役仍被有效发布引用的业务场景"
-        ) from exc
+    Scenario retirement is an explicit human governance decision, so the
+    releases it anchors are retired in the same transaction instead of
+    blocking the workspace lifecycle.  Each release keeps its own audited
+    lifecycle event and revision bump; the immutable snapshot and invocation
+    history remain readable for already-pinned runs.
+    """
+    releases = list(
+        db.execute(
+            select(OntologyRelease)
+            .where(
+                OntologyRelease.scenario_id == scenario.id,
+                OntologyRelease.tenant_id == scenario.tenant_id,
+                OntologyRelease.status == "released",
+                OntologyRelease.deleted_at.is_(None),
+            )
+            .with_for_update()
+        ).scalars().all()
+    )
+    retired_at = _now()
+    for release in releases:
+        release.enabled = False
+        release.status = "retired"
+        release.retired_at = retired_at
+        release.revision += 1
+        db.add(ReleaseLifecycleEvent(
+            release_id=release.id,
+            tenant_id=release.tenant_id,
+            scenario_id=release.scenario_id,
+            snapshot_id=release.snapshot_id,
+            actor_id=actor_id,
+            revision=release.revision,
+            action="scenario_retire",
+        ))
+    return releases
 
 
 def assert_resource_deletion_allowed(

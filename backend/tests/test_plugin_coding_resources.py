@@ -325,7 +325,7 @@ def test_discussion_cannot_write_files_or_claim_revalidation():
 
 
 def test_legacy_project_discussion_refreshes_exact_release_context_without_changing_files(monkeypatch):
-    document = {"manifest": {"scenario": {"id": "scenario"}, "deployment": {"release_id": "fixed-release"}},
+    document = {"manifest": {"scenario": {"id": "scenario"}, "deployment": {"release_id": "fixed-release"}, "host": "claude_code"},
         "revision": 5, "files": {"README.md": "Reviewed source"}, "previous": {}, "phase": "released", "events": [],
         "active_run_id": None, "required_paths": ["scripts/existing.py"], "coding_contract": {"legacy": True},
         "validation": [], "llm_config_id": "model"}
@@ -333,7 +333,9 @@ def test_legacy_project_discussion_refreshes_exact_release_context_without_chang
     calls = []
     monkeypatch.setattr(workspace, "owned_root", lambda *args, **kwargs: row)
     monkeypatch.setattr(workspace, "assert_adapter_identity", lambda *args: None)
-    monkeypatch.setattr(workspace, "public_workspace", lambda db, root: deepcopy(root.proposal))
+    monkeypatch.setattr(workspace, "find_project_thread", lambda db, scenario_id, host: SimpleNamespace(id="workspace"))
+    monkeypatch.setattr(workspace, "owned_session", lambda db, project_id, session_id: SimpleNamespace(id=session_id))
+    monkeypatch.setattr(workspace, "public_workspace", lambda db, root, session_id=None: deepcopy(root.proposal))
     monkeypatch.setattr(resources.release_service, "_scenario_for_manage", lambda *args: None)
     monkeypatch.setattr(resources, "prepare_context", lambda *args: {})
     def contract(db, manifest):
@@ -342,7 +344,8 @@ def test_legacy_project_discussion_refreshes_exact_release_context_without_chang
     monkeypatch.setattr(workspace, "authoring_contract", contract)
     monkeypatch.setattr(workspace, "enqueue_round", lambda *args, **kwargs: None)
     result = workspace.update_workspace(DB(), "workspace", PluginCodingUpdate(expected_revision=5,
-        request_id="request-id", action="discuss", base_files_hash=files_hash(document["files"]), instruction="Explain the scenario goal"))
+        session_id="b" * 32, request_id="request-id", action="discuss",
+        base_files_hash=files_hash(document["files"]), instruction="Explain the scenario goal"))
     assert calls == ["fixed-release"]
     assert result["coding_contract"]["scenario"]["description"] == "Fixed release goal"
     assert result["files"] == document["files"] and result["required_paths"] == document["required_paths"]
@@ -356,7 +359,7 @@ def test_discussion_queue_and_read_progress_describe_the_current_mode(monkeypatc
                         lambda db: SimpleNamespace(tenant_id="tenant", user_id="user"))
     monkeypatch.setattr(workspace.jobs, "request_message_id", lambda kind, **kwargs: kind)
     monkeypatch.setattr(workspace.jobs, "enqueue_request", lambda *args, **kwargs: None)
-    workspace.enqueue_round(SimpleNamespace(add_all=lambda values: None), row,
+    workspace.enqueue_round(SimpleNamespace(add_all=lambda values: None), row, "c" * 32,
                             instruction="Explain the existing plugin", request_id="request-id", mode="discuss")
     assert row.proposal["events"][-1]["message"] == "讨论问题已保存，等待后台分析"
     assert row.proposal['coding_failure_diagnostic'] is None
@@ -397,15 +400,18 @@ def test_coding_failure_persistence_contains_only_bounded_safe_diagnostic_fields
 
 
 def test_public_discussion_source_phase_preserves_the_reviewed_source_state(monkeypatch):
-    document = {'manifest': {'package_name': 'scenario-fixture', 'capabilities': []},
+    document = {'manifest': {'package_name': 'scenario-fixture', 'capabilities': [], 'scenario': {'id': 'scenario'}},
         'plugin_version': '1.0.0', 'revision': 2, 'phase': 'generating', 'round_mode': 'discuss',
         'round_base_phase': 'released', 'release_id': 'release', 'llm_config_id': 'model',
         'files': {'README.md': 'Reviewed source'}, 'events': [], 'validation': [],
         'active_run_id': None, 'coding_contract': {'capabilities': []}}
     monkeypatch.setattr(workspace, 'assert_adapter_identity', lambda *args: None)
     monkeypatch.setattr(workspace, 'coding_turns', lambda *args: [])
+    monkeypatch.setattr(workspace, 'latest_session_thread', lambda db, project_id: None)
     result = workspace.public_workspace(DB(), SimpleNamespace(thread_id='workspace', proposal=document))
     assert result['phase'] == 'generating' and result['source_phase'] == 'released'
+    assert result['scenario_id'] == 'scenario'
+    assert result['session_id'] == '' and result['turns'] == []
 
 
 @pytest.mark.parametrize('missing_path', ['.', 'server-missing.py'])

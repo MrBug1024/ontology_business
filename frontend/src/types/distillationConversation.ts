@@ -7,7 +7,7 @@ export interface DistillationResourceSelection {
   mcp_ids?: string[]
   investigation_tool_keys?: InvestigationToolKey[] | null
 }
-export type InvestigationToolKey = 'list_evidence' | 'read_evidence' | 'read_current_document' | 'review_business' | 'read_target_system' | 'read_database_sample' | 'compare_database_samples' | 'discover_data_landscape' | 'infer_data_lineage' | 'record_human_statement' | 'open_business_system' | 'inspect_business_page' | 'navigate_business_page' | 'fill_business_query' | 'click_business_control' | 'login_business_system' | 'list_library_sources' | 'list_library_files' | 'read_library_source' | 'read_attachment' | 'ask_human' | 'propose_document'
+export type InvestigationToolKey = 'list_evidence' | 'read_evidence' | 'read_current_document' | 'review_business' | 'read_target_system' | 'read_database_sample' | 'compare_database_samples' | 'discover_data_landscape' | 'infer_data_lineage' | 'record_human_statement' | 'open_business_system' | 'inspect_business_page' | 'navigate_business_page' | 'fill_business_query' | 'click_business_control' | 'login_business_system' | 'list_library_sources' | 'list_library_files' | 'read_library_source' | 'read_attachment' | 'ask_human' | 'propose_document' | 'deliver_to_library'
 export interface DistillationResourceOption {
   id: string
   name: string
@@ -61,6 +61,15 @@ export interface DistillationWebsiteObservation {
   visible_fields: string[]
   allowed_links: string[]
 }
+export interface DistillationDeliveryReceipt {
+  data_source_id: string
+  publication_id: string
+  name: string
+  decision: 'continue' | 'adjust' | 'stop'
+  artifacts: { key: string; filename: string }[]
+  already_delivered: boolean
+  delivered_at: string
+}
 export interface DistillationToolStep {
   id: string
   tool_name: string
@@ -73,6 +82,7 @@ export interface DistillationToolStep {
   library?: { data_source_id: string; bucket_file_id: string | null; evidence_key: string; title: string; identity_sha256: string; retrieved_at: string } | null
   libraries?: { data_source_id: string; bucket_file_id: string | null; evidence_key: string; title: string; identity_sha256: string; retrieved_at: string }[]
   mcp?: { mcp_id: string; evidence_key: string; title: string; summary: string; content_sha256: string; identity_sha256: string; retrieved_at: string; read_only: true } | null
+  delivery?: DistillationDeliveryReceipt | null
   capability?: {
     capability: 'jev_decide'
     mcp_id: string

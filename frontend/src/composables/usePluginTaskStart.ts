@@ -13,7 +13,6 @@ export function usePluginTaskStart(release: Ref<ScenarioRelease>, initialSetting
   const resourceSelection = ref<CodingResourceSelection>({ llm_config_id: initialSettings?.llm_config_id || '', skill_ids: [...(initialSettings?.skill_ids || [])], mcp_ids: [...(initialSettings?.mcp_ids || [])] })
   const models = computed(() => catalog.value?.models || [])
   const modelId = computed({ get: () => resourceSelection.value.llm_config_id, set: (value: string) => { resourceSelection.value = { ...resourceSelection.value, llm_config_id: value } } })
-  const pluginVersion = ref('1.0.0')
   const target = ref<PluginHost>('claude_code')
   const loading = ref(false)
   const building = ref(false)
@@ -24,9 +23,8 @@ export function usePluginTaskStart(release: Ref<ScenarioRelease>, initialSetting
   let admissionId = ''
   const capabilities = computed(() => context.value?.capabilities || [])
   const selectedCapabilities = computed(() => capabilities.value.filter(item => selected[`${item.kind}:${item.key}`]).map(({ kind, key }) => ({ kind, key })))
-  const validVersion = computed(() => /^(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})$/.test(pluginVersion.value))
   const resourcesValid = computed(() => Boolean(resourceSelection.value.skill_ids.length <= 10 && resourceSelection.value.mcp_ids.length <= 10 && catalog.value?.models.some(model => model.id === modelId.value && (!resourceSelection.value.mcp_ids.length || model.supports_tools)) && resourceSelection.value.skill_ids.every(id => catalog.value?.skills.some(item => item.id === id)) && resourceSelection.value.mcp_ids.every(id => catalog.value?.mcps.some(item => item.id === id))))
-  const canStart = computed(() => !loading.value && !building.value && release.value.enabled && selectedCapabilities.value.length > 0 && selectedCapabilities.value.length <= 20 && Boolean(instruction.value.trim()) && resourcesValid.value && validVersion.value)
+  const canStart = computed(() => !loading.value && !building.value && release.value.enabled && selectedCapabilities.value.length > 0 && selectedCapabilities.value.length <= 20 && Boolean(instruction.value.trim()) && resourcesValid.value)
   async function load() {
     controller?.abort()
     const current = ++generation
@@ -65,7 +63,7 @@ export function usePluginTaskStart(release: Ref<ScenarioRelease>, initialSetting
     const current = generation
     building.value = true
     error.value = ''
-    const payload = { expected_revision: release.value.revision, target: target.value, capabilities: selectedCapabilities.value, ...resourceSelection.value, instruction: instruction.value, plugin_version: pluginVersion.value }
+    const payload = { expected_revision: release.value.revision, target: target.value, capabilities: selectedCapabilities.value, ...resourceSelection.value, instruction: instruction.value }
     const body = JSON.stringify(payload)
     if (body !== admissionBody) { admissionBody = body; admissionId = createClientRequestId() }
     controller?.abort()
@@ -76,7 +74,12 @@ export function usePluginTaskStart(release: Ref<ScenarioRelease>, initialSetting
     } catch (caught: unknown) { if (current === generation) error.value = caught instanceof Error ? caught.message : '编码任务创建失败；需求已保留，可重试'; return null }
     finally { if (current === generation) building.value = false }
   }
+  function applyFixedCapabilities(fixed: Array<{ kind: string; key: string }>) {
+    // An existing project fixes the capability scope; the form reflects it.
+    for (const key of Object.keys(selected)) delete selected[key]
+    for (const item of fixed) selected[`${item.kind}:${item.key}`] = true
+  }
   watch([() => release.value.id, target], load, { immediate: true })
   onBeforeUnmount(() => { generation++; controller?.abort() })
-  return { context, capabilities, catalog, models, resourceSelection, selected, instruction, modelId, pluginVersion, target, loading, building, error, validVersion, canStart, load, start }
+  return { context, capabilities, catalog, models, resourceSelection, selected, instruction, modelId, target, loading, building, error, canStart, load, start, applyFixedCapabilities }
 }

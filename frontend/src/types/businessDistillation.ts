@@ -144,7 +144,6 @@ export interface DistillationScenarioState {
   document: DistillationDocument
   updated_at: string
 }
-export interface DistillationProposal { base_revision: number; document: DistillationDocument; limitations: string[] }
 export interface DistillationArtifact { key: string; filename: string; mime: string; sha256: string }
 export interface DistillationPublication {
   id: string

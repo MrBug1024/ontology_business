@@ -34,6 +34,7 @@ InvestigationToolKey = Literal[
     "read_attachment",
     "ask_human",
     "propose_document",
+    "deliver_to_library",
 ]
 
 
@@ -205,6 +206,21 @@ class JevDecisionReceipt(ClosedModel):
         return self
 
 
+class DeliveryArtifactReceipt(ClosedModel):
+    key: Annotated[str, Field(min_length=1, max_length=32)]
+    filename: Annotated[str, Field(min_length=1, max_length=200)]
+
+
+class DeliveryReceipt(ClosedModel):
+    data_source_id: Annotated[str, Field(min_length=1, max_length=32)]
+    publication_id: Annotated[str, Field(min_length=1, max_length=32)]
+    name: Annotated[str, Field(min_length=1, max_length=200)]
+    decision: Literal["continue", "adjust", "stop"]
+    artifacts: list[DeliveryArtifactReceipt] = Field(default_factory=list, max_length=16)
+    already_delivered: bool = False
+    delivered_at: datetime
+
+
 class ToolStep(ClosedModel):
     id: Annotated[str, Field(max_length=32)]
     tool_name: Annotated[str, Field(max_length=64)]
@@ -218,6 +234,7 @@ class ToolStep(ClosedModel):
     libraries: list[LibraryReadReceipt] = Field(default_factory=list, max_length=6)
     mcp: MCPReadReceipt | None = None
     capability: JevDecisionReceipt | None = None
+    delivery: DeliveryReceipt | None = None
 
 
 class TurnOut(ClosedModel):

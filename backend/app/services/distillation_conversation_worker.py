@@ -278,7 +278,7 @@ def _start_step(lease, session_factory, name: str) -> str:
             raise ValueError("Investigation tool limit reached")
         row.steps = [*row.steps, {"id": step_id, "tool_name": name, "title": title,
             "status": "running", "summary": "正在调查…", "started_at": leases.now().isoformat(),
-            "completed_at": None, "source": None, "capability": None}]
+            "completed_at": None, "source": None, "capability": None, "delivery": None}]
     _save(lease, session_factory, mutate)
     return step_id
 
@@ -339,7 +339,8 @@ def _complete_step(lease, session_factory, step_id, result):
         row.steps = [{**step, "status": "failed" if result.content.get("status") == "blocked" else "succeeded", "summary": result.summary[:4000],
             "completed_at": leases.now().isoformat(),
             "source": result.source.model_dump(mode="json") if result.source else None, "library": receipt,
-            "libraries": receipts, "mcp": mcp_receipt, "capability": capability_receipt}
+            "libraries": receipts, "mcp": mcp_receipt, "capability": capability_receipt,
+            "delivery": result.delivery.model_dump(mode="json") if result.delivery else None}
             if step["id"] == step_id else step for step in row.steps]
     _save(lease, session_factory, mutate)
 

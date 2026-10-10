@@ -54,6 +54,9 @@
     </section>
 
     <el-tabs v-model="activeTab" class="access-tabs">
+      <el-tab-pane label="能力版本" name="releases">
+        <ScenarioReleaseList :scenario-id="scenarioId" :scenarios="scenarios" :can-manage="canManage" @select="selectRelease" @changed="releaseChanged" />
+      </el-tab-pane>
       <el-tab-pane label="插件发布" name="plugins">
         <PluginPublishing :scenario-id="scenarioId" :artifact-id="queryText(route.query.artifact)" @select="selectPlugin" />
       </el-tab-pane>
@@ -224,7 +227,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import PluginPublishing from '@/components/plugin-coding/PluginPublishing.vue'
+import ScenarioReleaseList from '@/components/ScenarioReleaseList.vue'
 import type { PluginArtifact } from '@/types/pluginArtifact'
+import type { ScenarioRelease } from '@/types/scenarioRelease'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api'
@@ -253,7 +258,7 @@ const manifestErrorRef = ref()
 const loadingScenarios = ref(false)
 const loadingManifest = ref(false)
 const activeTab = computed({
-  get: () => ['plugins', 'adapters', 'keys', 'manifest'].includes(queryText(route.query.tab)) ? queryText(route.query.tab) : 'plugins',
+  get: () => ['releases', 'plugins', 'adapters', 'keys', 'manifest'].includes(queryText(route.query.tab)) ? queryText(route.query.tab) : 'plugins',
   set: (value: string) => { void router.replace({ query: { ...route.query, tab: value === 'plugins' ? undefined : value } }) },
 })
 const mcpAdapters = computed(() => manifest.value?.adapters.filter(item => item.protocol === 'mcp') || [])
@@ -423,6 +428,15 @@ async function deleteUnboundKey(key: IntegrationKey) {
 
 function selectPlugin(value: PluginArtifact) {
   void router.push({ query: { scenario_id: value.scenario_id, release_id: value.release_id, artifact: value.id } })
+}
+
+function selectRelease(value: ScenarioRelease) {
+  void router.push({ query: { scenario_id: value.scenario_id, release_id: value.id } })
+  activeTab.value = 'adapters'
+}
+
+function releaseChanged(release: ScenarioRelease) {
+  if (release.id === releaseId.value) void loadManifest()
 }
 
 function clearSecret() {

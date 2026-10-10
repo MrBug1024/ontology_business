@@ -6,7 +6,10 @@ import re
 import json
 from jsonschema import Draft202012Validator
 from .capability_contracts import canonical_hash, canonical_json
-from .plugin_source_policy import MAX_PROJECT_FILES, check_client_script, check_reference, check_skill, editable_path
+from .plugin_source_policy import (
+    MAX_PROJECT_FILES, check_client_script, check_reference, check_skill, check_standard_layout, editable_path,
+)
+from .plugin_skill_contract import load_frontmatter
 from .plugin_client_contract import check_invocation_options, client_contract
 from .plugin_host_profile import require_manifest_host
 
@@ -119,12 +122,18 @@ def validate_files(files: dict[str, str], manifest: dict) -> list[str]:
             issues.append(f'{path}：Codex 插件不能使用其他宿主变量或不支持的安装命令，请依据当前宿主契约修正')
         if path.endswith('/SKILL.md'):
             issues.extend(check_skill(path, content))
-        elif path.startswith('scripts/'):
+        elif path.endswith('.py') and not path.startswith('examples/'):
+            # Every generated script — root, inside a Skill, or under hooks —
+            # stays within the trusted client boundary.
             issues.extend(f'{path}：{issue}' for issue in check_client_script(content, manifest))
         elif path.startswith('examples/') and path != 'examples/invoke.py':
             issues.extend(f'{path}：{issue}' for issue in check_example(content, manifest))
         elif path.endswith('.json'):
             issues.extend(check_reference(path, content))
+        elif path.startswith(('agents/', 'commands/', 'output-styles/')) and path.endswith('.md'):
+            _, frontmatter_error = load_frontmatter(content)
+            if frontmatter_error is not None:
+                issues.append(f'{path}：{frontmatter_error}')
         client = manifest.get('client_contract')
         if client and path.endswith('.md'):
             environment = client.get('environment') or client_contract()['environment']
@@ -136,4 +145,5 @@ def validate_files(files: dict[str, str], manifest: dict) -> list[str]:
         if marker not in skill + files['README.md']:
             issues.append(f'使用合同缺少必要说明：{marker}')
     issues.extend(check_example(files['examples/invoke.py'], manifest))
+    issues.extend(check_standard_layout(files))
     return issues

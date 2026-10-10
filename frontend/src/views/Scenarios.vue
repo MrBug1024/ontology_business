@@ -155,6 +155,7 @@ const purgeCountLabels: Record<string, string> = {
   agents: '验证 Agent', conversations: '验证会话', messages: '对话消息', assistant_threads: '顾问会话',
   assistant_attachments: '顾问附件', capability_invocations: '能力调用记录', action_logs: '操作审计',
   workflow_runs: '工作流记录', releases: '发布记录', llm_traces: '模型调用审计',
+  plugin_publications: '已发布插件安装源',
   assertions: '验证结论', derivation_runs: '推理运行', derivation_evidence: '推理证据',
   external_api_keys: '集成密钥及签发审计', external_scenario_assets: '外部调用附件归属',
 }
@@ -208,7 +209,7 @@ async function save() {
 async function remove(s: Scenario) {
   try {
     await ElMessageBox.confirm(
-      `退役场景「${s.name}」？退役会暂停新的验证和调用，但保留全部配置；之后可以随时恢复或由管理员永久删除。`,
+      `退役场景「${s.name}」？退役会暂停新的验证和调用；仍在启用的能力版本将一并停用并退役，第三方调用随之停止（审计保留）。之后可以随时恢复或由管理员永久删除。`,
       '确认退役',
       { type: 'warning' },
     )

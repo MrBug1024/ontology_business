@@ -39,8 +39,8 @@ function mount(document = emptyDistillationDocument(), overrides = {}) {
     insert(child, parent, anchor) { remove(child); const index = parent.children.indexOf(anchor); parent.children.splice(index < 0 ? parent.children.length : index, 0, child); child.parent = parent },
     remove, parentNode: target => target.parent, nextSibling: target => target.parent?.children[target.parent.children.indexOf(target) + 1] || null,
   })
-  const root = node('root'), asks = [], publications = []
-  const app = renderer.createApp(Canvas, { document, embedded: true, dirty: false, canEdit: true, canPublish: false, onAsk: message => asks.push(message), onPublish: () => publications.push(true), ...overrides })
+  const root = node('root'), asks = []
+  const app = renderer.createApp(Canvas, { document, embedded: true, dirty: false, canEdit: true, onAsk: message => asks.push(message), ...overrides })
   app.component('el-button', { setup: (_props, context) => () => h('button', context.attrs, context.slots.default?.()) })
   app.component('el-icon', { setup: (_props, context) => () => h('i', context.attrs, context.slots.default?.()) })
   app.mount(root)
@@ -49,7 +49,7 @@ function mount(document = emptyDistillationDocument(), overrides = {}) {
   const button = label => all().find(target => target.type === 'button' && textOf(target) === label)
   const tabs = () => all().filter(target => target.props.role === 'tab')
   const choose = async label => { const target = button(label); assert.ok(target, `Missing button: ${label}`); target.props.onClick(); await nextTick() }
-  return { all, text: () => textOf(root), button, tabs, choose, asks, publications, focused: () => focused, stop: () => app.unmount() }
+  return { all, text: () => textOf(root), button, tabs, choose, asks, focused: () => focused, stop: () => app.unmount() }
 }
 
 test('conclusion tabs have keyboard navigation, one tab stop, and a labelled active panel', async () => {
@@ -86,8 +86,7 @@ test('empty artifact tabs contain only concise empty states with no modeling for
   }
   assert.deepEqual(document, before)
   assert.deepEqual(view.asks, [])
-  assert.deepEqual(view.publications, [])
-  assert.equal(view.button('保存到资料库').props.disabled, true)
+  assert.equal(view.button('保存到资料库'), undefined)
   view.stop()
 })
 
@@ -104,40 +103,14 @@ test('questions display AI findings without topic signoff forms or automatic cha
   view.stop()
 })
 
-test('saved publication artifacts stay within their matching conclusion tabs', async () => {
-  const artifact = (key, filename) => ({ key, filename, mime: 'text/plain', sha256: `${key}-sha256` })
-  const version = {
-    id: 'publication-1', project_id: 'project-1', scenario_id: null, project_revision: 3,
-    data_source_id: 'source-1', created_at: '2026-09-21T00:00:00Z',
-    artifacts: [
-      artifact('brief', 'business-brief.md'), artifact('as_is', 'process-as-is.mmd'),
-      artifact('to_be', 'process-to-be.mmd'), artifact('er', 'entity-relations.mmd'),
-      artifact('lineage', 'data-lineage.mmd'), artifact('contract', 'business-contract.json'),
-      artifact('provenance', 'evidence-provenance.json'),
-    ],
+test('conclusion tabs never render publication management for delivered documents', async () => {
+  const view = mount(emptyDistillationDocument())
+  for (const label of ['业务价值', 'ER', '流程', '血缘', '历史案例', '证据', '待澄清']) {
+    await view.choose(label)
+    assert.doesNotMatch(view.text(), /交付物|版本|删除版本/)
+    assert.equal(view.button('保存到资料库'), undefined)
+    assert.equal(view.all().find(target => target.props['aria-label'] === '当前分类已保存交付物'), undefined)
   }
-  const downloads = []
-  const view = mount(emptyDistillationDocument(), {
-    publications: [version],
-    onDownloadPublication: (_publication, artifact) => downloads.push(artifact.key),
-  })
-
-  assert.doesNotMatch(view.text(), /已保存交付物/)
-  await view.choose('ER')
-  assert.match(view.text(), /ER交付物/)
-  assert.ok(view.all().find(target => target.props.role === 'tabpanel')?.children.some(target => target.props['aria-label'] === '当前分类已保存交付物'))
-  assert.ok(view.button('下载 entity-relations.mmd'))
-  assert.equal(view.button('下载 process-as-is.mmd'), undefined)
-  view.button('下载 entity-relations.mmd').props.onClick()
-  await view.choose('流程')
-  assert.ok(view.button('下载 process-as-is.mmd'))
-  assert.ok(view.button('下载 process-to-be.mmd'))
-  assert.equal(view.button('下载 entity-relations.mmd'), undefined)
-  await view.choose('血缘')
-  assert.ok(view.button('下载 data-lineage.mmd'))
-  await view.choose('证据')
-  assert.ok(view.button('下载 evidence-provenance.json'))
-  assert.deepEqual(downloads, ['er'])
   view.stop()
 })
 
@@ -156,12 +129,11 @@ test('unconfirmed entity relationships display uncertainty without a definite ca
 test('a saved target process is shown as an artifact even before value statements exist', async () => {
   const document = emptyDistillationDocument()
   document.to_be.nodes = [{ key: 'verify', name: '核对结果', owner: '', outcome: '', evidence_refs: [] }]
-  const view = mount(document, { canPublish: true })
+  const view = mount(document)
   await view.choose('流程')
   assert.match(view.text(), /核对结果/)
-  assert.match(view.text(), /已保存的阶段产物/)
-  assert.doesNotMatch(view.text(), /等待产物|暂无流程图谱/)
-  assert.equal(view.button('保存到资料库').props.disabled, false)
+  assert.doesNotMatch(view.text(), /等待产物|暂无流程图谱|已保存的阶段产物/)
+  assert.equal(view.button('保存到资料库'), undefined)
   view.stop()
 })
 

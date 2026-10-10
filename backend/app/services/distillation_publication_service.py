@@ -49,6 +49,21 @@ def create_publication(db: Session, *, tenant_id: str, scenario_id: str, project
     return publication
 
 
+def _find_scenario_publication(db: Session, *, tenant_id: str, scenario_id: str,
+                               scenario_state_id: str, revision: int) -> DistillationPublication | None:
+    # (project_id, project_revision) uniqueness cannot dedupe scenario-level
+    # rows because PostgreSQL treats NULL project_id as distinct; the lookup
+    # is the idempotency contract for scenario deliveries.
+    return db.scalar(select(DistillationPublication).join(DataSource,
+        DataSource.id == DistillationPublication.data_source_id).where(
+        DistillationPublication.tenant_id == tenant_id,
+        DistillationPublication.scenario_id == scenario_id,
+        DistillationPublication.project_id.is_(None),
+        DataSource.tenant_id == tenant_id,
+        DataSource.config["distillation_scenario_state_id"].as_string() == scenario_state_id,
+        DistillationPublication.project_revision == revision))
+
+
 def publish_scenario(db: Session, scenario_id: str, payload: ScenarioPublishRequest) -> DistillationPublication:
     from . import distillation_service
 
@@ -67,17 +82,51 @@ def publish_scenario(db: Session, scenario_id: str, payload: ScenarioPublishRequ
         state.updated_at = datetime.now(timezone.utc)
         state.updated_by = permission_service.require_principal(db).user_id
         db.flush()
-    existing = db.scalar(select(DistillationPublication).join(DataSource,
-        DataSource.id == DistillationPublication.data_source_id).where(
-        DistillationPublication.tenant_id == state.tenant_id,
-        DistillationPublication.scenario_id == scenario_id,
-        DistillationPublication.project_id.is_(None),
-        DataSource.tenant_id == state.tenant_id,
-        DataSource.config["distillation_scenario_state_id"].as_string() == state.id,
-        DistillationPublication.project_revision == state.revision))
+    existing = _find_scenario_publication(db, tenant_id=state.tenant_id, scenario_id=scenario_id,
+        scenario_state_id=state.id, revision=state.revision)
     if existing is not None:
         return existing
     scenario = db.scalar(select(BusinessScenario).where(
         BusinessScenario.id == scenario_id, BusinessScenario.tenant_id == state.tenant_id))
     return create_publication(db, tenant_id=state.tenant_id, scenario_id=scenario_id,
         project_id=None, revision=state.revision, name=scenario.name, document=document, scenario_state_id=state.id)
+
+
+def deliver_scenario_documents(db: Session, scenario_id: str, note: str) -> tuple[DistillationPublication, bool]:
+    """Deliver the current scenario baseline to scenario materials from a conversation.
+
+    Unlike publish_scenario this must not mutate the baseline: an in-flight
+    conversation turn keeps a frozen context that compares the scenario state
+    with the project document, so the handoff decision lives only inside the
+    immutable publication snapshot. Re-delivering the same baseline revision
+    returns the existing publication.
+    """
+    from . import distillation_service
+
+    state = distillation_service.scenario_state(db, scenario_id, write=True, lock=True, create=False)
+    if state is None:
+        raise HTTPException(422, "当前场景还没有可提交的阶段成果，请先在对话中形成并采用阶段结论")
+    existing = _find_scenario_publication(db, tenant_id=state.tenant_id, scenario_id=scenario_id,
+        scenario_state_id=state.id, revision=state.revision)
+    if existing is not None:
+        return existing, False
+    current_decision = state.document.get("decision")
+    if current_decision == "stop":
+        raise HTTPException(422, "当前阶段结论的人工决定为暂缓建设，不能直接提交；请先修订该决定")
+    decision = current_decision if current_decision in ("continue", "adjust") else "continue"
+    reason = str(state.document.get("decision_reason") or "").strip() or note.strip()
+    document = DistillationDocument.model_validate({**state.document,
+        "decision": decision, "decision_reason": reason[:4000]})
+    missing = [label for label, value in (("受益者", document.beneficiary), ("痛点", document.pain),
+        ("期望结果", document.desired_outcome), ("成功标准", document.success_metric)) if not value.strip()]
+    if not reason:
+        missing.append("提交说明")
+    if missing:
+        raise HTTPException(422, "提交前请先补齐：" + "、".join(missing))
+    scenario = db.scalar(select(BusinessScenario).where(
+        BusinessScenario.id == scenario_id, BusinessScenario.tenant_id == state.tenant_id))
+    if scenario is None:
+        raise HTTPException(404, "业务场景不存在")
+    publication = create_publication(db, tenant_id=state.tenant_id, scenario_id=scenario_id,
+        project_id=None, revision=state.revision, name=scenario.name, document=document, scenario_state_id=state.id)
+    return publication, True

@@ -17,11 +17,12 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { businessDistillationApi } from '@/api/businessDistillation'
-import { notifyScenarioDiscoveryContextChanged } from '@/utils/scenarioAdvisorEvents'
 import type { DataSource } from '@/types'
 import type { DistillationArtifact, DistillationPublication } from '@/types/businessDistillation'
 const props = defineProps<{ source: DataSource }>()
 const router = useRouter()
+// Scenario-level deliveries have no conversation; the publication id alone
+// identifies the immutable material.
 const projectId = computed(() => typeof props.source.config.distillation_project_id === 'string' ? props.source.config.distillation_project_id : '')
 const publicationId = computed(() => typeof props.source.config.publication_id === 'string' ? props.source.config.publication_id : '')
 const publication = ref<DistillationPublication | null>(null)
@@ -29,10 +30,10 @@ const loading = ref(false), error = ref(''), busy = ref('')
 let controller: AbortController | undefined
 function openDistillation() {
   if (props.source.scenario_id) {
-    void router.push({ name: 'scenario-detail', params: { id: props.source.scenario_id }, query: { stage: 'distillation', distillation_id: projectId.value } })
+    void router.push({ name: 'scenario-detail', params: { id: props.source.scenario_id }, query: { stage: 'distillation', ...(projectId.value ? { distillation_id: projectId.value } : {}) } })
     return
   }
-  void router.push({ name: 'business-distillation', params: { id: projectId.value } })
+  void router.push({ name: 'business-distillation', params: projectId.value ? { id: projectId.value } : {} })
 }
 async function load() {
   controller?.abort()
@@ -42,7 +43,7 @@ async function load() {
   error.value = ''
   loading.value = true
   try {
-    if (!projectId.value || !publicationId.value) throw new Error('资料库中的阶段交接资料引用不完整，请返回业务蒸馏核对。')
+    if (!publicationId.value) throw new Error('资料库中的阶段交接资料引用不完整，请返回业务蒸馏核对。')
     const result = await businessDistillationApi.publicationById(publicationId.value, request.signal)
     if (!request.signal.aborted) publication.value = result
   } catch (caught: unknown) {
@@ -78,7 +79,6 @@ async function remove() {
   busy.value = 'delete'
   try {
     await businessDistillationApi.deleteProduct(publicationId.value, new AbortController().signal)
-    notifyScenarioDiscoveryContextChanged(props.source.scenario_id || '')
     ElMessage.success('业务蒸馏产物已删除')
     if (props.source.scenario_id) {
       await router.replace({ name: 'scenario-detail', params: { id: props.source.scenario_id }, query: { stage: 'materials' } })

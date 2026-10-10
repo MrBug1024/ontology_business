@@ -86,9 +86,9 @@ def test_investigation_catalog_accepts_the_lineage_tool():
     items = catalog()
     response = InvestigationToolCatalogOut(
         default_tool_keys=[item["key"] for item in items if item["selectable"]],
-        always_available_tool_keys=["ask_human", "propose_document"],
+        always_available_tool_keys=["ask_human", "propose_document", "deliver_to_library"],
         tools=items,
     )
 
     assert "infer_data_lineage" in response.default_tool_keys
-    assert len(response.tools) == 22
+    assert len(response.tools) == 23

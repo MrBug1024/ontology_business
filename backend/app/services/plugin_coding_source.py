@@ -9,7 +9,10 @@ from .plugin_host_artifact import build_artifact
 
 
 def project_files(document: dict) -> list[dict]:
-    base = build_artifact(document['manifest'], plugin_version=document['plugin_version'])
+    # The preview baseline renders trusted read-only scaffolding; a project that
+    # has never been reviewed shows 0.0.0 there. Real versions live only in the
+    # immutable snapshots stamped at review time.
+    base = build_artifact(document['manifest'], plugin_version=document.get('plugin_version') or '0.0.0')
     files = []
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         for full_path in archive.namelist():

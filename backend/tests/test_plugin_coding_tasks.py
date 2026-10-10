@@ -5,14 +5,17 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.plugin_coding_schemas import CodingFile, PluginCodingDraftCreate, PluginCodingReview
-from app.services import plugin_authoring_context as context, plugin_coding_export as review
+from app.plugin_coding_schemas import (
+    CodingFile, CodingProjectOut, PluginCodingDraftCreate, PluginCodingReview, PluginCodingUpdate,
+)
+from app.services import plugin_artifact_catalog as catalog, plugin_authoring_context as context, plugin_coding_export as review
 from app.services.plugin_coding_identity import adapter_hash
 from app.services.plugin_coding_repair import code_and_repair
 from app.services.plugin_project_validation import required_paths, validate_project
 from app.services.plugin_native_coding import native_coding_steps
 from app.services.plugin_client_contract import client_contract
 from app.services.plugin_coding_validation import files_hash, validate_files
+from app.services.plugin_source_policy import editable_path
 from app.services.plugin_coding_worker import CodingStep, apply_step, finish_document, parse_tool_steps
 from app.services.scenario_package_artifact import build_artifact
 
@@ -163,7 +166,7 @@ def test_valid_code_cannot_be_reviewed_without_business_acceptance(monkeypatch):
     monkeypatch.setattr(review, 'owned_root', lambda *args, **kwargs: root)
     with pytest.raises(HTTPException) as error:
         review.review_workspace(None, 'workspace', PluginCodingReview(expected_revision=1,
-            files_hash=files_hash(value['files']), confirmed_code_review=True))
+            files_hash=files_hash(value['files']), plugin_version='1.2.0', confirmed_code_review=True))
     assert error.value.status_code == 409
     assert '业务验收' in error.value.detail
     assert root.proposal == value
@@ -176,7 +179,7 @@ def test_failed_model_round_cannot_be_reviewed_even_if_retained_files_validate(m
     monkeypatch.setattr(review, 'owned_root', lambda *args, **kwargs: root)
     with pytest.raises(HTTPException) as error:
         review.review_workspace(None, 'workspace', PluginCodingReview(expected_revision=1,
-            files_hash=files_hash(value['files']), confirmed_code_review=True))
+            files_hash=files_hash(value['files']), plugin_version='1.2.0', confirmed_code_review=True))
     assert '本轮编码未完成' in error.value.detail
 
 
@@ -201,3 +204,164 @@ def test_model_receives_real_validation_feedback_and_repair_is_bounded(repair_su
     assert 'amount' in prompts[1][0]
     assert state['phase'] == ('ready_for_review' if repair_succeeds else 'validation_failed')
     assert bool(state['validation']) != repair_succeeds
+
+
+def test_project_summary_exposes_only_explorer_files_behind_the_owned_root_gate(monkeypatch):
+    state = document()
+    state['phase'] = 'ready_for_review'
+    state['files']['scripts/check_request.py'] = 'from server import invoke_scenario_capability\n'
+    state['previous'] = {'README.md': 'old template\n'}
+    state['events'] = [{'sequence': 1, 'kind': 'created', 'message': 'internal'}]
+    state['turns'] = [{'id': 'turn', 'instruction': 'private goal'}]
+    roots = []
+    monkeypatch.setattr(context, 'owned_root', lambda db, workspace_id, **kwargs: roots.append(workspace_id) or SimpleNamespace(thread_id=workspace_id, proposal=deepcopy(state)))
+    summary = context.project_summary(object(), 'a' * 32)
+    assert roots == ['a' * 32]
+    modelled = CodingProjectOut.model_validate(summary)
+    assert (modelled.id, modelled.release_id, modelled.phase) == ('a' * 32, 'release', 'ready_for_review')
+    paths = {item.path: item for item in modelled.files}
+    assert paths['scripts/check_request.py'].editable is True
+    assert paths['server.py'].editable is False
+    assert paths['README.md'].previous == 'old template\n'
+    assert set(modelled.model_dump()) == {'id', 'release_id', 'revision', 'phase', 'files'}
+    with pytest.raises(ValidationError):
+        CodingProjectOut.model_validate({**summary, 'plugin_version': '1.1.0'})
+
+
+def test_skill_directories_follow_the_host_standard_with_scoped_resources():
+    source = files()
+    source['skills/submit-request/SKILL.md'] = (
+        '---\nname: submit-request\ndescription: Submit a service request through the trusted client\n---\n'
+        'Call scripts/submit_request.py with current inputs.\n')
+    source['skills/submit-request/scripts/submit_request.py'] = (
+        'from server import invoke_scenario_capability\n'
+        'async def submit_request(inputs):\n'
+        '    return await invoke_scenario_capability("function", "check", inputs)\n')
+    source['skills/submit-request/references/fields.md'] = 'Required fields and their meaning.\n'
+    source['skills/submit-request/config.json'] = '{"limit": 10}\n'
+    assert not validate_files(source, contract())
+    broken = dict(source)
+    broken.pop('skills/submit-request/SKILL.md')
+    issues = validate_files(broken, contract())
+    assert any('标准 Skill 目录必须提供 SKILL.md' in issue for issue in issues)
+    escaping = dict(source)
+    escaping['skills/submit-request/scripts/escape.py'] = 'import os\n'
+    assert any('仅允许 asyncio/json' in issue for issue in validate_files(escaping, contract()))
+
+
+def test_agent_and_hook_extensions_follow_the_host_standard_layout():
+    source = files()
+    source['agents/request-tagger.md'] = (
+        '---\nname: request-tagger\ndescription: Tag service requests by business type\n---\n'
+        'Classify the current request before submission.\n')
+    source['hooks/hooks.json'] = (
+        '[{"matcher": "PreToolUse", "hooks": [{"type": "command", "command": "python hooks/scripts/guard.py"}]}]\n')
+    source['hooks/scripts/guard.py'] = (
+        'from server import invoke_scenario_capability\n'
+        'async def guard(inputs):\n'
+        '    return await invoke_scenario_capability("function", "check", inputs)\n')
+    assert not validate_files(source, contract())
+    mismatched = dict(source)
+    mismatched['agents/request-tagger.md'] = '---\nname: other-name\ndescription: mismatched\n---\nBody.\n'
+    assert any('name 必须与文件名一致' in issue for issue in validate_files(mismatched, contract()))
+    headless = dict(source)
+    headless['agents/request-tagger.md'] = 'No frontmatter body.\n'
+    assert any('frontmatter' in issue for issue in validate_files(headless, contract()))
+    missing_script = dict(source)
+    missing_script.pop('hooks/scripts/guard.py')
+    assert any('引用的脚本不存在' in issue for issue in validate_files(missing_script, contract()))
+
+
+@pytest.mark.parametrize('path,allowed', [
+    ('lsp/python.json', True), ('output-styles/concise.md', True), ('commands/check.md', True),
+    ('skills/a/scripts/run.py', True), ('skills/a/settings.json', True), ('skills/a/references/data.json', True),
+    ('agents/tool.py', False), ('skills/a/b/c.txt', False), ('hooks/other.json', False),
+    ('lsp/x.py', False), ('commands/Sub-Name.md', False), ('mcp_servers/x/.mcp.json', False),
+])
+def test_editable_surface_covers_only_host_standard_locations(path, allowed):
+    assert editable_path(path) is allowed
+
+
+def test_review_stamps_the_explicit_human_version_and_keeps_the_tree_evolving(monkeypatch):
+    from datetime import datetime, timezone
+    from app.scenario_package_schemas import ScenarioPackageBuild
+
+    class FakeDb:
+        def __init__(self):
+            self.added = []
+
+        def get(self, model, identity):
+            return None
+
+        def add(self, row):
+            self.added.append(row)
+
+        def commit(self):
+            return None
+
+    value = document()
+    value['phase'] = 'ready_for_review'
+    value['plugin_version'] = ''
+    root = SimpleNamespace(thread_id='w', proposal=value)
+    monkeypatch.setattr(review, 'owned_root', lambda *args, **kwargs: root)
+    monkeypatch.setattr(review, 'validate_project', lambda document: [])
+    monkeypatch.setattr(review, 'prepare_package', lambda db, release_id, original: ('scenario-synthetic', deepcopy(contract())))
+    monkeypatch.setattr(review, 'check_release_state', lambda *args: None)
+    monkeypatch.setattr(review.permission_service, 'require_principal',
+                        lambda db: SimpleNamespace(tenant_id='tenant', user_id='user'))
+    acceptance = ScenarioPackageBuild(expected_revision=1, target='claude_code',
+        capabilities=[{'kind': 'function', 'key': 'check'}],
+        acceptance_cases=[{'kind': 'function', 'key': 'check', 'role': role, 'invocation_id': f'inv-{role}'}
+                          for role in ('success', 'boundary', 'failure')],
+        confirmed_business_acceptance=True)
+    before = deepcopy(value)
+    db = FakeDb()
+    identity = review.review_workspace(db, 'w', PluginCodingReview(expected_revision=1,
+        files_hash=files_hash(value['files']), plugin_version='2.0.0', confirmed_code_review=True,
+        acceptance=acceptance))
+    snapshot = db.added[0].proposal
+    assert snapshot['plugin_version'] == '2.0.0' and snapshot['kind'] == 'scenario-plugin-artifact.v1'
+    assert root.proposal == before, 'publication must never mutate the plugin project'
+
+
+def test_update_rounds_require_a_session_and_never_carry_a_plugin_version():
+    base = dict(expected_revision=1, request_id='synthetic-request', action='save',
+                base_files_hash='a' * 64, instruction='', files=[])
+    with pytest.raises(ValidationError):
+        PluginCodingUpdate.model_validate(base)
+    modelled = PluginCodingUpdate.model_validate({**base, 'session_id': 'b' * 32})
+    assert modelled.session_id == 'b' * 32
+    with pytest.raises(ValidationError):
+        PluginCodingUpdate.model_validate({**base, 'session_id': 'b' * 32, 'plugin_version': '1.0.0'})
+
+
+def test_retired_snapshot_leaves_the_active_catalog_but_keeps_audit(monkeypatch):
+    from datetime import datetime, timezone
+    from app.plugin_coding_schemas import PluginArtifactRetire
+
+    class FakeDb:
+        def __init__(self):
+            self.added = []
+
+        def add(self, row):
+            self.added.append(row)
+
+        def flush(self):
+            return None
+
+    artifact = {'kind': 'scenario-plugin-artifact.v1', 'manifest': {'package_name': 'scenario-synthetic'},
+                'plugin_version': '1.0.0', 'artifact_hash': 'b' * 64, 'files': {}}
+    row = SimpleNamespace(id='a' * 32, thread_id='w', created_at=datetime.now(timezone.utc), proposal=dict(artifact))
+    release = SimpleNamespace(id='release', name='Release', deleted_at=None, status='released', enabled=True, tenant_id='tenant')
+    scenario = SimpleNamespace(id='scenario', name='Scenario', status='active', tenant_id='tenant')
+    monkeypatch.setattr(catalog, 'get_artifact', lambda db, artifact_id: (row, release, scenario))
+    monkeypatch.setattr(catalog.permission_service, 'require_principal',
+                        lambda db: SimpleNamespace(tenant_id='tenant', user_id='user'))
+    monkeypatch.setattr(catalog.permission_service, 'require_tenant_permission', lambda *a, **k: None)
+    monkeypatch.setattr(catalog.permission_service, 'require_scenario_permission', lambda *a, **k: None)
+    db = FakeDb()
+    value = catalog.retire_artifact(db, 'a' * 32, PluginArtifactRetire(artifact_hash='b' * 64))
+    assert value.retired is True and value.available is False
+    assert '已下线' in value.unavailable_reason
+    assert row.proposal['retired_at'] and row.proposal['retired_by_user_id'] == 'user'
+    assert db.added[0].proposal['action'] == 'retire' and db.added[0].proposal['artifact_hash'] == 'b' * 64

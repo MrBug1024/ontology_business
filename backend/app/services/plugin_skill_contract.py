@@ -50,16 +50,30 @@ def _safe_tool_permissions(value: object) -> bool:
     return all(_READ_ONLY_SCENARIO_TOOL.fullmatch(tool) for tool in tools)
 
 
-def validate_skill(path: str, source: str) -> list[str]:
+def load_frontmatter(source: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse a closed YAML frontmatter block shared by host-standard files.
+
+    Returns (metadata, error). (None, None) means the source has no frontmatter
+    block at all; (None, message) reports an invalid one.
+    """
     header = _FRONTMATTER.match(source)
     if header is None:
-        return [f'{path}：Skill 必须提供闭合的 YAML frontmatter']
+        return None, None
     try:
         metadata = yaml.load(header.group(1), Loader=_UniqueSkillLoader)
     except (yaml.YAMLError, ValueError, RecursionError):
-        return [f'{path}：Skill 元数据须为安全 YAML，字段不能重复']
+        return None, 'frontmatter 须为安全 YAML，字段不能重复'
     if not isinstance(metadata, dict):
-        return [f'{path}：Skill frontmatter 必须为字段映射']
+        return None, 'frontmatter 必须为字段映射'
+    return metadata, None
+
+
+def validate_skill(path: str, source: str) -> list[str]:
+    metadata, error = load_frontmatter(source)
+    if error is not None:
+        return [f'{path}：Skill {error}']
+    if metadata is None:
+        return [f'{path}：Skill 必须提供闭合的 YAML frontmatter']
     name = metadata.get('name')
     if (not isinstance(name, str) or not 1 <= len(name) <= 64
             or not _SKILL_NAME.fullmatch(name) or name != path.split('/')[1]):

@@ -20,7 +20,7 @@ def test_attachment_turn_keeps_bounded_attachment_tools_when_selection_is_narrow
             "investigation_tools": {
                 "mode": "selected",
                 "selected_tool_keys": [],
-                "effective_tool_keys": ["ask_human", "propose_document"],
+                "effective_tool_keys": ["ask_human", "propose_document", "deliver_to_library"],
             },
         },
     })

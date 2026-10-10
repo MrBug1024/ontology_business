@@ -28,21 +28,20 @@ export function usePluginCodingEditor(workspace: Ref<CodingWorkspace | null>, re
   }
   function discardDraft() { original.value = selectedFile.value?.content || ''; draft.value = original.value; baseHash.value = workspace.value?.files_hash || ''; message.value = '' }
   watch(() => workspace.value?.files_hash, () => { if (!dirty.value) selectFile(selectedPath.value) }, { immediate: true })
-  async function submit(action: 'save' | 'generate' | 'discuss', pluginVersion?: string) {
+  async function submit(action: 'save' | 'generate' | 'discuss') {
     const value = workspace.value
     if (!value || (dirty.value && basisChanged.value)) return false
     if (action === 'discuss' && dirty.value) { message.value = '讨论基于已保存文件，请先保存当前代码；本地修改已保留'; return false }
     const edited = dirty.value && selectedFile.value ? [{ path: selectedFile.value.path, content: draft.value }] : []
-    const accepted = await revise({ expected_revision: value.revision, request_id: createClientRequestId(), action,
-      base_files_hash: edited.length ? baseHash.value : value.files_hash, instruction: action !== 'save' ? feedback.value : '', files: edited,
-      ...(pluginVersion ? { plugin_version: pluginVersion } : {}) })
+    const accepted = await revise({ expected_revision: value.revision, request_id: createClientRequestId(), session_id: value.session_id, action,
+      base_files_hash: edited.length ? baseHash.value : value.files_hash, instruction: action !== 'save' ? feedback.value : '', files: edited })
     if (accepted) { original.value = draft.value; if (action !== 'save') feedback.value = ''; selectFile(selectedPath.value) }
     return accepted
   }
   async function stopCoding() {
     const value = workspace.value
     if (!value) return
-    await revise({ expected_revision: value.revision, request_id: createClientRequestId(), action: 'stop', base_files_hash: value.files_hash, instruction: '', files: [] })
+    await revise({ expected_revision: value.revision, request_id: createClientRequestId(), session_id: value.session_id, action: 'stop', base_files_hash: value.files_hash, instruction: '', files: [] })
   }
   return { selectedPath, selectedFile, draft, feedback, dirty, basisChanged, baseHash, message, selectFile, discardDraft, submit, stopCoding, restoreInstruction }
 }

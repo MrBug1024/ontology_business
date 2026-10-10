@@ -54,12 +54,24 @@ def _latest_handoff(db: Session, scenario: BusinessScenario) -> DistillationPubl
     ).order_by(DistillationPublication.created_at.desc(), DistillationPublication.id.desc()).limit(1))
 
 
-def _construction(db: Session, scenario: BusinessScenario, document: DistillationDocument, status: str) -> dict:
+def _documents_match_for_handoff(delivered: DistillationDocument, baseline: DistillationDocument) -> bool:
+    """Handoff freshness ignores publication-time decision bookkeeping.
+
+    A conversation delivery keeps the evolving scenario baseline untouched and
+    carries the handoff decision only inside the immutable snapshot, so only
+    business content participates in the comparison.
+    """
+    bookkeeping = ("decision", "decision_reason")
+    strip = lambda document: {key: value for key, value in document.model_dump().items() if key not in bookkeeping}
+    return strip(delivered) == strip(baseline)
+
+
+def _construction(db: Session, scenario: BusinessScenario, decision: str, status: str) -> dict:
     if not permission_service.check_scenario(db, scenario, "write").allowed or scenario.status == "retired":
         return {"can_continue": False, "reason": "当前场景没有可用的建设权限。"}
-    if document.decision == "stop":
+    if decision == "stop":
         return {"can_continue": False, "reason": "人工决定暂缓建设，请先讨论业务价值并修订阶段决定。"}
-    if document.decision == "undecided":
+    if decision == "undecided":
         return {"can_continue": False, "reason": "尚未明确人工建设决定，请先讨论目标、边界和成功标准并完成交接。"}
     if status != "current":
         return {"can_continue": False, "reason": "当前阶段结论尚未交接或交接已过期，请核对最新结论并重新交接。"}
@@ -81,18 +93,25 @@ def context_for_scenario(db: Session, scenario_id: str) -> ScenarioDiscoveryCont
     document = DistillationDocument.model_validate(state.document) if state else DistillationDocument()
     publication = _latest_handoff(db, scenario)
     status = "missing" if publication is None else "stale"
-    if state and publication and DistillationDocument.model_validate(publication.document) == document:
+    if state and publication and _documents_match_for_handoff(
+            DistillationDocument.model_validate(publication.document), document):
         status = "current"
+    # The handoff decision belongs to the delivered snapshot; before the first
+    # delivery (or once it is stale) only the baseline's own decision is known.
+    handoff = DistillationDocument.model_validate(publication.document) if publication is not None else None
+    decision_source = handoff if status == "current" else document
     library = distillation_library_service.list_sources(db, scenario_id, 0, MAX_MATERIALS)
     return ScenarioDiscoveryContextOut.model_validate({
         "version": "scenario-discovery-context.v1",
         "scenario": {"id": scenario.id, "name": _text(scenario.name, 200), "description": _text(scenario.description or "", 4000)},
         "revision": state.revision if state else None,
-        "business": {**{key: _text(getattr(document, key), 4000) for key in BUSINESS_FIELDS},
-                     "decision": document.decision, "open_questions": [_text(value, 4000) for value in document.open_questions]},
+        "business": {**{key: _text(getattr(document, key), 4000) for key in BUSINESS_FIELDS
+                        if key != "decision_reason"},
+                     "decision_reason": _text(decision_source.decision_reason, 4000),
+                     "decision": decision_source.decision, "open_questions": [_text(value, 4000) for value in document.open_questions]},
         "handoff": {"status": status, "publication_id": publication.id if publication else None,
                     "publication_revision": publication.project_revision if publication else None},
-        "construction": _construction(db, scenario, document, status),
+        "construction": _construction(db, scenario, decision_source.decision, status),
         "processes": {"as_is": _process(document.as_is), "to_be": _process(document.to_be)},
         "historical_cases": {"items": [{"key": case.key, "title": _text(case.title, 200),
             "result_summary": _text(case.result_summary, 600), "limitations": _text(case.limitations, 600)}

@@ -134,25 +134,26 @@ def test_review_reserves_a_snapshot_without_starting_delivery(monkeypatch):
     monkeypatch.setattr(review, 'check_release_state', lambda *args: None)
     monkeypatch.setattr(review.permission_service, 'require_principal', lambda *args: SimpleNamespace(tenant_id='tenant', user_id='user'))
     saved = []
-    db = SimpleNamespace(get=lambda *args: None, add=saved.append, commit=lambda: None)
+    db = SimpleNamespace(get=lambda kind, identity: next((row for row in saved if row.id == identity), None),
+                         add=saved.append, commit=lambda: None)
     identity = review.review_workspace(db, 'workspace', PluginCodingReview(expected_revision=3,
-        files_hash=files_hash(files), confirmed_code_review=True))
+        files_hash=files_hash(files), plugin_version='1.0.0', confirmed_code_review=True))
     assert saved[0].id == identity
     assert saved[0].proposal['kind'] == catalog.ARTIFACT_KIND
-    assert root.proposal['phase'] == 'released'
-    assert root.proposal['exported_count'] == 0
-    assert root.proposal['revision'] == 4
+    assert root.proposal is document and root.proposal['phase'] == 'ready_for_review'         and root.proposal['revision'] == 3, 'publication must never mutate the plugin project'
     assert saved[0].proposal['files'] == files
+    reserved_readme = files['README.md']
     root.proposal['files']['README.md'] += 'later workspace mutation'
-    assert saved[0].proposal['files']['README.md'] == files['README.md']
+    assert saved[0].proposal['files']['README.md'] == reserved_readme
+    assert saved[0].proposal['files']['README.md'] != files['README.md'], 'later workspace edits cannot reach the reserved snapshot'
     with pytest.raises(HTTPException) as caught:
         review.review_workspace(db, 'workspace', PluginCodingReview(expected_revision=3,
-            files_hash=files_hash(files), confirmed_code_review=True))
+            files_hash=files_hash(files), plugin_version='1.0.0', confirmed_code_review=True))
     assert caught.value.status_code == 409
 
 
 def test_review_and_delivery_contracts_reject_unreviewed_or_open_inputs():
     with pytest.raises(ValidationError):
-        PluginCodingReview(expected_revision=1, files_hash='a' * 64, confirmed_code_review=False)
+        PluginCodingReview(expected_revision=1, files_hash='a' * 64, plugin_version='1.0.0', confirmed_code_review=False)
     with pytest.raises(ValidationError):
         PluginArtifactDownload(artifact_hash='a' * 64, workspace_files={'README.md': 'tampered'})

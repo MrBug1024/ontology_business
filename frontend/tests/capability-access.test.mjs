@@ -17,11 +17,23 @@ test('publishing selects reviewed plugins and only exposes MCP configuration', (
   assert.match(view, /adapter\.managed_input_upload/)
   assert.match(view, /adapter\.optional_scopes/)
   assert.match(view, /value="assets:write"/)
-  assert.doesNotMatch(view, /ScenarioReleaseList/)
+  // 能力版本的生命周期治理是发布中心的职责：创建/启用/停用/退役都在这里，
+  // 场景详情只保留能力建设页签。
+  assert.match(view, /<el-tab-pane label="能力版本" name="releases">[\s\S]*?ScenarioReleaseList/)
   const development = readFileSync(new URL('../src/views/PluginDevelopment.vue', import.meta.url), 'utf8')
   assert.doesNotMatch(development, /ScenarioReleaseList/)
   assert.match(development, /PluginBuildSetup/)
-  assert.match(development, /pluginCodingApi.tasks/)
+  // 场景的插件项目与编码会话由资源管理器 composable 按场景读取；会话不承载版本。
+  assert.match(development, /usePluginProjectExplorer/)
+  const explorer = readFileSync(new URL('../src/composables/usePluginProjectExplorer.ts', import.meta.url), 'utf8')
+  assert.match(explorer, /pluginCodingApi\.projects/)
+  assert.match(explorer, /pluginCodingApi\.sessions/)
+  assert.doesNotMatch(explorer, /plugin_version/)
+  const chatHome = readFileSync(new URL('../src/components/plugin-coding/PluginCodingChatHome.vue', import.meta.url), 'utf8')
+  assert.doesNotMatch(chatHome, /plugin_version/)
+  assert.match(development, /capability-access', query: \{ scenario_id: scenarioId, tab: 'releases' \}/)
+  const detail = readFileSync(new URL('../src/views/ScenarioDetail.vue', import.meta.url), 'utf8')
+  assert.doesNotMatch(detail, /ScenarioReleaseList/)
   const releases = readFileSync(new URL('../src/api/scenarioReleases.ts', import.meta.url), 'utf8')
   assert.match(releases, /scenario-releases/)
   assert.match(releases, /expected_revision/)
@@ -73,13 +85,13 @@ test('an unknown plugin URL stays in plugin development instead of becoming a sc
   } finally { view.stop() }
 })
 
-test('the plugin fallback preserves existing release and workspace deep links', async () => {
+test('the plugin fallback preserves workspace deep links on the single-page IDE', async () => {
   const view = await mountPlatformNavigation('/plugin-studio/synthetic-release?workspace=synthetic-workspace')
   try {
-    assert.equal(view.router.currentRoute.value.name, 'plugin-coding-studio')
-    assert.equal(view.router.currentRoute.value.params.releaseId, 'synthetic-release')
+    assert.equal(view.router.currentRoute.value.path, '/plugin-studio')
+    assert.equal(view.router.currentRoute.value.name, 'plugin-development')
     assert.equal(view.router.currentRoute.value.query.workspace, 'synthetic-workspace')
-    assert.ok(view.find(target => target.props['data-page'] === 'PluginCodingStudio'))
+    assert.ok(view.find(target => target.props['data-page'] === 'PluginDevelopment'))
   } finally { view.stop() }
 })
 

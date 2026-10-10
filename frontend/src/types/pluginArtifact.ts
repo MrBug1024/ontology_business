@@ -15,6 +15,8 @@ export interface PluginArtifact {
   created_at: string
   available: boolean
   unavailable_reason: string
+  retired: boolean
+  retired_at: string | null
 }
 export interface PluginArtifactPage {
   items: PluginArtifact[]

@@ -4,9 +4,14 @@ from __future__ import annotations
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from ..models import AssistantMessage, AssistantThread, OntologyRelease
+from ..models import AssistantMessage, AssistantRequestRun, AssistantThread, OntologyRelease
 from . import capability_application_service, permission_service, release_service
 from .plugin_coding_contract import authoring_contract
+from .plugin_coding_source import project_files
+from .plugin_coding_workspace import (
+    SESSION_KIND, WORKSPACE_KIND, find_project_thread, owned_root, root_id,
+    LEGACY_SCOPE_PREFIX, PROJECT_SCOPE_PREFIX,
+)
 from .plugin_host_profile import package_name, require_host
 
 
@@ -63,28 +68,110 @@ def prepare_authoring(db, release_id: str, request) -> tuple[str, dict]:
     return manifest['package_name'], manifest
 
 
-def list_tasks(db, scenario_id: str | None = None) -> list[dict]:
+def _scenario_projects(db, scenario_id: str) -> list[tuple[AssistantThread, AssistantMessage]]:
+    """Resolve the durable project for each host plus its workspace root."""
     principal = permission_service.require_principal(db)
-    if scenario_id:
-        release_service._scenario_for_read(db, scenario_id)
+    resolved: dict[str, tuple[AssistantThread, AssistantMessage]] = {}
+    rows = db.execute(select(AssistantThread, AssistantMessage).join(AssistantMessage).where(
+        AssistantThread.tenant_id == principal.tenant_id,
+        AssistantThread.created_by_user_id == principal.user_id,
+        AssistantThread.scenario_id == scenario_id,
+        AssistantMessage.proposal['kind'].as_string() == WORKSPACE_KIND,
+        AssistantThread.scope_key.like(f'{PROJECT_SCOPE_PREFIX}%'),
+    ).order_by(AssistantThread.created_at.desc(), AssistantThread.id.desc())).all()
+    for thread, row in rows:
+        host = (row.proposal or {}).get('manifest', {}).get('host', 'claude_code')
+        resolved.setdefault(host, (thread, row))
+    for host in ('claude_code', 'codex'):
+        if host in resolved:
+            continue
+        adopted = find_project_thread(db, scenario_id, host)
+        if adopted is not None:
+            root = db.get(AssistantMessage, root_id(adopted.id))
+            if root is not None:
+                resolved[host] = (adopted, root)
+    return [resolved[host] for host in sorted(resolved)]
+
+
+def _latest_snapshot_version(db, project_id: str) -> str:
+    """Most recent non-deleted reviewed snapshot version; '' before first review."""
+    from .plugin_artifact_catalog import ARTIFACT_KIND
+    row = db.scalar(select(AssistantMessage).where(
+        AssistantMessage.thread_id == project_id,
+        AssistantMessage.proposal['kind'].as_string() == ARTIFACT_KIND,
+        AssistantMessage.proposal['deleted_at'].as_string().is_(None),
+    ).order_by(AssistantMessage.created_at.desc(), AssistantMessage.id.desc()).limit(1))
+    return (row.proposal or {}).get('plugin_version') or '' if row is not None else ''
+
+
+def list_projects(db, scenario_id: str) -> list[dict]:
+    release_service._scenario_for_read(db, scenario_id)
+    projects = []
+    for thread, row in _scenario_projects(db, scenario_id):
+        document = row.proposal
+        projects.append({'id': thread.id, 'scenario_id': scenario_id, 'release_id': document['release_id'],
+            'host': document.get('manifest', {}).get('host', 'claude_code'), 'phase': document['phase'],
+            'plugin_version': _latest_snapshot_version(db, thread.id),
+            'capabilities': [{'kind': item['kind'], 'key': item['key'], 'name': item['name']}
+                             for item in document['manifest'].get('capabilities', [])],
+            'created_at': thread.created_at})
+    return projects
+
+
+def list_sessions(db, scenario_id: str) -> list[dict]:
+    principal = permission_service.require_principal(db)
+    release_service._scenario_for_read(db, scenario_id)
     statement = select(AssistantThread, AssistantMessage).join(AssistantMessage).where(
         AssistantThread.tenant_id == principal.tenant_id,
         AssistantThread.created_by_user_id == principal.user_id,
-        AssistantMessage.proposal['kind'].as_string() == 'scenario-plugin-workspace.v1',
-    ).order_by(AssistantThread.created_at.desc()).limit(20)
-    if scenario_id:
-        statement = statement.where(AssistantThread.scenario_id == scenario_id)
-    tasks = []
-    for thread, row in db.execute(statement).all():
-        try:
-            release_service._scenario_for_read(db, thread.scenario_id)
-        except HTTPException as exc:
-            if exc.status_code in {403, 404}:
-                continue
-            raise
-        doc = row.proposal
-        tasks.append({'id': thread.id, 'release_id': doc['release_id'], 'scenario_id': thread.scenario_id,
-                      'host': doc['manifest'].get('host', 'claude_code'),
-                      'title': thread.title, 'plugin_version': doc['plugin_version'],
-                      'phase': doc['phase'], 'created_at': thread.created_at})
-    return tasks
+        AssistantThread.scenario_id == scenario_id,
+        AssistantMessage.proposal['kind'].as_string() == SESSION_KIND,
+    ).order_by(AssistantThread.created_at.desc(), AssistantThread.id.desc()).limit(20)
+    sessions = [_session_out(db, thread, marker.proposal['project_id'])
+                for thread, marker in db.execute(statement).all()]
+    sessions.extend(_legacy_frozen_sessions(db, scenario_id))
+    sessions.sort(key=lambda item: item['created_at'], reverse=True)
+    return sessions[:20]
+
+
+def _session_out(db, thread: AssistantThread, project_id: str) -> dict:
+    root = db.get(AssistantMessage, root_id(project_id))
+    document = (root.proposal if root is not None else {}) or {}
+    active_run = db.get(AssistantRequestRun, document.get('active_run_id')) if document.get('active_run_id') else None
+    return {'id': thread.id, 'project_id': project_id, 'release_id': document.get('release_id', ''),
+            'scenario_id': thread.scenario_id, 'title': thread.title,
+            'host': document.get('manifest', {}).get('host', 'claude_code'),
+            'phase': document.get('phase', 'draft'),
+            'active': active_run is not None and active_run.thread_id == thread.id
+                      and active_run.status in {'queued', 'waiting_upload', 'running'},
+            'frozen': False, 'created_at': thread.created_at}
+
+
+def _legacy_frozen_sessions(db, scenario_id: str) -> list[dict]:
+    principal = permission_service.require_principal(db)
+    rows = db.execute(select(AssistantThread, AssistantMessage).join(AssistantMessage).where(
+        AssistantThread.tenant_id == principal.tenant_id,
+        AssistantThread.created_by_user_id == principal.user_id,
+        AssistantThread.scenario_id == scenario_id,
+        AssistantMessage.proposal['kind'].as_string() == WORKSPACE_KIND,
+        AssistantThread.scope_key.like(f'{LEGACY_SCOPE_PREFIX}%'),
+    ).order_by(AssistantThread.created_at.desc(), AssistantThread.id.desc())).all()
+    frozen = []
+    for thread, row in rows:
+        host = (row.proposal or {}).get('manifest', {}).get('host', 'claude_code')
+        current = find_project_thread(db, scenario_id, host)
+        if current is not None and current.id == thread.id:
+            continue
+        document = row.proposal
+        frozen.append({'id': thread.id, 'project_id': current.id if current is not None else thread.id,
+            'release_id': document.get('release_id', ''), 'scenario_id': scenario_id, 'title': thread.title,
+            'host': host, 'phase': document.get('phase', 'draft'), 'active': False, 'frozen': True,
+            'created_at': thread.created_at})
+    return frozen
+
+
+def project_summary(db, workspace_id: str) -> dict:
+    row = owned_root(db, workspace_id)
+    document = row.proposal
+    return {'id': row.thread_id, 'release_id': document['release_id'], 'revision': document['revision'],
+            'phase': document['phase'], 'files': project_files(document)}

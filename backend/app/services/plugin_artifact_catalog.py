@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
 from sqlalchemy import Select, select
@@ -10,12 +11,15 @@ from sqlalchemy.orm import Session
 from ..models import AssistantMessage, AssistantThread, BusinessScenario, OntologyRelease
 from ..plugin_coding_schemas import PluginArtifactDownload, PluginArtifactOut, PluginArtifactPage
 from . import permission_service, release_service
+from .capability_contracts import canonical_hash
 from .plugin_host_distribution import marketplace_artifact
 from .plugin_coding_identity import assert_adapter_identity
 from .plugin_host_artifact import build_artifact
 from .plugin_host_profile import HOST_LABELS
 
 ARTIFACT_KIND = 'scenario-plugin-artifact.v1'
+ARTIFACT_AUDIT_KIND = 'scenario-plugin-artifact-audit.v1'
+RETIRED_REASON = '此插件版本已下线；定版内容与审计保留，可继续开发新版本'
 
 
 def catalog_query(db: Session) -> Select[tuple[AssistantMessage, OntologyRelease, BusinessScenario]]:
@@ -32,13 +36,18 @@ def catalog_query(db: Session) -> Select[tuple[AssistantMessage, OntologyRelease
         OntologyRelease.tenant_id == principal.tenant_id,
         BusinessScenario.tenant_id == principal.tenant_id,
         AssistantMessage.proposal['kind'].as_string() == ARTIFACT_KIND,
+        # Deleted snapshots leave management entirely; only their audit rows remain.
+        AssistantMessage.proposal['deleted_at'].as_string().is_(None),
     )
 
 
 def artifact_out(row: AssistantMessage, release: OntologyRelease, scenario: BusinessScenario) -> PluginArtifactOut:
     document = row.proposal
+    retired_at = document.get('retired_at')
     reason = ''
-    if release.deleted_at is not None or release.status != 'released' or scenario.status == 'retired':
+    if retired_at:
+        reason = RETIRED_REASON
+    elif release.deleted_at is not None or release.status != 'released' or scenario.status == 'retired':
         reason = '绑定的能力版本已退役，需开发新插件版本'
     elif not release.enabled:
         reason = '绑定的能力版本已停用，请先在插件开发中启用'
@@ -54,11 +63,17 @@ def artifact_out(row: AssistantMessage, release: OntologyRelease, scenario: Busi
         host_label=HOST_LABELS[document['manifest'].get('host', 'claude_code')],
         plugin_version=document['plugin_version'], artifact_hash=document['artifact_hash'],
         created_at=row.created_at, available=not reason, unavailable_reason=reason,
+        retired=bool(retired_at), retired_at=retired_at,
     )
 
 
-def list_artifacts(db: Session, *, scenario_id: str | None, offset: int, limit: int) -> PluginArtifactPage:
+def list_artifacts(db: Session, *, scenario_id: str | None, offset: int, limit: int,
+                   include_retired: bool = False) -> PluginArtifactPage:
     statement = catalog_query(db)
+    if not include_retired:
+        # Retiring removes a snapshot from the active management list; the
+        # immutable bytes and audit trail stay queryable by identity.
+        statement = statement.where(AssistantMessage.proposal['retired_at'].as_string().is_(None))
     if scenario_id:
         release_service._scenario_for_read(db, scenario_id)
         statement = statement.where(BusinessScenario.id == scenario_id)
@@ -111,3 +126,53 @@ def restore_artifact(document: dict) -> bytes:
     if hashlib.sha256(artifact).hexdigest() != document['artifact_hash']:
         raise HTTPException(409, '原工件无法准确恢复，请开发新版本；不会替换已定版内容')
     return artifact
+
+
+def retire_artifact(db: Session, artifact_id: str, request) -> PluginArtifactOut:
+    """Take a reviewed snapshot offline: out of the active list and installs."""
+    row, release, scenario = get_artifact(db, artifact_id)
+    principal = permission_service.require_principal(db)
+    permission_service.require_tenant_permission(db, 'manage')
+    permission_service.require_scenario_permission(db, scenario, 'manage')
+    document = row.proposal
+    if request.artifact_hash != document['artifact_hash']:
+        raise HTTPException(409, '所选插件版本身份不匹配，请重新选择')
+    if document.get('retired_at'):
+        return artifact_out(row, release, scenario)
+    document = {**document, 'retired_at': datetime.now(timezone.utc).isoformat(),
+                'retired_by_user_id': principal.user_id}
+    row.proposal = document
+    audit_id = canonical_hash({'artifact': row.id, 'action': 'retire',
+                               'retired_at': document['retired_at']}, domain=ARTIFACT_AUDIT_KIND)[:32]
+    db.add(AssistantMessage(id=audit_id, thread_id=row.thread_id, role='system', content='插件定版快照下线',
+        proposal={'kind': ARTIFACT_AUDIT_KIND, 'artifact_id': row.id, 'artifact_hash': request.artifact_hash,
+                  'action': 'retire', 'principal_id': principal.user_id, 'at': document['retired_at']}))
+    db.flush()
+    return artifact_out(row, release, scenario)
+
+
+def delete_artifact(db: Session, artifact_id: str, request) -> None:
+    """Remove an already-retired snapshot from management; audit stays.
+
+    Deletion never reaches the plugin project or its source tree, and the
+    immutable bytes/history remain auditable through the audit trail.
+    """
+    row, release, scenario = get_artifact(db, artifact_id)
+    principal = permission_service.require_principal(db)
+    permission_service.require_tenant_permission(db, 'manage')
+    permission_service.require_scenario_permission(db, scenario, 'manage')
+    document = row.proposal
+    if request.artifact_hash != document['artifact_hash']:
+        raise HTTPException(409, '所选插件版本身份不匹配，请重新选择')
+    if not document.get('retired_at'):
+        raise HTTPException(409, '请先下线此版本，再删除')
+    if document.get('deleted_at'):
+        return
+    deleted_at = datetime.now(timezone.utc).isoformat()
+    row.proposal = {**document, 'deleted_at': deleted_at, 'deleted_by_user_id': principal.user_id}
+    audit_id = canonical_hash({'artifact': row.id, 'action': 'delete', 'deleted_at': deleted_at},
+                              domain=ARTIFACT_AUDIT_KIND)[:32]
+    db.add(AssistantMessage(id=audit_id, thread_id=row.thread_id, role='system', content='插件定版快照删除',
+        proposal={'kind': ARTIFACT_AUDIT_KIND, 'artifact_id': row.id, 'artifact_hash': request.artifact_hash,
+                  'action': 'delete', 'principal_id': principal.user_id, 'at': deleted_at}))
+    db.flush()

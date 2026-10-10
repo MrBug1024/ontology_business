@@ -50,7 +50,8 @@ const router = createRouter({
     { path: '/agents/:id/chat', name: 'agent-chat', component: () => import('@/views/AgentChat.vue'), meta: { title: '能力验证' } },
     { path: '/plugin-studio', name: 'plugin-development', component: () => import('@/views/PluginDevelopment.vue'), meta: { title: '插件开发', focusWorkspace: true } },
     { path: '/access', name: 'capability-access', component: () => import('@/views/CapabilityAccess.vue'), meta: { title: '发布中心' } },
-    { path: '/plugin-studio/:releaseId', name: 'plugin-coding-studio', component: () => import('@/views/PluginCodingStudio.vue'), meta: { title: '插件工作台', focusWorkspace: true } },
+    // The two-level studio merged into the single-page IDE; old deep links keep working.
+    { path: '/plugin-studio/:releaseId', name: 'plugin-coding-studio', redirect: (to) => ({ name: 'plugin-development', params: {}, query: to.query }) },
     { path: '/plugin-studio/:pathMatch(.*)*', redirect: (to) => ({ name: 'plugin-development', params: {}, query: to.query }) },
     { path: '/tasks', name: 'tasks', component: () => import('@/views/Tasks.vue'), meta: { title: '运行治理' } },
     { path: '/llm', name: 'llm', redirect: legacyPlatformSettingsRedirect('llm') },

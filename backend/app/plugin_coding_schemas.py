@@ -132,7 +132,6 @@ class PluginCodingCreate(ScenarioPackageBuild):
     request_id: str = Field(min_length=8, max_length=100)
     llm_config_id: str = Field(min_length=1, max_length=32)
     instruction: str = Field(min_length=1, max_length=4000)
-    plugin_version: str = Field(default="1.0.0", pattern=PLUGIN_VERSION_PATTERN)
     skill_ids: list[Annotated[str, Field(min_length=1, max_length=32)]] = Field(default_factory=list, max_length=10)
     mcp_ids: list[Annotated[str, Field(min_length=1, max_length=32)]] = Field(default_factory=list, max_length=10)
 
@@ -150,7 +149,6 @@ class PluginCodingDraftCreate(BaseModel):
     request_id: str = Field(min_length=8, max_length=100)
     llm_config_id: str = Field(min_length=1, max_length=32)
     instruction: str = Field(min_length=1, max_length=4000)
-    plugin_version: str = Field(default="1.0.0", pattern=PLUGIN_VERSION_PATTERN)
     skill_ids: list[Annotated[str, Field(min_length=1, max_length=32)]] = Field(default_factory=list, max_length=10)
     mcp_ids: list[Annotated[str, Field(min_length=1, max_length=32)]] = Field(default_factory=list, max_length=10)
 
@@ -166,20 +164,20 @@ class PluginCodingUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int = Field(ge=1)
     request_id: str = Field(min_length=8, max_length=100)
+    session_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     action: Literal["generate", "save", "discuss", "stop"]
     base_files_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
     instruction: str = Field(default="", max_length=4000)
     files: list[CodingFile] = Field(default_factory=list, max_length=32)
-    plugin_version: str | None = Field(default=None, pattern=PLUGIN_VERSION_PATTERN)
 
     @model_validator(mode="after")
     def complete_instruction(self):
         if self.action in {"generate", "discuss"} and not self.instruction.strip():
             raise ValueError("请描述本轮编码目标或修正意见")
-        if self.action == "discuss" and (self.files or self.plugin_version is not None):
-            raise ValueError("讨论轮次不能提交文件或修改插件版本")
-        if self.action == "stop" and (self.files or self.plugin_version is not None or self.instruction):
-            raise ValueError("停止轮次不能提交文件、需求或修改插件版本")
+        if self.action == "discuss" and self.files:
+            raise ValueError("讨论轮次不能提交文件")
+        if self.action == "stop" and (self.files or self.instruction):
+            raise ValueError("停止轮次不能提交文件或需求")
         if len({item.path for item in self.files}) != len(self.files):
             raise ValueError("不能重复编辑同一文件")
         return self
@@ -190,6 +188,7 @@ class PluginCodingExport(BaseModel):
     expected_revision: int = Field(ge=1)
     files_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
     format: Literal["plugin", "marketplace"] = "plugin"
+    plugin_version: str = Field(pattern=PLUGIN_VERSION_PATTERN)
     confirmed_code_review: Literal[True]
 
 
@@ -197,6 +196,7 @@ class PluginCodingReview(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int = Field(ge=1)
     files_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    plugin_version: str = Field(pattern=PLUGIN_VERSION_PATTERN)
     confirmed_code_review: Literal[True]
     acceptance: ScenarioPackageBuild | None = None
 
@@ -205,6 +205,16 @@ class PluginArtifactDownload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     artifact_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
     format: Literal["plugin", "marketplace"] = "plugin"
+
+
+class PluginArtifactRetire(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    artifact_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class PluginArtifactDelete(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    artifact_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
 class PluginArtifactOut(BaseModel):
@@ -223,6 +233,8 @@ class PluginArtifactOut(BaseModel):
     created_at: datetime
     available: bool
     unavailable_reason: str
+    retired: bool = False
+    retired_at: datetime | None = None
 
 
 class PluginArtifactPage(BaseModel):
@@ -260,10 +272,12 @@ class CodingWorkspaceOut(BaseModel):
     id: str
     host: Literal['claude_code', 'codex'] = 'claude_code'
     release_id: str
+    scenario_id: str
     revision: int
     phase: Literal["draft", "generating", "ready_for_review", "validation_failed", "released"]
     source_phase: Literal["draft", "generating", "ready_for_review", "validation_failed", "released"]
-    plugin_version: str
+    session_id: str = ""
+    session_title: str = ""
     files_hash: str
     files: list[CodingFileOut]
     events: list[CodingEventOut]
@@ -280,16 +294,55 @@ class CodingWorkspaceOut(BaseModel):
     delivery_profile: PluginDeliveryProfileOut | None = None
 
 
-class CodingTaskOut(BaseModel):
+class CodingSessionOut(BaseModel):
+    # A session is a context-bounded conversation on the shared plugin project;
+    # it never implies a plugin version. `frozen` marks legacy workspaces whose
+    # code diverged before projects existed and are kept as read-only history.
     model_config = ConfigDict(extra="forbid")
     id: str
-    host: Literal['claude_code', 'codex'] = 'claude_code'
+    project_id: str
     release_id: str
     scenario_id: str
     title: str
-    plugin_version: str
+    host: Literal['claude_code', 'codex'] = 'claude_code'
     phase: str
+    active: bool = False
+    frozen: bool = False
     created_at: datetime
+
+
+class CodingProjectCapabilityOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal['function', 'action', 'rule', 'workflow']
+    key: str = Field(max_length=240)
+    name: str = Field(max_length=1000)
+
+
+class CodingProjectSummaryOut(BaseModel):
+    # Explorer projection: the durable per-scenario, per-host plugin project that
+    # owns the only mutable source tree. plugin_version is the latest reviewed
+    # snapshot version (empty before the first review); reviews never change the
+    # project itself, so development state and publication state stay decoupled.
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    scenario_id: str
+    release_id: str
+    host: Literal['claude_code', 'codex'] = 'claude_code'
+    phase: Literal["draft", "generating", "ready_for_review", "validation_failed", "released"]
+    plugin_version: str = ""
+    capabilities: list[CodingProjectCapabilityOut] = Field(default_factory=list, max_length=20)
+    created_at: datetime
+
+
+class CodingProjectOut(BaseModel):
+    # Explorer projection for one plugin project: source files and identity only.
+    # Conversation turns, receipts and events stay behind the full workspace read.
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    release_id: str
+    revision: int = Field(ge=1)
+    phase: Literal["draft", "generating", "ready_for_review", "validation_failed", "released"]
+    files: list[CodingFileOut] = Field(max_length=64)
 
 
 class CodingContextOut(BaseModel):

@@ -64,11 +64,12 @@ test('scenario removal is an auditable retirement workflow', () => {
   assert.match(apiSource, /include_retired: includeRetired/)
   assert.match(listView, /api\.listScenarios\(true\)/)
   assert.match(listView, /已退役/)
-  assert.match(listView, /退役会暂停新的验证和调用，但保留全部配置/)
+  assert.match(listView, /退役会暂停新的验证和调用；仍在启用的能力版本将一并停用并退役/)
   assert.match(listView, /s\.status !== 'retired'/)
   assert.match(detailView, /detail\.status === 'retired'/)
   assert.match(listView, /@click="restore\(s\)"/)
   assert.match(listView, /@click="openPurge\(s\)"/)
+  assert.match(listView, /plugin_publications: '已发布插件安装源'/)
 })
 
 test('scenario lifecycle toggle binds stable values instead of display labels', () => {
@@ -97,6 +98,7 @@ test('scenario workspace starts with materials before distillation and keeps all
   ])
   assert.match(detailSource, /<el-tab-pane name="distillation"[\s\S]*?业务蒸馏/)
   assert.match(detailSource, /<el-tab-pane name="materials"[\s\S]*?场景资料/)
+  assert.doesNotMatch(detailSource, /ScenarioReleaseList/)
   assert.match(detailSource, /normalizeScenarioStage\(route\.query\.stage\)/)
   assert.match(detailSource, /function goToDataSources\(\)[\s\S]*?stage: 'materials'/)
   assert.match(scenariosSource, /query:\s*\{ stage: 'materials' \}/)

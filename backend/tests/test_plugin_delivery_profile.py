@@ -248,7 +248,7 @@ def test_review_exports_the_reference_shown_in_the_workspace_and_retains_it_in_t
     saved = []
     db = SimpleNamespace(get=lambda *args: None, add=saved.append, commit=lambda: None)
     review.review_workspace(db, 'workspace', PluginCodingReview(expected_revision=1,
-        files_hash=files_hash(source), confirmed_code_review=True))
+        files_hash=files_hash(source), plugin_version='1.0.0', confirmed_code_review=True))
     snapshot = saved[0].proposal
     assert snapshot['manifest']['scenario_blueprint'] == value['scenario_blueprint']
     assert snapshot['manifest']['scenario_blueprint'] != current['scenario_blueprint']

@@ -2,7 +2,7 @@ import { onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { pluginCodingApi } from '@/api/pluginCoding'
 import type { CodingSettingsUpdate, CodingUpdate, CodingWorkspace } from '@/types/pluginCoding'
 
-export function usePluginCodingWorkspace(workspaceId: Ref<string>, releaseId?: Ref<string>) {
+export function usePluginCodingWorkspace(workspaceId: Ref<string>, sessionId?: Ref<string>, releaseId?: Ref<string>) {
   const workspace = ref<CodingWorkspace | null>(null)
   const loading = ref(false)
   const busy = ref(false)
@@ -23,7 +23,7 @@ export function usePluginCodingWorkspace(workspaceId: Ref<string>, releaseId?: R
     if (poll) clearTimeout(poll)
     loading.value = true
     try {
-      const value = await pluginCodingApi.get(id, signal)
+      const value = await pluginCodingApi.get(id, signal, sessionId?.value || undefined)
       if (disposed || current !== generation || id !== workspaceId.value) return
       if (releaseId?.value && value.release_id !== releaseId.value) throw new Error('此编码会话不属于当前业务发布，请选择对应会话')
       workspace.value = value
@@ -66,7 +66,7 @@ export function usePluginCodingWorkspace(workspaceId: Ref<string>, releaseId?: R
   const revise = (payload: CodingUpdate) => mutate(payload, 'revision')
   const settings = (payload: CodingSettingsUpdate) => mutate(payload, 'settings')
 
-  watch(workspaceId, () => {
+  watch([workspaceId, () => sessionId?.value], () => {
     generation += 1
     controller?.abort()
     for (const action of operations) action.abort()

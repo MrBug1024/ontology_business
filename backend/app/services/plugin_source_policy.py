@@ -1,15 +1,34 @@
-"""Bounded plugin projects; generated code is data, never platform executable."""
+"""Bounded plugin projects; generated code is data, never platform executable.
+
+Editable paths follow the host-standard plugin layout: each Skill lives in its
+own `skills/<skill>/` directory with `SKILL.md` plus optional `scripts/` and
+`references/` resources; host extensions use their standardized locations
+(`agents/`, `commands/`, `hooks/`, `output-styles/`, `lsp/`). Anything outside
+this layout is rejected before it can reach a review.
+"""
 from __future__ import annotations
 
 import ast
 import json
 import re
 from .plugin_client_contract import check_invocation_options
-from .plugin_skill_contract import validate_skill
+from .plugin_skill_contract import load_frontmatter, validate_skill
 from .plugin_delivery_profile import BLUEPRINT_REFERENCE_PATH, PROTECTED_REFERENCE_PATHS
 
-MAX_PROJECT_FILES = 32
-_PATH = re.compile(r'^(?:README\.md|skills/[a-z][a-z0-9-]{0,63}/(?:SKILL\.md|references/[a-z0-9_-]+\.md)|(?:examples|scripts)/[a-z][a-z0-9_]{0,63}\.py|references/[a-z][a-z0-9_-]{0,63}\.(?:md|json))$')
+MAX_PROJECT_FILES = 48
+STANDARD_DIRECTORIES = ('skills', 'agents', 'commands', 'hooks', 'output-styles', 'lsp', 'references', 'scripts', 'examples')
+_PATH = re.compile(
+    r'^(?:README\.md|'
+    r'skills/[a-z][a-z0-9-]{0,63}/(?:SKILL\.md|[a-z0-9_-]{1,64}\.json|scripts/[a-z][a-z0-9_]{0,63}\.py|references/[a-z0-9_-]{1,64}\.(?:md|json))|'
+    r'agents/[a-z][a-z0-9-]{0,63}\.md|'
+    r'commands/[a-z][a-z0-9-]{0,63}\.md|'
+    r'output-styles/[a-z][a-z0-9-]{0,63}\.md|'
+    r'hooks/(?:hooks\.json|scripts/[a-z][a-z0-9_]{0,63}\.py)|'
+    r'lsp/[a-z0-9_-]{1,64}\.json|'
+    r'(?:examples|scripts)/[a-z][a-z0-9_]{0,63}\.py|'
+    r'references/[a-z0-9_-]{0,64}\.(?:md|json))$'
+)
+_HOOK_SCRIPT = re.compile(r'(?:^|\s)((?:hooks/scripts|scripts)/[a-z][a-z0-9_./-]*\.py)(?:\s|$)')
 
 
 def editable_path(path: str, *, legacy_blueprint: bool = False) -> bool:
@@ -85,3 +104,63 @@ def check_reference(path: str, source: str) -> list[str]:
     except (ValueError, RecursionError):
         return [f'{path}：JSON 资料格式无效']
     return []
+
+
+def check_standard_layout(files: dict[str, str]) -> list[str]:
+    """Enforce the host-standard layout for every extension directory present.
+
+    A Skill directory must contain its SKILL.md; agents carry name/description
+    frontmatter matching the file name; hooks configuration is valid JSON whose
+    local command scripts exist in the project.
+    """
+    issues: list[str] = []
+    skill_directories = {path[len('skills/'):].split('/', 1)[0] for path in files
+                         if path.startswith('skills/') and '/' in path[len('skills/'):]}
+    for directory in sorted(skill_directories):
+        if f'skills/{directory}/SKILL.md' not in files:
+            issues.append(f'skills/{directory}/：标准 Skill 目录必须提供 SKILL.md（含 name、description frontmatter）')
+    for path, content in files.items():
+        if path.startswith('agents/') and path.endswith('.md'):
+            issues.extend(_check_agent(path, content))
+        elif path == 'hooks/hooks.json':
+            issues.extend(_check_hooks(path, content, files))
+    return issues
+
+
+def _check_agent(path: str, source: str) -> list[str]:
+    name = path[len('agents/'):-len('.md')]
+    metadata, error = load_frontmatter(source)
+    if error is not None:
+        return [f'{path}：子代理 {error}']
+    if metadata is None:
+        return [f'{path}：子代理必须提供闭合的 YAML frontmatter（name、description）']
+    issues = []
+    if metadata.get('name') != name:
+        issues.append(f'{path}：子代理 name 必须与文件名一致：{name}')
+    if not isinstance(metadata.get('description'), str) or not metadata['description'].strip():
+        issues.append(f'{path}：子代理 description 必须为非空说明')
+    if 'hooks' in metadata:
+        issues.append(f'{path}：子代理不能定义自动运行的宿主 hooks，执行入口必须保留受信客户端边界')
+    return issues
+
+
+def _check_hooks(path: str, source: str, files: dict[str, str]) -> list[str]:
+    try:
+        document = json.loads(source, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+    except (ValueError, RecursionError):
+        return [f'{path}：hooks 配置必须是合法 JSON']
+    entries = document if isinstance(document, list) else [document] if isinstance(document, dict) else []
+    issues: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get('hooks'), list):
+            issues.append(f'{path}：每个 hooks 条目必须包含 matcher 与 hooks 命令数组')
+            continue
+        for hook in entry['hooks']:
+            command = hook.get('command') if isinstance(hook, dict) else None
+            if not isinstance(command, str) or not command.strip():
+                issues.append(f'{path}：每个 hook 必须提供非空 command')
+                continue
+            referenced = _HOOK_SCRIPT.search(command)
+            if referenced and referenced.group(1) not in files:
+                issues.append(f'{path}：hook 命令引用的脚本不存在：{referenced.group(1)}')
+    return issues

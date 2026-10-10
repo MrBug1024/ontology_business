@@ -76,6 +76,31 @@ def test_adopted_changes_do_not_claim_the_old_handoff_is_current(monkeypatch):
     assert result.business.non_goals == 'No automatic submission'
 
 
+def test_conversation_delivery_overlays_decision_without_baseline_mutation(monkeypatch):
+    # A conversation delivery keeps decision/decision_reason only inside the
+    # immutable snapshot; the untouched baseline still counts as handed off.
+    baseline = DistillationDocument(decision='undecided', desired_outcome='Outcome', success_metric='Metric')
+    delivered = baseline.model_copy(update={'decision': 'continue', 'decision_reason': '专家确认提交'})
+    service, db, _scenario, _calls = _setup(monkeypatch, baseline, delivered)
+    monkeypatch.setattr(service.distillation_service, 'modeling_documents', lambda *args, **kwargs:
+        [{'business_decision': 'continue'}])
+    result = service.context_for_scenario(db, 'scene')
+    assert result.handoff.status == 'current'
+    assert result.construction.can_continue is True
+    assert result.business.decision == 'continue'
+    assert result.business.decision_reason == '专家确认提交'
+
+
+def test_delivered_stop_decision_still_blocks_construction(monkeypatch):
+    baseline = DistillationDocument(decision='undecided', desired_outcome='Outcome', success_metric='Metric')
+    delivered = baseline.model_copy(update={'decision': 'stop', 'decision_reason': '暂缓'})
+    service, db, _scenario, _calls = _setup(monkeypatch, baseline, delivered)
+    result = service.context_for_scenario(db, 'scene')
+    assert result.handoff.status == 'current'
+    assert result.construction.can_continue is False
+    assert '暂缓建设' in result.construction.reason
+
+
 def test_current_handoff_cannot_override_another_projects_stop_decision(monkeypatch):
     document = DistillationDocument(decision='continue')
     service, db, _scenario, _calls = _setup(monkeypatch, document, document)

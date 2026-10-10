@@ -8,7 +8,8 @@ from typing import Literal
 from pydantic import Field, model_validator
 from sqlalchemy.orm import Session
 
-from ..distillation_conversation_schemas import ClarificationQuestion, JevDecisionReceipt, MCPMaterialRead, WebsiteObservation
+from ..distillation_conversation_schemas import (ClarificationQuestion, DeliveryReceipt, JevDecisionReceipt,
+                                                 MCPMaterialRead, WebsiteObservation)
 from ..distillation_sample_schemas import DatabaseSampleArguments, CompareSamplesArguments
 from ..distillation_schemas import ClosedModel, DistillationDocument, Evidence, InvestigationSource
 from . import distillation_analysis_service, distillation_target_service
@@ -74,6 +75,10 @@ class ProposalArguments(ClosedModel):
     delivery_mode: Literal["exploration", "construction"] = "exploration"
 
 
+class DeliveryArguments(ClosedModel):
+    note: str = Field(min_length=1, max_length=2000)
+
+
 class LineageInferenceArguments(ClosedModel):
     evidence_keys: list[str] = Field(min_length=2, max_length=6)
 
@@ -104,6 +109,7 @@ _TOOLS = {
     "read_attachment": (AttachmentArguments, "阅读对话临时附件", "读取本轮固定的当前对话附件节选。附件24小时后失效；没有可用ID时不能声称读过原文。"),
     "ask_human": (AskArguments, "等待人工澄清", "遇到业务决策、证据缺口或匹配歧义时提出最多3个问题并结束本轮等待人回答。不能自己回答。"),
     "propose_document": (ProposalArguments, "提出阶段建议", "提交完整待人工采用的阶段建议，并结束本轮。不能修改人工证据、决策、调查授权或自动发布。"),
+    "deliver_to_library": (DeliveryArguments, "提交阶段产物到场景资料", "把当前场景阶段结论发布为场景资料中的不可变交付物，返回真实回执。仅在专家明确要求提交时调用；不能主动提交，没有回执不能声称已提交。"),
 }
 _TOOLS.update(distillation_browser_tools.TOOLS)
 _TOOLS.update({
@@ -114,7 +120,7 @@ _TOOLS.update({
     "record_human_statement": (EmptyArguments, "引用专家陈述", "将本轮真实用户消息登记为可追溯的访谈证据，返回 evidence_key。只表示专家陈述，尚未独立核实；不自动登记所有消息。"),
 })
 
-ALWAYS_AVAILABLE_TOOL_KEYS = frozenset({"ask_human", "propose_document"})
+ALWAYS_AVAILABLE_TOOL_KEYS = frozenset({"ask_human", "propose_document", "deliver_to_library"})
 
 
 def selectable_tool_keys() -> tuple[str, ...]:
@@ -192,6 +198,7 @@ class ToolResult:
     mcp_read: MCPMaterialRead | None = None
     capability_receipt: JevDecisionReceipt | None = None
     interview_source: Evidence | None = None
+    delivery: DeliveryReceipt | None = None
 
 
 _REVIEW_METHODS = {
@@ -386,4 +393,40 @@ def execute(db: Session, name: str, arguments: dict, document: DistillationDocum
                 "建设交接尚不完整，已返回逐对象缺口，继续调查或修复。")
         return ToolResult({"proposal_ready": True}, "已准备成果建议，等待你明确采用。",
             message=payload.message, proposal=proposal)
+    if isinstance(payload, DeliveryArguments):
+        from fastapi import HTTPException
+
+        from .distillation_publication_service import deliver_scenario_documents
+
+        if not scenario_id:
+            return ToolResult({"status": "blocked",
+                "reason": "当前会话未关联业务场景，不能提交；请先把会话复制回所属场景。"},
+                "没有可提交的场景。")
+        try:
+            publication, created = deliver_scenario_documents(db, scenario_id, payload.note)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else "提交未完成"
+            return ToolResult({"status": "blocked", "reason": detail},
+                f"提交未完成：{detail}。请向专家转述需要补齐的内容后重试。")
+        decision = publication.document.get("decision")
+        from sqlalchemy import select
+
+        from ..models import DataSource
+
+        source = db.scalar(select(DataSource).where(
+            DataSource.id == publication.data_source_id, DataSource.tenant_id == publication.tenant_id))
+        receipt = DeliveryReceipt(
+            data_source_id=publication.data_source_id, publication_id=publication.id,
+            name=source.name if source is not None else "业务蒸馏交付物",
+            decision=decision if decision in ("continue", "adjust", "stop") else "continue",
+            artifacts=[{"key": item["key"], "filename": item["filename"]}
+                       for item in publication.artifacts],
+            already_delivered=not created, delivered_at=publication.created_at,
+        )
+        return ToolResult({"delivered": True, "data_source_id": receipt.data_source_id,
+            "publication_id": receipt.publication_id, "already_delivered": receipt.already_delivered,
+            "artifacts": [item.model_dump(mode="json") for item in receipt.artifacts],
+            "decision": receipt.decision},
+            "已提交到场景资料。" if created else "该阶段结论已提交过，返回同一份资料。",
+            delivery=receipt)
     raise ValueError("不支持的调查工具参数")

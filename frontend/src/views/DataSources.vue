@@ -268,7 +268,6 @@ import type {
   TableInfo,
 } from '@/types'
 import { dataSourceLocationLabel } from '@/utils/dataSources'
-import { notifyScenarioDiscoveryContextChanged } from '@/utils/scenarioAdvisorEvents'
 import DistillationMaterialPanel from '@/components/distillation/DistillationMaterialPanel.vue'
 import LibraryEditorDialog from '@/components/library/LibraryEditorDialog.vue'
 import Templates from '@/views/Templates.vue'
@@ -593,7 +592,6 @@ async function doUpload() {
       }
     }
     uploadList.value = uploadList.value.filter((item) => !completed.has(item.uid))
-    if (completed.size) notifyScenarioDiscoveryContextChanged(changedScenarioId)
     await loadFiles()
     if (uploadFailures.value.length) {
       const succeeded = completed.size
@@ -728,7 +726,6 @@ async function removeFile(f: BucketFile) {
       { type: 'warning', confirmButtonText: '删除文件', cancelButtonText: '取消' },
     )
     await api.deleteFile(f.id)
-    notifyScenarioDiscoveryContextChanged(changedScenarioId)
     ElMessage.success('已删除')
     await loadFiles()
   } catch (e: any) {
@@ -747,9 +744,6 @@ function openEdit(ds: DataSource) {
   dlg.value = true
 }
 async function onLibrarySaved(saved: DataSource) {
-  for (const id of new Set([editingSource.value?.scenario_id, saved.scenario_id, routeScenarioId.value])) {
-    if (id) notifyScenarioDiscoveryContextChanged(id)
-  }
   ElMessage.success('资料库已保存')
   if (saved.id) {
     if (props.embedded && !editingSource.value?.id) catalogOffset.value = 0
@@ -772,7 +766,6 @@ async function remove(ds: DataSource) {
       cancelButtonText: '取消',
     })
     const result: any = await api.deleteDataSource(ds.id!)
-    notifyScenarioDiscoveryContextChanged(ds.scenario_id || routeScenarioId.value)
     clearSelection()
     ElMessage.success(result?.message || '已删除')
     await load()

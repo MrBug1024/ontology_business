@@ -19,7 +19,7 @@ const { usePluginCodingWorkspace } = await import(workspaceComposableUrl)
 const renderer = createRenderer({ createElement: () => ({}), createText: () => ({}), createComment: () => ({}), insert() {}, remove() {}, setText() {}, setElementText() {}, patchProp() {}, parentNode: () => null, nextSibling: () => null })
 function value(id, revision = 1, run_status = null) { return { id, revision, run_status, files_hash: `${id}-${revision}`, files: [], events: [], validation: [] } }
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-function mount(id = 'one', releaseId) { const workspaceId = ref(id); let state; const app = renderer.createApp({ setup() { state = usePluginCodingWorkspace(workspaceId, releaseId); return () => h('div') } }); app.mount({}); return { state, workspaceId, stop: () => app.unmount() } }
+function mount(id = 'one', releaseId) { const workspaceId = ref(id); let state; const app = renderer.createApp({ setup() { state = usePluginCodingWorkspace(workspaceId, undefined, releaseId); return () => h('div') } }); app.mount({}); return { state, workspaceId, stop: () => app.unmount() } }
 async function flush() { await nextTick(); await new Promise(resolve => setImmediate(resolve)); await nextTick() }
 const payload = { expected_revision: 1, request_id: 'synthetic-edit', action: 'save', base_files_hash: 'a'.repeat(64), instruction: '', files: [] }
 
@@ -191,6 +191,8 @@ const taskRequestUrl = encode('export const createClientRequestId = () => "synth
 const taskStartUrl = encode(compile(readFileSync(new URL('../src/composables/usePluginTaskStart.ts', import.meta.url), 'utf8')).replace("from 'vue'", `from '${vueUrl}'`).replace("from '@/api'", `from '${developmentApiUrl}'`).replace("from '@/api/pluginCoding'", `from '${developmentApiUrl}'`).replace("from '@/utils/clientRequestId'", `from '${taskRequestUrl}'`))
 const codingSettingsUrl = encode(compile(readFileSync(new URL('../src/composables/usePluginCodingSettings.ts', import.meta.url), 'utf8')).replace("from 'vue'", `from '${vueUrl}'`).replace("from '@/api/pluginCoding'", `from '${developmentApiUrl}'`))
 const { usePluginCodingSettings } = await import(codingSettingsUrl)
+const projectExplorerUrl = encode(compile(readFileSync(new URL('../src/composables/usePluginProjectExplorer.ts', import.meta.url), 'utf8')).replace("from 'vue'", `from '${vueUrl}'`).replace("from '@/api/pluginCoding'", `from '${developmentApiUrl}'`))
+const { usePluginProjectExplorer } = await import(projectExplorerUrl)
 const safeMarkdownUrl = encode(`import { h } from '${vueUrl}'; export default { props: ['content'], setup: props => () => h('p', props.content) }`)
 function componentUrl(relative) {
   const url = new URL(relative, import.meta.url)
@@ -204,6 +206,7 @@ function componentUrl(relative) {
     else if (['@/api', '@/api/pluginCoding', '@/api/scenarioReleases'].includes(name)) target = developmentApiUrl
     else if (name === '@/composables/usePluginTaskStart') target = taskStartUrl
     else if (name === '@/composables/usePluginCodingSettings') target = codingSettingsUrl
+    else if (name === '@/composables/usePluginProjectExplorer') target = projectExplorerUrl
     else if (name === '@/composables/usePluginCodingWorkspace') target = workspaceComposableUrl
     else if (name === '@/composables/usePluginCodingEditor') target = encode(compile(readFileSync(new URL('../src/composables/usePluginCodingEditor.ts', import.meta.url), 'utf8')).replace("from 'vue'", `from '${vueUrl}'`).replace("from '@/utils/clientRequestId'", `from '${taskRequestUrl}'`))
     else if (name === '@/utils/platformSettings') target = encode(compile(readFileSync(new URL('../src/utils/platformSettings.ts', import.meta.url), 'utf8')))
@@ -222,13 +225,26 @@ function componentUrl(relative) {
 const { default: SourceEditor } = await import(componentUrl('../src/components/plugin-coding/PluginSourceEditor.vue'))
 const { default: Inspector } = await import(componentUrl('../src/components/plugin-coding/PluginCodingInspector.vue'))
 const { default: Explorer } = await import(componentUrl('../src/components/plugin-coding/PluginFileExplorer.vue'))
-const { default: IdeStart } = await import(componentUrl('../src/components/plugin-coding/PluginIdeStart.vue'))
 const { default: Development } = await import(componentUrl('../src/views/PluginDevelopment.vue'))
 const { default: Composer } = await import(componentUrl('../src/components/plugin-coding/PluginCodingComposer.vue'))
 const { default: CodingSettings } = await import(componentUrl('../src/components/plugin-coding/PluginCodingSettings.vue'))
 const { default: Conversation } = await import(componentUrl('../src/components/plugin-coding/PluginCodingConversation.vue'))
-const { default: Workbench } = await import(componentUrl('../src/components/PluginCodingWorkbench.vue'))
 const { default: BuildSetup } = await import(componentUrl('../src/components/plugin-coding/PluginBuildSetup.vue'))
+const { default: ChatHome } = await import(componentUrl('../src/components/plugin-coding/PluginCodingChatHome.vue'))
+// The single-page development view registers unload listeners on mount.
+globalThis.window ??= { addEventListener() {}, removeEventListener() {} }
+globalThis.document ??= { activeElement: null }
+function mountDevelopment(router) {
+  return mountEditorComponent(Development, {}, {}, { plugins: [router], routerView: true })
+}
+async function developmentRouter(initial = '/plugin-studio') {
+  const router = createRouter({ history: createMemoryHistory(), routes: [
+    { path: '/plugin-studio', name: 'plugin-development', component: Development },
+    { path: '/access', name: 'capability-access', component: { render: () => null } },
+  ] })
+  await router.push(initial)
+  return router
+}
 function mountEditorComponent(component, initial, handlers = {}, options = {}) {
   const props = ref(initial)
   const node = (type, text = '') => ({ type, tagName: type.toUpperCase(), text, props: {}, children: [], parent: null, value: '', events: {}, selectionStart: 0, selectionEnd: 0, scrollTop: 0, scrollLeft: 0, isConnected: true, focus() { this.focused = true }, setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end }, addEventListener(name, handler) { this.events[name] = handler }, removeEventListener(name) { delete this.events[name] } })
@@ -241,7 +257,11 @@ function mountEditorComponent(component, initial, handlers = {}, options = {}) {
     parentNode: target => target.parent, nextSibling: target => target.parent?.children[target.parent.children.indexOf(target) + 1] || null,
   })
   const root = node('root')
-  const app = host.createApp({ setup: () => () => options.routerView ? h(RouterView) : h(component, { ...props.value, ...handlers }, options.slots) })
+  const app = host.createApp({ setup: () => {
+    // Composables with lifecycle hooks must be created inside a component setup.
+    const explorer = options.createExplorer?.()
+    return () => options.routerView ? h(RouterView) : h(component, { ...props.value, ...handlers, ...(explorer ? { explorer } : {}) }, options.slots)
+  } })
   for (const [name, tag] of [['el-button', 'button'], ['el-icon', 'i'], ['el-select', 'select'], ['el-option', 'option'], ['el-alert', 'div'], ['el-checkbox', 'label'], ['el-input', 'input']]) app.component(name, { setup: (unused, context) => () => h(tag, context.attrs, context.slots.default?.()) })
   app.component('el-drawer', { props: ['modelValue'], setup: (props, context) => () => props.modelValue ? h('section', context.attrs, [context.slots.default?.(), context.slots.footer?.()]) : null })
   if (!options.plugins?.length) app.component('RouterLink', RouterLink)
@@ -391,17 +411,19 @@ test('pending source saves freeze editing and dirty tabs cannot close without pr
   } finally { view.stop() }
 })
 
-test('empty plugin IDE renders explorer, primary code area and a usable AI slot without fake files', async () => {
-  const view = mountEditorComponent(IdeStart, { tasks: [], loading: false }, {}, { slots: { default: () => h('textarea', { 'aria-label': '真实 AI 编码目标', value: 'My plugin goal' }) } })
+test('empty plugin IDE renders explorer, primary code area and a usable AI panel without fake files', async () => {
+  Object.assign(developmentApi, { listScenarios: async () => [], projects: async () => [], sessions: async () => [] })
+  const router = await developmentRouter()
+  const view = mountDevelopment(router)
   try {
+    await flush()
     for (const label of ['插件资源管理器', '代码编辑器', 'AI 编码']) assert.ok(view.all().find(node => ['aside', 'section'].includes(node.type) && node.props['aria-label'] === label), `Missing IDE landmark: ${label}`)
-    const projectList = view.all().find(node => node.props['aria-label'] === '最近插件开发任务')
-    assert.match(view.textOf(projectList), /尚无插件项目/)
+    const projectList = view.all().find(node => node.props['aria-label'] === '业务场景插件项目')
+    assert.match(view.textOf(projectList), /尚无业务场景/)
     assert.equal(projectList.children.some(node => node.type === 'a'), false)
     assert.equal(view.all().some(node => node.props['aria-label'] === '插件文件'), false)
     assert.equal(view.all().some(node => /(?:README\.md|SKILL\.md|server\.py)/.test(node.text)), false)
-    assert.equal(view.all().find(node => node.props['aria-label'] === '真实 AI 编码目标').props.value, 'My plugin goal')
-    assert.equal(view.button('AI 编码').props['aria-pressed'], true)
+    assert.equal(view.all().find(node => node.type === 'button' && view.textOf(node) === '新建任务').props.disabled, true)
     view.button('代码').props.onClick()
     await nextTick()
     assert.equal(view.button('代码').props['aria-pressed'], true)
@@ -409,21 +431,199 @@ test('empty plugin IDE renders explorer, primary code area and a usable AI slot 
   } finally { view.stop() }
 })
 
-test('recent IDE projects use real release and workspace identities in RouterLink destinations', async () => {
-  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/plugin-studio', component: { render: () => null } }, { path: '/plugin-studio/:releaseId', name: 'plugin-coding-studio', component: { render: () => null } }] })
-  await router.push('/plugin-studio')
-  const tasks = [{ id: 'workspace-one', release_id: 'release-one', title: 'Build first plugin', plugin_version: '1.0.0', phase: 'generating' }, { id: 'workspace-two', release_id: 'release-two', title: 'Continue second plugin', plugin_version: '2.1.0', phase: 'released' }]
-  const view = mountEditorComponent(IdeStart, { tasks, loading: false }, {}, { plugins: [router] })
+function workspaceValue(id, scenarioId = 'scene-one', extra = {}) {
+  return { id, release_id: 'release-one', scenario_id: scenarioId, revision: 5, host: 'claude_code', phase: 'draft', plugin_version: '',
+    suggested_plugin_version: '1.0.0', session_id: 'session-one', session_title: 'Current session',
+    files_hash: 'b'.repeat(64), files: [{ path: 'README.md', content: '# Notes\n', previous: '', editable: true }], events: [], validation: [],
+    active_run_id: null, run_status: null, exported_count: 0, turns: [], capabilities: [], business_acceptance_required: true,
+    resource_selection: { llm_config_id: 'model', skill_ids: [], mcp_ids: [] }, resource_receipts: [], ...extra }
+}
+
+function projectValue(id, scenarioId = 'scene-one', extra = {}) {
+  return { id, scenario_id: scenarioId, release_id: 'release-one', host: 'claude_code', phase: 'released',
+    plugin_version: '2.1.0', capabilities: [{ kind: 'workflow', key: 'submit', name: '服务申请' }], created_at: '2026-10-02T00:00:00Z', ...extra }
+}
+
+function sessionValue(id, projectId, scenarioId = 'scene-one', extra = {}) {
+  return { id, project_id: projectId, release_id: 'release-one', scenario_id: scenarioId, title: `Session ${id}`,
+    host: 'claude_code', phase: 'released', active: false, frozen: false, created_at: '2026-10-02T00:00:00Z', ...extra }
+}
+
+const sourceFiles = [
+  { path: 'README.md', content: '# Plugin notes\n', previous: '', editable: true },
+  { path: 'scripts/run.py', content: 'from server import invoke_scenario_capability\n', previous: '', editable: true },
+  { path: 'server.py', content: 'protected adapter\n', previous: '', editable: false },
+]
+
+test('expanding a scenario shows its plugin source files directly with no wrapper level', async () => {
+  const projectRequests = []
+  const workspaceReads = []
+  Object.assign(developmentApi, {
+    listScenarios: async () => [{ id: 'scene-one', name: 'Scene one' }, { id: 'scene-two', name: 'Scene two' }],
+    projects: async (scenarioId) => { projectRequests.push(scenarioId); return scenarioId === 'scene-one'
+      ? [projectValue('project-one', scenarioId)] : [] },
+    sessions: async (scenarioId) => scenarioId === 'scene-one' ? [
+      sessionValue('session-two', 'project-one', scenarioId, { title: 'Continue second plugin', created_at: '2026-10-02T00:00:00Z' }),
+      sessionValue('session-one', 'project-one', scenarioId, { title: 'Build first plugin', created_at: '2026-10-01T00:00:00Z' }),
+    ] : [],
+    project: async (id) => { projectRequests.push(`files:${id}`); return { id, release_id: 'release-one', revision: 3, phase: 'released', files: sourceFiles } },
+  })
+  fakeApi.get = async (id, signal, sessionId) => { workspaceReads.push([id, sessionId]); return workspaceValue(id, 'scene-one', { session_id: sessionId || 'session-two' }) }
+  const router = await developmentRouter()
+  const view = mountDevelopment(router)
   try {
-    const links = view.all().filter(node => node.type === 'a')
-    assert.deepEqual(links.map(link => link.props.href), ['/plugin-studio/release-one?workspace=workspace-one', '/plugin-studio/release-two?workspace=workspace-two'])
-    assert.match(view.textOf(links[0]), /Build first plugin/)
-    assert.match(view.textOf(links[1]), /v2\.1\.0 · 已定版/)
-    await links[1].props.onClick({ button: 0, preventDefault() {}, currentTarget: { getAttribute: () => null } })
+    await flush()
+    view.all().find(node => node.type === 'button' && view.textOf(node) === 'Scene one').props.onClick()
+    await flush()
+    assert.deepEqual(projectRequests, ['scene-one', 'files:project-one'], 'expanding the scenario loads its source tree immediately')
+    assert.equal(router.currentRoute.value.path, '/plugin-studio', 'selecting a scenario must not navigate')
+    const projectNav = view.all().find(node => node.props['aria-label'] === '业务场景插件项目')
+    const fileButton = name => view.all().find(node => node.type === 'button' && typeof node.props.class === 'string' && node.props.class.includes('file-row') && view.textOf(node) === name)
+    assert.ok(fileButton('scripts'), 'folder row renders directly under the scenario')
+    assert.ok(fileButton('README.md'), 'editable file row renders directly under the scenario')
+    assert.ok(fileButton('server.py'), 'protected file row renders directly under the scenario')
+    assert.doesNotMatch(view.textOf(projectNav), /插件源码|Claude Code/, 'no wrapper level wraps the source tree for a single-host scenario')
+    assert.doesNotMatch(view.textOf(projectNav), /v\d+\.\d+\.\d+/, 'the explorer tree carries no version labels')
+    assert.doesNotMatch(view.textOf(projectNav), /Continue second plugin|Build first plugin/, 'sessions stay in the chat history, not the explorer')
+    fileButton('README.md').props.onClick()
     await nextTick()
-    assert.equal(router.currentRoute.value.params.releaseId, 'release-two')
-    assert.equal(router.currentRoute.value.query.workspace, 'workspace-two')
+    const preview = view.all().find(node => node.type === 'textarea' && node.props['aria-label'] === '只读 README.md')
+    assert.ok(preview, 'selecting a file previews it read-only')
+    view.all().find(node => node.type === 'button' && view.textOf(node).includes('Continue second plugin')).props.onClick()
+    await flush()
+    assert.deepEqual(workspaceReads, [['project-one', 'session-two']])
+    assert.equal(router.currentRoute.value.query.workspace, 'project-one')
+    assert.equal(router.currentRoute.value.query.session, 'session-two')
+    assert.ok(view.all().find(node => node.type === 'b' && view.textOf(node) === 'AI 编码助手'), 'coding chat replaces the session list')
+    view.button('会话列表').props.onClick()
+    await flush()
+    assert.equal(router.currentRoute.value.query.workspace, undefined)
+    const sessionList = view.all().find(node => node.props['aria-label'] === '场景插件编码会话')
+    assert.match(view.textOf(sessionList), /Continue second plugin/)
+    assert.doesNotMatch(view.textOf(sessionList), /v\d+\.\d+\.\d+/, 'sessions never carry plugin versions')
   } finally { view.stop() }
+})
+
+test('the scenario chat history opens any past session for in-page coding', async () => {
+  Object.assign(developmentApi, {
+    listScenarios: async () => [{ id: 'scene-one', name: 'Scene one' }],
+    projects: async () => [projectValue('project-one', 'scene-one')],
+    sessions: async () => [
+      sessionValue('session-two', 'project-one', 'scene-one', { title: 'Continue second plugin', created_at: '2026-10-02T00:00:00Z' }),
+      sessionValue('session-one', 'project-one', 'scene-one', { title: 'Build first plugin', phase: 'validation_failed', created_at: '2026-10-01T00:00:00Z' }),
+    ],
+    project: async (id) => ({ id, release_id: 'release-one', revision: 3, phase: 'validation_failed', files: sourceFiles }),
+  })
+  fakeApi.get = async (id, signal, sessionId) => workspaceValue('project-one', 'scene-one', { phase: 'validation_failed', session_id: sessionId || 'session-one',
+    turns: [
+      { id: 'turn-one', instruction: 'Build the first plugin covering the approval workflow', status: 'succeeded', created_at: '2026-10-01T08:00:00Z', mode: 'generate' },
+      { id: 'turn-three', instruction: 'Fix the README instructions', status: 'failed', created_at: '2026-10-01T10:00:00Z', mode: 'generate' },
+    ] })
+  const router = await developmentRouter('/plugin-studio?scenario_id=scene-one')
+  const view = mountDevelopment(router)
+  try {
+    await flush()
+    assert.ok(view.all().find(node => node.props['aria-label'] === '场景插件编码会话'))
+    view.all().find(node => node.type === 'button' && view.textOf(node).includes('Build first plugin')).props.onClick()
+    await flush()
+    assert.equal(router.currentRoute.value.query.workspace, 'project-one')
+    assert.equal(router.currentRoute.value.query.session, 'session-one')
+    assert.ok(view.all().find(node => node.props['aria-label'] === '插件编码修正意见'), 'in-page composer opens for the past session')
+    assert.match(view.all().map(view.textOf).join(''), /Build the first plugin covering the approval workflow/)
+    assert.match(view.all().map(view.textOf).join(''), /需要修正/)
+    const nav = view.all().find(node => node.props['aria-label'] === '业务场景插件项目')
+    assert.match(view.textOf(nav), /README\.md/, 'the shared source tree stays directly under the scenario')
+  } finally { view.stop() }
+})
+
+test('the scenario source tree previews protected files read-only and offers in-page coding', async () => {
+  Object.assign(developmentApi, {
+    listScenarios: async () => [{ id: 'scene-one', name: 'Scene one' }],
+    projects: async () => [projectValue('project-one', 'scene-one', { phase: 'ready_for_review', plugin_version: '' })],
+    sessions: async () => [sessionValue('session-one', 'project-one', 'scene-one', { phase: 'ready_for_review' })],
+    project: async (id, signal) => {
+      assert.ok(signal instanceof AbortSignal)
+      return { id, release_id: 'release-one', revision: 3, phase: 'ready_for_review', files: sourceFiles }
+    },
+  })
+  const router = await developmentRouter()
+  const view = mountDevelopment(router)
+  try {
+    await flush()
+    view.all().find(node => node.type === 'button' && view.textOf(node) === 'Scene one').props.onClick()
+    await flush()
+    const fileButton = name => view.all().find(node => node.type === 'button' && typeof node.props.class === 'string' && node.props.class.includes('file-row') && view.textOf(node) === name)
+    fileButton('README.md').props.onClick()
+    await nextTick()
+    const preview = view.all().find(node => node.type === 'textarea' && node.props['aria-label'] === '只读 README.md')
+    assert.ok(preview, 'readonly preview renders while only browsing')
+    assert.equal(preview.props.readonly, true)
+    assert.equal(preview.props.value, '# Plugin notes\n')
+    assert.match(view.all().find(node => node.props['aria-label'] === '插件源码只读预览').props.class, /file-preview/)
+    assert.ok(view.button('在本页继续编码'), 'preview offers an in-page coding entry')
+    fileButton('server.py').props.onClick()
+    await nextTick()
+    assert.equal(view.all().find(node => node.type === 'textarea' && node.props['aria-label'] === '只读 server.py').props.value, 'protected adapter\n')
+  } finally { view.stop() }
+})
+
+test('expanding another scenario collapses the previously open source tree', async () => {
+  const projectReads = []
+  Object.assign(developmentApi, {
+    projects: async (scenarioId) => [projectValue(`project-${scenarioId}`, scenarioId)],
+    sessions: async () => [],
+    project: async (id) => { projectReads.push(id); return { id, release_id: 'release-one', revision: 1, phase: 'draft', files: [{ path: 'README.md', content: 'note', previous: '', editable: true }] } },
+  })
+  let explorer
+  const app = renderer.createApp({ setup() { explorer = usePluginProjectExplorer(); return () => h('div') } })
+  app.mount({})
+  try {
+    explorer.expandScenario('scene-one')
+    await flush()
+    assert.equal(explorer.isScenarioExpanded('scene-one'), true)
+    explorer.expandScenario('scene-two')
+    await flush()
+    assert.equal(explorer.isScenarioExpanded('scene-one'), false, 'the previous scenario collapses automatically')
+    assert.equal(explorer.isScenarioExpanded('scene-two'), true)
+    assert.deepEqual(projectReads, ['project-scene-one', 'project-scene-two'])
+  } finally { app.unmount() }
+})
+
+test('chat home defers opening a new-task draft to the page and keeps history by default', async () => {
+  const started = []
+  const view = mountEditorComponent(ChatHome, { scenario: { id: 'scene-one', name: 'Scene one' }, sessions: [] }, { onStartNew: () => started.push(true) }, { createExplorer: usePluginProjectExplorer, slots: { default: () => h('textarea', { 'aria-label': '新建对话草稿' }) } })
+  try {
+    assert.equal(view.all().some(node => node.props['aria-label'] === '新建对话草稿'), false)
+    view.button('新建任务').props.onClick()
+    assert.deepEqual(started, [true])
+    assert.equal(view.all().some(node => node.props['aria-label'] === '新建对话草稿'), false, 'page decides when the composer opens')
+  } finally { view.stop() }
+})
+
+test('collapsed scenarios abort pending source reads and refuse their late responses', async () => {
+  const pending = deferred()
+  let signal
+  Object.assign(developmentApi, {
+    projects: async () => [projectValue('project-one', 'scene-one')],
+    sessions: async () => [],
+    project: (id, current) => { signal = current; return pending.promise },
+  })
+  let explorer
+  const app = renderer.createApp({ setup() { explorer = usePluginProjectExplorer(); return () => h('div') } })
+  app.mount({})
+  try {
+    explorer.expandScenario('scene-one')
+    await flush()
+    assert.equal(explorer.isLoading('project-one'), true)
+    explorer.collapseScenario('scene-one')
+    assert.equal(signal.aborted, true)
+    pending.resolve({ id: 'project-one', release_id: 'release-one', revision: 1, phase: 'draft', files: [{ path: 'README.md', content: 'late\n', previous: '', editable: true }] })
+    await flush()
+    assert.equal(explorer.projectOf('project-one'), undefined)
+    explorer.expandScenario('scene-one')
+    await flush()
+    assert.equal(explorer.selectedFile, null)
+  } finally { app.unmount() }
 })
 
 test('typing a plugin goal before selecting scene and version preserves it without a leave warning', async () => {
@@ -434,7 +634,7 @@ test('typing a plugin goal before selecting scene and version preserves it witho
   let confirmations = 0
   globalThis.__pluginDevelopmentConfirm = async () => { confirmations++; throw new Error('Keep draft') }
   Object.assign(developmentApi, {
-    listScenarios: async () => [{ id: 'scene-one', name: 'Scene one' }, { id: 'scene-two', name: 'Scene two' }], tasks: async () => [],
+    listScenarios: async () => [{ id: 'scene-one', name: 'Scene one' }, { id: 'scene-two', name: 'Scene two' }], projects: async () => [], sessions: async () => [],
     list: async scenario => ({ items: [1, 2].map(version => ({ id: `${scenario}-v${version}`, scenario_id: scenario, name: `Version ${version}`, status: 'released', enabled: true, revision: 1 })) }),
     context: async release => ({ scenario: { id: release.startsWith('scene-one') ? 'scene-one' : 'scene-two' }, deployment: { release_id: release }, capabilities: [{ kind: 'workflow', key: 'example', name: 'Example', description: '', definition_hash: 'a'.repeat(64), input_schema: {}, output_schema: {}, side_effect: false, requires_confirmation: false, idempotency_required: false, data_ports: [], readiness: { ready: true, issues: [] } }] }),
     resources: async () => resourceCatalog(),
@@ -445,25 +645,27 @@ test('typing a plugin goal before selecting scene and version preserves it witho
     await router.push('/plugin-studio')
     view = mountEditorComponent(Development, {}, {}, { plugins: [router], routerView: true })
     await flush()
+    const scenarioRow = () => view.all().find(node => node.type === 'button' && node.props['aria-expanded'] === false && view.textOf(node) === 'Scene one')
+    scenarioRow().props.onClick()
+    await flush()
+    view.button('新建任务').props.onClick()
+    await flush()
     const goal = 'Build a plugin that completes this business process'
     const textarea = view.all().find(node => node.props['aria-label'] === '插件编码目标')
     textarea.value = goal
     textarea.props.onInput({ target: textarea })
     await flush()
-    const scenarioSelect = () => view.all().find(node => node.props['aria-label'] === '插件开发业务场景')
     const versionSelect = () => view.all().find(node => node.props['aria-label'] === '插件开发能力版本')
-    scenarioSelect().props['onUpdate:modelValue']('scene-one')
-    await flush()
-    assert.equal(confirmations, 0, 'Selecting a scene must preserve the goal without a leave confirmation')
-    assert.equal(router.currentRoute.value.query.scenario_id, 'scene-one')
+    assert.equal(confirmations, 0, 'Opening a fresh task must not leave-confirm an empty draft')
     versionSelect().props['onUpdate:modelValue']('scene-one-v1')
     await flush()
+    assert.equal(router.currentRoute.value.query.scenario_id, 'scene-one')
     assert.equal(router.currentRoute.value.query.release_id, 'scene-one-v1')
     assert.equal(view.all().find(node => node.props['aria-label'] === '插件编码目标').value, goal)
     versionSelect().props['onUpdate:modelValue']('scene-one-v2')
     await flush()
     assert.equal(view.all().find(node => node.props['aria-label'] === '插件编码目标').value, goal)
-    scenarioSelect().props['onUpdate:modelValue']('scene-two')
+    view.all().find(node => node.type === 'button' && view.textOf(node) === 'Scene two').props.onClick()
     await flush()
     versionSelect().props['onUpdate:modelValue']('scene-two-v1')
     await flush()
@@ -597,9 +799,9 @@ test('retrying a failed discussion protects the composer draft then restores and
   let submissions = 0
   fakeApi.get = async () => workspace
   fakeApi.revise = async () => { submissions++; return workspace }
-  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/project/:releaseId', component: Workbench }] })
-  await router.push('/project/release-one')
-  const view = mountEditorComponent(Workbench, { workspaceId: 'one', releaseId: 'release-one' }, {}, { plugins: [router] })
+  Object.assign(developmentApi, { listScenarios: async () => [], projects: async () => [], sessions: async () => [] })
+  const router = await developmentRouter('/plugin-studio?workspace=one&scenario_id=scene')
+  const view = mountDevelopment(router)
   try {
     await flush()
     const input = () => view.all().find(node => node.props['aria-label'] === '插件编码修正意见')
@@ -626,9 +828,9 @@ test('retrying a failed discussion protects the composer draft then restores and
 test('an active discussion reports analysis using the authoritative source phase while the workspace generates', async () => {
   developmentApi.resources = async () => resourceCatalog()
   fakeApi.get = async () => ({ ...value('one', 1, 'running'), release_id: 'release-one', phase: 'generating', source_phase: 'released', plugin_version: '1.0.0', turns: [{ id: 'discuss-one', instruction: 'Explain the saved plugin', mode: 'discuss', status: 'running', created_at: '2026-10-05T14:00:00Z' }], active_run_id: 'discuss-one', resource_selection: { llm_config_id: 'model', skill_ids: [], mcp_ids: [] }, resource_receipts: [] })
-  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/project/:releaseId', component: Workbench }] })
-  await router.push('/project/release-one')
-  const view = mountEditorComponent(Workbench, { workspaceId: 'one', releaseId: 'release-one' }, {}, { plugins: [router] })
+  Object.assign(developmentApi, { listScenarios: async () => [], projects: async () => [], sessions: async () => [] })
+  const router = await developmentRouter('/plugin-studio?workspace=one&scenario_id=scene')
+  const view = mountDevelopment(router)
   try {
     await flush()
     const status = view.all().filter(node => node.props.role === 'status').map(view.textOf)
@@ -654,9 +856,9 @@ test('settings keyboard close and cancellation return focus to the actual header
   const workspace = { ...value('one'), release_id: 'release-one', phase: 'released', plugin_version: '1.0.0', turns: [], active_run_id: null, resource_selection: { llm_config_id: 'model', skill_ids: [], mcp_ids: [] }, resource_receipts: [] }
   fakeApi.get = async () => workspace
   fakeApi.settings = async () => workspace
-  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/project/:releaseId', component: Workbench }] })
-  await router.push('/project/release-one')
-  const view = mountEditorComponent(Workbench, { workspaceId: 'one', releaseId: 'release-one' }, {}, { plugins: [router] })
+  Object.assign(developmentApi, { listScenarios: async () => [], projects: async () => [], sessions: async () => [] })
+  const router = await developmentRouter('/plugin-studio?workspace=one&scenario_id=scene')
+  const view = mountDevelopment(router)
   try {
     await flush()
     const header = view.all().find(node => node.props['aria-label'] === '打开编码 AI 设置')

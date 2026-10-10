@@ -147,6 +147,7 @@ def test_legacy_workspace_reports_missing_profile_without_regenerating_its_contr
     monkeypatch.setattr(plugin_coding_workspace, 'assert_adapter_identity', lambda value: None)
     monkeypatch.setattr(plugin_coding_workspace, 'project_files', lambda value: [])
     monkeypatch.setattr(plugin_coding_workspace, 'coding_turns', lambda *args: [])
+    monkeypatch.setattr(plugin_coding_workspace, 'latest_session_thread', lambda db, project_id: None)
     actual = plugin_coding_workspace.public_workspace(None, Resource(proposal=document, thread_id='workspace'))
     assert actual['scenario_blueprint'] is None and actual['delivery_profile'] is None
     assert document == original

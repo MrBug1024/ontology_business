@@ -21,6 +21,7 @@ from ..models import (
     AssistantAttachment,
     AssistantAuditLog,
     AssistantCompilationJob,
+    AssistantMessage,
     AssistantRouteDecision,
     AssistantThread,
     BusinessScenario,
@@ -58,7 +59,10 @@ from ..models import (
     SemanticRelationMapping,
     WorkflowRun,
 )
-from . import agent_deletion_service, scenario_purge_asset_service
+from . import agent_deletion_service, plugin_publication_service, scenario_purge_asset_service
+
+
+_PUBLISHED_PLUGIN_STATUS = "published"
 
 
 @dataclass(frozen=True)
@@ -339,6 +343,23 @@ def _audit_counts(
     }
 
 
+def _published_plugin_count(db: Session, scenario: BusinessScenario) -> int:
+    """Count live installation sources before their owning thread is purged."""
+
+    thread_ids = select(AssistantThread.id).where(
+        AssistantThread.scenario_id == scenario.id,
+        AssistantThread.tenant_id == scenario.tenant_id,
+    )
+    return _count_where(
+        db,
+        AssistantMessage,
+        AssistantMessage.thread_id.in_(thread_ids),
+        AssistantMessage.proposal["kind"].as_string()
+        == plugin_publication_service.PUBLICATION_KIND,
+        AssistantMessage.proposal["status"].as_string() == _PUBLISHED_PLUGIN_STATUS,
+    )
+
+
 def _retained_dataset_counts(
     db: Session,
     scenario: BusinessScenario,
@@ -374,12 +395,16 @@ def _plan_blockers(
     db: Session,
     scenario: BusinessScenario,
     queries: _PurgePlanQueries,
+    *,
+    published_plugin_count: int = 0,
 ) -> tuple[str, ...]:
     blockers: list[str] = []
     if scenario_tenant_mismatch_exists(db, scenario):
         blockers.append("场景历史数据的租户归属不一致，已停止永久删除，请先修复数据")
     if scenario.status != "retired":
         blockers.append("请先退役场景，确认不再接受新的验证和运行请求")
+    if published_plugin_count:
+        blockers.append("场景仍有已发布插件，请先撤回插件安装源后再永久删除")
     source_state = scenario_purge_asset_service.inspect_scenario_sources(db, scenario)
     blockers.extend(item for item in source_state.blockers if item not in blockers)
     return tuple(blockers)
@@ -392,14 +417,21 @@ def build_purge_plan(
     """Build the bounded, value-free preview used by every purge entry point."""
 
     queries = _plan_queries(scenario)
+    published_plugin_count = _published_plugin_count(db, scenario)
     counts = {
         **_definition_counts(db, scenario),
         **_agent_counts(db, scenario, queries),
         **_audit_counts(db, scenario, queries),
+        "plugin_publications": published_plugin_count,
     }
     retained = _retained_dataset_counts(db, scenario)
     retained["distillation_projects"] = _count_scenario(db, DistillationProject, scenario)
-    blockers = _plan_blockers(db, scenario, queries)
+    blockers = _plan_blockers(
+        db,
+        scenario,
+        queries,
+        published_plugin_count=published_plugin_count,
+    )
     external_assets = _count_where(db, ExternalScenarioAsset,
         ExternalScenarioAsset.scenario_id == scenario.id, ExternalScenarioAsset.tenant_id == scenario.tenant_id)
     retained["external_scenario_assets"] = external_assets

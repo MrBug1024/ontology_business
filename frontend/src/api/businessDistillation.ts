@@ -1,7 +1,6 @@
 import { http } from '@/api'
-import type { BucketFile, DataSourceCatalog, Scenario } from '@/types'
-import type { DistillationDraft, DistillationProject, DistillationProposal, DistillationPublication, DistillationScenarioState, DistillationTargetSystem } from '@/types/businessDistillation'
-import type { handoffDecision } from '@/utils/distillationHandoff'
+import type { DataSourceCatalog, Scenario } from '@/types'
+import type { DistillationDraft, DistillationProject, DistillationPublication, DistillationScenarioState, DistillationTargetSystem } from '@/types/businessDistillation'
 
 const root = '/business-distillation'
 const projectPath = (id: string) => `${root}/${encodeURIComponent(id)}`
@@ -23,37 +22,18 @@ export const businessDistillationApi = {
   remove: (id: string, signal: AbortSignal) => http.delete<void>(projectPath(id), { signal }),
   update: (id: string, expectedRevision: number, draft: DistillationDraft, signal: AbortSignal) =>
     http.put<DistillationProject>(projectPath(id), { ...draft, expected_revision: expectedRevision }, { signal }),
-  analyze: (id: string, expectedRevision: number, instructions: string, signal: AbortSignal) =>
-    http.post<DistillationProposal>(`${projectPath(id)}/analyze`, { expected_revision: expectedRevision, instructions }, { signal, timeout: 180_000 }),
-  publish: (id: string, expectedRevision: number, signal: AbortSignal) =>
-    http.post<DistillationPublication>(`${projectPath(id)}/publish`, { expected_revision: expectedRevision }, { signal }),
-  publishScenario: (scenarioId: string, expectedRevision: number, decision: ReturnType<typeof handoffDecision>, signal: AbortSignal) =>
-    http.post<DistillationPublication>(`${root}/scenario/${encodeURIComponent(scenarioId)}/publish`, { expected_revision: expectedRevision, ...decision }, { signal }),
-  publications: (id: string, signal: AbortSignal) =>
-    http.get<DistillationPublication[]>(`${projectPath(id)}/publications`, { signal }),
-  scenarioPublications: (scenarioId: string, signal: AbortSignal) =>
-    http.get<DistillationPublication[]>(`${root}/scenario/${encodeURIComponent(scenarioId)}/publications`, { signal }),
-  publication: (id: string, publicationId: string, signal: AbortSignal) =>
-    http.get<DistillationPublication>(`${projectPath(id)}/publications/${encodeURIComponent(publicationId)}`, { signal }),
   publicationById: (publicationId: string, signal: AbortSignal) =>
     http.get<DistillationPublication>(`${root}/publications/${encodeURIComponent(publicationId)}`, { signal }),
-  artifact: (id: string, publicationId: string, key: string, signal: AbortSignal) =>
-    http.get<Blob>(`${projectPath(id)}/publications/${encodeURIComponent(publicationId)}/artifacts/${encodeURIComponent(key)}`, { signal, responseType: 'blob' }),
   artifactByPublicationId: (publicationId: string, key: string, signal: AbortSignal) =>
     http.get<Blob>(`${root}/publications/${encodeURIComponent(publicationId)}/artifacts/${encodeURIComponent(key)}`, { signal, responseType: 'blob' }),
-  deletePublication: (id: string, publicationId: string, signal: AbortSignal) =>
-    http.delete<void>(`${projectPath(id)}/publications/${encodeURIComponent(publicationId)}`, { signal }),
   deleteProduct: (publicationId: string, signal: AbortSignal) =>
     http.delete<void>(`${root}/publications/${encodeURIComponent(publicationId)}`, { signal }),
-  scenarioArtifact: (scenarioId: string, publicationId: string, key: string, signal: AbortSignal) =>
-    http.get<Blob>(`${root}/scenario/${encodeURIComponent(scenarioId)}/publications/${encodeURIComponent(publicationId)}/artifacts/${encodeURIComponent(key)}`, { signal, responseType: 'blob' }),
   scenarios: (signal: AbortSignal) => http.get<Scenario[]>('/scenarios', { signal }),
   materials: (scenarioId: string | undefined, offset: number, limit: number, signal: AbortSignal) =>
     http.get<DataSourceCatalog>('/data-sources/catalog', {
       params: { scenario_id: scenarioId, offset, limit },
       signal,
     }),
-  files: (sourceId: string, signal: AbortSignal) => http.get<BucketFile[]>(`/data-sources/${encodeURIComponent(sourceId)}/files`, { signal }),
 }
 
 export interface SystemAccessStatus {

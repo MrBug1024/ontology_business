@@ -54,7 +54,6 @@ from . import (
     agent_deletion_service,
     object_deletion_service,
     object_storage_service,
-    release_service,
     distillation_service,
     scenario_purge_asset_service,
     scenario_purge_plan_service,
@@ -138,10 +137,8 @@ def _validate_request(
 
 def _prepare_templates(db: Session, scenario: BusinessScenario) -> None:
     try:
-        release_service.assert_scenario_deletion_allowed(db, scenario)
         template_catalog_service.prepare_scenario_deletion(db, scenario)
     except (
-        release_service.ReleaseValidationError,
         template_catalog_service.TemplateCatalogError,
     ) as exc:
         raise ScenarioPurgeConflict(str(exc)) from exc

@@ -2671,6 +2671,7 @@ def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
     s = tenant_service.require_scenario(db, scenario_id)
     if s.tenant_id != tenant_service.current_tenant_id(db):
         raise HTTPException(403, "公共业务场景只读")
+    principal = permission_service.require_principal(db)
     permission_service.require_scenario_permission(db, s, "write")
     s = db.scalar(
         select(BusinessScenario)
@@ -2685,10 +2686,9 @@ def delete_scenario(scenario_id: str, db: Session = Depends(get_db)):
         raise HTTPException(409, "业务场景在退役期间已变化，请刷新后重试")
     if s.status == "retired":
         return Msg(message="已退役")
-    try:
-        release_service.assert_scenario_retirement_allowed(db, s)
-    except release_service.ReleaseValidationError as exc:
-        raise HTTPException(409, str(exc)) from exc
+    # Retirement is one human governance decision: releases anchored by this
+    # scenario are retired in the same transaction instead of blocking it.
+    release_service.retire_scenario_releases(db, s, actor_id=principal.user_id)
     s.status = "retired"
     db.commit()
     return Msg(message="已退役")
