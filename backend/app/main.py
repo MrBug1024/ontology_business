@@ -69,7 +69,7 @@ from .services.auth_request_security import (
 )
 from .services.distillation_attachment_parser import MAX_ATTACHMENT_BYTES
 from .services.library_sqlite_adapter import MAX_SQLITE_BYTES
-from .routers import distillation_access, distillation_conversation
+from .routers import distillation_access, distillation_conversation, distillation_investigation_connector
 from .services import distillation_attachment_service, distillation_conversation_worker
 
 
@@ -325,6 +325,8 @@ app.include_router(business_distillation.router, prefix=settings.api_prefix)
 app.include_router(distillation_conversation.router, prefix=settings.api_prefix)
 app.include_router(distillation_conversation.preupload_router, prefix=settings.api_prefix)
 app.include_router(distillation_access.router, prefix=settings.api_prefix)
+app.include_router(distillation_investigation_connector.router, prefix=settings.api_prefix)
+app.include_router(distillation_investigation_connector.connector_ws_router, prefix=settings.api_prefix)
 app.include_router(catalog.scenario_router, prefix=settings.api_prefix)
 app.include_router(managed_uploads.router, prefix=settings.api_prefix)
 app.include_router(llm_configs.router, prefix=settings.api_prefix)

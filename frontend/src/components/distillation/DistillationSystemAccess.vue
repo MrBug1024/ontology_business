@@ -9,6 +9,7 @@
       <div class="distill-actions"><el-button :disabled="disabled" @click="edit(target)">配置</el-button><el-button v-if="accessOf(target.key)?.status === 'active'" text :disabled="disabled" @click="revoke(target.key)">撤销授权</el-button></div>
     </article>
     <el-button :disabled="disabled || project.document.target_systems.length >= 10" @click="edit()">添加业务系统</el-button>
+    <DistillationConnectorPanel :project-id="project.id" :targets="project.document.target_systems" :disabled="disabled" />
     <el-dialog v-model="editorOpen" title="配置业务系统" width="min(560px, 94vw)" :close-on-click-modal="false" :close-on-press-escape="!busy" :show-close="!busy" @closed="clearCredentials">
       <el-form label-position="top" :disabled="busy" @submit.prevent="saveSystem">
         <el-form-item label="系统名称"><el-input v-model="targetDraft.name" :maxlength="200" /></el-form-item>
@@ -36,6 +37,7 @@
 </template>
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import DistillationConnectorPanel from './DistillationConnectorPanel.vue'
 import { businessDistillationApi as api, type SystemAccessStatus, type SystemAccessInput } from '@/api/businessDistillation'
 import type { DistillationProject, DistillationTargetSystem } from '@/types/businessDistillation'
 import { createClientRequestId } from '@/utils/clientRequestId'

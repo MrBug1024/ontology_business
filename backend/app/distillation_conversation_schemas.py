@@ -221,6 +221,15 @@ class DeliveryReceipt(ClosedModel):
     delivered_at: datetime
 
 
+class StepScreenshot(ClosedModel):
+    """Reference to the observed-page screenshot stored in object storage."""
+    bucket: Annotated[str, Field(max_length=120)]
+    object_key: Annotated[str, Field(max_length=400)]
+    content_sha256: Annotated[str, Field(max_length=64)]
+    byte_size: int
+    media_type: Literal["image/jpeg"]
+
+
 class ToolStep(ClosedModel):
     id: Annotated[str, Field(max_length=32)]
     tool_name: Annotated[str, Field(max_length=64)]
@@ -235,6 +244,7 @@ class ToolStep(ClosedModel):
     mcp: MCPReadReceipt | None = None
     capability: JevDecisionReceipt | None = None
     delivery: DeliveryReceipt | None = None
+    screenshot: StepScreenshot | None = None
 
 
 class TurnOut(ClosedModel):

@@ -83,6 +83,7 @@ export interface DistillationToolStep {
   libraries?: { data_source_id: string; bucket_file_id: string | null; evidence_key: string; title: string; identity_sha256: string; retrieved_at: string }[]
   mcp?: { mcp_id: string; evidence_key: string; title: string; summary: string; content_sha256: string; identity_sha256: string; retrieved_at: string; read_only: true } | null
   delivery?: DistillationDeliveryReceipt | null
+  screenshot?: { bucket: string; object_key: string; content_sha256: string; byte_size: number; media_type: 'image/jpeg' } | null
   capability?: {
     capability: 'jev_decide'
     mcp_id: string

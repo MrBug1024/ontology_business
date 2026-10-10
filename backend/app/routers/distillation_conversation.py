@@ -111,6 +111,24 @@ def cancel_turn(project_id: str, turn_id: str, db: Session = Depends(get_tenant_
     return conversation.public_turn(row)
 
 
+@router.get("/turns/{turn_id}/steps/{step_id}/screenshot")
+def get_step_screenshot(project_id: str, turn_id: str, step_id: str, db: Session = Depends(get_tenant_db)):
+    """Observed-page screenshot of one step; project members only."""
+    from ..services import distillation_screenshot_service as screenshots
+
+    row = conversation.get_turn(db, project_id, turn_id)
+    step = next((item for item in row.steps if item.get("id") == step_id), None)
+    reference = (step or {}).get("screenshot") or {}
+    bucket, object_key = reference.get("bucket", ""), reference.get("object_key", "")
+    if not bucket or not object_key:
+        raise HTTPException(status_code=404, detail="该步骤没有截图")
+    image = screenshots.load_screenshot(bucket, object_key)
+    if image is None:
+        raise HTTPException(status_code=404, detail="截图已不可用")
+    return Response(content=image, media_type="image/jpeg",
+                    headers={"Cache-Control": "private, max-age=3600"})
+
+
 @router.post("/turns/{turn_id}/apply", response_model=ProjectOut)
 def apply_turn(project_id: str, turn_id: str, payload: RevisionRequest, db: Session = Depends(get_tenant_db)):
     row = conversation.apply(db, project_id, turn_id, payload.expected_revision)

@@ -174,7 +174,7 @@ class InvestigationBrowser:
             "content_sha256": hashlib.sha256(text.encode()).hexdigest(), "retrieved_at": datetime.now(timezone.utc).isoformat(),
             "limitations": ["真实浏览器当前可见页面的有界快照；不代表隐藏记录、完整样本或后台流程已获验证。"]}
         tables = self.page.locator("table").evaluate_all("""tables => tables.slice(0,5).map(t => [...t.rows].slice(0,51).map(r => [...r.cells].slice(0,20).map(c => c.innerText.slice(0,200))))""")
-        return {"observation": observation, "page_id": self.page_id, "elements": controls,
+        content = {"observation": observation, "page_id": self.page_id, "elements": controls,
             "login_configured": bool(self._credentials),
             "login_instructions": "凭据已由服务端配置；调用 login_business_system 并传控件引用，不要询问或传入账号密码。"
                 if self._credentials else "未配置网页登录；若需要登录，请引导专家使用业务系统配置窗口。",
@@ -183,6 +183,17 @@ class InvestigationBrowser:
             "blocked_requests": list(self.network.blocked), "elements_truncated": count > offset + MAX_ELEMENTS,
             "next_offset": offset + MAX_ELEMENTS if count > offset + MAX_ELEMENTS and offset + MAX_ELEMENTS <= 5000 else None,
             "embedded_frames": len(self.page.frames) - 1}
+        # Login forms never become screenshots: only fully observed pages do.
+        if status == "observed":
+            try:
+                import base64
+
+                image = self.page.screenshot(type="jpeg", quality=55)
+                if 0 < len(image) <= 400_000:
+                    content["screenshot"] = base64.b64encode(image).decode("ascii")
+            except Exception:
+                pass
+        return content
 
     def element(self, page_id: str, ref: str):
         if page_id != self.page_id or ref not in self.elements or self.page.url != self.observed_url:
@@ -268,9 +279,16 @@ class InvestigationBrowser:
 
 
 class BrowserTurn:
-    """One transient session; no sessions, cookies or credentials in checkpoints."""
-    def __init__(self, authorize):
+    """One transient session; no sessions, cookies or credentials in checkpoints.
+
+    When the project has an attached investigation connector for the target,
+    the browser runs on the member machine through it; otherwise the local
+    headless Chromium serves the turn. Either way authorization is re-checked
+    server-side before every operation.
+    """
+    def __init__(self, authorize, project_id=None, session_factory=None):
         self.authorize, self.session = authorize, None
+        self.project_id, self.session_factory = project_id, session_factory
 
     def __enter__(self):
         return self
@@ -279,9 +297,35 @@ class BrowserTurn:
         if self.session:
             self.session.close()
 
+    def _attached_connector(self, target: TargetSystem) -> str | None:
+        if not self.project_id or self.session_factory is None:
+            return None
+        try:
+            from ..config import get_settings as _settings
+
+            if not _settings().distillation_connector_enabled:
+                return None
+            from . import distillation_investigation_connector_service as connectors
+
+            with self.session_factory() as db:
+                row = connectors.active_connection_session(db, self.project_id, target)
+                db.commit()
+                return row.id if row is not None else None
+        except Exception:
+            # A transient lookup failure falls back to the local executor; the
+            # connector itself remains governed by its own session lease.
+            return None
+
     def open(self, target: TargetSystem, credentials):
         if self.session:
             self.session.close()
+        connector_session_id = self._attached_connector(target)
+        if connector_session_id:
+            from .distillation_connector_executor import ConnectorInvestigation
+
+            self.session = ConnectorInvestigation(connector_session_id, target,
+                lambda: self.authorize(target), credentials)
+            return self.session.open()
         self.session = InvestigationBrowser(target, lambda: self.authorize(target), credentials)
         self.session.start()
         return self.session.navigate(target.browser.entry_path)

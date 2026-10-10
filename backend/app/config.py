@@ -185,6 +185,13 @@ class Settings(BaseSettings):
     allow_insecure_mcp_http: bool = False
     distillation_browser_enabled: bool = False
     distillation_browser_max_sessions: int = Field(default=2, ge=1, le=8)
+    # Investigation connector lets a member's own machine act as the browser
+    # executor through an outbound-only WebSocket. It never exposes files or a
+    # shell; the authority (authorization, tool catalog, audit) stays server-side.
+    distillation_connector_enabled: bool = False
+    distillation_connector_token_ttl_seconds: int = Field(default=1800, ge=300, le=86400)
+    distillation_connector_idle_timeout_seconds: float = Field(default=45, ge=10, le=300)
+    distillation_connector_call_timeout_seconds: float = Field(default=90, ge=10, le=300)
     # Timeout for the AI model used by business discovery; this is not a model
     # distillation/training setting.
     distillation_model_timeout_seconds: float = Field(default=120, ge=30, le=300)

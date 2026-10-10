@@ -284,6 +284,17 @@ def _start_step(lease, session_factory, name: str) -> str:
 
 
 def _complete_step(lease, session_factory, step_id, result):
+    # Object-store upload happens outside the lease row transaction; only the
+    # resulting reference is written under the lock.
+    screenshot_reference = None
+    if result.screenshot:
+        from . import distillation_screenshot_service as screenshots
+
+        with session_factory() as db:
+            owner = leases.owned(db, lease)
+            screenshot_reference = screenshots.store_screenshot(
+                owner.tenant_id, owner.project_id, owner.id, step_id, result.screenshot)
+
     def mutate(row):
         if result.source:
             from .distillation_access_service import current_grant
@@ -340,7 +351,8 @@ def _complete_step(lease, session_factory, step_id, result):
             "completed_at": leases.now().isoformat(),
             "source": result.source.model_dump(mode="json") if result.source else None, "library": receipt,
             "libraries": receipts, "mcp": mcp_receipt, "capability": capability_receipt,
-            "delivery": result.delivery.model_dump(mode="json") if result.delivery else None}
+            "delivery": result.delivery.model_dump(mode="json") if result.delivery else None,
+            "screenshot": screenshot_reference}
             if step["id"] == step_id else step for step in row.steps]
     _save(lease, session_factory, mutate)
 
@@ -526,11 +538,12 @@ def execute_claim(lease: leases.Lease, session_factory) -> None:
         row = leases.owned(db, lease)
         conversations.assert_current_context(db, row)
         conversations.ensure_turn_resource_selection(db, row)
+        project_id = row.project_id
         messages = row.checkpoint or _initial_messages(db, row)
         db.commit()
     _checkpoint(lease, session_factory, messages)
     _reset_visible_output(lease, session_factory)
-    with leases.heartbeat(lease, session_factory) as lost, BrowserTurn(authorize_browser) as browser:
+    with leases.heartbeat(lease, session_factory) as lost, BrowserTurn(authorize_browser, project_id, session_factory) as browser:
         if lost.is_set():
             raise leases.LeaseLost("Heartbeat lost")
         graph_state = INVESTIGATION_GRAPH.invoke({

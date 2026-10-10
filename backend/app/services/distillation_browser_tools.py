@@ -50,7 +50,14 @@ def execute(db, name, payload, document, turn, browser):
                 session.settle()
                 content = session.snapshot(payload.offset)
         observation = WebsiteObservation.model_validate(content["observation"])
-        return ToolResult(content, "已读取真实浏览器页面。" if observation.status == "observed" else "已打开页面，仍需登录或补充访问条件。", source=observation)
+        # The base64 screenshot leaves the content dict here: it becomes binary
+        # evidence in object storage instead of model-facing tool output.
+        screenshot = None
+        if isinstance(content.get("screenshot"), str):
+            from .distillation_screenshot_service import decode_step_screenshot
+
+            screenshot = decode_step_screenshot(content.pop("screenshot"))
+        return ToolResult(content, "已读取真实浏览器页面。" if observation.status == "observed" else "已打开页面，仍需登录或补充访问条件。", source=observation, screenshot=screenshot)
     except BrowserAccessError as exc:
         return ToolResult({"status": "blocked", "reason": str(exc)}, str(exc))
     finally:

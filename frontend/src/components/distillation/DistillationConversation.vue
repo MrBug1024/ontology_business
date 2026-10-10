@@ -29,7 +29,7 @@
           <DistillationLiveActivity :turn="turn" />
           <details v-if="turn.steps.length" class="discovery-tool-steps">
             <summary>查证过程 · {{ turn.steps.length }} 项</summary>
-            <ol><li v-for="step in turn.steps" :key="step.id"><div><strong>{{ step.title }}</strong><span>{{ stepStatus[step.status] }}</span></div><p v-if="step.summary">{{ step.summary }}</p><p v-for="library in (step.libraries?.length ? step.libraries : step.library ? [step.library] : [])" :key="library.evidence_key">资料库依据：{{ library.title }} · {{ new Date(library.retrieved_at).toLocaleString() }}</p><p v-if="step.capability">Jev 决策能力回执：{{ step.capability.model }} · {{ step.capability.result_count }} 项 · {{ step.capability.results.length ? `最低置信度 ${Math.min(...step.capability.results.map(result => result.confidence)).toFixed(2)}` : '未形成可验证结果' }}</p><p v-if="step.mcp">历史 MCP 资料回执（兼容旧会话）：{{ step.mcp.title }} · {{ new Date(step.mcp.retrieved_at).toLocaleString() }}</p><p v-if="step.mcp?.summary">{{ step.mcp.summary }}</p><div v-if="step.delivery" class="discovery-delivery-receipt"><span>{{ step.delivery.already_delivered ? '阶段产物此前已提交到场景资料' : '已提交到场景资料' }}：{{ step.delivery.name }} · {{ step.delivery.artifacts.length }} 份产物</span><el-button text type="primary" @click="openDelivery(step.delivery)">查看场景资料</el-button></div><DistillationSourceObservation v-if="step.source" :source="step.source" /></li></ol>
+            <ol><li v-for="step in turn.steps" :key="step.id"><div><strong>{{ step.title }}</strong><span>{{ stepStatus[step.status] }}</span></div><p v-if="step.summary">{{ step.summary }}</p><p v-for="library in (step.libraries?.length ? step.libraries : step.library ? [step.library] : [])" :key="library.evidence_key">资料库依据：{{ library.title }} · {{ new Date(library.retrieved_at).toLocaleString() }}</p><p v-if="step.capability">Jev 决策能力回执：{{ step.capability.model }} · {{ step.capability.result_count }} 项 · {{ step.capability.results.length ? `最低置信度 ${Math.min(...step.capability.results.map(result => result.confidence)).toFixed(2)}` : '未形成可验证结果' }}</p><p v-if="step.mcp">历史 MCP 资料回执（兼容旧会话）：{{ step.mcp.title }} · {{ new Date(step.mcp.retrieved_at).toLocaleString() }}</p><p v-if="step.mcp?.summary">{{ step.mcp.summary }}</p><div v-if="step.delivery" class="discovery-delivery-receipt"><span>{{ step.delivery.already_delivered ? '阶段产物此前已提交到场景资料' : '已提交到场景资料' }}：{{ step.delivery.name }} · {{ step.delivery.artifacts.length }} 份产物</span><el-button text type="primary" @click="openDelivery(step.delivery)">查看场景资料</el-button></div><DistillationSourceObservation v-if="step.source" :source="step.source" :screenshot-url="stepScreenshot(turn.project_id, turn.id, step)" /></li></ol>
           </details>
           <template v-for="(part, index) in splitAssistantMessage(turn.assistant_message, isWorking(turn))" :key="`${turn.id}:${index}`">
             <details v-if="part.kind === 'thinking'" class="discovery-thinking" :open="part.streaming && isWorking(turn)">
@@ -95,7 +95,8 @@ import SafeMarkdown from '@/components/SafeMarkdown.vue'
 import DistillationLiveActivity from './DistillationLiveActivity.vue'
 import DistillationSourceObservation from './DistillationSourceObservation.vue'
 import DistillationResourceSettings from './DistillationResourceSettings.vue'
-import type { DistillationDeliveryReceipt, DistillationQuestion, DistillationResourceSelection, DistillationTurn } from '@/types/distillationConversation'
+import type { DistillationDeliveryReceipt, DistillationQuestion, DistillationResourceSelection, DistillationToolStep, DistillationTurn } from '@/types/distillationConversation'
+import { distillationConnectorApi } from '@/api/distillationConnector'
 import { composeClarificationAnswer, isWorking, splitAssistantMessage, TURN_STATUS_LABELS, visibleTurnError } from '@/utils/distillationConversation'
 const input = defineModel<string>({ required: true })
 const route = useRoute(), router = useRouter()
@@ -113,6 +114,9 @@ const connectionNotice = computed(() => {
   return ''
 })
 const stepStatus = { running: '进行中', succeeded: '已完成', failed: '未完成' }
+function stepScreenshot(projectId: string, turnId: string, step: DistillationToolStep): string | undefined {
+  return step.screenshot ? distillationConnectorApi.stepScreenshotUrl(projectId, turnId, step.id) : undefined
+}
 const starters = [
   { title: '梳理一个业务困境', caption: '从真正受益的人开始', message: '我想先弄清楚一个项目真正应该解决的问题。' },
   { title: '逆向现有业务流程', caption: '从资料和事实还原过程', message: '我有一个现有系统，希望从证据还原业务流程，再分析哪些环节值得保留。' },

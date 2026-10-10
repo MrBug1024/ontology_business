@@ -199,6 +199,7 @@ class ToolResult:
     capability_receipt: JevDecisionReceipt | None = None
     interview_source: Evidence | None = None
     delivery: DeliveryReceipt | None = None
+    screenshot: bytes | None = None
 
 
 _REVIEW_METHODS = {
